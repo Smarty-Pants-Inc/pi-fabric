@@ -308,6 +308,18 @@ export interface FabricActorRequest {
   records?: FabricActorRecordsOptions;
 }
 
+export interface FabricActorSessionOrphan {
+  oldRoot: string;
+  oldHost: string;
+  lastUpdated: number;
+  orphanedAt: number;
+  reason: string;
+  leadName?: string;
+  role?: string;
+  /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
+  alarmPublishedAt?: number;
+}
+
 export interface FabricActorInfo {
   id: string;
   scope: FabricActorStorageScope;
@@ -324,6 +336,8 @@ export interface FabricActorInfo {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
+  /** Terminal foreign session-root record, not authority to adopt or restart it. */
+  sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;

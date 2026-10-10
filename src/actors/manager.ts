@@ -208,6 +208,7 @@ interface ManagedActor {
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
+  sessionOrphan?: FabricActorInfo["sessionOrphan"];
   /** Persistent, deduplicated publication diagnostic; does not stop actor execution. */
   presenceError?: string;
   abortController?: AbortController;
@@ -999,6 +1000,9 @@ export class ActorManager {
       .catch(() => undefined);
     return this.#publicInfo(actor);
   }
+
+  /** ActorDirectory supplies foreign-session discovery; a single registry has none. */
+  reconcileSessionOrphans(): Promise<number> { return Promise.resolve(0); }
 
   list(): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
@@ -4839,6 +4843,7 @@ export class ActorManager {
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
       ...(actor.removal ? { removal: actor.removal } : {}),
       ...(actor.presenceError ? { presenceError: actor.presenceError } : {}),
+      ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan }, ...(actor.lastError ? { lastError: actor.lastError } : {}) } : {}),
     };
   }
 
@@ -5324,6 +5329,10 @@ export class ActorManager {
         createdAt: record.createdAt,
         updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
+        ...(record.status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
+            typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
+            Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
+          ? { sessionOrphan: { ...record.sessionOrphan }, ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}) } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
@@ -5898,6 +5907,7 @@ export class ActorManager {
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
       ...(actor.project ? { project: actor.project } : {}),
+      ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan } } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
       // against a rendered role without reading the registry file (smarty-dev#918).
       instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),

@@ -452,7 +452,9 @@ export class MeshStore {
   /** Per-host lease commits and recovery serialize without the shared state/custody lock.
    * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
    * before recovery can change its receipt. Async lease-owned transactions retain this gate until
-   * settled; recovery requires matching machine identity and death/current-boot evidence. */
+   * settled; recovery requires matching machine identity and death/current-boot evidence.
+   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery;
+   * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
     options: { ownIncarnation?: string | undefined } = {}): Promise<T> {
     const domain = path.join(this.root, "host-lease-commits", createHash("sha256").update(path.basename(file)).digest("hex"));

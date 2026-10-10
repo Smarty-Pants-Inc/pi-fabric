@@ -9,12 +9,21 @@ export const validBootId = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
 /** Hostnames and mesh hostIds are labels, never evidence that a PID is local.
- * Missing/unreadable kernel identity fails closed (including non-Linux hosts). */
-export const readPhysicalHostIdentity = (): PhysicalHostIdentity | undefined => {
+ * Keep machine evidence independent of boot evidence: unreadable procfs must not erase locality. */
+export const readPhysicalMachineId = (): string | undefined => {
   try {
     const machineId = fs.readFileSync("/etc/machine-id", "utf8").trim().toLowerCase();
+    return /^[0-9a-f]{32}$/.test(machineId) ? machineId : undefined;
+  } catch { return undefined; }
+};
+
+/** Missing/unreadable boot identity is unknown, never evidence of a previous boot. */
+export const readPhysicalHostIdentity = (): PhysicalHostIdentity | undefined => {
+  const machineId = readPhysicalMachineId();
+  if (!machineId) return undefined;
+  try {
     const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().toLowerCase();
-    return /^[0-9a-f]{32}$/.test(machineId) && validBootId(bootId) ? { machineId, bootId } : undefined;
+    return validBootId(bootId) ? { machineId, bootId } : undefined;
   } catch { return undefined; }
 };
 

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, validBootId } from "../core/atomic-write.js";
+import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
 
 /**
  * File custody lock (smarty-dev#6477 L5). `exclusive()` users that only guard files beside the
@@ -19,6 +19,19 @@ import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validP
  */
 export const MESH_CUSTODY_LOCK_NAME = "custody.lock";
 const CUSTODY_LOCK_TIMEOUT_MS = 10_000;
+// Same conservative 30s staleness bound as mesh/exclusive locks; age alone NEVER proves death.
+export const CUSTODY_LOCK_STALE_MS = 30_000;
+
+/** Not a contention timeout: callers must surface this refusal, not silently retry/skip it. */
+export class MeshCustodyUnrecoverableError extends Error {
+  override readonly name = "MeshCustodyUnrecoverableError";
+  readonly code = "FABRIC_MESH_CUSTODY_UNRECOVERABLE";
+  readonly kind = "custody-unrecoverable";
+  readonly retryable = false;
+  constructor(readonly lock: string) {
+    super(`Fabric custody-unrecoverable: ${lock} has no valid owner pid; recovery refused`);
+  }
+}
 
 export type MeshCustodyMode = "dual" | "own";
 
@@ -54,8 +67,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   const started = Object.hasOwn(options, "ownIncarnation") ? options.ownIncarnation
     : await ownProcessIncarnation().catch(() => undefined);
   const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
+  const machineId = physical?.machineId ?? (options.hostQualified ? readPhysicalMachineId() : undefined);
   const record = options.hostQualified
-    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${physical?.machineId ?? ""}\n${physical?.bootId ?? ""}\n`
+    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${machineId ?? ""}\n${physical?.bootId ?? ""}\n`
     : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
   const readOwner = (): string | undefined => {
     try { return fs.readFileSync(ownerPath, "utf8"); }
@@ -85,7 +99,14 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
-    if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified)) continue;
+    try {
+      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified)) continue;
+    } catch (error) {
+      if (error instanceof MeshCustodyUnrecoverableError) {
+        try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
+      }
+      throw error;
+    }
     if (Date.now() >= deadline) {
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
       const pid = owner?.split("\n")[1];
@@ -115,19 +136,33 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
     const owner = readOwner();
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
-    const fields = owner.split("\n");
+    const fields = owner?.split("\n") ?? [];
     const [token, pidText, createdText, recordedStart] = fields;
-    // A host-lease commit gate is never recovered by a foreign/unknown PID. It has no
-    // age-steal path: a paused commit holds its fence until resume; death is proven locally.
-    const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
-    if (hostQualified && (!physical || fields.length !== 7 || fields[4] !== physical.machineId ||
-      !validBootId(fields[5]))) return false;
-    const previousBoot = hostQualified && fields[5] !== physical!.bootId;
     const pid = Number(pidText);
+    if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {
+      // A concurrent release/replacement is not a corrupt receipt. Alarm only the same
+      // canonical lock we actually observed, just as recovery fences the same inode/bytes.
+      const current = fs.lstatSync(lock);
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+      throw new MeshCustodyUnrecoverableError(lock);
+    }
+    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
+    // machine evidence is still mandatory when boot/process identity is unavailable.
+    const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
+    const machineId = physical?.machineId ?? (hostQualified ? readPhysicalMachineId() : undefined);
+    if (hostQualified && (!machineId || fields.length !== 7 || fields[4] !== machineId)) return false;
+    const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
+    const previousBoot = bootKnown && fields[5] !== physical!.bootId;
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
       (fields.length !== 4 && fields.length !== 5 && !(hostQualified && fields.length === 7))) return false;
-    if (!previousBoot && processAlive(pid)) {
+    if (hostQualified && !bootKnown) {
+      // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE
+      // holder. Do not compare incarnations or infer a reboot from missing evidence.
+      const ownerStat = fs.lstatSync(path.join(lock, "owner"));
+      if (!ownerStat.isFile() || Date.now() - Math.max(stat.mtimeMs, ownerStat.mtimeMs) <= CUSTODY_LOCK_STALE_MS ||
+        processAlive(pid)) return false;
+    } else if (!previousBoot && processAlive(pid)) {
       if (!validProcessIncarnation(recordedStart)) return false;
       // Our own pid with another incarnation is a dead predecessor; with ours, a live caller.
       const remaining = deadline - Date.now();
@@ -139,7 +174,8 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
     fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
     return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof MeshCustodyUnrecoverableError) throw error;
     return false;
   }
 };

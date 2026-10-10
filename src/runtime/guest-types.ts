@@ -279,7 +279,22 @@ interface FabricLifecycleSubscription {
   lastEventId?: string;
   lastError?: string;
 }
+interface FabricTargetTerminalError extends Error {
+  readonly code: "FABRIC_TARGET_TERMINAL";
+  readonly targetId: string;
+  readonly finalAnswerReceiptId: string;
+}
+interface FabricTargetTerminalNotice {
+  code: "FABRIC_TARGET_TERMINAL";
+  targetId: string;
+  messageId: string;
+  delivery: "steer" | "followUp";
+  finalAnswerReceiptId: string;
+  sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
+}
 interface FabricAgentHandle {
+  /** Durable answer boundary; does not confirm native worker/tree exit. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */
   fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];

@@ -116,6 +116,43 @@ const mainLeaseFixture = async (files: boolean) => {
 };
 
 describe("sender incarnation fencing (#7514)", () => {
+  it.each(["warn", "enforce"] as const)("a legacy wire sender to an advertised Main obeys %s and explicit stale epochs still fail", async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "router-rollout-")); roots.push(root);
+    const mesh = new MeshStore(root, 65_536, 1_000);
+    const targetId = "session:upgraded";
+    const owner = new FabricControlPlane(mesh, { id: targetId, name: "Upgraded", kind: "main" },
+      { enabled: true, hostId: targetId, pollMs: 20, controlIncarnationFence: mode });
+    const sender = new FabricControlPlane(new MeshStore(root, 65_536, 1_000), { id: "session:legacy", name: "Legacy", kind: "main" },
+      { enabled: true, hostId: "session:legacy", pollMs: 20 });
+    planes.push(owner, sender);
+    const receiver = router(unknown);
+    Object.assign(receiver.main, { id: targetId, matches: (id: string) => id === targetId });
+    owner.start((...args) => receiver.value.acceptControl(...args)); sender.start(() => ({ accepted: false }));
+    const target = { ...remote(targetId, "idle", "root"), ownerHostId: targetId, ownerIdentityId: targetId, ownerIncarnation: owner.incarnation };
+    const source = router(unknown, [target], sender);
+    const publish = sender.mesh.publish.bind(sender.mesh);
+    const legacyWire = vi.spyOn(sender.mesh, "publish").mockImplementation(input => {
+      if (input.topic !== "fabric.control.command") return publish(input);
+      const data = input.data;
+      return publish({ ...input, data: (at: number) => {
+        const { ownerIncarnation: _epoch, requestCreatedAt: _origin, ...wire } =
+          (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+        return wire; // The old-release sender omits both fields.
+      } });
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    for (const delivery of ["steer", "followUp"] as const) {
+      const outcome = source.value.routeMessage(targetId, "legacy sender message", undefined, delivery);
+      if (mode === "warn") await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "main-queue" });
+      else await expect(outcome).rejects.toMatchObject({ code: "FABRIC_CONTROL_STALE_INCARNATION" });
+    }
+    expect(receiver.main.deliverAgent).toHaveBeenCalledTimes(mode === "warn" ? 2 : 0);
+    expect(warn).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    if (mode === "warn") expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:legacy"');
+    legacyWire.mockRestore(); target.ownerIncarnation = "predecessor:epoch";
+    await expect(source.value.routeMessage(targetId, "stale message", undefined, "steer")).rejects.toMatchObject({ code: "FABRIC_CONTROL_STALE_INCARNATION" });
+    expect(receiver.main.deliverAgent).toHaveBeenCalledTimes(mode === "warn" ? 2 : 0);
+  });
   it.each(["root", "actor", "agent"] as const)("routes every old %s peer unfenced without inventing an epoch", async kind => {
     for (const delivery of ["steer", "followUp"] as const) {
       for (const protocol of ["legacy", "v1"] as const) {

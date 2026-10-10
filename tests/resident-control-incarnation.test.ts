@@ -11,7 +11,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { CONTROL_STALE_INCARNATION, FabricControlPlane } from "../src/topology/control-plane.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
-it("real resident relaunch keeps host/actor IDs but refuses the queued predecessor stop, then admits a fresh stop once", async () => {
+it.each(["warn", "enforce"] as const)("real resident %s relaunch refuses predecessor stop, deduplicates fresh stop, and applies legacy sender policy", async mode => {
   installInProcessResidentFence();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-control-incarnation-"));
   const identity = { id: "session:incarnation", name: "Main", kind: "main" as const, sessionId: "incarnation" };
@@ -20,7 +20,7 @@ it("real resident relaunch keeps host/actor IDs but refuses the queued predecess
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
     sessionActorRoot: path.join(root, "session-actors"), residencyRoot: residentRoot(path.join(root, "mesh"), identity.id),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, controlIncarnationFence: mode }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
@@ -60,6 +60,18 @@ it("real resident relaunch keeps host/actor IDs but refuses the queued predecess
       { idempotencyKey: "after-relaunch", routedRemoteHost: null })).resolves.toMatchObject({ acknowledged: true });
     expect(stop).toHaveBeenCalledOnce();
     expect(mesh.read({ topic: "fabric.control.ack" }).at(-1)!.data).toMatchObject({ ownerIncarnation: replacement.control.incarnation });
+    expect(replacement.control.options.controlIncarnationFence).toBe(mode);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity, to: fresh.ownerHostId,
+      data: { version: 1, commandId: "legacy-resident", targetId: actor.id, operation: "stop", replyTo: identity.id,
+        requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+    await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack" }).find(event =>
+      (event.data as { commandId: string }).commandId === "legacy-resident")).toBeDefined());
+    const legacyAck = mesh.read({ topic: "fabric.control.ack" }).find(event => (event.data as { commandId: string }).commandId === "legacy-resident")!.data;
+    expect(legacyAck).toMatchObject(mode === "warn" ? { accepted: true } : { accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null });
+    expect(stop).toHaveBeenCalledTimes(mode === "warn" ? 2 : 1);
+    expect(warn).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    if (mode === "warn") expect(warn.mock.calls[0]![0]).toContain(`count=1 sender=${JSON.stringify(identity.id)}`);
   } finally {
     await sender.close(); await pending;
     for (const host of hosts.reverse()) await host.close();

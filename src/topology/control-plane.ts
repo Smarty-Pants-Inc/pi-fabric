@@ -1,3 +1,4 @@
+import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
@@ -18,6 +19,7 @@ const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_ACK_TIMEOUT_MS = 5_000;
+const UNFENCED_SENDER_WARNING_MS = 60 * 60 * 1_000;
 // A cancellation owns a separate retry deadline, longer than a production mesh lock wait.
 const CANCELLATION_RETENTION_MS = 60_000;
 const CONTROL_COMMAND_EXPIRED = "Fabric control command expired";
@@ -290,6 +292,8 @@ const controlSeenRecord = (value: unknown): FabricControlSeenRecord | undefined 
 };
 
 export interface FabricControlPlaneOptions {
+  /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
+  controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
   ownerIncarnation?: string;
   enabled: boolean;
@@ -429,6 +433,7 @@ export class FabricControlPlane {
   readonly #resendWaits = new Set<() => void>();
   #closed = false;
   #legacyDeliveryCount = 0;
+  readonly #unfencedSenders = new Map<string, { count: number; warnedAt: number }>();
   #paused = false;
   #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
@@ -1121,10 +1126,10 @@ export class FabricControlPlane {
       if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
-    // Post-switch controls require an explicit captured epoch. Neither sender origin
-    // nor native event/commit time proves which durable owner record was resolved:
-    // that record can still name the predecessor while this epoch's publish waits.
-    const incarnationMatches = command.ownerIncarnation === this.incarnation;
+    // Explicit epochs always fence stale owners. Omission remains compatible only
+    // during warn-mode rollout; timestamps cannot substitute for an epoch in enforce.
+    const incarnationMatches = command.ownerIncarnation === this.incarnation ||
+      (command.ownerIncarnation === undefined && this.options.controlIncarnationFence !== "enforce");
     if (command.operation === "cancel") {
       if (incarnationMatches) this.#acceptCancellation(command, event.from);
       return;
@@ -1150,8 +1155,8 @@ export class FabricControlPlane {
       }
       return;
     }
-    // This owner advertises fencing. Missing or stale wire epochs cannot downgrade
-    // a new admission; completed predecessor claims above remain observable.
+    // Stale wire epochs cannot downgrade a new admission in either mode. Enforce
+    // also refuses omission; completed predecessor claims above remain observable.
     if (!incarnationMatches) {
       await this.#publishAcknowledgement(command, {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
@@ -1291,6 +1296,23 @@ export class FabricControlPlane {
     await execution;
   }
 
+  #warnUnfencedSenderDelivery(command: FabricControlCommand, from: MeshIdentity): void {
+    if (command.ownerIncarnation !== undefined) return;
+    const now = Date.now();
+    const previous = this.#unfencedSenders.get(from.id);
+    const count = (previous?.count ?? 0) + 1;
+    if (previous && now - previous.warnedAt < UNFENCED_SENDER_WARNING_MS) {
+      previous.count = count;
+      return;
+    }
+    // Retain only this hour's senders, without a timer or an unbounded historical map.
+    for (const [id, record] of this.#unfencedSenders) {
+      if (now - record.warnedAt >= UNFENCED_SENDER_WARNING_MS) this.#unfencedSenders.delete(id);
+    }
+    this.#unfencedSenders.set(from.id, { count, warnedAt: now });
+    console.warn(`[pi-fabric] Unfenced legacy sender delivery count=${count} sender=${JSON.stringify(from.id)} operation=${command.operation} target=${JSON.stringify(command.targetId)} mesh.controlIncarnationFence=warn`);
+  }
+
   #acceptCancellation(command: FabricControlCommand, from: MeshIdentity): void {
     if (!command.cancelCommandId) return;
     const active = this.#activeCommands.get(command.cancelCommandId);
@@ -1299,6 +1321,7 @@ export class FabricControlPlane {
       active.requesterId === from.id &&
       active.targetId === command.targetId
     ) {
+      this.#warnUnfencedSenderDelivery(command, from);
       active.controller.abort();
     }
   }
@@ -1332,9 +1355,10 @@ export class FabricControlPlane {
         assertMeshConsumption(this.options.canConsumeMesh);
         if (owned.acceptance) acceptance = owned.acceptance;
         else if (Date.now() > deadlineAt) acceptance = { accepted: false, error: CONTROL_COMMAND_EXPIRED, notRun: true };
-        else acceptance = this.#handler
-          ? await this.#handler(command, from, controller.signal, verification)
-          : { accepted: false, error: "Fabric owner has no control handler" };
+        else if (this.#handler) {
+          this.#warnUnfencedSenderDelivery(command, from);
+          acceptance = await this.#handler(command, from, controller.signal, verification);
+        } else acceptance = { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         if (error instanceof MeshConsumptionPausedError) throw error;
         acceptance = {

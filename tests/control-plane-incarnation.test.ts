@@ -15,9 +15,10 @@ const bridges: MeshBridge[] = [];
 const identity = (id: string): MeshIdentity => ({ id, name: id, kind: "main", sessionId: id });
 const temp = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-incarnation-")); roots.push(root); return root; };
 const store = (root: string) => new MeshStore(root, 65_536, 1_000);
-const plane = (mesh: MeshStore, id: string, directory?: ParticipantDirectory) => {
+const plane = (mesh: MeshStore, id: string, directory?: ParticipantDirectory, controlIncarnationFence?: "warn" | "enforce") => {
   const value = new FabricControlPlane(mesh, identity(id), { enabled: true, hostId: id, pollMs: 20,
-    acknowledgementTimeoutMs: 1_000, ...(directory ? { ownerIncarnation: directory.ownerIncarnation } : {}) });
+    acknowledgementTimeoutMs: 1_000, ...(directory ? { ownerIncarnation: directory.ownerIncarnation } : {}),
+    ...(controlIncarnationFence ? { controlIncarnationFence } : {}) });
   planes.push(value); return value;
 };
 const directory = (mesh: MeshStore, id: string) => {
@@ -35,6 +36,69 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(value => value.close()));
   vi.restoreAllMocks(); vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("owner incarnation rollout gate", () => {
+  it.each([undefined, "warn", "enforce"] as const)("handles an actual epochless legacy sender in mode %s (default warn)", async mode => {
+    const mesh = store(temp()); const owner = plane(mesh, "session:owner", undefined, mode);
+    const handler = vi.fn(() => ({ accepted: true, messageId: "legacy", result: "answer" }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined); owner.start(handler);
+    for (const [index, operation] of (["steer", "followUp", "stop", "ask"] as const).entries()) {
+      // Old releases have neither an epoch nor an immutable request origin.
+      await mesh.publish({ topic: "fabric.control.command", kind: operation, from: identity("session:legacy"), to: "session:owner",
+        data: { version: 1, commandId: `legacy:${operation}`, targetId: "actor:target", operation, replyTo: "session:legacy",
+          message: "old sender", requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+      await vi.waitFor(() => expect(acks(mesh)).toHaveLength(index + 1));
+      expect(acks(mesh).at(-1)!.data).toMatchObject(mode === "enforce"
+        ? { accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null }
+        : { accepted: true, ownerIncarnation: owner.incarnation, messageId: "legacy" });
+    }
+    expect(handler).toHaveBeenCalledTimes(mode === "enforce" ? 0 : 4);
+    expect(mesh.listAll("topology/control-seen/")).toHaveLength(mode === "enforce" ? 0 : 4);
+    expect(warn).toHaveBeenCalledTimes(mode === "enforce" ? 0 : 1);
+    if (mode !== "enforce") expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:legacy"');
+  });
+
+  it.each(["warn", "enforce"] as const)("refuses explicit stale epochs for every operation in %s mode", async mode => {
+    const mesh = store(temp()); const owner = plane(mesh, "session:owner", undefined, mode);
+    const handler = vi.fn(() => ({ accepted: true })); const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    owner.start(handler);
+    for (const [index, operation] of (["steer", "followUp", "stop", "ask"] as const).entries()) {
+      await mesh.publish({ topic: "fabric.control.command", kind: operation, from: identity("session:stale"), to: "session:owner",
+        data: { version: 1, commandId: `stale:${operation}`, targetId: "actor:target", operation, replyTo: "session:stale",
+          ownerIncarnation: "predecessor:epoch", requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+      await vi.waitFor(() => expect(acks(mesh)).toHaveLength(index + 1));
+      expect(acks(mesh).at(-1)!.data).toMatchObject({ accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: "predecessor:epoch" });
+    }
+    expect(handler).not.toHaveBeenCalled(); expect(warn).not.toHaveBeenCalled();
+    expect(mesh.listAll("topology/control-seen/")).toEqual([]);
+  });
+
+  it("counts real dispatches, rate-limits by envelope sender for one hour, and does not count duplicate outcomes", async () => {
+    const mesh = store(temp()); const owner = plane(mesh, "session:owner");
+    const handler = vi.fn(() => ({ accepted: true })); const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const at = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(at); owner.start(handler);
+    let published = 0;
+    const send = async (id: string, commandId: string) => {
+      await mesh.publish({ topic: "fabric.control.command", kind: "steer", from: identity(id), to: "session:owner",
+        data: { version: 1, commandId, targetId: "actor:target", operation: "steer", replyTo: id, requestedAt: Date.now(), deadlineAt: Date.now() + 5_000,
+          data: { sender: "forged:sender", ownerIncarnation: "forged:epoch" } } });
+      published++;
+      await vi.waitFor(() => expect(acks(mesh)).toHaveLength(published));
+    };
+    await send("session:a", "a:1"); await send("session:a", "a:2");
+    expect(warn).toHaveBeenCalledOnce();
+    await send("session:a", "a:2"); expect(handler).toHaveBeenCalledTimes(2);
+    await send("session:b", "b:1"); expect(warn).toHaveBeenCalledTimes(2);
+    clock.mockReturnValue(at + 60 * 60 * 1_000 - 1);
+    await send("session:a", "a:3"); expect(warn).toHaveBeenCalledTimes(2);
+    clock.mockReturnValue(at + 60 * 60 * 1_000);
+    await send("session:a", "a:4"); expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:a"');
+    expect(warn.mock.calls[1]![0]).toContain('count=1 sender="session:b"');
+    expect(warn.mock.calls[2]![0]).toContain('count=4 sender="session:a"');
+    expect(warn.mock.calls.flat().join(" ")).not.toContain("forged:sender");
+  });
 });
 
 describe("owner incarnation admission and durable receipts", () => {
@@ -185,7 +249,7 @@ describe("owner incarnation admission and durable receipts", () => {
     if (variant === "before") await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity("session:sender"), to: "session:owner",
       data: { version: 1, commandId: "legacy", targetId: "actor:target", operation: "stop", replyTo: "session:sender", requestedAt: at + 20, deadlineAt: at + 5_000 } });
     if (variant === "before") vi.mocked(Date.now).mockReturnValue(at + 1);
-    const owner = plane(mesh, "session:owner"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
+    const owner = plane(mesh, "session:owner", undefined, "enforce"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
     if (variant !== "before") {
       vi.mocked(Date.now).mockReturnValue(at + (variant === "bridge" ? 20 : 0));
       await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity("session:sender"), to: "session:owner",
@@ -221,7 +285,7 @@ describe("owner incarnation admission and durable receipts", () => {
     const pending = sender.request("session:owner", "actor:target", "stop", { message: "created before reload", ownerIncarnation: previous.incarnation }).catch(error => error);
     expect(commands(mesh)).toHaveLength(0);
     clock.mockReturnValue(at + 20);
-    const restarted = plane(mesh, "session:owner");
+    const restarted = plane(mesh, "session:owner", undefined, "enforce");
     const handler = vi.fn(() => ({ accepted: true })); restarted.start(handler);
     clock.mockReturnValue(at + 30); release();
     try {
@@ -271,7 +335,7 @@ describe("owner incarnation admission and durable receipts", () => {
   it.each([-1, 0, 1])("refuses origin-less native legacy controls even beyond the former maximum window (boundary %s)", async boundary => {
     const mesh = store(temp()); const at = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(at);
-    const owner = plane(mesh, "session:owner"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
+    const owner = plane(mesh, "session:owner", undefined, "enforce"); const handler = vi.fn(() => ({ accepted: true })); owner.start(handler);
     const requestedAt = at + 24 * 60 * 60 * 1_000 + 60_000 + boundary;
     clock.mockReturnValue(requestedAt);
     await mesh.publish({ topic: "fabric.control.command", kind: "stop", from: identity("session:sender"), to: "session:owner",
@@ -283,7 +347,7 @@ describe("owner incarnation admission and durable receipts", () => {
 
   it.each(["stop", "ask", "steer", "followUp"] as const)("refuses fresh native %s without an epoch, with or without an immutable origin", async operation => {
     for (const origin of [true, false]) {
-      const mesh = store(temp()); const owner = plane(mesh, "session:owner"); const sender = plane(mesh, "session:sender");
+      const mesh = store(temp()); const owner = plane(mesh, "session:owner", undefined, "enforce"); const sender = plane(mesh, "session:sender");
       const handler = vi.fn(() => ({ accepted: true })); owner.start(handler); sender.start(() => ({ accepted: false }));
       const publish = mesh.publish.bind(mesh);
       vi.spyOn(mesh, "publish").mockImplementation(input => {

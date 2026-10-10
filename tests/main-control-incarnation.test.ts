@@ -7,7 +7,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { CONTROL_STALE_INCARNATION, FabricControlPlane } from "../src/topology/control-plane.js";
 
-it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload refuses every unclaimed pre-reload %s with a typed fence", async operation => {
+it.each((["warn", "enforce"] as const).flatMap(mode =>
+  (["steer", "followUp", "stop", "ask"] as const).map(operation => ({ mode, operation }))))
+("real Main $mode reload refuses stale $operation, with the configured legacy rollout policy", async ({ mode, operation }) => {
   const { FabricRuntimeState } = await import("../src/fabric-runtime-state.js");
   const { CapturedToolCatalog } = await import("../src/capture/catalog.js");
   const { normalizeFabricConfig } = await import("../src/config.js");
@@ -24,7 +26,7 @@ it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload refuses
   const sendMessage = vi.fn();
   const host = { on: () => () => {}, events: { emit: () => {}, on: () => () => {} }, sendMessage,
     appendEntry: () => {}, getThinkingLevel: () => "off", getSessionName: () => "incarnation-main" } as unknown as ExtensionAPI;
-  const config = normalizeFabricConfig({ fullCodeMode: false, mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
+  const config = normalizeFabricConfig({ fullCodeMode: false, mesh: { enabled: true, root: meshRoot, actorPollMs: 20, controlIncarnationFence: mode },
     agents: { enabled: false }, residency: { enabled: false }, mcp: { enabled: false }, memory: { enabled: false },
     jev: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } });
   const runtimes: InstanceType<typeof FabricRuntimeState>[] = [];
@@ -70,6 +72,19 @@ it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload refuses
     await expect(sender.request(fresh.ownerHostId, fresh.id, "steer", { message: "after reload", ownerIncarnation: fresh.ownerIncarnation, triggerTurn: false },
       fresh.ownerIdentityId, { routedRemoteHost: null, idempotencyKey: "fresh-main" })).resolves.toMatchObject({ acknowledged: true });
     expect(sendMessage).toHaveBeenCalledOnce();
+    expect(ownerPlanes[1]!.options.controlIncarnationFence).toBe(mode);
+    sendMessage.mockClear();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await mesh.publish({ topic: "fabric.control.command", kind: "steer", from: { id: "session:legacy", name: "Legacy", kind: "main" }, to: fresh.ownerHostId,
+      data: { version: 1, commandId: "legacy-main", targetId: fresh.id, operation: "steer", replyTo: "session:legacy", message: "old-release Main sender",
+        triggerTurn: false, requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+    await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack" }).find(event =>
+      (event.data as { commandId: string }).commandId === "legacy-main")).toBeDefined());
+    const legacyAck = mesh.read({ topic: "fabric.control.ack" }).find(event => (event.data as { commandId: string }).commandId === "legacy-main")!.data;
+    expect(legacyAck).toMatchObject(mode === "warn" ? { accepted: true } : { accepted: false, errorCode: CONTROL_STALE_INCARNATION, staleIncarnation: null });
+    expect(sendMessage).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    expect(warn).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    if (mode === "warn") expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:legacy"');
   } finally {
     await sender.close(); await pending;
     for (const runtime of runtimes.reverse()) await runtime.shutdown("exit");
@@ -97,7 +112,7 @@ it.each(["stalled", "failed", "expired"] as const)("real Main queues controls un
   const sendMessage = vi.fn();
   const host = { on: () => () => {}, events: { emit: () => {}, on: () => () => {} }, sendMessage,
     appendEntry: () => {}, getThinkingLevel: () => "off", getSessionName: () => "publication-main" } as unknown as ExtensionAPI;
-  const config = normalizeFabricConfig({ fullCodeMode: false, mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
+  const config = normalizeFabricConfig({ fullCodeMode: false, mesh: { enabled: true, root: meshRoot, actorPollMs: 20, controlIncarnationFence: "enforce" },
     agents: { enabled: false }, residency: { enabled: false }, mcp: { enabled: false }, memory: { enabled: false },
     jev: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false } });
   const runtime = new FabricRuntimeState(host, new CapturedToolCatalog(), { paths: {

@@ -345,6 +345,7 @@ export class ResidentHost {
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       ownerIncarnation: this.participants.ownerIncarnation,
+      controlIncarnationFence: config.mesh.controlIncarnationFence,
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,

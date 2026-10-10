@@ -294,6 +294,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "terminalRunEventsMaxBytes": 262144
   },
   "mesh": {
+    "controlIncarnationFence": "warn",
     "lockProtocol": 1,
     "stateBackend": "file",
     "enabled": true,
@@ -726,6 +727,8 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 ```text
 call override → session binding → project default → Fabric default
 ```
+
+`mesh.controlIncarnationFence` is a **host-only** setting in the host's `fabric.json`: `"warn"` (default) or `"enforce"`. Project configuration cannot override it. In `"warn"`, an older sender that omits an upgraded destination's advertised `ownerIncarnation` can still deliver controls and messages, subject to the existing identity, target, bridge-link, lease, deadline and deduplication checks. The receiving owner emits a counted warning naming the sender at most once per sender per hour. An explicit wrong or stale incarnation is refused in **both** modes. In `"enforce"`, omission is also refused with `FABRIC_CONTROL_STALE_INCARNATION`. Keep `"warn"` while installs roll host by host: advertising an epoch alone does not make an old sender epoch-aware. **Flip to `"enforce"` only after every host runs a release containing this PR**, including Main and resident senders; see [the rollout cutover rule (smarty-dev#7514)](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7514). Reload the Main or restart the resident after changing this captured setting.
 
 `mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. ASK, bridge and explicitly bounded requests retain their timeout policy. Native steer/followUp commands with a validated fresh owner lease have a 60-second admission/ACK window plus the existing (up to 15-second) return-leg grace. While a message is pending, the sender polls only the captured owner's lease file; an owner more than the routing grace overdue produces retryable `FABRIC_PARTICIPANT_STALE`, not an acknowledgement timeout.
 

@@ -769,6 +769,7 @@ export class FabricRuntimeState {
     const controlParticipants = this.#participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
       canConsumeMesh: () => controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,

@@ -84,6 +84,7 @@ const lazy = [
   "worker/session-id.js",
   "guards/actor-bash-hook.js",
   "guards/model-route-hook.js",
+  "guards/sender-headers.js",
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/retry-profile.js",
@@ -198,6 +199,8 @@ if (actorBashHookFiles.size !== 1) {
 }
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
+// smarty-dev#6207: loaded with -e into every Pi worker child; one self-contained file.
+if (staticClosure([join(dist, "guards/sender-headers.js")]).size !== 1) throw new Error("Sender header hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
 if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
   .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {

@@ -490,6 +490,15 @@ const main = async (): Promise<void> => {
     // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
+  if (options.runner === "pi") {
+    // smarty-dev#6207: every Pi child names its sender, also with --no-extensions (explicit -e loads).
+    const hookPath = fileURLToPath(new URL(
+      import.meta.url.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js",
+      import.meta.url,
+    ));
+    if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
+    piArguments.push("-e", hookPath);
+  }
   const piTools = replyTool ? [...options.tools, "fabric_reply"] : options.tools;
   if (piTools.length > 0) piArguments.push("--tools", piTools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
@@ -559,7 +568,7 @@ const main = async (): Promise<void> => {
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
     "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
-    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN"]) {
+    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN", "PI_FABRIC_SPAWNER_NAME"]) {
     delete childEnvironment[key];
   }
   // A nested explicit-model task must never inherit its parent's route attribution.
@@ -630,6 +639,7 @@ const main = async (): Promise<void> => {
         PI_FABRIC_SPAWNER_KIND: options.spawner.kind,
         PI_FABRIC_SPAWNER_RUN: options.spawner.runId ?? "",
       } : {}),
+      ...(options.spawnerName ? { PI_FABRIC_SPAWNER_NAME: options.spawnerName } : {}),
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),

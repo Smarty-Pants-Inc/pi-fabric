@@ -177,7 +177,7 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
-  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
+  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts", "src/guards/sender-headers.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

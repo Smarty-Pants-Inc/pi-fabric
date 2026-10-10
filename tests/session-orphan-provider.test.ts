@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +15,8 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
-import { writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -61,7 +63,7 @@ const open = (root: string, sessionId: string, members: FabricParticipantInfo[] 
   const actorRoots = { project: path.join(mesh.root, "actors"), session: path.join(mesh.root, "actors", sessionId) };
   const directory = new ActorDirectory([
     sessionId, identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 60_000 }, manager, () => {},
-    { persistent: true, claimResidency: "session", rootId: identity.id, mainAgent },
+    { persistent: true, claimResidency: "session", rootId: identity.id, mainAgent, lineageAlive: () => true },
   ], actorRoots, "project");
   const self: FabricParticipantInfo = {
     format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
@@ -95,6 +97,22 @@ const oldLease = (meshRoot: string, sessionId: string, changes: Partial<FabricHo
   if (!withWriter) delete lease.writer;
   writeHostLease(meshRoot, lease);
   return lease;
+};
+
+const staleOwnerEvidence = (mesh: MeshStore, sessionId: string) => {
+  const at = Date.now() - 300_000;
+  const lease = oldLease(mesh.root, sessionId, { updatedAt: at, expiresAt: at,
+    session: { id: sessionId, startedAt: at - 60_000, updatedAt: at, expiresAt: at } });
+  const owner = path.join(mesh.root, "main-followups", `${sessionId}.owner.json`);
+  fs.mkdirSync(path.dirname(owner), { recursive: true });
+  fs.writeFileSync(owner, JSON.stringify({ rootId: lease.id, sessionId, ownerIdentityId: lease.id,
+    pid: lease.writer!.pid, processStartedAt: "1", host: os.hostname(), name: "prior incarnation" }));
+  fs.utimesSync(owner, new Date(at), new Date(at));
+  const presence = { key: `topology/participants/${createHash("sha256").update(lease.id).digest("hex")}`,
+    version: 1, updatedAt: at, updatedBy: { id: lease.id, kind: "main" as const, name: "old Main" },
+    value: { id: lease.id, kind: "root", rootId: lease.id, ownerHostId: lease.id, ownerIdentityId: lease.id, name: "old Main", status: "idle" } };
+  writeParticipantFile(mesh.root, presence);
+  return { lease, presence };
 };
 
 const seed = async (root: string, sessionId: string, options: {
@@ -226,6 +244,54 @@ describe("public session-orphan provider reads (#7227)", () => {
     await expect(status(current.provider, actor.id)).rejects.toThrow(/Unknown .*actor/);
     expect(store.snapshot().bytes).toBe(bytes);
     expect(alarms(mesh)).toEqual([]);
+  });
+
+  describe.each(["session", "project"] as const)("conflicting current evidence in %s storage", scope => {
+    it.each(["live-local-lease", "foreign-lease", "foreign-presence", "different-owner-presence"] as const)(
+      "%s cannot borrow a stale inbox death verdict or attribution", async evidence => {
+        const root = tmp();
+        const { actor, store, mesh } = await seed(root, "conflicted", { scope });
+        const { lease, presence } = staleOwnerEvidence(mesh, "conflicted");
+        if (evidence === "live-local-lease") writeHostLease(mesh.root, { ...lease, writer: { ...lease.writer!, pid: process.pid } });
+        if (evidence === "foreign-lease") writeHostLease(mesh.root, { ...lease, writer: { ...lease.writer!, host: "another-machine" } });
+        if (evidence === "foreign-presence") writeParticipantFile(mesh.root, { ...presence,
+          value: { ...presence.value, remoteHost: "another-machine" } });
+        if (evidence === "different-owner-presence") {
+          const other = { ...lease, id: "runtime:current", identityId: "runtime:current", writer: { ...lease.writer!, pid: process.pid } };
+          writeHostLease(mesh.root, other);
+          writeParticipantFile(mesh.root, { ...presence,
+            value: { ...presence.value, ownerHostId: other.id, ownerIdentityId: other.identityId } });
+        }
+        const before = store.snapshot().bytes;
+        const current = open(root, "current");
+        if (scope === "session") {
+          expect((await actors(current.provider)).map(row => row.id)).not.toContain(actor.id);
+          await expect(status(current.provider, actor.id)).rejects.toThrow(/Unknown .*actor/);
+        } else {
+          const read = await status(current.provider, actor.id);
+          expect(read).toMatchObject({ id: actor.id, status: "unknown" });
+          expect(read.sessionOrphan).toBeUndefined();
+          expect(read.lastError).toBeUndefined();
+          expect((await actors(current.provider)).find(row => row.id === actor.id)).toMatchObject({ status: "unknown" });
+        }
+        expect(await current.directory.reconcileSessionOrphans()).toBe(0);
+        expect(store.snapshot().bytes).toBe(before);
+        expect(store.snapshot().actors.find(row => row.id === actor.id)?.sessionOrphan).toBeUndefined();
+        expect(current.directory.owns(actor.id)).toBe(false);
+        expect(alarms(mesh)).toEqual([]);
+      });
+  });
+
+  it.each(["matched-dead", "missing-reaped-lease"] as const)("public reads retain the %s positive control", async evidence => {
+    const root = tmp();
+    const { actor, store, mesh } = await seed(root, "positive");
+    const { lease } = staleOwnerEvidence(mesh, "positive");
+    if (evidence === "missing-reaped-lease") fs.rmSync(hostLeasePath(mesh.root, lease.id));
+    const current = open(root, "current");
+    expectOrphan(await status(current.provider, actor.id), actor.id, lease.id);
+    expectOrphan((await actors(current.provider)).find(row => row.id === actor.id)!, actor.id, lease.id);
+    expect(store.snapshot().actors.find(row => row.id === actor.id)).toMatchObject({ status: "stopped" });
+    expect(alarms(mesh)).toHaveLength(1);
   });
 
   it("an in-process reload keeps the same own-root actor identity without an orphan alarm", async () => {

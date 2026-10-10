@@ -56,6 +56,9 @@ const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?:
       if (!value || value.id !== id || typeof value.ownerHostId !== "string" ||
           typeof value.ownerIdentityId !== "string" || typeof value.rootId !== "string" ||
           !time(entry.updatedAt) || now - entry.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) return false;
+      // Staleness is not death authority for a different owner or bridged root.
+      if (value.ownerHostId !== deadOwner || value.ownerIdentityId !== deadOwner || value.rootId !== deadOwner ||
+          (value.remoteHost !== undefined && value.remoteHost !== os.hostname())) return false;
       if (value.reloadUntil !== undefined && !time(value.reloadUntil)) return false;
       if (typeof value.reloadUntil === "number" && value.reloadUntil >= now) return false;
       const owner = leaseOf(mesh.root, value.ownerHostId);
@@ -133,6 +136,12 @@ export const sessionActorRootGone = (
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
     const writer = lease?.writer;
     const ownerHost = owner?.host ?? (writer && writer.pid === owner?.pid ? writer.host : undefined);
+    // Inbox activation and lease renewal are independent writes. An old inbox
+    // cannot qualify a different present writer, even after the lease expires.
+    if (writer && (writer.host !== os.hostname() ||
+        (owner && (writer.pid !== owner.pid || writer.host !== ownerHost)) ||
+        (censusRecordAlive(writer.pid, writer) && (!owner ||
+          residentProcessAlive(owner.pid as number, owner.processStartedAt as string | undefined))))) return undefined;
     let reason: string | undefined;
     // The directory's clean-close proof is lease independent; preserve its conservative
     // raw-presence policy. Recheck the receipt's age, not just the actor's last update.

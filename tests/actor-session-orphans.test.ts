@@ -47,6 +47,20 @@ const fixture = () => {
   return { root, mesh, identity, store, actor, lease, repair, id };
 };
 const alarms = (mesh: MeshStore) => mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
+const staleInbox = (root: string, lease: FabricHostLease, pid = deadPid, processStartedAt = "1") => {
+  const owner = path.join(root, "main-followups", "old.owner.json");
+  fs.mkdirSync(path.dirname(owner), { recursive: true });
+  fs.writeFileSync(owner, JSON.stringify({ rootId: lease.id, sessionId: "old", ownerIdentityId: lease.id,
+    pid, processStartedAt, host: os.hostname(), name: "prior incarnation" }));
+  fs.utimesSync(owner, new Date(lease.updatedAt), new Date(lease.updatedAt));
+};
+const staleRootPresence = (root: string, lease: FabricHostLease, changes = {}) => {
+  const key = `topology/participants/${createHash("sha256").update(lease.id).digest("hex")}`;
+  writeParticipantFile(root, { key, version: 1, updatedAt: lease.updatedAt,
+    updatedBy: { id: lease.id, kind: "main", name: "old Main" },
+    value: { id: lease.id, kind: "root", rootId: lease.id, ownerHostId: lease.id, ownerIdentityId: lease.id,
+      name: "old Main", status: "idle", ...changes } });
+};
 
 describe("foreign session actor registry truth", () => {
   it("discovers the old registry, persists root-gone and emits one factory-compatible alarm across duplicate reads", async () => {
@@ -78,6 +92,62 @@ describe("foreign session actor registry truth", () => {
     expect(store.snapshot().bytes).toBe(before);
     expect(repair.list()).toEqual([]);
     expect(repair.resolve(actor.id)).toBeUndefined();
+  });
+
+  it.each(["live-local-lease", "foreign-lease", "different-dead-lease", "foreign-presence", "different-owner-presence", "shared-foreign-presence"] as const)(
+    "a stale dead inbox cannot override present %s evidence", async mode => {
+      const { root, mesh, identity, lease, store, repair, actor } = fixture();
+      const at = Date.now() - 300_000;
+      const current = { ...lease, updatedAt: at, expiresAt: at,
+        session: { id: "old", startedAt: at - 60_000, updatedAt: at, expiresAt: at } };
+      staleInbox(root, current);
+      staleRootPresence(root, current);
+      if (mode === "live-local-lease") current.writer = { ...lease.writer!, pid: process.pid };
+      if (mode === "foreign-lease") current.writer = { ...lease.writer!, host: "another-machine" };
+      if (mode === "different-dead-lease") current.writer = { ...lease.writer!, pid: 2_147_483_647 };
+      if (mode === "foreign-presence") staleRootPresence(root, current, { remoteHost: "another-machine" });
+      if (mode === "different-owner-presence") {
+        const other = { ...current, id: "runtime:current", identityId: "runtime:current",
+          writer: { ...lease.writer!, pid: process.pid } };
+        writeHostLease(root, other);
+        staleRootPresence(root, current, { ownerHostId: other.id, ownerIdentityId: other.identityId });
+      }
+      if (mode === "shared-foreign-presence") {
+        const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+        try { await mesh.put({ identity,
+          key: `topology/participants/${createHash("sha256").update(lease.id).digest("hex")}`,
+          value: { id: lease.id, kind: "root", rootId: lease.id, ownerHostId: lease.id, ownerIdentityId: lease.id,
+            remoteHost: "another-machine" } });
+        } finally { clock.mockRestore(); }
+      }
+      writeHostLease(root, current);
+      const before = store.snapshot().bytes;
+      // No clean-close proof: the prior process's death says nothing about this writer.
+      expect(sessionActorRootGone(mesh, lease.id, () => true)).toBeUndefined();
+      expect(await repair.reconcile()).toBe(0);
+      expect(store.snapshot().bytes).toBe(before);
+      expect(store.records()[0]?.sessionOrphan).toBeUndefined();
+      expect(repair.list()).toEqual([]);
+      expect(repair.resolve(actor.id)).toBeUndefined();
+      expect(alarms(mesh)).toEqual([]);
+    });
+
+  it("still retires a matched dead lease and inbox with stale root presence", async () => {
+    const { root, lease, store, mesh, repair } = fixture();
+    staleInbox(root, lease);
+    staleRootPresence(root, lease);
+    expect(await repair.reconcile()).toBe(1);
+    expect(store.records()[0]).toMatchObject({ status: "stopped", sessionOrphan: { oldHost: os.hostname() } });
+    expect(alarms(mesh)).toHaveLength(1);
+  });
+
+  it.skipIf(process.platform !== "linux")("preserves positive old-incarnation death when the matched PID was reused", async () => {
+    const { root, lease, mesh, repair } = fixture();
+    staleInbox(root, lease, process.pid, "0"); // a live PID cannot have this old kernel start tick
+    writeHostLease(root, { ...lease, writer: { ...lease.writer!, pid: process.pid } });
+    expect(sessionActorRootGone(mesh, lease.id, () => true)).toMatchObject({ reason: "Main inbox owner incarnation is dead" });
+    expect(await repair.reconcile()).toBe(1);
+    expect(alarms(mesh)).toHaveLength(1);
   });
 
   it("lets a durable resident observer repair its own dead Main's private actor without changing durable rows", async () => {
@@ -128,6 +198,7 @@ describe("foreign session actor registry truth", () => {
     fs.utimesSync(owner, new Date(at), new Date(at));
     expect(await reapDeadHostRecords(mesh, identity, { ownHostId: identity.id })).toBeGreaterThan(0);
     expect(fs.existsSync(hostLeasePath(root, lease.id))).toBe(false);
+    staleRootPresence(root, { ...lease, updatedAt: at, expiresAt: at });
     expect(await repair.reconcile()).toBe(1);
     expect(store.records()[0]).toMatchObject({ status: "stopped", sessionOrphan: { oldHost: os.hostname(), reason: "Main inbox owner incarnation is dead" } });
     expect(alarms(mesh)).toHaveLength(1);

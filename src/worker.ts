@@ -47,6 +47,9 @@ import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
+import { syncPathNamespace } from "./core/atomic-write.js";
+import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -399,8 +402,8 @@ const main = async (): Promise<void> => {
   if (persistentPiTask && options.inferenceContext !== "activation") {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
     const { prepareRetryProfile, resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
+    piRetrySdk = resolveRetrySdk(options.piBinary);
     if (prepareRetryProfile(options.cwd, path.join(path.dirname(options.statusFile), "pi-agent"), process.env, recoveryScale)) {
-      piRetrySdk = resolveRetrySdk(options.piBinary);
       // Opaque/custom launchers are a supported fallback, not a degraded run.
       // Keep profile-selection telemetry separate from result/cleanup warnings.
       if (!piRetrySdk) appendLog(`${JSON.stringify({ type: "fabric_retry_profile", mode: "launcher", reason: "sdk_unavailable", message: "Selected Pi launcher has no discoverable native SDK; preserving its retry settings and canonical auth path (Fabric same-session recovery remains enabled)" })}\n`);
@@ -610,6 +613,7 @@ const main = async (): Promise<void> => {
       PI_FABRIC_ACTIVATION_NONCE: activationNonce ?? "",
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
       PI_FABRIC_DELIVERY_DIR: deliveryDirectory,
+      PI_FABRIC_TERMINAL_TASK: persistentPiTask && piRetrySdk ? "1" : "",
       // Own run only, never the shared parent/nested run root.
       PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
@@ -650,7 +654,7 @@ const main = async (): Promise<void> => {
         : {}),
       ...(options.runRoot ? { PI_FABRIC_RUN_ROOT: options.runRoot } : {}),
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
@@ -726,6 +730,10 @@ const main = async (): Promise<void> => {
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
+  let finalAnswerReceipt: FinalAnswerReceipt | undefined;
+  let lastUsageMessageTimestamp: number | undefined;
+  let finalTurnCompleted = false;
+  let attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
   let completedToolInTurn = false;
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
@@ -855,9 +863,17 @@ const main = async (): Promise<void> => {
 
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
-  const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[]): void => {
+  const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[], controlId?: string): void => {
+    if (finalAnswerReceipt) return;
+    if (persistentPiTask && piRetrySdk && controlId) {
+      trackTerminalControl(path.dirname(options.statusFile), { id: controlId, delivery, provenance });
+      fs.writeFileSync(path.join(deliveryDirectory, controlId + ".json"), JSON.stringify({ message, provenance, delivery, images, controlId }), { mode: 0o600 });
+      child.stdin?.write(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n");
+      return;
+    }
     if (!provenance?.principal) {
-      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message }) + "\n");
+      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
+        ...(controlId ? { id: controlId } : {}) }) + "\n");
       return;
     }
     const id = randomUUID();
@@ -1370,6 +1386,84 @@ const main = async (): Promise<void> => {
     }
   };
 
+  const validateCompletedResult = (): void => {
+    if (record.status !== "completed") return;
+    if (replyFile) {
+      try {
+        record.value = JSON.parse(fs.readFileSync(replyFile, "utf8")) as unknown;
+        record.replyVia = "tool";
+      } catch { /* The reply tool's durable file is authoritative, never final prose. */ }
+      if (record.value === undefined) {
+        record.status = "failed";
+        const snippet = record.text.trim().slice(0, 200);
+        record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
+      }
+    }
+    if (record.status === "completed" && options.schemaFile) {
+      try {
+        validateAgentResult(record, JSON.parse(fs.readFileSync(options.schemaFile, "utf8")) as Record<string, unknown>);
+      } catch (error) {
+        record.status = "failed";
+        const reason = error instanceof Error ? error.message : String(error);
+        const output = record.text.trim();
+        const snippet = output.slice(0, 200);
+        record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
+      }
+    }
+  };
+  const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
+    if (finalAnswerReceipt || !persistentPiTask) return;
+    finalAnswerReceipt = receipt;
+    piControlLive = false;
+    nativeActivity = false;
+    producedFinalAnswer = true;
+    recoveryWatchdog.dispose();
+    toolCallStreamGuard.dispose();
+    record.text = receipt.text; // Full answer, not latestRunText's UI-sized tail.
+    record.lastCompleteText = receipt.text;
+    delete record.partialText;
+    delete record.currentTool;
+    delete record.currentToolStartedAt;
+    record.pendingMessages = { steering: [], followUp: [] };
+    // A receipt certifies one completed final assistant/tool turn. Its native
+    // turn_end frame follows the receipt and cannot mutate the frozen snapshot.
+    if (!finalTurnCompleted) {
+      record.turns++;
+      emitLifecycle("pi.turn_end", { terminalAnswer: true });
+    }
+    record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
+    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) {
+      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
+        delivery: control.delivery, finalAnswerReceiptId: receipt.id,
+        ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
+      // Unlike progress telemetry, refusal emission must precede its registry
+      // transition. The manager's validated-status scan is the publication fence.
+      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
+      try {
+        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      syncPathNamespace(options.lifecycleFile);
+      settleTerminalControl(path.dirname(options.statusFile), control.id, "refused");
+    }
+    // Preserve any earlier admission/limit/stop failure; the receipt never blesses
+    // invalid structured output. Publish before closing the owned execution tree.
+    record.status = terminalStatus ?? "completed";
+    if (terminalError) record.error = terminalError;
+    record.finishedAt = receipt.recordedAt;
+    record.updatedAt = Date.now();
+    validateCompletedResult();
+    terminalStatus = record.status;
+    terminalError = record.error;
+    saveWorkerCompletion(options.statusFile, record);
+    writeRunRecord(options.statusFile, record);
+    terminalWritten = true;
+    child.stdin?.end();
+    // Reuse the sole custody/cleanup obligation, not a second kill mechanism.
+    void executionCleanup().catch(finishCrash);
+  };
+
   const processEvent = (line: string): void => {
     if (process.env.PI_FABRIC_INJECT_CRASH === "stream") throw new Error("simulated stream crash");
     if (!line.trim()) return;
@@ -1421,6 +1515,36 @@ const main = async (): Promise<void> => {
       }
       return;
     }
+    if (persistentPiTask && event.type === "fabric_final_answer") {
+      const receipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+      if (receipt && event.runId === options.id && event.receiptId === receipt.id) {
+        const assistant = event.assistant as Record<string, unknown> | undefined;
+        if (!finalAnswerReceipt && assistant && typeof assistant.timestamp === "number" && assistant.timestamp !== lastUsageMessageTimestamp) {
+          const delta = extractUsageDelta(assistant);
+          applyUsage(record, assistant);
+          emitTokenUsage(delta, { model: stringField(assistant.model), provider: stringField(assistant.provider) }, assistant);
+          modelControl.observeAssistant(assistant);
+          enforceTokenLimit();
+          lastUsageMessageTimestamp = assistant.timestamp;
+        }
+        const totals = event.totals as { turns?: unknown; toolCalls?: unknown; usage?: Record<string, unknown> } | undefined;
+        if (!finalAnswerReceipt && totals && Number.isSafeInteger(totals.turns) && Number(totals.turns) > 0 &&
+            Number.isSafeInteger(totals.toolCalls) && Number(totals.toolCalls) >= 0 && totals.usage &&
+            ["input", "output", "cacheRead", "cacheWrite", "cost"].every(key => typeof totals.usage![key] === "number" && Number.isFinite(totals.usage![key]) && Number(totals.usage![key]) >= 0)) {
+          record.turns = attemptBase.turns + Number(totals.turns);
+          record.toolCalls = attemptBase.toolCalls + Number(totals.toolCalls);
+          for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) record.usage[key] = attemptBase.usage[key] + Number(totals.usage[key]);
+          if (!finalTurnCompleted) emitLifecycle("pi.turn_end", { terminalAnswer: true });
+          finalTurnCompleted = true;
+          enforceTokenLimit();
+        }
+        acceptFinalAnswer(receipt);
+      } else failStalledChild("Native final-answer frame has no matching durable receipt");
+      return;
+    }
+    // Receipt-bound status/text is immutable even if shutdown emits aborted,
+    // stale settlement or later assistant frames in the same stdout chunk.
+    if (finalAnswerReceipt) return;
     compactControl.observe(event);
     if (activationWindow && event.type === "fabric_activation_window_ready") {
       if (event.runId === options.id && event.nonce === activationNonce &&
@@ -1592,6 +1716,9 @@ const main = async (): Promise<void> => {
         ...(typeof event.turnIndex === "number" ? { turnIndex: event.turnIndex } : {}),
       });
       record.turns++;
+      const ended = event.message as Record<string, unknown> | undefined;
+      finalTurnCompleted = finalAssistantText(ended) !== undefined || Boolean(replyFile &&
+        Array.isArray(ended?.content) && ended.content.some(block => block?.type === "toolCall" && block.name === "fabric_reply"));
       update();
       return;
     }
@@ -1641,6 +1768,7 @@ const main = async (): Promise<void> => {
         delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
+      lastUsageMessageTimestamp = typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : undefined;
       applyUsage(record, messageRecord);
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
@@ -1754,7 +1882,7 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || terminalStatus || (options.runner === "pi" &&
+    if (!options.steerFile || finalAnswerReceipt || terminalStatus || (options.runner === "pi" &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
     let descriptor: number | undefined;
     try {
@@ -1805,7 +1933,7 @@ const main = async (): Promise<void> => {
         const line = raw.trim();
         if (!line) continue;
         processedCommands += 1;
-        let command: { type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
+        let command: { id?: string; type?: string; message?: string; mode?: string; instructions?: string; provenance?: unknown; followUpId?: string };
         try {
           command = JSON.parse(line);
         } catch {
@@ -1840,17 +1968,19 @@ const main = async (): Promise<void> => {
             // headless prompt per invocation. The command is dropped, never
             // forwarded to pi-style stdin frames.
           } else if (command.type === "steer" && typeof command.message === "string") {
-            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "steer");
+            sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "steer", undefined, command.id);
           } else if (command.type === "follow_up" && typeof command.message === "string") {
             if (command.followUpId && /^[0-9a-f-]{36}$/.test(command.followUpId)) {
               const id = command.followUpId;
               const receipt = followUpFile(path.dirname(deliveryDirectory), id);
               if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
+              if (persistentPiTask && piRetrySdk) trackTerminalControl(path.dirname(options.statusFile), { id, delivery: "followUp", provenance: copyFabricProvenance(command.provenance) });
               fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({
                 message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
+                ...(persistentPiTask && piRetrySdk ? { controlId: id } : {}),
               }), { mode: 0o600 });
-              child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
-            } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
+              child.stdin?.write(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+            } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp", undefined, command.id);
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
             child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
@@ -1964,11 +2094,18 @@ const main = async (): Promise<void> => {
     }
   };
   const attachChildStreams = (): void => {
+    child.on("message", (message: unknown) => {
+      if (message && typeof message === "object" && "type" in message && message.type === "fabric_final_answer") {
+        processEvent(JSON.stringify(message));
+      }
+    });
     child.stdout?.on("data", (chunk: Buffer) => consumeOutput(outputDecoder.write(chunk)));
     child.stderr?.on("data", (chunk: Buffer) => recordStderr(stderrDecoder.write(chunk)));
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
+    finalTurnCompleted = false;
     streamingToolCallInTurn = false;
     unresolvedToolCalls.clear();
     completedToolInTurn = false;
@@ -2042,6 +2179,10 @@ const main = async (): Promise<void> => {
       outputBuffer = "";
       recordStderr(stderrDecoder.end());
       toolCallStreamGuard.clear();
+      if (persistentPiTask && piRetrySdk && !finalAnswerReceipt) {
+        const receipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+        if (receipt) acceptFinalAnswer(receipt); // Native died after fsync but before frame delivery.
+      }
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
     }
@@ -2276,36 +2417,7 @@ const main = async (): Promise<void> => {
     record.warnings = [...(record.warnings ?? []), warning].slice(-20);
     appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
-  if (record.status === "completed" && replyFile) {
-    // The reply is the tool call's arguments, and nothing else: final text is never parsed for it,
-    // not even JSON-only text (smarty-dev#967; the roles name the tool since smarty-dev#1105).
-    try {
-      record.value = JSON.parse(fs.readFileSync(replyFile, "utf8")) as unknown;
-      record.replyVia = "tool";
-    } catch {
-      // No fabric_reply call.
-    }
-    if (record.value === undefined) {
-      record.status = "failed";
-      const snippet = record.text.trim().slice(0, 200);
-      record.error = `Directive reply missing: the run ended without a fabric_reply call${snippet ? ` (final text: ${snippet}${record.text.trim().length > 200 ? "…" : ""})` : ""}`;
-    }
-  }
-  if (record.status === "completed" && options.schemaFile) {
-    try {
-      const schema = JSON.parse(fs.readFileSync(options.schemaFile, "utf8")) as Record<
-        string,
-        unknown
-      >;
-      validateAgentResult(record, schema);
-    } catch (error) {
-      record.status = "failed";
-      const reason = error instanceof Error ? error.message : String(error);
-      const output = record.text.trim();
-      const snippet = output.slice(0, 200);
-      record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
-    }
-  }
+  validateCompletedResult();
   delete record.currentTool;
   await new Promise<void>((resolve) =>
     sessionStream ? sessionStream.end(resolve) : resolve(),

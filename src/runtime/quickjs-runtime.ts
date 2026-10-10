@@ -6,6 +6,7 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { FabricTargetTerminalError } from "../agents/terminal-target.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
@@ -42,6 +43,10 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (!(error instanceof Error)) return undefined;
   // Preserve only the fixed policy classification, never arbitrary Error fields.
   if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  if (error instanceof FabricTargetTerminalError) return {
+    name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
+    targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
+  };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
   if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;

@@ -38,6 +38,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
+import { terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -460,6 +461,7 @@ export class ResidentHost {
         }).appendText || undefined;
       },
       onLifecycle: (event) => { if (this.lifecycle) this.#trackPublication(this.lifecycle.publishBackground(event)); },
+      onTerminalNotice: notice => this.#deliverTerminalNotice(notice),
       onSettled: (result) => {
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
@@ -869,7 +871,7 @@ export class ResidentHost {
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
-        return { accepted: false, error: errorMessage(error) };
+        return { accepted: false, error: errorMessage(error), ...terminalRejectionFields(error) };
       }
     }
     try {
@@ -888,6 +890,37 @@ export class ResidentHost {
       if (error instanceof MeshConsumptionPausedError) throw error;
       return { accepted: false, error: errorMessage(error) };
     }
+  }
+
+  async #deliverTerminalNotice(notice: AgentTerminalNotice): Promise<void> {
+    if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
+    if (!this.#ready || this.#closed || this.#staged || this.#handover) throw new Error(HOST_CLOSING_RETRY);
+    assertMeshConsumption(() => this.participants.canConsumeMesh());
+    const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+      `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
+    const from: MeshIdentity = { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" };
+    if (notice.sender.id === this.config.rootId) {
+      // Existing resident durable delivery outbox, addressed to the exact sender
+      // root. The route receipt means retained handoff, not sender consumption.
+      await this.#queueDelivery(from, message, "steer", false, notice, undefined, notice.sender.id);
+      return;
+    }
+    const provenance = fabricTurnProvenance(from, "steer", "mesh");
+    try {
+      this.agents.status(notice.sender.id);
+      this.agents.steer(notice.sender.id, message, notice, provenance);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
+    }
+    if (this.actors.owns(notice.sender.id)) {
+      this.actors.tell(notice.sender.id, message, notice, { provenance });
+      return;
+    }
+    const sender = this.participants.get(notice.sender.id, undefined, { fresh: true });
+    if (!sender || sender.stale) throw new Error(`Terminal refusal sender unavailable: ${notice.sender.id}`);
+    await this.control.request(sender.ownerHostId, sender.id, "steer", { message, data: notice, triggerTurn: false }, sender.ownerIdentityId,
+      { routedRemoteHost: sender.remoteHost ?? null, idempotencyKey: `terminal-refusal:${notice.targetId}:${notice.messageId}` });
   }
 
   async #deliverLifecycle(

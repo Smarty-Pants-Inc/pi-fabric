@@ -900,6 +900,23 @@ export class FabricRuntimeState {
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
       },
+      onTerminalNotice: async (notice) => {
+        if (!notice.sender?.id) throw new Error("Terminal refusal has no attributed sender; retain native receipt");
+        const message = `FABRIC_TARGET_TERMINAL: ${notice.delivery} ${notice.messageId} was not delivered to task ${notice.targetId}; ` +
+          `its final answer receipt is ${notice.finalAnswerReceiptId}. Start a new task; this input cannot revive the old one.`;
+        if (notice.sender.id === identity.id || mainAgent.matches(notice.sender.id) && mainAgent.local) {
+          this.pi.sendMessage({ customType: "pi-fabric-target-terminal", content: message, display: true, details: notice },
+            { deliverAs: "steer", triggerTurn: false });
+          this.pi.events.emit("fabric.target.terminal", notice);
+          return;
+        }
+        const provider = this.#agentsProvider;
+        if (!provider) throw new Error("Terminal refusal router unavailable; retain native receipt");
+        await provider.routeMessage(notice.sender.id, message, notice, "steer", undefined, {
+          from: { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" },
+          triggerTurn: false, idempotencyKey: `terminal-refusal:${notice.targetId}:${notice.messageId}`,
+        });
+      },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
           { deliverAs: "steer", triggerTurn: false });

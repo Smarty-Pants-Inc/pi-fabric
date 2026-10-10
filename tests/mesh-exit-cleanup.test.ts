@@ -9,7 +9,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { sweepAbandonedStateTemporaries } from "../src/mesh/temp-janitor.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import { readHostLeaseCurrent, readHostLeases } from "../src/topology/host-leases.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readParticipantFiles } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -171,6 +171,9 @@ const record = (id: string, kind: "root" | "agent", hostId: string): FabricParti
 const reloadingDirectory = async (meshRoot: string, warnings: string[]) => {
   const identity: MeshIdentity = { id: "session:reload", name: "main", kind: "main", sessionId: "reload" };
   const mesh = new MeshStore(meshRoot, 64 * 1024, 1_000, { lockTimeoutMs: 200 });
+  // Install the process-wide atomic-write temp hook before measuring the directory's
+  // own exit hook: this fixture must also work when run without the state-temp tests.
+  await mesh.put({ key: "fixture/seed", value: true, identity });
   const directory = new ParticipantDirectory(mesh, {
     enabled: true, hostId: identity.id, rootId: identity.id, identity, heartbeatMs: 100, leaseMs: 200, reapDeadHosts: false,
     onWithdrawalFailure: (message) => warnings.push(message),
@@ -205,7 +208,7 @@ const expectLapse = async (setup: Awaited<ReturnType<typeof reloadingDirectory>>
   await new Promise((resolve) => setTimeout(resolve, 500));
   expect(readHostLeaseCurrent(meshRoot, identity.id)).toEqual(lease);
   // Within one (reload) lease the leftover child lapses on its own.
-  expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
+  expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(MAIN_RELOAD_LEASE_MS);
   expect(child(lease.expiresAt + 1)).toMatchObject({ stale: true });
   await setup.directory.close();
   expect(warnings).toHaveLength(1);
@@ -255,7 +258,7 @@ describe("directory withdrawal on exit (smarty-dev#6622)", () => {
     expect(setup.mesh.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id))
       .toContain("agent:child");
     expect(readHostLeaseCurrent(meshRoot, identity.id)).toBeUndefined();
-    expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(30_000);
+    expect(lease.expiresAt - Date.now()).toBeLessThanOrEqual(MAIN_RELOAD_LEASE_MS);
     expect(child(lease.expiresAt + 1)).toMatchObject({ stale: true });
   }, 20_000);
 

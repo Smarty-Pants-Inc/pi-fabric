@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**']
 
 permissions:
   contents: read
@@ -104,3 +104,33 @@ jobs:
           path: ${{ runner.temp }}/fabric-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  mesh-lock-bench:
+    # The mesh lock benchmark ratchet (smarty-dev#6676, docs/mesh-lock-bench.md): fails a >10%
+    # regression of the deterministic per-op lock metrics against bench/mesh-lock-baseline.json.
+    # Timing metrics are reported only: on a shared runner they swing by tens of percent.
+    # Not a required check (.mergify.yml requires `check (ubuntu-latest)` only).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # The benchmark runs dist/ (built for node24) in node worker processes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build
+        run: bun run build
+      - name: Mesh lock benchmark ratchet
+        # The table (ratchet, timing and report rows) goes to stderr; the JSON result to the file.
+        run: bun run bench:mesh-lock:check --out mesh-lock.json > /dev/null
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mesh-lock-bench-${{ github.sha }}
+          path: mesh-lock.json
+          if-no-files-found: warn
+          retention-days: 14

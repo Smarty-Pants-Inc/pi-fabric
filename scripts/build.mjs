@@ -13,6 +13,7 @@ const primaryEntryPoints = [
   "src/actors-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
+  "src/mesh-lock-stats-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/agents/worker-protocol.ts",
@@ -39,6 +40,7 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
+  "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
@@ -144,8 +146,11 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // self-contained file that carries its own copy of the host packages it uses.
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
+// fabric-mesh-backend (smarty-dev#6477 W1) is here too: its writer census shares host-leases.ts with
+// index.js, and a split build would carve that out of index.js into one more startup chunk.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
+    "src/mesh/mesh-backend-cli.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",

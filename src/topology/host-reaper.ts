@@ -5,6 +5,7 @@ import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, 
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
 import { sweepAbandonedStateTemporaries } from "../mesh/temp-janitor.js";
+import { meshDirectoryStamp } from "./publication-generation.js";
 
 /** A host's records are removed when its lease expired this long ago (smarty-dev#367). */
 export const DEAD_HOST_RECORDS_MS = 6 * 60 * 60 * 1000;
@@ -78,6 +79,7 @@ export const deadHostRecords = (
 // on positive host liveness; malformed participant presence already fails closed below.
 const liveRootCursorKeys = (
   view: Pick<MeshBatchView, "listAll">, mesh: { root?: string }, now: number,
+  leases: ReadonlyMap<string, FabricHostLease> = fileLeases(mesh),
 ): Set<string> => {
   const keys = new Set<string>();
   const keep = (id: unknown): void => {
@@ -86,7 +88,6 @@ const liveRootCursorKeys = (
   for (const entry of view.listAll(SESSION_PREFIX)) {
     if (isLiveLegacyRootEntry(entry, now, mesh.root)) keep(entry.value.id);
   }
-  const leases = fileLeases(mesh);
   for (const entry of view.listAll(HOST_PREFIX)) {
     const host = record(entry.value);
     if (typeof host?.id !== "string" || entry.key !== hostKey(host.id)) continue;
@@ -167,6 +168,11 @@ export const reapDeadHostRecords = async (
   }
   if (found.length === 0 && bookkeeping.length === 0) return 0;
   const dead = found.filter((item) => !item.file);
+  // File leases are read before the state transaction and revalidated in it by their directory
+  // stamp (smarty-dev#6477 R11): only a lease written in between is read again under the lock.
+  const leaseStamp = typeof mesh.root === "string" ? meshDirectoryStamp(mesh.root, "host-leases") : "";
+  const leasesBefore = fileLeases(mesh);
+  let leases = leasesBefore;
   const results = dead.length === 0 && bookkeeping.length === 0 ? [] : await mesh.writeBatch({
     identity,
     ops: [...dead.map(({ entry, hostId }) => ({
@@ -178,15 +184,17 @@ export const reapDeadHostRecords = async (
       // record, where the orphan rule held at selection and the version fence holds since).
       condition: (current: (key: string) => MeshStateEntry | undefined) => {
         const host = current(hostKey(hostId));
-        return host === undefined || leaseGone(host, cutoff, fileLeases(mesh));
+        return host === undefined || leaseGone(host, cutoff, leases);
       },
     }))],
     // Session keys are not derivable from participant ids, and a returning root can create
     // a new one after selection. Scan the authoritative batch view, not a cached listAll,
-    // under the commit lock. File leases are reread here too. Presence is checked by each
+    // under the commit lock. File leases are revalidated here too. Presence is checked by each
     // cursor condition; its version fence still protects a rewritten checkpoint.
     prepare: (view) => {
-      const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now());
+      leases = typeof mesh.root !== "string" || meshDirectoryStamp(mesh.root, "host-leases") === leaseStamp
+        ? leasesBefore : fileLeases(mesh);
+      const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now(), leases);
       return bookkeeping.filter((op) => !live.has(op.key));
     },
   });

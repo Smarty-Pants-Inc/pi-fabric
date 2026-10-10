@@ -60,7 +60,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   }
   for (const key of [
     "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",
-    "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG",
+    "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "HERDR_BIN_PATH", "MCPORTER_CONFIG",
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.
@@ -89,6 +89,9 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     PI_CODING_AGENT_DIR: join(root, "agent"),
     // An explicit private MCP layer prevents fallback to the real home config.
     MCPORTER_CONFIG: join(root, "mcporter.json"),
+    // Mesh-lock diagnostics write <mesh>/lock-stats each minute and at exit (smarty-dev#6477 L8);
+    // suites that list a mesh root must not race that timer. Lock-stats suites opt in explicitly.
+    PI_FABRIC_LOCK_STATS: "0",
   };
   for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
     mkdirSync(join(root, directory), { recursive: true });

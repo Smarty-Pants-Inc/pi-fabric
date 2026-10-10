@@ -106,6 +106,65 @@ describe("worker run-record process identity", () => {
   });
 });
 
+describe("atomic streamed run-record updates", () => {
+  it("publishes complete JSON only after the temporary streamed-text record is written", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-record-atomic-"));
+    const file = path.join(root, "status.json");
+    const temporary = `${file}.${process.pid}.tmp`;
+    const record = { ...baseRecord(), text: "previous complete output", lastCompleteText: "previous complete output" };
+    writeRunRecord(file, record);
+    const before = JSON.parse(fs.readFileSync(file, "utf8"));
+    const actualWrite = fs.writeFileSync.bind(fs);
+    const actualRename = fs.renameSync.bind(fs);
+    let sawTemporaryWrite = false;
+    let sawAtomicPublish = false;
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation((target, data, options) => {
+      expect(String(target)).toBe(temporary); // Never open/truncate the published file.
+      actualWrite(target, String(data).slice(0, 20), options); // Deliberately torn staging bytes.
+      expect(() => JSON.parse(fs.readFileSync(temporary, "utf8"))).toThrow();
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(before);
+      actualWrite(target, data, options);
+      sawTemporaryWrite = true;
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      expect(String(source)).toBe(temporary);
+      expect(String(target)).toBe(file);
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual(before);
+      expect(JSON.parse(fs.readFileSync(temporary, "utf8"))).toMatchObject({ partialText: "partial final 🦄", lastCompleteText: before.text });
+      actualRename(source, target);
+      expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ text: "partial final 🦄", partialText: "partial final 🦄" });
+      sawAtomicPublish = true;
+    });
+    try {
+      const streaming = { ...record, text: "partial final 🦄", partialText: "partial final 🦄" };
+      updateRunRecord(file, streaming);
+      expect(sawTemporaryWrite && sawAtomicPublish).toBe(true);
+      expect(fs.existsSync(temporary)).toBe(false);
+    } finally {
+      write.mockRestore(); rename.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the preceding published result intact if replacement fails", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-record-atomic-failure-"));
+    const file = path.join(root, "status.json");
+    const record = { ...baseRecord(), text: "complete" };
+    writeRunRecord(file, record);
+    const before = fs.readFileSync(file, "utf8");
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+      throw Object.assign(new Error("cannot publish"), { code: "EIO" });
+    });
+    try {
+      expect(() => updateRunRecord(file, { ...record, text: "partial", partialText: "partial" })).toThrow("cannot publish");
+      expect(fs.readFileSync(file, "utf8")).toBe(before);
+      expect(JSON.parse(before).text).toBe("complete");
+    } finally {
+      rename.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("worker run-record usage", () => {
   it("persists the publishing process identity for process workers only", () => {
     const options = { id: "identity", name: "identity", runner: "pi" as const, transport: "process" as const,

@@ -1,6 +1,6 @@
 import type { TaskReturnAddress } from "../agents/task-return-address.js";
 import type { FabricParticipantInfo } from "../topology/types.js";
-import type { FabricPrincipal } from "../fabric-provenance.js";
+import type { FabricPrincipal, FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ResidentReleaseIntent, ResidentLauncherIdentity } from "./handover.js";
 import { recordResidentOutcome, registerCancellationEffect } from "../async-settlement.js";
@@ -171,7 +171,9 @@ export class ResidentOutcomeUnknownError extends Error {
     // Guest runtimes may preserve only message, so the classification and IDs live there too.
     super(`ResidentOutcomeUnknownError: Fabric residency ${command.operation} outcome unknown: requestId=${command.requestId}` +
       `, ${kind}Id=${id ?? "not yet known"}` +
-      `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}. ` +
+      `${decision?.ownerHostId ? `, ownerHostId=${decision.ownerHostId}` : ""}` +
+      // smarty-dev#6829: the request journal committed; the registry save may still be retrying.
+      `${decision?.state === "committed" ? `, state=accepted; ${kind === "actor" ? "registry save" : "publication"} pending` : ""}. ` +
       `Do not retry or reassign this work. Check agents.${kind === "actor" ? "actorStatus" : "status"}` +
       ` / agents.list${id ? ` for ${id}` : ` and request ${command.requestId}`}; ` +
       `publication may still be pending. Use agents.stop with the known ID once registered to cancel. ` +
@@ -304,6 +306,14 @@ const digest = (value: string): string =>
 
 export const residentHostId = (rootId: string): string =>
   `resident:${digest(rootId).slice(0, 24)}`;
+
+/** The resident's project and session actor registry roots (shared by the host and the offline remove). */
+export const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
+  config.sessionActorRoot
+    ? { project: config.actorRoot, session: config.sessionActorRoot }
+    : config.mesh.actorScope === "session"
+      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
 
 export const isResidentHostId = (id: string): boolean => /^resident:[0-9a-f]{24}$/.test(id);
 
@@ -693,6 +703,8 @@ export interface ResidentDeliveryRecord {
   /** Producer-owned classification. Only actor-output admits an actor sender; absent or
    * unknown classifications (including older/retained records) keep the label but no claim. */
   source?: "actor-output" | "fabric-host";
+  /** Producer diagnostic snapshot survives outbox replay; not an authority claim. */
+  wakeCause?: FabricWakeCause;
   principal?: FabricPrincipal | undefined;
   format: typeof RESIDENT_HOST_FORMAT;
   /** Survives payload truncation; lets Main read the authoritative terminal result. */

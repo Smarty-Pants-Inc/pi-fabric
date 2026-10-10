@@ -774,19 +774,23 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     expect(manager.status(handle.id).status).toBe("stopped");
   });
 
-  // These fixtures test crash reporting, not the run deadline. The shared 2s
-  // budget can kill a slow-starting child before its first stream event injects
-  // the crash. Allow cold startup and the worker's 5s execution-cleanup grace;
-  // keep the outer test bound above the run budget and transport teardown.
-  const crashRunTimeoutMs = 30_000;
-  const crashTestTimeoutMs = 45_000;
+  // These fixtures test crash reporting, not the run deadline. The crash is
+  // injected at the child's first stream event (or at finalization), so any
+  // wall-clock run budget also bounds cold worker/child startup: a loaded CI
+  // runner reached even a 30s budget before the first event and the run was
+  // (correctly) reported timed_out (smarty-dev#6956). A crash that happens
+  // before the deadline is classified failed even when its cleanup crosses it,
+  // so the run must settle on the crash record itself: keep the deadline far
+  // out of reach and bound the test, not the run, generously.
+  const crashRunTimeoutMs = 10 * 60_000;
+  const crashTestTimeoutMs = 180_000;
 
   it("reports a terminal failure (not exited-without-a-result) when the worker crashes mid-stream", async () => {
     process.env.FAKE_PI_BEHAVIOR = "success";
     process.env.PI_FABRIC_INJECT_CRASH = "stream";
     try {
       const result = await run("do it", crashRunTimeoutMs);
-      expect(result.status).toBe("failed");
+      expect(result.status, JSON.stringify(result)).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated stream crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
@@ -798,7 +802,7 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     process.env.PI_FABRIC_INJECT_CRASH = "close";
     try {
       const result = await run("do it", crashRunTimeoutMs);
-      expect(result.status).toBe("failed");
+      expect(result.status, JSON.stringify(result)).toBe("failed");
       expect(result.error ?? "").toMatch(/simulated close crash/);
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;

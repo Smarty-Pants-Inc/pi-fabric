@@ -342,7 +342,7 @@ describe("shared run-tree exit veto", () => {
     expect(runTreeExitVeto(run, 0, () => true, true)).toMatch(/incomplete/);
   });
 
-  it("retains tracked descendant ownership even when PID reuse passes the cleanup birth proof", () => {
+  it("retains tracked descendant ownership unless its checked birth identity proves PID reuse (smarty-dev#3252)", () => {
     const run = temporaryDirectory();
     writeStatus(run, { status: "completed", transport: "process", sessionId: "2147483646" });
     writeStatus(path.join(run, "nested", "child"), { status: "completed", transport: "process", sessionId: "2147483647", processStartTime: "123" });
@@ -350,10 +350,18 @@ describe("shared run-tree exit veto", () => {
       if (pid === 2147483646) throw Object.assign(new Error("gone"), { code: "ESRCH" });
       return true;
     });
-    const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("456");
+    const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("123");
     try {
+      // The saved worker itself (same birth identity) or an unreadable identity still vetoes.
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
+      birth.mockReturnValue(undefined);
+      expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
+      // A read, differing birth identity is a reused PID: by default retention keeps the strict
+      // live veto; only the mesh-wide sweep's opt-in accepts the reuse proof.
+      birth.mockReturnValue("456");
       expect(runTreeExitVeto(run)).toBeUndefined();
       expect(runTreeExitVeto(run, 0, undefined, true)).toMatch(/descendant worker may still be running/);
+      expect(runTreeExitVeto(run, 0, undefined, true, true)).toBeUndefined();
     } finally { probe.mockRestore(); birth.mockRestore(); }
   });
 
@@ -389,11 +397,12 @@ describe("safe run roots", () => {
   it.each([
     ["closed", "root"], ["closed", "descendant"],
     ["orphan", "root"], ["orphan", "descendant"],
-  ])("keeps a live %s-root %s writer even with a mismatched saved birth identity", (kind, location) => {
+  ])("keeps a live %s-root %s writer with its saved birth identity, not a reused PID (smarty-dev#3252)", (kind, location) => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     const run = path.join(root, "run");
-    writeStatus(run, { status: "completed", finishedAt: 1 });
+    // A dead, identified root: only the live writer under test can veto.
+    writeStatus(run, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
     const writer = location === "root" ? run : path.join(run, "nested", "child");
     writeStatus(writer, { status: "completed", finishedAt: 1, transport: "process", sessionId: String(process.pid), processStartTime: "123" });
     fs.writeFileSync(path.join(run, "task.txt.provenance.json"), "{}");
@@ -401,15 +410,28 @@ describe("safe run roots", () => {
     markRunRootActive(root, 1);
     if (kind === "closed") markRunRootClosed(root, 1, true);
     else fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("456");
+    const birth = vi.spyOn(processIdentity, "processStartTime").mockReturnValue("123");
     try {
-      // Explicit cleanup's PID-reuse proof does not replace retention's
-      // independent live-writer fence, for roots or nested descendants.
-      expect(runTreeExitVeto(run)).toBeUndefined();
+      // The live process IS the saved writer (same birth identity): retention's
+      // live-writer fence holds, for roots and nested descendants.
       expect(canRemoveTerminalRun(run)).toBe(false);
       if (kind === "closed") expect(canRemoveManagedRunRoot(root)).toBe(false);
       expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY })).toEqual([]);
+      // An unreadable current identity is not proof of reuse.
+      birth.mockReturnValue(undefined);
+      expect(canRemoveTerminalRun(run)).toBe(false);
       expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(fs.existsSync(writer)).toBe(true);
+      // A read, differing birth identity proves PID reuse, but only the mesh-wide sweep accepts that
+      // proof; the temp-root sweep and every default caller keep the live veto (pi-fabric#645 CI).
+      birth.mockReturnValue("456");
+      expect(runTreeExitVeto(run)).toBeUndefined();
+      expect(canRemoveTerminalRun(run)).toBe(false);
+      if (kind === "closed") expect(canRemoveManagedRunRoot(root)).toBe(false);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true })).toEqual([]);
+      expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(canRemoveTerminalRun(run, undefined, true)).toBe(true);
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual([run]);
       expect(fs.existsSync(writer)).toBe(true);
     } finally { birth.mockRestore(); }
   });

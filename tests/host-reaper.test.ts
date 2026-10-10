@@ -330,6 +330,43 @@ describe("records of dead hosts", () => {
     expect(mesh.get("topology/participants/back-root")).toBeDefined();
   });
 
+  // smarty-dev#6477 L2b (R11): file leases are read before the state transaction; a lease file
+  // written in between moves the directory stamp, so the transaction reads them again.
+  it("keeps a host whose file lease renews between the pre-read and the commit", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await host(mesh, "file-back", now - 7 * HOUR);
+    const original = mesh.writeBatch.bind(mesh);
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+      writeHostLease(mesh.root, { id: "file-back", rootId: "file-back", identityId: "file-back", updatedAt: now, expiresAt: now + 60_000 });
+      return original(input);
+    });
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(0);
+    expect(mesh.get(hostKey("file-back"))).toBeDefined();
+  });
+
+  // Windows stamps list the directory (its timestamps are no replacement receipts).
+  it.skipIf(process.platform === "win32")("does not read file leases inside the transaction when their directory did not move", async () => {
+    const mesh = store();
+    const now = Date.now();
+    await host(mesh, "dead", now - 7 * HOUR);
+    writeHostLease(mesh.root, { id: "dead", rootId: "dead", identityId: "dead", updatedAt: now - 8 * HOUR, expiresAt: now - 7 * HOUR });
+    const original = mesh.writeBatch.bind(mesh);
+    let insideReads = -1;
+    vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async (input) => {
+      const readdir = vi.spyOn(fs, "readdirSync");
+      try {
+        return await original({ ...input, prepare: (view) => {
+          const ops = input.prepare?.(view) ?? [];
+          insideReads = readdir.mock.calls.filter(([dir]) => String(dir).endsWith("host-leases")).length;
+          return ops;
+        } });
+      } finally { readdir.mockRestore(); }
+    });
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
+    expect(insideReads).toBe(0);
+  });
+
   it("keeps an orphan participant whose host appears before the delete commits", async () => {
     const mesh = store();
     const now = Date.now();

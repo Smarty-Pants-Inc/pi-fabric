@@ -33,7 +33,7 @@ resource replace an older queued one. It never supplies a completed dedupe key.
 An actor without `dedupeKey` behaves as before: a durable reviewer with
 `coalesceKey: "payload.number"` runs a new head or security event for the same PR
 after its earlier activation completes. Do not use a PR number as `dedupeKey`:
-that would explicitly opt into suppressing genuinely new work for that resource.
+that would explicitly opt into suppressing new work for that resource.
 Both options may be supplied, but they serve different purposes.
 
 With `dedupeKey`, a duplicate queued while the first activation runs is checked

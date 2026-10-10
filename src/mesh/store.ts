@@ -12,7 +12,7 @@ import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, typ
 import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
-export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError } from "./event-log.js";
+export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
 export type { MeshStateEntry, MeshReadOptions, MeshBatchOperation, MeshBatchView, MeshBatchResult } from "./state-file.js";
 export { RUNTIME_MESH_READ_CACHE_MS, MIN_BACKGROUND_MESH_READ_CACHE_MS, assertMeshStateReadable, MeshBatchConflictError } from "./state-file.js";
 export type { MeshStateBackendKind, MeshCommitEffects, MeshStateFileRead, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
@@ -233,6 +233,10 @@ export interface MeshStoreOptions {
   lockProtocol?: MeshLockProtocol;
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
+  /** Receipt lifetime from publication; enforced at compaction/capacity pressure. Default 7 days. */
+  dedupeReceiptTtlMs?: number;
+  /** Hard cap on receipt/intent keys; protected pending intents can refuse new keys. Default 100,000. */
+  maxDedupeReceipts?: number;
   maxStateBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;

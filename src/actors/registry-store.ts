@@ -182,15 +182,21 @@ export class ActorRegistryStore {
         this.#payloads.committedRing(String(input.id), before.messageHistory, input.messages)
         ? (({ messages: _messages, ...rest }) => ({ ...rest, messageHistory: before.messageHistory }))(input)
         : input;
-      if (!before || row === before || row.registryMessageReset === true ||
+      // An owned rewrite of a long inline persona migrates it (smarty-dev#8525); foreign
+      // rows passed through unchanged stay byte-identical until their owner saves.
+      if (!before || row === before || row.registryMessageReset === true || this.#payloads.movesInstructions(before) ||
         (Array.isArray(row.registryMessageAppend) && row.registryMessageAppend.length > 0)) return row;
       const { instructions, messages, registryMessageAppend: _append, registryMessageReset: _reset, ...small } = row;
       const { instructions: oldInstructions, messages: oldMessages, ...oldSmall } = before;
       // Persona strings dominate registry size. Compare them directly; serialize
       // only small metadata and (when needed) the bounded message ring.
+      // smarty-dev#8525: an inline text equal to the row's verified sidecar is unchanged.
+      const sameSidecar = oldInstructions === undefined && small.instructionsFile === undefined &&
+        this.#payloads.storedInstructions(String(row.id), oldSmall.instructionsFile, instructions);
+      if (sameSidecar) delete oldSmall.instructionsFile;
       const selectedStub = messages === undefined && row.messageHistory !== undefined &&
         Array.isArray(oldMessages) && oldMessages.length === 0;
-      return instructions === oldInstructions && smallState(small) === smallState(oldSmall) &&
+      return (sameSidecar || instructions === oldInstructions) && smallState(small) === smallState(oldSmall) &&
         (selectedStub || messages === oldMessages || JSON.stringify(messages) === JSON.stringify(oldMessages)) ? before : row;
     });
     const payload = this.#payloads.prepare(reusable, prior);
@@ -347,7 +353,7 @@ export class ActorRegistryStore {
     }
   }
 
-  /** Instructions remain inline; prior PR sidecars are accepted for migration. */
+  /** Long instructions are content-addressed sidecars (smarty-dev#8525); inline rows still read. */
   instructions(record: Record<string, unknown>): unknown {
     return this.#payloads.instructions(record);
   }

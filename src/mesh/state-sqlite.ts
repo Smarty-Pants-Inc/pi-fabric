@@ -42,7 +42,7 @@
  * keeps SQLite's built-in autocheckpoint (`WAL_AUTOCHECKPOINT_PAGES`, ~4 MiB). It is PASSIVE and runs on
  * the committing connection right after its COMMIT, so it never blocks another writer; with it off and
  * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
- * maintenance holder, tests) checkpoints on an unref'd timer: PASSIVE first (copies and fsyncs
+ * maintenance holder, tests) checkpoints on WAL/store notifications (coalesced by a one-shot deadline): PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
  * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
  * few ms, so the checkpointer raises its own flag in `state-checkpoint.flags/` and writers yield while any is fresh
@@ -357,13 +357,13 @@ export interface SqliteStateStoreOptions {
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
-  /** "maintainer" runs the checkpoint timer (projector or maintenance holder). Default "client". */
+  /** "maintainer" watches WAL commits (projector or maintenance holder). Default "client". */
   checkpoint?: "maintainer" | "client";
   /** A WAL file above this size that grew since the last checkpoint escalates PASSIVE to TRUNCATE. Default 4 MiB. */
   checkpointBytes?: number;
   /** WAL size above which any writer checkpoints after its COMMIT. Default 64 MiB. */
   emergencyCheckpointBytes?: number;
-  /** Maintainer timer period. Default 1,000 ms. */
+  /** Minimum spacing of notification-driven maintenance and one busy retry. Default 1,000 ms. */
   checkpointIntervalMs?: number;
   /** First busy budget of a TRUNCATE attempt; doubles after each busy attempt up to 400 ms. Default 50 ms. */
   checkpointBusyMs?: number;
@@ -704,6 +704,12 @@ export class SqliteStateStore {
     walBytes: 0, maxWalBytes: 0,
   };
   #timer: NodeJS.Timeout | undefined;
+  #maintenanceWatcher: fs.FSWatcher | undefined;
+  #maintainer = false;
+  #maintenanceIntervalMs = 1_000;
+  #maintenanceAt = 0;
+  #maintenanceVersion = -1;
+  #maintenanceRetry = false;
   #inTransaction = false;
   #closed = false;
   #dataVersion = -1;
@@ -737,11 +743,29 @@ export class SqliteStateStore {
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
     this.#walHardCapBytes = walHardCapOf(options);
     if (options.checkpoint === "maintainer") {
-      const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
-      this.#timer = setInterval(() => {
-        try { if (this.walBytes() > 0) this.checkpoint(); } catch { this.#stats.checkpoints.failed += 1; }
-      }, interval);
-      this.#timer.unref();
+      this.#maintainer = true;
+      this.#maintenanceIntervalMs = Math.max(10, options.checkpointIntervalMs ?? 1_000);
+      this.#maintenanceVersion = this.dataVersion();
+      // Watch the directory, not a WAL inode: SQLite can remove/recreate it. Never open a
+      // database file with fs (POSIX lock rule). data_version ignores our own checkpoints
+      // and commits, so delayed own-write events cannot create a notification feedback loop.
+      this.#maintenanceWatcher = fs.watch(this.root, { persistent: false }, (_event, name) => {
+        if (name !== null && String(name) !== "state.db" && String(name) !== "state.db-wal") return;
+        if (this.#closed) return;
+        try {
+          const version = this.dataVersion();
+          if (version === this.#maintenanceVersion) return;
+          this.#maintenanceVersion = version;
+          this.#queueMaintenance();
+        } catch { this.#stats.checkpoints.failed += 1; }
+      });
+      this.#maintenanceWatcher.on("error", () => {
+        this.#stats.checkpoints.failed += 1;
+        this.#maintenanceWatcher?.close();
+        this.#maintenanceWatcher = undefined;
+        // Own commits still drive maintenance; client emergency checkpoints remain enabled.
+      });
+      this.#queueMaintenance(); // Existing WAL work at open, not an idle recurring timer.
     }
   }
 
@@ -773,8 +797,8 @@ export class SqliteStateStore {
     // succeeds no connection in this process can have the file open, so closing drops no lock.
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
-    const db = (options.open ?? openNodeSqlite)(file);
+    const validated = assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -823,8 +847,8 @@ export class SqliteStateStore {
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    assertPrivateStateFiles(file);
-    const db = (options.open ?? openNodeSqlite)(file);
+    const validated = assertPrivateStateFiles(file);
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -1193,6 +1217,29 @@ export class SqliteStateStore {
 
   // ---------------------------------------------------------------- maintenance
 
+  #queueMaintenance(retry = false): void {
+    if (this.#closed) return;
+    if (!retry) this.#maintenanceRetry = false;
+    if (this.#timer) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#closed) return;
+      this.#maintenanceAt = Date.now();
+      try {
+        this.assertLive(); // A rollback/retirement is never checkpointed by the maintainer.
+        if (this.walBytes() === 0) return;
+        const result = this.checkpoint();
+        // One retry belongs to unfinished checkpoint work, not to an idle WAL-size poll.
+        // A long-lived pinned reader exhausts this retry; the next commit tries again.
+        if (!this.#maintenanceRetry && (result.busy > 0 || result.checkpointed < result.log)) {
+          this.#maintenanceRetry = true;
+          this.#queueMaintenance(true);
+        }
+      } catch { this.#stats.checkpoints.failed += 1; }
+    }, Math.max(0, this.#maintenanceAt + this.#maintenanceIntervalMs - Date.now()));
+    this.#timer.unref?.();
+  }
+
   /** `<state.db>-wal` size by stat only (never an fd on the database files). */
   walBytes(): number {
     const size = fs.statSync(`${this.file}-wal`, { throwIfNoEntry: false })?.size ?? 0;
@@ -1273,7 +1320,10 @@ export class SqliteStateStore {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#maintenanceWatcher?.close();
+    this.#maintenanceWatcher = undefined;
     try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* closing anyway */ }
     this.#db.close();
   }
@@ -1481,7 +1531,13 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) { this.#emergencyCheckpoint(); this.#maybeResetWal(); }
+      if (committed && changed) {
+        // data_version does not change for this connection's own commits. Metadata-only
+        // imports also notify, but write-free fences never schedule unnecessary maintenance.
+        if (this.#maintainer) this.#queueMaintenance();
+        this.#emergencyCheckpoint();
+        this.#maybeResetWal();
+      }
     }
   }
 
@@ -1696,9 +1752,9 @@ export const checkpointFlagRaised = (root: string): boolean => {
  * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits here, so only the
  * type and symlink checks apply.
  */
-export const assertPrivatePath = (file: string, kind: "directory" | "file"): void => {
+export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-  if (!stat) return;
+  if (!stat) return undefined;
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   const uid = posix ? process.getuid!() : undefined;
   const why = stat.isSymbolicLink() ? "is a symbolic link"
@@ -1710,6 +1766,7 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): voi
       ? `is group or other readable (mode ${(stat.mode & 0o777).toString(8)}) and could not be made 0600`
     : undefined;
   if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
+  return stat;
 };
 
 // chmod 0600 the very file that was checked: O_NOFOLLOW never follows a swapped-in link, and dev/ino must match.
@@ -1725,9 +1782,97 @@ const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
   finally { if (fd !== undefined) fs.closeSync(fd); }
 };
 
-const assertPrivateStateFiles = (file: string): void => {
+/**
+ * smarty-dev#7784 (security-gap; pi-fabric#730 CODE c6085070307, pi-fabric#733 CODE c6085492681): bind the SQLite
+ * connection to the very state.db that assertPrivateStateFiles validated (its lstat is the baseline, not a later one).
+ * node:sqlite has no fd API, but SQLite's unix VFS opens the main file inside the constructor, on a descriptor of its
+ * own even when another connection has the file open. So, before any SQL: snapshot /proc/self/fd, open, and require
+ * exactly one NEW descriptor whose link names this state.db, on the validated dev/ino, with the path still naming it
+ * (or SQLite's reuse of a descriptor parked on that inode, proven below).
+ * A swap (a link to another mesh's database, or a renamed-in file, even one put back at once) gives that descriptor
+ * another link or identity: zero or several candidates, or a mismatch, closes the connection and fails closed, as
+ * does Linux without /proc/self/fd. Other platforms keep only the post-open lstat compare (residual on #7784).
+ */
+const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): SqliteConnection => {
+  const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: ${why}`);
+  const linux = process.platform === "linux";
+  const name = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  const before = linux ? fdSnapshot() : undefined;
+  if (linux && before === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
+  const db = open(file);
+  try {
+    if (before !== undefined) {
+      const after = fdSnapshot();
+      if (after === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
+      const link = (fd: string) => { try { return fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { return undefined; } };
+      const target = `${validated.dev}:${validated.ino}`;
+      const added = [...after].filter(([fd, identity]) => before.get(fd) !== identity);
+      const mains = added.filter(([fd]) => [name, `${name} (deleted)`].includes(link(fd) ?? ""));
+      if (mains.length > 1) throw refuse(`the connection's own descriptor on it is ambiguous (${mains.length} new)`);
+      if (mains.length === 1 && mains[0]![1] !== target) throw refuse("the connection opened a different file than the one checked");
+      // Zero new: SQLite's unix VFS took back a descriptor it parked (setPendingFd) when an earlier connection in this
+      // process closed while another one still had the inode open; findReusableFd hands it to the next open of the
+      // inode it stat()s, so it is unproven by itself. It is proven when no regular descriptor appeared at all and
+      // the validated inode is the ONLY inode with a parked descriptor (descriptors on it beyond this module's live
+      // connections): then the reused one can only be that. Residual on #7784: a SQLite connection in this process
+      // that bypasses this module.
+      if (mains.length === 0) {
+        const fds = new Map<string, number>();
+        for (const [, identity] of before) fds.set(identity, (fds.get(identity) ?? 0) + 1);
+        const parked = (identity: string) => (fds.get(identity) ?? 0) - (liveConnections.get(identity) ?? 0);
+        const elsewhere = [...liveConnections.keys()].some(identity => identity !== target && parked(identity) > 0);
+        if (added.length > 0 || parked(target) < 1 || elsewhere) {
+          throw refuse(`the connection's own descriptor on it is not proven (0 new, ${added.length} other, ` +
+            `${Math.max(0, parked(target))} parked here${elsewhere ? ", parked elsewhere" : ""})`);
+        }
+      }
+    }
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
+    return tracked(db, `${validated.dev}:${validated.ino}`);
+  } catch (error) {
+    try { db.close(); } catch { /* best effort */ }
+    throw error;
+  }
+};
+
+// This module's live connections per "dev:ino" (openPinned's reuse proof). Closing a connection releases its count.
+const liveConnections = new Map<string, number>();
+const tracked = (db: SqliteConnection, identity: string): SqliteConnection => {
+  liveConnections.set(identity, (liveConnections.get(identity) ?? 0) + 1);
+  const close = db.close.bind(db);
+  let open = true;
+  db.close = () => {
+    if (open) {
+      open = false;
+      const left = (liveConnections.get(identity) ?? 1) - 1;
+      if (left > 0) liveConnections.set(identity, left); else liveConnections.delete(identity);
+    }
+    close();
+  };
+  return db;
+};
+
+// fd -> "dev:ino" of each open regular file. Compared by identity as well as number: the listing's own directory fd
+// is closed again at once, so SQLite may get that very number.
+const fdSnapshot = (): Map<string, string> | undefined => {
+  let names: string[];
+  try { names = fs.readdirSync("/proc/self/fd"); } catch { return undefined; }
+  const identities = new Map<string, string>();
+  for (const fd of names) {
+    try { const stat = fs.fstatSync(Number(fd)); if (stat.isFile()) identities.set(fd, `${stat.dev}:${stat.ino}`); }
+    catch { /* closed meanwhile (the listing's own fd) */ }
+  }
+  return identities;
+};
+
+// The validated lstat of state.db is returned: openPinned binds the connection to it.
+const assertPrivateStateFiles = (file: string): fs.Stats => {
   assertPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
-  for (const name of [file, `${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
+  for (const name of [`${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
+  const stat = assertPrivatePath(file, "file");
+  if (!stat?.isFile()) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it is not a regular file`);
+  return stat;
 };
 
 // The owner's release: check the token, then unlink (pi-fabric#694 P2, smarty-dev#6477). Nothing is moved aside.

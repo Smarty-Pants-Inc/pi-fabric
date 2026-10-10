@@ -75,7 +75,6 @@ const totalCost = (
 const agentLines = (
   theme: Theme,
   agent: FabricUiAgent,
-  now: number,
 ): string[] => {
   const status = colorStatus(theme, agent.status, statusGlyph(agent.status));
   const activity =
@@ -90,8 +89,8 @@ const agentLines = (
   const metrics = [
     agent.toolCalls !== undefined ? `${agent.toolCalls} calls` : undefined,
     agent.usage ? `${formatTokens(agent.usage.input + agent.usage.output)} tok` : undefined,
-    agent.startedAt
-      ? formatDuration((agent.finishedAt ?? now) - agent.startedAt)
+    agent.startedAt !== undefined && agent.finishedAt !== undefined
+      ? formatDuration(agent.finishedAt - agent.startedAt)
       : undefined,
   ].filter((value): value is string => Boolean(value));
   const indent = "  ".repeat(1 + Math.max(0, agent.nestingDepth ?? 0));
@@ -308,7 +307,9 @@ export class FabricWidget implements Component {
     if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
     const cost = totalCost(snapshot, run);
     if (cost > 0) parts.push(formatCost(cost));
-    const elapsed = run && formatDuration((run.finishedAt ?? snapshot.now) - run.startedAt);
+    // Live durations would imply a ticking clock. Only completed work gets a
+    // duration; progress and status redraw exclusively on observed events.
+    const elapsed = run?.finishedAt !== undefined && formatDuration(run.finishedAt - run.startedAt);
     if (elapsed) parts.push(elapsed);
 
     const glyph = colorStatus(this.theme, headerStatus, statusGlyph(headerStatus));
@@ -322,26 +323,26 @@ export class FabricWidget implements Component {
     const taskHeader = taskHint ? `${glyph} ${this.theme.fg("accent", "Fabric")}${taskHint}${parts.length ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}` : header;
     const lines = [hasActiveConversations ? `${taskHeader} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : taskHeader];
     for (const job of [...liveShells, ...recentShells].slice(0, 3)) {
-      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
+      const elapsed = job.finishedAt !== undefined ? formatDuration(job.finishedAt - job.startedAt) : "";
       const status = job.stopping ? "stopping" : job.status;
       const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
       const glyph = colorStatus(this.theme, status, statusGlyph(status));
       lines.push(
         `  ${glyph} ${this.theme.fg("muted", job.id.slice(0, 8))} ${this.theme.fg("muted", label)}` +
-        `${this.theme.fg("dim", ` · ${elapsed} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
+        `${this.theme.fg("dim", `${elapsed ? ` · ${elapsed}` : ""} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
       );
     }
     if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
 
     lines.push(
-      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent)),
       ...activeActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
       ...terminalActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
-      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent)),
     );
     return lines;
   }

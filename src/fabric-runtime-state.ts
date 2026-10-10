@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
+import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
@@ -88,6 +88,7 @@ import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
 import { rootParticipantName } from "./topology/participant-name.js";
+import { herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -118,7 +119,7 @@ import {
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
 import { deliverActorToMain } from "./actors/main-delivery.js";
-import { sendFabricMessage } from "./fabric-provenance.js";
+import { fabricWakeCause, sendFabricMessage } from "./fabric-provenance.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -360,10 +361,10 @@ export class FabricRuntimeState {
    * The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox.
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
     let batch: RootInboxBatch | undefined;
     await this.#inboxRetry.run(async () => {
-      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
+      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
     });
     return batch;
   }
@@ -667,6 +668,18 @@ export class FabricRuntimeState {
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
+    // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
+    // start or reload (no polling); any failure keeps "main". Print/JSON roots and children inherit
+    // HERDR_PANE_ID but are not the pane's agent, so they never ask.
+    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId() };
+    if (identity.kind === "main" && mainAgent.local && mainAgent.interactive && herdr.pane) {
+      void readHerdrAgentName().then((name) => {
+        if (!name || !live.current()) return;
+        herdr.name = name;
+        this.#participants?.scheduleRefresh();
+      });
+    }
+    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
     const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
     const configuredMeshRoot = this.#config.mesh.root;
     const meshRoot =
@@ -855,7 +868,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.()), role,
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -1088,7 +1101,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
-            mainName: rootParticipantName(this.pi.getSessionName?.()),
+            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(role ? { role } : {}),
             project: participantProject(context.cwd),
@@ -1121,7 +1134,7 @@ export class FabricRuntimeState {
           onBackgroundComplete: (result, delivered) => completionInbox.enqueue(result, delivered),
           onResultConsumed: (id) => completionInbox.acknowledge(id),
           piModelState,
-          mainName: () => rootParticipantName(live.sessionName()),
+          mainName,
           ...(this.#paths ? { hostPath: this.#paths.residentHost } : {}),
         })
       : undefined;
@@ -1135,7 +1148,7 @@ export class FabricRuntimeState {
       participants.registerSource(() => {
         const current = live.read(ctx => mainAgent.info(ctx));
         rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
-        return [participants.root(rootInfo, mainAgent.interactive, live.sessionName(), { role })];
+        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane)];
       });
     }
     this.#participants.registerSource(() =>
@@ -1149,7 +1162,7 @@ export class FabricRuntimeState {
       ),
     );
     this.#participants.registerSource(() =>
-      this.#actors!.listOwned().map((actor) =>
+      this.#actors!.listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
     );
@@ -1238,7 +1251,8 @@ export class FabricRuntimeState {
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh");
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh", undefined,
+              fabricWakeCause({ id: advice.runId, name: advice.name, kind: "agent" }, "host-event", "jev.advice", advice.eventId));
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.

@@ -5,4 +5,5 @@ export { agentServiceDescriptors } from "./agents/service-schema.js";
 export type * from "./agents/service-types.js";
 export type { AgentSpawner, AgentRunRequest, AgentRunRecord, AgentRunResult, AgentHandleInfo, AgentUsage } from "./agents/types.js";
 export { FabricModelDeniedError } from "./core/model-policy.js";
+export { AgentInputError, RequiredInputMissingError } from "./host-compatibility.js";
 export const HOSTED_AGENTS_PROTOCOL_VERSION = 1 as const;

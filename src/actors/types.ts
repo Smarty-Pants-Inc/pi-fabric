@@ -120,6 +120,14 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
   }
 }
 
+/** An explicit occurrence path into the full mesh event, such as "data.key". */
+export function validateActorDedupeKey(value: unknown): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length > 200 || !COALESCE_KEY_PATTERN.test(value)) {
+    throw new Error(`Invalid actor dedupeKey: ${String(value)} (use a dotted path such as data.key)`);
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
@@ -247,6 +255,10 @@ export interface FabricActorRequest {
    * same topic with the same value there is replaced by the newer one, in its queue place.
    */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
   /** Optional per-source leading-edge minimum interval for agent_settled only; omitted is off. */
   activation?: FabricActorActivationPolicy;
   /**
@@ -322,6 +334,10 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */

@@ -355,8 +355,9 @@ export class MeshStore {
       const { wakeResidentActors } = await import("../residency/wake.js");
       await wakeResidentActors(this, events);
     } catch (error) {
-      // Already committed: throwing would invite a duplicate publish. The wake request and
-      // archived event remain retryable; report failure rather than inventing delivery.
+      // Already committed: throwing would invite a duplicate publish. The durable pending
+      // index and archived event survive even without a wake request; startup or the next
+      // publish retries the drain. Report failure rather than inventing delivery.
       console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
     }
   }

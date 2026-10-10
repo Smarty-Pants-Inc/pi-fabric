@@ -122,7 +122,7 @@ describe("archive-coupled resident wake retry index", () => {
       index.acknowledgeResidentDelivery(f.mesh.root, f.resident, { id: "event-700", sequence: 700 });
       expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
     } finally { f.mesh.closeState(); fs.rmSync(f.root, { recursive: true, force: true }); }
-  });
+  }, 60_000); // 700 real namespace/fsync barriers, like the durable fanout cases below.
 
   it.each([
     [128, "single"], [129, "single"], [257, "single"], [129, "batch"], [129, "matching-retry"],

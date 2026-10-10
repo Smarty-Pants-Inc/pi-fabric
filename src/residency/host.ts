@@ -34,9 +34,9 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
-import { assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
+import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
-import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "./wake-index.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
@@ -722,6 +722,16 @@ export class ResidentHost {
       };
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
+      // A publisher can die after commit but before writing any root-local wake request.
+      // Reuse the durable pending-index drain once on startup, without a polling host.
+      // Our owner is live now, so recovery cannot launch a second copy of this host;
+      // keep restored actor queues paused until the readiness receipt below commits.
+      // No index has ever been written on an empty mesh: avoid a needless lock round trip.
+      // A racing first publish performs its own drain after committing the new index.
+      if (fs.existsSync(residentWakeIndexPath(this.mesh.root)) || fs.existsSync(path.join(this.mesh.root, "wake-overflow"))) {
+        try { await wakeResidentActors(this.mesh, []); }
+        catch (error) { console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`); }
+      }
       // The originating client may cancel this owned attempt until it sees the
       // required receipt. Commit it BEFORE opening any business gate or resuming
       // restored queues: publication failure/timeout must remain a non-serving

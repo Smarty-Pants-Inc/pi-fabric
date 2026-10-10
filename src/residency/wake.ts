@@ -281,7 +281,8 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   }
 }
 
-/** Called only after the event log's durability barrier, including batch/bridge publishers. */
+/** Drain durable pending wakes after publication (including batches/bridges), or with no
+ * events on resident startup. Recovery does not depend on the publishing process surviving. */
 export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll" | "exclusive">, events: readonly MeshEvent[],
   launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>): Promise<void> {
   const lifecycle = events.some(event => event.topic === "fabric.participant.lifecycle")

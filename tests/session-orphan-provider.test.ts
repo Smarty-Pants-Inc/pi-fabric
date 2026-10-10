@@ -192,6 +192,26 @@ describe("public session-orphan provider reads (#7227)", () => {
     expect(second.manager.list()).toEqual([]);
   });
 
+  it("public orphan reads keep control-bearing actor names out of alarm text", async () => {
+    const root = tmp();
+    const { actor, store, mesh } = await seed(root, "old");
+    const unsafe = 'spoof\n\u001b"\\label' + "x".repeat(256);
+    await store.update(rows => ({ actors: rows.map(row => row.id === actor.id ? { ...row, name: unsafe } : row), value: true }));
+    oldLease(mesh.root, "old");
+    const reader = open(root, "current");
+    expectOrphan(await status(reader.provider, actor.id), actor.id, "session:old");
+    const alarm = alarms(mesh)[0]!;
+    const text = "session actor orphaned: its Main moved or ended; re-run activation.py in the new Main";
+    expect(alarm.text).toBe(text);
+    expect((alarm.data as { line: string }).line).toBe(text);
+    const escapedPrefix = JSON.stringify('spoof"\\label').slice(1, -1);
+    expect((alarm.data as { name: string }).name).toBe(escapedPrefix + "x".repeat(128 - escapedPrefix.length));
+    expect(alarm.text).not.toContain("spoof");
+    expect((alarm.data as { name: string }).name).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    await actors(reader.provider);
+    expect(alarms(mesh)).toHaveLength(1);
+  });
+
   it("a terminal orphan bypasses retained-owner routing recovery when no participant is available", async () => {
     const root = tmp();
     const { actor, mesh } = await seed(root, "old-route");

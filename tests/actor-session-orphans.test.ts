@@ -72,9 +72,55 @@ describe("foreign session actor registry truth", () => {
     await Promise.all([repair.reconcile(), repair.reconcile()]);
     expect(alarms(mesh)).toHaveLength(1);
     expect(alarms(mesh)[0]).toMatchObject({ topic: "ops.owner", kind: "actor.session.orphaned",
-      text: "actor project-supervisor orphaned: its Main moved or ended; re-run activation.py in the new Main",
+      text: "session actor orphaned: its Main moved or ended; re-run activation.py in the new Main",
       data: { actorId: id, name: "project-supervisor", oldRoot: "session:old", rootId: "session:old", oldHost: os.hostname(),
         lastUpdated: expect.any(Number), project: "project", role: "supervisor", line: expect.stringContaining("re-run activation.py") } });
+  });
+
+  it.each(["fresh", "pending"] as const)("keeps %s alarm text static and confines unsafe record labels to bounded escaped data", async mode => {
+    const { root, mesh, store, actor, lease, repair } = fixture();
+    const prefix = 'spoof\n\u001b"\\label';
+    const unsafe = prefix + "x".repeat(256);
+    const escapedPrefix = JSON.stringify('spoof"\\label').slice(1, -1);
+    const expected = escapedPrefix + "x".repeat(128 - escapedPrefix.length);
+    const text = "session actor orphaned: its Main moved or ended; re-run activation.py in the new Main";
+    staleRootPresence(root, lease, { name: unsafe, role: unsafe });
+    store.write([{ ...actor, name: unsafe, project: unsafe, role: unsafe,
+      ...(mode === "pending" ? { status: "stopped", sessionOrphan: {
+        oldRoot: actor.rootId, oldHost: unsafe, reason: unsafe, leadName: unsafe, role: unsafe,
+        lastUpdated: actor.updatedAt, orphanedAt: Date.now(),
+        // Untrusted extra marker fields must not override the sanitized payload.
+        actorId: unsafe, name: unsafe, line: unsafe, text: unsafe,
+      } } : {}) }]);
+    expect(await repair.reconcile()).toBe(mode === "fresh" ? 1 : 0);
+    const alarm = alarms(mesh)[0]!;
+    expect(alarm.text).toBe(text);
+    expect(alarm.data).toMatchObject({ actorId: actor.id, name: expected, leadName: expected,
+      project: expected, role: expected, oldRoot: actor.rootId, rootId: actor.rootId, line: text });
+    if (mode === "pending") expect(alarm.data).toMatchObject({ oldHost: expected, reason: expected });
+    expect(alarm.data).not.toHaveProperty("text");
+    for (const [key, value] of Object.entries(alarm.data!)) {
+      if (typeof value !== "string" || key === "line") continue;
+      expect(value.length).toBeLessThanOrEqual(128);
+      expect(value).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+      expect(() => JSON.parse(`"${value}"`)).not.toThrow();
+    }
+    expect(alarm.text).not.toContain("spoof");
+    const persisted = store.records()[0]!;
+    expect(persisted.name).toBe(unsafe);
+    expect(persisted.sessionOrphan).toMatchObject({ alarmPublishedAt: expect.any(Number) });
+    if (mode === "fresh") expect(persisted.lastError).toBe(`root-gone: ${text}`);
+    await repair.reconcile();
+    expect(alarms(mesh)).toHaveLength(1);
+  });
+
+  it("does not cut a JSON escape at the metadata length boundary", async () => {
+    const { mesh, store, actor, repair } = fixture();
+    store.write([{ ...actor, name: "x".repeat(127) + '"tail\n\u001b' }]);
+    expect(await repair.reconcile()).toBe(1);
+    const name = (alarms(mesh)[0]!.data as { name: string }).name;
+    expect(name).toBe("x".repeat(127));
+    expect(JSON.parse(`"${name}"`)).toBe(name);
   });
 
   it.each(["grace", "reload", "live-process", "foreign-host", "missing-lease", "invalid-lease", "durable", "current-root"] as const)("preserves %s evidence and private visibility", async mode => {

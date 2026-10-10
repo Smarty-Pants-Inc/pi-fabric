@@ -14,6 +14,17 @@ import { FABRIC_ACTOR_HOST_EVENTS, type FabricActorInfo, type FabricActorSession
 
 /** Restart/reload grace, in addition to requiring positive owner death evidence. */
 export const SESSION_ACTOR_ORPHAN_GRACE_MS = 120_000;
+const SESSION_ACTOR_ORPHAN_TEXT = "session actor orphaned: its Main moved or ended; re-run activation.py in the new Main";
+/** Display-only metadata, not stored identities or durable dedupe keys. Never split a JSON escape at the bound. */
+const alarmLabel = (value: string): string => {
+  let label = "";
+  for (const character of value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "")) {
+    const escaped = JSON.stringify(character).slice(1, -1);
+    if (label.length + escaped.length > 128) break;
+    label += escaped;
+  }
+  return label;
+};
 const digest = (id: string): string => createHash("sha256").update(id).digest("hex");
 const participantKey = (id: string): string => `topology/participants/${digest(id)}`;
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -279,7 +290,7 @@ export class SessionActorOrphans {
               current.removal || current.sessionOrphan || !time(current.updatedAt) || Date.now() - current.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) continue;
           const gone = sessionActorRootGone(this.mesh, rootId, this.lineageAlive);
           if (!gone) continue;
-          const text = `actor ${String(current.name)} orphaned: its Main moved or ended; re-run activation.py in the new Main`;
+          const text = SESSION_ACTOR_ORPHAN_TEXT;
           const marker: FabricActorSessionOrphan = { ...gone, oldRoot: rootId, lastUpdated: current.updatedAt, orphanedAt: Date.now() };
           const row = { ...current, status: "stopped", lastError: `root-gone: ${text}`, sessionOrphan: marker, updatedAt: marker.orphanedAt };
           const prepared = store.prepare(snapshot.actors.map(before => before.id === id ? row : before), { durable: true }, snapshot);
@@ -320,12 +331,19 @@ export class SessionActorOrphans {
   async #publishAlarm(store: ActorRegistryStore, row: Record<string, unknown> & { id: string }): Promise<void> {
     const marker = record(row.sessionOrphan);
     if (!marker || typeof marker.oldRoot !== "string" || typeof row.name !== "string" || !time(marker.orphanedAt)) return;
-    const text = `actor ${row.name} orphaned: its Main moved or ended; re-run activation.py in the new Main`;
+    const text = SESSION_ACTOR_ORPHAN_TEXT;
+    // Whitelist attribution fields: a persisted marker cannot override the name or display line.
+    const metadata = Object.fromEntries(["oldHost", "reason", "leadName", "role"].flatMap(key => {
+      const value = marker[key];
+      return typeof value === "string" ? [[key, alarmLabel(value)]] : [];
+    }));
     await this.mesh.publish({ from: this.identity, topic: "ops.owner", kind: "actor.session.orphaned",
       dedupeKey: `session-actor-orphan:${row.id}:${marker.oldRoot}`, text,
-      data: { actorId: row.id, name: row.name, ...marker, rootId: marker.oldRoot, line: text,
-        ...(typeof row.project === "string" ? { project: row.project } : {}),
-        ...(typeof row.role === "string" ? { role: row.role } : {}) } });
+      data: { ...metadata, actorId: alarmLabel(row.id), name: alarmLabel(row.name),
+        oldRoot: alarmLabel(marker.oldRoot), rootId: alarmLabel(marker.oldRoot),
+        ...(time(marker.lastUpdated) ? { lastUpdated: marker.lastUpdated } : {}), orphanedAt: marker.orphanedAt, line: text,
+        ...(typeof row.project === "string" ? { project: alarmLabel(row.project) } : {}),
+        ...(typeof row.role === "string" ? { role: alarmLabel(row.role) } : {}) } });
     // A receipt is durable before acknowledging it. Preserve every concurrent
     // registry mutation; never stamp a successor or a reopened row.
     await store.update(current => {

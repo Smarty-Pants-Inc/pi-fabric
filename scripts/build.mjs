@@ -105,7 +105,9 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
 ];
 
-buildLandlock();
+// smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).
+const nativeDigests = buildLandlock();
+const nativeDefine = { __FABRIC_NATIVE_DIGESTS__: JSON.stringify(JSON.stringify(nativeDigests)) };
 
 // The production authority path is a literal. Only Vitest may substitute a
 // private fixture path; there is no production rollout/requirement switch.
@@ -114,6 +116,7 @@ const hostPolicyConstants = {
 };
 
 const result = await build({
+  define: nativeDefine,
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
   // Both facades only re-export host metadata. Resolve to their implementation
   // so empty facade-only chunks do not consume startup graph slots.
@@ -157,6 +160,7 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // fabric-mesh-backend (smarty-dev#6477 W1) is here too: its writer census shares host-leases.ts with
 // index.js, and a split build would carve that out of index.js into one more startup chunk.
 const standalone = await build({
+  define: nativeDefine,
   entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
     "src/mesh/mesh-backend-cli.ts"],
   outdir: "dist",
@@ -185,6 +189,7 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
+  define: nativeDefine,
   entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
   outdir: "dist",
   outbase: "src",
@@ -216,6 +221,7 @@ await build({
 // The records service runs as its own OS user from a root-owned copy of one file:
 // inline every package (pg included) so no module resolves outside that copy.
 await build({
+  define: nativeDefine,
   entryPoints: ["src/records/service-main.ts"],
   outfile: "dist/records-service/service-main.mjs",
   bundle: true,

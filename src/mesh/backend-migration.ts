@@ -147,6 +147,12 @@ export interface MeshBackendOptions {
    * (smarty-dev#7815: the reader readiness gate is re-checked here, see reader-proof.ts).
    */
   beforeCommit?: (commit: { phase: "importing" | "sqlite"; fromEpoch: number; toEpoch: number }) => void;
+  /**
+   * Runs under the fence of an import or cutover, before this operation opens state.db (smarty-dev#7936:
+   * the readiness gate's write-lease probe needs this process to hold no fd on it). A throw aborts the
+   * switch with nothing changed.
+   */
+  beforeOpen?: () => void | Promise<void>;
   /** Fence violations and late writers. The error is thrown as well. */
   onAlarm?: (alarm: MeshBackendAlarm) => void;
 }
@@ -787,6 +793,7 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   return holdFence(root, options, async (lock) => {
+    await options.beforeOpen?.();
     const census = await adviseCensus(options);
     const fence = FenceDb.open(root, options, "write", true)!;
     try {

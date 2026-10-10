@@ -121,6 +121,24 @@ it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 60_000 } }).mesh.idleReadCoalesceMs).toBe(10_000);
 });
 
+it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the file setting (pi-fabric#796)", () => {
+  const inherited = process.env.PI_FABRIC_MESH_STATE_BACKEND;
+  try {
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = "jetstream";
+    expect(() => normalizeFabricConfig({ mesh: { stateBackend: "sqlite" } }))
+      .toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be file, shadow, sqlite or nats/);
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = " NATS ";
+    expect(normalizeFabricConfig({ mesh: { stateBackend: "sqlite" } }).mesh.stateBackend).toBe("nats");
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = " ";
+    expect(normalizeFabricConfig({ mesh: { stateBackend: "sqlite" } }).mesh.stateBackend).toBe("sqlite");
+    delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    expect(normalizeFabricConfig({}).mesh.stateBackend).toBe("file");
+  } finally {
+    if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
+  }
+});
+
 describe("Fabric configuration", () => {
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);

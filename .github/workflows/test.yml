@@ -38,6 +38,27 @@ jobs:
           fi
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Install pinned NATS server for JetStream integration
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          version=2.14.7
+          archive="nats-server-v${version}-linux-amd64.tar.gz"
+          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
+          stage="$RUNNER_TEMP/nats-release"
+          mkdir -p "$stage"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          (
+            cd "$stage"
+            awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
+            # Also bind the release asset to the locally qualified v2.14.7 bytes.
+            printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
+            tar -xzf "$archive"
+          )
+          server_dir="$stage/nats-server-v${version}-linux-amd64"
+          "$server_dir/nats-server" -v
+          echo "$server_dir" >> "$GITHUB_PATH"
       - name: Install pinned Bend proof compiler
         if: runner.os == 'Linux'
         shell: bash
@@ -56,6 +77,11 @@ jobs:
       # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
         run: bun run build
+      - name: JetStream event-log integration (required server)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          NATS_SERVER_REQUIRED: '1'
+        run: bunx vitest run tests/mesh-event-log-conformance.test.ts tests/mesh-jetstream-event-log.test.ts tests/mesh-jetstream-fault.test.ts
       # Pi installs packages without peer or dev dependencies; the agent and memory
       # workers run outside Pi's module aliases, so their imports must resolve there.
       - name: Package install smoke (no peers, as pi install)

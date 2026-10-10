@@ -14,3 +14,8 @@ export type {
   MeshStoreOptions,
   MeshTailResult,
 } from "./mesh/store.js";
+
+export { openFileEventLog, openJetStreamEventLog, JetStreamPublishUncertainError, JetStreamCursorExpiredError,
+  JetStreamBatchPublishError } from "./mesh/event-backend.js";
+export type { MeshEventLogBackend, EventLogReadOptions, JetStreamEventLogOptions,
+  JetStreamReaderOptions, JetStreamReader, PendingMeshEvent } from "./mesh/event-backend.js";

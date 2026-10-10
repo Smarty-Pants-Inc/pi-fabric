@@ -7,3 +7,5 @@ coverage/
 .veda/
 *.log
 .DS_Store
+# Local verified release for opt-in NATS event-log tests.
+.lane/nats/

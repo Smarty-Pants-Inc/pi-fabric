@@ -164,11 +164,11 @@ export interface StateProjectorOptions {
   mode?: StateProjectorMode;
   /** Lease owner id. Default host:pid:random. */
   owner?: string;
-  /** Loop period of run(). Default 250 ms. */
+  /** Retry delay after a failed pass (no idle polling). Default 250 ms. */
   pollMs?: number;
   /** Lease lifetime; renewed at half. Default 10 s. */
   leaseMs?: number;
-  /** Period of the automatic divergence check while caught up; 0 disables. Default 60 s. */
+  /** Minimum spacing of notification-driven divergence checks; 0 disables. Default 60 s. */
   verifyMs?: number;
   /** Repair a found divergence with a full resync. Default true. */
   repairDivergence?: boolean;
@@ -178,7 +178,7 @@ export interface StateProjectorOptions {
   maxStateBytes?: number;
   /** Rows kept in the changes feed. Default 4,096 (as state-sqlite.ts). */
   changesRetained?: number;
-  /** Checkpoint period of the active projector. Default 1 s. */
+  /** Minimum spacing of WAL-change-driven checkpoints. Default 1 s. */
   checkpointMs?: number;
   /** WAL size above which a growing WAL is TRUNCATEd (R10). Default 64 MiB. */
   checkpointBytes?: number;
@@ -480,7 +480,7 @@ const parseJson = <T>(value: unknown): T | undefined => {
 const EMPTY_PROGRESS: Progress = { generation: null, hash: null, identity: null, cursor: null, commit: 0, appliedAt: 0 };
 
 /**
- * One projector for one mesh root. open() connects; run() starts the loop; tick() is one pass;
+ * One projector for one mesh root. open() connects; run() watches changes; tick() is one pass;
  * verify() is the divergence check; stop() ends it cleanly (lease released, connections closed).
  */
 export class StateProjector {
@@ -508,6 +508,14 @@ export class StateProjector {
   #queue: Promise<unknown> = Promise.resolve();
   #timer: ReturnType<typeof setTimeout> | undefined;
   #running = false;
+  #watchers: fs.FSWatcher[] = [];
+  #requested = false;
+  #draining = false;
+  #leaseDeadline = Number.POSITIVE_INFINITY;
+  #retryAt = Number.POSITIVE_INFINITY;
+  #walDirty = true;
+  #verifyPending = false;
+  #databaseVersion = -1;
   #lastVerifyAt = Date.now();
   #lastCheckpointAt = 0;
   #lastStatusAt = 0;
@@ -532,6 +540,7 @@ export class StateProjector {
     this.#store = store;
     this.#db = db;
     this.#sql = statements(db);
+    this.#databaseVersion = Number(db.prepare("PRAGMA data_version").get()?.data_version ?? 0);
     this.#pollMs = Math.max(10, options.pollMs ?? 250);
     this.#leaseMs = Math.max(100, options.leaseMs ?? 10_000);
     this.#verifyMs = Math.max(0, options.verifyMs ?? 60_000);
@@ -557,6 +566,8 @@ export class StateProjector {
     const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, {
       checkpoint: "client", checkpointBytes: options.checkpointBytes ?? 64 * 1024 * 1024,
       lockTimeoutMs: options.busyBudgetMs ?? 5_000, ...(options.open ? { open: options.open } : {}),
+      // shadow: its own copy, never the fence; sqlite: the mesh root, which only an import initialises (smarty-dev#6477).
+      ...((options.mode ?? "shadow") === "shadow" ? { initialize: "detached" as const } : {}),
     });
     let db: SqliteConnection | undefined;
     try {
@@ -573,11 +584,46 @@ export class StateProjector {
     }
   }
 
-  /** Starts the loop (one tick per pollMs; unref'd timers: the host owns the process lifetime). */
+  /** Watches file/WAL changes; only lease, pending work and failure deadlines arm timers. */
   run(): this {
     if (this.#role === "stopped" || this.#running) return this;
-    this.#running = true;
-    this.#schedule(0);
+    const watch = (directory: string, state: boolean, database: boolean): void => {
+      const watcher = fs.watch(directory, { persistent: false }, (_event, name) => {
+        if (!this.#running) return;
+        const file = name === null ? undefined : String(name);
+        if (state && (file === undefined || file === STATE_FILE || file === JOURNAL_FILE)) {
+          // A platform may omit the filename. In that case a status-file rewrite is not
+          // a new state generation: compare identity before waking our own writer again.
+          try { if (file !== undefined || stateIdentity(this.root) !== this.#progress?.identity) this.#requestTick(); }
+          catch { this.#requestTick(); }
+        }
+        if (database && (file === undefined || file === "state.db" || file === "state.db-wal")) {
+          try { if (this.#observeDatabase()) this.#requestTick(); }
+          catch { this.#requestTick(); } // The pass reports/fences a failed database read.
+        }
+      });
+      watcher.on("error", (error) => {
+        this.#stats.errors += 1;
+        this.#lastError = errorText(error);
+        this.#emit({ type: "error", at: Date.now(), message: this.#lastError });
+        // Do not silently replace a failed watcher with idle polling.
+        void this.stop();
+      });
+      this.#watchers.push(watcher);
+    };
+    try {
+      const databaseRoot = path.dirname(this.database);
+      if (sameDirectory(this.root, databaseRoot)) watch(this.root, this.mode === "shadow", true);
+      else {
+        if (this.mode === "shadow") watch(this.root, true, false);
+        watch(databaseRoot, false, true);
+      }
+      this.#running = true;
+      this.#requestTick(); // Watch before reading: a commit in the startup window is not lost.
+    } catch (error) {
+      this.#closeWatchers();
+      throw error;
+    }
     return this;
   }
 
@@ -608,6 +654,7 @@ export class StateProjector {
     this.#running = false;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#closeWatchers();
     await this.#serial(() => this.#shutdown(undefined));
   }
 
@@ -630,15 +677,57 @@ export class StateProjector {
   #serial<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.#queue.then(operation, operation);
     this.#queue = run.catch(() => undefined);
-    return run;
+    return run.finally(() => { if (!this.#draining) this.#scheduleDeadline(); });
   }
 
-  #schedule(ms: number): void {
+  #closeWatchers(): void {
+    for (const watcher of this.#watchers.splice(0)) watcher.close();
+    this.#requested = false;
+  }
+
+  #observeDatabase(): boolean {
+    const version = Number(this.#db.prepare("PRAGMA data_version").get()?.data_version ?? 0);
+    if (version === this.#databaseVersion) return false;
+    this.#databaseVersion = version;
+    this.#walDirty = true;
+    if (this.#verifyMs > 0) this.#verifyPending = true;
+    return true;
+  }
+
+  #requestTick(): void {
     if (!this.#running || this.#role === "stopped") return;
+    this.#requested = true;
+    if (this.#draining) return;
+    this.#draining = true;
+    // Coalesce a notification burst without a debounce/poll timer. Notifications arriving
+    // during an awaited transaction leave one more pass pending (never one per event).
+    void Promise.resolve().then(async () => {
+      try {
+        while (this.#running && this.#requested) {
+          this.#requested = false;
+          await this.tick();
+        }
+      } finally {
+        this.#draining = false;
+        this.#scheduleDeadline();
+      }
+    });
+  }
+
+  #scheduleDeadline(): void {
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    if (!this.#running || this.#role === "stopped") return;
+    let at = Math.min(this.#leaseDeadline, this.#retryAt);
+    if (this.#role === "active") {
+      if (this.#walDirty) at = Math.min(at, this.#lastCheckpointAt + this.#checkpointMs);
+      if (this.mode === "shadow" && this.#verifyPending) at = Math.min(at, this.#lastVerifyAt + this.#verifyMs);
+    }
+    if (!Number.isFinite(at)) return;
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      void this.tick().finally(() => this.#schedule(this.#pollMs));
-    }, ms);
+      this.#requestTick();
+    }, Math.max(1, Math.ceil(at - Date.now())));
     this.#timer.unref?.();
   }
 
@@ -647,6 +736,8 @@ export class StateProjector {
     await this.#guard(async () => {
       // smarty-dev#7064: the backend fence comes before election and maintenance in every mode, so a
       // sqlite-mode projector never renews its lease on, or checkpoints, a retired/exporting database.
+      this.#retryAt = Number.POSITIVE_INFINITY;
+      this.#observeDatabase();
       this.#backendFence();
       if (!(await this.#elect())) return;
       if (this.mode === "shadow") await this.#project();
@@ -666,6 +757,7 @@ export class StateProjector {
         return;
       }
       this.#stats.errors += 1;
+      this.#retryAt = Date.now() + this.#pollMs;
       this.#lastError = errorText(error);
       this.#emit({ type: "error", at: Date.now(), message: this.#lastError });
     }
@@ -697,6 +789,7 @@ export class StateProjector {
     this.#running = false;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#closeWatchers();
     const wasActive = this.#role === "active";
     // Release the lease so a standby takes over at once (a crash releases it by expiry). A retired
     // database is never written again (smarty-dev#7064): a rollback/export owns it, expiry releases it.
@@ -733,6 +826,7 @@ export class StateProjector {
         const result = body();
         this.#db.exec("COMMIT");
         committed = true;
+        this.#walDirty = true;
         return result;
       } finally {
         if (!committed && this.#db.isTransaction) try { this.#db.exec("ROLLBACK"); } catch { /* ended */ }
@@ -778,6 +872,9 @@ export class StateProjector {
   async #elect(): Promise<boolean> {
     const now = Date.now();
     const current = this.#readMeta().lease;
+    this.#leaseDeadline = current
+      ? current.expiresAt - (current.owner === this.owner ? this.#leaseMs / 2 : 0)
+      : now;
     if (current && current.owner !== this.owner && current.expiresAt > now) {
       this.#setRole("standby", current.owner);
       return false;
@@ -789,8 +886,12 @@ export class StateProjector {
         this.#backendFence(meta.backend);
         const lease = meta.lease;
         const at = Date.now();
-        if (lease && lease.owner !== this.owner && lease.expiresAt > at) return lease.owner;
+        if (lease && lease.owner !== this.owner && lease.expiresAt > at) {
+          this.#leaseDeadline = lease.expiresAt;
+          return lease.owner;
+        }
         this.#sql.metaPut.run(LEASE_META, JSON.stringify({ owner: this.owner, expiresAt: at + this.#leaseMs, pid: process.pid, host: os.hostname() }));
+        this.#leaseDeadline = at + this.#leaseMs / 2;
         return this.owner;
       });
       if (holder !== this.owner) {
@@ -804,10 +905,11 @@ export class StateProjector {
 
   #maintain(): void {
     const now = Date.now();
-    if (now - this.#lastCheckpointAt >= this.#checkpointMs) {
+    if (this.#walDirty && now - this.#lastCheckpointAt >= this.#checkpointMs) {
       // Re-checked here: election may have awaited, and a checkpoint of an exporting database is refused.
       this.#backendFence();
       this.#lastCheckpointAt = now;
+      this.#walDirty = false;
       try {
         // R10: the elected projector is the checkpointer: PASSIVE, TRUNCATE when large and growing.
         this.#store.checkpoint();
@@ -815,6 +917,8 @@ export class StateProjector {
       } catch (error) {
         this.#stats.errors += 1;
         this.#lastError = errorText(error);
+        this.#walDirty = true;
+        this.#retryAt = now + this.#pollMs;
       }
     }
     this.#stats.walBytes = this.#store.walBytes();
@@ -840,7 +944,7 @@ export class StateProjector {
     const progress = this.#fence(false);
     if (stateIdentity(this.root) === progress.identity) {
       this.#lag = { revisions: 0, generations: 0, ms: 0 };
-      if (this.#verifyMs > 0 && Date.now() - this.#lastVerifyAt >= this.#verifyMs) await this.#verify();
+      if (this.#verifyMs > 0 && this.#verifyPending && Date.now() - this.#lastVerifyAt >= this.#verifyMs) await this.#verify();
       return;
     }
     const head = readHead(this.root);
@@ -1067,6 +1171,7 @@ export class StateProjector {
   async #verify(): Promise<ProjectorDivergence[]> {
     if (this.#role !== "active" || this.mode !== "shadow") return [];
     this.#lastVerifyAt = Date.now();
+    this.#verifyPending = false;
     const snapshot = readSnapshot(this.root, this.#maxStateBytes);
     // One read transaction: the rows and the fence come from one SQLite snapshot.
     let rows: SqliteRow[];

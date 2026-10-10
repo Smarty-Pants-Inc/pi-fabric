@@ -282,7 +282,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
+    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -1469,7 +1469,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, boundGrant?: { role: string | undefined }): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, boundGrant?: { role: string | undefined }, herdrPane?: string): FabricParticipantRecord {
     // Runtime supplies its session_start-bound snapshot. Standalone directories bind once too.
     const role = boundGrant ? boundGrant.role : this.#roleGrant.roleFor(main.sessionId ?? "", main.cwd ?? "");
     const project = main.cwd ? participantProject(main.cwd) : undefined;
@@ -1494,6 +1494,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ...(project ? { project } : {}),
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
+      ...(herdrPane ? { herdrPane } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),
@@ -1993,7 +1994,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       let committedAt = 0;
       const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
         prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
-        afterCommit: () => { committedAt = Date.now(); publication?.committed(); } });
+        // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
+        // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
+        // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
+        commitOutbox: () => { committedAt = Date.now(); publication?.committed(); } });
       if (!filesOnly) this.#recordsWrittenAt = Date.now();
       await publishDeferredFiles();
       // Each record the shared state committed goes to its file too, for runtimes that read files.

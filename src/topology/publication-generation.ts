@@ -98,6 +98,23 @@ const hostDeadline = (id: string, entry: MeshStateEntry | undefined, lease: Fabr
   return lease?.expiresAt;
 };
 
+/** A store that reads one shared-state key at a time (MeshStore; the file store's get). */
+export interface OwnershipPointReadSource {
+  get(key: string, options?: { fresh?: boolean }): MeshStateEntry | undefined;
+}
+
+/**
+ * smarty-dev#6477: the `openState` of `observeActorOwnership` for a live store. Ownership depends on
+ * a handful of keys per actor (its participant record, its owner host record, its root's lineage
+ * closure), so each is a fresh POINT read: a primary-key lookup on SQLite, the stamp-validated
+ * state cache on file. Never a fresh full-state snapshot (`stateToken({ fresh: true })`): on SQLite
+ * that rebuilds the whole state on every commit anywhere on the hub, and registry saves validate
+ * UNDER the actor-registry locks that the resident host heartbeat needs too. Per-key reads need no
+ * cross-key snapshot: validation compares each key on its own, and the stamp is read before them.
+ */
+export const ownershipPointReads = (mesh: OwnershipPointReadSource) => (): ((key: string) => MeshStateEntry | undefined) =>
+  (key: string) => mesh.get(key, { fresh: true });
+
 /** One prepared observation of the ownership inputs of specific actors. */
 export interface ActorOwnershipObservation {
   /** Narrow validation to the actors the save will actually write (call before unchanged()). */
@@ -121,6 +138,8 @@ export interface ActorOwnershipObservation {
  * a moved or removed participant or a closed lineage still does. Leaf files only, so the
  * Windows leaf-stamp behaviour is the behaviour on every platform.
  * Validation, never authority: callers still decide ownership from a fresh directory read.
+ * `openState` returns a reader of shared-state entries current at the call; pass
+ * `ownershipPointReads(store)` (smarty-dev#6477), never a full-state snapshot.
  */
 export const observeActorOwnership = (
   mesh: string | PublicationGenerationSource,

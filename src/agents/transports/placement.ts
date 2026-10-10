@@ -189,6 +189,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     if (config.resultDirectory) values.resultDir = render(config.resultDirectory, values);
     writeJsonAtomic(path.join(path.dirname(statusFile), "placement.json"), { id: request.id, host: values.host, output, deadline, ...(values.resultDir ? { resultDirectory: values.resultDir } : {}) });
     audit("placement.remote", { host: values.host, needs: request.needs ?? [], deadline });
+    handle.placement = `remote ${values.host}`;
     save("running");
     return handle;
   } catch (error) {

@@ -310,6 +310,8 @@ interface FabricAgentHandle {
   actorId?: string;
   actorName?: string;
   sessionId?: string;
+  /** "remote <host>" when host placement ran this task on a work host. */
+  placement?: string;
   runnerSessionId?: string;
   runnerSessionIds?: string[];
   mainAgentId?: string;

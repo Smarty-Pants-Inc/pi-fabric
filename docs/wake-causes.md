@@ -16,7 +16,7 @@ Example: human input followed by an admitted Fabric steer in one boundary:
 {"cause":"multiple","exact":false,"causes":[{"cause":"unattributed","exact":false},{"cause":"steer","from":{"id":"agent:worker","name":"Worker","kind":"agent"},"exact":true}]}
 ```
 
-Batched Main followUps, root mesh inbox events and local lifecycle events retain all their causes, rather than selecting one representative as an exact aggregate.
+Batched Main followUps, root mesh inbox events and local lifecycle events retain all their causes as an exact aggregate; none is reduced to one representative.
 
 ## Trust boundary
 

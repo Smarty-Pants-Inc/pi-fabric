@@ -28,30 +28,6 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
-### Bound Main name selectors
-
-An interactive Main publishes its Pi session name, or its Herdr agent name when unnamed.
-`agents.steer` / `agents.followUp` accept `id: "name:<name>"`. The first publisher records durable
-selector custody in `topology/main-names/`: `{sessionId, herdrPane, hostId}` plus its owner-process
-witness. A later same-named Main remains in `agents.sessions` with `nameBinding: "unbound"`.
-
-A name never selects a different session while its bound owner is absent, reloading, or of unknown
-liveness. These attempts refuse with `FABRIC_NAME_TARGET_ABSENT` and `boundSessionId`; no command
-is sent. Multiple live matches still refuse with `FABRIC_NAME_TARGET_AMBIGUOUS`. Rebinding requires
-positive owner death on that owner's host: PID gone (`ESRCH`) or a readable start-time mismatch,
-not lease expiry, missing presence, or a clean-close receipt. The exact binding is CAS-replaced,
-and `topology/main-name-rebindings/` records the old/new binding in the same transaction.
-A remote-host witness is never tested against local PIDs; unknown remote death stays fail-closed.
-
-Principal names from available `setup/org.json` (`principals[].orgInstance.herdrAgent`) are not
-`name:` targets. The conservative fixed deny list also contains `org`, `org-kate`, `org-marisela`,
-`org-deputy`, and `org-preview-paul`. Use exact `session:<uuid>` ids for principals.
-
-**Same-UID is the fleet trust boundary (smarty-dev#7800).** Herdr names and durable selector custody
-do not authenticate identity or grant principal authority: a same-UID process can rename itself
-or alter fleet-owned files. This mechanism prevents ordinary name squatting from redirecting a
-bound selector, not malicious mutation by a trusted UID.
-
 ### Opt-in process task placement
 
 A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.

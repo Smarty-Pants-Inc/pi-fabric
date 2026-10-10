@@ -6,10 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
-import { FabricTellNameTargetError } from "../src/providers/agents-message-router.js";
 import { herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
 import { rootParticipantName } from "../src/topology/participant-name.js";
-import { claimMainName, mainNameBindingKey, readMainNameBinding, MAIN_NAME_REBINDING_PREFIX } from "../src/topology/main-name-binding.js";
 
 // smarty-dev#6758: an unnamed Main takes its Herdr agent name; name:<x> selects one live Main.
 
@@ -128,14 +126,12 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       for (const [m, pane] of [[a, "w1:p1"], [b, "w2:p1"], [dup1, "w3:p1"], [dup2, "w4:p1"], [named, "w5:p1"]] as const) {
         vi.stubEnv("HERDR_PANE_ID", pane);
         await m.runtime.initialize(m.context, config);
-        if (m === dup1) await vi.waitFor(() => expect(readMainNameBinding(a.runtime.mesh, "lane-dup")?.sessionId)
-          .toBe(dup1.id.slice("session:".length)), { timeout: 8000 });
       }
       await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: a.id, name: "lane-a", herdrPane: "w1:p1" }),
         expect.objectContaining({ id: b.id, name: "lane-b", herdrPane: "w2:p1" }),
         expect.objectContaining({ id: dup1.id, name: "lane-dup", herdrPane: "w3:p1" }),
-        expect.objectContaining({ id: dup2.id, name: "lane-dup", herdrPane: "w4:p1", nameBinding: "unbound" }),
+        expect.objectContaining({ id: dup2.id, name: "lane-dup", herdrPane: "w4:p1" }),
         // A valid Pi session name wins over the Herdr name.
         expect.objectContaining({ id: named.id, name: "pi-named", herdrPane: "w5:p1" }),
       ])), { timeout: 8000, interval: 100 });
@@ -151,19 +147,6 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       // A Main can address itself by its own Herdr name.
       await expect(a.invoke("agents.followUp", { id: "name:lane-a", message: "self" }))
         .resolves.toMatchObject({ routed: "main", queued: true });
-
-      // tell remains actor-oriented: reject even a resolvable Main name before routing.
-      const tellCommandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
-      const deliveriesBefore = all.map(m => m.sendMessage.mock.calls.length);
-      for (const target of [{ id: "name:lane-b" }, { to: "name:lane-b" },
-        { id: " name:lane-a " }, { id: "name:nobody" }, { id: "name:org" }]) {
-        const error = await a.invoke("agents.tell", { ...target, message: "never via tell" }).catch(error => error);
-        expect(error).toBeInstanceOf(FabricTellNameTargetError);
-        expect(error).toMatchObject({ code: "FABRIC_TELL_NAME_TARGET_UNSUPPORTED",
-          message: expect.stringContaining("agents.steer or agents.followUp") });
-      }
-      expect(a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(tellCommandsBefore);
-      expect(all.map(m => m.sendMessage.mock.calls.length)).toEqual(deliveriesBefore);
 
       const commandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
       const ambiguous = await a.invoke("agents.followUp", { id: "name:lane-dup", message: "never guess" })
@@ -182,22 +165,8 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       await expect(a.invoke("agents.followUp", { id: dup1.id, message: "exact id" }))
         .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
 
-      // Removing presence is NOT positive process death (these test Mains share a pid).
+      // The duplicate resolves once only one live Main keeps the name.
       await dup1.runtime.shutdown();
-      const beforeSquat = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
-      await expect(a.invoke("agents.followUp", { id: "name:lane-dup", message: "squat during absence" }))
-        .rejects.toMatchObject({ code: "FABRIC_NAME_TARGET_ABSENT", boundSessionId: dup1.id });
-      expect(a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(beforeSquat);
-      expect(dup2.sendMessage).not.toHaveBeenCalled();
-      // A readable start-time mismatch is the PID-reuse death witness, not lease expiry.
-      const old = readMainNameBinding(a.runtime.mesh, "lane-dup")!;
-      const newcomerIdentity = { id: dup2.id, name: "main", kind: "main" as const };
-      await a.runtime.mesh.put({ key: mainNameBindingKey("lane-dup"), identity: newcomerIdentity,
-        value: { ...old, owner: { ...old.owner, processStartedAt: "0" } } });
-      const newcomer = (await a.invoke("agents.sessions") as import("../src/topology/types.js").FabricParticipantInfo[])
-        .find((s) => s.id === dup2.id)!;
-      await claimMainName(a.runtime.mesh, newcomerIdentity, newcomer);
-      expect(a.runtime.mesh.listAll(MAIN_NAME_REBINDING_PREFIX)).toHaveLength(1);
       await expect(a.invoke("agents.followUp", { id: "name:lane-dup", message: "only live" }))
         .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
       expect(dup2.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -207,62 +176,6 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 40_000);
-
-  it.each([[false, "reload"], [false, "exit"], [true, "reload"], [true, "exit"]] as const)(
-    "refuses a same-named newcomer during %s/%s, keeps it unbound in sessions, and forbids principal selectors", async (files, reason) => {
-      const root = temp();
-      for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
-      vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
-      vi.stubEnv("HERDR_PANE_ID", undefined);
-      const meshRoot = path.join(root, "mesh");
-      const config = normalizeFabricConfig({ fullCodeMode: false,
-        mesh: { enabled: true, root: meshRoot, actorPollMs: 20 },
-        agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
-        mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
-        prewalk: { enabled: false, alwaysRearm: false },
-      });
-      const lead = main(root, "aaaaaaaa-0000-4000-8000-000000000001", "lead");
-      const newcomer = main(root, "bbbbbbbb-0000-4000-8000-000000000002", "lead");
-      const sender = main(root, "cccccccc-0000-4000-8000-000000000003", "sender");
-      const principal = main(root, "dddddddd-0000-4000-8000-000000000004", "org");
-      try {
-        if (files) {
-          const { MeshStore } = await import("../src/mesh/store.js");
-          const { LIVENESS_POLICY_KEY } = await import("../src/topology/host-leases.js");
-          await new MeshStore(meshRoot, 64 * 1024, 1000).put({ key: LIVENESS_POLICY_KEY,
-            identity: { id: lead.id, name: "main", kind: "main" },
-            value: { version: 1, participants: "files", hostLeases: "files" } });
-        }
-        await lead.runtime.initialize(lead.context, config);
-        await sender.runtime.initialize(sender.context, config);
-        await lead.runtime.shutdown(reason);
-        await newcomer.runtime.initialize(newcomer.context, config);
-        expect(await sender.invoke("agents.sessions")).toEqual(expect.arrayContaining([
-          expect.objectContaining({ id: newcomer.id, name: "lead", nameBinding: "unbound" }),
-        ]));
-        const before = sender.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
-        for (const action of ["steer", "followUp"] as const) {
-          await expect(sender.invoke(`agents.${action}`, { id: "name:lead", message: "never to newcomer" }))
-            .rejects.toMatchObject({ code: "FABRIC_NAME_TARGET_ABSENT", boundSessionId: lead.id });
-        }
-        expect(sender.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(before);
-        expect(newcomer.sendMessage).not.toHaveBeenCalled();
-        expect(lead.sendMessage).not.toHaveBeenCalled();
-        await principal.runtime.initialize(principal.context, config);
-        const principalBefore = sender.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
-        await expect(sender.invoke("agents.steer", { id: "name:org", message: "not by name" }))
-          .rejects.toMatchObject({ code: "FABRIC_NAME_TARGET_PRINCIPAL" });
-        expect(sender.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(principalBefore);
-        expect(principal.sendMessage).not.toHaveBeenCalled();
-        await expect(sender.invoke("agents.steer", { id: principal.id, message: "exact principal session" }))
-          .resolves.toMatchObject({ acknowledged: true });
-        expect(principal.sendMessage).toHaveBeenCalledOnce();
-      } finally {
-        await principal.runtime.shutdown(); await newcomer.runtime.shutdown(); await sender.runtime.shutdown();
-        await lead.runtime.shutdown();
-        fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-      }
-    }, 30_000);
 
   it("keeps main for a Main whose Herdr lookup fails and for a print-mode root", async () => {
     const root = temp();

@@ -39,7 +39,6 @@ import {
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
-import { claimMainName, mainNameProcessOwner, principalMainNames, readMainNameBinding, type MainNameBinding } from "./main-name-binding.js";
 import { ownProcessIncarnation } from "../core/atomic-write.js";
 import {
   ParticipantFileLockBusyError,
@@ -544,7 +543,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #ownIncarnationValue: string | undefined;
   #prepareFileLocks = false;
   readonly #roleGrant = new ParticipantRoleGrant();
-  #principalNames: ReadonlySet<string> | undefined;
   readonly #heartbeatMs: number;
   /** Latest commit witness mtime already behind a confirmation receipt (smarty-dev#6477 L6). */
   #commitWitnessSeen = 0;
@@ -953,25 +951,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     ) {
       byId.set(self.id, self);
     }
-    const nameRead = { snapshot: this.mesh.stateToken(read) };
-    return [...byId.values()].map((participant) => {
-      if (participant.kind !== "root") return participant;
-      const binding = readMainNameBinding(this.mesh, participant.name, nameRead);
-      return { ...participant, nameBinding: !this.principalName(participant.name) &&
-        binding?.sessionId === participant.sessionId && binding?.hostId === participant.ownerHostId &&
-        binding?.herdrPane === participant.herdrPane ? "bound" as const : "unbound" as const };
-    }).sort(
+    return [...byId.values()].sort(
       (left, right) =>
         left.startedAt - right.startedAt || left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
     );
-  }
-
-  mainNameBinding(name: string): MainNameBinding | undefined {
-    return readMainNameBinding(this.mesh, name);
-  }
-
-  principalName(name: string): boolean {
-    return (this.#principalNames ?? principalMainNames(this.#localRecords.get(this.options.rootId)?.cwd)).has(name);
   }
 
   // The directory's records, parsed once per parse of the shared state. list() ran for every
@@ -1499,7 +1482,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
       name: rootParticipantName(sessionName),
-      mainNameOwner: mainNameProcessOwner(),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
       transport: "host",
@@ -1673,12 +1655,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // this fresh authority read, not every idle heartbeat (smarty-dev#4383).
     if (desired.get(this.options.rootId)?.kind === "root" &&
       this.#localRecords.get(this.options.rootId)?.kind !== "root") await this.resumeLineage();
-    // Name custody precedes even file-only presence and survives close/reload/reaping.
-    // A newcomer remains visible, but cannot replace an absent owner without positive death.
-    if (this.options.enabled && !this.#quiescing && candidateRoot?.kind === "root") {
-      this.#principalNames ??= principalMainNames(candidateRoot.cwd);
-      if (!this.#principalNames.has(candidateRoot.name)) await claimMainName(this.mesh, this.options.identity, candidateRoot);
-    }
     // Mint before the local cache swap so self() exposes the label too.
     await this.#ensurePeerLabels(desired);
     if (!this.options.enabled) {

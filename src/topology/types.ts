@@ -2,7 +2,6 @@ import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentUsage } from "../agents/types.js";
-import type { MainNameBinding, MainNameOwner } from "./main-name-binding.js";
 
 export type FabricParticipantKind = "root" | "agent" | "actor";
 export type FabricParticipantResidency = "session" | "durable";
@@ -34,8 +33,6 @@ export interface FabricParticipantRecord {
   role?: string;
   /** The Herdr pane a root Main runs in (smarty-dev#6758); display only, never authority. */
   herdrPane?: string;
-  /** Local process-incarnation witness for name selection; never authentication. */
-  mainNameOwner?: MainNameOwner;
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
   /** Runtime project root, distinct from the shared checkout of linked worktrees. */
@@ -89,8 +86,6 @@ export interface FabricParticipantRecord {
 export interface FabricParticipantInfo extends FabricParticipantRecord {
   local: boolean;
   stale: boolean;
-  /** Display-only selector custody; never an authentication or role grant. */
-  nameBinding?: "bound" | "unbound";
 }
 
 export interface FabricHostRecord {
@@ -145,8 +140,6 @@ export interface FabricPeerInfo {
 
 export interface FabricParticipantSource {
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
-  mainNameBinding?(name: string): MainNameBinding | undefined;
-  principalName?(name: string): boolean;
   get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
   /**
    * Whether this host publishes the participant (`main` names the lineage root), from memory.

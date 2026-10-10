@@ -9,7 +9,7 @@ import {
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
 
-const MAIN_NAME_TARGET = "Target id. name:<name> selects only its durable first-publisher Main binding, never an unbound newcomer during absence/reload. Refuses absent or ambiguous matches; principal names require exact session:<uuid> ids. Bindings are selector custody, not same-UID authentication.";
+const MAIN_NAME_TARGET = "Target id. name:<name> selects the one live Main with that published name and refuses (listing candidates) when none or several match.";
 
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
@@ -540,7 +540,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "tell",
-    description: "Queue a message through a persistent actor's live owner without waiting. Main name selectors are not supported; use steer or followUp for Main name addressing. Optional model/thinking values apply only to this activation.",
+    description: "Queue a message through a persistent actor's live owner without waiting. Optional model/thinking values apply only to this activation.",
     inputSchema: {
       type: "object",
       properties: { ...actorInvocationProperties,

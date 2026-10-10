@@ -237,7 +237,7 @@ export class ActorRegistryStore {
           renamed = true;
           if (durable) syncDirectoryChain(this.#actorRoot);
           this.#payloads.publishHeads(changedHeads);
-          payload.accept(changedHeads);
+          payload.accept(changedHeads, accepted);
           this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
         } catch (error) {
           if (renamed) {
@@ -355,6 +355,9 @@ export class ActorRegistryStore {
   messages(record: Record<string, unknown>, limit?: number): unknown[] {
     return this.#payloads.messages(record, limit);
   }
+
+  /** Actor ids whose committed ring digest this store remembers (tests). */
+  committedRingIds(): string[] { return this.#payloads.committedRingIds(); }
 
   messageCount(record: Record<string, unknown>): number {
     return this.#payloads.count(record);

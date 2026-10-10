@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Fixed-load mesh lock benchmark: the acceptance number of the mesh-lock redesign and, later,
-// its CI ratchet (smarty-dev#6477 L9a, smarty-dev#6676). Synthetic only: it seeds its own
-// mesh root in $TMPDIR and never opens a live mesh. Runs against dist/ (bun run build first);
-// on a shared host run it under nice -n 19. docs/mesh-lock-bench.md explains the load,
-// the metrics and the ratchet.
+// Fixed-load mesh lock benchmark: the acceptance number of the mesh-lock redesign and its CI
+// ratchet, the mesh-lock-bench job in .github/workflows/test.yml (smarty-dev#6477 L9a,
+// smarty-dev#6676). Synthetic only: it seeds its own mesh root in $TMPDIR and never opens a
+// live mesh. Runs against dist/ (bun run build first); on a shared host run it under
+// nice -n 19. docs/mesh-lock-bench.md explains the load, the metrics and the ratchet.
 //
 //   node scripts/benchmark-mesh-lock.mjs [--duration 120] [--warmup 15] [--state-mb 4.8] ...
 //     [--out result.json] [--baseline bench/mesh-lock-baseline.json --max-regress 10] [--gate-timing]

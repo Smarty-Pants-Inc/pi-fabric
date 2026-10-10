@@ -60,7 +60,7 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   }
   for (const key of [
     "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",
-    "HERDR_WORKSPACE_ID", "MCPORTER_CONFIG",
+    "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "HERDR_BIN_PATH", "MCPORTER_CONFIG",
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.

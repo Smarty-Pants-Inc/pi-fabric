@@ -55,7 +55,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
+import type { AgentRunRecord, AgentRunRequest } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -2743,8 +2743,14 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
-  it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
+  it.each([[undefined, false], ["handoff-review", false], [undefined, true]] as const)("defers handoff until the finalized outer Fabric result and records its class: %s, interrupted=%s", async (routeClass, interrupted) => {
     const { provider, root, agents } = setup();
+    const warning = "final report interrupted by a model stream error; showing the last persisted output";
+    if (interrupted) {
+      const wait = agents.wait.bind(agents);
+      vi.spyOn(agents, "wait").mockImplementation(async (...args) => ({ ...await wait(...args), status: "failed",
+        text: "VERDICT: PASS", partialText: "VERDICT: PASS", error: "stream disconnected", warnings: [warning], exitCode: 1 }));
+    }
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));
     source.appendMessage({
       role: "user",
@@ -2836,9 +2842,10 @@ describe("AgentsProvider runner support", () => {
 
     expect(result).toMatchObject({
       handedOff: true,
-      completed: true,
-      status: "completed",
-      implementation: "fake worker complete",
+      completed: !interrupted,
+      status: interrupted ? "failed" : "completed",
+      implementation: interrupted ? "VERDICT: PASS" : "fake worker complete",
+      ...(interrupted ? { partialText: "VERDICT: PASS", warnings: [warning], exitCode: 1, error: "stream disconnected" } : {}),
       agent: { model: "anthropic/executor" },
     });
     const expectedClass = { routeClass: routeClass ?? "handoff", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
@@ -2846,7 +2853,7 @@ describe("AgentsProvider runner support", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, "runs", result.agent.id, "status.json"), "utf8")))
       .toMatchObject(expectedClass);
     expect(updates).toContainEqual(expect.stringContaining("caller is waiting"));
-    expect(updates).toContainEqual(expect.stringContaining("completed implementation"));
+    expect(updates).toContainEqual(expect.stringContaining(interrupted ? "ended with failed" : "completed implementation"));
     const task = fs.readFileSync(
       path.join(root, "runs", result.agent.id, "task.txt"),
       "utf8",
@@ -4340,6 +4347,71 @@ describe("AgentsProvider retained run authorization", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
+  it.each([false, true])("round 2 members leaves a legacy binding unknown with project defaults=%s (#7682)", async hasDefaults => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "legacy-member", instructions: "Observe.",
+      ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
+    });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].projectDefaults;
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const reader = new ActorManager("test", state.identity, state.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(reader);
+    await reader.setModel(actor.id, "provider/reader-overlay");
+    await reader.setThinking(actor.id, "high");
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => reader.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, reader, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      const members = await provider.invoke("members", { kinds: ["actor"] }, context) as FabricParticipantInfo[];
+      expect(members).toHaveLength(1);
+      expect(members[0]?.id).toBe(actor.id);
+      expect(members[0]?.model).toBeUndefined();
+      expect(members[0]?.thinking).toBeUndefined();
+      expect(reader.status(actor.id)).toMatchObject({ model: "provider/reader-overlay", thinking: "high" });
+    } finally { await directory.close(); }
+  });
+
+  it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => state.actors.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+      await state.actors.setThinking(actor.id, "xhigh");
+      await state.actors.ask(actor.id, "first run");
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" }),
+      ]);
+      await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "provider/foreign", thinking: "low" }),
+      ]);
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna",
+        projectDefaults: { model: "anthropic/claude-opus-5-5" } });
+    } finally { await directory.close(); }
+  });
+
   it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
     const { provider, actors } = setup();
     const actor = await actors.create(createRequest as FabricActorRequest);
@@ -4819,7 +4891,8 @@ describe("AgentsProvider shared actor definitions", () => {
       fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };
     expect(registry.actors).toContainEqual(
-      expect.objectContaining({ id: actor.id, model: "provider/project-default" }),
+      expect.objectContaining({ id: actor.id, model: "provider/project-default", thinking: "medium",
+        resolvedBinding: { model: "provider/model-b", thinking: "medium" } }),
     );
   });
 
@@ -5290,6 +5363,24 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: "not a path" }, context)).rejects.toThrow("Invalid actor coalesceKey");
     await expect(provider.invoke("setCoalesceKey", { id: actor.id }, context)).rejects.toThrow("coalesceKey is required");
     await expect(provider.invoke("create", { name: "bad", instructions: "x", coalesceKey: "" }, context)).rejects.toThrow("Invalid actor coalesceKey");
+  });
+
+  it("creates and imports an actor with an explicit dedupeKey independently of coalesceKey", async () => {
+    const { provider } = setup();
+    const actor = await provider.invoke("create", {
+      name: "owner-alarm", instructions: "Handle alarms.", topics: ["ops.owner"],
+      dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 },
+    }, context) as { id: string; dedupeKey?: string; coalesceKey?: string };
+    expect(actor).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 } });
+    await expect(provider.invoke("status", { id: actor.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: null }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    const template = await provider.invoke("create", {
+      name: "alarm-template", instructions: "Handle alarms.", scope: "global", dedupeKey: "data.key", activation: { minIntervalMs: 1_000 },
+    }, context) as { id: string };
+    await expect(provider.invoke("import", { id: template.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key", activation: { minIntervalMs: 1_000 } });
+    for (const dedupeKey of ["", "not a path", "data..key", "x".repeat(201), 42, null]) {
+      await expect(provider.invoke("create", { name: "bad-dedupe", instructions: "x", dedupeKey }, context)).rejects.toThrow("Invalid actor dedupeKey");
+    }
   });
 
   // smarty-dev#1579: the skip-only activation filter, set at creation or later, project or global.
@@ -6185,3 +6276,119 @@ describe("own-root resident setters and authoritative status", () => {
   });
 });
 
+describe("external spawn router hook (#2890)", () => {
+  const pick = { model: "provider/model-b", thinking: "high", reason: "policy:task/normal", policyVersion: "v1" };
+  const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {}) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-spawn-router-")); roots.push(dir);
+    const inputPath = path.join(dir, "requests.jsonl");
+    const command = [process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
+      require('node:fs').appendFileSync(process.argv[1], input); ${body ?? `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`}
+    });`, inputPath];
+    const state = setup([], [], undefined, { agentsConfig: { model: "provider/model-a", thinking: "medium", ...agentsConfig,
+      router: { command, mode, timeoutMs: 400 } } });
+    const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    return { ...state, dir, inputPath, logs, requests };
+  };
+  it.each(["off", "shadow", "enforce"] as const)("%s selects the expected actual worker model/thinking", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "implementation", name: "normal child", complexity: "normal", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual);
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    if (mode === "off") {
+      expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+    } else {
+      expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+      expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", name: "normal child", requestedComplexity: "normal", parentId: state.identity.id,
+        defaults: { model: "provider/model-a", thinking: "medium" } })]);
+      expect(state.requests()[0]).not.toHaveProperty("task");
+    }
+  });
+  it("advertises all four caller complexity classes in the spawn schema", async () => {
+    const state = routerSetup("off");
+    const spawn = await state.provider.describe("spawn", context);
+    expect(spawn?.inputSchema).toMatchObject({ properties: { complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"] } } });
+  });
+  it.each(["shadow", "enforce"] as const)("accepts delicate and forwards it verbatim in %s mode", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "delicate implementation", complexity: "delicate", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", requestedComplexity: "delicate" })]);
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+  });
+  it.each([
+    [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
+    [{ thinking: "xhigh" }, { model: "provider/model-a", thinking: "xhigh" }],
+  ])("caller override %j bypasses router and is logged explicit", async (overrides, actual) => {
+    const state = routerSetup("enforce");
+    const child = await state.provider.invoke("spawn", { task: "explicit", ...overrides }, context) as AgentHandleInfo;
+    expect(child).toMatchObject(actual); await state.agents.wait(child.id);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual, error: null })]);
+  });
+  it.each([
+    ["process.stdout.write('garbage');", "invalid-json"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/unknown', thinking: 'high' }));", "unknown-or-denied-model"],
+    ["setInterval(() => {}, 1000);", "timeout"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'invalid' }));", "invalid-output"],
+  ])("router error %s keeps worker defaults and records %s", async (body, error) => {
+    const state = routerSetup("enforce", body);
+    const child = await state.provider.invoke("spawn", { task: "fallback" }, context) as AgentHandleInfo;
+    const actual = { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual); expect(await state.agents.wait(child.id)).toMatchObject({ status: "completed", ...actual });
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, error })]);
+  });
+  it("does not fuzzy-match or bypass host deny policy for a router pick", async () => {
+    for (const model of ["provider/modle-b", "provider/model-b"]) {
+      const state = routerSetup("enforce", `process.stdout.write(JSON.stringify({ model: ${JSON.stringify(model)}, thinking: 'high' }));`, { deniedModels: ["provider/model-b"] });
+      const child = await state.provider.invoke("spawn", { task: "protected fallback" }, context) as AgentHandleInfo;
+      expect(child.model).toBe("provider/model-a"); await state.agents.wait(child.id);
+      expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
+    }
+  });
+  it("uses inherited model/thinking as the static default but does not mistake inheritance for explicit", async () => {
+    const state = routerSetup("shadow");
+    const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, undefined, state.lifecycle,
+      undefined, undefined, true, undefined, () => "max");
+    const child = await provider.invoke("spawn", { task: "inherited" }, inherited) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: "provider/session", thinking: "max" }); await state.agents.wait(child.id);
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()[0]).toMatchObject({ pick, actual: { model: "provider/session", thinking: "max" } });
+  });
+  it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
+    const state = routerSetup("enforce");
+    const actor = await state.provider.invoke(action, { name: "router actor", instructions: "private actor instructions" }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.actors.definition(actor.id)).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
+    expect(state.logs()).toHaveLength(1);
+  });
+  it.each(["complex", "delicate"] as const)("forwards the selected model and %s complexity to a durable spawn without a second router call", async complexity => {
+    const state = routerSetup("enforce");
+    const spawnAgent = vi.fn(async (request: AgentRunRequest) => ({ id: "durable-test", name: "durable", runner: "pi", transport: "process", cwd: process.cwd(), status: "running", model: request.model, thinking: request.thinking }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const child = await state.provider.invoke("spawn", { task: "durable", complexity, residency: "durable" }, context) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity }), undefined);
+    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]); expect(state.logs()).toHaveLength(1);
+  });
+  it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
+    const state = routerSetup("enforce");
+    await state.provider.invoke("create", { name: "template", instructions: "later", scope: "global" }, context);
+    await state.provider.invoke("run", { task: "one-off" }, context);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+  });
+  it("validates complexity before command or launch", async () => {
+    const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "bad hint", complexity: "extreme" }, context)).rejects.toThrow("Invalid agent complexity: expected simple, normal, complex or delicate");
+      expect(launch).not.toHaveBeenCalled(); expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+    } finally { launch.mockRestore(); }
+  });
+});

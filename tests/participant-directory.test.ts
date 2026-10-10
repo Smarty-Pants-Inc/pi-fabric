@@ -20,6 +20,11 @@ import { awaitPeerSettle, type PeerSettleResult } from "../src/topology/peer-set
 
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
+// smarty-dev#6956: for tests that read a peer's record right after start(), not across expiry.
+// With the default 300 ms test lease, a stalled event loop (a loaded CI runner) let the peer's
+// host lease lapse before the read; peers() then fell back to its legacy sessions/ advertisement
+// (fixed 15 s TTL), which carries no role, project or repository. No stall outlasts this lease.
+const steadyLease = { heartbeatMs: 60_000, leaseMs: 120_000 };
 
 const rootRecord = (
   id: string,
@@ -106,9 +111,15 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     const directory = fixture();
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
-    const read = vi.spyOn(directory.mesh, "exclusive");
+    // A state operation bounded to 250 ms, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
+    const read = vi.spyOn(directory.mesh, "withTryLock");
+    const exclusive = vi.spyOn(directory.mesh, "exclusive");
+    const fence = vi.spyOn(directory.mesh, "writeBatch");
     await directory.refreshRoutingView();
-    expect(read).toHaveBeenCalledWith(expect.any(Function), 250);
+    expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(250);
+    expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
+    expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
     expect(directory.canConsumeMesh()).toBe(false);
     await directory.refresh();
@@ -1014,11 +1025,11 @@ describe("ParticipantDirectory role and project", () => {
     let alpha: ParticipantDirectory;
     const info = { id: identity.id, name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host",
       cwd: dir, sessionId: "audit", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true } as const;
-    alpha = createDirectory(path.join(dir, "mesh"), identity, identity.id, () => [alpha.root(info, false)]);
+    alpha = createDirectory(path.join(dir, "mesh"), identity, identity.id, () => [alpha.root(info, false)], steadyLease);
     await alpha.start();
     expect(alpha.get(identity.id)).toMatchObject({ repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false, capabilities: ["fabric"] });
     expect(alpha.root(info, true)).toMatchObject({ interactive: true, capabilities: ["steer", "followUp", "fabric"], mainBindings: false });
-    const reader = createDirectory(path.join(dir, "mesh"), { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => []);
+    const reader = createDirectory(path.join(dir, "mesh"), { id: "session:reader", name: "main", kind: "main" }, "session:reader", () => [], steadyLease);
     expect(reader.peers()).toEqual([expect.objectContaining({ id: identity.id, repository: "github.com/smarty-pants-inc/pi-fabric", interactive: false })]);
   });
 
@@ -1036,8 +1047,8 @@ describe("ParticipantDirectory role and project", () => {
       alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [alpha!.root({
         id: alphaIdentity.id, name: "main", kind: "main", status: "idle", runner: "pi", transport: "host",
         cwd: process.cwd(), sessionId: "alpha", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true,
-      } as never)]);
-      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+      } as never)], steadyLease);
+      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")], steadyLease);
       await alpha.start();
       await beta.start();
       expect(beta.peers().find((peer) => peer.id === "session:alpha")).toMatchObject({
@@ -1071,8 +1082,8 @@ describe("ParticipantDirectory root project", () => {
       alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [alpha!.root({
         id: alphaIdentity.id, name: "main", kind: "main", status: "idle", runner: "pi", transport: "host",
         cwd: process.cwd(), sessionId: "alpha", startedAt: 1, updatedAt: 2, pendingMessages: false, local: true,
-      } as never)]);
-      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+      } as never)], steadyLease);
+      const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")], steadyLease);
       await alpha.start();
       await beta.start();
       const peer = beta.peers().find((candidate) => candidate.id === "session:alpha");

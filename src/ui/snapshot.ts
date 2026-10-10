@@ -66,7 +66,7 @@ const stateEntry = (entry: MeshStateEntry): FabricUiStateEntry => {
   };
 };
 
-/** Poll-only memoization. Event-driven refreshes and dispatch bypass this cache. */
+/** Optional memoization for snapshot consumers; controller event refreshes bypass this cache. */
 export class FabricDashboardSnapshotCache {
   private inputs: unknown;
   private snapshot: FabricDashboardSnapshot | undefined;
@@ -109,8 +109,8 @@ export const createDashboardSnapshot = (
     typeof state.agents.listForUi === "function"
       ? state.agents.listForUi()
       : state.agents.list();
-  // Observe externally owned domains on every poll, including remote lease
-  // expiry and model/usage updates that need not emit a local manager event.
+  // Observe externally owned domains on each event or explicit view refresh.
+  // Quiet remote lease/model changes are picked up on the next notification or view opening.
   // smarty-dev#4250: these three mesh reads only FEED the dashboard (nothing here routes,
   // admits or writes), so they are displayOnly: `background` makes the participant directory
   // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.

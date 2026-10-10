@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { assertMeshStateReadable, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -17,6 +19,7 @@ import type {
 
 import { reapDeadHostRecords } from "./host-reaper.js";
 import { compactExpiredHostRecords } from "./host-record-compaction.js";
+import { withStateFence } from "../mesh/commit-outbox.js";
 import { effectiveLiveness } from "./liveness.js";
 import { isLiveLegacyRootEntry, sessionLiveness, LEGACY_ROOT_LEASE_MS as PARTICIPANT_LEASE_MS } from "./legacy-root-liveness.js";
 import {
@@ -25,6 +28,7 @@ import {
   hostLiveness,
   LIVENESS_POLICY_KEY,
   readHostLease,
+  readHostLeaseCurrent,
   readHostLeaseSnapshot,
   participantLeaseGraceMs,
   waitForHostLeaseRenewal,
@@ -33,6 +37,7 @@ import {
   removeHostLease,
   STATE_LEASE_RENEW_MS,
   writeHostLease,
+  meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
@@ -269,6 +274,23 @@ const remoteHostValid = (value: unknown): boolean =>
 const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   keys.every((key) => value[key] === undefined || typeof value[key] === "string");
 
+let ownProcessIdentity: { pid: number; host: string; startTime?: string } | undefined;
+/** This process's identity, read once: stable for the process's life. */
+const ownMainProcess = (): { pid: number; host: string; startTime?: string } => {
+  if (!ownProcessIdentity) {
+    // Linux /proc/<pid>/stat field 22 (start ticks), after comm; the same value residency's processStartTime reads.
+    let startTime: string | undefined;
+    if (process.platform === "linux") {
+      try {
+        const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+        startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      } catch { /* unknown: the record carries no start time */ }
+    }
+    ownProcessIdentity = { pid: process.pid, host: os.hostname(), ...(startTime ? { startTime } : {}) };
+  }
+  return ownProcessIdentity;
+};
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
@@ -279,7 +301,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
+    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -591,6 +613,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #routingReadAt = 0;
   #routingError: unknown;
   #leaseConfirmed = false;
+  /** Only a kept predecessor reload lease needs takeover after the first host commit. */
+  #keptReloadLease = false;
   #deadHostSweepAt = Date.now();
   #presencePassAt = Date.now();
   #quiescing = false;
@@ -801,6 +825,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // Every commit witness up to here is accounted for by this receipt, our own commit's included.
       this.#commitWitnessSeen = latestCommitWitness(this.mesh.root);
       this.#leaseConfirmed = true;
+      // Only a reload successor withheld its own lease before the host commit.
+      if (this.#keptReloadLease && this.options.enabled && (!this.#quiescing || this.#reloadUntil !== undefined)) {
+        try { this.#renewFileLease(); } catch { /* the next heartbeat renews it */ }
+      }
       this.#refreshError = undefined;
       this.#cancelPublicationRetry();
       this.#publicationRetryDelay = 750;
@@ -1233,6 +1261,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (expiresAt >= now) return true;
     if (now - expiresAt > participantLeaseGraceMs(options.graceMs) ||
       participant.status === "stopping" || participant.status === "reloading") return false;
+    // A direct `.lock` observer (smarty-dev#6477 A1 section 4): a heartbeat writer shows there on
+    // the `file` backend only. With state in SQLite this reads the state write-lock signal (L2a).
     const lockWaiting = options.lockWaiting ?? (() => fs.existsSync(path.join(this.mesh.root, ".lock")));
     // A replaced lease file newer than the stored ownership record also explains a cached lapse.
     const advanced = matching && snapshot!.mtimeMs > owner.updatedAt;
@@ -1389,14 +1419,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
       : `participant directory view is overdue (${now - confirmed} ms old)`;
   }
 
-  /** Revalidate once under the ordinary mesh lock, without waiting for a long heartbeat write.
-   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease. */
+  /** Revalidate once under the state write lock, without waiting for a long heartbeat write.
+   * Never promote this read to confirmedAt/canConsumeMesh: it renews no ownership lease.
+   * A state operation, not exclusive(): the backend picks the lock (smarty-dev#6477 R3). */
   async refreshRoutingView(): Promise<void> {
     if (this.#closed) throw new Error("participant directory is closed");
     if (!this.options.enabled) return;
     this.#routingReadAt = 0;
     try {
-      await this.mesh.exclusive(() => {
+      await withStateFence(this.mesh, this.options.identity, () => {
         // MeshStore reads are intentionally tolerant for dashboards. Routing absence is
         // stronger: a damaged canonical state must never be confirmed as an empty view.
         assertMeshStateReadable(this.mesh.root);
@@ -1495,7 +1526,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
-  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, boundGrant?: { role: string | undefined }): FabricParticipantRecord {
+  root(main: FabricMainAgentInfo, interactive = true, sessionName?: string, boundGrant?: { role: string | undefined }, herdrPane?: string): FabricParticipantRecord {
     // Runtime supplies its session_start-bound snapshot. Standalone directories bind once too.
     const role = boundGrant ? boundGrant.role : this.#roleGrant.roleFor(main.sessionId ?? "", main.cwd ?? "");
     const project = main.cwd ? participantProject(main.cwd) : undefined;
@@ -1520,6 +1551,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ...(project ? { project } : {}),
       ...(repository ? { repository } : {}),
       ...(role ? { role } : {}),
+      ...(herdrPane ? { herdrPane } : {}),
       ...(main.sessionId ? { sessionId: main.sessionId } : {}),
       ...(main.model ? { model: main.model } : {}),
       ...(main.thinking ? { thinking: main.thinking } : {}),
@@ -1527,6 +1559,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: main.updatedAt,
       pendingMessages: main.pendingMessages,
       controlProtocol: "v1",
+      mainProcess: ownMainProcess(),
     };
   }
 
@@ -2018,8 +2051,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
       let committedAt = 0;
       const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
-        afterCommit: () => { committedAt = Date.now(); publication?.committed(); } });
+        prepare: view => {
+          this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
+          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
+        },
+        // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
+        // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
+        // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
+        commitOutbox: () => { committedAt = Date.now(); publication?.committed(); } });
       if (!filesOnly) this.#recordsWrittenAt = Date.now();
       await publishDeferredFiles();
       // Each record the shared state committed goes to its file too, for runtimes that read files.
@@ -2082,6 +2121,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (participant?.kind === "actor" && this.options.actorRenewalAllowed &&
         !this.options.actorRenewalAllowed(participant)) return undefined;
       if (this.#renewalAhead(current, committed)) return undefined;
+      if (participant) this.#assertRootPublishable(participant);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }, this.#fileLockOptions()));
@@ -2164,14 +2204,50 @@ export class ParticipantDirectory implements FabricParticipantSource {
       latest > this.#commitWitnessSeen && evidence > this.#refreshedAt && at - evidence <= this.#heartbeatMs;
   }
 
+  /** smarty-dev#6729 gate 1: a listing pairs a root with its owner's shared host record, extended
+   * only by a lease file of the same incarnation (hostLiveness). Until this incarnation's first
+   * shared commit stamps its own host record, that record is still the predecessor's; replacing
+   * the predecessor's live reload lease file with this incarnation's (new startedAt) dropped the
+   * reloading Main from every listing until the commit landed, 10-55 s under lock load. Keep it.
+   * Its reloadUntil still bounds the listing if this release never commits.
+   * The predecessor's own recorded expiry decides, not a relation to this release's #leaseMs: a
+   * fixed 180 s reload lease never outlasts leaseMs >= 180 s (or heartbeatMs >= 90 s), which made
+   * the guard dead under that config (#663 round 2). Before this incarnation's host record commits,
+   * its own lease file pairs with no host record. Keep only a matching predecessor's reload
+   * lease, never an ordinary heartbeat or a lease after our own host record has committed.
+   * Reload is explicit in new leases; older leases extended the fixed Main session TTL.
+   * Neither signal depends on this release's configurable host TTL. */
+  #keepsPredecessorReloadLease(at: number): boolean {
+    if (this.#leaseConfirmed || this.options.identity.kind !== "main" || this.options.hostId !== this.options.rootId) return false;
+    const entry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId), { fresh: true });
+    const host = entry && hostFromEntry(entry);
+    if (!host || host.remoteHost !== undefined || host.startedAt === this.#startedAt ||
+      host.rootId !== this.options.rootId || host.identity.id !== this.options.identity.id) return false;
+    const lease = readHostLeaseCurrent(this.mesh.root, this.options.hostId);
+    return lease !== undefined && lease.rootId === this.options.rootId &&
+      lease.identityId === this.options.identity.id && lease.startedAt !== undefined &&
+      lease.startedAt === host.startedAt && lease.startedAt < this.#startedAt && lease.expiresAt > at &&
+      (lease.reloadUntil === lease.expiresAt ||
+        // Older releases extended the fixed Main session TTL without an explicit reload marker.
+        (lease.reloadUntil === undefined && lease.session?.expiresAt === lease.expiresAt &&
+          lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS));
+  }
+
   #renewFileLease(): number {
     const leaseAt = Date.now();
+    if (this.#keepsPredecessorReloadLease(leaseAt)) {
+      this.#keptReloadLease = true;
+      return leaseAt;
+    }
     const root = this.#localRecords.get(this.options.rootId);
     writeHostLease(this.mesh.root, {
       id: this.options.hostId,
       rootId: this.options.rootId,
       identityId: this.options.identity.id,
       startedAt: this.#startedAt,
+      // The census record's exact start time: identity is (host, pid, startedAt) (pi-fabric#638).
+      writer: meshWriterLeaseRecord(this.mesh.lockProtocol, this.mesh.stateBackend, meshProcessStartedAt),
+      ...(this.#reloadUntil !== undefined ? { reloadUntil: this.#reloadUntil } : {}),
       ...(this.options.identity.kind === "main" && root?.sessionId ? {
         session: {
           id: root.sessionId,
@@ -2183,6 +2259,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: leaseAt,
       expiresAt: this.#reloadUntil ?? leaseAt + this.#leaseMs,
     });
+    this.#keptReloadLease = false;
     return leaseAt;
   }
 
@@ -2229,13 +2306,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
+  /** Under the same key lock or state transaction as the write: a root Main never publishes its root
+   * participant while an operator actor removal fences that root (smarty-dev#7817). */
+  #assertRootPublishable(record: FabricParticipantRecord | undefined): true {
+    if (record?.kind === "root" && record.id === this.options.rootId && mainPublicationFenced(this.mesh.root, record.id)) {
+      throw new MainPublicationFencedError(record.id);
+    }
+    return true;
+  }
+
   #writeFile(
     record: FabricParticipantRecord,
     allowed: (current: MeshStateEntry | undefined) => boolean,
     durable = false,
   ): Promise<boolean> {
     const key = keyFor(PARTICIPANT_PREFIX, record.id);
-    return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
+    return writeParticipantFileIf(this.mesh, key, (current) => this.#assertRootPublishable(record) && allowed(current) ? {
       key,
       value: record,
       version: (current?.version ?? 0) + 1,

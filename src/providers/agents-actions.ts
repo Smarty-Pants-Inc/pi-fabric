@@ -1,5 +1,6 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
 import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
+import { MAX_AGENT_REQUIRED_INPUTS, MAX_AGENT_REQUIRED_INPUT_BYTES } from "../host-compatibility.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
@@ -12,7 +13,8 @@ import type { FabricActionDescriptor } from "../protocol.js";
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities, NFKC-normalized then lowercased and split on commas/Unicode White_Space; tokens must match [a-z0-9._-], canonical local always pins to the Main host, and any unmet need stays local and is audited." },
+  requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Literal absolute selected-host input paths, each at most 4096 UTF-8 bytes, without dot/dot-dot segments, line breaks or control characters. Local process spawns check existence before starting; unsupported transports refuse requires with AgentInputError; remote launches preflight via repeated --require PATH arguments." },
   runner: {
     type: "string",
     enum: ["pi", "claude", "veda"],
@@ -53,6 +55,12 @@ const runProperties = {
     minimum: 0,
     maximum: 19,
     description: "Unix niceness for this child and its tools. Only raises agents.nice, never lowers it.",
+  },
+  bashIdleSeconds: {
+    type: "integer",
+    minimum: 0,
+    maximum: MAX_ACTOR_BASH_TIMEOUT_S,
+    description: "Pi runs: kill a blocking bash call after this many seconds with no output (default 180), also when the call sets its own timeout; 0 = no idle limit.",
   },
   timeoutMs: {
     type: "number",
@@ -122,6 +130,7 @@ const spawnSchema = {
   ...runSchema,
   properties: {
     ...runProperties, residency: residencySchema,
+    complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
@@ -444,6 +453,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         triggerTurn: { type: "boolean" },
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
+        dedupeKey: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$", description: "Opt-in occurrence path into the full mesh event (such as data.key). Persistent durable actors skip the last 256 successfully completed keys across restart. Never inferred from coalesceKey." },
+        activation: {
+          type: "object",
+          description: "Optional minimum interval per actor/source session for host agent_settled only. First is admitted immediately; the latest event inside the interval is admitted once at the original window end, without sliding the deadline. Persistent pending delivery survives manager close/restart and is restored on start, re-armed if not yet due. Stop, removal, redefinition or halt drops it. Omitted or 0 is off.",
+          properties: { minIntervalMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER } },
+          required: ["minIntervalMs"],
+          additionalProperties: false,
+        },
         activationFilter: activationFilterSchema,
         routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },

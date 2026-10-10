@@ -86,6 +86,7 @@ export const parseWorkerOptions = (
   const actorId = optional(args, "actor-id");
   const actorName = optional(args, "actor-name");
   const actorBashTimeout = optional(args, "actor-bash-timeout");
+  const bashIdle = optional(args, "bash-idle-seconds");
   const capabilityRequirementsSource = optional(args, "capability-requirements");
   const capabilityDigest = optional(args, "capability-digest");
   const capabilityRequirements = capabilityRequirementsSource
@@ -229,6 +230,7 @@ export const parseWorkerOptions = (
     ...(actorId ? { actorId } : {}),
     ...(actorName ? { actorName } : {}),
     ...(actorBashTimeout ? { bashTimeoutSeconds: Number(actorBashTimeout) } : {}),
+    ...(bashIdle ? { bashIdleSeconds: Number(bashIdle) } : {}),
     ...(capabilityRequirements
       ? { capabilityRequirements: [...new Set(capabilityRequirements as string[])] }
       : {}),

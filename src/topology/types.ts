@@ -31,6 +31,8 @@ export interface FabricParticipantRecord {
   label?: string;
   /** The root's fleet role, for example "project-agent" (smarty-dev#784). */
   role?: string;
+  /** The Herdr pane a root Main runs in (smarty-dev#6758); display only, never authority. */
+  herdrPane?: string;
   /** The checkout that owns the root's git common directory (smarty-dev#784). */
   project?: string;
   /** Runtime project root, distinct from the shared checkout of linked worktrees. */
@@ -45,6 +47,9 @@ export interface FabricParticipantRecord {
   /** Outside capabilities so old format-1 parsers can read the advertisement. */
   livenessLeaseFiles?: 1;
   status: string;
+  /** Root records: the writing Main process (pid, host, Linux /proc start ticks), so an operator tool can
+   * tell a live Main from a reused pid (smarty-dev#7817). Absent on older writers: identity unavailable. */
+  mainProcess?: { pid: number; host: string; startTime?: string };
   /** Fixed expiry of a Main reload handoff; never a grace period for an exited session. */
   reloadUntil?: number;
   residency?: FabricParticipantResidency;

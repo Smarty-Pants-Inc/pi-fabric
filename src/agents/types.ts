@@ -72,8 +72,12 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
-  /** Required target capabilities. Unknown needs force configured placement local. */
+  /** Caller classification passed to the optional external spawn router. */
+  complexity?: "simple" | "normal" | "complex" | "delicate";
+  /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
+  /** Absolute inputs that must exist on the selected execution host before starting. */
+  requires?: string[];
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -121,6 +125,8 @@ export interface AgentRunRequest {
   nice?: number;
   /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
   bashTimeoutSeconds?: number;
+  /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
+  bashIdleSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -194,14 +200,19 @@ export interface AgentRunRecord {
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
   toolCalls: number;
+  /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
+  /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
+  lastCompleteText?: string;
+  /** Streaming text; on an interrupted failed task, retained partial output (possibly the preceding message), never a successful report. */
+  partialText?: string;
   /** How a structured reply arrived: its fabric_reply tool call (smarty-dev#967). */
   replyVia?: "tool";
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
-  /** Non-fatal run problems, e.g. a dropped oversized child event (smarty-dev#1907). */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
+  /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
   exitCode?: number | null;
@@ -318,6 +329,7 @@ export interface AgentWorkerOptions {
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
   bashTimeoutSeconds?: number;
+  bashIdleSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
   /** Host-only bounded judge: no ambient resources, compaction or retry. */
@@ -370,6 +382,7 @@ export interface AgentTransportLaunch {
   workerPath: string;
   workerArguments: string[];
   needs?: string[];
+  requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
@@ -398,6 +411,9 @@ export interface AgentTransportHandle {
   kind: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
+  /** Event custody is opt-in only after a verified, owned cgroup-v2 receipt.
+   * Missing/failed admission keeps the legacy checked-query contract. */
+  liveness?: "events" | "poll";
   livenessPollIntervalMs?: number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
@@ -422,6 +438,12 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
+  /** Scoped-only tree-empty receipt: the live PID and admission record agree
+   * on our UID-owned v2 scope, with cgroup.events opened and watched before
+   * publication. Populated-0 plus retained execution custody proves exit;
+   * observation failure rejects, never authorizes collection/replacement.
+   * Unverified scopes and unscoped workers omit this field entirely. */
+  treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

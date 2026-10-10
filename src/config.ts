@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
+export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
 import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
@@ -170,6 +172,8 @@ interface FabricPrewalkConfig {
 }
 
 export interface FabricAgentConfig {
+  /** Optional host-only external spawn/actor model router; off unless enabled. */
+  router?: FabricAgentRouterConfig;
   /** Opt-in shadow routing pins and finite candidates, never live routing. */
   modelRouting?: ModelRoutingConfig;
   enabled: boolean;
@@ -354,9 +358,25 @@ const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   throw new Error("mesh.lockProtocol must be 1 or 2");
 };
 
+/** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
+export type MeshStateBackend = "file" | "shadow" | "sqlite";
+
+// Local and tiny on purpose: importing state-backend.ts here would put SQLite in the config graph.
+const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = ["file", "shadow", "sqlite"];
+const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
+  // The environment overrides the file setting; an unknown environment value is ignored (fail safe).
+  const override = env?.trim().toLowerCase();
+  if (override && (MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+  if (value === undefined) return "file";
+  if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
+  throw new Error("mesh.stateBackend must be file, shadow or sqlite");
+};
+
 export interface FabricMeshConfig {
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
+  /** Keyed-state backend: "file" (default), "shadow" or "sqlite"; env PI_FABRIC_MESH_STATE_BACKEND overrides. */
+  stateBackend: MeshStateBackend;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -623,6 +643,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   mesh: {
     lockProtocol: 1,
+    stateBackend: "file",
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -925,6 +946,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
   const wakeText = normalizeWakeTextConfig(agents.wakeText);
+  const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
@@ -1152,6 +1174,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
       ...(placement ? { placement } : {}),
+      ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1370,6 +1393,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     },
     mesh: {
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
+      stateBackend: meshStateBackend(mesh.stateBackend),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1726,6 +1750,7 @@ const resolveFabricConfig = (
     }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
+      delete agents.router; // Host-only argv execution and task disclosure policy.
       delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;

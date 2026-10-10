@@ -2,6 +2,8 @@ import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } 
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
+import { normalizeAgentRequires } from "./input-validation.js";
+import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -11,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import {
@@ -477,7 +479,7 @@ const safeName = (value: string): string =>
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const parsed: unknown = JSON.parse(readFileRetrying(filePath));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as AgentRunRecord;
     return {
@@ -625,7 +627,12 @@ const failedRecord = (
     finishedAt: now,
     turns: Math.max(progress.turns, previous?.turns ?? 0),
     toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
-    text: "",
+    // A forced termination (Windows stop or SIGKILL) cannot publish a worker
+    // exit record. Its last atomic streaming checkpoint is still actual output;
+    // retain only prose, never a structured reply or a success/error verdict.
+    text: previous?.text ?? "",
+    ...(previous?.partialText !== undefined ? { partialText: previous.partialText } : {}),
+    ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
@@ -1085,8 +1092,15 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
-    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}) };
+    const needs = normalizeAgentCapabilityTokens(request.needs);
+    const requires = normalizeAgentRequires(request.requires);
+    // Session transports are disabled until they can retain execution custody.
+    // Refuse input declarations explicitly rather than silently skipping preflight.
+    const transport = request.transport ?? this.config.transport;
+    if (requires?.length && transport !== "auto" && transport !== "process") {
+      throw new AgentInputError("requires", `Agent requires cannot be honoured by disabled transport ${transport}; use process; no worker started`);
+    }
+    request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1403,6 +1417,7 @@ export class AgentManager {
           ...(request.actorId ? ["--actor-id", request.actorId] : []),
           ...(request.actorName ? ["--actor-name", request.actorName] : []),
           ...(request.bashTimeoutSeconds !== undefined ? ["--actor-bash-timeout", String(request.bashTimeoutSeconds)] : []),
+          ...(request.bashIdleSeconds !== undefined ? ["--bash-idle-seconds", String(request.bashIdleSeconds)] : []),
           ...(request.capabilityRequirements
             ? ["--capability-requirements", JSON.stringify(request.capabilityRequirements)]
             : []),
@@ -1435,6 +1450,7 @@ export class AgentManager {
           workerPath: this.#workerPath,
           workerArguments,
           ...(request.needs ? { needs: [...request.needs] } : {}),
+          ...(request.requires ? { requires: [...request.requires] } : {}),
           placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
@@ -1443,7 +1459,7 @@ export class AgentManager {
                 ? "inherited account pins require the local worker"
                 : !extensions
                   ? "extensions disabled require the local worker"
-                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || request.bashIdleSeconds !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
                     ? "requested worker features cannot be preserved by one-shot placement"
                     : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,

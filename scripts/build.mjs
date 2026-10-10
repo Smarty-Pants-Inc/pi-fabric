@@ -189,6 +189,20 @@ await build({
   logLevel: "info",
 });
 
+// The bash tool_call envelope invokes a real file: the fleet guard refuses computed -e code.
+// Keep watchdog/group custody code out of the extension graph and out of inline shell operands.
+await build({
+  entryPoints: ["src/bash-idle-watchdog.ts"],
+  outfile: "dist/bash-idle-watchdog.js",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
+});
+
 // The records service runs as its own OS user from a root-owned copy of one file:
 // inline every package (pg included) so no module resolves outside that copy.
 await build({

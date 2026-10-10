@@ -1,4 +1,8 @@
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { loadedFabricRoot } from "../core/agent-dir.js";
 
 // smarty-dev#2184: an actor run's bash call without a timeout could hang the run (and the actor's removal)
 // for good. Actor runs (PI_FABRIC_ACTOR_ID set) get a default per-command timeout; an actor's
@@ -20,12 +24,9 @@ export const DEFAULT_ACTOR_BASH_TIMEOUT_S = 600;
 export const MAX_ACTOR_BASH_TIMEOUT_S = 2_147_483;
 /** Default seconds without output before a Fabric run's bash call is killed (smarty-dev#6137). */
 export const DEFAULT_BASH_IDLE_S = 180;
-/** Exit code of an idle-killed command, as timeout(1). */
-export const BASH_IDLE_EXIT_CODE = 124;
+export { BASH_IDLE_EXIT_CODE, BASH_IDLE_TERM_GRACE_S } from "./bash-idle-policy.js";
 /** Diagnostic first line only: command text is never evidence that a call was wrapped. */
 export const BASH_IDLE_MARKER = "# pi-fabric bash idle watchdog (smarty-dev#6137)";
-/** Bounded TERM-to-KILL grace; output/early shell exit cannot cancel escalation. */
-export const BASH_IDLE_TERM_GRACE_S = 5;
 
 type Env = Readonly<Record<string, string | undefined>>;
 
@@ -57,52 +58,39 @@ type BashInput = { command?: unknown; timeout?: unknown; background?: unknown; m
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
 
-// This detached execution envelope is the command's process-group leader. IPC custody ensures
-// Pi killing the outer watchdog on total timeout/abort also kills this newly detached group.
-// Ignore TERM in the envelope so it retains custody while the command handles TERM during grace.
-const GROUP_RUNNER = `
-const cp=require("child_process"),os=require("os");
-process.on("SIGTERM",()=>{});
-process.on("disconnect",()=>{try{process.kill(-process.pid,"SIGKILL")}catch{process.exit(1)}});
-const[sh,command]=process.argv.slice(-2);
-const c=cp.spawn(sh,["-c",command],{stdio:["ignore","inherit","inherit"]});
-c.on("error",e=>{process.stderr.write(String(e)+"\\n");process.exit(127)});
-c.on("exit",(code,sig)=>process.exit(code??128+(os.constants.signals[sig]||0)));
-`.trim();
+// Resolve at actual first wrap, not registration. Package-root lookup works from source,
+// dist/index.js, dist/chunks/* and the separately built dist/guards/actor-bash-hook.js.
+let watchdogPath: string | undefined;
+const idleWatchdogPath = (): string => {
+  if (watchdogPath) return watchdogPath;
+  const root = loadedFabricRoot(import.meta.url);
+  if (!root) throw new Error("Cannot locate the Fabric bash idle watchdog package");
+  return watchdogPath = path.join(root, "dist", "bash-idle-watchdog.js");
+};
 
-// Runs as `node -e`, argv tail [idleSeconds, shell], command on stdin. A detached group makes
-// reparented background jobs killable even when this watchdog isn't its own group leader.
-// Linux /proc ppid traversal is a second net for setsid children, with start times retained
-// across TERM/reparenting to avoid signaling reused PIDs. No ps executable is required.
-// A double-forked setsid daemon that leaves the group before discovery is not covered (#7934).
-// No per-command delegated cgroup-v2 launch is reachable from this lightweight tool_call hook.
-const WATCHDOG = `
-const fs=require("fs"),cp=require("child_process"),os=require("os");
-const[s,sh]=process.argv.slice(-2),n=Number(s);
-const c=cp.spawn(process.execPath,["-e",${JSON.stringify(GROUP_RUNNER)},sh,fs.readFileSync(0,"utf8")],{detached:true,stdio:["ignore","pipe","pipe","ipc"]});
-let t,g,code=1,exited=false,idle=false,done=false;
-const tracked=new Map();
-const finish=()=>{if(done)return;done=true;clearTimeout(t);clearTimeout(g);let p=2;const e=()=>--p||process.exit(idle?${BASH_IDLE_EXIT_CODE}:code);process.stdout.write("",e);process.stderr.write("",e)};
-const rows=()=>{const result=new Map();try{for(const name of fs.readdirSync("/proc")){if(!/^\\d+$/.test(name))continue;try{const stat=fs.readFileSync("/proc/"+name+"/stat","utf8"),a=stat.slice(stat.lastIndexOf(")")+2).split(" ");result.set(Number(name),{pp:Number(a[1]),pg:Number(a[2]),start:a[19]})}catch{}}}catch{}return result};
-const sweep=sig=>{const all=rows(),owned=new Set([c.pid]);for(const[p,start]of tracked)if(all.get(p)?.start===start)owned.add(p);
-for(let grew=true;grew;){grew=false;for(const[p,r]of all)if((owned.has(r.pp)||r.pg===c.pid)&&!owned.has(p)){owned.add(p);grew=true}}
-for(const p of owned){const r=all.get(p);if(r)tracked.set(p,r.start)}
-try{process.kill(-c.pid,sig)}catch{}
-for(const[p,start]of tracked){const r=all.get(p);if(r?.start===start&&r.pg!==c.pid)try{process.kill(p,sig)}catch{}}};
-const expire=()=>{idle=true;process.stderr.write("\\n[pi-fabric] bash idle timeout: no output for "+n+" s; killed; rerun with a bounded range or a command that prints progress\\n");sweep("SIGTERM");g=setTimeout(()=>{sweep("SIGKILL");finish()},${BASH_IDLE_TERM_GRACE_S}*1000)};
-const arm=()=>{clearTimeout(t);if(!exited&&!idle)t=setTimeout(expire,n*1000)};
-const forward=w=>d=>{w.write(d);if(idle)return;if(exited){clearTimeout(g);g=setTimeout(finish,100)}else arm()};
-c.stdout.on("data",forward(process.stdout));c.stderr.on("data",forward(process.stderr));
-c.on("error",e=>{process.stderr.write(String(e)+"\\n");code=127;if(!idle)finish()});
-c.on("exit",(x,sig)=>{exited=true;clearTimeout(t);code=x??128+(os.constants.signals[sig]||0);if(!idle){clearTimeout(g);g=setTimeout(finish,100)}});
-c.on("close",()=>{if(!idle)finish()});
-arm();
-`.trim();
+const idleShellPath = (): string => {
+  if (process.env.BASH && path.isAbsolute(process.env.BASH)) return process.env.BASH;
+  // Mirror Pi's POSIX getShellConfig: /bin/bash, `which bash`, then sh on PATH.
+  // Importing the host barrel here also bundles it into the standalone worker.
+  if (existsSync("/bin/bash")) return "/bin/bash";
+  let shell = "sh";
+  try {
+    const found = spawnSync("which", ["bash"], { encoding: "utf8", timeout: 5000 });
+    const first = found.status === 0 ? found.stdout?.trim().split(/\r?\n/)[0] : undefined;
+    if (first) shell = first;
+  } catch { /* Pi falls back to sh if which is unavailable */ }
+  if (path.isAbsolute(shell)) return shell;
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    const candidate = path.resolve(directory, shell);
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(`Cannot resolve Pi's bash shell to an absolute path: ${shell}`);
+};
 
 /** The command wrapped in the idle watchdog. The original runs verbatim from a quoted heredoc. */
 export const idleWatchdogCommand = (command: string, idleSeconds: number, nodePath = process.execPath): string => {
   const delimiter = `PI_FABRIC_IDLE_${randomBytes(12).toString("hex")}`;
-  return `${BASH_IDLE_MARKER}\nexec ${shellQuote(nodePath)} -e ${shellQuote(WATCHDOG)} ${idleSeconds} "\${BASH:-$0}" <<'${delimiter}'\n${command}\n${delimiter}\n`;
+  return `${BASH_IDLE_MARKER}\nexec ${shellQuote(nodePath)} ${shellQuote(idleWatchdogPath())} ${idleSeconds} ${shellQuote(idleShellPath())} <<'${delimiter}'\n${command}\n${delimiter}\n`;
 };
 
 /**

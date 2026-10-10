@@ -9,7 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { main } from "../src/actors-cli.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
-import { mainStoppedAudit, offlineRemovalHooks, removeActorOffline } from "../src/actors/remove-offline.js";
+import { mainStoppedAudit, offlineMarkerPath, offlineRemovalHooks, removeActorOffline } from "../src/actors/remove-offline.js";
 import * as operatorSafety from "../src/residency/operator-safety.js";
 import { MeshStore, meshProcessStartedAt } from "../src/mesh/store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
@@ -453,12 +453,11 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       fs.mkdirSync(path.join(actorDir, "runs"), { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       const outside = path.join(f.config.meshRoot, "outside"); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
       await f.killResident();
-      offlineRemovalHooks.afterStep = step => {
-        if (step !== "bindings") return;
+      offlineRemovalHooks.beforeTreeMove = () => {
         fs.rmSync(path.join(actorDir, "runs"), { recursive: true }); fs.symlinkSync(outside, path.join(actorDir, "runs"));
       };
       let result: Awaited<ReturnType<typeof f.cli>>;
-      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.beforeTreeMove; }
       expect(result).toMatchObject({ code: 0, err: "" });
       const tree = path.join(JSON.parse(result.out).archive, "tree");
       // One rename moved the directory, link included; nothing was followed or deleted outside.
@@ -477,23 +476,95 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
       const outside = path.join(f.config.meshRoot, "outside"); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
       await f.killResident();
-      offlineRemovalHooks.afterStep = step => {
-        if (step !== "bindings") return;
+      offlineRemovalHooks.beforeTreeMove = () => {
         fs.renameSync(actorDir, `${actorDir}.moved`); fs.symlinkSync(outside, actorDir);
       };
       let result: Awaited<ReturnType<typeof f.cli>>;
-      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
-      expect(result.code).toBe(1);
-      const output = JSON.parse(result.out);
-      expect(output).toMatchObject({ cleaned: false, pending: expect.stringContaining("replaced before the archive rename") });
-      // The link was moved back; its target and the real directory are untouched; the removal record stays.
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.beforeTreeMove; }
+      expect(result.code).toBe(1); expect(result.err).toContain("replaced before the archive rename");
+      // The link was moved back; its target and the real directory are untouched; nothing else changed.
       expect(fs.lstatSync(actorDir).isSymbolicLink()).toBe(true);
-      expect(fs.existsSync(path.join(output.archive, "tree"))).toBe(false);
+      expect(f.archives().filter(file => path.basename(file) === "tree")).toEqual([]);
       expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
       expect(fs.readFileSync(path.join(`${actorDir}.moved`, "session.jsonl"), "utf8")).toBe("history\n");
-      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
+      expect(f.registered(actor.id)).toBe(true);
+      expect(fs.existsSync(offlineMarkerPath(f.config.actorRoot, actor.id))).toBe(false);
     } finally { await f.close(); }
   }, 40_000);
+
+  const bindingSnapshot = (f: Awaited<ReturnType<typeof fixture>>) => {
+    const dir = path.join(f.config.actorRoot, "bindings");
+    return fs.existsSync(dir) ? treeSnapshot(dir) : [];
+  };
+  it.each(["archives", "resident root (an ancestor)"] as const)("smarty-dev#8159: %s swapped for a symlink after the first check and before the rename refuses; tree, registry, bindings and marker unchanged", async which => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("chain-swap");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      await f.killResident();
+      const registry = fs.readFileSync(path.join(f.config.actorRoot, "actors.json"), "utf8");
+      const bindings = bindingSnapshot(f);
+      offlineRemovalHooks.beforeTreeMove = () => {
+        const swapped = which === "archives" ? path.join(f.config.residencyRoot, "archives") : f.config.residencyRoot;
+        fs.renameSync(swapped, `${swapped}.real`); fs.symlinkSync(`${swapped}.real`, swapped);
+      };
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.beforeTreeMove; }
+      expect(result.code).toBe(1); expect(result.err).toContain("archive path changed during removal; refusing (smarty-dev#8159)");
+      expect(fs.lstatSync(actorDir).isDirectory()).toBe(true); // not moved
+      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.readFileSync(path.join(f.config.actorRoot, "actors.json"), "utf8")).toBe(registry);
+      expect(bindingSnapshot(f)).toEqual(bindings);
+      expect(fs.existsSync(offlineMarkerPath(f.config.actorRoot, actor.id))).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it.each([
+    ["after the pending record, before the rename", "marker"],
+    ["after the rename, before the registry update", "tree"],
+  ] as const)("a crash %s: the generic startup cleanup leaves the record and the tree; the next remove resumes", async (_name, crashAt) => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("crash-resume");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      await f.killResident();
+      offlineRemovalHooks.afterStep = step => { if (step === crashAt) throw new Error("simulated crash"); };
+      let crashed: Awaited<ReturnType<typeof f.cli>>;
+      try { crashed = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      expect(crashed.code).toBe(1); expect(crashed.err).toContain("simulated crash");
+      const markerFile = offlineMarkerPath(f.config.actorRoot, actor.id);
+      const marker = JSON.parse(fs.readFileSync(markerFile, "utf8"));
+      expect(marker).toMatchObject({ kind: "offline-removal", sessionDir: actorDir, archive: expect.any(String),
+        pin: { dev: expect.any(Number), ino: expect.any(Number) }, chain: expect.any(Array) });
+      expect(f.registered(actor.id)).toBe(true);
+      // Where the tree is at the crash: still in place, or already in the recorded archive.
+      const treeFile = crashAt === "marker" ? path.join(actorDir, "session.jsonl") : path.join(marker.archive, "tree", "session.jsonl");
+      expect(fs.existsSync(crashAt === "marker" ? path.join(marker.archive, "tree") : actorDir)).toBe(false);
+      // (b) The resident host starts: its generic cleanup (ActorManager removal-<id>.json obligations) leaves
+      // the offline record and the tree alone.
+      const owner = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "owner.json"), "utf8"));
+      const restarted = new ResidentHost(f.config, () => {});
+      await restarted.start();
+      await restarted.actors.finishPendingRemovals();
+      expect(fs.readFileSync(treeFile, "utf8")).toBe("history\n");
+      expect(fs.readFileSync(markerFile, "utf8")).toBe(JSON.stringify(marker));
+      expect(f.registered(actor.id)).toBe(true);
+      await restarted.close();
+      for (const name of ["owner.json", "host.lock"]) {
+        fs.writeFileSync(path.join(f.config.residencyRoot, name), JSON.stringify({ ...owner, pid: 2147483647, processStartTime: "1" }));
+      }
+      // (a) The next offline remove resumes the ONE recorded rename and completes.
+      const resumed = await f.cli(actor.id);
+      expect(resumed).toMatchObject({ code: 0, err: "" });
+      expect(JSON.parse(resumed.out).archive).toBe(marker.archive);
+      expect(fs.readFileSync(path.join(marker.archive, "tree", "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.existsSync(actorDir)).toBe(false);
+      expect(fs.existsSync(markerFile)).toBe(false);
+      expect(f.registered(actor.id)).toBe(false);
+    } finally { await f.close(); }
+  }, 60_000);
 
   it("offline: an archive target that already exists is refused, never merged", async () => {
     const f = await fixture();
@@ -530,11 +601,13 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(result.code).toBe(1);
       expect(JSON.parse(result.out)).toMatchObject({ cleaned: false, pending: expect.stringContaining("Main is live: root participant is fresh") });
       // The kept removal record carries the operator's audited assertion.
-      const marker = JSON.parse(fs.readFileSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`), "utf8"));
+      const marker = JSON.parse(fs.readFileSync(offlineMarkerPath(f.config.actorRoot, actor.id), "utf8"));
       expect(marker.operatorAssertion).toMatchObject({ mainStopped: true, rootId: f.config.rootId, operatorAttestation: EVIDENCE,
         operator: { user: process.env.USER ?? null }, assertedAt: expect.any(String) });
-      expect(bindings).toHaveBeenCalledTimes(step === "revoke" ? 0 : 1);
-      expect(fs.existsSync(actorDir)).toBe(step !== "tree");
+      // Order: tree move, revoke, bindings. The tree is archived (moved, never deleted) before either.
+      expect(bindings).toHaveBeenCalledTimes(step === "bindings" ? 1 : 0);
+      expect(f.registered(actor.id)).toBe(step === "tree");
+      expect(fs.existsSync(actorDir)).toBe(false);
       expect(presence).not.toHaveBeenCalled();
       bindings.mockRestore(); presence.mockRestore();
     } finally { await f.close(); }
@@ -594,7 +667,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(output).toMatchObject({ offline: true, cleaned: true, actor: { id: actor.id } });
       expect(f.registered(actor.id)).toBe(false);
       expect(fs.existsSync(actorDir)).toBe(false);
-      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
+      expect(fs.existsSync(offlineMarkerPath(f.config.actorRoot, actor.id))).toBe(false);
       const archived = f.archives();
       expect(archived.map(file => path.basename(file)).sort()).toEqual(["SHA256SUMS", `${actor.id}.operator.json`, `${actor.id}.registry.json`, "tree"].sort());
       expect(path.basename(output.archive)).toMatch(new RegExp(`^${actor.id}\\.\\d{8}T\\d{6}Z\\.[0-9a-f-]{36}$`));

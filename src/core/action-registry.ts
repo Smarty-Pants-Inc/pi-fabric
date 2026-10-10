@@ -800,7 +800,7 @@ export class ActionRegistry {
         action.ref,
         effectiveSchema,
         provider.guardArguments
-          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args, context))
           : args,
       );
       const preparedArgs = provider.prepareArguments
@@ -897,7 +897,7 @@ export class ActionRegistry {
         action.ref,
         effectiveSchema,
         provider.guardArguments
-          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args, context))
           : args,
       );
       const preparedArgs = provider.prepareArguments

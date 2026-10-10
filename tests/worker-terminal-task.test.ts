@@ -151,6 +151,9 @@ describe("native worker task terminal boundary", () => {
     const { handle, directory } = await spawn(s);
     const allowed = s.manager.steer(handle.id, "ALLOWED_INTERMEDIATE_STEER");
     await until(() => readTerminalControl(directory, allowed.messageId)?.state === "queued");
+    // The worker's queued admission precedes asynchronous native input. Confirm
+    // the native queue before opening the intermediate turn's delivery boundary.
+    await until(() => rows(path.join(directory, "events.jsonl")).some(row => row.type === "queue_update" && JSON.stringify(row).includes("ALLOWED_INTERMEDIATE_STEER")));
     fs.writeFileSync(path.join(s.root, "release-1"), "");
     await until(() => rows(path.join(s.root, "provider.jsonl")).filter(row => row.type === "request").length === 2);
     expect(readFinalAnswerReceipt(directory, handle.id)).toBeUndefined();

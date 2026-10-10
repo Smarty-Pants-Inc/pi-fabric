@@ -213,8 +213,11 @@ const runTreeVeto = (
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
+// Native receipt completion precedes teardown. An exit-only status rewrite
+// must not restart retention; deletion still requires receipt and exit checks.
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
-  time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
+  time(record.finalAnswerReceipt?.recordedAt) ? record.finalAnswerReceipt.recordedAt :
+    time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
@@ -285,8 +288,11 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     });
   }
   if (!ownedStat(answerFile)?.isFile()) return false;
-  const answer = readFinalAnswerReceipt(root, path.basename(root));
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // Retained trees can be copied under archive aliases. Bind the receipt to
+  // the original run identity, not its collection path; controls still require
+  // their exact original admission below.
+  const answer = typeof record?.id === "string" ? readFinalAnswerReceipt(root, record.id) : undefined;
   if (!answer || expired() || record?.id !== answer.runId || record.finalAnswerReceipt?.id !== answer.id ||
       record.finalAnswerReceipt.recordedAt !== answer.recordedAt || record.actorId) return false;
   const routed = new Set<string>();

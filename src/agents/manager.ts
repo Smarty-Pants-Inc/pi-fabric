@@ -3387,6 +3387,9 @@ export class AgentManager {
           validateAgentResult(record, schema);
         }
       }
+      // Receipt-bound success is the task outcome, not the later teardown
+      // signal. Native close/custody is still checked independently below.
+      if (record.status === "completed") record.exitCode = 0;
       managed.finalAnswerResult = record;
       this.#settle(managed, record);
     })().catch(error => {
@@ -4213,6 +4216,7 @@ export class AgentManager {
         status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,
         finishedAt: managed.finalAnswerResult.finishedAt, finalAnswerReceipt: managed.finalAnswerResult.finalAnswerReceipt,
         value: managed.finalAnswerResult.value, error: managed.finalAnswerResult.error,
+        exitCode: managed.finalAnswerResult.exitCode,
       } : {}),
       ...managed.runRoute,
       ...(includeSaveFailure && managed.settlementSaveFailure

@@ -218,7 +218,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     cleanups.push(() => control.close());
     control.start((command, from, signal, verification) => router.acceptControl(command, from, signal, verification));
     retain(h.mesh, { id: "old-command", topic: "fabric.control.command", kind: delivery, from: remote, to: "receiver",
-      data: { version: 1, commandId: "old", targetId: host.id, operation: delivery, requestedAt: Date.now(), replyTo: "peer",
+      data: { version: 1, commandId: "old", targetId: host.id, ownerIncarnation: control.incarnation, operation: delivery, requestedAt: Date.now(), replyTo: "peer",
         message: "Remote task", bridge: { from: "old-peer", id: "old" } } });
     await vi.waitFor(() => expect(h.fake.sendMessage).toHaveBeenCalledOnce());
     expect(h.fake.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: delivery, triggerTurn: true });
@@ -232,7 +232,7 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
     cleanups.push(() => control.close());
     control.start((command, from, signal, verification) => router.acceptControl(command, from, signal, verification));
     retain(h.mesh, { id: "bridge-command", verification: "bridge", topic: "fabric.control.command", kind: "steer", from: remote, to: "receiver",
-      data: { version: 1, commandId: "bridge", targetId: host.id, operation: "steer", requestedAt: Date.now(), replyTo: "peer", message: "Remote task" } });
+      data: { version: 1, commandId: "bridge", targetId: host.id, ownerIncarnation: control.incarnation, operation: "steer", requestedAt: Date.now(), replyTo: "peer", message: "Remote task" } });
     await vi.waitFor(() => expect(h.fake.sendMessage).toHaveBeenCalledOnce());
     expect(h.fake.sendMessage.mock.calls[0]![1].provenance.sender).toEqual({ id: remote.id, name: remote.name, kind: "remote", verified: "bridge" });
   });

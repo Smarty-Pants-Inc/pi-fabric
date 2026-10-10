@@ -10,7 +10,7 @@ const ACTOR = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 const setup = () => {
   const peer = {
     id: `session:${UUID}`, kind: "root", local: false, ownerHostId: `session:${UUID}`, ownerIdentityId: `session:${UUID}`,
-    capabilities: ["steer", "followUp"], controlProtocol: "v1",
+    ownerIncarnation: "fixture:live-main", capabilities: ["steer", "followUp"], controlProtocol: "v1",
   } as unknown as FabricParticipantInfo;
   const actor = { id: ACTOR, kind: "actor", local: true, capabilities: ["steer", "followUp"] } as unknown as FabricParticipantInfo;
   const request = vi.fn(async () => ({ acknowledged: true, messageId: "m" }));
@@ -41,6 +41,8 @@ describe("a bare session UUID (smarty-dev#1729)", () => {
     const { router, request } = setup();
     await router.routeMessage(UUID, "hi", undefined, "followUp");
     await router.routeMessage(UUID, "now", undefined, "steer");
+    expect((request.mock.calls as unknown[][]).every(call =>
+      (call[3] as { ownerIncarnation?: string }).ownerIncarnation === "fixture:live-main")).toBe(true);
     expect(request.mock.calls.map((call) => [(call as unknown[])[1], (call as unknown[])[2]])).toEqual([
       [`session:${UUID}`, "followUp"],
       [`session:${UUID}`, "steer"],

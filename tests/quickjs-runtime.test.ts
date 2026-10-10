@@ -264,6 +264,7 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   });
 
   it.each([
+    ["FABRIC_CONTROL_INCARNATION_REQUIRED", "FabricControlIncarnationRequiredError"],
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],

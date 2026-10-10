@@ -17,6 +17,7 @@ import type { FabricInvocationContext } from "../src/protocol.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
 const owners = ["persistent session", "transient session", "resident"] as const;
@@ -100,6 +101,9 @@ const withOwner = async (
       format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: "session:owner",
       ownerHostId: owner instanceof ResidentHost ? owner.hostId : "session:owner",
       ownerIdentityId: owner instanceof ResidentHost ? owner.identity.id : "session:owner",
+      ownerIncarnation: await liveControlOwnerIncarnation(owner instanceof ResidentHost ? owner.participants : {
+        get: id => owner.participantInfos({ fresh: true }).find(info => info.id === id),
+      }, actor.id),
       status: "idle", residency: kind === "resident" ? "durable" : "session", runner: "pi", transport: "host",
       capabilities: ["ask", "steer", "followUp", "actor-bindings"],
       startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false,

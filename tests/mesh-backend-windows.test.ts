@@ -39,7 +39,7 @@ const waitClose=(child:ReturnType<typeof spawn>)=>new Promise<void>(resolve=>chi
 
 describe("SQLite state Windows semantics", () => {
   it("uses a path containing spaces and non-ASCII characters", async () => {
-    const root=path.join(makeRoot("mesh sqlite "),"més h"); fs.mkdirSync(root);
+    const root=path.join(makeRoot("mesh sqlite "),"més h"); fs.mkdirSync(root,{mode:0o700});
     const store=await SqliteStateStore.open(root,65536,1000);
     await store.put({key:"unicode/path",value:"ok",identity:{id:"test",name:"test",kind:"agent"}});
     expect(store.get("unicode/path")?.value).toBe("ok");

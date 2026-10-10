@@ -69,7 +69,7 @@ it.skipIf(process.platform === "win32" || rootUser)("a tell to a durable actor w
     let outcome: { ok: true; value: unknown } | { ok: false; error: Error };
     const started = Date.now();
     try {
-      outcome = { ok: true, value: await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def" }, client.hostId) };
+      outcome = { ok: true, value: await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId) };
     } catch (error) {
       outcome = { ok: false, error: error as Error };
     }
@@ -97,7 +97,7 @@ it.skipIf(process.platform === "win32" || rootUser)("a tell to a durable actor w
       // and the resend the error calls safe is queued exactly once.
       fs.chmodSync(sessionActorRoot, 0o700);
       chmodded = false;
-      const resent = await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def" }, client.hostId, { timeoutMs: 20_000 });
+      const resent = await control.request(client.hostId, actor.id, "followUp", { message: "PR 1000 head def", ownerIncarnation: participants.get(actor.id, undefined, { fresh: true })!.ownerIncarnation }, client.hostId, { timeoutMs: 20_000 });
       expect(resent).toMatchObject({ acknowledged: true });
       const delivered = host.actors.messages(actor.id).slice(before)
         .filter(message => message.direction === "in" && JSON.stringify(message.data).includes("PR 1000 head def"));

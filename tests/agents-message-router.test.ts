@@ -64,7 +64,7 @@ const running = async () => {
   return { root, manager, id: handle.id, statusFile, record, entries };
 };
 const remote = (id: string, status = "running", kind = "agent") => ({ id, kind, status, local: false,
-  ownerHostId: "host:owner", ownerIdentityId: "host:owner", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
+  ownerHostId: "host:owner", ownerIdentityId: "host:owner", ownerIncarnation: "fixture:owner", controlProtocol: "v1", capabilities: ["steer", "followUp"] } as FabricParticipantInfo);
 const unknown = { status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0];
 
 afterEach(async () => {
@@ -91,6 +91,7 @@ const mainLeaseFixture = async (files: boolean) => {
   const key = (prefix: string) => prefix + createHash("sha256").update(target.id).digest("hex");
   const presence: FabricParticipantRecord = {
     format: 1, id: target.id, rootId: target.id, kind: "root", ownerHostId: target.id, ownerIdentityId: target.id,
+    ownerIncarnation: `lease-test:${sessionId}`,
     name: "lead-example", status: "running", runner: "pi", transport: "host", cwd: root, sessionId,
     capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: 1, updatedAt: Date.now(),
   };
@@ -103,7 +104,8 @@ const mainLeaseFixture = async (files: boolean) => {
   else await mesh.put({ key: participantKey, identity: target, value: presence });
   const plane = (who: MeshIdentity) => {
     const value = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1000), who,
-      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000 });
+      { enabled: true, hostId: who.id, pollMs: 20, acknowledgementTimeoutMs: 2000,
+        ...(who.id === target.id ? { ownerIncarnation: presence.ownerIncarnation! } : {}) });
     planes.push(value); return value;
   };
   const publishPresence = async (value: FabricParticipantRecord) => {
@@ -112,6 +114,132 @@ const mainLeaseFixture = async (files: boolean) => {
   };
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
+
+describe("sender incarnation fencing (#7514)", () => {
+  it.each(["warn", "enforce"] as const)("a legacy wire sender to an advertised Main obeys %s and explicit stale epochs still fail", async mode => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "router-rollout-")); roots.push(root);
+    const mesh = new MeshStore(root, 65_536, 1_000);
+    const targetId = "session:upgraded";
+    const owner = new FabricControlPlane(mesh, { id: targetId, name: "Upgraded", kind: "main" },
+      { enabled: true, hostId: targetId, pollMs: 20, controlIncarnationFence: mode });
+    const sender = new FabricControlPlane(new MeshStore(root, 65_536, 1_000), { id: "session:legacy", name: "Legacy", kind: "main" },
+      { enabled: true, hostId: "session:legacy", pollMs: 20 });
+    planes.push(owner, sender);
+    const receiver = router(unknown);
+    Object.assign(receiver.main, { id: targetId, matches: (id: string) => id === targetId });
+    owner.start((...args) => receiver.value.acceptControl(...args)); sender.start(() => ({ accepted: false }));
+    const target = { ...remote(targetId, "idle", "root"), ownerHostId: targetId, ownerIdentityId: targetId, ownerIncarnation: owner.incarnation };
+    const source = router(unknown, [target], sender);
+    const publish = sender.mesh.publish.bind(sender.mesh);
+    const legacyWire = vi.spyOn(sender.mesh, "publish").mockImplementation(input => {
+      if (input.topic !== "fabric.control.command") return publish(input);
+      const data = input.data;
+      return publish({ ...input, data: (at: number) => {
+        const { ownerIncarnation: _epoch, requestCreatedAt: _origin, ...wire } =
+          (typeof data === "function" ? data(at) : data) as Record<string, unknown>;
+        return wire; // The old-release sender omits both fields.
+      } });
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    for (const delivery of ["steer", "followUp"] as const) {
+      const outcome = source.value.routeMessage(targetId, "legacy sender message", undefined, delivery);
+      if (mode === "warn") await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "main-queue" });
+      else await expect(outcome).rejects.toMatchObject({ code: "FABRIC_CONTROL_STALE_INCARNATION" });
+    }
+    expect(receiver.main.deliverAgent).toHaveBeenCalledTimes(mode === "warn" ? 2 : 0);
+    expect(warn).toHaveBeenCalledTimes(mode === "warn" ? 1 : 0);
+    if (mode === "warn") expect(warn.mock.calls[0]![0]).toContain('count=1 sender="session:legacy"');
+    legacyWire.mockRestore(); target.ownerIncarnation = "predecessor:epoch";
+    await expect(source.value.routeMessage(targetId, "stale message", undefined, "steer")).rejects.toMatchObject({ code: "FABRIC_CONTROL_STALE_INCARNATION" });
+    expect(receiver.main.deliverAgent).toHaveBeenCalledTimes(mode === "warn" ? 2 : 0);
+  });
+  it.each(["root", "actor", "agent"] as const)("routes every old %s peer unfenced without inventing an epoch", async kind => {
+    for (const delivery of ["steer", "followUp"] as const) {
+      for (const protocol of ["legacy", "v1"] as const) {
+        const id = kind === "root" ? "session:older" : `${kind}:older`;
+        const target = { ...remote(id, "idle", kind), controlProtocol: protocol };
+        delete target.ownerIncarnation;
+        const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh", messageId: "legacy" });
+        const r = router(unknown, [target], { request });
+        vi.mocked(r.actors.steerRemote).mockResolvedValue({ queued: true, messageId: "legacy", routed: "mesh" });
+        await expect(r.value.routeMessage(id, "legacy delivery", { ownerIncarnation: "payload-forgery" }, delivery))
+          .resolves.toMatchObject({ messageId: "legacy" });
+        const relay = protocol === "legacy" && kind !== "agent";
+        if (relay) {
+          expect(request).not.toHaveBeenCalled();
+          expect(r.actors.steerRemote).toHaveBeenCalledOnce();
+        } else {
+          expect(request.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
+          expect(r.actors.steerRemote).not.toHaveBeenCalled();
+        }
+        expect(r.actors.tell).not.toHaveBeenCalled();
+        expect(r.main.deliverAgent).not.toHaveBeenCalled();
+        if (kind === "agent") {
+          const unavailable = router(unknown, [target]);
+          await expect(unavailable.value.routeMessage(id, "no transport", undefined, delivery))
+            .rejects.toThrow("control plane is unavailable");
+        }
+      }
+    }
+  });
+
+  it.each(["root", "actor", "agent"] as const)("stamps the directory's current %s epoch, never message data", async kind => {
+    const id = kind === "root" ? "session:current" : `${kind}:current`;
+    const target = remote(id, "idle", kind);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [target], { request });
+    for (const delivery of ["steer", "followUp"] as const) {
+      target.ownerIncarnation = `current:${delivery}`;
+      await r.value.routeMessage(id, "fenced", { ownerIncarnation: "payload-forgery" }, delivery);
+      expect(request.mock.calls.at(-1)![3]).toMatchObject({ ownerIncarnation: target.ownerIncarnation });
+    }
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it.each(["root", "actor", "agent"] as const)("uses the legacy path, never a cached %s epoch, after the directory shows an old peer", async kind => {
+    const id = kind === "root" ? "session:downgraded" : `${kind}:downgraded`;
+    const cached = remote(id, "idle", kind);
+    const fresh = { ...cached }; delete fresh.ownerIncarnation;
+    const get = vi.fn((_id: string, _now?: number, options?: { fresh?: boolean }) => options?.fresh ? fresh : cached);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn() });
+    await r.value.routeMessage(id, "legacy current record", undefined, "followUp");
+    expect(request.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+    expect(get.mock.calls.some(call => call[2]?.fresh)).toBe(true);
+  });
+
+  it("refreshes a mirrored Main epoch without changing its bridge authority", async () => {
+    const cached = { ...remote("session:mirrored", "idle", "root"), remoteHost: "forge" };
+    const fresh = { ...cached, ownerIncarnation: "current:mirrored" };
+    const get = vi.fn((_id: string, _now?: number, options?: { fresh?: boolean }) => options?.fresh ? fresh : cached);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn() });
+    await r.value.routeMessage(cached.id, "fenced", undefined, "followUp");
+    expect(request.mock.calls[0]![3]).toMatchObject({ ownerIncarnation: fresh.ownerIncarnation });
+    expect(request.mock.calls[0]![5]).toMatchObject({ routedRemoteHost: "forge" });
+  });
+
+  it.each(["root", "actor", "agent"] as const)("never downgrades a malformed advertised %s epoch to legacy delivery", async kind => {
+    const id = kind === "root" ? "session:malformed" : `${kind}:malformed`;
+    const request = vi.fn();
+    const target = { ...remote(id, "idle", kind), ownerIncarnation: "", controlProtocol: "legacy" as const };
+    const r = router(unknown, [target], { request });
+    await expect(r.value.routeMessage(id, "must not publish", undefined, "followUp"))
+      .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
+    expect(request).not.toHaveBeenCalled();
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("fences any peer advertising an epoch, even with a legacy protocol label", async () => {
+    const target = { ...remote("session:legacy", "idle", "root"), controlProtocol: "legacy" as const };
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [target], { request });
+    await r.value.routeMessage(target.id, "fenced", undefined, "steer");
+    expect(request.mock.calls[0]![3]).toMatchObject({ ownerIncarnation: target.ownerIncarnation });
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+});
 
 describe("directory availability for live Mains (#2386)", () => {
   it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {
@@ -632,7 +760,7 @@ describe("running-task followUp advisory (#3005)", () => {
     const owner = make("host:owner"), sender = make("host:sender");
     const accept = vi.fn((...args: Parameters<AgentMessageRouter["acceptControl"]>) => router(f.manager).value.acceptControl(...args));
     owner.start(accept); sender.start(() => ({ accepted: false }));
-    const receipt = await router(unknown, [remote(f.id, "idle")], sender).value.routeMessage(f.id, "later", undefined, "followUp");
+    const receipt = await router(unknown, [{ ...remote(f.id, "idle"), ownerIncarnation: owner.incarnation }], sender).value.routeMessage(f.id, "later", undefined, "followUp");
     const command = sender.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;
     await owner.close(); // Replay through a new owner: exercise the persisted seen outcome, not an in-memory map.
     const restarted = make("host:owner"); restarted.start(accept);

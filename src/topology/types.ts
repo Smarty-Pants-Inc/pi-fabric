@@ -22,6 +22,8 @@ export interface FabricParticipantRecord {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  /** Fresh control-owner activation, including same-process extension reloads. */
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   /**

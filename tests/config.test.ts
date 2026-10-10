@@ -113,6 +113,30 @@ describe("host-only processSlice (#4383)", () => {
   });
 });
 
+describe("host-only control incarnation rollout fence (#7514)", () => {
+  it("defaults to warn, accepts both modes, and rejects invalid policy values", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.controlIncarnationFence).toBe("warn");
+    expect(normalizeFabricConfig({}).mesh.controlIncarnationFence).toBe("warn");
+    for (const mode of ["warn", "enforce"]) {
+      expect(normalizeFabricConfig({ mesh: { controlIncarnationFence: mode } }).mesh.controlIncarnationFence).toBe(mode);
+    }
+    for (const value of [null, false, "off", "ENFORCE", 1]) {
+      expect(() => normalizeFabricConfig({ mesh: { controlIncarnationFence: value } })).toThrow("mesh.controlIncarnationFence must be warn or enforce");
+    }
+  });
+  it.each([true, false])("ignores project rollout policy, even in trusted lanes (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "enforce" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).mesh.controlIncarnationFence).toBe("warn");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "enforce" } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "warn" } }));
+    for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }),
+      loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
+      expect(config.mesh.controlIncarnationFence).toBe("enforce");
+    }
+  });
+});
+
 it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
   expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 0 } }).mesh.idleReadCoalesceMs).toBe(0);

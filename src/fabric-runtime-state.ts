@@ -764,7 +764,13 @@ export class FabricRuntimeState {
       if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
     }
     this.#rootInbox?.start();
+    // Capture this activation's directory: no control may claim/run before its epoch
+    // commits, after failed renewal, or through a replacement generation's lease.
+    const controlParticipants = this.#participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      canConsumeMesh: () => controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,

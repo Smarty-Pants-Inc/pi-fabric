@@ -303,7 +303,7 @@ describe("Astra resident lease delivery fence", () => {
       const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
       sender = new FabricControlPlane(new MeshStore(config.meshRoot, 65536, 1000), identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5000 });
       sender.start(() => ({ accepted: false }));
-      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work" }).catch(error => error);
+      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work", ownerIncarnation: host.participants.ownerIncarnation }).catch(error => error);
       await preparing; healthy = false; release(); await delay(150);
       expect(tell).not.toHaveBeenCalled();
       const seenRoot = path.join(config.meshRoot, "control-seen", createHash("sha256").update(host.hostId).digest("hex").slice(0, 32));
@@ -1040,7 +1040,9 @@ describe("resident host ownership", () => {
       sender.start(() => ({ accepted: false }));
       const child = await host.agents.spawn({ task: "HANG", transport: "process" });
       await vi.waitFor(() => expect(fs.existsSync(path.join(host.agents.runDirectory(child.id)!, "status.json"))).toBe(true));
-      const receipt = await sender.request(host.hostId, child.id, "followUp", { message: "later" }, host.identity.id);
+      await host.participants.refresh();
+      const receipt = await sender.request(host.hostId, child.id, "followUp",
+        { message: "later", ownerIncarnation: host.participants.get(child.id, undefined, { fresh: true })!.ownerIncarnation }, host.identity.id);
       const warning = { code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: child.id, kind: "agent", status: "running",
         message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion." };
       const command = host.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;

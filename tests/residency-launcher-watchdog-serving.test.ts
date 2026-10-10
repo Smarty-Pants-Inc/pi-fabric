@@ -13,6 +13,7 @@ import { residentRoot, type ResidentHostConfig, type ResidentHostOwner } from ".
 import { watchResidentChild } from "../src/residency/child-lifetime.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
 
@@ -138,10 +139,10 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       const actor = await client.createActor({ name: "watchdog-in-flight", instructions: "Wait for the offline response.", residency: "durable",
         model: "watchdog-offline/activation", transport: "process", tools: [], extensions: false, delivery: "mailbox", responseMode: "text" });
       await until(() => !!participants.get(actor.id, Date.now(), { fresh: true }));
-      const admitted = await control.request(owner.hostId, actor.id, "followUp", { message: "keep this activation in flight" }, owner.hostId);
+      const admitted = await control.request(owner.hostId, actor.id, "followUp", { message: "keep this activation in flight", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, owner.hostId);
       expect(admitted.acknowledged).toBe(true);
       await until(() => inferences === 1 && !!participants.get(actor.id, Date.now(), { fresh: true })?.actorRun);
-      const queued = await control.request(owner.hostId, actor.id, "followUp", { message: "queued work must not be replayed by a second host" }, owner.hostId);
+      const queued = await control.request(owner.hostId, actor.id, "followUp", { message: "queued work must not be replayed by a second host", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, owner.hostId);
       expect(queued.acknowledged).toBe(true);
       await until(() => participants.get(actor.id, Date.now(), { fresh: true })?.actorQueued === 1);
       // Admit a second real launcher while custody is absent and A still owns

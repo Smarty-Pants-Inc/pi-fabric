@@ -8,6 +8,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { residentProcessAlive } from "../src/residency/process-identity.js";
@@ -94,9 +95,9 @@ fs.rmSync = function(file, options) {
       const owner = readHandoverJson<ResidentHostOwner>(ownerPath)!;
       expect(owner.handover?.launcher.pid).toBe(launcher.pid);
       const actor = await clientA.createActor({ name: "preserved-actor", instructions: "Reply", residency: "durable", tools: [], responseMode: "text", delivery: "mailbox" });
-      await control.request(clientA.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS" }, clientA.hostId);
+      await control.request(clientA.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, clientA.hostId);
       await until(() => !!participants.get(actor.id, Date.now(), { fresh: true })?.actorRun);
-      const queued = await control.request(clientA.hostId, actor.id, "followUp", { message: "queued-before-intent" }, clientA.hostId);
+      const queued = await control.request(clientA.hostId, actor.id, "followUp", { message: "queued-before-intent", ownerIncarnation: await liveControlOwnerIncarnation(participants, actor.id) }, clientA.hostId);
       expect(queued.acknowledged).toBe(true);
       process.execPath = bundled; vi.stubEnv("PI_FABRIC_NODE_BINARY", successorRuntime);
       if (mode === 'crash-at-first-publication') {

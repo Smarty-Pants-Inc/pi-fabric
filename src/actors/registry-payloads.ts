@@ -58,6 +58,8 @@ export class ActorRegistryPayloads {
   // A committed head selects an immutable byte range, so a matching in-memory ring needs no
   // history re-read. Speculative digests are promoted only by accept() after the commit.
   readonly #committedRings = new Map<string, { head: string; digest: string }>();
+  /** Actor ids with a remembered committed ring (tests). */
+  committedRingIds(): string[] { return [...this.#committedRings.keys()]; }
   #speculativeRings: Map<string, { head: string; digest: string }> | undefined;
 
   /** True when `messages` is exactly the ring this process committed at `head` for `id`. */
@@ -80,7 +82,11 @@ export class ActorRegistryPayloads {
     return {
       metadata,
       /** After the registry commit: remember the rings whose heads it published. */
-      accept: (heads: readonly Row[]): void => {
+      accept: (heads: readonly Row[], committed: readonly Row[]): void => {
+        // smarty-dev#8533: forget actors the committed registry no longer holds (removed).
+        // A ceded row stays bounded by the registry; its next head change misses the digest.
+        const ids = new Set(committed.map(row => row.id));
+        for (const id of this.#committedRings.keys()) if (!ids.has(id)) this.#committedRings.delete(id);
         for (const row of heads) {
           const ring = typeof row.id === "string" ? rings.get(row.id) : undefined;
           if (ring && ring.head === JSON.stringify(row.messageHistory)) this.#committedRings.set(row.id as string, ring);

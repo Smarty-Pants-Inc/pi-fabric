@@ -283,10 +283,13 @@ describe("host process task placement", () => {
     ["Run org-search 'placement' and summarize", "org-search"],
     ["Read the prompt in /run/user/1000/fabric/task.md", "/run/user/"],
   ])("adds the corpus need for a corpus prompt without needs (smarty-dev#6779): %s", async (task, _marker) => {
-    const f=fixture(); const h=await f.manager.spawn({task,transport:"process",needs:["compute"]});
-    expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
-    const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
-    expect(lines).toEqual([expect.objectContaining({reason:"corpus",needs:["compute","corpus"]})]);
+    const f=fixture();
+    for (const [needs, expected] of [[undefined,["corpus"]],[["compute"],["compute","corpus"]],[["corpus"],["corpus"]]] as const) {
+      const h=await f.manager.spawn({task,transport:"process",...(needs ? {needs:[...needs]} : {})});
+      expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+      const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
+      expect(lines).toEqual([expect.objectContaining({reason:"corpus",needs:expected})]);
+    }
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it("adds the corpus need when the cwd names the corpus (smarty-dev#6779)", async () => {

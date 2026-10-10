@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
-import { type FabricHostLease, hostEntryLiveness, readHostLeases, removeHostLease } from "./host-leases.js";
+import { type FabricHostLease, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
+  readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion } from "./host-leases.js";
+import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
 import { effectiveLiveness } from "./liveness.js";
@@ -46,12 +48,12 @@ interface DeadRecord { entry: MeshStateEntry; hostId: string; file?: true }
 export const deadHostRecords = (
   mesh: Pick<MeshStore, "listAll"> & { root?: string },
   options: { ownHostId: string; now?: number; deadAfterMs?: number },
+  leases: ReadonlyMap<string, FabricHostLease> = fileLeases(mesh),
 ): DeadRecord[] => {
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const fresh = { fresh: true };
   const hosts = new Map<string, boolean>();
   const dead: DeadRecord[] = [];
-  const leases = fileLeases(mesh);
   for (const entry of mesh.listAll(HOST_PREFIX, fresh)) {
     const id = record(entry.value)?.id;
     if (typeof id !== "string" || entry.key !== hostKey(id)) continue;
@@ -147,12 +149,15 @@ const staleDirectoryDeletes = (
  * Returns how many it removed.
  */
 export const reapDeadHostRecords = async (
-  mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & { root?: string },
+  mesh: Pick<MeshStore, "listAll" | "writeBatch" | "custody"> & Partial<Pick<MeshStore, "leaseCustody">> & { root?: string },
   identity: MeshIdentity,
-  options: { ownHostId: string; now?: number; deadAfterMs?: number },
+  options: { ownHostId: string; now?: number; deadAfterMs?: number;
+    withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
 ): Promise<number> => {
+  const fenced = options.withCommitFence ?? (async <T>(operation: () => T | Promise<T>): Promise<T> => operation());
   const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
-  const found = deadHostRecords(mesh, options);
+  const selectedLeases = fileLeases(mesh);
+  const found = deadHostRecords(mesh, options, selectedLeases);
   const bookkeeping = staleDirectoryDeletes(mesh, identity, options.now ?? Date.now());
   // Leftovers of per-key lock operations whose process died (security pass S5 on #142).
   if (typeof mesh.root === "string") {
@@ -169,51 +174,74 @@ export const reapDeadHostRecords = async (
   const leaseStamp = typeof mesh.root === "string" ? meshDirectoryStamp(mesh.root, "host-leases") : "";
   const leasesBefore = fileLeases(mesh);
   let leases = leasesBefore;
-  const results = dead.length === 0 && bookkeeping.length === 0 ? [] : await mesh.writeBatch({
-    identity,
-    ops: [...dead.map(({ entry, hostId }) => ({
-      kind: "delete" as const,
-      key: entry.key,
-      ifVersion: entry.version,
-      onConflict: "skip" as const,
-      // Absent at commit is gone: the host was deleted (earlier in this batch, or it had no
-      // record, where the orphan rule held at selection and the version fence holds since).
-      condition: (current: (key: string) => MeshStateEntry | undefined) => {
-        const host = current(hostKey(hostId));
-        return host === undefined || leaseGone(host, cutoff, leases);
+  const targets = [...new Set(found.map(item => item.hostId))].sort();
+  const changed = new Error("Reaper target lease renewed or replaced");
+  const root = mesh.root;
+  const assertTarget = (hostId: string, expected: FabricHostLease | undefined): void => {
+    if (typeof root === "string" && !sameHostLeaseVersion(hostLeasePredecessor(root, hostId), expected)) throw changed;
+  };
+  const targetGate = <T>(hostId: string, operation: () => T | Promise<T>): Promise<T> =>
+    typeof root === "string" && mesh.leaseCustody
+      ? mesh.leaseCustody(hostLeasePath(root, hostId), operation)
+      : Promise.resolve().then(operation);
+  // Acquire target gates in a stable order, before the reaper's gate and shared state.
+  // A renewal on ANY selected target aborts this pass before any record/file deletion.
+  const targetGates = <T>(operation: () => T | Promise<T>, index = 0): Promise<T> => index === targets.length
+    ? Promise.resolve().then(operation)
+    : targetGate(targets[index]!, () => { assertTarget(targets[index]!, selectedLeases.get(targets[index]!)); return targetGates(operation, index + 1); });
+  const retired = new Set<string>();
+  const reapable = new Set<string>();
+  let results;
+  try {
+    results = await targetGates(() => fenced(() => mesh.writeBatch({
+      identity,
+      ops: dead.map(({ entry, hostId }) => ({
+        kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const,
+        condition: (current: (key: string) => MeshStateEntry | undefined) => {
+          const host = current(hostKey(hostId));
+          return host === undefined || leaseGone(host, cutoff, leases);
+        },
+      })),
+      prepare: view => {
+        leases = typeof root !== "string" || meshDirectoryStamp(root, "host-leases") === leaseStamp
+          ? leasesBefore : fileLeases(mesh);
+        for (const hostId of targets) {
+          const host = view.get(hostKey(hostId));
+          if (!host || leaseGone(host, cutoff, leases)) reapable.add(hostId);
+        }
+        const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now(), leases);
+        return bookkeeping.filter(op => !live.has(op.key));
       },
-    }))],
-    // Session keys are not derivable from participant ids, and a returning root can create
-    // a new one after selection. Scan the authoritative batch view, not a cached listAll,
-    // under the commit lock. File leases are revalidated here too. Presence is checked by each
-    // cursor condition; its version fence still protects a rewritten checkpoint.
-    prepare: (view) => {
-      leases = typeof mesh.root !== "string" || meshDirectoryStamp(mesh.root, "host-leases") === leaseStamp
-        ? leasesBefore : fileLeases(mesh);
-      const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now(), leases);
-      return bookkeeping.filter((op) => !live.has(op.key));
-    },
-  });
-  let removed = results.filter((result) => result.applied).length;
-  if (typeof mesh.root === "string") {
-    // Participant files, each checked again just before its removal: its host must still be gone
-    // (or have no record, where the orphan rule held at selection), and the file unchanged since.
-    // Under the file's own lock, so a takeover since the scan keeps its file (review/astra F1 on #142).
-    // ponytail: a host renewing only its lease file is not fenced; it has been gone for hours.
-    for (const { entry, hostId } of found.filter((item) => item.file)) {
-      const hostGone = (): boolean => {
-        const host = mesh.listAll(hostKey(hostId), { fresh: true }).find((candidate) => candidate.key === hostKey(hostId));
-        return !host || leaseGone(host, cutoff, fileLeases(mesh));
-      };
-      const gone = await removeParticipantFileIf({ root: mesh.root, custody: (operation) => mesh.custody(operation) }, entry.key, (current) =>
-        current.version === entry.version && current.updatedAt === entry.updatedAt && hostGone()).catch(() => false);
+      beforeCommit: () => { for (const hostId of targets) assertTarget(hostId, selectedLeases.get(hostId)); },
+      // Still inside every target's gate. Renew/claim cannot cross the state COMMIT
+      // and exact-version lease removal. Never re-read/adopt a later renewal as a victim.
+      commitOutbox: () => {
+        if (typeof root !== "string") return;
+        for (const hostId of reapable) {
+          const expected = selectedLeases.get(hostId);
+          if (expected && effectiveLiveness(undefined, expected).expiresAt <= cutoff &&
+            removeHostLeaseVersionUnderCustody(root, expected)) retired.add(hostId);
+        }
+      },
+    })));
+  } catch (error) {
+    if (error === changed || isMeshLockTimeout(error)) return 0;
+    throw error;
+  }
+  let removed = results.filter(result => result.applied).length;
+  if (typeof root === "string") {
+    // Lock order remains participant key -> target gate -> own gate -> state.
+    // A new claim after the shared commit keeps ALL remaining participant files.
+    for (const { entry, hostId } of found.filter(item => item.file)) {
+      const gone = await removeParticipantFileIf({ root, custody: operation => mesh.custody(operation) }, entry.key, current => {
+        const host = mesh.listAll(hostKey(hostId), { fresh: true }).find(candidate => candidate.key === hostKey(hostId));
+        return current.version === entry.version && current.updatedAt === entry.updatedAt &&
+          (!host || leaseGone(host, cutoff, fileLeases(mesh)));
+      }, { withCommitFence: operation => targetGate(hostId, () => fenced(() => {
+        assertTarget(hostId, retired.has(hostId) ? undefined : selectedLeases.get(hostId));
+        return operation();
+      })) }).catch(() => false);
       if (gone) removed += 1;
-    }
-    // A reaped host's file lease goes too, once it is as old.
-    const leases = readHostLeases(mesh.root);
-    for (const hostId of new Set(found.map((item) => item.hostId))) {
-      const lease = leases.get(hostId);
-      if (lease && effectiveLiveness(undefined, lease).expiresAt <= cutoff) removeHostLease(mesh.root, hostId);
     }
   }
   return removed;

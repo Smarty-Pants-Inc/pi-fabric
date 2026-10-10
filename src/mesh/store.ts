@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { withMeshCustody } from "./custody-lock.js";
+import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
@@ -451,6 +451,26 @@ export class MeshStore {
    * transition-safe "dual" mode. For operations that guard only files beside the mesh. */
   async custody<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return withMeshCustody(this, operation, lockTimeoutMs);
+  }
+
+  /** Per-host lease commits and recovery serialize without the shared state/custody lock.
+   * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
+   * before recovery can change its receipt. Async lease-owned transactions retain this gate until
+   * settled; recovery requires matching machine identity and death/current-boot evidence.
+   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery;
+   * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
+  async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
+    options: { ownIncarnation?: string | undefined } = {}): Promise<T> {
+    const hash = createHash("sha256").update(path.basename(file)).digest("hex");
+    const legacy = path.join(this.root, "host-lease-commits", hash);
+    // One-release compatibility: prefer an existing full-hash domain, including an idle one,
+    // so its old readers/holders still share custody. New domains stay within Windows MAX_PATH.
+    // ponytail: 64-bit prefix collisions among one mesh's hosts are negligible; a collision
+    // only serializes two hosts on the same gate, never bypasses their lease-token checks.
+    const domain = fs.existsSync(legacy) ? legacy
+      : path.join(this.root, "host-lease-commits", hash.slice(0, 16));
+    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true });
+    try { return await operation(); } finally { release(); }
   }
 
   /** The active withTryLock budget in this async context, if any. */

@@ -2,6 +2,7 @@
 // such as fleet schedulers and maintenance tools. It loads only the mesh store: no
 // extension, UI, or agent runtime.
 export { MeshBatchConflictError, MeshDedupeRecoveryError, MeshDedupeStoreFullError, MeshLockTimeoutError, MeshStore } from "./mesh/store.js";
+export { MeshCustodyUnrecoverableError } from "./mesh/custody-lock.js";
 export type { FabricPrincipal, FabricPrincipalAuthorityCheck } from "./fabric-provenance.js";
 export type {
   MeshBatchOperation,

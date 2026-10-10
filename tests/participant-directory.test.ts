@@ -12,7 +12,7 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -768,8 +768,7 @@ describe("ParticipantDirectory host leases", () => {
         // A legacy reader has no host-file fallback: its fixed 15 s TTL must never lapse.
         expect(now - mesh.get("sessions/idle", { fresh: true })!.updatedAt).toBeLessThan(15_000);
         // Read the canonical file here; fake wall-clock jumps do not change filesystem clocks.
-        const leaseFile = fs.readdirSync(path.join(mesh.root, "host-leases"))[0]!;
-        const lease = JSON.parse(fs.readFileSync(path.join(mesh.root, "host-leases", leaseFile), "utf8"));
+        const lease = JSON.parse(fs.readFileSync(hostLeasePath(mesh.root, identity.id), "utf8"));
         expect(lease.expiresAt).toBe(now + 15_000);
         expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
       }

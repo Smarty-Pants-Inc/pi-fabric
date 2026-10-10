@@ -37,7 +37,8 @@ export const sessionLiveness = (entry: MeshStateEntry, meshRoot?: string): Liven
   const lease = readHostLease(meshRoot, typeof value.livenessHostId === "string" ? value.livenessHostId : value.id);
   const session = lease?.session;
   const matching = lease?.rootId === value.id && lease.identityId === entry.updatedBy?.id &&
-    lease.startedAt === value.livenessStartedAt &&
+    (typeof value.livenessIncarnationToken === "string" ? lease.incarnationToken === value.livenessIncarnationToken :
+      lease.startedAt === value.livenessStartedAt) &&
     session?.id === value.sessionId && session.startedAt === value.startedAt;
   return effectiveLiveness(stored, matching ? session : undefined);
 };

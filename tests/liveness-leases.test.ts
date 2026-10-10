@@ -17,6 +17,14 @@ describe("shared state/file liveness", () => {
   const host = { id: "host", rootId: "root", identity: { id: "writer" }, startedAt: 1, updatedAt: 10, expiresAt: 25 };
   const lease: FabricHostLease = { id: host.id, rootId: host.rootId, identityId: host.identity.id,
     startedAt: host.startedAt, updatedAt: 20, expiresAt: 35 };
+  it("uses tokens rather than colliding timestamps for token-capable host liveness", () => {
+    const modern = { ...host, incarnationToken: "current" };
+    const current = { ...lease, incarnationToken: "current", startedAt: -1 };
+    expect(hostLiveness(new Map([[host.id, current]]), modern)).toEqual({ updatedAt: 20, expiresAt: 35 });
+    for (const stale of [{ ...lease, incarnationToken: "stale" }, lease]) {
+      expect(hostLiveness(new Map([[host.id, stale]]), modern)).toEqual({ updatedAt: 10, expiresAt: 25 });
+    }
+  });
   it("accepts a matching modern lease and a pre-capability host lease", () => {
     expect(hostLiveness(new Map([[host.id, lease]]), host)).toEqual({ updatedAt: 20, expiresAt: 35 });
     const { startedAt: _startedAt, ...legacyLease } = lease;

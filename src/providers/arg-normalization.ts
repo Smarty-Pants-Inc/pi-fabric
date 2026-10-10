@@ -1,3 +1,4 @@
+import { Value } from "typebox/value";
 import type { FabricActionDescriptor } from "../protocol.js";
 
 // Argument-shape normalization shared by the stable Fabric providers,
@@ -6,8 +7,8 @@ import type { FabricActionDescriptor } from "../protocol.js";
 // 1. prepareArguments canonicalizes near-miss argument spellings at the
 //    registry prepare stage — aliases resolve to the canonical key (which
 //    wins on conflict), value spellings repair, numeric strings coerce for
-//    schema-declared numeric fields, and nullish values of declared
-//    optionals are stripped.
+//    schema-declared numeric fields, and nullish values of declared keys
+//    are stripped unless the property's schema accepts null.
 // 2. validateArguments then owns the didactic failure tier: required
 //    canonical keys are enforced and unknown keys fail
 //    additionalProperties: false validation with the offending path named.
@@ -160,8 +161,16 @@ const deriveEnumValueMap = (
   return map;
 };
 
+// Use the same validator as the registry so every nullable schema encoding
+// (including unions and open schemas) keeps its explicit null value.
+const allowsNull = (schema: unknown): boolean => {
+  try { return Value.Check(schema as Record<string, unknown>, null); }
+  catch { return true; } // Unknown schemas must reach authoritative validation unchanged.
+};
+
 type DerivedAction = {
   declared: Set<string>;
+  nullable: Set<string>;
   declaredForms: Map<string, string>;
   singulars: Map<string, string>;
   numerics: Set<string>;
@@ -182,6 +191,7 @@ const deriveAction = (
       ? (inputSchema.properties as Record<string, unknown>)
       : undefined;
   const declared = new Set(Object.keys(properties ?? {}));
+  const nullable = new Set(Object.entries(properties ?? {}).filter(([, property]) => allowsNull(property)).map(([key]) => key));
   const declaredForms = new Map<string, string>();
   const ambiguousForms = new Set<string>();
   for (const key of declared) {
@@ -223,7 +233,7 @@ const deriveAction = (
     }
     values.set(key, map);
   }
-  return { declared, declaredForms, singulars, numerics, numericArrays, values, aliases: explicit?.aliases };
+  return { declared, nullable, declaredForms, singulars, numerics, numericArrays, values, aliases: explicit?.aliases };
 };
 
 const lexiconRepair = (
@@ -272,7 +282,8 @@ const applyDerived = (
 
   // Explicit action-local aliases first, then derived repairs. Both obey
   // canonical-wins: the canonical key keeps an already-supplied value and
-  // the spelling variant is dropped either way.
+  // the spelling variant is dropped either way, including when the
+  // canonical value is explicitly null.
   const repair = (alias: string, canonical: string) => {
     if (!(alias in out) || alias === canonical) return;
     if (!(canonical in out)) out[canonical] = out[alias];
@@ -316,7 +327,7 @@ const applyDerived = (
   }
   if (derived.declared.size > 0) {
     for (const key of Object.keys(out)) {
-      if (derived.declared.has(key) && (out[key] === null || out[key] === undefined)) {
+      if (derived.declared.has(key) && (out[key] === undefined || (out[key] === null && !derived.nullable.has(key)))) {
         delete out[key];
       }
     }
@@ -334,8 +345,9 @@ export const normalizeActionArgs = (
 ): Record<string, unknown> => {
   const derived: DerivedAction = {
     // The low-level path strips nullish values only for explicit knownKeys;
-    // schema-derived declared keys come from actionArgNormalizer.
+    // schema-derived declared/nullable keys come from actionArgNormalizer.
     declared: new Set(spec.knownKeys ?? []),
+    nullable: new Set(),
     declaredForms: new Map(),
     singulars: new Map(),
     numerics: new Set(spec.numerics ?? []),

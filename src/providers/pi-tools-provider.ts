@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
+import { trackResidentProcessWork } from "../residency/process-work.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import type { LandlockBashConfinement, LandlockSettings } from "../core/landlock.js";
@@ -513,13 +514,13 @@ export class PiToolsProvider implements FabricProvider {
   ): Promise<PiToolResult> {
     if (!isPiShellToolName(name) || this.#requireCapturedOverrides) {
       return await runAbortable(context.signal, () =>
-        tool.execute(
+        trackResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.(), () => tool.execute(
           context.nestedToolCallId,
           args,
           context.signal,
           onUpdate,
           this.#executionContextFor(name, args, context.extensionContext),
-        ),
+        )),
       ) as PiToolResult;
     }
     return this.#executeHungShell(name, args, context, onUpdate, middleware);
@@ -563,7 +564,7 @@ export class PiToolsProvider implements FabricProvider {
       job,
       execute: (signal) =>
         // Settlement of the tool call ends launch custody (also after a spill/handoff).
-        Promise.resolve().then(() => tool.execute(
+        trackResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.(), () => Promise.resolve().then(() => tool.execute(
           context.nestedToolCallId,
           executeArgs,
           signal,
@@ -572,7 +573,7 @@ export class PiToolsProvider implements FabricProvider {
             onUpdate(partialResult as PiToolResult);
           },
           this.#executionContextFor(name, args, context.extensionContext),
-        )).finally(releaseHolds),
+        ))).finally(releaseHolds),
     });
     if (outcome.status === "done") {
       await job.finish((outcome.value as PiToolResult & { isError?: boolean }).isError ? null : 0);

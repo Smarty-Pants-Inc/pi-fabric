@@ -169,11 +169,12 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
 
   it("never exits on a reused actor observation: an idle exit is confirmed by a current check", async () => {
     let idled = 0;
-    const { root, host } = fixture(() => { idled++; });
     let now = Date.now();
+    // Freeze before construction/startup: fence and recovery latency are not idle time.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { root, host } = fixture(() => { idled++; });
     try {
       await host.start();
-      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       let active = false;
       const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => active);
       // Just short of the idle window: the next tick takes a current (inactive) observation.
@@ -192,8 +193,8 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       now += 30_100;
       await sleep(200);
       expect(idled).toBeGreaterThan(0);
-      clock.mockRestore();
     } finally {
+      clock.mockRestore();
       await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }

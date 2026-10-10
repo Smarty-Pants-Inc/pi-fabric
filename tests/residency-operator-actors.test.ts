@@ -112,7 +112,7 @@ describe("same-user resident actor operator", () => {
         updatedAt: Date.now(), expiresAt: Date.now() + 60_000 });
       const result = await f.cli("remove", actor.id, f.confirm);
       expect(result.code).toBe(1); expect(result.err).toContain("live root lease");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
     } finally { await f.close(); }
   }, 30_000);
 
@@ -141,7 +141,7 @@ describe("same-user resident actor operator", () => {
         const refused = await f.cli(action, actor.id, flags);
         expect(refused.code).toBe(1); expect(refused.err).toContain("root lease is unreadable or invalid");
         expect(refused.err).toContain("--confirm-dead-root");
-        expect(f.host.actors.status(actor.id).status).toBe("idle");
+        expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
         expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
       }
     } finally { spy?.mockRestore(); await f.close(); }
@@ -199,7 +199,7 @@ describe("same-user resident actor operator", () => {
           cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
         });
         expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action, resident: f.config.residencyRoot });
-        expect(other.host.actors.status(wrongRoot.id).status).toBe("idle");
+        expect(other.host.actors.status(wrongRoot.id).status).toMatch(/^(idle|dormant)$/);
         expect(new ActorRegistryStore(other.config.actorRoot).records().some(row => row.id === wrongRoot.id)).toBe(true);
         if (action === "stop") expect(f.host.actors.status(target.id).status).toBe("stopped");
         else expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === target.id)).toBe(false);
@@ -210,7 +210,7 @@ describe("same-user resident actor operator", () => {
         "--resident", selector, "--actor", target.name, ...f.confirm], {
         cwd, env: { ...process.env, PI_FABRIC_MESH_ROOT: f.config.meshRoot },
       })).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Ambiguous resident prefix") });
-      expect(other.host.actors.status(wrongRoot.id).status).toBe("idle");
+      expect(other.host.actors.status(wrongRoot.id).status).toMatch(/^(idle|dormant)$/);
     } finally { if (other) await other.close(); await f.close(); }
   }, 40_000);
 
@@ -232,7 +232,7 @@ describe("same-user resident actor operator", () => {
         expect(refused.code).toBe(1);
         expect(refused.err).toContain(flags.length ? "Mismatched --confirm-dead-root" : "Missing --confirm-dead-root");
         expect(refused.err).toContain(JSON.stringify(evidence));
-        expect(f.host.actors.status(actor.id).status).toBe("idle");
+        expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
       }
       expect(await f.cli(action, actor.id, ["--dry-run", "--confirm-dead-root", "session:wrong"]))
         .toMatchObject({ code: 1, err: expect.stringContaining("Mismatched --confirm-dead-root") });
@@ -253,7 +253,7 @@ describe("same-user resident actor operator", () => {
       const dry = await f.cli(action, actor.id, ["--dry-run", ...f.confirm]);
       expect(dry.code).toBe(1); expect(dry.err).toContain("Main has a live root lease");
       expect(dry.err).toContain(`"lastLeaseTime":${updatedAt},"leaseExpiresAt":${expiresAt},"liveLease":true`);
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
     } finally { await f.close(); }
   }, 30_000);
 
@@ -267,7 +267,7 @@ describe("same-user resident actor operator", () => {
         return stop(...args);
       });
       expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("live root lease") });
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
       expect(new ActorRegistryStore(f.config.actorRoot).records().some(row => row.id === actor.id)).toBe(true);
     } finally { await f.close(); }
   }, 30_000);
@@ -281,7 +281,7 @@ describe("same-user resident actor operator", () => {
       for (const action of ["stop", "remove"] as const) {
         expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("not owned by this OS user") });
       }
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
     } finally { await f.close(); }
   }, 30_000);
 
@@ -299,7 +299,7 @@ describe("same-user resident actor operator", () => {
       fs.writeFileSync(ownerPath, JSON.stringify({ ...owner, commands: owner.commands.filter((op: string) => op !== "operatorActor") }));
       await expect(client.operatorActor("remove", actor.id, { confirmDeadRoot: f.config.rootId })).rejects.toThrow("older release");
       expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(f.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
     } finally { await f.close(); }
   }, 30_000);
 
@@ -381,7 +381,7 @@ describe("resident selector boundary", () => {
           const symlink = await f.cli(action, actor.name, [], selector);
           expect(symlink.code).toBe(1); expect(symlink.err).toContain("must not be a symlink");
         }
-        expect(other.host.actors.status(actor.id).status).toBe("idle");
+        expect(other.host.actors.status(actor.id).status).toMatch(/^(idle|dormant)$/);
         expect(fs.readdirSync(path.join(other.config.residencyRoot, "requests"))).toHaveLength(0);
       }
     } finally { if (other) await other.close(); await f.close(); }

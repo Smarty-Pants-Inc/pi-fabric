@@ -8,8 +8,9 @@ fabric-v2 owns the NATS store (pi-fabric#708 KV lease, #717 event log).
 `createStateBackend` (`src/mesh/state-backend.ts`) resolves a kind and calls its entry in
 `STATE_BACKEND_FACTORIES`. The kinds list is the import-free leaf `src/mesh/state-backend-kinds.ts`,
 so `config.ts` parses `mesh.stateBackend` without loading SQLite. Precedence is unchanged:
-an explicit option, then a valid `PI_FABRIC_MESH_STATE_BACKEND`, then `file`. An unknown
-environment value is still ignored.
+an explicit option, then a valid `PI_FABRIC_MESH_STATE_BACKEND`, then `file`. An empty
+environment value counts as unset. An unknown non-empty value now fails config loading and
+store open. Before this, it was ignored, and a typo silently opened a different store than its peers.
 
 | kind | factory | `unavailable` (falls back to `file`) |
 |---|---|---|

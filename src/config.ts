@@ -361,9 +361,13 @@ export type MeshStateBackend = MeshStateBackendKind;
 // The import-free kinds leaf on purpose: importing state-backend.ts here would put SQLite in the config graph.
 const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = MESH_STATE_BACKEND_KINDS;
 const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
-  // The environment overrides the file setting; an unknown environment value is ignored (fail safe).
+  // The environment overrides the file setting. An unknown non-empty value is refused, never ignored:
+  // a typo would silently open a different store than its peers and split the mesh (pi-fabric#796).
   const override = env?.trim().toLowerCase();
-  if (override && (MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+  if (override) {
+    if ((MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+    throw new Error(`PI_FABRIC_MESH_STATE_BACKEND must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
+  }
   if (value === undefined) return "file";
   if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
   throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);

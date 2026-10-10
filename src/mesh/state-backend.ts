@@ -247,7 +247,8 @@ export { MeshStateFileReadChangedError };
 
 /**
  * The effective kind: an explicit option wins, then a valid `PI_FABRIC_MESH_STATE_BACKEND`, then
- * `"file"`. An unknown environment value is ignored (fail safe to the file backend).
+ * `"file"`. An empty environment value counts as unset. An unknown non-empty one throws: ignoring it
+ * would open a different store than the operator chose, and split the mesh (pi-fabric#796).
  */
 export const resolveMeshStateBackend = (explicit?: MeshStateBackendKind,
   env: string | undefined = process.env[MESH_STATE_BACKEND_ENV]): MeshStateBackendKind => {
@@ -256,7 +257,9 @@ export const resolveMeshStateBackend = (explicit?: MeshStateBackendKind,
     return explicit;
   }
   const value = env?.trim().toLowerCase();
-  return isMeshStateBackendKind(value) ? value : "file";
+  if (!value) return "file";
+  if (isMeshStateBackendKind(value)) return value;
+  throw new Error(`${MESH_STATE_BACKEND_ENV} must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
 };
 
 /** A SQLite state write ran out of its busy budget (`MeshStateBusy`). */

@@ -42,11 +42,13 @@ describe("state backend selector registry", () => {
   it("resolves file, shadow and sqlite exactly as before", () => {
     const table: [Parameters<typeof resolveMeshStateBackend>[0], string | undefined, string][] = [
       [undefined, undefined, "file"], [undefined, "", "file"], [undefined, "sqlite", "sqlite"], [undefined, " Shadow ", "shadow"],
-      [undefined, "FILE", "file"], [undefined, "bogus", "file"], ["file", "sqlite", "file"], ["sqlite", "file", "sqlite"],
+      [undefined, "FILE", "file"], ["file", "sqlite", "file"], ["sqlite", "file", "sqlite"],
       ["shadow", undefined, "shadow"],
     ];
     for (const [explicit, env, expected] of table) expect(resolveMeshStateBackend(explicit, env)).toBe(expected);
     expect(() => resolveMeshStateBackend("bogus" as "file")).toThrow(/mesh.stateBackend must be file, shadow, sqlite or nats/);
+    // pi-fabric#796: an unknown non-empty environment value is refused, no longer ignored.
+    expect(() => resolveMeshStateBackend(undefined, "bogus")).toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be/);
   });
 
   it("opens file by default, sqlite from the environment, and an explicit file over the environment", async () => {

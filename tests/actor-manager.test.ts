@@ -101,6 +101,32 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+describe("owner-minted supervisor interrupt binding (#7452)", () => {
+  it("persists the binding only for an owning Main's native supervisor", async () => {
+    const { actors, root, identity, mesh, meshConfig, agents } = setup(true);
+    const request = { name: "supervisor", instructions: "Watch Main.", events: ["agent_settled" as const], responseMode: "directive" as const, delivery: "steer" as const, triggerTurn: true };
+    const own = await actors.create(request);
+    expect(own.supervisorFor).toBe(identity.id);
+    const rows = new ActorRegistryStore(path.join(root, "actors")).snapshot().actors;
+    expect(rows.find(row => row.id === own.id)?.supervisorFor).toBe(identity.id);
+    const forged = await actors.create({ ...request, name: "peer-supervisor", supervisorFor: identity.id } as any,
+      { supervisorOwner: { id: "peer", name: "supervisor", kind: "actor" } });
+    expect(forged.supervisorFor).toBeUndefined();
+    const ordinary = await actors.create({ name: "ordinary-supervisor", instructions: "Ordinary actor." });
+    expect(ordinary.supervisorFor).toBeUndefined();
+    const foreign = await actors.create({ ...request, name: "foreign-supervisor" },
+      { supervisorOwner: { id: "session:foreign", name: "main", kind: "main" } });
+    expect(foreign.supervisorFor).toBeUndefined();
+    await actors.close();
+    const restored = new ActorManager("test", identity, mesh, meshConfig, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent: true,
+    });
+    actorManagers.push(restored);
+    expect(restored.status(own.id).supervisorFor).toBe(identity.id);
+    expect(restored.status(forged.id).supervisorFor).toBeUndefined();
+  });
+});
+
 describe("ActorManager idle observer versus canonical authority (#4383)", () => {
   it("coalesces an ownership view but refuses tell after canonical ownership moved", async () => {
     let canonical = true;

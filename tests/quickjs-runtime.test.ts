@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
@@ -36,6 +37,14 @@ catch (error) {
       message: error.message, isError: true, extra: "undefined", continued: ["continued"] });
     expect(hostCall.mock.calls.map(([reference]) => reference)).toEqual(["mesh.put", "mesh.read"]);
   });
+
+  it.each([new FabricInterruptNotAuthorizedError("sender", "target"), new FabricInterruptRateLimitedError("sender", "target")])
+    ("preserves the vetted interrupt refusal code in agents.send (%s)", async error => {
+      Object.assign(error, { secret: "host-only" });
+      const result = await new QuickJsRuntime().execute('try { await agents.send({ id: "main", message: "HOLD", priority: "interrupt" }); } catch (error) { return { name: error.name, code: error.code, extra: typeof error.secret }; }', async () => { throw error; }, options);
+      expect(result.error).toBeUndefined();
+      expect(result.value).toEqual({ name: error.name, code: error.code, extra: "undefined" });
+    });
 
   it("preserves a non-lock host Error name without transferring its arbitrary code", async () => {
     const error = Object.assign(new RangeError("bounded"), { code: "PROVIDER_CODE", secret: "not-guest-data" });

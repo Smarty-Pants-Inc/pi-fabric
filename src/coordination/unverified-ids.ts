@@ -155,7 +155,7 @@ const candidates = (text: string, work: WorkBudget): Identifier[] => {
 
 type Entry = { id?: string; parentId?: string | null; type?: string; customType?: string; content?: unknown; details?: unknown; message?: { role?: string; customType?: string; toolName?: string; content?: unknown; details?: unknown } };
 type DeliveryDetails = { from?: { id?: string; sessionId?: string }; items?: unknown[] };
-const sendRefs = new Set(["agents.steer", "agents.followUp", "agents.tell", "mesh.publish"]);
+const sendRefs = new Set(["agents.send", "agents.steer", "agents.followUp", "agents.tell", "mesh.publish"]);
 
 // Routing metadata may exclude a send-only result, but never supplies positive
 // read evidence. Do not inspect nested args/results or copy the whole trace.

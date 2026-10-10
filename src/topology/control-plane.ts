@@ -2,6 +2,7 @@ import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-lea
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
+import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -74,6 +75,9 @@ export interface FabricControlCommand {
 }
 
 export interface FabricControlAcceptance {
+  code?: "FABRIC_TARGET_TERMINAL";
+  finalAnswerReceiptId?: string;
+  targetId?: string;
   warning?: AgentFollowUpRunningWarning;
   accepted: boolean;
   messageId?: string;
@@ -672,6 +676,8 @@ export class FabricControlPlane {
       await Promise.race([publishing, acceptance.then(() => undefined)]);
       const acknowledged = await acceptance;
       if (!acknowledged.accepted) {
+        const terminal = terminalRejectionFields(acknowledged);
+        if (terminal && terminal.targetId === targetId) throw new FabricTargetTerminalError(targetId, terminal.finalAnswerReceiptId);
         const error = acknowledged.error || "Remote Fabric owner rejected command for " + targetId;
         throw new FabricControlRejection(
           acknowledged.notRun === true && error === CONTROL_COMMAND_EXPIRED
@@ -988,6 +994,8 @@ export class FabricControlPlane {
     this.#clearPending(event.data.commandId);
     pending.resolve({
       accepted: event.data.accepted === true,
+      ...(event.data.accepted !== true && terminalRejectionFields(event.data)?.targetId === pending.targetId
+        ? terminalRejectionFields(event.data) : {}),
       ...(typeof event.data.messageId === "string" ? { messageId: event.data.messageId } : {}),
       ...queueDepthOf(event.data),
       ...coalescedOf(event.data),
@@ -1413,6 +1421,8 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
+          ...(!acceptance.accepted && terminalRejectionFields(acceptance)?.targetId === command.targetId
+            ? terminalRejectionFields(acceptance) : {}),
           ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),
           };
         },

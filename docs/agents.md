@@ -28,6 +28,43 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Native Pi task final-answer boundary
+
+An ordinary native Pi process task ends when its final assistant answer is durably
+recorded in `final-answer.json`. The immutable receipt fences input immediately.
+Fabric then reads the worker's associated validated terminal snapshot and releases
+`agents.wait`/`run` once, **before native process/tree close**. Run/result/handle
+records expose `finalAnswerReceipt: { id, recordedAt }`. Structured replies retain
+`replyVia`, `value`, and schema failures; the answer receipt cannot promote a failed
+reply to success. Intermediate prose and tool turns remain steerable. Actor
+activations retain their continuation semantics. Claude and external placement
+completion rules are unchanged.
+
+Later `steer` and `followUp` calls reject with `FabricTargetTerminalError`, carrying
+`code: "FABRIC_TARGET_TERMINAL"`, `targetId`, and `finalAnswerReceiptId`, including
+across owner-control ACKs and TypeScript guest catches. Queued but unconsumed
+messages produce an asynchronous typed notice for **each original sender** and
+original message ID. Attribution comes from the manager-admitted native control
+journal, not final prose, message data, or a worker-selected notification address.
+Already consumed non-final controls receive no refusal.
+
+Pending refusal notices stay durable in the owned run directory. Main and resident
+owners use their existing sender route/mailbox paths; failed routes retry on status,
+archive recovery, and retention-sweep wakes. A host restart can reconstruct an
+outbox from the final receipt and original control journal. An unavailable sender
+remains delivery debt, not a successful notification. A retained `.delivered`
+notice marks an acknowledged route or durable mailbox handoff, **not sender
+consumption**, and suppresses duplicate recovery. Collection requires those route
+receipts for refused/unread controls; pending, malformed, or identity-mismatched
+artifacts veto deletion. Python kernels currently stringify host exceptions rather
+than exposing these TypeScript custom error fields; typed notice data is unchanged.
+
+A final answer or a completed wait is **not native custody release**. Fabric retains
+the transport PID, admission permit, run files, and execution-tree obligation until
+the existing owned-tree close confirms exit. Stop acknowledgment alone does not
+confirm exit. Consume the result and separately verify native terminal state before
+reclaiming a child's exclusive source scope.
+
 ### Main display names
 
 An interactive local Main publishes its valid Pi session name, or its Herdr agent name when

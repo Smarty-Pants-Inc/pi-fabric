@@ -9,8 +9,8 @@ import { lockFile } from "./file-lock.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricParticipantInfo, FabricParticipantRecord } from "../topology/types.js";
-import { readWakeJson, residentOwnerLive, residentOwnerSleeping, routesAt, residentDirectories, residentDeliveryMatches, residentUnacknowledgedDeliveries,
-  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch, RESIDENT_WAKE_INDEX_MAX_ROOTS, type WakeDelivery } from "./wake-index.js";
+import { readWakeJson, residentOwnerLive, residentOwnerSleeping, routesAt, residentDirectories, residentDeliveryMatches,
+  acknowledgeResidentDelivery, assertResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, RESIDENT_WAKE_RECOVERY_MAX_BYTES, type ResidentWakeRecoveryBatch, type WakeDelivery } from "./wake-index.js";
 export { readWakeJson, residentOwnerLive, residentOwnerSleeping, ResidentWakeConfigMismatch } from "./wake-index.js";
 
 /** Sleep needs archive retention even on a mesh that previously used only a bounded live log. */
@@ -281,26 +281,72 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   }
 }
 
+export interface ResidentWakeRecovery {
+  config: Pick<ResidentHostConfig, "rootId" | "residencyRoot">;
+  /** Fresh registry-owned actors, not retained routing metadata. */
+  ownedActors: readonly FabricActorInfo[];
+  batch: ResidentWakeRecoveryBatch;
+  ignored: number;
+}
+
+/** Startup records are hints, never authority to launch another resident. Validate
+ * the exact archived event, current registry lineage, route and replay cursor. */
+const recoveryDeliveryPending = (meshRoot: string, root: string, routes: ResidentWakeRoutes,
+  delivery: WakeDelivery | undefined, recovery: ResidentWakeRecovery, lifecycle: readonly { from?: string; to?: string; events?: string[] }[]): boolean => {
+  if (root !== recovery.config.residencyRoot || routes.rootId !== recovery.config.rootId || !delivery ||
+      !Number.isSafeInteger(delivery.sequence) || delivery.sequence! < 1) return false;
+  const owned = recovery.ownedActors.filter(actor => actor.rootId === recovery.config.rootId && actor.residency === "durable");
+  const actors = routes.actors.filter(route => owned.some(actor => actor.id === route.id));
+  if (!actors.length) return false;
+  try {
+    const entry = MeshArchive.fromRoot(meshRoot)?.lookupEntry(delivery.sequence!, RESIDENT_WAKE_RECOVERY_MAX_BYTES - recovery.batch.bytes);
+    if (!entry?.committed || entry.event.id !== delivery.id || entry.event.sequence !== delivery.sequence) return false;
+    recovery.batch.bytes += Buffer.byteLength(entry.line);
+    return actors.some(actor => {
+      if (!residentDeliveryMatches({ ...routes, actors: [actor] }, entry.event, lifecycle)) return false;
+      const scope = owned.find(row => row.id === actor.id)!.scope;
+      const cursorFile = path.join(root, `actor-mesh-cursor.json.${scope}`);
+      const cursor = readWakeJson<{ format?: number; cursor?: number; last?: { sequence?: number } }>(
+        fs.existsSync(cursorFile) ? cursorFile : path.join(root, "actor-mesh-cursor.json"));
+      // No saved cursor means a new monitor starts at the tail, not behind this
+      // event. Only an actual checkpoint (legacy no-anchor checkpoints replay
+      // conservatively from sequence zero) can prove a pending delivery.
+      return !!cursor && cursor.format === 1 && typeof cursor.cursor === "number" && Number.isFinite(cursor.cursor) &&
+        cursor.cursor >= 0 && (cursor.last?.sequence === undefined ||
+          (Number.isSafeInteger(cursor.last.sequence) && cursor.last.sequence >= 0 && cursor.last.sequence < delivery.sequence!));
+    });
+  } catch { return false; } // Unknown proof stays durable, but cannot authorize a wake.
+};
+
 /** Drain durable pending wakes after publication (including batches/bridges), or with no
  * events on resident startup. Recovery does not depend on the publishing process surviving. */
 export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll" | "exclusive">, events: readonly MeshEvent[],
-  launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>): Promise<void> {
+  launch?: (configPath: string, config: ResidentHostConfig) => Promise<void>, recovery?: ResidentWakeRecovery): Promise<void> {
   const lifecycle = events.some(event => event.topic === "fabric.participant.lifecycle")
     ? mesh.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as {
       from?: string; to?: string; events?: string[];
     }) : [];
-  const pending = await mesh.exclusive(() => residentUnacknowledgedDeliveries(mesh.root));
+  const pending = recovery ? recovery.batch.pending : await mesh.exclusive(() => {
+    const reader = new ResidentWakeRecoveryReader(mesh.root);
+    try { return reader.next().pending; } finally { reader.close(); }
+  });
   const acknowledge = (root: string, delivery: WakeDelivery): Promise<void> =>
     mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, delivery));
   let attempted = 0;
   // A subsequent MATCHING delivery must not let a newly re-filled journal starve old overflow.
   const deferred = [...pending].filter(([, delivery]) => delivery.deferredAt !== undefined &&
     (!events.length || events.some(event => event.sequence > delivery.deferredAt!))).map(([root]) => root);
-  for (const root of new Set([...deferred, ...pending.keys(), ...residentDirectories(mesh.root)])) {
-    if (attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
+  for (const root of new Set([...deferred, ...pending.keys(), ...(recovery ? [] : residentDirectories(mesh.root))])) {
+    if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
     try {
+      // Reject foreign paths before opening their retained config or route files.
+      if (recovery && root !== recovery.config.residencyRoot) { recovery.ignored++; continue; }
       const routes = retainedRoutesAt(root);
+      if (recovery && (!routes || !recoveryDeliveryPending(mesh.root, root, routes, pending.get(root), recovery,
+          mesh.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as { from?: string; to?: string; events?: string[] })))) {
+        recovery.ignored++; continue;
+      }
       if (!routes) continue;
       if (residentOwnerLive(root) && !residentOwnerSleeping(root)) {
         const covered = pending.get(root);

@@ -36,7 +36,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
-import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS } from "./wake-index.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
@@ -243,6 +243,9 @@ export class ResidentHost {
   #idleSince = Date.now();
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
+  #wakeRecovery: ResidentWakeRecoveryReader | undefined;
+  #wakeRecoveryPending: Promise<void> | undefined;
+  #wakeRecoveryIgnored = 0;
   #wakeCapacityWarned = false;
   #wakeWatchSupported: boolean | undefined;
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
@@ -300,7 +303,7 @@ export class ResidentHost {
     const { config, modelRegistry } = this;
     this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,
       { backgroundReadCacheMs: config.mesh.idleReadCoalesceMs ?? RUNTIME_MESH_READ_CACHE_MS, lockProtocol: config.mesh.lockProtocol,
-        stateBackend: config.mesh.stateBackend });
+        stateBackend: config.mesh.stateBackend, canWakeResidents: () => this.#ready && !this.#closed });
     this.#deliveryCommits = new CommitOutbox(this.mesh, `residency/${this.hostId}/deliveries`, this.identity, {
       delivery: (record: ResidentDeliveryRecord, view, replay) => this.#writeDelivery(record, view, replay),
     });
@@ -723,14 +726,17 @@ export class ResidentHost {
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
       // A publisher can die after commit but before writing any root-local wake request.
-      // Reuse the durable pending-index drain once on startup, without a polling host.
-      // Our owner is live now, so recovery cannot launch a second copy of this host;
-      // keep restored actor queues paused until the readiness receipt below commits.
-      // No index has ever been written on an empty mesh: avoid a needless lock round trip.
-      // A racing first publish performs its own drain after committing the new index.
+      // Before readiness, stream at most 256 entries / 4 MiB. Own-root recovery
+      // cannot launch another host; restored actor queues remain paused here.
+      // Presence publications above do not perform an unscoped pending drain.
       if (fs.existsSync(residentWakeIndexPath(this.mesh.root)) || fs.existsSync(path.join(this.mesh.root, "wake-overflow"))) {
-        try { await wakeResidentActors(this.mesh, []); }
-        catch (error) { console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`); }
+        try {
+          this.#wakeRecovery = await this.mesh.exclusive(() => new ResidentWakeRecoveryReader(this.mesh.root));
+          await this.#recoverWakeBatch(this.#wakeRecovery.next());
+        } catch (error) {
+          this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
+          console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+        }
       }
       // The originating client may cancel this owned attempt until it sees the
       // required receipt. Commit it BEFORE opening any business gate or resuming
@@ -743,6 +749,9 @@ export class ResidentHost {
       fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
       this.#scheduleIdleCheck();
       this.#writeWakeRoutes();
+      if (this.#wakeRecovery) {
+        this.#wakeRecoveryPending = this.#continueWakeRecovery().finally(() => { this.#wakeRecoveryPending = undefined; });
+      }
       this.#startStateProjector();
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
@@ -770,6 +779,32 @@ export class ResidentHost {
       this.#failure ??= error;
       await this.close();
       throw error;
+    }
+  }
+
+  async #recoverWakeBatch(batch: ResidentWakeRecoveryBatch): Promise<void> {
+    const recovery = { config: this.config, ownedActors: this.actors.listOwned(true), batch, ignored: 0 };
+    await wakeResidentActors(this.mesh, [], undefined, recovery);
+    this.#wakeRecoveryIgnored += recovery.ignored;
+  }
+
+  async #continueWakeRecovery(): Promise<void> {
+    const reader = this.#wakeRecovery!;
+    let deferred = 0;
+    try {
+      while (!reader.done && !this.#closed) {
+        // Yield AFTER the readiness receipt and between every bounded batch.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (this.#closed) break;
+        const batch = reader.next();
+        deferred += batch.entries;
+        await this.#recoverWakeBatch(batch);
+      }
+    } catch (error) {
+      console.warn(`[pi-fabric] resident startup wake recovery deferred: ${String(error)}`);
+    } finally {
+      reader.close(); this.#wakeRecovery = undefined;
+      console.warn(`[pi-fabric] resident startup wake recovery: ${deferred} deferred entries processed after readiness; ${this.#wakeRecoveryIgnored} ignored (foreign, unmatched or not pending)`);
     }
   }
 
@@ -818,6 +853,8 @@ export class ResidentHost {
     // FSWatcher.close() schedules native handle closure. Join its close event before
     // owner release or callers removing the residency directory on Windows.
     await wakeWatchClosed;
+    await this.#wakeRecoveryPending;
+    this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
     this.#requestRetention.close();
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
@@ -1353,7 +1390,7 @@ export class ResidentHost {
   }
 
   #hasHostWork(): boolean {
-    return residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
+    return this.#wakeRecoveryPending !== undefined || residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
       this.#publicationFailed || this.actors.inFlightCount() > 0 ||
       this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
       [this.#requestsPath, this.#processingPath].some(directory => {

@@ -589,7 +589,7 @@ export class MeshArchive {
   }
 
   /** Exact archived bytes and advisory new-writer confirmation, never absence evidence. */
-  lookupEntry(sequence: number): (MeshArchiveEntry & { committed: boolean }) | undefined {
+  lookupEntry(sequence: number, maxBytes = 64 * 1024 * 1024): (MeshArchiveEntry & { committed: boolean }) | undefined {
     if (!Number.isSafeInteger(sequence) || sequence < 1) throw new MeshArchiveLookupUnavailableError("Invalid mesh archive sequence lookup");
     const indexPath = this.#indexPath(sequence);
     let indexed: MeshArchiveIndexEntry | { sequence: number; absent: true };
@@ -611,6 +611,8 @@ export class MeshArchive {
         (indexed.committed !== undefined && typeof indexed.committed !== "boolean")) {
       throw new MeshArchiveLookupUnavailableError(`Invalid mesh archive sequence index: ${indexPath}`);
     }
+    // Callers doing pre-readiness recovery have a smaller aggregate byte budget.
+    if (indexed.length > maxBytes) throw new MeshArchiveLookupUnavailableError("Mesh archive lookup exceeds caller byte budget");
     if (this.#readJson<Record<string, string>>(`${indexed.file.split("/").slice(0, 3).join("/")}/ABORTED.json`)?.[sequence] === indexed.id) return undefined;
     let descriptor: number | undefined;
     try {
@@ -622,12 +624,14 @@ export class MeshArchive {
       if (available <= 0) return undefined;
       let bytes = Buffer.allocUnsafe(Math.min(indexed.length, available));
       let count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+      let readBytes = count;
       let newline = bytes.subarray(0, count).indexOf(0x0a);
       // The old writer may reuse that address for a differently sized event. Resolve
       // only this one bounded line, never search the segment for the missing identity.
-      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < 64 * 1024 * 1024) {
-        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024));
+      while (newline < 0 && count === bytes.length && bytes.length < available && bytes.length < Math.min(64 * 1024 * 1024, maxBytes - readBytes)) {
+        bytes = Buffer.allocUnsafe(Math.min(Math.max(bytes.length * 2, 4096), available, 64 * 1024 * 1024, maxBytes - readBytes));
         count = fs.readSync(descriptor, bytes, 0, bytes.length, indexed.offset);
+        readBytes += count;
         newline = bytes.subarray(0, count).indexOf(0x0a);
       }
       if (newline < 0) throw new Error("short archive line");

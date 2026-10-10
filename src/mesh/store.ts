@@ -260,6 +260,8 @@ export interface MeshStoreOptions {
   writeReadJournal?: boolean;
   /** Keyed-state backend (smarty-dev#6477 L2a). Explicit wins; else PI_FABRIC_MESH_STATE_BACKEND; else "file". */
   stateBackend?: MeshStateBackendKind;
+  /** A resident startup owns a scoped recovery pass before opening ordinary dispatch. */
+  canWakeResidents?: () => boolean;
 }
 
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
@@ -269,6 +271,7 @@ export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
   readonly #events: EventLog;
+  readonly #canWakeResidents: () => boolean;
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
 
@@ -278,6 +281,7 @@ export class MeshStore {
     readonly maxReadEvents: number,
     options: MeshStoreOptions = {},
   ) {
+    this.#canWakeResidents = options.canWakeResidents ?? (() => true);
     // A failed operation under the lock drops the parsed state (see MeshLock.withLock).
     this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
@@ -350,7 +354,7 @@ export class MeshStore {
   }
 
   async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
-    if (!events.length || !fs.existsSync(path.join(this.root, "residency"))) return;
+    if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
     try {
       const { wakeResidentActors } = await import("../residency/wake.js");
       await wakeResidentActors(this, events);

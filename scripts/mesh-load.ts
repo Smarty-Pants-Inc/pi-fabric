@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import fs from "node:fs";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { readLockStats, summarizeLockStats } from "../src/mesh/commit-stats.js";
+import { createScratchRoot, requireScratchRoot, MeshLoadRootError } from "./mesh-load-scratch.js";
 
 const args = new Map<string, string | true>();
 for (let i = 2; i < process.argv.length; i++) {
@@ -40,43 +41,77 @@ const SEED_PREFIX = "fleet/actors/load-seed-a";
 const seedValue = (i: number) => ({ id: `a${pad(i, 6)}`, kind: "actor", status: i % 3 ? "idle" : "done", host: `h${pad(i % 32, 2)}`,
   model: "load-seed-model", summary: "s".repeat(820) });
 /**
- * Grow state.json to at least `mb` decimal MB with seed records. Idempotent: a root already at that size is
- * left as is, and seed keys are not run keys, so they stay for later runs like a hub's standing state.
+ * Grow the effective backend's state to at least `mb` decimal MB: state.json for file/shadow,
+ * state.db plus its WAL for sqlite. Idempotent: a root already at that size is left as is, and
+ * seed keys are not run keys, so they stay for later runs like a hub's standing state.
  */
-const seedState = async (root: string, mb: number): Promise<{ stateBytes: number; seeded: number }> => {
+const seedState = async (root: string, mb: number): Promise<{
+  stateBytes: number; seeded: number; backend: MeshStore["stateBackend"]; databaseBytes?: number; walBytes?: number;
+}> => {
   const store = new MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 120_000 });
-  // The seeder identity must not carry the run namespace: seed entries are not synthetic run keys.
-  const identity: MeshIdentity = { id: "load-seeder", name: "load-seeder", kind: "agent" };
-  const statePath = path.join(root, "state.json");
-  const sizeOf = () => { try { return fs.statSync(statePath).size; } catch { return 0; } };
-  const target = mb * 1e6;
-  let next = store.listAll().filter(entry => entry.key.startsWith(SEED_PREFIX)).length;
-  let seeded = 0;
-  for (let size = sizeOf(); size < target; size = sizeOf()) {
-    const count = Math.max(1, Math.min(1000, Math.ceil((target - size) / 1000)));
-    await store.writeBatch({ identity, ops: Array.from({ length: count }, () => {
-      const i = next++;
-      return { kind: "put" as const, key: `${SEED_PREFIX}${pad(i, 6)}`, value: seedValue(i) };
-    }) });
-    seeded += count;
+  try {
+    // The seeder identity must not carry the run namespace: seed entries are not synthetic run keys.
+    const identity: MeshIdentity = { id: "load-seeder", name: "load-seeder", kind: "agent" };
+    const statePath = path.join(root, "state.json");
+    // listAll also initializes SQLite before its database file is required for measurement.
+    let next = store.listAll("", { fresh: true }).filter(entry => entry.key.startsWith(SEED_PREFIX)).length;
+    const backend = store.stateBackend;
+    const database = store.stateDiagnostics().database;
+    if (backend === "sqlite" && !database) throw new Error("mesh-load: SQLite seed measurement has no database path");
+    const sqliteSize = (file: string, optional = false): number => {
+      try {
+        const stat = fs.statSync(file);
+        fs.accessSync(file, fs.constants.R_OK);
+        if (!stat.isFile()) throw new Error("not a regular file");
+        return stat.size;
+      } catch (error) {
+        if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+        throw new Error(`mesh-load: failed to measure SQLite seed state at ${file}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+    };
+    const sizeOf = () => {
+      if (backend === "sqlite") {
+        const databaseBytes = sqliteSize(database!);
+        const walBytes = sqliteSize(`${database!}-wal`, true);
+        return { stateBytes: databaseBytes + walBytes, databaseBytes, walBytes };
+      }
+      try { return { stateBytes: fs.statSync(statePath).size }; } catch { return { stateBytes: 0 }; }
+    };
+    const target = mb * 1e6;
+    let seeded = 0;
+    let size = sizeOf();
+    while (size.stateBytes < target) {
+      const count = Math.max(1, Math.min(1000, Math.ceil((target - size.stateBytes) / 1000)));
+      await store.writeBatch({ identity, ops: Array.from({ length: count }, () => {
+        const i = next++;
+        return { kind: "put" as const, key: `${SEED_PREFIX}${pad(i, 6)}`, value: seedValue(i) };
+      }) });
+      seeded += count;
+      size = sizeOf();
+    }
+    return { ...size, seeded, backend };
+  } finally {
+    store.closeState();
   }
-  return { stateBytes: sizeOf(), seeded };
 };
-const USAGE = `Usage: bun scripts/mesh-load.ts --root <dir> --target-writes-per-min <n> --target-processes <n> [options]
-  --root <dir>                 mesh root (required; never inferred)
+const USAGE = `Usage: bun scripts/mesh-load.ts [--root <dir>] --target-writes-per-min <n> --target-processes <n> [options]
+  --root <dir>                 reuse a script-created scratch root containing .mesh-load-scratch;
+                               omitted: create a private mkdtemp root under os.tmpdir(). Live mesh roots,
+                               their ancestors/descendants and symlink aliases are always refused
   --target-writes-per-min <n>  mesh writes/min to sustain; at least ${HEARTBEAT_WRITES_PER_MIN} x --target-processes,
                                because each worker heartbeats every 5 s (${HEARTBEAT_WRITES_PER_MIN} writes/min)
   --target-processes <n>       minimum worker processes (positive integer)
   --max-workers <n>            worker cap (default 64)
-  --seed-state-mb <n>          before the run, grow the root's state.json to n decimal MB (0-30, default 0) with
-                               hub-shaped actor records (kept after the run). A keyed put rewrites the whole state
-                               under the lock, so this sets the hold: about 5 ms per MB on ryzen5
+  --seed-state-mb <n>          before the run, grow effective backend state to n decimal MB (0-30, default 0):
+                               state.json for file/shadow, state.db + WAL for sqlite, with hub-shaped actor
+                               records (kept after the run). File/shadow puts rewrite state.json under the lock;
+                               sqlite puts commit database transactions instead
   --put-share <f>              fraction (0-1, default 0) of the paced writes that are keyed puts (writeBatch,
-                               state-size hold) instead of publishes (event append, about 0.5 ms hold)
+                               backend-dependent state hold) instead of publishes (event append, about 0.5 ms hold)
   --custody-share <f>          fraction (0-1, default 0; with --put-share at most 1) of the paced writes that are
-                               custody ops: read and parse state.json under the mesh lock, as registry and inbox
-                               custody does, without writing. The hold scales with the state size, and unlike a
-                               put it does not invalidate the other writers' prepared snapshots
+                               custody ops: scan all keyed state fresh through the effective backend under the
+                               mesh lock, as registry and inbox custody does, without writing. The hold scales
+                               with state size; it does not invalidate other writers' prepared snapshots
   --max-in-flight <n>          writes in flight per worker (default 1); a paced write due while the worker is
                                at the cap is skipped and counted, never queued
   --control-interval <s>       controller period in seconds (default 30)
@@ -90,20 +125,31 @@ and a run deletes only its own keys. Stop a run on any platform by writing "stop
 The controller starts --target-processes workers, adds one only when the last full control window fell
 below 90% of the target, sheds one above 110% or when lock busy exceeds 65%, and ignores the window
 right after each resize (worker start-up).
-Hub profile (ryzen5 scratch mesh, about 60% lock busy): see docs/mesh-lock-plan.md, "mesh-load hub profile".
+Backend selection follows MeshStore (PI_FABRIC_MESH_STATE_BACKEND; default file, with runtime/filesystem fallback).
+Hub profile (ryzen5 file-backend scratch mesh, about 60% lock busy): see docs/mesh-lock-plan.md, "mesh-load hub profile".
 `;
 const usageError = (message: string): never => {
   process.stderr.write(`mesh-load: ${message}\n${USAGE}`);
   process.exit(2);
 };
 
+const scratchRootOrExit = (root?: string): string => {
+  try { return root === undefined ? createScratchRoot() : requireScratchRoot(root); }
+  catch (error) {
+    if (!(error instanceof MeshLoadRootError)) throw error;
+    process.stderr.write(`mesh-load: ${error.name} [${error.code}]: ${error.message}\n`);
+    process.exit(2);
+  }
+};
+
 if (args.has("--worker")) {
-  const root = String(args.get("--root"));
+  const rootArg = args.get("--root");
+  if (typeof rootArg !== "string" || !rootArg.trim()) usageError("--worker requires a marked --root");
+  const root = scratchRootOrExit(rootArg as string);
   const id = String(args.get("--id"));
   const rate = Math.max(0, number("--rate", 1));
   const putShare = Math.min(1, Math.max(0, number("--put-share", 0)));
   const custodyShare = Math.min(1 - putShare, Math.max(0, number("--custody-share", 0)));
-  const statePath = path.join(root, "state.json");
   const maxInFlight = Math.max(1, Math.floor(number("--max-in-flight", 1)));
   const profile = String(args.get("--profile") ?? "fleet");
   const identity: MeshIdentity = { id, name: workerName(id), kind: "agent" };
@@ -130,7 +176,9 @@ if (args.has("--worker")) {
     custodyCredit += custodyShare;
     if (custodyCredit >= 1) {
       custodyCredit -= 1;
-      return store.exclusive(() => JSON.parse(fs.readFileSync(statePath, "utf8")) as unknown);
+      return store.exclusive(() => store.listAll("", { fresh: true })).then(entries => {
+        process.stdout.write(JSON.stringify({ type: "custody", entries: entries.length }) + "\n");
+      });
     }
     if (putCredit >= 1) {
       putCredit -= 1;
@@ -182,9 +230,10 @@ if (args.has("--worker")) {
 } else {
   if (args.has("--help")) { process.stdout.write(USAGE); process.exit(0); }
   const rootArg = args.get("--root");
-  if (typeof rootArg !== "string" || !rootArg.trim()) usageError("--root is required; mesh-load never infers a mesh root");
+  if (rootArg !== undefined && (typeof rootArg !== "string" || !rootArg.trim())) usageError("--root must name a marked scratch directory");
+  if (args.has("--dry-run") && rootArg === undefined) usageError("--dry-run requires a marked --root (no scratch is created)");
   if (os.hostname().toLowerCase().startsWith("epyc1") && !args.has("--allow-epyc1")) throw new Error("refusing to run on epyc1 without --allow-epyc1");
-  const root = path.resolve(rootArg as string);
+  let root = typeof rootArg === "string" ? scratchRootOrExit(rootArg) : "";
   const target = number("--target-writes-per-min", NaN);
   const requested = number("--target-processes", NaN);
   const maxWorkers = number("--max-workers", 64);
@@ -214,6 +263,8 @@ if (args.has("--worker")) {
   const live = new Set<ChildProcess>();
   const children = new Map<number, ChildProcess>();
   let writes = 0;
+  let custodyReads = 0;
+  let custodyEntries = 0;
   let skipped = 0;
   let maxSeenInFlight = 0;
   let stopped = false;
@@ -235,11 +286,15 @@ if (args.has("--worker")) {
       buffer += String(chunk);
       const lines = buffer.split("\n"); buffer = lines.pop() ?? "";
       for (const line of lines) try {
-        const message = JSON.parse(line) as { type?: unknown; inFlight?: unknown };
+        const message = JSON.parse(line) as { type?: unknown; inFlight?: unknown; entries?: unknown };
         if (message.type === "write") {
           writes++;
           if (typeof message.inFlight === "number") maxSeenInFlight = Math.max(maxSeenInFlight, message.inFlight);
         } else if (message.type === "skip") skipped++;
+        else if (message.type === "custody" && typeof message.entries === "number") {
+          custodyReads++;
+          custodyEntries = Math.max(custodyEntries, message.entries);
+        }
       } catch { /* Ignore diagnostics. */ }
     });
     child.on("exit", () => { children.delete(key); live.delete(child); });
@@ -269,11 +324,19 @@ if (args.has("--worker")) {
       seedStateMb: seedMb, putShare, custodyShare, maxInFlight, controlIntervalSec: controlIntervalS }) + "\n");
     process.exit(0);
   }
+  if (!root) root = scratchRootOrExit();
+  const store = new MeshStore(root, 64 * 1024, 100);
+  const backend = store.stateBackend;
+  store.closeState();
+  let seededStateBytes = 0;
   if (seedMb > 0) {
     const seeded = await seedState(root, seedMb);
-    process.stderr.write(`mesh-load: seeded ${seeded.seeded} records; state.json is ${seeded.stateBytes} bytes\n`);
+    seededStateBytes = seeded.stateBytes;
+    process.stderr.write(seeded.backend === "sqlite"
+      ? `mesh-load: seeded ${seeded.seeded} records; backend=sqlite state.db is ${seeded.databaseBytes} bytes + wal ${seeded.walBytes} bytes (${seeded.stateBytes} bytes total)\n`
+      : `mesh-load: seeded ${seeded.seeded} records; state.json is ${seeded.stateBytes} bytes\n`);
   }
-  process.stderr.write(`mesh-load: run ${runId} root ${root}\n`);
+  process.stderr.write(`mesh-load: run ${runId} root ${root} backend=${backend}\n`);
   resize(requested);
   const started = Date.now();
   let lastMinute = started;
@@ -297,9 +360,9 @@ if (args.has("--worker")) {
     }
     const elapsedMin = Math.max(1 / 60, (Date.now() - started) / 60_000);
     const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: Date.now() - STATS_SETTLE_MS });
-    // The final line covers the whole run: peak workers, mean writes/min, skips and the in-flight peak.
-    process.stdout.write(JSON.stringify({ at: new Date().toISOString(), final: true, workers: peakWorkers, writesPerMin: Math.round(writes / elapsedMin),
-      skipped, maxInFlight: maxSeenInFlight, busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
+    // The final line covers the whole run, including successful keyed-state custody reads and initial seed size.
+    process.stdout.write(JSON.stringify({ at: new Date().toISOString(), final: true, backend, workers: peakWorkers, writesPerMin: Math.round(writes / elapsedMin),
+      custodyReads, custodyEntries, seededStateBytes, skipped, maxInFlight: maxSeenInFlight, busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
     process.exit(exitCode);
   };
   // The controller keeps its own window, independent of the minute report: reading the report's freshly reset
@@ -326,7 +389,7 @@ if (args.has("--worker")) {
     const achieved = elapsedMin > 0 ? Math.round((writes - lastWrites) / elapsedMin) : 0;
     lastWrites = writes; lastMinute = now;
     const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: Date.now() - STATS_SETTLE_MS });
-    process.stdout.write(JSON.stringify({ at: new Date(now).toISOString(), workers: children.size, writesPerMin: achieved, skipped,
+    process.stdout.write(JSON.stringify({ at: new Date(now).toISOString(), backend, workers: children.size, writesPerMin: achieved, skipped,
       acqPerMin: summary.n, holdMeanMs: Math.round(summary.holdMeanMs * 100) / 100, waitP99Ms: summary.waitP99Ms,
       busyPct: summary.busyPct, timeouts: summary.timeouts }) + "\n");
     if (duration > 0 && now - started >= duration * 1000) void shutdown();

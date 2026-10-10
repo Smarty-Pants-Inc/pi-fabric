@@ -7,7 +7,7 @@ import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
 import { OutputArtifactStore } from "./output-budget.js";
-import { resolveAgentDir } from "./core/agent-dir.js";
+import { resolveAgentDir, resolveMeshDirectory, resolveProjectRoot } from "./core/agent-dir.js";
 import { recordMainRelease } from "./lifecycle/release-process.js";
 import { loadedFabricRoot } from "./core/agent-dir.js";
 import type { FabricModelCandidate } from "./core/model-resolution.js";
@@ -667,13 +667,8 @@ export class FabricRuntimeState {
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
     );
     this.#mainAgent = mainAgent;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const configuredMeshRoot = this.#config.mesh.root;
-    const meshRoot =
-      process.env.PI_FABRIC_MESH_ROOT ??
-      (configuredMeshRoot
-        ? path.resolve(projectRoot, configuredMeshRoot)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    const projectRoot = resolveProjectRoot(context.cwd);
+    const meshRoot = resolveMeshDirectory(this.#config.mesh.root, context.cwd);
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;

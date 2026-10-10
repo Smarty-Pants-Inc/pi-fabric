@@ -24,6 +24,23 @@ export const resolveAgentDir = (envDir = process.env[ENV_AGENT_DIR]): string => 
   return path.join(homedir(), CONFIG_DIR_NAME, "agent");
 };
 
+// Shared runtime/CLI resolution stays in this already-eager core module to avoid a startup chunk.
+/** The project root Fabric uses for both runtime activation and mesh path resolution. */
+export const resolveProjectRoot = (cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string =>
+  env.PI_FABRIC_PROJECT_ROOT ?? cwd;
+
+/** Resolve a configured mesh root without loading/migrating config or opening a backend. */
+export const resolveMeshDirectory = (
+  configuredRoot: string | undefined,
+  cwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): string => {
+  const projectRoot = resolveProjectRoot(cwd, env);
+  return env.PI_FABRIC_MESH_ROOT ?? (configuredRoot
+    ? path.resolve(projectRoot, configuredRoot)
+    : path.join(projectRoot, ".pi", "fabric", "mesh"));
+};
+
 // Shared with self-reload and the release census. Kept in this existing cheap core module so
 // code splitting does not create an additional eager startup chunk for release selectors.
 export const SELF_RELOAD_COMMAND = "fabric-release-reload";

@@ -128,28 +128,36 @@ describe("external spawn router behavior", () => {
     expect(request(dir).task).toBe(opts.task);
     expect(JSON.stringify(decisions(dir))).not.toContain(opts.task);
   });
-  it.each(["normal.policy", "normal.implementation:secret-token", "normal.implementation\n", "policy", "a".repeat(100), "private task 🦉", "UPPERCASE", ""])("maps unrecognized reason %s to other", async reason => {
+  it.each(["policy:task/normal", "policy:task/tier-1", `policy:task/${"a".repeat(32)}`, "capacity-hold", "taskclass:implementation", "taskclass:code-1", `taskclass:${"a".repeat(32)}`, "default", "unavailable", "normal.implementation"])("preserves structured router reason %s", async reason => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, reason }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { ...pick, reason }, error: null });
+  });
+  it.each(["normal.policy", "normal.implementation:secret-token", "normal.implementation\n", "policy", "policy:task/", `policy:task/${"a".repeat(33)}`, "policy:task/UPPERCASE", "taskclass:", "taskclass:secret words with spaces", `taskclass:${"a".repeat(33)}`, "taskclass:private_task", "taskclass:normal\r\n", "capacity-hold\u2028", "default\u2029", "a".repeat(100), "private task 🦉", "UPPERCASE", ""])("maps unrecognized reason %s to other", async reason => {
     const dir = root(); const opts = options(dir);
     const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, reason }))});`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
     expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: pick.policyVersion }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(JSON.stringify(reason));
   });
-  it.each(["1.2", "1.2.3", `${"1".repeat(36)}.1.0`, "abcdef0", "a".repeat(40), "ABCDEF0123456789"])("preserves the documented reason and valid version %s", async policyVersion => {
+  it.each(["v1", "v1-2026.10.09", "v12-release.1", `v1-${"a".repeat(32)}`, `v${"1".repeat(40)}`, "1.2", "1.2.3", `${"1".repeat(37)}.1.0`, "abcdef0", "a".repeat(40)])("preserves structured router version %s", async policyVersion => {
     const dir = root(); const opts = options(dir);
     const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
     expect(decisions(dir)[0]).toMatchObject({ pick: { ...pick, policyVersion }, error: null });
   });
-  it.each(["v1", "2026-10-v1", "abcdef", "a".repeat(41), `${"1".repeat(37)}.1.0`, "1", "1.2.3.4", "1.2.3-secret", "1.2\n", "abcdef0\r\n", "1.2\u2028", "1.2\u2029", " 1.2", "1.2 ", ""])("maps invalid version %s to unknown without truncation", async policyVersion => {
+  it.each(["v", "v1-", `v1-${"a".repeat(33)}`, "v1-secret words with spaces", "v1-2026.10.09\n", "v1-UPPERCASE", "2026-10-v1", "abcdef", "a".repeat(41), "ABCDEF0123456789", "private task 🦉", "1", "1.2.3.4", "1.2.3-secret", "1.2\n", "abcdef0\r\n", "1.2\u2028", "1.2\u2029", " 1.2", "1.2 ", ""])("maps invalid version %s to unknown without truncation", async policyVersion => {
     const dir = root(); const opts = options(dir);
     const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
     expect(decisions(dir)[0]).toMatchObject({ pick: { reason: pick.reason, policyVersion: "unknown" }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(JSON.stringify(policyVersion));
   });
-  it.each(["shadow", "enforce"] as const)("never records task-secret fragments echoed through either metadata field in %s mode", async mode => {
-    const dir = root(); const fragment = "secret-token"; const opts = { ...options(dir), task: `deploy ${fragment} to production` };
+  it.each((["shadow", "enforce"] as const).flatMap(mode => ["secret-token", "taskclass:secret words with spaces", `taskclass:${"a".repeat(33)}`].map(fragment => ({ mode, fragment }))))("never records task-secret fragment $fragment echoed through either metadata field in $mode mode", async ({ mode, fragment }) => {
+    const dir = root(); const opts = { ...options(dir), task: `deploy ${fragment}` };
     const logs = [vi.spyOn(console, "log"), vi.spyOn(console, "warn"), vi.spyOn(console, "error")].map(spy => spy.mockImplementation(() => {}));
-    const body = `const fragment = JSON.parse(input).task.split(' ')[1]; process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: fragment, policyVersion: fragment }));`;
+    const body = `const fragment = JSON.parse(input).task.slice('deploy '.length); process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: fragment, policyVersion: fragment }));`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, mode, includeTask: true, command: command(dir, body) } })).toEqual(mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : undefined);
     expect(request(dir).task).toBe(opts.task);
     expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: "unknown" }, error: null });

@@ -52,10 +52,11 @@ const routerEnv = (): NodeJS.ProcessEnv => {
   }
   return env;
 };
-const reasonCode = (value: string): string => value === "normal.implementation" ? "normal.implementation" : "other";
+// The final assertions also reject trailing line terminators, which $ alone accepts.
+const reasonCode = (value: string): string =>
+  /^(?:policy:task\/[a-z0-9-]{1,32}|capacity-hold|taskclass:[a-z0-9-]{1,32}|default|unavailable|normal\.implementation)$(?![\s\S])/.test(value) ? value : "other";
 const policyVersionCode = (value: string): string =>
-  // The final assertion also rejects trailing line terminators, which $ alone accepts.
-  value.length <= 40 && /^(?:[0-9]+\.[0-9]+(?:\.[0-9]+)?|[a-fA-F0-9]{7,40})$(?![\s\S])/.test(value) ? value : "unknown";
+  /^(?:v[0-9]+(?:-[a-z0-9.]{1,32})?|[0-9]+\.[0-9]+(?:\.[0-9]+)?|[0-9a-f]{7,40})$(?![\s\S])/.test(value) ? value : "unknown";
 const MAX_LEDGER_BYTES = 8 * 1024 * 1024;
 const ledgerWrites = new Map<string, Promise<void>>();
 

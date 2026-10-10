@@ -119,14 +119,19 @@ Enabled modes append one JSON line to `<mesh>/router/decisions.jsonl`:
 `ts`, `requestDigest` (SHA-256 of request metadata excluding raw task), `kind`,
 `mode`, `decision` (`explicit`/`default`/`enforce`), `pick`, `actual`, `latencyMs`,
 and `error` (fixed adapter code or null). A valid pick includes its canonical
-model/thinking and optional reason/version codes. The closed reason allowlist is
-`normal.implementation` (the documented command reason above); all other string
-reasons are recorded as `other`, never as the router's raw value. `policyVersion`
-is preserved only when it is a numeric `major.minor` or `major.minor.patch`, or a
-7–40-character hexadecimal SHA (case-insensitive), with a maximum of 40 characters.
-No whitespace, suffixes, or truncation are accepted; all other string versions
-are recorded as `unknown`. Free-form router reasons, raw tasks, and router stderr
-never enter the ledger.
+model/thinking and optional reason/version codes. Only these structured grammars
+are preserved unchanged (case-sensitive, full-string matches):
+
+- `reason`: `^(policy:task/[a-z0-9-]{1,32}|capacity-hold|taskclass:[a-z0-9-]{1,32}|default|unavailable|normal\.implementation)$`.
+  All other string reasons become `other`, including task-text fragments with
+  spaces or more than 32 characters after `policy:task/` or `taskclass:`.
+- `policyVersion`: `^v[0-9]+(-[a-z0-9.]{1,32})?$`,
+  `^[0-9]+\.[0-9]+(\.[0-9]+)?$`, or `^[0-9a-f]{7,40}$`.
+  For example, `v1-2026.10.09`, `1.2.3`, and a lowercase hexadecimal SHA pass
+  through; all other string versions become `unknown`.
+
+No whitespace (including trailing line terminators) or truncation is accepted.
+Rejected raw values, raw tasks, and router stderr never enter the ledger.
 
 The router directory is created with mode 0700 and must be a real directory
 (`lstat`, not a symlink), owned by the current uid with private permissions

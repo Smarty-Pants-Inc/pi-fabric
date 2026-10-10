@@ -549,7 +549,16 @@ export interface ParticipantDirectoryOptions {
    * Explicit refresh()/quiesce() calls still publish from the owner's last live snapshot.
    */
   live?: () => boolean;
+  /**
+   * Once per outage: more than LIFECYCLE_LOST_TICKS consecutive heartbeats found no live
+   * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
+   * must say so visibly instead of vanishing from the directory in silence.
+   */
+  onLifecycleLost?: (ticks: number) => void;
 }
+
+/** Heartbeats a retired lifecycle may skip quietly (a rebind is normally immediate). */
+export const LIFECYCLE_LOST_TICKS = 2;
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
@@ -573,6 +582,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
+  /** Consecutive heartbeats skipped for want of a live lifecycle; degraded past the limit. */
+  #retiredTicks = 0;
+  #degraded = false;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
@@ -629,6 +641,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try { return this.options.live?.() ?? true; } catch { return false; }
   }
 
+  /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
+  get degraded(): boolean { return this.#degraded; }
+
+  #lifecycleTick(live: boolean): void {
+    if (live) {
+      this.#retiredTicks = 0;
+      this.#degraded = false;
+      return;
+    }
+    if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
+    this.#degraded = true;
+    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+      `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
+    try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
+  }
+
   registerSource(source: ParticipantSnapshotSource): () => void {
     this.#sources.add(source);
     if (this.#timer) this.scheduleRefresh();
@@ -651,8 +679,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
+      this.#retiredTicks = 0;
+      this.#degraded = false;
       this.#timer = setInterval(() => {
-        if (this.#closed || !this.#live()) return;
+        if (this.#closed) return;
+        const live = this.#live();
+        this.#lifecycleTick(live);
+        if (!live) return;
         void this.#renewActors();
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;

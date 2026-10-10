@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../../core/atomic-write.js";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -48,7 +49,7 @@ export const executeFile = (
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
         ...(options.cwd ? { cwd: options.cwd } : {}),
-        ...(options.env ? { env: options.env } : {}),
+        env: childProcessEnvironment(options.env),
         ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
         // Query callers opt into SIGKILL; preserve cooperative termination for
         // existing mutating commands (for example git releasing its lock files).
@@ -336,7 +337,7 @@ export const spawnDetached = async (
     "fabric-scope", marker!, scopeUnit!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
-    ...(environment ? { env: environment } : {}),
+    env: childProcessEnvironment(environment),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });

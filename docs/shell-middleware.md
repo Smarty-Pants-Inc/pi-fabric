@@ -59,7 +59,9 @@ schemas, guest payloads, or discovery metadata.
 ## Opt-in Linux filesystem confinement
 
 Fabric can put a static Landlock helper below the supplied local operations when
-`executor.landlock.mode` is `enforce`. Middleware still owns its prefix/spawn
+`executor.landlock.mode` is `enforce`; this applies to the Bash route only.
+Non-Bash enforcement is tracked in [smarty-dev#7935](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7935).
+Middleware still owns its prefix/spawn
 hook and output filters, but the actual shell starts only after kernel
 confinement. Reads remain unrestricted; writes use the reviewed per-role list.
 No kernel-6.8 audit-only mode exists: the fallback is off/enforce plus logged

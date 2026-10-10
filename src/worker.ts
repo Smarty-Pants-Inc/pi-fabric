@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { childProcessEnvironment } from "./core/atomic-write.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
@@ -76,8 +77,8 @@ const spawnCli = (
   args: readonly string[],
   options: SpawnOptions,
 ): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase()) || nodeShebang(command)
-  ? crossSpawn(process.execPath, [command, ...args], options)
-  : crossSpawn(command, [...args], options);
+  ? crossSpawn(process.execPath, [command, ...args], { ...options, env: childProcessEnvironment(options.env) })
+  : crossSpawn(command, [...args], { ...options, env: childProcessEnvironment(options.env) });
 
 type ClaudeCliModule = typeof import("./agents/claude-cli.js");
 type VedaCliModule = typeof import("./agents/veda-cli.js");

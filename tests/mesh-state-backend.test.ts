@@ -59,7 +59,11 @@ describe("state backend selection", () => {
     expect(resolveMeshStateBackend(undefined, undefined)).toBe("file");
     expect(resolveMeshStateBackend(undefined, "sqlite")).toBe("sqlite");
     expect(resolveMeshStateBackend(undefined, " Shadow ")).toBe("shadow");
-    expect(resolveMeshStateBackend(undefined, "bogus")).toBe("file");
+    // pi-fabric#796: an unknown non-empty override is refused, never ignored; empty counts as unset.
+    expect(() => resolveMeshStateBackend(undefined, "bogus")).toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be file, shadow, sqlite or nats/);
+    expect(() => resolveMeshStateBackend(undefined, "jetstream")).toThrow(/PI_FABRIC_MESH_STATE_BACKEND/);
+    expect(resolveMeshStateBackend(undefined, "  ")).toBe("file");
+    expect(resolveMeshStateBackend(undefined, "")).toBe("file");
     expect(resolveMeshStateBackend("file", "sqlite")).toBe("file");
     expect(() => resolveMeshStateBackend("bogus" as "file")).toThrow(/mesh.stateBackend/);
     const root = tempRoot("select");
@@ -75,8 +79,9 @@ describe("state backend selection", () => {
     expect(() => normalizeFabricConfig({ mesh: { stateBackend: "postgres" } })).toThrow(/mesh.stateBackend/);
     vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");
     expect(normalizeFabricConfig({ mesh: { stateBackend: "file" } }).mesh.stateBackend).toBe("sqlite");
+    // pi-fabric#796: an unknown override fails config loading; it no longer falls back to the file setting.
     vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "nope");
-    expect(normalizeFabricConfig({ mesh: { stateBackend: "shadow" } }).mesh.stateBackend).toBe("shadow");
+    expect(() => normalizeFabricConfig({ mesh: { stateBackend: "shadow" } })).toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be/);
   });
 
   it("the file backend creates no SQLite file", async () => {

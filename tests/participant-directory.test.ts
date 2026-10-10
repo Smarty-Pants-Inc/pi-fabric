@@ -7,7 +7,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
@@ -111,13 +112,13 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     const directory = fixture();
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
-    // A state operation bounded to 250 ms, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
+    // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
     const read = vi.spyOn(directory.mesh, "withTryLock");
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
     await directory.refreshRoutingView();
     expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(250);
+    expect(read.mock.calls[0]![1]).toBe(ROUTING_REFRESH_LOCK_BUDGET_MS);
     expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
@@ -152,6 +153,27 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     await directory.refreshRoutingView();
     expect(directory.routingUnavailable()).toBeUndefined();
   });
+
+  // smarty-dev#6477: one fleet publish holds the lock ~250 ms (smarty-dev#8305); a 250 ms budget
+  // failed the send behind one hold. The budget covers a few holds and still bounds a stuck holder.
+  const holdLock = (directory: ParticipantDirectory, ms: number): Promise<void> =>
+    new MeshLock(directory.mesh.root, {}, () => undefined)
+      .withLockAcrossAwait(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  it("survives a ~400 ms publish hold and still fails past its lock budget", async () => {
+    const directory = fixture();
+    let hold = holdLock(directory, 400);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    await hold;
+
+    hold = holdLock(directory, ROUTING_REFRESH_LOCK_BUDGET_MS + 300);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(directory.refreshRoutingView()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(directory.routingUnavailable()).toBeDefined();
+    await hold;
+  }, 10_000);
 
   it("does not refresh a closed directory", async () => {
     const directory = fixture();

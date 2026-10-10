@@ -3,6 +3,10 @@ import { assistantStreamEvent } from "./assistant-stream-event.js";
 export const PI_RECOVERY_TIMEOUT_MS = 60_000;
 export const PI_RECOVERY_MAX_MS = 10 * 60_000;
 export const PI_PROVIDER_RESUME_DELAYS_MS = [30_000, 60_000, 120_000] as const;
+/** A scaled test still boots a real Pi process at unscaled speed: production leaves
+ * a relaunch the full 60 s window after its resume delay, so a scaled no-progress
+ * window never drops below this allowance (still capped by the scaled 10-minute bound). */
+export const PI_RECOVERY_TEST_BOOT_ALLOWANCE_MS = 15_000;
 
 /** Test-only acceleration of the real process path; production defaults stay fixed. */
 export const recoveryTimeScale = (): number => {
@@ -24,7 +28,9 @@ export class PiRecoveryWatchdog {
 
   constructor(fail: (error: string) => void, scale = 1) {
     this.#fail = fail;
-    this.#timeoutMs = PI_RECOVERY_TIMEOUT_MS * scale;
+    this.#timeoutMs = scale < 1
+      ? Math.max(PI_RECOVERY_TIMEOUT_MS * scale, PI_RECOVERY_TEST_BOOT_ALLOWANCE_MS)
+      : PI_RECOVERY_TIMEOUT_MS;
     this.#maxMs = PI_RECOVERY_MAX_MS * scale;
   }
 

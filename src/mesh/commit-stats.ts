@@ -123,6 +123,30 @@ export interface LockStatsBucket {
   holdHist: number[];
 }
 export interface LockStatsMinute { minute: number; classes: Partial<Record<MeshLockClass, LockStatsBucket>> }
+/**
+ * What kind of process wrote a stats file (smarty-dev#8305), captured once at the recorder's first
+ * acquisition and never re-derived: an exited writer stays attributable from its file alone. Each
+ * field is a separate source fact, present only when its source was set; nothing is inferred.
+ */
+export interface LockStatsWriter {
+  /** Basename of process.argv[1] (the script the runtime was started with). */
+  argv1?: string;
+  /** PI_FABRIC_AGENT_NAME. */
+  agentName?: string;
+  /** PI_FABRIC_ACTOR_ID. */
+  actorId?: string;
+  /** PI_FABRIC_ACTOR_NAME. */
+  actorName?: string;
+  /** PI_FABRIC_ROLE, verbatim. */
+  role?: string;
+  /** SMARTY_ROLE, verbatim (may carry an "@revision" suffix). */
+  smartyRole?: string;
+  /** process.ppid at capture. */
+  ppid?: number;
+}
+const WRITER_STRING_FIELDS = ["argv1", "agentName", "actorId", "actorName", "role", "smartyRole"] as const;
+/** Writer strings are truncated to this many UTF-16 units when captured; a reader rejects longer. */
+export const LOCK_STATS_WRITER_MAX_CHARS = 128;
 export interface LockStatsFile {
   version: 1;
   host: string;
@@ -130,6 +154,8 @@ export interface LockStatsFile {
   root: string;
   startedAt: number;
   updatedAt: number;
+  /** Optional in version 1: files written before smarty-dev#8305 have none. */
+  writer?: LockStatsWriter;
   minutes: LockStatsMinute[];
 }
 
@@ -198,6 +224,25 @@ const warnPrivately = (message: string): void => {
 const WRITE_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
 
+/** The writer facts of this process, read once from its argv, environment and ppid. */
+export const captureLockStatsWriter = (env: NodeJS.ProcessEnv = process.env,
+  argv1: string | undefined = process.argv[1], ppid: number = process.ppid): LockStatsWriter => {
+  const bounded = (value: string | undefined): string | undefined => {
+    const text = value?.trim();
+    return text ? text.slice(0, LOCK_STATS_WRITER_MAX_CHARS) : undefined;
+  };
+  const facts: Record<string, string | number | undefined> = {
+    argv1: bounded(argv1 ? path.basename(argv1) : undefined),
+    agentName: bounded(env.PI_FABRIC_AGENT_NAME),
+    actorId: bounded(env.PI_FABRIC_ACTOR_ID),
+    actorName: bounded(env.PI_FABRIC_ACTOR_NAME),
+    role: bounded(env.PI_FABRIC_ROLE),
+    smartyRole: bounded(env.SMARTY_ROLE),
+    ppid: Number.isSafeInteger(ppid) && ppid >= 0 ? ppid : undefined,
+  };
+  return Object.freeze(Object.fromEntries(Object.entries(facts).filter(([, value]) => value !== undefined)) as LockStatsWriter);
+};
+
 /** Sanitized host label used in file names. */
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
@@ -218,6 +263,8 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const roots = new Map<string, RootLockStats>();
   let flushedMinute = Math.floor(startedAt / 60_000);
   let started = false;
+  // Captured once, at the first acquisition (with the exit hook): later env changes never alter it.
+  let writer: LockStatsWriter | undefined;
   const warn = options.warn ?? warnPrivately;
 
   // By age only, the own file included: a fresh own file is never stale, and a stale one (no
@@ -254,6 +301,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
     const file = path.join(directory, name);
     const body: LockStatsFile = {
       version: 1, host, pid: process.pid, root: entry.root, startedAt, updatedAt: now,
+      ...writer ? { writer } : {},
       minutes: [...entry.minutes].sort(([a], [b]) => a - b).map(([minute, classes]) => ({ minute, classes })),
     };
     // Atomic for readers; deliberately not durable (diagnostics, no fsync). A unique temporary,
@@ -330,6 +378,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       roots.set(key, entry);
       if (!started) {
         started = true;
+        writer ??= captureLockStatsWriter();
         process.once("exit", onExit);
       }
     }
@@ -388,12 +437,29 @@ const isBucket = (value: unknown): value is LockStatsBucket => {
     [bucket.waitMs, bucket.waitMaxMs, bucket.holdMs, bucket.holdMaxMs, bucket.failedWaitMs].every(isDuration) &&
     isHistogram(bucket.waitHist) && isHistogram(bucket.holdHist);
 };
+/** A present writer must be an object of bounded strings and a pid; unknown keys are ignored. */
+const invalidWriter = (value: unknown): boolean => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return true;
+  const writer = value as Record<string, unknown>;
+  if (writer.ppid !== undefined && !isCount(writer.ppid)) return true;
+  return WRITER_STRING_FIELDS.some(field => writer[field] !== undefined &&
+    (typeof writer[field] !== "string" || (writer[field] as string).length > LOCK_STATS_WRITER_MAX_CHARS));
+};
+/** Only the known writer facts, so a summary never relays unknown keys from a file. */
+const knownWriter = (writer: LockStatsWriter | undefined): LockStatsWriter | undefined => {
+  if (!writer) return undefined;
+  const known: LockStatsWriter = {};
+  for (const field of WRITER_STRING_FIELDS) if (writer[field] !== undefined) known[field] = writer[field];
+  if (writer.ppid !== undefined) known.ppid = writer.ppid;
+  return known;
+};
 /** Why a parsed stats file is invalid, or undefined. A file is used whole or not at all. */
 const invalidLockStats = (value: unknown): string | undefined => {
   const file = value as Partial<LockStatsFile> | null;
   if (!file || typeof file !== "object" || file.version !== 1) return "not a version-1 stats file";
   if (typeof file.host !== "string" || !file.host || file.host.length > 256) return "bad host";
   if (!Number.isSafeInteger(file.pid) || file.pid! < 0) return "bad pid";
+  if (file.writer !== undefined && invalidWriter(file.writer)) return "bad writer";
   if (!Array.isArray(file.minutes) || file.minutes.length > LOCK_STATS_RETAIN_MINUTES + 1) return "bad minutes";
   for (const minute of file.minutes as unknown[]) {
     const { minute: at, classes } = (minute ?? {}) as Partial<LockStatsMinute>;
@@ -502,7 +568,7 @@ export interface LockStatsSummary extends LockStatsTotals {
   processes: number;
   peakMinuteBusyPct: number;
   classes: Array<LockStatsTotals & { lockClass: MeshLockClass; holdSharePct: number }>;
-  pids: Array<LockStatsTotals & { host: string; pid: number; topClass: MeshLockClass | undefined }>;
+  pids: Array<LockStatsTotals & { host: string; pid: number; topClass: MeshLockClass | undefined; writer?: LockStatsWriter }>;
 }
 
 const mergeBucket = (into: LockStatsBucket, from: LockStatsBucket): void => {
@@ -554,9 +620,9 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   const all = emptyBucket();
   const byClass = new Map<MeshLockClass, LockStatsBucket>();
   const perMinuteHold = new Map<number, number>();
-  const byPid: Array<{ host: string; pid: number; bucket: LockStatsBucket; classes: Map<MeshLockClass, number> }> = [];
+  const byPid: Array<{ host: string; pid: number; writer: LockStatsWriter | undefined; bucket: LockStatsBucket; classes: Map<MeshLockClass, number> }> = [];
   for (const file of files) {
-    const own = { host: file.host, pid: file.pid, bucket: emptyBucket(), classes: new Map<MeshLockClass, number>() };
+    const own = { host: file.host, pid: file.pid, writer: knownWriter(file.writer), bucket: emptyBucket(), classes: new Map<MeshLockClass, number>() };
     for (const { minute, classes } of file.minutes) {
       if (minute < fromMinute || minute > toMinute) continue;
       for (const [lockClass, bucket] of Object.entries(classes) as Array<[MeshLockClass, LockStatsBucket]>) {
@@ -574,9 +640,10 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   const classes = [...byClass].map(([lockClass, bucket]) => ({
     lockClass, ...totalsOf(bucket, windowMs), holdSharePct: all.holdMs > 0 ? bucket.holdMs / all.holdMs * 100 : 0,
   })).sort((a, b) => b.holdMs - a.holdMs || b.n - a.n || a.lockClass.localeCompare(b.lockClass));
-  const pids = byPid.map(({ host, pid, bucket, classes: held }) => ({
+  const pids = byPid.map(({ host, pid, writer, bucket, classes: held }) => ({
     host, pid, ...totalsOf(bucket, windowMs),
     topClass: [...held].sort((a, b) => b[1] - a[1])[0]?.[0],
+    ...writer ? { writer } : {},
   })).sort((a, b) => b.holdMs - a.holdMs || b.n - a.n || a.pid - b.pid).slice(0, top);
   return {
     root, fromMinute, toMinute, minutes: span, processes: byPid.length, ...totalsOf(all, windowMs),

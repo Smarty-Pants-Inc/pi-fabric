@@ -580,14 +580,17 @@ export class AgentMessageRouter {
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
     let remoteAgent = this.#get(id);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
-      const nativeTerminalTask = remoteAgent.runner === "pi" && remoteAgent.transport === "process" && terminalAgentStatuses.has(remoteAgent.status);
+      if (terminalAgentStatuses.has(remoteAgent.status) && remoteAgent.stale) throw new FabricRouteAuthorityError(remoteAgent.id);
+      const nativeTerminalTask = remoteAgent.runner === "pi" && remoteAgent.transport === "process" &&
+        terminalAgentStatuses.has(remoteAgent.status) && Boolean(remoteAgent.finalAnswerReceiptId);
       if (nativeTerminalTask) {
         // Terminal tasks advertise no ingress capability. Their still-live exact
         // owner must nevertheless answer with the typed final receipt refusal.
         // Revalidate authority; stale/withdrawn/replaced owners never gain a route.
         const fresh = this.#directoryRead(() => this.participants.get(remoteAgent!.id, undefined, { fresh: true }));
         if (!fresh || fresh.stale || fresh.kind !== "agent" || fresh.runner !== "pi" || fresh.transport !== "process" ||
-            !terminalAgentStatuses.has(fresh.status) || fresh.startedAt !== remoteAgent.startedAt || fresh.ownerHostId !== remoteAgent.ownerHostId ||
+            !terminalAgentStatuses.has(fresh.status) || fresh.finalAnswerReceiptId !== remoteAgent.finalAnswerReceiptId ||
+            fresh.startedAt !== remoteAgent.startedAt || fresh.ownerHostId !== remoteAgent.ownerHostId ||
             fresh.ownerIdentityId !== remoteAgent.ownerIdentityId || fresh.rootId !== remoteAgent.rootId ||
             fresh.remoteHost !== remoteAgent.remoteHost) throw new FabricRouteAuthorityError(remoteAgent.id);
         remoteAgent = fresh;

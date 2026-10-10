@@ -34,6 +34,21 @@ export default function principalDelivery(pi: ExtensionAPI): void {
       const id = event.source === "extension" ? followUpMessageId(event.text) : undefined;
       if (id && followUpState(followUpFile(runDirectory, id)) !== "queued") return { action: "handled" };
     });
+    pi.on("message_end", event => {
+      if (!terminalTask || event.message.role !== "user" || !Array.isArray(event.message.content)) return;
+      const first = event.message.content[0];
+      if (first?.type !== "text") return;
+      const id = terminalControlMessageId(first.text);
+      if (!id) return;
+      const text = first.text.slice(terminalControlMessage(id, "").length);
+      // Untracked controls are consumed when the native loop appends the user
+      // input. Strip their private envelope before persistence, not just in the
+      // provider context. Tracked follow-ups keep their separate context-only
+      // consumption/cancellation gate and never receive an early receipt here.
+      if (followUpMessageId(text)) return;
+      settleTerminalControl(runDirectory, id, "delivered");
+      return { message: { ...event.message, content: [{ ...first, text }, ...event.message.content.slice(1)] } };
+    });
     pi.on("context", event => {
       const seen = new Set<string>();
       return { messages: event.messages.flatMap(message => {

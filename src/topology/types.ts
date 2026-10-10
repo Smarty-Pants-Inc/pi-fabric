@@ -60,6 +60,8 @@ export interface FabricParticipantRecord {
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;
+  /** Advertised only after the durable task final-answer boundary, never a turn/status alone. */
+  finalAnswerReceiptId?: string;
   pendingMessages?: boolean;
   currentTool?: string;
   turns?: number;

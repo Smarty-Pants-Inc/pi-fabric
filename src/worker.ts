@@ -591,6 +591,7 @@ const main = async (): Promise<void> => {
     if (!header) throw new Error("Actor launch session has no valid native header");
     return { PI_SESSION_ID: header.id, PI_SESSION_FILE: nativeFile };
   };
+  let taskResuming = false;
   const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
@@ -614,6 +615,7 @@ const main = async (): Promise<void> => {
       PI_FABRIC_ACTIVATION_HOOK: activationHookPath ?? "",
       PI_FABRIC_DELIVERY_DIR: deliveryDirectory,
       PI_FABRIC_TERMINAL_TASK: persistentPiTask && piRetrySdk ? "1" : "",
+      PI_FABRIC_TASK_RESUMING: persistentPiTask && taskResuming ? "1" : "",
       // Own run only, never the shared parent/nested run root.
       PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
       PI_FABRIC_DEPTH: String(options.depth),
@@ -2104,6 +2106,7 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    taskResuming = true;
     attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
     finalTurnCompleted = false;
     streamingToolCallInTurn = false;

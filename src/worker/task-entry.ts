@@ -129,7 +129,7 @@ if (process.env.PI_FABRIC_TERMINAL_TASK === "1") {
       provider: message.provider, timestamp: message.timestamp } : undefined;
     process.send?.({ type: "fabric_final_answer", runId, receiptId: receipt.id, assistant,
       totals: { ...totals, turns: totals.turns + 1 } });
-  }, process.env.PI_FABRIC_REPLY_FILE);
+  }, process.env.PI_FABRIC_REPLY_FILE, process.env.PI_FABRIC_TASK_RESUMING === "1");
   process.channel?.unref();
 }
 applyHttpProxySettings(runtime.services.settingsManager.getGlobalSettings().httpProxy);

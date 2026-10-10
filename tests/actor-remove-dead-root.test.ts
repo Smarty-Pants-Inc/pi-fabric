@@ -401,7 +401,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       const actor = await f.create("timer");
       let code: number;
       try {
-        code = await main(["stop", "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, "--dry-run"],
+        code = await main(["stop", "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, "--dry-run", "--confirm-dead-root", f.config.rootId],
           { out: () => {}, err: () => {} });
       } finally { timeout.mockRestore(); }
       expect(code).toBe(0);

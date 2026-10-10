@@ -224,15 +224,16 @@ function rootParticipantVerdict(config: ResidentHostConfig, mesh: Pick<MeshStore
 
 export const MAIN_STOPPED_REQUIRED = "the root's Main may be running; confirm it is stopped and pass --main-stopped (automatic proof: smarty-dev#7956)";
 
-/** `mainStopped` undefined: the action needs no Main-stopped assertion (stop); false/true: it does (remove). */
-export function assertResidentOperatorConfirmed(evidence: ResidentOperatorEvidence, confirmation?: string, dryRun = false,
+/** `mainStopped` undefined: the action needs no Main-stopped assertion (stop); false/true: it does (remove).
+ * A dry run runs EVERY check and refuses exactly where a real run would (smarty-dev#7817); callers that
+ * report a plan turn the refusal into "would refuse". `_dryRun` is kept for the callers' signature only. */
+export function assertResidentOperatorConfirmed(evidence: ResidentOperatorEvidence, confirmation?: string, _dryRun = false,
   mainStopped?: boolean): void {
-  if (dryRun && confirmation === undefined) return;
   if (confirmation !== evidence.rootId) refuse(evidence, confirmation === undefined
     ? "Missing --confirm-dead-root: operator confirmation is required"
     : "Mismatched --confirm-dead-root: value must equal the selected resident's root id exactly");
-  if (!dryRun && mainStopped === false) refuse(evidence, MAIN_STOPPED_REQUIRED);
-  if (dryRun || !evidence.liveLease) return;
+  if (mainStopped === false) refuse(evidence, MAIN_STOPPED_REQUIRED);
+  if (!evidence.liveLease) return;
   if (!evidence.liveRootLease && evidence.mainLiveness?.startsWith("unknown:")) {
     refuse(evidence, `Main identity cannot be verified: ${evidence.mainLiveness.slice("unknown: ".length)}; refusing (smarty-dev#7956)`);
   }

@@ -113,6 +113,7 @@ describe("legacy routes and durable mesh delivery", () => {
       sent.push({ route, message, data }); return { queued: true as const, messageId: route, routed: "local" as const };
     };
     const remote = (id: string, kind: FabricParticipantInfo["kind"], legacy = false) => ({ id, kind, local: false,
+      ...(legacy ? {} : { ownerIncarnation: "fixture:owner" }),
       capabilities: ["steer", "followUp"], ownerHostId: "owner", ownerIdentityId: "owner-id", controlProtocol: legacy ? "legacy" : "v1" }) as FabricParticipantInfo;
     const participants = [remote("remote-root", "root"), remote("remote-child", "agent"), remote("remote-actor", "actor"), remote("legacy-root", "root", true)];
     const provider = new AgentsProvider({
@@ -128,7 +129,10 @@ describe("legacy routes and durable mesh delivery", () => {
       id: "main", local: true, matches: (id: string) => id === "main",
       deliverAgent: ({ message, data }: { message: string; data: unknown }) => deliver("main", message, data),
     } as unknown as Ports[3], { get: (id: string) => participants.find(p => p.id === id) } as unknown as Ports[4], {
-      request: async (_host: string, id: string, _kind: string, args: { message: string; data: unknown }) => deliver(id, args.message, args.data),
+      request: async (_host: string, id: string, _kind: string, args: { message: string; data: unknown; ownerIncarnation?: string }) => {
+        expect(args.ownerIncarnation).toBe(id === "legacy-root" ? undefined : "fixture:owner");
+        return deliver(id, args.message, args.data);
+      },
     } as unknown as Ports[5], {} as Ports[6]);
     const context = invocation(session());
     const data = { untouched: "head def5678" };

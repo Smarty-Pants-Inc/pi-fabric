@@ -33,11 +33,11 @@ export class FabricControlStaleIncarnationError extends Error {
     this.name = "FabricControlStaleIncarnationError";
   }
 }
-/** Pre-publication refusal: an older target cannot safely admit fenced control. */
+/** Pre-publication refusal: an advertised fencing epoch is malformed. */
 export class FabricControlIncarnationRequiredError extends Error {
   readonly code = "FABRIC_CONTROL_INCARNATION_REQUIRED";
   constructor(readonly targetId: string) {
-    super(`Fabric target ${targetId}: target must run a Fabric release with incarnation fencing; this attempt was not published.`);
+    super(`Fabric target ${targetId}: target advertises an invalid owner incarnation; this attempt was not published.`);
     this.name = "FabricControlIncarnationRequiredError";
   }
 }
@@ -47,11 +47,18 @@ export const controlOwnerIncarnation = (participant: {
   id: string;
   ownerIncarnation?: string | undefined;
   controlProtocol?: "v1" | "legacy" | undefined;
-}): string => {
-  if (!isIncarnation(participant.ownerIncarnation) || participant.controlProtocol === "legacy") {
+}): string | undefined => {
+  // Absence means an older release, not a failed fencing upgrade. Never fabricate
+  // an epoch from payload data, cached sender state, or the protocol label.
+  if (participant.ownerIncarnation === undefined) return undefined;
+  if (!isIncarnation(participant.ownerIncarnation)) {
     throw new FabricControlIncarnationRequiredError(participant.id);
   }
   return participant.ownerIncarnation;
+};
+/** One-line counted diagnostic; a legacy route remains authorized by its existing checks. */
+export const warnUnfencedControlDelivery = (operation: FabricControlOperation, targetId: string, count: number): void => {
+  console.warn(`[pi-fabric] Unfenced legacy control delivery count=${count} operation=${operation} target=${JSON.stringify(targetId)}`);
 };
 const DEFAULT_RESULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
@@ -75,11 +82,6 @@ export const CONTROL_CLAIMS_POLICY_KEY = "topology/control-claims";
 
 // Legacy Main setter wire names remain parseable only so owners can refuse them clearly.
 export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "cancel" | "setModel" | "setThinking";
-
-// Messages address a durable session; stop/ask (and legacy setters/cancel) address
-// a particular execution. A same-session reload must not discard queued messages.
-const sessionBoundControlOperation = (operation: FabricControlOperation): boolean =>
-  operation === "steer" || operation === "followUp";
 
 // Keep the reader free to deliver cancellation while asynchronous work waits at its
 // commit fence. These commands own their handler and outcome/ACK retries after the cursor.
@@ -426,6 +428,7 @@ export class FabricControlPlane {
   // A proven-notRun request remains close-owned while waiting to resend.
   readonly #resendWaits = new Set<() => void>();
   #closed = false;
+  #legacyDeliveryCount = 0;
   #paused = false;
   #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
@@ -596,8 +599,7 @@ export class FabricControlPlane {
       throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     }
     if (!ownerHostId.trim()) throw new Error("Remote participant has no execution owner");
-    if (input.ownerIncarnation === undefined) throw new FabricControlIncarnationRequiredError(targetId);
-    if (!isIncarnation(input.ownerIncarnation)) {
+    if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
       throw new Error("Invalid Fabric owner incarnation");
     }
     // Freeze the resolved activation AND request origin before any publication/lock wait.
@@ -630,6 +632,10 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    if (ownerIncarnation === undefined && notRunAttempt === 0) {
+      // Once per logical legacy delivery, not once per proven-notRun resend.
+      warnUnfencedControlDelivery(operation, targetId, ++this.#legacyDeliveryCount);
+    }
     // One budget drives admission and ACK timing. A validated fresh native owner gets
     // a bounded busy-owner window; bridges and explicit caller deadlines retain their policy.
     const readOwnerExpiry = typeof destinationRemoteHost === "string" ? undefined :
@@ -719,7 +725,7 @@ export class FabricControlPlane {
           targetId,
           operation,
           replyTo: this.options.hostId,
-          ownerIncarnation,
+          ...(ownerIncarnation !== undefined ? { ownerIncarnation } : {}),
           ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
@@ -1059,7 +1065,7 @@ export class FabricControlPlane {
       (event.data.ownerIncarnation !== undefined && !isIncarnation(event.data.ownerIncarnation)) ||
       // A correlated typed refusal may explicitly attest a missing wire epoch (null);
       // ordinary errors, successes, and an absent staleIncarnation never gain that authority.
-      (!sessionBoundControlOperation(pending.operation) && pending.ownerIncarnation !== undefined &&
+      (pending.ownerIncarnation !== undefined &&
         event.data.ownerIncarnation !== pending.ownerIncarnation &&
         !(event.data.accepted === false && event.data.errorCode === CONTROL_STALE_INCARNATION &&
           event.data.error === STALE_INCARNATION_ERROR && isIncarnation(event.data.ownerIncarnation) &&
@@ -1144,11 +1150,9 @@ export class FabricControlPlane {
       }
       return;
     }
-    // Messages with an explicit epoch still address the durable session across a
-    // same-session reload, even when that epoch names the predecessor. Missing an
-    // epoch is never a legacy downgrade: no unclaimed control can be admitted.
-    if (command.ownerIncarnation === undefined ||
-      (!sessionBoundControlOperation(command.operation) && !incarnationMatches)) {
+    // This owner advertises fencing. Missing or stale wire epochs cannot downgrade
+    // a new admission; completed predecessor claims above remain observable.
+    if (!incarnationMatches) {
       await this.#publishAcknowledgement(command, {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
       }, this.incarnation, command.ownerIncarnation ?? null);

@@ -26,7 +26,7 @@ participants.registerSource(() => [{
   pendingMessages: resolved, controlProtocol: "v1",
 }]);
 const control = new FabricControlPlane(mesh, identity, {
-  enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 500,
+  enabled: true, hostId: identity.id, ownerIncarnation: participants.ownerIncarnation, pollMs: 20, acknowledgementTimeoutMs: 500,
 });
 let stop!: () => void;
 const stopped = new Promise<void>(resolve => { stop = resolve; });

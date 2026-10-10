@@ -116,22 +116,31 @@ const mainLeaseFixture = async (files: boolean) => {
 };
 
 describe("sender incarnation fencing (#7514)", () => {
-  it.each(["root", "actor", "agent"] as const)("refuses every old %s peer route without calling control or the legacy relay", async kind => {
+  it.each(["root", "actor", "agent"] as const)("routes every old %s peer unfenced without inventing an epoch", async kind => {
     for (const delivery of ["steer", "followUp"] as const) {
       for (const protocol of ["legacy", "v1"] as const) {
-        for (const available of [false, true]) {
-          const id = kind === "root" ? "session:older" : `${kind}:older`;
-          const target = { ...remote(id, "idle", kind), controlProtocol: protocol };
-          delete target.ownerIncarnation;
-          const request = vi.fn();
-          const r = router(unknown, [target], available ? { request } : undefined);
-          await expect(r.value.routeMessage(id, "do not deliver", { ownerIncarnation: "payload-forgery" }, delivery))
-            .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
-              targetId: id, message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+        const id = kind === "root" ? "session:older" : `${kind}:older`;
+        const target = { ...remote(id, "idle", kind), controlProtocol: protocol };
+        delete target.ownerIncarnation;
+        const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh", messageId: "legacy" });
+        const r = router(unknown, [target], { request });
+        vi.mocked(r.actors.steerRemote).mockResolvedValue({ queued: true, messageId: "legacy", routed: "mesh" });
+        await expect(r.value.routeMessage(id, "legacy delivery", { ownerIncarnation: "payload-forgery" }, delivery))
+          .resolves.toMatchObject({ messageId: "legacy" });
+        const relay = protocol === "legacy" && kind !== "agent";
+        if (relay) {
           expect(request).not.toHaveBeenCalled();
+          expect(r.actors.steerRemote).toHaveBeenCalledOnce();
+        } else {
+          expect(request.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
           expect(r.actors.steerRemote).not.toHaveBeenCalled();
-          expect(r.actors.tell).not.toHaveBeenCalled();
-          expect(r.main.deliverAgent).not.toHaveBeenCalled();
+        }
+        expect(r.actors.tell).not.toHaveBeenCalled();
+        expect(r.main.deliverAgent).not.toHaveBeenCalled();
+        if (kind === "agent") {
+          const unavailable = router(unknown, [target]);
+          await expect(unavailable.value.routeMessage(id, "no transport", undefined, delivery))
+            .rejects.toThrow("control plane is unavailable");
         }
       }
     }
@@ -150,16 +159,16 @@ describe("sender incarnation fencing (#7514)", () => {
     expect(r.actors.steerRemote).not.toHaveBeenCalled();
   });
 
-  it.each(["root", "actor", "agent"] as const)("never uses a cached %s epoch after the directory shows an old peer", async kind => {
+  it.each(["root", "actor", "agent"] as const)("uses the legacy path, never a cached %s epoch, after the directory shows an old peer", async kind => {
     const id = kind === "root" ? "session:downgraded" : `${kind}:downgraded`;
     const cached = remote(id, "idle", kind);
     const fresh = { ...cached }; delete fresh.ownerIncarnation;
     const get = vi.fn((_id: string, _now?: number, options?: { fresh?: boolean }) => options?.fresh ? fresh : cached);
-    const request = vi.fn();
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
     const r = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn() });
-    await expect(r.value.routeMessage(id, "unsafe cached epoch", undefined, "followUp"))
-      .rejects.toMatchObject({ code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
-    expect(request).not.toHaveBeenCalled(); expect(r.actors.steerRemote).not.toHaveBeenCalled();
+    await r.value.routeMessage(id, "legacy current record", undefined, "followUp");
+    expect(request.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
     expect(get.mock.calls.some(call => call[2]?.fresh)).toBe(true);
   });
 
@@ -174,13 +183,24 @@ describe("sender incarnation fencing (#7514)", () => {
     expect(request.mock.calls[0]![5]).toMatchObject({ routedRemoteHost: "forge" });
   });
 
-  it("refuses a legacy protocol even if it advertises an epoch", async () => {
-    const target = { ...remote("session:legacy", "idle", "root"), controlProtocol: "legacy" as const };
+  it.each(["root", "actor", "agent"] as const)("never downgrades a malformed advertised %s epoch to legacy delivery", async kind => {
+    const id = kind === "root" ? "session:malformed" : `${kind}:malformed`;
     const request = vi.fn();
+    const target = { ...remote(id, "idle", kind), ownerIncarnation: "", controlProtocol: "legacy" as const };
     const r = router(unknown, [target], { request });
-    await expect(r.value.routeMessage(target.id, "unsafe", undefined, "steer"))
-      .rejects.toMatchObject({ code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
-    expect(request).not.toHaveBeenCalled(); expect(r.actors.steerRemote).not.toHaveBeenCalled();
+    await expect(r.value.routeMessage(id, "must not publish", undefined, "followUp"))
+      .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED" });
+    expect(request).not.toHaveBeenCalled();
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("fences any peer advertising an epoch, even with a legacy protocol label", async () => {
+    const target = { ...remote("session:legacy", "idle", "root"), controlProtocol: "legacy" as const };
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const r = router(unknown, [target], { request });
+    await r.value.routeMessage(target.id, "fenced", undefined, "steer");
+    expect(request.mock.calls[0]![3]).toMatchObject({ ownerIncarnation: target.ownerIncarnation });
+    expect(r.actors.steerRemote).not.toHaveBeenCalled();
   });
 });
 

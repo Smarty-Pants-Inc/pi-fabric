@@ -48,7 +48,7 @@ const fixture = async () => {
     directory.registerSource(() => [record]);
     closers.push(() => directory.close());
     await directory.start();
-    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: id, pollMs: 10 });
+    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: id, ownerIncarnation: directory.ownerIncarnation, pollMs: 10 });
     closers.push(() => control.close());
     const entries: any[] = [];
     const main = new MainAgentController({ on: () => () => {}, sendMessage: (message: any) => {

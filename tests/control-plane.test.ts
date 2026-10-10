@@ -54,19 +54,57 @@ afterEach(async () => {
 });
 
 describe("FabricControlPlane", () => {
-  it.each(["steer", "followUp", "ask", "stop"] as const)("refuses epochless %s before publishing even to an older accepting owner", async operation => {
+  it("delivers ordinary control to older owners unfenced with one counted warning per request", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sender-incarnation-")); roots.push(root);
     const sender = plane(path.join(root, "mesh"), "host:sender");
-    const publish = vi.spyOn(sender.mesh, "publish");
-    // An older owner would accept an epochless command. No command may reach that owner.
-    const request = operation === "ask"
-      ? sender.requestResult("host:older", "actor:target", operation, { message: "unsafe", data: { ownerIncarnation: "payload-forgery" } })
-      : sender.request("host:older", "actor:target", operation, { message: "unsafe" });
-    await expect(request).rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError",
-      code: "FABRIC_CONTROL_INCARNATION_REQUIRED", targetId: "actor:target",
-      message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
-    expect(publish).not.toHaveBeenCalled();
-    expect(sender.mesh.read({ topic: "fabric.control.command" })).toEqual([]);
+    sender.start(() => ({ accepted: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      for (const [index, operation] of (["steer", "followUp", "ask", "stop"] as const).entries()) {
+        const input = { message: "legacy delivery", data: { ownerIncarnation: "payload-forgery" } };
+        const pending = operation === "ask"
+          ? sender.requestResult("host:older", "actor:target", operation, input)
+          : sender.request("host:older", "actor:target", operation, input);
+        await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(index + 1));
+        const command = sender.mesh.read({ topic: "fabric.control.command" }).at(-1)!.data as FabricControlCommand;
+        expect(command).not.toHaveProperty("ownerIncarnation");
+        expect(command.data).toEqual(input.data);
+        // The older release's handler and ACK know nothing about incarnation fields.
+        await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:older"), to: "host:sender",
+          data: { version: 1, commandId: command.commandId, targetId: command.targetId, accepted: true, messageId: "legacy", result: "answer" } });
+        expect(await pending).toEqual(operation === "ask" ? "answer" : { queued: true, routed: "mesh", acknowledged: true, messageId: "legacy" });
+        expect(warn).toHaveBeenCalledTimes(index + 1);
+        expect(warn.mock.calls[index]![0]).toBe(`[pi-fabric] Unfenced legacy control delivery count=${index + 1} operation=${operation} target="actor:target"`);
+      }
+    } finally { warn.mockRestore(); }
+  });
+
+  it("counts one legacy warning even when a proven-notRun receipt causes a bounded resend", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-legacy-resend-")); roots.push(root);
+    const sender = plane(path.join(root, "mesh"), "host:sender");
+    sender.start(() => ({ accepted: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const pending = sender.request("host:older", "actor:target", "followUp", { message: "legacy" }).catch(error => error);
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command" })).toHaveLength(attempt + 1));
+        const command = sender.mesh.read({ topic: "fabric.control.command" }).at(-1)!.data as FabricControlCommand;
+        expect(command).not.toHaveProperty("ownerIncarnation");
+        if (attempt === 0) await sender.mesh.put({
+          key: "topology/control-seen/" + createHash("sha256").update(`host:older\0${command.commandId}`).digest("hex"),
+          identity: identity("host:older"), ifVersion: 0,
+          value: { format: 1, hostId: "host:older", commandId: command.commandId, targetId: command.targetId,
+            expiresAt: Date.now() + 10_000, acceptance: { accepted: false, error: "Fabric control command expired", notRun: true } },
+        });
+        await sender.mesh.publish({ topic: "fabric.control.ack", kind: attempt === 0 ? "rejected" : "accepted",
+          from: identity("host:older"), to: "host:sender", data: { version: 1, commandId: command.commandId,
+            targetId: command.targetId, accepted: attempt === 1,
+            ...(attempt === 0 ? { error: "Fabric control command expired", notRun: true } : { messageId: "legacy-retry" }) } });
+      }
+      expect(await pending).toMatchObject({ acknowledged: true, messageId: "legacy-retry" });
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toContain("Unfenced legacy control delivery count=1");
+    } finally { await sender.close(); await pending; warn.mockRestore(); }
   });
 
   it("derives wake cause from the real event envelope, never a forged sender diagnostic", async () => {
@@ -133,7 +171,7 @@ describe("FabricControlPlane", () => {
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(index + 1));
       const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
       await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
-        data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: true, messageId: "accepted", ...(warning === undefined ? {} : { warning }) } });
+        data: { version: 1, commandId: command.commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: true, messageId: "accepted", ...(warning === undefined ? {} : { warning }) } });
       expect(await outcome).toEqual({ queued: true, messageId: "accepted", routed: "mesh", acknowledged: true,
         ...(index >= variants.length - 2 ? { warning: valid } : {}) });
     }
@@ -145,7 +183,7 @@ describe("FabricControlPlane", () => {
       await vi.waitFor(() => expect(sender.mesh.read({ topic: "fabric.control.command", limit: 100 })).toHaveLength(variants.length + length - 199));
       const command = sender.mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.data as { commandId: string };
       await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:owner"), to: "host:sender",
-        data: { version: 1, commandId: command.commandId, targetId, accepted: true, messageId: "bounded", warning: { ...valid, targetId } } });
+        data: { version: 1, commandId: command.commandId, targetId, ownerIncarnation: fixtureOwnerIncarnation, accepted: true, messageId: "bounded", warning: { ...valid, targetId } } });
       expect(await outcome).toEqual({ queued: true, messageId: "bounded", routed: "mesh", acknowledged: true,
         ...(length === 200 ? { warning: { ...valid, targetId } } : {}) });
     }
@@ -482,7 +520,7 @@ describe("FabricControlPlane", () => {
       f.setLease({ remoteHost: "ryzen2", expiresAt: Date.now() + 60_000 });
       await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "rejected",
         from: identity("identity:owner"), to: "host:sender", data: {
-          version: 1, commandId, targetId: "agent:target", accepted: false,
+          version: 1, commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: false,
           error: "native notRun", notRun: true,
         } });
       expect((await outcome).error?.message).toContain("Fabric native routing is unavailable");
@@ -506,7 +544,7 @@ describe("FabricControlPlane", () => {
       const tail = vi.spyOn(f.sender.mesh, "tail");
       await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "rejected",
         from: identity("identity:owner"), to: "host:sender", data: {
-          version: 1, commandId, targetId: "agent:target", accepted: false,
+          version: 1, commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: false,
           error: "foreign notRun", notRun: true, bridge: { from: "ryzen2" },
         } });
       await vi.waitFor(() => expect(tail.mock.results.some((result) => result.type === "return" &&
@@ -515,7 +553,7 @@ describe("FabricControlPlane", () => {
       expect(settled).toBe(false);
       await f.sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted",
         from: identity("identity:owner"), to: "host:sender", data: {
-          version: 1, commandId, targetId: "agent:target", accepted: true, messageId: "native",
+          version: 1, commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: true, messageId: "native",
         } });
       await expect(outcome).resolves.toMatchObject({ messageId: "native" });
       const events = f.sender.mesh.read({ topic: "fabric.control.command", limit: 100 });
@@ -675,7 +713,7 @@ describe("FabricControlPlane", () => {
         const command = f.commands()[0]!.data as FabricControlCommand;
         await f.sender.mesh.publish({
           topic: "fabric.control.ack", kind: "rejected", from: identity("identity:owner"), to: "host:sender",
-          data: { version: 1, commandId: command.commandId, targetId: "agent:target", accepted: false,
+          data: { version: 1, commandId: command.commandId, targetId: "agent:target", ownerIncarnation: fixtureOwnerIncarnation, accepted: false,
             error: "Fabric control command expired", notRun: true, bridge: { from: "forge" } },
         });
         await vi.advanceTimersByTimeAsync(20);
@@ -889,7 +927,7 @@ describe("FabricControlPlane", () => {
       const ack = (commandId: string, remoteHost: string | undefined, accepted = true) => writer.publish({
         topic: "fabric.control.ack", kind: accepted ? "accepted" : "rejected", from: owner, to: "host:sender",
         data: {
-          version: 1, commandId, targetId: ownerId, accepted,
+          version: 1, commandId, targetId: ownerId, ownerIncarnation: fixtureOwnerIncarnation, accepted,
           ...(accepted ? { messageId: "original-forge" } : { error: "replacement says not run", notRun: true }),
           ...(remoteHost === undefined ? {} : { bridge: { from: remoteHost } }),
         },
@@ -2172,7 +2210,7 @@ describe("FabricControlPlane", () => {
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
       const sender = plane(meshRoot, "host:sender");                     // a 1 s deadline
       sender.start(() => ({ accepted: false }));
-      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "once" }));
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "once" }));
       let commandId = "";
       await vi.waitFor(() => {
         commandId = (store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string }).commandId;
@@ -2231,7 +2269,7 @@ describe("FabricControlPlane", () => {
       const sender = plane(meshRoot, "host:sender");
       sender.start(() => ({ accepted: false }));
       const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
-      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { ownerIncarnation: fixtureOwnerIncarnation, message: "old" }));
+      const outcome = settle(sender.request("host:receiver", "agent:target", "followUp", { message: "old" }));
       let command: { commandId: string } | undefined;
       await vi.waitFor(() => {
         command = store.read({ topic: "fabric.control.command", limit: 10 })[0]?.data as { commandId: string };

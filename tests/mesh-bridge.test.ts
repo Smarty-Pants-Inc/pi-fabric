@@ -9,6 +9,7 @@ import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
   type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MainAgentController } from "../src/main-agent.js";
+import { ActorManager } from "../src/actors/manager.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -622,7 +623,7 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
 });
 
 describe("cross-host Main delivery semantics (#3015)", () => {
-  it.each(["legacy", "v1"] as const)("refuses an old %s Main before publishing anything through the real pipe bridge", async controlProtocol => {
+  it.each(["legacy", "v1"] as const)("preserves an old %s Main legacy route without adding an epoch", async controlProtocol => {
     const { hub, far, bridge } = setup(undefined, { realPipe: true });
     const source = await addRoot(hub, "fenced-source");
     const target = await addRoot(far, "old-target");
@@ -633,25 +634,51 @@ describe("cross-host Main delivery semantics (#3015)", () => {
     const directory = new ParticipantDirectory(hub, { enabled: true, hostId: source.hostId, rootId: source.identity.id, identity: source.identity });
     const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
       readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
-    const steerRemote = vi.fn();
+    const steerRemote = vi.fn((...args: Parameters<ActorManager["steerRemote"]>) =>
+      ActorManager.prototype.steerRemote.apply({ mesh: hub, identity: source.identity, meshConfig: { enabled: true } } as ActorManager, args));
     const sending = new AgentsProvider({ cwd: os.tmpdir() } as any, { identity: source.identity, steerRemote } as any, {} as any,
       { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id } as any,
       directory, sender, {} as any, () => false, undefined, false);
     try {
       await bridge.start(); await bridge.syncPresence();
-      // Old peer presence is still discoverable; only control admission is forbidden.
       expect(directory.get(target.identity.id, undefined, { fresh: true })?.ownerIncarnation).toBeUndefined();
-      for (const delivery of ["steer", "followUp"] as const) {
-        await expect(sending.invoke(delivery, { id: target.identity.id, message: "must not arrive" }, { cwd: os.tmpdir() } as any))
-          .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
-            message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
+      sender.start(() => ({ accepted: false }));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      if (controlProtocol === "legacy") {
+        for (const [index, delivery] of (["steer", "followUp"] as const).entries()) {
+          await expect(sending.invoke(delivery, { id: target.identity.id, message: "legacy relay" }, { cwd: os.tmpdir() } as any))
+            .resolves.toMatchObject({ queued: true, routed: "mesh" });
+          await bridge.step();
+          // The existing bridge v1 allow-list does not carry fabric.steer. Preserve
+          // main's native legacy relay; do not silently invent a bridge protocol.
+          expect(on(hub, "fabric.steer").at(-1)).toMatchObject({ kind: delivery, text: "legacy relay", to: target.identity.id });
+          expect(on(far, "fabric.steer")).toEqual([]);
+          expect(warn.mock.calls[index]![0]).toContain(`Unfenced legacy control delivery count=${index + 1}`);
+        }
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(steerRemote).toHaveBeenCalledTimes(2);
+        expect(on(hub, "fabric.control.command")).toEqual([]);
+        return;
       }
-      await bridge.step();
+      for (const [index, delivery] of (["steer", "followUp"] as const).entries()) {
+        const pending = sending.invoke(delivery, { id: target.identity.id, message: "legacy delivery" }, { cwd: os.tmpdir() } as any);
+        void pending.catch(() => undefined);
+        await waitFor(() => on(hub, "fabric.control.command").length === index + 1);
+        await bridge.step();
+        await waitFor(() => on(far, "fabric.control.command").length === index + 1);
+        const command = on(far, "fabric.control.command").at(-1)!.data as { commandId: string; targetId: string; operation: string };
+        expect(command).not.toHaveProperty("ownerIncarnation");
+        expect(command.operation).toBe(delivery);
+        // Simulate the old Main handler's receipt, with no incarnation support.
+        await far.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.hostId,
+          data: { version: 1, commandId: command.commandId, targetId: command.targetId, accepted: true, messageId: `legacy-${index}` } });
+        await bridge.step();
+        await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: `legacy-${index}` });
+        expect(warn.mock.calls[index]![0]).toContain(`Unfenced legacy control delivery count=${index + 1}`);
+      }
+      expect(warn).toHaveBeenCalledTimes(2);
       expect(steerRemote).not.toHaveBeenCalled();
-      for (const store of [hub, far]) {
-        expect(on(store, "fabric.control.command")).toEqual([]);
-        expect(on(store, "fabric.steer")).toEqual([]);
-      }
+      expect(on(far, "fabric.steer")).toEqual([]);
     } finally { await sender.close(); await bridge.stop(); }
   });
   it("starts a real idle Pi Main through the pipe bridge and returns triggered:true", async () => {

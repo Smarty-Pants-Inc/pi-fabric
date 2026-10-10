@@ -741,16 +741,16 @@ describe("agents provider message routing service boundaries", () => {
     expect(main.deliverAgent).not.toHaveBeenCalled();
   });
 
-  it("refuses a listed legacy peer root before control or legacy relay publication", async () => {
+  it("routes a listed legacy peer root without an owner incarnation", async () => {
     const { router, participants, actors, control } = routing();
     const old = { ...participant(), id: "session:legacy", controlProtocol: "legacy" as const };
     delete old.ownerIncarnation;
     participants.get.mockReturnValue(old);
+    actors.steerRemote.mockResolvedValue({ queued: true, messageId: "legacy", routed: "mesh" });
     await expect(router.routeMessage("session:legacy", "observation", undefined, "followUp"))
-      .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
-        message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
-    expect(actors.steerRemote).not.toHaveBeenCalled();
+      .resolves.toMatchObject({ messageId: "legacy" });
     expect(control.request).not.toHaveBeenCalled();
+    expect(actors.steerRemote).toHaveBeenCalledWith(old.id, "observation", "followUp", undefined);
   });
 
   it("does not hide local agent failures by falling through to actors", async () => {

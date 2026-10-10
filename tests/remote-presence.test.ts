@@ -154,21 +154,24 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     expect(directory.list({ scope: "local" }).map((participant) => participant.id)).toEqual(["session:dev1"]);
   });
 
-  it.each(["steer", "followUp"] as const)("refuses an older mirrored peer without an owner incarnation with a typed error (%s)", async kind => {
+  it.each(["steer", "followUp"] as const)("delivers to an older mirrored peer without an owner incarnation (%s)", async kind => {
     const { mesh, directory, mirror, local, remote } = await setup();
-    await mirror({ epochless: true, record: { controlProtocol: "legacy" } });
-    expect(directory.get(remote.id)).toMatchObject({ id: remote.id, controlProtocol: "legacy" });
+    await mirror({ epochless: true });
+    expect(directory.get(remote.id)).toMatchObject({ id: remote.id, controlProtocol: "v1" });
     const sender = senderOn(mesh, local, 5_000, directory);
     const request = vi.spyOn(sender, "request");
-    const publish = vi.spyOn(mesh, "publish");
+    const { received } = await remoteOwner(mesh, local, remote, undefined, true);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const router = routerFor(directory, sender, local);
-    await expect(router.routeMessage(remote.id, "unsafe legacy delivery", undefined, kind)).rejects.toMatchObject({
-      name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED", targetId: remote.id,
-      message: expect.stringContaining("target must run a Fabric release with incarnation fencing"),
-    });
-    expect(request).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
-    expect(mesh.read({ topic: "fabric.control.command" })).toEqual([]);
+    try {
+      await expect(router.routeMessage(remote.id, "legacy delivery", undefined, kind))
+        .resolves.toMatchObject({ acknowledged: true, messageId: "m-1" });
+      expect(request.mock.calls[0]![3]!.ownerIncarnation).toBeUndefined();
+      expect(mesh.read({ topic: "fabric.control.command" })[0]!.data).not.toHaveProperty("ownerIncarnation");
+      expect(received).toEqual([[kind, remote.id, "legacy delivery", local.id]]);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toContain("Unfenced legacy control delivery count=1");
+    } finally { warn.mockRestore(); }
   });
 
   it.each(["steer", "followUp"] as const)("resolves a long-lived remote root from a fresh Main's negative cache within its first minute (%s)", async (kind) => {
@@ -195,6 +198,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     local: MeshIdentity,
     remote: MeshIdentity,
     stamp: (data: Record<string, unknown>) => Record<string, unknown> = (data) => ({ ...data, bridge: { from: "forge", id: "x" } }),
+    legacy = false,
   ) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-remote-mesh-"));
     cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -211,7 +215,14 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       cursors.near = out.nextOffset;
       for (const event of out.events) {
         if (event.topic !== "fabric.control.command" || event.to !== remote.id) continue;
-        await far.publish({ topic: event.topic, kind: event.kind, from: event.from, to: event.to, data: { ...(event.data as object), bridge: { from: "dev1", id: event.id } } });
+        if (legacy) {
+          const command = event.data as { commandId: string; targetId: string; operation: string; message?: string };
+          received.push([command.operation, command.targetId, command.message, event.from.id]);
+          await far.publish({ topic: "fabric.control.ack", kind: "accepted", from: remote, to: local.id,
+            data: { version: 1, commandId: command.commandId, targetId: command.targetId, accepted: true, messageId: `m-${received.length}` } });
+        } else {
+          await far.publish({ topic: event.topic, kind: event.kind, from: event.from, to: event.to, data: { ...(event.data as object), bridge: { from: "dev1", id: event.id } } });
+        }
       }
       const back = far.tail(cursors.far, 100);
       cursors.far = back.nextOffset;

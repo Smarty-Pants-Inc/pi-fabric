@@ -109,8 +109,9 @@ const expectedResident = (cfg: ResidentHostConfig, record: ResidentDeliveryRecor
   fabricWakeCause(record.source === "actor-output" ? record.from : writer,
     record.source === "fabric-host" ? "host-event" : record.source === "actor-output" ? "actor" : record.delivery,
     "fabric.resident.delivery", `${residentDeliveryPrefix(cfg.rootId)}${record.id}`);
-const control = (mesh: MeshStore, from: MeshIdentity) => {
-  const plane = new FabricControlPlane(mesh, from, { enabled: true, hostId: from.id, pollMs: 20, acknowledgementTimeoutMs: 2_000 });
+const control = (mesh: MeshStore, from: MeshIdentity, participants?: ParticipantDirectory) => {
+  const plane = new FabricControlPlane(mesh, from, { enabled: true, hostId: from.id,
+    ...(participants ? { ownerIncarnation: participants.ownerIncarnation } : {}), pollMs: 20, acknowledgementTimeoutMs: 2_000 });
   cleanups.push(() => plane.close());
   return plane;
 };
@@ -199,7 +200,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const localParticipants = await directory(root, mesh, localIdentity);
     const remoteParticipants = await directory(root, mesh, remoteIdentity);
     const sender = control(mesh, localIdentity);
-    const receiver = control(mesh, remoteIdentity);
+    const receiver = control(mesh, remoteIdentity, remoteParticipants);
     const sourceProvider = provider(root, mesh, localIdentity, local.controller, localParticipants, sender);
     const ownerProvider = provider(root, mesh, remoteIdentity, remote.controller, remoteParticipants, receiver);
     const deliver = vi.spyOn(remote.controller, "deliverAgent");
@@ -234,13 +235,13 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const senderIdentity = identity("session:sender");
     const participants = await directory(root, mesh, owner);
     await directory(root, mesh, senderIdentity);
-    const receiver = control(mesh, owner);
+    const receiver = control(mesh, owner, participants);
     const sender = control(mesh, senderIdentity);
     const agents = provider(root, mesh, owner, recording.controller, participants, receiver);
     receiver.start((command, from, signal, verification) => agents.acceptControl(command, from, signal, verification));
     sender.start(() => ({ accepted: false }));
     const malformed = { cause: "host-event", from: { id: "fake", kind: "invalid" } } as unknown as FabricWakeCause;
-    await expect(sender.request(owner.id, owner.id, "followUp", { message: "normal input", wakeCause: malformed })).resolves.toMatchObject({ acknowledged: true });
+    await expect(sender.request(owner.id, owner.id, "followUp", { message: "normal input", ownerIncarnation: receiver.incarnation, wakeCause: malformed })).resolves.toMatchObject({ acknowledged: true });
     await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", "fabric.control.command",
       mesh.read({ topic: "fabric.control.command", limit: 100 }).at(-1)!.id));
     expect(recording.sent[0]!.options).toMatchObject({ provenance: { sender: { id: senderIdentity.id, verified: "mesh" } } });
@@ -249,7 +250,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     // must still admit the command under its original envelope authority.
     const forged = await mesh.publish({ topic: "fabric.control.command", kind: "followUp", from: senderIdentity, to: owner.id,
       data: { version: 1, commandId: "raw:malformed-diagnosis", targetId: owner.id, operation: "followUp", replyTo: senderIdentity.id,
-        requestedAt: Date.now(), deadlineAt: Date.now() + 2_000, message: "raw normal input", wakeCause: malformed } });
+        ownerIncarnation: receiver.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 2_000, message: "raw normal input", wakeCause: malformed } });
     await vi.waitFor(() => expect(recording.sent).toHaveLength(2));
     expect(recording.sent[1]!.options).toMatchObject({ provenance: { sender: { id: senderIdentity.id, verified: "mesh" } } });
     await assertWake(recording, fabricWakeCause(senderIdentity, "followUp", "fabric.control.command", forged.id));
@@ -283,7 +284,7 @@ describe("host-event attribution through lifecycle routing and durable resident 
     const remote = main(root, "peer");
     const remoteIdentity = identity(remote.controller.id);
     const participants = await directory(root, host.mesh, remoteIdentity);
-    const receiver = control(host.mesh, remoteIdentity);
+    const receiver = control(host.mesh, remoteIdentity, participants);
     const agents = provider(root, host.mesh, remoteIdentity, remote.controller, participants, receiver);
     receiver.start((command, from, signal, verification) => agents.acceptControl(command, from, signal, verification));
     const event = lifecycle("resident:remote", "session:observer", "root");

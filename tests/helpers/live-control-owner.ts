@@ -9,5 +9,7 @@ export const liveControlOwnerIncarnation = (
 ): Promise<string> => vi.waitFor(() => {
   const target = participants.get(targetId, undefined, { fresh: true });
   expect(target, `live control owner for ${targetId}`).toBeDefined();
-  return controlOwnerIncarnation(target!);
+  const incarnation = controlOwnerIncarnation(target!);
+  expect(incarnation, `published fenced owner for ${targetId}`).toBeDefined();
+  return incarnation!;
 }, { timeout: 5_000, interval: 20 });

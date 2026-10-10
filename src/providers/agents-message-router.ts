@@ -7,7 +7,7 @@ import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js"
 import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import { controlOwnerIncarnation, controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
+import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
@@ -109,6 +109,7 @@ class LeaseResolutionRequired extends Error {
 
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
+  #legacyDeliveryCount = 0;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
@@ -516,6 +517,12 @@ export class AgentMessageRouter {
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);
+      if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+        warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
+        return context?.signal || options.principal
+          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
+          : this.actorManager.steerRemote(participant.id, message, kind, data);
+      }
       if (!this.control) throw new Error("Fabric control plane is unavailable");
       return this.control.request(
         participant.ownerHostId,
@@ -628,6 +635,13 @@ export class AgentMessageRouter {
     );
     if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
+    }
+    if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+      if (needsBinding) throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
+      warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
+      return context?.signal || options.principal
+        ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
+        : this.actorManager.steerRemote(participant.id, message, kind, data);
     }
     if (!this.control) throw new Error("Fabric control plane is unavailable");
     return this.control.request(

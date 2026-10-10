@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { CONTROL_STALE_INCARNATION, FabricControlPlane } from "../src/topology/control-plane.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -63,8 +63,8 @@ const fixture = async (filesOnly = false) => {
     cleanup.push(() => controller.closeFollowUpDrain());
     return { controller, pi, context, setIdle: (value: boolean) => { idle = value; }, emit: (name: string, event: any = {}) => { for (const fn of handlers.get(name) ?? []) fn(event, context); } };
   };
-  const plane = (who: MeshIdentity) => {
-    const result = new FabricControlPlane(mesh(), who, { enabled: true, hostId: who.id, pollMs: 20 });
+  const plane = (who: MeshIdentity, participants = who.id === identity.id ? owner : observer) => {
+    const result = new FabricControlPlane(mesh(), who, { enabled: true, hostId: who.id, ownerIncarnation: participants.ownerIncarnation, pollMs: 20 });
     cleanup.push(() => result.close());
     return result;
   };
@@ -90,7 +90,7 @@ const cacheRootSnapshot = (directory: ParticipantDirectory) => {
 };
 
 describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
-  it.each([false, true])("delivers followUp and steer once at shutdown, without a runtime, and just after session_start (files=%s)", async (filesOnly) => {
+  it.each([false, true])("refuses predecessor messages from shutdown/gap and delivers fresh messages once (files=%s)", async (filesOnly) => {
     const f = await fixture(filesOnly);
     const old = f.main();
     const oldControl = f.plane(identity);
@@ -123,13 +123,15 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     const fresh = f.main();
     const newDirectory = f.directory(identity);
     await newDirectory.start();
-    const newControl = f.plane(identity);
+    const newControl = f.plane(identity, newDirectory);
     const newRouter = f.router(fresh.controller, newDirectory, newControl);
     newControl.start((command, from, signal) => newRouter.acceptControl(command, from, signal));
     send("after");
-    for (const result of await Promise.all(outcomes)) expect(result).toMatchObject({ queued: true });
-    await vi.waitFor(() => expect(f.sent).toHaveLength(6));
-    for (const phase of ["shutdown", "absent", "after"]) for (const kind of ["followUp", "steer"]) {
+    const results = await Promise.all(outcomes);
+    for (const result of results.slice(0, 4)) expect(result).toMatchObject({ code: CONTROL_STALE_INCARNATION });
+    for (const result of results.slice(4)) expect(result).toMatchObject({ queued: true });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(2));
+    for (const phase of ["after"]) for (const kind of ["followUp", "steer"]) {
       const deliveries = f.sent.filter((item) => item.content.includes(`${phase}-${kind}`));
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]!.options.deliverAs).toBe(kind);
@@ -139,10 +141,10 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     fresh.controller.closeFollowUpDrain();
     const replay = f.main();
     replay.emit("turn_end", { context: { pendingMessages: [] } });
-    expect(f.sent).toHaveLength(6);
+    expect(f.sent).toHaveLength(2);
   }, 15_000);
 
-  it("real FabricRuntimeState shutdown/reinitialize retains all six sender messages, then a real exit rejects", async () => {
+  it("real FabricRuntimeState reload refuses four stale messages, delivers two fresh ones, then exit rejects", async () => {
     const { FabricRuntimeState } = await import("../src/fabric-runtime-state.js");
     const { CapturedToolCatalog } = await import("../src/capture/catalog.js");
     const { normalizeFabricConfig } = await import("../src/config.js");
@@ -201,9 +203,11 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
       expect(f.sent).toHaveLength(0);
       await fresh.initialize(context, config);
       send("after");
-      for (const outcome of await Promise.all(outcomes)) expect(outcome).toMatchObject({ queued: true });
-      expect(f.sent).toHaveLength(6);
-      for (const phase of ["shutdown", "gap", "after"]) for (const kind of ["followUp", "steer"]) {
+      const results = await Promise.all(outcomes);
+      for (const result of results.slice(0, 4)) expect(result).toMatchObject({ code: CONTROL_STALE_INCARNATION });
+      for (const result of results.slice(4)) expect(result).toMatchObject({ queued: true });
+      expect(f.sent).toHaveLength(2);
+      for (const phase of ["after"]) for (const kind of ["followUp", "steer"]) {
         expect(f.sent.filter((message) => message.content.includes(`runtime-${phase}-${kind}`))).toHaveLength(1);
       }
       host.emit("turn_end", { context: { pendingMessages: [] } });
@@ -222,7 +226,7 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     }
   }, 30_000);
 
-  it.each(["followUp", "steer"] as const)("accepts %s while the old runtime is absent, before the replacement joins", async (kind) => {
+  it.each(["followUp", "steer"] as const)("queues %s during the absent runtime, refuses its stale epoch, and requires a fresh decision", async (kind) => {
     const f = await fixture();
     await f.owner.quiesce("reload");
     await f.owner.close();
@@ -234,10 +238,12 @@ describe("Main reload sender admission (smarty-dev#2160 item 4)", () => {
     const fresh = f.main();
     const nextDirectory = f.directory(identity);
     await nextDirectory.start();
-    const control = f.plane(identity);
+    const control = f.plane(identity, nextDirectory);
     const owner = f.router(fresh.controller, nextDirectory, control);
     control.start((command, from, signal) => owner.acceptControl(command, from, signal));
-    expect(await pending).toMatchObject({ queued: true });
+    expect(await pending).toMatchObject({ code: CONTROL_STALE_INCARNATION });
+    expect(f.sent).toHaveLength(0);
+    await expect(f.sendRouter.routeMessage(identity.id, `fresh-${kind}`, undefined, kind)).resolves.toMatchObject({ queued: true });
     expect(f.sent).toHaveLength(1);
     expect(f.sent[0]!.options.deliverAs).toBe(kind);
   });

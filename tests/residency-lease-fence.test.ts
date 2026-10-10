@@ -36,7 +36,7 @@ describe("Astra F2 resident control lease fences", () => {
       return batch.call(this, input);
     });
     const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); f.owner.start(handler);
-    const result = f.sender.request("owner", "actor", "followUp", { message: "work" }).catch(error => error);
+    const result = f.sender.request("owner", "actor", "followUp", { message: "work", ownerIncarnation: f.owner.incarnation }).catch(error => error);
     try {
       await entered.promise; f.lease(false); release.resolve(); await pause(120);
       expect(handler).not.toHaveBeenCalled();
@@ -59,7 +59,7 @@ describe("Astra F2 resident control lease fences", () => {
       return publish.call(this, input);
     });
     const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); f.owner.start(handler);
-    const result = f.sender.request("owner", "actor", "followUp", { message: "work" }).catch(error => error);
+    const result = f.sender.request("owner", "actor", "followUp", { message: "work", ownerIncarnation: f.owner.incarnation }).catch(error => error);
     try {
       await entered.promise; f.lease(false); release.resolve(); await pause(120);
       expect(f.mesh.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(0);
@@ -72,7 +72,7 @@ describe("Astra F2 resident control lease fences", () => {
   it("keeps a completed sequence-free outcome across a fenced host restart without running the handler again", async () => {
     const f = setup(); const entered = deferred(), release = deferred();
     const handler = vi.fn(async () => { entered.resolve(); await release.promise; return { accepted: true, messageId: "original" }; }); f.owner.start(handler);
-    const result = f.sender.request("owner", "actor", "followUp", { message: "work" }).catch(error => error);
+    const result = f.sender.request("owner", "actor", "followUp", { message: "work", ownerIncarnation: f.owner.incarnation }).catch(error => error);
     let successor: FabricControlPlane | undefined;
     try {
       await entered.promise; f.lease(false); release.resolve();
@@ -89,7 +89,7 @@ describe("Astra F2 resident control lease fences", () => {
   it.each(["followUp", "ask"] as const)("retains the completed %s outcome without a sequence/ACK commit or replay across lease loss", async operation => {
     const f = setup(); const entered = deferred(), release = deferred();
     const handler = vi.fn(async () => { entered.resolve(); await release.promise; return { accepted: true, messageId: "once" }; }); f.owner.start(handler);
-    const result = f.sender.request("owner", "actor", operation, { message: "work" }).catch(error => error);
+    const result = f.sender.request("owner", "actor", operation, { message: "work", ownerIncarnation: f.owner.incarnation }).catch(error => error);
     try {
       await entered.promise; f.lease(false); release.resolve(); await pause(120);
       expect(f.seen.listAll("topology/control-seen/").every(entry => !(entry.value as { sequence?: number }).sequence)).toBe(true);

@@ -7,7 +7,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { CONTROL_STALE_INCARNATION, FabricControlPlane } from "../src/topology/control-plane.js";
 
-it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload preserves session messages but fences pre-reload %s execution", async operation => {
+it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload refuses every unclaimed pre-reload %s with a typed fence", async operation => {
   const { FabricRuntimeState } = await import("../src/fabric-runtime-state.js");
   const { CapturedToolCatalog } = await import("../src/capture/catalog.js");
   const { normalizeFabricConfig } = await import("../src/config.js");
@@ -61,13 +61,8 @@ it.each(["steer", "followUp", "stop", "ask"] as const)("real Main reload preserv
     const fresh = observer.get(old.id, undefined, { fresh: true })!;
     expect(fresh.ownerIncarnation).toBe(ownerPlanes[1]!.incarnation);
     expect(fresh.ownerIncarnation).not.toBe(old.ownerIncarnation);
-    if (operation === "steer" || operation === "followUp") {
-      expect(await pending).toMatchObject({ acknowledged: true });
-      expect(sendMessage).toHaveBeenCalledOnce();
-    } else {
-      expect(await pending).toMatchObject({ code: CONTROL_STALE_INCARNATION });
-      expect(sendMessage).not.toHaveBeenCalled();
-    }
+    expect(await pending).toMatchObject({ code: CONTROL_STALE_INCARNATION });
+    expect(sendMessage).not.toHaveBeenCalled();
     sendMessage.mockClear();
     await expect(sender.request(fresh.ownerHostId, fresh.id, "steer", { message: "after reload", ownerIncarnation: fresh.ownerIncarnation, triggerTurn: false },
       fresh.ownerIdentityId, { routedRemoteHost: null, idempotencyKey: "fresh-main" })).resolves.toMatchObject({ acknowledged: true });

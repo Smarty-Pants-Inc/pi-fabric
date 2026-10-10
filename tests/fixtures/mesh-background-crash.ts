@@ -185,7 +185,7 @@ if (mode === "foreground") {
   } else {
     await mesh.publish({ topic: "fabric.control.command", kind: "ask", from: { ...identity, id: sourceId }, to: identity.id,
       data: { version: 1, commandId: "probe", targetId: "actor:probe", operation: mode === "control-claim" ? "steer" : "ask",
-        message: "probe", replyTo: sourceId, requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
+        ownerIncarnation: plane.incarnation, message: "probe", replyTo: sourceId, requestedAt: Date.now(), deadlineAt: Date.now() + 5_000 } });
     let runs = 0;
     let release: (() => void) | undefined = mode === "control-claim" ? hold(mesh) : undefined;
     plane.start(() => { runs++; if (mode === "control-detached-ack") release = hold(mesh); return { accepted: true, result: 42 }; });

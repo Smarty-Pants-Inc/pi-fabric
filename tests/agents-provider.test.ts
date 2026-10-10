@@ -2334,19 +2334,19 @@ describe("AgentsProvider runner support", () => {
     expect(status).not.toHaveBeenCalled();
   });
 
-  it.each(["legacy", "v1"] as const)("remote ask refuses an epochless %s peer before result publication", async controlProtocol => {
+  it.each(["legacy", "v1"] as const)("remote ask uses the unfenced legacy path for an epochless %s peer", async controlProtocol => {
     const id = "actor:older";
     const member = { format: 1, id, kind: "actor", rootId: "session:older", ownerHostId: "host:older", ownerIdentityId: "session:older",
       name: "old actor", status: "idle", runner: "pi", transport: "host", capabilities: ["ask"],
       startedAt: 1, updatedAt: 2, controlProtocol, local: false, stale: false } as FabricParticipantInfo;
-    const requestResult = vi.fn();
+    const requestResult = vi.fn().mockResolvedValue({ id: "legacy-reply", text: "done" });
     const request = vi.fn();
     const { provider, actors } = setup([], [member], { request, requestResult } as unknown as FabricControlPlane);
     const legacy = vi.spyOn(actors, "steerRemote");
-    await expect(provider.invoke("ask", { id, message: "unsafe", data: { ownerIncarnation: "payload-forgery" } }, context))
-      .rejects.toMatchObject({ name: "FabricControlIncarnationRequiredError", code: "FABRIC_CONTROL_INCARNATION_REQUIRED",
-        targetId: id, message: expect.stringContaining("target must run a Fabric release with incarnation fencing") });
-    expect(requestResult).not.toHaveBeenCalled(); expect(request).not.toHaveBeenCalled(); expect(legacy).not.toHaveBeenCalled();
+    await expect(provider.invoke("ask", { id, message: "legacy delivery", data: { ownerIncarnation: "payload-forgery" } }, context))
+      .resolves.toMatchObject({ id: "legacy-reply" });
+    expect(requestResult.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
+    expect(request).not.toHaveBeenCalled(); expect(legacy).not.toHaveBeenCalled();
   });
 
   it("remote ask stamps the target's current directory epoch, not caller data", async () => {
@@ -2402,7 +2402,7 @@ describe("AgentsProvider runner support", () => {
       name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
       startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
       role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
-    const members = scenario === "incarnation-required" ? [{ ...base, controlProtocol: "legacy" as const }]
+    const members = scenario === "incarnation-required" ? [{ ...base, ownerIncarnation: "" }]
       : scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];

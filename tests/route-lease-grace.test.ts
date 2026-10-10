@@ -258,7 +258,7 @@ describe("live-owner ACK window and same-key retry (#4383)", () => {
     expect(settled).toBe(false);
     expiresAt = Date.now() + 120000;
     await sender.mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("owner"), to: "sender",
-      data: { version: 1, commandId: sent.commandId, targetId: sent.targetId, accepted: true, messageId: "late-ack" } });
+      data: { version: 1, commandId: sent.commandId, targetId: sent.targetId, ownerIncarnation: sent.ownerIncarnation, accepted: true, messageId: "late-ack" } });
     await vi.advanceTimersByTimeAsync(20);
     await expect(outcome).resolves.toMatchObject({ messageId: "late-ack" });
   });

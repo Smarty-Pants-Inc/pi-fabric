@@ -63,19 +63,22 @@ describe("owner incarnation admission and durable receipts", () => {
       ownerIncarnation: restarted.incarnation, staleIncarnation: previous.incarnation, errorCode: CONTROL_STALE_INCARNATION }) }));
   });
 
-  it.each(["steer", "followUp"] as const)("delivers queued explicitly bound session %s once across Main/actor reload", async operation => {
+  it.each(["steer", "followUp"] as const)("refuses unclaimed fenced %s across Main/actor reload, then delivers a fresh epoch once", async operation => {
     for (const targetId of ["session:owner", "actor:target"]) {
       const mesh = store(temp());
       const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
       const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
       const pending = sender.request("session:owner", targetId, operation,
-        { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" });
+        { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" }).catch(error => error);
       await vi.waitFor(() => expect(commands(mesh)).toHaveLength(1)); await previous.close();
       const restarted = plane(mesh, "session:owner");
       const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); restarted.start(handler);
-      await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
-      await expect(sender.request("session:owner", targetId, operation,
-        { message: "same session", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: "same" }))
+      expect(await pending).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+      expect(handler).not.toHaveBeenCalled();
+      expect(mesh.listAll("topology/control-seen/")).toEqual([]);
+      expect(commands(mesh)).toHaveLength(1);
+      for (let i = 0; i < 2; i++) await expect(sender.request("session:owner", targetId, operation,
+        { message: "fresh decision", ownerIncarnation: restarted.incarnation }, "session:owner", { idempotencyKey: "fresh" }))
         .resolves.toMatchObject({ acknowledged: true, messageId: "once" });
       expect(handler).toHaveBeenCalledOnce();
       expect(acks(mesh).at(-1)!.data).toMatchObject({ ownerIncarnation: restarted.incarnation });
@@ -233,7 +236,7 @@ describe("owner incarnation admission and durable receipts", () => {
     } finally { release(); await pending; blocked.mockRestore(); clock.mockRestore(); }
   });
 
-  it("keeps a session request's origin through a proven-notRun resend without losing reload delivery", async () => {
+  it("keeps request origin through a proven-notRun resend and refuses the stale epoch after reload", async () => {
     const mesh = store(temp()); const at = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(at);
     const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
@@ -259,9 +262,9 @@ describe("owner incarnation admission and durable receipts", () => {
       await vi.waitFor(() => expect(commands(mesh)).toHaveLength(2));
       expect(commands(mesh).map(event => (event.data as { requestCreatedAt: number }).requestCreatedAt)).toEqual([at + 10, at + 10]);
       restarted.resume();
-      expect(await pending).toMatchObject({ acknowledged: true });
-      expect(handler).toHaveBeenCalledOnce();
-      expect(mesh.listAll("topology/control-seen/")).toHaveLength(2);
+      expect(await pending).toMatchObject({ code: CONTROL_STALE_INCARNATION });
+      expect(handler).not.toHaveBeenCalled();
+      expect(mesh.listAll("topology/control-seen/")).toHaveLength(1);
     } finally { restarted.resume(); await pending; clock.mockRestore(); }
   });
 

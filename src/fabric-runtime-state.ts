@@ -261,11 +261,12 @@ export class FabricRuntimeState {
   // smarty-dev#5962: background timers (participant heartbeat/change refresh, mesh read
   // pacing, root inbox naming) outlive a /reload or session replacement. They never hold
   // a ctx: each tick reads the ctx bound by the latest activation/ensure, and only while
-  // that lifecycle lease is current. A retired lease skips the tick quietly.
+  // that lifecycle lease is current. An obsolete/stale epoch retires its owned background paths.
   #binding: { context: ExtensionContext; current: () => boolean } | undefined;
   // Each initialize() starts a new epoch. Sources and closures built by an older epoch never
   // read the live ctx again, even after the runtime is rebound to a successor session.
   #epoch = 0;
+  #backgroundReads: { epoch: number; guards: MeshBackgroundRetry[] } | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -453,6 +454,10 @@ export class FabricRuntimeState {
   /** Rebinds session-bound background reads to this ctx while `current()` holds (smarty-dev#5962). */
   bindLifecycle(context: ExtensionContext, current: () => boolean): void {
     this.#binding = { context, current };
+    if (this.#backgroundReads?.epoch === this.#epoch) {
+      for (const guard of this.#backgroundReads.guards) guard.rebind();
+    }
+    this.#participants?.rebindLifecycle();
   }
 
   /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
@@ -469,22 +474,39 @@ export class FabricRuntimeState {
    */
   #liveReads(epoch: number): {
     current: () => boolean;
-    read: <T>(read: (context: ExtensionContext) => T) => T | undefined;
+    read: <T>(read: (context: ExtensionContext) => T, purpose?: "mesh read pacing" | "root inbox naming") => T | undefined;
     sessionName: () => string | undefined;
+    pacingActive: () => boolean;
+    backgroundEpoch: { epoch: number; current: () => boolean };
   } {
+    const ownedCurrent = (): boolean => epoch === this.#epoch && Boolean(this.#binding?.current());
     const current = (): boolean => epoch === this.#epoch && this.lifecycleCurrent;
-    const read = <T>(read: (context: ExtensionContext) => T): T | undefined => {
+    // These are callbacks of background consumers, not independent intervals. Once retired
+    // they keep their last-live fallback and never poll a stale ctx/pi again.
+    const guards = new Map(["mesh read pacing", "root inbox naming"].map(label => [label,
+      new MeshBackgroundRetry(label, 100, 5_000, { epoch, current: ownedCurrent, retire: () => {} })] as const));
+    this.#backgroundReads = { epoch, guards: [...guards.values()] };
+    const read = <T>(read: (context: ExtensionContext) => T, purpose?: "mesh read pacing" | "root inbox naming"): T | undefined => {
+      const guard = purpose ? guards.get(purpose) : undefined;
+      if (guard && !guard.active) return undefined;
       const context = current() ? this.#binding?.context : undefined;
       if (!context) return undefined;
-      // The token cannot observe every host invalidation; a stale read is a quiet skip too.
-      try { return read(context); } catch { return undefined; }
+      try { return read(context); } catch (error) { guard?.failure(error); return undefined; }
     };
     let sessionName: string | undefined;
     return {
       current,
       read,
+      pacingActive: () => guards.get("mesh read pacing")!.active,
+      backgroundEpoch: { epoch, current: () => {
+        if (!ownedCurrent()) return false;
+        // A lease can still say current after Pi invalidates its ctx. Probe before renewal,
+        // outside the quiet snapshot fallback, so #660 reports the lost lifecycle.
+        this.#binding!.context.isIdle();
+        return true;
+      } },
       sessionName: () => {
-        const live = read(() => ({ name: this.pi.getSessionName?.() }));
+        const live = read(() => ({ name: this.pi.getSessionName?.() }), "root inbox naming");
         if (live) sessionName = live.name;
         return sessionName;
       },
@@ -696,8 +718,9 @@ export class FabricRuntimeState {
       this.#config.mesh.maxReadEvents,
       {
         backgroundReadCacheMs: this.#config.mesh.idleReadCoalesceMs,
-        readActive: () => live.read(ctx => !ctx.isIdle() || ctx.hasPendingMessages()) === true ||
-          (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0,
+        readActive: () => live.pacingActive() &&
+          (live.read(ctx => !ctx.isIdle() || ctx.hasPendingMessages(), "mesh read pacing") === true ||
+            (this.#agents?.runningCount() ?? 0) > 0 || (this.#actors?.inFlightCount() ?? 0) > 0),
         lockProtocol: this.#config.mesh.lockProtocol,
         stateBackend: this.#config.mesh.stateBackend,
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
@@ -726,6 +749,7 @@ export class FabricRuntimeState {
         live.read(ctx => { if (ctx.hasUI) ctx.ui.notify(warning, "warning"); });
       },
       live: live.current,
+      backgroundEpoch: live.backgroundEpoch,
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
       // ops topic instead of vanishing from the directory in silence. The UI ctx is retired too.
       // Non-Main runtimes (actors, agents) heartbeat their own host lease too, so they report

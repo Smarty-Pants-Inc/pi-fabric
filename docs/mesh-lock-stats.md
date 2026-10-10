@@ -51,7 +51,18 @@ The reader takes regular files only (no symlinks), at most 1 MiB each and 4096 f
 file only when every counter is a non-negative integer, every duration finite and non-negative,
 every histogram 14 buckets long and every class known. Other files are ignored with a warning on
 stderr; with a gate flag they also exit 3, so a gate never passes on files it could not read.
-Host labels are printed with control characters escaped.
+Host and writer labels are printed with control characters escaped.
+
+The file's optional `writer` object records the script basename (`argv1`),
+`PI_FABRIC_AGENT_NAME` (`agentName`), `PI_FABRIC_ACTOR_ID` (`actorId`),
+`PI_FABRIC_ACTOR_NAME` (`actorName`), `PI_FABRIC_ROLE` (`role`), `SMARTY_ROLE`
+(`smartyRole`), and the parent PID (`ppid`). These facts are captured once at the
+recorder's first acquisition and retained on every rewrite, so an exited writer
+stays attributable without a process scan. Unset or blank strings are omitted;
+strings are trimmed and limited to 128 characters. Files from older writers
+remain valid without this object. Malformed writer metadata fails a gate like
+malformed counters. The top-pids table shows a compact `writer` column; `--json`
+keeps the separate facts in `pids[].writer`.
 
 `PI_FABRIC_COMMIT_STATS` (commits and bytes by key family) and `PI_FABRIC_COMMIT_TRACE` (keys and
 callers) complement this view.

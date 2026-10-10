@@ -94,6 +94,28 @@ const visiblePiModels = [
   { provider: "provider", id: "model-b" },
 ];
 
+describe("records option", () => {
+  it.each(["create", "createActor"])("%s retains and normalizes records through the provider", async action => {
+    const { provider, actors } = setup();
+    const result = await provider.invoke(action, { name: "records-org", instructions: "Work.",
+      records: { topic: "org.records", maxEntries: 10_000, maxAgeMs: 1_234 } }, context) as FabricActorInfo;
+    expect(result.records).toEqual({ topic: "org.records", maxEntries: 4096, maxAgeMs: 1_234 });
+    expect(actors.status(result.id).records).toEqual(result.records);
+    await expect(provider.invoke(action, { name: "records-invalid", instructions: "Work.",
+      records: { topic: 7 } }, context)).rejects.toThrow(/records topic/);
+    await expect(provider.invoke(action, { name: "records-invalid-age", instructions: "Work.",
+      records: { topic: "org.records", maxAgeMs: 0 } }, context)).rejects.toThrow(/maxAgeMs/);
+  });
+  it("retains records in a global template and its live import", async () => {
+    const { provider } = setup();
+    const template = await provider.invoke("create", { scope: "global", name: "records-template", instructions: "Work.",
+      records: { topic: "org.records" } }, context) as { id: string; records: unknown };
+    expect(template.records).toEqual({ topic: "org.records", maxEntries: 512, maxAgeMs: 21_600_000 });
+    const imported = await provider.invoke("import", { id: template.id }, context) as FabricActorInfo;
+    expect(imported.records).toEqual(template.records);
+  });
+});
+
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
   const refusal = `model ${model} requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134`;

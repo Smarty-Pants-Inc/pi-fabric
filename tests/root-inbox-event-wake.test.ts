@@ -48,13 +48,14 @@ const watched = (wake: () => Promise<void>, safetyMs?: number) => {
   return observer;
 };
 const mockWatch = () => {
-  const watcher = Object.assign(new EventEmitter(), { close: vi.fn(), ref: vi.fn(), unref: vi.fn() });
-  let notify: (event: string, filename: string | null) => void = () => {};
+  const watches: Array<{ watcher: EventEmitter & { close: ReturnType<typeof vi.fn> }; notify: (filename: string | null) => void }> = [];
   const spy = vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
-    notify = args[2] as typeof notify;
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn(), ref: vi.fn(), unref: vi.fn() });
+    const callback = args[2] as (event: string, filename: string | null) => void;
+    watches.push({ watcher, notify: filename => callback("change", filename) });
     return watcher;
   }) as typeof fs.watch);
-  return { watcher, spy, notify: (filename: string | null) => notify("change", filename) };
+  return { watches, spy, get watcher() { return watches.at(-1)!.watcher; }, notify: (filename: string | null) => watches.at(-1)!.notify(filename) };
 };
 
 describe("root mesh event wake observation", () => {
@@ -98,27 +99,96 @@ describe("root mesh event wake observation", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["error", "unavailable"])("has no fast fallback after watch %s and stops on replacement", async (mode) => {
-    vi.useFakeTimers();
-    const mock = mockWatch();
-    if (mode === "unavailable") mock.spy.mockImplementation(() => { throw new Error("watch unavailable"); });
-    const wake = vi.fn().mockResolvedValue(undefined);
-    const old = watched(wake);
-    await settleMicrotasks();
-    if (mode === "error") mock.watcher.emit("error", new Error("watch lost"));
-    await vi.advanceTimersByTimeAsync(59_999);
-    expect(wake).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(wake).toHaveBeenCalledTimes(1); // Attachment repair never requests work.
-    old.close();
-    const successorWake = vi.fn().mockResolvedValue(undefined);
-    const successor = watched(successorWake);
-    await settleMicrotasks();
-    expect(successorWake).toHaveBeenCalledTimes(1);
-    await old.request();
-    expect(successorWake).toHaveBeenCalledTimes(1);
-    successor.close();
+  it("reattaches an idle watcher error after one backoff and delivers gap work exactly once, then stays timer-free", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {}), mock = mockWatch();
+    const { mesh, box, work } = fixture(0, 0);
+    const delivered: string[] = [];
+    const wake = vi.fn(async () => {
+      const batch = await box.wake(held, () => true);
+      delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
+    });
+    const observer = new RootInboxEventWake(mesh.root, wake); observers.push(observer);
+    observer.start(); await observer.request();
     expect(vi.getTimerCount()).toBe(0);
+    const lost = mock.watches[0]!;
+    lost.watcher.emit("error", new Error("idle watch lost"));
+    expect(lost.watcher.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1);
+    await work("written during watch gap");
+    await vi.advanceTimersByTimeAsync(499);
+    expect(mock.spy).toHaveBeenCalledTimes(1); expect(delivered).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(delivered).toEqual(["written during watch gap"]));
+    expect(mock.spy).toHaveBeenCalledTimes(2); expect(wake).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+    lost.notify("events.jsonl"); lost.watcher.emit("error", new Error("stale error"));
+    await settleMicrotasks(); expect(wake).toHaveBeenCalledTimes(2);
+    await work("new watch event"); mock.notify("events.jsonl");
+    await vi.waitFor(() => expect(delivered).toEqual(["written during watch gap", "new watch event"]));
+    await box.close(); // Join observational publication before measuring healthy idle work.
+    const reads = vi.spyOn(mesh, "read"), stat = vi.spyOn(fs, "statSync"), interval = vi.spyOn(globalThis, "setInterval");
+    const before = wake.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(wake).toHaveBeenCalledTimes(before); expect(mock.spy).toHaveBeenCalledTimes(2);
+    expect(reads).not.toHaveBeenCalled(); expect(stat).not.toHaveBeenCalled(); expect(interval).not.toHaveBeenCalled();
+    expect(delivered).toEqual(["written during watch gap", "new watch event"]); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("backs off failed reattachment without a catch-up read until attachment succeeds", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mock = mockWatch(), wake = vi.fn().mockResolvedValue(undefined), observer = watched(wake);
+    await observer.request();
+    mock.watcher.emit("error", new Error("watch lost"));
+    mock.spy.mockImplementationOnce(() => { throw new Error("watch temporarily unavailable"); });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(mock.spy).toHaveBeenCalledTimes(2); expect(wake).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(999); expect(mock.spy).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mock.spy).toHaveBeenCalledTimes(3); expect(wake).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["error", "unavailable"])("caps watch %s recovery at eight attempts, logs exhaustion once and retains trusted recovery", async mode => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {}), mock = mockWatch();
+    const attach = mock.spy.getMockImplementation()!;
+    if (mode === "unavailable") mock.spy.mockImplementation(() => { throw new Error("watch unavailable"); });
+    const wake = vi.fn().mockResolvedValue(undefined), observer = watched(wake);
+    await settleMicrotasks();
+    if (mode === "error") {
+      mock.watcher.emit("error", new Error("watch lost"));
+      mock.spy.mockImplementation(() => { throw new Error("watch unavailable"); });
+    }
+    const delays = [500, 1_000, 2_000, 2_500, 2_500, 2_500, 2_500, ...(mode === "error" ? [2_500] : [])];
+    for (const [index, ms] of delays.entries()) {
+      await vi.advanceTimersByTimeAsync(ms - 1); expect(mock.spy).toHaveBeenCalledTimes(index + 1);
+      await vi.advanceTimersByTimeAsync(1); expect(mock.spy).toHaveBeenCalledTimes(index + 2);
+    }
+    const exhaustedCalls = mock.spy.mock.calls.length;
+    expect(wake).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5 * 60_000); expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls);
+    await observer.request(); // Existing safety/event/turn drains remain usable, even without a watch.
+    expect(wake).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("retry exhausted after 8 attempts"))).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(2); // One fault diagnostic, one exhaustion diagnostic.
+    mock.spy.mockImplementation(attach); await observer.request();
+    expect(vi.getTimerCount()).toBe(0);
+    mock.watcher.emit("error", new Error("new outage after recovery"));
+    expect(vi.getTimerCount()).toBe(1); // Successful recovery reset the exhausted fault state.
+    observer.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels an armed watcher retry on close and never wakes or attaches the retired observer", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mock = mockWatch(), wake = vi.fn().mockResolvedValue(undefined), old = watched(wake);
+    await old.request(); mock.watcher.emit("error", new Error("watch lost"));
+    expect(vi.getTimerCount()).toBe(1); old.close(); expect(vi.getTimerCount()).toBe(0);
+    const successorWake = vi.fn().mockResolvedValue(undefined), successor = watched(successorWake);
+    await settleMicrotasks(); await old.request(); await vi.advanceTimersByTimeAsync(120_000);
+    expect(mock.spy).toHaveBeenCalledTimes(2); expect(wake).toHaveBeenCalledTimes(1);
+    expect(successorWake).toHaveBeenCalledTimes(1); successor.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
   it("reattaches a silently replaced physical root only at a trusted request, then wakes on new appends without a tick", async () => {
@@ -141,25 +211,24 @@ describe("root mesh event wake observation", () => {
     expect(watch).toHaveBeenCalledTimes(2);
   });
 
-  it("retires a missing physical root and reattaches only at a trusted request", async () => {
-    vi.useFakeTimers();
-    const mock = mockWatch();
-    const observer = watched(vi.fn().mockResolvedValue(undefined));
+  it("discovers a missing physical root only at a trusted request, then fault-arms reattachment", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mock = mockWatch(), wake = vi.fn().mockResolvedValue(undefined);
+    const observer = watched(wake);
     await observer.request();
+    const lost = mock.watcher;
     fs.rmSync(observer.root, { recursive: true });
     await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(mock.watcher.close).not.toHaveBeenCalled(); // No idle tick observes the loss.
+    expect(lost.close).not.toHaveBeenCalled(); // No idle tick observes the loss.
     await observer.request();
-    expect(mock.watcher.close).toHaveBeenCalledTimes(1);
-    expect(mock.spy).toHaveBeenCalledTimes(1);
+    expect(lost.close).toHaveBeenCalledTimes(1); expect(mock.spy).toHaveBeenCalledTimes(1);
     fs.mkdirSync(observer.root);
-    await vi.advanceTimersByTimeAsync(5 * 60_000);
-    expect(mock.spy).toHaveBeenCalledTimes(1);
-    await observer.request();
-    expect(mock.spy).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(499); expect(mock.spy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mock.spy).toHaveBeenCalledTimes(2); expect(wake).toHaveBeenCalledTimes(3);
     expect(vi.getTimerCount()).toBe(0);
-    mock.notify(null);
-    await observer.request();
+    mock.notify(null); await observer.request();
   });
 
   it("does not churn watchers or reread an unchanged root's log/state/directory while idle", async () => {
@@ -232,6 +301,29 @@ const startSession = async (capable = true, tokensPerSecond = 1_000, safetyMs = 
 };
 
 describe("changed source activation and Main gate", () => {
+  it("wakes an idle native Main exactly once for an event published during a watcher-error gap", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const watch = vi.spyOn(fs, "watch"), h = await startSession(true, 1_000, 60_000);
+    const rootWatches = () => watch.mock.calls.flatMap((args, index) =>
+      String(args[0]) === h.meshRoot && (args[1] as unknown as fs.WatchOptions | undefined)?.persistent === false
+        ? [watch.mock.results[index]!.value as fs.FSWatcher] : []);
+    const before = rootWatches().length;
+    expect(before).toBeGreaterThan(0); expect(h.session.isStreaming).toBe(false);
+    let turns = 0;
+    const unsubscribe = h.session.subscribe(event => { if (event.type === "agent_start") turns++; });
+    h.faux.setResponses([fauxAssistantMessage("gap event received")]);
+    rootWatches().at(-1)!.emit("error", new Error("idle native Main watcher lost"));
+    h.publish("event written while native Main watcher was closed");
+    await vi.waitFor(() => {
+      expect(rootWatches()).toHaveLength(before + 1);
+      expect(h.inbox()).toHaveLength(1); expect(h.session.isStreaming).toBe(false);
+    }, { timeout: 3_000 });
+    expect(JSON.stringify(h.inbox()[0])).toContain("event written while native Main watcher was closed");
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(h.inbox()).toHaveLength(1); expect(turns).toBe(1); unsubscribe();
+  }, 60_000);
+
   it("uses the current runtime's actual grace hint before any 60-second safety tick", async () => {
     const h = await startSession(true, 1_000, 60_000);
     h.faux.setResponses([fauxAssistantMessage("deadline received")]);

@@ -622,6 +622,15 @@ export class MeshBackgroundRetry {
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
+    this.#backoff(error, "mesh lock timeout; retrying");
+    return true;
+  }
+
+  /** Explicit observed-fault admission (e.g. a lost watcher), not automatic retry policy
+   * for unrelated operation errors. The owner retains its obligation and attempt cap. */
+  fault(error: unknown): void { this.#backoff(error, "observed fault; retrying"); }
+
+  #backoff(error: unknown, reason: string): void {
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
@@ -630,10 +639,9 @@ export class MeshBackgroundRetry {
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: ${reason} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
-    return transient;
   }
 
   /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.

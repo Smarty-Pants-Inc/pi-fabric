@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshBackgroundQueue } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 
@@ -146,6 +146,10 @@ export interface RootInboxSession {
 export class RootInboxEventWake {
   #watcher: fs.FSWatcher | undefined;
   #rootIdentity: string | undefined;
+  readonly #watchRetry = new MeshBackgroundRetry("root inbox watcher", 1_000, 5_000);
+  #watchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #watchAttempts = 0;
+  #watchExhausted = false;
   #started = false;
   #deadline: ReturnType<typeof setTimeout> | undefined;
   #running: Promise<void> | undefined;
@@ -214,17 +218,39 @@ export class RootInboxEventWake {
     this.#closed = true;
     this.#requested = false;
     this.cancelKnownDeadline();
+    if (this.#watchRetryTimer) clearTimeout(this.#watchRetryTimer);
+    this.#watchRetryTimer = undefined;
     this.#retireWatch();
   }
 
   #retireWatch(): void {
-    this.#watcher?.close();
+    const watcher = this.#watcher;
     this.#watcher = undefined;
     this.#rootIdentity = undefined;
+    watcher?.close();
+  }
+
+  #watchFault(error: unknown): void {
+    if (this.#closed || this.#watchRetryTimer || this.#watchExhausted) return;
+    if (this.#watchAttempts >= 8) {
+      this.#watchExhausted = true;
+      console.warn(`[pi-fabric] root inbox watcher: retry exhausted after 8 attempts; using existing safety-net drain`);
+      return;
+    }
+    this.#watchRetry.fault(error);
+    // #7299 fault-armed one-shot retry: no observed fault, no timer. Only
+    // successful reattachment earns a catch-up read across the notification gap.
+    this.#watchRetryTimer = setTimeout(() => {
+      this.#watchRetryTimer = undefined;
+      if (this.#closed) return;
+      this.#watch();
+      if (this.#watcher) void this.request();
+    }, this.#watchRetry.waitMs);
+    this.#watchRetryTimer.unref();
   }
 
   #watch(): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#watchRetryTimer) return;
     try {
       // A directory watcher may silently keep observing a renamed/unlinked inode forever.
       // Only stat the root itself: unchanged ticks must not enumerate it or reread the log.
@@ -242,14 +268,20 @@ export class RootInboxEventWake {
       });
       this.#watcher = watcher;
       this.#rootIdentity = current;
-      watcher.on("error", () => {
+      watcher.on("error", error => {
         if (this.#watcher !== watcher) return;
         this.#retireWatch();
+        this.#watchFault(error);
       });
       // Do not retain a watch if the path changed while subscribing.
-      if (identity() !== current) this.#retireWatch();
-    } catch {
-      this.#retireWatch(); // Missing root/watch support: the next trusted request retries attachment.
+      if (identity() !== current) throw new Error("root changed during watcher attachment");
+      this.#watchAttempts = 0;
+      this.#watchExhausted = false;
+      this.#watchRetry.success();
+    } catch (error) {
+      this.#retireWatch();
+      this.#watchAttempts++;
+      this.#watchFault(error);
     }
   }
 }

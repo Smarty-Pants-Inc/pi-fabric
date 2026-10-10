@@ -603,15 +603,52 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
-/** Pi invalidates ctx/pi together; this is terminal for an owned background generation. */
-export const isStaleExtensionContext = (error: unknown): boolean =>
-  error instanceof Error && error.message.startsWith("This extension ctx is stale after session replacement or reload");
+export interface FabricRuntimeEpochRecord {
+  epoch: number;
+  instanceId: string;
+}
+
+const FABRIC_RUNTIME_EPOCH = Symbol.for("pi-fabric.runtime-epoch");
+type FabricRuntimeEpochRegistry = Map<string, FabricRuntimeEpochRecord>;
+
+/** The live runtime generation for each session is Fabric-owned, not inferred from Pi errors. */
+const fabricRuntimeEpochRegistry = (): FabricRuntimeEpochRegistry => {
+  const globals = globalThis as typeof globalThis & { [key: symbol]: unknown };
+  const existing = globals[FABRIC_RUNTIME_EPOCH];
+  if (existing instanceof Map) return existing as FabricRuntimeEpochRegistry;
+  const created: FabricRuntimeEpochRegistry = new Map();
+  globals[FABRIC_RUNTIME_EPOCH] = created;
+  return created;
+};
+
+/** Claim the current runtime instance for a session. Rebinding the same instance is idempotent. */
+export const claimFabricRuntimeInstance = (sessionId: string, instanceId: string): FabricRuntimeEpochRecord => {
+  const registry = fabricRuntimeEpochRegistry();
+  const current = registry.get(sessionId);
+  if (current?.instanceId === instanceId) return current;
+  const record = { epoch: (current?.epoch ?? 0) + 1, instanceId };
+  registry.set(sessionId, record);
+  return record;
+};
+
+/** A timer is obsolete only when a later Fabric-owned instance won this session's record. */
+export const isFabricRuntimeInstanceObsolete = (
+  sessionId: string,
+  owner: FabricRuntimeEpochRecord,
+): boolean => {
+  const current = fabricRuntimeEpochRegistry().get(sessionId);
+  return current !== undefined && current.instanceId !== owner.instanceId && current.epoch > owner.epoch;
+};
 
 export interface MeshBackgroundOwner {
   epoch: number;
   current: () => boolean;
   retire: () => void;
-  onStale?: () => void;
+  /** Fabric-owned obsolescence fact. Error text is never consulted. */
+  obsolete?: () => boolean;
+  /** Current-owner probe and tick failures stay retryable under the owning lifecycle policy. */
+  onFailure?: (error: unknown, consecutiveFailures: number) => void;
+  onRecovery?: () => void;
 }
 
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
@@ -621,6 +658,7 @@ export class MeshBackgroundRetry {
   #reported = false;
   #running = false;
   #retired = false;
+  #consecutiveFailures = 0;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000, readonly owner?: MeshBackgroundOwner) {}
 
   get retired(): boolean { return this.#retired; }
@@ -630,41 +668,55 @@ export class MeshBackgroundRetry {
     if (this.#retired) return false;
     if (!this.owner) return true;
     try {
+      if (this.owner.obsolete?.() === true) {
+        this.#retire();
+        return false;
+      }
+      if (this.waitMs > 0) return false;
       if (this.owner.current()) return true;
+      this.failure(new Error("background owner is not current"));
+      return false;
     } catch (error) {
-      if (isStaleExtensionContext(error)) { this.#retire(true); return false; }
       this.failure(error);
+      return false;
     }
-    this.#retire(false);
-    return false;
   }
 
-  /** Only an explicit live lifecycle rebind may re-arm a retired owner. */
+  /** A live rebind resets outage state; a superseded owner can never be re-armed. */
   rebind(): void {
-    if (!this.#retired || !this.owner) return;
-    try { if (!this.owner.current()) return; } catch { return; }
+    if (!this.owner) return;
+    try {
+      if (this.owner.obsolete?.() === true || !this.owner.current()) return;
+    } catch { return; }
     this.#retired = false;
     this.success();
   }
 
-  #retire(stale: boolean): void {
+  #retire(): void {
     if (this.#retired || !this.owner) return;
     this.#retired = true;
     this.success();
     this.owner.retire();
-    console.warn(`[pi-fabric] ${this.label}: retired background timer for epoch ${this.owner.epoch} (${stale ? "stale extension context" : "epoch no longer current"})`);
-    if (stale) this.owner.onStale?.();
+    console.warn(`[pi-fabric] ${this.label}: retired obsolete background timer for epoch ${this.owner.epoch}`);
   }
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
+  success(): void {
+    this.#delay = 0;
+    this.#retryAt = 0;
+    this.#reported = false;
+    this.#consecutiveFailures = 0;
+    this.owner?.onRecovery?.();
+  }
   failure(error: unknown): boolean {
     if (this.#retired) return false;
-    if (this.owner && isStaleExtensionContext(error)) { this.#retire(true); return false; }
+    if (this.owner?.obsolete?.() === true) { this.#retire(); return false; }
+    this.#consecutiveFailures += 1;
+    this.owner?.onFailure?.(error, this.#consecutiveFailures);
     const transient = isMeshLockTimeout(error);
-    if (!transient) {
-      // Contain the owned callback, but surface unrelated bugs and preserve its existing
-      // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
+    if (!transient && !this.owner) {
+      // Unowned handlers retain their visible permanent-failure behavior. Owned lifecycle
+      // probes and ticks retry every error, without treating Pi's error text as an owner fact.
       this.success();
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
@@ -677,10 +729,12 @@ export class MeshBackgroundRetry {
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(transient
+        ? `[pi-fabric] ${this.label}: mesh lock timeout; retrying in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`
+        : `[pi-fabric] ${this.label}: background operation failed; retrying in ${delayMs} ms`);
       this.#reported = true;
     }
-    return transient;
+    return transient || Boolean(this.owner);
   }
 
   /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.

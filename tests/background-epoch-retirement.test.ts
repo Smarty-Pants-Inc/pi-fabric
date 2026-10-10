@@ -4,7 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
-import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
+import { claimFabricRuntimeInstance, isFabricRuntimeInstanceObsolete, MeshBackgroundRetry } from "../src/core/atomic-write.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { FabricState } from "../src/fabric-state.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
@@ -109,35 +109,132 @@ const warningLines = (warn: ReturnType<typeof vi.spyOn>): string[] =>
   warn.mock.calls.map((call: unknown[]) => call.map(String).join(" "));
 
 describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
-  it.each(["obsolete epoch", "stale tick", "stale lease"])("%s cancels once and never retries", async reason => {
+  it("only a newer Fabric-owned instance cancels once, even when its Pi binding still looks live", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    let current = true;
+    const owner = claimFabricRuntimeInstance("obsolete-unit", "first");
     let attempts = 0;
-    let staleReports = 0;
     let timer: ReturnType<typeof setInterval>;
+    const current = vi.fn(() => true);
     const retry = new MeshBackgroundRetry("participant heartbeat/change refresh", 100, 5_000, {
-      epoch: 2,
-      current: () => { if (reason === "stale lease") throw new Error(STALE); return current; },
+      epoch: 2, current,
+      obsolete: () => isFabricRuntimeInstanceObsolete("obsolete-unit", owner),
       retire: () => clearInterval(timer),
-      onStale: () => { staleReports++; },
     });
-    timer = setInterval(() => void retry.run(async () => { attempts++; throw new Error(STALE); }), 100);
-    if (reason === "obsolete epoch") current = false;
+    timer = setInterval(() => void retry.run(() => { attempts++; }), 100);
+    claimFabricRuntimeInstance("obsolete-unit", "second");
     await vi.advanceTimersByTimeAsync(100);
     expect(retry.retired).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
-    expect(attempts).toBe(reason === "stale tick" ? 1 : 0);
-    expect(staleReports).toBe(reason === "obsolete epoch" ? 0 : 1);
-    expect(warningLines(warn)).toEqual([expect.stringContaining("participant heartbeat/change refresh: retired background timer for epoch 2")]);
-    retry.success(); // success/backoff reset must never revive a terminal owner
+    expect(current).not.toHaveBeenCalled();
+    expect(attempts).toBe(0);
+    expect(warningLines(warn)).toEqual([expect.stringContaining("retired obsolete background timer for epoch 2")]);
+    retry.success();
+    retry.rebind();
     await retry.run(() => { attempts++; });
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(attempts).toBe(reason === "stale tick" ? 1 : 0);
+    expect(attempts).toBe(0);
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["probe", "tick"])("an unrelated Error with Pi's stale prefix on the CURRENT %s retries, counts failures, and resets once recovered", async via => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let failing = true;
+    const failures: number[] = [];
+    const retire = vi.fn();
+    const retry = new MeshBackgroundRetry("current-owner", 100, 400, {
+      epoch: 1, obsolete: () => false,
+      current: () => { if (failing && via === "probe") throw new Error(`${STALE} unrelated bug`); return true; },
+      retire, onFailure: (_error, count) => { failures.push(count); },
+    });
+    const operation = () => { if (failing && via === "tick") throw new Error(`${STALE} unrelated bug`); };
+    for (const wait of [0, 50, 100, 200]) {
+      await vi.advanceTimersByTimeAsync(wait);
+      await retry.run(operation);
+    }
+    expect(failures).toEqual([1, 2, 3, 4]);
+    expect(retire).not.toHaveBeenCalled();
+    expect(retry.retired).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warningLines(warn).filter(line => line.includes(STALE))).toEqual([]);
+    failing = false;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await retry.run(operation)).toBe("done");
+    failing = true;
+    await retry.run(operation);
+    expect(failures).toEqual([1, 2, 3, 4, 1]);
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("a transient CURRENT context-probe failure keeps the heartbeat and renews on the next tick", async () => {
+    const h = harness();
+    const scheduled = timerCensus();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    const probe = vi.spyOn(one.ctx.value, "isIdle").mockImplementationOnce(() => { throw new Error("transient current probe"); });
+    const before = h.lease();
+    tick();
+    expect(scheduled.size).toBe(1);
+    expect(h.lease()).toBe(before);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    tick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    expect(scheduled.size).toBe(1);
+    expect(probe.mock.calls.length).toBeGreaterThan(1);
+    expect(warningLines(warn).filter(line => line.includes("retired"))).toEqual([]);
+    console.info("8588 transient probe", JSON.stringify({ heartbeatTimers: scheduled.size, leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
+  it("an unrelated stale-prefix tick error on the CURRENT runtime reports degraded after three failures, never retires, and recovers", async () => {
+    const h = harness();
+    const scheduled = timerCensus();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let directory: ParticipantDirectory | undefined;
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      directory = this;
+      return register.call(this, source);
+    });
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    const refresh = vi.spyOn(directory!, "refresh").mockRejectedValue(new Error(`${STALE} unrelated storage error`));
+    const before = h.lease();
+    for (let i = 0; i < 3; i++) {
+      tick();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(directory!.degraded).toBe(i === 2);
+      expect(scheduled.size).toBe(1);
+    }
+    expect(h.lease()).toBe(before);
+    for (let i = 0; i < 3; i++) {
+      tick();
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(warningLines(warn).filter(line => line.includes("is degraded"))).toHaveLength(1);
+    expect(warningLines(warn).filter(line => line.includes("retired"))).toEqual([]);
+    refresh.mockRestore();
+    tick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    expect(directory!.degraded).toBe(false);
+    expect(scheduled.size).toBe(1);
+    console.info("8588 unrelated stale-prefix tick", JSON.stringify({ heartbeatTimers: scheduled.size,
+      degradedReports: 1, recovered: !directory!.degraded, leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
   it("two interrupted reloads leave exactly one heartbeat, no stale failure spam, and a renewing lease", async () => {
+    const runtimes: FabricRuntimeState[] = [];
+    const bind = FabricRuntimeState.prototype.bindLifecycle;
+    vi.spyOn(FabricRuntimeState.prototype, "bindLifecycle").mockImplementation(function (this: FabricRuntimeState, ctx, current) {
+      if (!runtimes.includes(this)) runtimes.push(this);
+      return bind.call(this, ctx, current);
+    });
     const h = harness();
     const scheduled = timerCensus();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -158,10 +255,13 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
     for (const tick of callbacks) tick();
     expect(scheduled.size).toBe(1);
     await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
-    const retirements = warningLines(warn).filter(line => line.includes("participant heartbeat/change refresh: retired background timer"));
+    const retirements = warningLines(warn).filter(line => line.includes("participant heartbeat/change refresh: retired obsolete background timer"));
     expect(retirements).toHaveLength(2);
     expect(retirements.every(line => line.includes("epoch 1"))).toBe(true); // epoch ids are local to each extension instance
     const afterFirstTick = warn.mock.calls.length;
+    // A late callback from either old extension must not take the process-global record back.
+    for (const runtime of runtimes.slice(0, 2)) runtime.bindLifecycle(h.session().value as unknown as ExtensionContext, () => true);
+    expect(scheduled.size).toBe(1);
     for (let i = 0; i < 4; i++) for (const tick of callbacks.slice(0, 2)) tick();
     expect(warn.mock.calls).toHaveLength(afterFirstTick);
     expect(warningLines(warn).filter(line => line.includes("This extension ctx is stale"))).toEqual([]);
@@ -177,7 +277,7 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
       leaseRenewed: h.lease() > renewed }));
   }, 30_000);
 
-  it.each(["ctx read", "lease check"])("a stale CURRENT %s raises #660's degraded ops report and a live bind re-arms it", async staleVia => {
+  it.each(["ctx read", "lease check"])("a stale CURRENT %s keeps its timer, raises #660 after three failures, and recovers on a live rebind", async staleVia => {
     const h = harness();
     const scheduled = timerCensus();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -202,32 +302,38 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
     const one = h.generation();
     await h.activate(one, true);
     const tick = [...scheduled.values()][0]!;
+    vi.spyOn(Math, "random").mockReturnValue(0);
     let leaseChecks = 0;
     if (staleVia === "lease check") {
       runtime!.bindLifecycle(one.ctx.value as unknown as ExtensionContext, () => { leaseChecks++; throw new Error(STALE); });
     } else {
       one.ctx.invalidate(); // lease still says current: only the ctx probe discovers the outage
     }
-    tick();
-    expect(scheduled.size).toBe(0);
-    expect(directories[0]!.degraded).toBe(true);
+    for (let i = 0; i < 3; i++) {
+      tick();
+      expect(scheduled.size).toBe(1);
+      expect(directories[0]!.degraded).toBe(i === 2);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
     await vi.waitFor(() => {
       const events = runtime!.mesh.read({ topic: "ops.fabric.presence" }).filter(event => event.kind === "fabric.presence.degraded");
       expect(events).toHaveLength(1);
       expect(events[0]!.data).toMatchObject({ participantId: `session:${h.sessionId}`, hostId: `session:${h.sessionId}`, ticks: 3 });
     });
-    tick(); // even an already-queued tick cannot duplicate the report
-    // Public reader interfaces must freeze as well: not even a stale lease getter is retried.
-    inbox!.names();
-    void runtime!.mesh.stateBackendHandle.backgroundReadCacheMs;
-    const checksAfterRetirement = leaseChecks;
-    const noticesAfterRetirement = warn.mock.calls.length;
+    const noticesAfterDegraded = warn.mock.calls.length;
     for (let i = 0; i < 4; i++) {
+      tick();
       inbox!.names();
       void runtime!.mesh.stateBackendHandle.backgroundReadCacheMs;
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
-    expect(leaseChecks).toBe(checksAfterRetirement);
-    expect(warn.mock.calls).toHaveLength(noticesAfterRetirement);
+    const checksDuringOutage = leaseChecks;
+    if (staleVia === "lease check") expect(checksDuringOutage).toBeGreaterThan(3);
+    expect(scheduled.size).toBe(1);
+    const degradedWarnings = warningLines(warn).filter(line => line.includes("is degraded"));
+    expect(degradedWarnings).toHaveLength(1);
+    // Reads have their own deduplicated outage warning, not one warning per stale read.
+    expect(warn.mock.calls.length - noticesAfterDegraded).toBeLessThanOrEqual(2);
     expect(warningLines(warn).filter(line => line.includes("This extension ctx is stale"))).toEqual([]);
     const live = h.session();
     runtime!.bindLifecycle(live.value as unknown as ExtensionContext, () => true);
@@ -238,7 +344,7 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
     for (const currentTick of scheduled.values()) currentTick();
     await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
     console.info("8588 current-binding probe", JSON.stringify({ staleVia, scheduledAfterLiveRebind: scheduled.size,
-      degradedCleared: !directories[0]!.degraded, staleLeaseChecksAfterRetirement: leaseChecks - checksAfterRetirement,
+      degradedCleared: !directories[0]!.degraded, leaseChecksWhileRetrying: checksDuringOutage,
       leaseRenewed: h.lease() > before }));
   }, 30_000);
 });

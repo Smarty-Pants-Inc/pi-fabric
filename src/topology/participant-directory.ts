@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isStaleExtensionContext, MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, type MeshBackgroundOwner } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -553,12 +553,12 @@ export interface ParticipantDirectoryOptions {
    */
   live?: () => boolean;
   /** Unlike a rebindable live token, an obsolete runtime epoch must cancel its timers. */
-  backgroundEpoch?: { epoch: number; current: () => boolean };
+  backgroundEpoch?: Pick<MeshBackgroundOwner, "epoch" | "current" | "obsolete">;
   /**
    * Once per outage: more than LIFECYCLE_LOST_TICKS consecutive heartbeats found no live
    * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
-   * must say so visibly instead of vanishing from the directory in silence. An owned
-   * epoch with a stale binding reports immediately, before cancelling its heartbeat.
+   * must say so visibly instead of vanishing from the directory in silence. A current
+   * epoch keeps its timer and reports after the same consecutive-failure threshold.
    */
   onLifecycleLost?: (ticks: number) => void;
 }
@@ -634,7 +634,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       options.backgroundEpoch ? {
         ...options.backgroundEpoch,
         retire: () => this.#stopBackgroundTimers(),
-        onStale: () => this.#lifecycleTick(false, true),
+        onFailure: (_error, failures) => this.#lifecycleTick(false, failures),
+        onRecovery: () => this.#lifecycleTick(true),
       } : undefined);
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
@@ -648,7 +649,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
   }
 
-  /** A retired owner lifecycle skips background work; a throwing token is retired too. */
+  /** An unavailable owner lifecycle skips work without retiring its timer. */
   #live(): boolean {
     try { return this.options.live?.() ?? true; } catch { return false; }
   }
@@ -656,15 +657,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
   get degraded(): boolean { return this.#degraded; }
 
-  #lifecycleTick(live: boolean, stale = false): void {
+  #lifecycleTick(live: boolean, failures?: number): void {
     if (live) {
       this.#retiredTicks = 0;
       this.#degraded = false;
       return;
     }
-    // A stale current binding cannot renew at all: report now, before retiring its timer.
-    if (stale) this.#retiredTicks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS);
-    if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
+    this.#retiredTicks = failures ?? this.#retiredTicks + 1;
+    if (this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
     console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
@@ -690,9 +690,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#cancelPublicationRetry();
   }
 
-  /** An activation/ensure with a live binding is the only way to restart a retired epoch. */
+  /** A live rebind clears the outage; an obsolete instance cannot regain its timers. */
   rebindLifecycle(): void {
-    if (this.#closed || !this.#backgroundRefresh.retired) return;
+    if (this.#closed) return;
     this.#backgroundRefresh.rebind();
     this.#armHeartbeat();
   }
@@ -712,7 +712,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #armHeartbeat(): void {
-    if (this.options.enabled && !this.#timer && this.#backgroundRefresh.active) {
+    if (this.options.enabled && !this.#timer && !this.#backgroundRefresh.retired) {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
       this.#retiredTicks = 0;
@@ -720,7 +720,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#timer = setInterval(() => {
         if (this.#closed || !this.#backgroundRefresh.active) return;
         const live = this.#live();
-        this.#lifecycleTick(live);
+        if (!this.options.backgroundEpoch) this.#lifecycleTick(live);
         if (!live) return;
         void this.#renewActors().catch(error => this.#backgroundRefresh.failure(error));
         // The retry runner coalesces shared publication, not independent liveness.
@@ -872,7 +872,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     } catch (error) {
-      if (isStaleExtensionContext(error)) this.#backgroundRefresh.failure(error);
       // A failed shared write is NOT a terminal liveness transition. An already-admitted
       // live process retains its ownership/incarnation and renews only that file lease.
       // Do not advance confirmedAt, clear the outage, admit an unregistered host, or let

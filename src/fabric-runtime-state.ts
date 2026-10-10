@@ -14,6 +14,7 @@ import type { FabricModelCandidate } from "./core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin } from "./core/model-refresh.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory } from "./actors/directory.js";
@@ -82,7 +83,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
 import { MeshStore, type MeshIdentity } from "./mesh/store.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "./core/atomic-write.js";
+import { claimFabricRuntimeInstance, isFabricRuntimeInstanceObsolete, MeshBackgroundQueue, MeshBackgroundRetry, type FabricRuntimeEpochRecord, type MeshBackgroundOwner } from "./core/atomic-write.js";
 import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
@@ -261,11 +262,13 @@ export class FabricRuntimeState {
   // smarty-dev#5962: background timers (participant heartbeat/change refresh, mesh read
   // pacing, root inbox naming) outlive a /reload or session replacement. They never hold
   // a ctx: each tick reads the ctx bound by the latest activation/ensure, and only while
-  // that lifecycle lease is current. An obsolete/stale epoch retires its owned background paths.
+  // that lifecycle lease is current. Only a newer Fabric-owned instance retires the old paths.
   #binding: { context: ExtensionContext; current: () => boolean } | undefined;
   // Each initialize() starts a new epoch. Sources and closures built by an older epoch never
   // read the live ctx again, even after the runtime is rebound to a successor session.
   #epoch = 0;
+  readonly #instanceId = randomUUID();
+  #runtimeEpoch: { sessionId: string; record: FabricRuntimeEpochRecord } | undefined;
   #backgroundReads: { epoch: number; guards: MeshBackgroundRetry[] } | undefined;
 
   constructor(
@@ -454,6 +457,11 @@ export class FabricRuntimeState {
   /** Rebinds session-bound background reads to this ctx while `current()` holds (smarty-dev#5962). */
   bindLifecycle(context: ExtensionContext, current: () => boolean): void {
     this.#binding = { context, current };
+    // An old instance's late rebind must never take the record back from its successor.
+    if (!this.#runtimeEpoch) {
+      const sessionId = context.sessionManager.getSessionId();
+      this.#runtimeEpoch = { sessionId, record: claimFabricRuntimeInstance(sessionId, `${this.#instanceId}:${this.#epoch}`) };
+    }
     if (this.#backgroundReads?.epoch === this.#epoch) {
       for (const guard of this.#backgroundReads.guards) guard.rebind();
     }
@@ -477,28 +485,34 @@ export class FabricRuntimeState {
     read: <T>(read: (context: ExtensionContext) => T, purpose?: "mesh read pacing" | "root inbox naming") => T | undefined;
     sessionName: () => string | undefined;
     pacingActive: () => boolean;
-    backgroundEpoch: { epoch: number; current: () => boolean };
+    backgroundEpoch: Pick<MeshBackgroundOwner, "epoch" | "current" | "obsolete">;
   } {
-    const ownedCurrent = (): boolean => epoch === this.#epoch && Boolean(this.#binding?.current());
-    const current = (): boolean => epoch === this.#epoch && this.lifecycleCurrent;
+    const owner = this.#runtimeEpoch!;
+    const obsolete = (): boolean => isFabricRuntimeInstanceObsolete(owner.sessionId, owner.record);
+    const ownedCurrent = (): boolean => !obsolete() && epoch === this.#epoch && Boolean(this.#binding?.current());
+    const current = (): boolean => !obsolete() && epoch === this.#epoch && this.lifecycleCurrent;
     // These are callbacks of background consumers, not independent intervals. Once retired
     // they keep their last-live fallback and never poll a stale ctx/pi again.
     const guards = new Map(["mesh read pacing", "root inbox naming"].map(label => [label,
-      new MeshBackgroundRetry(label, 100, 5_000, { epoch, current: ownedCurrent, retire: () => {} })] as const));
+      new MeshBackgroundRetry(label, 100, 5_000, { epoch, current: ownedCurrent, obsolete, retire: () => {} })] as const));
     this.#backgroundReads = { epoch, guards: [...guards.values()] };
     const read = <T>(read: (context: ExtensionContext) => T, purpose?: "mesh read pacing" | "root inbox naming"): T | undefined => {
       const guard = purpose ? guards.get(purpose) : undefined;
       if (guard && !guard.active) return undefined;
       const context = current() ? this.#binding?.context : undefined;
       if (!context) return undefined;
-      try { return read(context); } catch (error) { guard?.failure(error); return undefined; }
+      try {
+        const result = read(context);
+        guard?.success();
+        return result;
+      } catch (error) { guard?.failure(error); return undefined; }
     };
     let sessionName: string | undefined;
     return {
       current,
       read,
       pacingActive: () => guards.get("mesh read pacing")!.active,
-      backgroundEpoch: { epoch, current: () => {
+      backgroundEpoch: { epoch, obsolete, current: () => {
         if (!ownedCurrent()) return false;
         // A lease can still say current after Pi invalidates its ctx. Probe before renewal,
         // outside the quiet snapshot fallback, so #660 reports the lost lifecycle.
@@ -530,6 +544,9 @@ export class FabricRuntimeState {
     // successor's; the successor lease is installed only once the old runtime is torn down.
     this.#epoch += 1;
     const epoch = this.#epoch;
+    const runtimeSessionId = context.sessionManager.getSessionId();
+    this.#runtimeEpoch = { sessionId: runtimeSessionId,
+      record: claimFabricRuntimeInstance(runtimeSessionId, `${this.#instanceId}:${epoch}`) };
     this.#binding = undefined;
     const live = this.#liveReads(epoch);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh

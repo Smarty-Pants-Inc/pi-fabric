@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { HostLeaseLockBusyError } from "../src/topology/host-lease-lock.js";
 import { hostLeasePath, readHostLeaseCurrent, renewHostLease, withOwnedHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import { runTreeExitVeto } from "../src/storage/retention.js";
 
 // smarty-dev#8132: machine locality survives missing boot/process identity. All proof files
 // are inside Vitest's private TMPDIR, never the live fleet mesh or a shared /tmp probe root.
@@ -76,6 +77,79 @@ describe.each(["file", "sqlite"] as const)("%s missing-identity custody recovery
     expect(held.owner.split("\n")).toEqual([expect.any(String), String(process.pid), expect.any(String), "", machineId, "", ""]);
   });
 
+  it.skipIf(process.platform === "win32")("SIGKILLs a real host-qualified custody holder, recovers once, and never steals it live (POSIX SIGKILL is unavailable on Windows)", async () => {
+    const s = setup(backend), domain = domainOf(s.root, s.lease.id), lock = path.join(domain, "custody.lock");
+    // This child takes MeshStore.leaseCustody, not a fabricated owner directory. Only
+    // kernel-identity reads are fault-injected; the receipt, lock, PID and death are real.
+    const child = spawn(process.execPath, ["--input-type=module", "-e", `
+      import fs from "node:fs";
+      import { createJiti } from "jiti";
+      import { pathToFileURL } from "node:url";
+      const [root, file, backend, machineId] = process.argv.slice(1);
+      const read = fs.readFileSync;
+      fs.readFileSync = (...args) => {
+        const file = String(args[0]);
+        if (file === "/etc/machine-id") return machineId + "\\n";
+        if (file === "/proc/sys/kernel/random/boot_id" || /^\\/proc\\/\\d+\\/stat$/.test(file)) {
+          throw Object.assign(new Error("kernel identity unavailable"), { code: "EACCES" });
+        }
+        return read(...args);
+      };
+      globalThis[Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures")] = "create";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+      const { MeshStore } = await jiti.import("./src/mesh/store.ts");
+      const mesh = new MeshStore(root, 65536, 100, { stateBackend: backend });
+      // Finite safety bound even if the parent fails; IPC keeps the holder alive.
+      setTimeout(() => process.exit(2), 15000);
+      await mesh.leaseCustody(file, async () => {
+        process.send({ held: true, pid: process.pid });
+        await new Promise(() => {});
+      }, 0, { ownIncarnation: undefined });
+    `, s.root, hostLeasePath(s.root, s.lease.id), backend, machineId], {
+      cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "ipc"],
+    });
+    let stderr = "";
+    child.stderr!.on("data", chunk => { stderr += chunk; });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once("error", reject); child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    exited.catch(() => undefined);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Custody child readiness timed out: ${stderr}`)), 10_000);
+        const finish = (error?: Error) => { clearTimeout(timer); if (error) reject(error); else resolve(); };
+        child.once("error", finish);
+        child.once("close", () => finish(new Error(`Custody child exited before readiness: ${stderr}`)));
+        child.once("message", message => {
+          try { expect(message).toEqual({ held: true, pid: child.pid }); finish(); }
+          catch (error) { finish(error as Error); }
+        });
+      });
+      const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
+      expect(owner.split("\n")).toEqual([expect.any(String), String(child.pid), expect.any(String), "", machineId, "", ""]);
+      age(lock); // Age is accelerated; it must not make the real live holder recoverable.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(renewHostLease(s.mesh, s.lease, { claim: true, ownIncarnation: undefined })).rejects.toBeInstanceOf(HostLeaseLockBusyError);
+      }
+      expect(child.exitCode).toBeNull(); expect(child.signalCode).toBeNull();
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(fences(domain)).toEqual([]); expect(readHostLeaseCurrent(s.root, s.lease.id)).toBeUndefined();
+      expect(child.kill("SIGKILL")).toBe(true);
+      expect(await exited).toEqual({ code: null, signal: "SIGKILL" });
+      expect(() => process.kill(child.pid!, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      await renewHostLease(s.mesh, s.lease, { claim: true, ownIncarnation: undefined });
+      expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(s.lease);
+      expect(fences(domain)).toHaveLength(1); expect(fs.existsSync(lock)).toBe(false);
+      expect(fs.readFileSync(path.join(domain, fences(domain)[0]!, "owner"), "utf8")).toBe(owner);
+      const renewed = { ...s.lease, updatedAt: s.lease.updatedAt + 1_000, expiresAt: s.lease.expiresAt + 1_000 };
+      await renewHostLease(s.mesh, renewed, { ownIncarnation: undefined });
+      expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(renewed); expect(fences(domain)).toHaveLength(1);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    }
+  }, 20_000);
+
   it("requires ESRCH AND stale files, recovers once, resumes claims and renews after restart", async () => {
     const s = setup(backend), pid = deadPid(), held = await gate(s.root, s.lease.id, pid, false);
     await expect(renewHostLease(s.mesh, s.lease, { claim: true, ownIncarnation: undefined })).rejects.toBeInstanceOf(HostLeaseLockBusyError);
@@ -90,6 +164,28 @@ describe.each(["file", "sqlite"] as const)("%s missing-identity custody recovery
     await renewHostLease(restarted, renewed, { ownIncarnation: undefined });
     expect(readHostLeaseCurrent(s.root, s.lease.id)).toEqual(renewed); expect(fences(held.domain)).toHaveLength(1);
     await expect(withOwnedHostLease(restarted, renewed, () => "owned", { ownIncarnation: undefined })).resolves.toBe("owned");
+  });
+
+  it.each(["missing", "unknown"] as const)("custody recovery never admits %s descendant identity to cleanup before confirmed exit", async state => {
+    const s = setup(backend), pid = deadPid(), held = await gate(s.root, s.lease.id, pid);
+    const run = path.join(s.root, "runs", "parent"), child = path.join(run, "nested", "child");
+    fs.mkdirSync(child, { recursive: true });
+    fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: String(pid) }));
+    const statusFile = path.join(child, "status.json"), record = {
+      status: "completed", transport: "process", ...(state === "unknown" ? { sessionId: "not-a-pid" } : {}),
+    };
+    fs.writeFileSync(statusFile, JSON.stringify(record));
+    // This is the same strict tree-wide helper used by public offline cleanup.
+    const veto = () => runTreeExitVeto(run, 0, undefined, true);
+    expect(readPhysicalHostIdentity()).toBeUndefined();
+    expect(veto()).toMatch(/exit is unconfirmed: unknown descendant identity/);
+    await renewHostLease(s.mesh, s.lease, { claim: true, ownIncarnation: undefined });
+    expect(fences(held.domain)).toHaveLength(1); // Degraded custody DID recover.
+    expect(veto()).toMatch(/exit is unconfirmed: unknown descendant identity/);
+    expect(JSON.parse(fs.readFileSync(statusFile, "utf8"))).toEqual(record);
+    // A checked exited PID, not lock recovery or terminal status, removes the veto.
+    fs.writeFileSync(statusFile, JSON.stringify({ ...record, sessionId: String(pid) }));
+    expect(veto()).toBeUndefined();
   });
 
   it.each(["live", "EPERM"] as const)("never steals an ancient %s holder without identity", async status => {

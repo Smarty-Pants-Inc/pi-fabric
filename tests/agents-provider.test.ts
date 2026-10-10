@@ -2438,8 +2438,15 @@ describe("AgentsProvider runner support", () => {
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.
+  // smarty-dev#7554: run outside the checkout, whose lane may carry its own .local/lead marker.
+  const leaderlessProject = () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-project-"));
+    roots.push(cwd);
+    return { cwd, project: projectOf(cwd), context: { ...context, cwd } };
+  };
+
   it("returns this session's project agent", async () => {
-    const project = projectOf(process.cwd());
+    const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
@@ -2453,7 +2460,7 @@ describe("AgentsProvider runner support", () => {
       ...base, id: "session:other", rootId: "session:other", ownerHostId: "session:other", ownerIdentityId: "session:other",
       sessionId: "other", role: "project-agent", project: "/elsewhere", cwd: "/elsewhere",
     } as FabricParticipantInfo;
-    const { provider } = setup([], [other, lead]);
+    const { provider } = setup([], [other, lead], undefined, { cwd });
     await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
     expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
   });
@@ -2461,7 +2468,7 @@ describe("AgentsProvider runner support", () => {
   // smarty-dev#2045 (security review F1 on pi-fabric#132): a mirrored root's role and project are
   // the remote's own claims and never make it this project's leader.
   it("never returns a mirrored root as the project agent, even newer than the native one", async () => {
-    const project = projectOf(process.cwd());
+    const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
@@ -2475,9 +2482,9 @@ describe("AgentsProvider runner support", () => {
       ...base, id: "session:remote", rootId: "session:remote", ownerHostId: "session:remote", ownerIdentityId: "session:remote",
       sessionId: "remote", startedAt: 99, remoteHost: "forge",
     } as FabricParticipantInfo;
-    await expect(setup([], [lead, mirrored]).provider.invoke("projectAgent", {}, context))
+    await expect(setup([], [lead, mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
       .resolves.toMatchObject({ id: "session:lead" });
-    await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
+    await expect(setup([], [mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
     // Resident delivery never elects a replacement: even a recorded integrator cannot inherit
     // a dead root's actor output, and an unrecorded mirror cannot either.

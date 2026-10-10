@@ -72,8 +72,10 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
-  /** Required target capabilities. Unknown needs force configured placement local. */
+  /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
+  /** Absolute inputs that must exist on the selected execution host before starting. */
+  requires?: string[];
   images?: ImageContent[];
   name?: string;
   runner?: FabricAgentRunner;
@@ -205,7 +207,7 @@ export interface AgentRunRecord {
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM";
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
@@ -375,6 +377,7 @@ export interface AgentTransportLaunch {
   workerPath: string;
   workerArguments: string[];
   needs?: string[];
+  requires?: string[];
   /** Host-derived incompatibility, never accepted from guest arguments. */
   placementLocalReason?: string | undefined;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */
@@ -403,6 +406,9 @@ export interface AgentTransportHandle {
   kind: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
+  /** Event custody is opt-in only after a verified, owned cgroup-v2 receipt.
+   * Missing/failed admission keeps the legacy checked-query contract. */
+  liveness?: "events" | "poll";
   livenessPollIntervalMs?: number;
   /**
    * False when a lost worker must never be launched again automatically: the transport
@@ -427,6 +433,12 @@ export interface AgentTransportHandle {
   waitForClose?(): Promise<void>;
   /** Passive native close notification; wakes monitoring, never itself grants collection. */
   closed?: Promise<void>;
+  /** Scoped-only tree-empty receipt: the live PID and admission record agree
+   * on our UID-owned v2 scope, with cgroup.events opened and watched before
+   * publication. Populated-0 plus retained execution custody proves exit;
+   * observation failure rejects, never authorizes collection/replacement.
+   * Unverified scopes and unscoped workers omit this field entirely. */
+  treeClosed?: Promise<void>;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }

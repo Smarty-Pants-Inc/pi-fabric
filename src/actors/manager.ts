@@ -1,4 +1,4 @@
-import { copyFabricProvenance, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -21,7 +21,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshBatchOperation, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -265,6 +265,10 @@ const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
 const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
+/** The hourly mesh retention sweep's CLI argv: a dry run only, never --apply, until deletion verifies each inode it
+ * removes (smarty-dev#7916). Its JSON report (would-be changes, runs, skips) is written atomically, never through a link. */
+export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
+  [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
 /** Presence carries no lease (owner liveness is the host lease), so a full heartbeat
@@ -415,11 +419,17 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
+export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
 /** At most one owner alarm per actor per hour while its events dead-letter. */
 const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
+/** An activation block older than this is alarmed again from the retention sweep (smarty-dev#7782)... */
+export const ACTOR_BLOCK_REALARM_AFTER_MS = 2 * 60 * 60 * 1000;
+/** ...at most once per this interval per actor while it stays blocked. */
+export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
@@ -533,6 +543,7 @@ export class ActorManager {
   readonly #adoptionRetryAt = new Map<string, number>();
   readonly #adoptionGraceMs: number;
   readonly #listeners = new Set<() => void>();
+  readonly #meshListeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
   readonly #meshRetentionSweepPath: string | undefined;
   #retentionSweep: Promise<void> | undefined;
@@ -653,6 +664,8 @@ export class ActorManager {
       preparationRetryMs?: number;
       /** First backoff of a failed accepted-removal cleanup (tests shorten it). */
       removalRetryMs?: number;
+      /** Retention sweep interval (tests shorten it). */
+      retentionSweepMs?: number;
       /** With meshCursorPath: on resume, replay only events newer than this (ms). */
       meshReplayAgeMs?: number;
       relayParticipantSteering?: boolean;
@@ -726,7 +739,7 @@ export class ActorManager {
     });
     this.#acquireCapabilityView = options.acquireCapabilityView;
     this.#startRetentionSweep();
-    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), RETENTION_SWEEP_INTERVAL_MS);
+    this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), options.retentionSweepMs ?? RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
       cursorPath: options.meshCursorPath,
@@ -748,6 +761,11 @@ export class ActorManager {
         return !this.#halted;
       },
       onEvent: (event) => {
+        // Reuse this monitor's accepted events for UI observers; never start a
+        // second reader/poll loop merely to keep an idle dashboard current.
+        for (const listener of this.#meshListeners) {
+          try { listener(); } catch { /* Observers must not interrupt delivery. */ }
+        }
         if (event.topic === "fabric.steer") this.#relaySteer(event);
         else if (!event.topic.startsWith("fabric.control.")) return this.#dispatchMeshEvent(event);
         return event.topic === "fabric.steer" ? true : "ignored";
@@ -770,6 +788,12 @@ export class ActorManager {
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  /** Events already consumed by the actor monitor, including topics with no actor subscriber. */
+  subscribeMesh(listener: () => void): () => void {
+    this.#meshListeners.add(listener);
+    return () => this.#meshListeners.delete(listener);
   }
 
   retryCapabilityWaiters(): void {
@@ -2553,6 +2577,7 @@ export class ActorManager {
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
+      await this.mesh.delete({ key: actorRealarmKey(cleanup.id) }).catch(() => undefined);
       if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
@@ -2654,7 +2679,7 @@ export class ActorManager {
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
       this.#closing = true;
-      this.#closePromise = this.#close();
+      this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
@@ -2688,6 +2713,7 @@ export class ActorManager {
     await this.#notifications.close();
     await this.#retentionSweep;
     this.#listeners.clear();
+    this.#meshListeners.clear();
     if (this.#persistent) {
       this.#refreshOwnership();
       const owned = [...this.#actors.values()].filter((actor) => this.#canManageCached(actor.id));
@@ -2729,6 +2755,7 @@ export class ActorManager {
     await Promise.allSettled(
       [...this.#actors.values()].map((actor) => actor.drain ?? Promise.resolve()),
     );
+    this.#registry.releaseReadCache();
     fs.rmSync(this.#actorRoot, { recursive: true, force: true });
   }
 
@@ -3411,7 +3438,11 @@ export class ActorManager {
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
-          delete actor.activationBlocked;
+          if (actor.activationBlocked) {
+            delete actor.activationBlocked;
+            // Best effort: a stale claim names an older since, so it never gates a new block.
+            void this.mesh.delete({ key: actorRealarmKey(actor.id) }).catch(() => undefined);
+          }
           actor.updatedAt = Date.now();
           const beforeDelivery = await this.#validity(actor, item);
           if (!this.#canManage(actor.id)) {
@@ -4047,6 +4078,7 @@ export class ActorManager {
             from: event.from,
             ...(event.verification === undefined ? {} : { verification: event.verification }),
             principal: event.principal,
+            wakeCause: fabricWakeCause(event.from, "mesh", event.topic, event.id),
             message,
             delivery: kind,
             ...(event.data === undefined ? {} : { data: event.data }),
@@ -4372,8 +4404,8 @@ export class ActorManager {
   /**
    * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
    * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
-   * niced process: it removes terminal runs older than the actor archive TTL mesh-wide under the
-   * owners' own fences, and a dead resident root's runs under that root's flock.
+   * niced process. It runs as a dry run only (smarty-dev#7916): it reports the terminal runs older than
+   * the actor archive TTL that it would remove, and deletes nothing.
    */
   async #startMeshRetentionSweep(): Promise<void> {
     const script = this.#meshRetentionSweepPath;
@@ -4382,7 +4414,7 @@ export class ActorManager {
     if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
-        [meshRoot, "--apply", "--runs-older-than", String(this.#logs.retention.actorRunArchiveMs)]);
+        meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
       const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
@@ -4391,6 +4423,50 @@ export class ActorManager {
       }
       child.unref();
     } catch { /* the next slot retries */ }
+  }
+
+  // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
+  // One durable mesh claim per actor gates each 6 h slot of a block episode, across managers,
+  // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes.
+  #realarmBlockedActivation(actor: ManagedActor, now: number): void {
+    const blocked = actor.activationBlocked;
+    if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
+    const slot = Math.floor((now - blocked.since - ACTOR_BLOCK_REALARM_AFTER_MS) / ACTOR_BLOCK_REALARM_EVERY_MS);
+    const key = actorRealarmKey(actor.id);
+    const covers = (entry: MeshStateEntry | undefined): boolean => {
+      const claimed = entry?.value as { since?: unknown; slot?: unknown } | undefined;
+      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot;
+    };
+    if (covers(this.mesh.get(key))) return;
+    const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+      since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
+    void (async () => {
+      // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
+      // tombstone, so a claim removed when an earlier block cleared can be taken again.
+      let previous: MeshStateEntry | undefined;
+      const results = await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: (view) => {
+        const current = view.get(key);
+        if (covers(current)) return [];
+        previous = current;
+        return [{ kind: "put", key, ifVersion: view.version(key), onConflict: "skip",
+          value: { since: blocked.since, slot, at: now, owner: this.identity.id } }];
+      } }).catch(() => [] as MeshBatchResult[]);
+      // No applied claim: another sweep or owner holds this slot, and only it publishes.
+      const claim = results.find((result) => result.key === key && result.applied);
+      if (!claim) return;
+      // ponytail: claim before publish. A crash between the two loses this slot's alarm and the
+      // next slot alarms; for a repeat alarm that is the safe direction (never a duplicate).
+      // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
+      try {
+        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity, data });
+      } catch {
+        // Release the slot, fenced to our claim, so the next sweep retries.
+        await (previous
+          ? this.mesh.put({ key, identity: previous.updatedBy, value: previous.value, ifVersion: claim.version })
+          : this.mesh.delete({ key, ifVersion: claim.version })).catch(() => undefined);
+      }
+    })();
   }
 
   #startRetentionSweep(): void {
@@ -4416,6 +4492,7 @@ export class ActorManager {
           if (this.#closing || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          this.#realarmBlockedActivation(actor, now);
           this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]

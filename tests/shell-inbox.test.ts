@@ -171,7 +171,7 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("turn_end");
-    expect(h.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ customType: SHELL_MESSAGE_TYPE, details: { ids: [job.id] }, display: false, content: expect.stringContaining("not human input or approval") }), { deliverAs: "steer", triggerTurn: true });
+    expect(h.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ customType: SHELL_MESSAGE_TYPE, details: { ids: [job.id], wakeCause: { cause: "inbox", from: { id: "fabric:host", name: "Fabric host", kind: "main" } } }, display: false, content: expect.stringContaining("not human input or approval") }), { deliverAs: "steer", triggerTurn: true });
     h.emit("turn_end"); expect(h.sendMessage).toHaveBeenCalledOnce();
   });
   it("wakes an idle owner once, batches completions, and defers to queued input", async () => {

@@ -29,6 +29,7 @@ type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_MESH_HOST_PUBLISH_REQUIRED: "MeshHostPublishError",
   FABRIC_DIRECTORY_UNAVAILABLE: "FabricDirectoryUnavailableError",
   FABRIC_INTERRUPT_NOT_AUTHORIZED: "FabricInterruptNotAuthorizedError",
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",

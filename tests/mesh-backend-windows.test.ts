@@ -21,7 +21,7 @@ const jiti = createJiti(pathToFileURL(process.cwd()+"/index.js").href);
 const { SqliteStateStore, openNodeSqlite } = await jiti.import("./src/mesh/state-sqlite.ts");
 const root=process.argv[1], mode=process.argv[2], ready=process.argv[3], ack=process.argv[4];
 const open=(file)=>{ const db=openNodeSqlite(file); return { exec(sql){ db.exec(sql); if(sql.includes("synchronous = NORMAL")) db.exec("PRAGMA synchronous = FULL"); }, prepare(sql){return db.prepare(sql)}, close(){db.close()}, get isTransaction(){return db.isTransaction} }; };
-const store=await SqliteStateStore.open(root,65536,1000,{open,lockTimeoutMs:3000});
+const store=await SqliteStateStore.open(root,65536,1000,{open,lockTimeoutMs:3000,initialize:"create"});
 const spin=()=>{ for(;;) {} };
 if(mode==="hold") { const db=openNodeSqlite(root+"/state.db"); db.exec("BEGIN IMMEDIATE"); fs.writeFileSync(ready,"held"); spin();
 } else if(mode==="between") {

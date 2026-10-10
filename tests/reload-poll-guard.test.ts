@@ -4,9 +4,10 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager,
-  type AgentSession, type ExtensionUIContext,
+  type AgentSession, type ExtensionUIContext, type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import type { TUI } from "@earendil-works/pi-tui";
 import { FABRIC_PROVIDER_REGISTER_EVENT } from "../src/protocol.js";
 
 const entry = path.resolve("dist/index.js");
@@ -14,7 +15,7 @@ const entry = path.resolve("dist/index.js");
 function stackIncludesDirectory(stack: string, directory: string): boolean {
   // Native Windows paths use backslashes, but Node ESM stack frames use file:///D:/... URLs.
   // Normalize both spellings before attributing timers; an empty owned list is not evidence
-  // that a headless Windows runner never started the dashboard poller.
+  // that a headless Windows runner never queued a visible dashboard event refresh.
   return stack.replaceAll("\\", "/").includes(`${directory.replaceAll("\\", "/")}/`);
 }
 
@@ -44,7 +45,7 @@ async function waitUntil(condition: () => boolean, description: string): Promise
   }
 }
 
-describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#4383)", () => {
+describe.skipIf(!fs.existsSync(entry))("real Pi reload event-refresh guard (smarty-dev#4383, #7791)", () => {
   it.each(["native", "win32"] as const)("clears the old generation's timers across ten reload windows with asynchronous disposal (%s paths)", async (pathStyle) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-reload-poll-")));
     const agentDir = path.join(root, "agent");
@@ -77,8 +78,12 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
       track(interval(...args))) as typeof interval);
     const destroyed = (timer: NodeJS.Timeout) => (timer as NodeJS.Timeout & { _destroyed: boolean })._destroyed;
     const doneCallbacks: Array<() => void> = [];
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text,
+      bold: (text: string) => text } as unknown as Theme;
     const ui = new Proxy({
-      custom: () => new Promise<void>(resolve => { doneCallbacks.push(resolve); }),
+      custom: (factory: (tui: TUI, theme: Theme, keys: unknown, done: () => void) => unknown) =>
+        new Promise<void>(resolve => { doneCallbacks.push(resolve); factory(tui, theme, {}, resolve); }),
       notify: vi.fn(), setWidget: vi.fn(), setStatus: vi.fn(),
     }, { get: (target, key) => Reflect.get(target, key) ?? (() => {}) }) as unknown as ExtensionUIContext;
     let closeCount = 0;
@@ -107,11 +112,15 @@ describe.skipIf(!fs.existsSync(entry))("real Pi reload poll guard (smarty-dev#43
           undefined, undefined, runner.createContext());
         expect(result.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text" })]));
         modal = runner.getCommand("fabric")!.handler("dashboard", runner.createCommandContext());
+        await waitUntil(() => doneCallbacks.length > 0, "the dashboard TUI to attach");
+        // A visible dashboard is silent until an actual activity event. Queue
+        // a second real tool execution, then reload through its pending coalescer.
+        expect(owned.filter(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#schedulePoll"))).toEqual([]);
+        await runner.getToolDefinition("fabric_exec")!.execute("event", { code: "return 2" } as never,
+          undefined, undefined, runner.createContext());
         await waitUntil(
-          // Activation can already own a widget poll; also wait for the dashboard's custom UI.
-          () => doneCallbacks.length > 0 &&
-            owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#schedulePoll")),
-          "the dashboard poll timer to exist before opening a reload window",
+          () => owned.some(({ timer, stack }) => !destroyed(timer) && stack.includes("FabricUiController.#scheduleRefresh")),
+          "a real dashboard event refresh to be queued before opening a reload window",
         );
       };
       await open();

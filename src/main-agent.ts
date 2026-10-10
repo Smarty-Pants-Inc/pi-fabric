@@ -7,7 +7,7 @@ import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
-import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
+import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
 
@@ -63,6 +63,10 @@ export interface FabricMainAgentDeliveryRequest {
   delivery: FabricMainAgentDelivery;
   priority?: FabricSteerPriority;
   triggerTurn?: boolean;
+  /** Legacy sender diagnostics are ignored at admission. */
+  wakeCause?: FabricWakeCause | undefined;
+  /** Receiving route metadata, never hydrated from command/message data. */
+  admissionTopic?: string | undefined;
   data?: unknown;
   /**
    * A stable id of the sender's durable record (a resident actor's delivery record). Main journals
@@ -202,6 +206,13 @@ export const followUpCoalesceKey = (data: unknown): string | undefined => {
   return typeof key === "string" && key.length > 0 && key.length <= 200 ? key : undefined;
 };
 
+const mainWakeCause = (
+  sender: MeshIdentity, source: FabricMainAgentDeliveryRequest["source"], delivery: FabricMainAgentDelivery,
+  topic?: string, key?: string,
+): FabricWakeCause => fabricWakeCause(sender,
+  source === "fabric-host" ? "host-event" : source === "actor-output" ? "actor" :
+    delivery === "steer" ? "steer" : "followUp", topic, key);
+
 /** Resident alarms historically used actor labels. Their durable receipt alone proves no authorship. */
 const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, source: unknown): boolean =>
   source !== "fabric-host" && !(sender.kind === "actor" && typeof deliveryId === "string" &&
@@ -214,6 +225,13 @@ export interface HeldAgentMessage {
   source?: FabricMainAgentDeliveryRequest["source"];
   /** Original verified admission, journalled before acknowledgement; never a Pi receipt stamp. */
   provenance?: FabricTurnProvenance | undefined;
+  wakeCause?: FabricWakeCause;
+  wakeCauses?: FabricWakeCause[];
+  /** Receiving-envelope route snapshots, never rehydrated from serialized wake causes. */
+  admissionTopic?: string;
+  admissionKey?: string;
+  /** A multi-source or differently classified producer has no reconstructable single envelope. */
+  unattributedOnReplay?: true;
   message: string;
   /** The first send of a coalesced chain: it keeps the queue position and the flush wait. */
   sentAt: number;
@@ -480,7 +498,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const messageId = randomUUID();
     const options = { deliverAs: delivery };
     // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
-    this.pi.sendUserMessage(text, from && (verification === "mesh" || verification === "bridge") ? fabricProvenanceOptions(this.pi, options, fabricTurnProvenance(from, delivery, verification)) : options);
+    // The dashboard composer is human input (no Fabric sender). Keep it user.
+    if (from) sendFabricUserMessage(this.pi, text, from, delivery, options, verification);
+    else this.pi.sendUserMessage(text, options);
     return { queued: true, messageId, routed: "main" };
   }
 
@@ -533,9 +553,25 @@ export class MainAgentController implements FabricMainAgentTarget {
       for (const [id, at] of this.#lastInterrupt) if (now - at >= 60_000) this.#lastInterrupt.delete(id);
       if (this.#lastInterrupt.has(sender.id)) throw new FabricInterruptRateLimitedError(sender.id, this.id);
     }
+    const admittedCauses = admittedFabricWakeCauses(request);
+    const admissionTopic = request.admissionTopic ?? (admittedCauses?.length === 1 ? admittedCauses[0]!.topic : undefined);
+    const admissionKey = admittedCauses?.length === 1 ? admittedCauses[0]!.key : deliveryId;
+    const derivedWake = mainWakeCause(sender, request.source, request.delivery, admissionTopic, admissionKey);
+    // Some live producers admit several envelopes, or a writer distinct from the
+    // routed sender. Their authenticated fields are not retained by this journal;
+    // never reconstruct those origins from the serialized diagnostic on restart.
+    const unattributedOnReplay = admittedCauses && (admittedCauses.length > 1 || admittedCauses.some(cause =>
+      cause.cause !== derivedWake.cause || cause.from.id !== derivedWake.from.id ||
+      cause.from.name !== derivedWake.from.name || cause.from.kind !== derivedWake.from.kind));
     const item: HeldAgentMessage = {
       id: randomUUID(),
       from: sender,
+      ...(admittedCauses?.length ? { wakeCause: admittedCauses[0]!,
+        ...(admittedCauses.length > 1 ? { wakeCauses: admittedCauses } : {}),
+      } : { wakeCause: derivedWake }),
+      ...(unattributedOnReplay ? { unattributedOnReplay: true } : {}),
+      ...(admissionTopic ? { admissionTopic } : {}),
+      ...(admissionKey ? { admissionKey } : {}),
       ...((request.verification === "mesh" || request.verification === "bridge") &&
         mainSenderClaimAllowed(sender, deliveryId, request.source) ? {
         provenance: fabricTurnProvenance(sender, request.delivery === "nextTurn" ? "actor" : request.delivery, request.verification, request.principal),
@@ -991,17 +1027,27 @@ export class MainAgentController implements FabricMainAgentTarget {
           }
           // A policy this runtime cannot read is dropped: the item is then released as a held
           // followUp, as before policies were journalled.
-          const { deliverAs, triggerTurn, supersedes, provenance, source, ...rest } = item;
-          const via = provenance?.via;
-          const verified = provenance?.sender?.verified;
+          const { deliverAs, triggerTurn, supersedes, provenance, source, wakeCause, wakeCauses, ...rest } = item;
+          // Serialized diagnostics are not admission evidence. Reconstruct only when
+          // the recorded envelope sender agrees with the displayed/routed sender.
+          const admission = copyFabricProvenance(provenance);
+          const via = admission?.via;
+          const verified = admission?.sender.verified;
+          const senderMatches = admission?.sender.id === sender.id &&
+            (admission.sender.name || admission.sender.id) === sender.name &&
+            admission.sender.kind === (verified === "bridge" ? "remote" : sender.kind);
           items.push({
             ...rest, from: sender,
+            ...(senderMatches && mainSenderClaimAllowed(sender, item.deliveryId, source) ? {
+              wakeCause: mainWakeCause(sender, source, via === "steer" ? "steer" : "followUp",
+                typeof item.admissionTopic === "string" ? item.admissionTopic : undefined,
+                typeof item.admissionKey === "string" ? item.admissionKey : item.deliveryId),
+            } : {}),
             // Only a recorded admission method permits a claim. Old journals (native or
             // bridged) are UNKNOWN; payload fields and a missing bridge marker prove nothing.
-            ...((verified === "mesh" || verified === "bridge") &&
-              mainSenderClaimAllowed(sender, item.deliveryId, source) ? {
+            ...(senderMatches && mainSenderClaimAllowed(sender, item.deliveryId, source) ? {
               provenance: fabricTurnProvenance(sender, via === "steer" || via === "followUp" || via === "actor" || via === "replay"
-                ? via : deliverAs === "steer" ? "steer" : "followUp", verified, provenance?.principal),
+                ? via : deliverAs === "steer" ? "steer" : "followUp", verified!, admission?.principal),
             } : {}),
             ...(source === "actor-output" || source === "fabric-host" ? { source } : {}),
             ...(Array.isArray(supersedes) ? { supersedes: supersedes.filter((id) => typeof id === "string") } : {}),
@@ -1579,7 +1625,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const options = { deliverAs, triggerTurn };
     const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
     this.pi.sendMessage(
-      {
+      fabricWakeMessage(this.pi, {
         customType: "pi-fabric-agent-message",
         content: [
           ...(flushed
@@ -1596,7 +1642,11 @@ export class MainAgentController implements FabricMainAgentTarget {
           triggerTurn,
           ...(flushed ? { flushed: true } : {}),
         },
-      },
+      }, options, items.flatMap<FabricWakeCause | { cause: "unattributed" }>(item => this.#replayed.has(item.id) &&
+        (!item.provenance || item.unattributedOnReplay === true)
+        ? [{ cause: "unattributed" as const }]
+        : item.wakeCauses ?? [item.wakeCause ?? mainWakeCause(item.from, item.source, delivery,
+          item.admissionTopic, item.admissionKey ?? item.deliveryId)])),
       provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
     );
     // A fresh delivery can win the deadline without going through #releaseQueue. It is

@@ -331,6 +331,9 @@ describe("resident creation cache boundaries", () => {
     try {
       const first = await state.client.createActor(actorRequest("before-expiry", "expiring"));
       clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000 + 1);
+      // Advance the creation-cache clock without accidentally expiring the owning Main's lease.
+      // A live Main would keep heartbeating throughout these ten minutes.
+      await state.participants.refresh();
       const next = await state.client.createActor(actorRequest("after-expiry", "expiring"));
       expect(next.id).not.toBe(first.id);
       expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);
@@ -1089,6 +1092,9 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      // The 250 ms exchange budget exists to expire the create above; this follow-up status read only checks the
+      // committed actor, so give it a bounded 5 s budget (a 2-core CI runner timed out at 250 ms; smarty-dev#7651).
+      state.client.options.commandTimeoutMs = 5_000;
       const status = await state.client.actorStatus(decisions[0]!.id);
       expect(status).toMatchObject({ id: decisions[0]!.id });
       clock.mockRestore();

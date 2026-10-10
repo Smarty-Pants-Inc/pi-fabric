@@ -56,6 +56,12 @@ const runProperties = {
     maximum: 19,
     description: "Unix niceness for this child and its tools. Only raises agents.nice, never lowers it.",
   },
+  bashIdleSeconds: {
+    type: "integer",
+    minimum: 0,
+    maximum: MAX_ACTOR_BASH_TIMEOUT_S,
+    description: "Pi runs: kill a blocking bash call after this many seconds with no output (default 180), also when the call sets its own timeout; 0 = no idle limit.",
+  },
   timeoutMs: {
     type: "number",
     description:
@@ -124,6 +130,7 @@ const spawnSchema = {
   ...runSchema,
   properties: {
     ...runProperties, residency: residencySchema,
+    complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },

@@ -52,6 +52,16 @@ describe("guest agents surface", () => {
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([{ ref: "agents.send", args: { id: "session:peer", message: "HOLD", priority: "interrupt" } }]);
   });
+
+  it.each([false, true])("types and registers spawn complexity hints (fullCodeMode=%s)", fullCodeMode => {
+    for (const complexity of ["simple", "normal", "complex", "delicate"]) {
+      expect(typeCheckFabricCode(`return await agents.spawn({ task: "work", complexity: "${complexity}" });`, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+    expect(typeCheckFabricCode('return await agents.spawn({ task: "work", complexity: "unknown" });', guestTypeDeclarations(fullCodeMode), true).errors).not.toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "spawn")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.complexity).toMatchObject({ type: "string", enum: ["simple", "normal", "complex", "delicate"] });
+  });
+
   it.each([false, true])("types opt-in actor occurrence dedupe (fullCodeMode=%s)", fullCodeMode => {
     const code = `const actor = await agents.create({ name: "alarm", instructions: "Handle alarms", residency: "durable", topics: ["ops.owner"], dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1000 } }); return { dedupeKey: actor.dedupeKey, activation: actor.activation };`;
     expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);

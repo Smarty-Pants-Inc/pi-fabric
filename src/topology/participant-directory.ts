@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
@@ -281,6 +283,23 @@ const remoteHostValid = (value: unknown): boolean =>
 
 const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   keys.every((key) => value[key] === undefined || typeof value[key] === "string");
+
+let ownProcessIdentity: { pid: number; host: string; startTime?: string } | undefined;
+/** This process's identity, read once: stable for the process's life. */
+const ownMainProcess = (): { pid: number; host: string; startTime?: string } => {
+  if (!ownProcessIdentity) {
+    // Linux /proc/<pid>/stat field 22 (start ticks), after comm; the same value residency's processStartTime reads.
+    let startTime: string | undefined;
+    if (process.platform === "linux") {
+      try {
+        const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+        startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      } catch { /* unknown: the record carries no start time */ }
+    }
+    ownProcessIdentity = { pid: process.pid, host: os.hostname(), ...(startTime ? { startTime } : {}) };
+  }
+  return ownProcessIdentity;
+};
 
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
@@ -1564,6 +1583,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: main.updatedAt,
       pendingMessages: main.pendingMessages,
       controlProtocol: "v1",
+      mainProcess: ownMainProcess(),
     };
   }
 
@@ -2098,6 +2118,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
         prepare: view => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
+          this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
           return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
         },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
@@ -2175,6 +2196,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (participant?.kind === "actor" && this.options.actorRenewalAllowed &&
         !this.options.actorRenewalAllowed(participant)) return undefined;
       if (this.#renewalAhead(current, committed)) return undefined;
+      if (participant) this.#assertRootPublishable(participant);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }, this.#fileLockOptions()));
@@ -2440,13 +2462,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
+  /** Under the same key lock or state transaction as the write: a root Main never publishes its root
+   * participant while an operator actor removal fences that root (smarty-dev#7817). */
+  #assertRootPublishable(record: FabricParticipantRecord | undefined): true {
+    if (record?.kind === "root" && record.id === this.options.rootId && mainPublicationFenced(this.mesh.root, record.id)) {
+      throw new MainPublicationFencedError(record.id);
+    }
+    return true;
+  }
+
   #writeFile(
     record: FabricParticipantRecord,
     allowed: (current: MeshStateEntry | undefined) => boolean,
     durable = false,
   ): Promise<boolean> {
     const key = keyFor(PARTICIPANT_PREFIX, record.id);
-    return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
+    return writeParticipantFileIf(this.mesh, key, (current) => this.#assertRootPublishable(record) && allowed(current) ? {
       key,
       value: record,
       version: (current?.version ?? 0) + 1,

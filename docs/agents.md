@@ -24,6 +24,51 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
+### Interrupt-priority steer
+
+For a time-critical HOLD to an interactive Main, use:
+
+```ts
+await agents.send({ id: "session:<id>", message: "HOLD: do not start the change", priority: "interrupt" });
+// agents.steer accepts the same optional priority; send is its alias.
+```
+
+When Main has an active tool call, it journals the steer, invokes Pi's native
+`ctx.abort()` (the Escape cancellation path), then delivers the HOLD as a
+user-role Fabric message after the aborted run settles. Fabric does not retry the
+aborted tool. Older held followUps stay behind the HOLD. If Main is idle or has
+no active tool call, this is an ordinary steer. Omit priority to keep the
+existing tool-boundary queue. Only `"interrupt"` is valid; followUp, non-Main
+participants and legacy control routes reject it. Interrupt has narrower authority than
+ordinary steer: the verified sender must be this Main's own root session or its
+owner-created supervisor bound to that root. Configuration cannot grant this
+authority. An unauthorized request fails with
+`FABRIC_INTERRUPT_NOT_AUTHORIZED` and is not delivered, even as an ordinary steer.
+Bridge admission checks the bridge-verified identity, never identities in message data.
+
+Main admits at most one actual interrupt per turn, including the HOLD-induced
+restart. Another authorized sender's interrupt in that turn becomes an ordinary
+steer without another abort. The same sender must wait 60 seconds between actual
+interrupts to this target; requests inside that window fail with
+`FABRIC_INTERRUPT_RATE_LIMITED` and are not delivered. Cooldown refusal takes
+precedence over same-turn coalescing; an idempotent retry of an already-admitted
+command remains a duplicate, not a second interrupt.
+
+The native supervisor convention is an owner-created `supervisor` or
+`*-supervisor` directive actor observing `agent_settled`, with `delivery: "steer"`
+and `triggerTurn: true`. Creation records an immutable `supervisorFor` root
+binding; a name, ordinary actor membership, later configuration changes or a
+forged message field cannot grant it. Old records without this binding remain
+closed; recreate the supervisor from its owning Main to grant it. Adoption to a
+different root does not transfer the original root's delegation.
+
+The receiver must run this Fabric version on a Pi host with `ctx.abort()` and
+`agent_settled`. Native cancellation is cooperative: a blocked event loop or a
+tool that ignores Pi's abort signal cannot meet a fixed preemption deadline.
+Owner stop, reload and session replacement retain their existing vetoes; journal
+replay never issues a second abort. This API does not interrupt Herdr-typed prompts
+or the fleet work-inbox/report-relay path.
+
 Fabric injections carry structured [turn provenance](turn-provenance.md) on capable Pi hosts. The sender is the admitted participant; message text cannot select a human channel or principal.
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
@@ -184,7 +229,7 @@ Fabric does not discover a replacement by name, role, or principal. The original
 `PI_FABRIC_MAIN_AGENT_ID` and `PI_FABRIC_SESSION_ID` remain the root topology and
 storage fields; they are not overwritten with a nested task's return address.
 
-A process task's `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
+A process task's `agents.send`, `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
 address only its bound spawner, that spawner's ancestor chain, or an explicitly
 allowlisted exact Main session. Other Main-bound sends fail before publication
 with `TaskEscalationTargetError` (`FABRIC_TASK_ESCALATION_TARGET_DENIED`), naming

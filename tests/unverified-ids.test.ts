@@ -166,13 +166,13 @@ describe("actual sender-session read evidence", () => {
     expect(unverifiedMessageIds("head abc1234", onlyReceipt)).toEqual(["abc1234"]);
   });
 
-  it("accepts received/tool-read marked text, but not direct send-only Fabric output", () => {
+  it.each(["agents.send", "agents.steer", "agents.followUp", "agents.tell"])("accepts received/tool-read marked text, but not %s send-only output", ref => {
     const manager = session();
     read(manager, "head abc1234\n\nunverified ids: abc1234"); // Actual separate read, not a receipt object.
     expect(unverifiedMessageIds("head abc1234", manager)).toEqual([]);
     const sender = session();
     sender.appendMessage({ role: "toolResult", toolCallId: "send", toolName: "fabric_exec", content: [{ type: "text", text: actor }],
-      details: { trace: { operations: [{ ref: "agents.followUp" }] } }, isError: false, timestamp: 1 });
+      details: { trace: { operations: [{ ref }] } }, isError: false, timestamp: 1 });
     expect(unverifiedMessageIds(actor, sender)).toEqual([actor]);
   });
 

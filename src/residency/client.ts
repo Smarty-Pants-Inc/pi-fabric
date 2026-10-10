@@ -469,6 +469,11 @@ export class ResidencyClient {
   async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
+    const self = this.options.participants.self();
+    const caller: ResidentActorCaller | undefined = this.options.mainAgent.local && self.kind === "root" &&
+      self.id === this.options.config.rootId && self.sessionId
+      ? { identity: { id: self.id, name: self.name, kind: "main", sessionId: self.sessionId }, hostId: self.ownerHostId }
+      : undefined;
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
@@ -476,6 +481,7 @@ export class ResidencyClient {
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
       request: creationRequest,
+      ...(caller ? { caller } : {}),
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");

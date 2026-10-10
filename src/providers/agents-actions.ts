@@ -560,10 +560,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "steer",
     description:
-      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
+      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. Optional priority interrupt requires owning-root/supervisor or host allowlist authority, aborts at most once per Main turn, and has a 60-second sender cooldown. It delivers the steer next without retrying the tool. Default delivery is unchanged. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" }, message: { type: "string" }, data: {},
+        priority: { type: "string", enum: ["interrupt"], description: "Main only; separate interrupt authority required. One abort per turn, 60-second sender cooldown. Abort its tool, then deliver the steer next." },
         idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
@@ -939,6 +940,9 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
 ];
+
+// send is the public steer spelling; both use the same validation, routing and authority.
+AGENTS_ACTION_DESCRIPTORS.push({ ...AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "steer")!, name: "send" });
 
 // Explicit spelling for callers; keep create as the backwards-compatible API.
 AGENTS_ACTION_DESCRIPTORS.push({

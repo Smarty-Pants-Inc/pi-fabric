@@ -354,12 +354,19 @@ export class FabricControlPlane {
 
   // Recheck under the actual store lock: checking only before an await is not admission.
   async #putFenced(store: MeshStore, input: Parameters<MeshStore["put"]>[0]): Promise<{ version: number }> {
-    if (!this.options.canConsumeMesh) return store.put(input);
-    const results = await store.writeBatch({ identity: this.identity, ops: [], prepare: () => {
-      assertMeshConsumption(this.options.canConsumeMesh);
-      return [{ kind: "put", ...input }];
-    } });
-    return { version: results[0]!.version };
+    const result = !this.options.canConsumeMesh ? await store.put(input) :
+      { version: (await store.writeBatch({ identity: this.identity, ops: [], prepare: () => {
+        assertMeshConsumption(this.options.canConsumeMesh);
+        return [{ kind: "put", ...input }];
+      } }))[0]!.version };
+    if (store === this.mesh && input.key.startsWith(CONTROL_SEEN_PREFIX)) {
+      const record = controlSeenRecord(input.value);
+      const policy = this.mesh.get(CONTROL_CLAIMS_POLICY_KEY, { fresh: true })?.value;
+      if (record?.explicitDeadline === true && isObject(policy) && policy.version === 1 && policy.sharedClaims === "expiry") {
+        this.#armSeenExpiry(record.expiresAt + SHARED_SEEN_GRACE_MS + 1);
+      }
+    }
+    return result;
   }
   readonly #pollMs: number;
   readonly #ackTimeoutMs: number;
@@ -386,7 +393,27 @@ export class FabricControlPlane {
   #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
-  #legacySeenCleanupAt = Date.now();
+  #legacySeenCleanupAt = 0; // The first drain seeds deadlines from existing shared claims.
+  #seenExpiryAt = Infinity;
+  #seenExpiryTimer: NodeJS.Timeout | undefined;
+
+  // An explicit claim owns one deadline wake, not a periodic Linux idle sweep.
+  #armSeenExpiry(at: number): void {
+    if (!Number.isFinite(at) || this.#closed) return;
+    at = Math.min(at, this.#seenExpiryAt); // A later write cannot postpone an already-due wake.
+    if ((this.#seenExpiryTimer || this.#paused) && at >= this.#seenExpiryAt) return;
+    if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
+    this.#seenExpiryAt = at;
+    if (this.#paused) return;
+    const timer = setTimeout(() => {
+      if (this.#seenExpiryTimer !== timer) return;
+      this.#seenExpiryTimer = undefined;
+      if (Date.now() < at) { this.#armSeenExpiry(at); return; }
+      this.#wake(); // The due deadline bypasses both cleanup cadence gates in the drain.
+    }, Math.max(1, Math.min(2 ** 31 - 1, at - Date.now())));
+    this.#seenExpiryTimer = timer;
+    timer.unref();
+  }
   /**
    * This host's dedupe records with their outcomes. Only this host reads them, so they live in
    * its own store under the mesh root rather than the shared state that every runtime parses
@@ -880,12 +907,15 @@ export class FabricControlPlane {
     this.#paused = true;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
+    this.#seenExpiryTimer = undefined;
   }
 
   resume(): void {
     if (this.#closed || !this.#paused) return;
     this.#paused = false;
     this.#attachWatcher();
+    this.#armSeenExpiry(this.#seenExpiryAt);
     this.#wake();
   }
 
@@ -904,6 +934,8 @@ export class FabricControlPlane {
     if (this.#closed) return;
     // Fence new requests before joining polls: a late notRun ACK must not arm a resend.
     this.#closed = true;
+    if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
+    this.#seenExpiryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
@@ -931,7 +963,7 @@ export class FabricControlPlane {
       // A denied lease is not itself work. Only an owned obligation or a changed
       // fixed-file witness (nonempty replay at startup) acquires a Linux retry.
       const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-      this.#retryNeeded ||= this.#ownedCommands.size > 0 || this.#sharedClaims.size > 0 ||
+      this.#retryNeeded ||= this.#ownedCommands.size > 0 || this.#sharedClaims.size > 0 || Date.now() >= this.#seenExpiryAt ||
         (this.#stamp === undefined ? (fs.statSync(path.join(this.mesh.root, "events.jsonl"), { throwIfNoEntry: false })?.size ?? 0) > 0
           : stamp !== this.#stamp);
       return;
@@ -1406,26 +1438,32 @@ export class FabricControlPlane {
   }
 
   async #cleanupSeen(now: number): Promise<void> {
-    if (now - this.#seenCleanupAt < this.#ackTimeoutMs) return;
-    this.#seenCleanupAt = now;
-    // A restarting owner replays the retained log from its start, so a record stays while its
-    // command is still in the log: past its expiry, and below the log's oldest sequence.
-    const oldest = this.mesh.oldestSequence();
-    if (oldest !== undefined) {
-      const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
-        const record = controlSeenRecord(entry.value);
-        return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
-      });
-      if (stale.length > 0) {
-        await this.#seen.writeBatch({
-          identity: this.identity,
-          ops: stale.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+    if (now - this.#seenCleanupAt >= this.#ackTimeoutMs) {
+      this.#seenCleanupAt = now;
+      // A restarting owner replays the retained log from its start, so a record stays while its
+      // command is still in the log: past its expiry, and below the log's oldest sequence.
+      const oldest = this.mesh.oldestSequence();
+      if (oldest !== undefined) {
+        const stale = this.#seen.listAll(CONTROL_SEEN_PREFIX).filter((entry) => {
+          const record = controlSeenRecord(entry.value);
+          return !record || (record.expiresAt < now && record.sequence !== undefined && record.sequence < oldest);
         });
+        if (stale.length > 0) {
+          await this.#seen.writeBatch({
+            identity: this.identity,
+            ops: stale.map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
+          });
+        }
       }
     }
-    if (now - this.#legacySeenCleanupAt >= LEGACY_SEEN_CLEANUP_MS) {
-      this.#legacySeenCleanupAt = now;
-      await this.#cleanupLegacySeen(now);
+    if (now >= this.#seenExpiryAt || now - this.#legacySeenCleanupAt >= LEGACY_SEEN_CLEANUP_MS) {
+      try {
+        await this.#cleanupLegacySeen(now);
+        this.#legacySeenCleanupAt = now;
+      } catch (error) {
+        this.#legacySeenCleanupAt = 0; // A failed sweep remains due for the owned retry.
+        throw error;
+      }
     }
   }
 
@@ -1441,13 +1479,19 @@ export class FabricControlPlane {
   // afterwards could run a command twice in that pause. Runtime versions cannot be told apart
   // automatically, since two processes of one host write the same lease key.
   async #cleanupLegacySeen(now: number): Promise<void> {
-    const expired = this.mesh.listAll(CONTROL_SEEN_PREFIX).flatMap((entry) => {
+    const entries = this.mesh.listAll(CONTROL_SEEN_PREFIX, { fresh: true });
+    const policy = this.mesh.get(CONTROL_CLAIMS_POLICY_KEY, { fresh: true })?.value;
+    const expiryReclaim = isObject(policy) && policy.version === 1 && policy.sharedClaims === "expiry";
+    if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
+    this.#seenExpiryTimer = undefined;
+    this.#seenExpiryAt = Infinity;
+    const expired = entries.flatMap((entry) => {
       const record = controlSeenRecord(entry.value);
+      const at = record && record.expiresAt + SHARED_SEEN_GRACE_MS + 1;
+      if (expiryReclaim && record?.explicitDeadline === true && at !== undefined && at > now) this.#armSeenExpiry(at);
       return !record || record.expiresAt < now ? [{ entry, record }] : [];
     });
     if (expired.length === 0) return;
-    const policy = this.mesh.get(CONTROL_CLAIMS_POLICY_KEY, { fresh: true })?.value;
-    const expiryReclaim = isObject(policy) && policy.version === 1 && policy.sharedClaims === "expiry";
     const reclaimable = ({ record }: { record: FabricControlSeenRecord | undefined }): boolean =>
       expiryReclaim && record?.explicitDeadline === true && record.expiresAt + SHARED_SEEN_GRACE_MS < now;
     const dead = expired.filter(reclaimable);

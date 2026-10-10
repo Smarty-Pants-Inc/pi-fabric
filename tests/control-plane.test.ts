@@ -1321,6 +1321,9 @@ describe("FabricControlPlane", () => {
       const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
       const now = Date.now;
       vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
+      // A clock jump alone does not advance a one-shot timer. Resume supplies a real
+      // drain admission instead of relying on a late native watch event (win32 CI).
+      receiver.pause(); receiver.resume();
       await vi.waitFor(() => expect(store.get(seenKey("host:other", "command:flagged"))).toBeUndefined(),
         { timeout: 3_000, interval: 20 });
       expect(store.get(seenKey("host:other", "command:grace"))).toBeDefined();
@@ -1329,6 +1332,54 @@ describe("FabricControlPlane", () => {
         && input.ops.some((op) => op.key.startsWith("topology/control-seen/")));
       expect(sweeps.length).toBeGreaterThanOrEqual(1);
       expect(sweeps[0]![0].ops.every((op) => op.ifVersion !== undefined)).toBe(true);   // one fenced batch
+    });
+
+    it.each(["linux", "win32"] as const)("reclaims at the one-shot grace deadline without watch events on %s, then idles", async platform => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-expiry-")); roots.push(root);
+      const meshRoot = path.join(root, "mesh"), store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+      const watches: Array<EventEmitter & { close: ReturnType<typeof vi.fn>; unref: ReturnType<typeof vi.fn> }> = [];
+      vi.spyOn(fs, "watch").mockImplementation((() => {
+        const watcher = Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() });
+        watches.push(watcher); return watcher; // Never deliver a file event.
+      }) as unknown as typeof fs.watch);
+      const settled = async () => { for (let i = 0; i < 30; i++) await new Promise<void>(resolve => setImmediate(resolve)); };
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      try {
+        const now = Date.now(), key = seenKey("host:other", "command:deadline");
+        for (const id of ["command:deadline", "command:legacy"]) await store.publish(command(id, "host:other"));
+        for (const [commandId, explicitDeadline] of [["command:deadline", true], ["command:legacy", false]] as const) {
+          await store.put({ key: seenKey("host:other", commandId), identity: identity("host:other"), value: {
+            format: 1, hostId: "host:other", commandId, targetId: "agent:target", expiresAt: now - 10 * 60_000 + 2_000, explicitDeadline,
+          } });
+        }
+        await store.put({ key: CONTROL_CLAIMS_POLICY_KEY, identity: identity("host:owner"), value: { version: 1, sharedClaims: "expiry" } });
+        const receiver = plane(meshRoot, "host:receiver", {}, { platform });
+        const tail = vi.spyOn(receiver.mesh, "tail"), batches = vi.spyOn(receiver.mesh, "writeBatch");
+        receiver.start(() => ({ accepted: true }));
+        await vi.advanceTimersByTimeAsync(0); await settled();
+        const startupReads = tail.mock.calls.length;
+        expect(store.get(key)).toBeDefined();
+        expect(vi.getTimerCount()).toBe(2); // Observation safety + the owned one-shot deadline.
+        await vi.advanceTimersByTimeAsync(2_000); await settled();
+        expect(store.get(key)).toBeDefined(); // Strictly after expiry + grace, never before.
+        expect(tail).toHaveBeenCalledTimes(startupReads); // No recurring active/idle cleanup polling.
+        await vi.advanceTimersByTimeAsync(2); await settled(); // Deadline wake plus its zero-delay drain.
+        expect(store.get(key, { fresh: true })).toBeUndefined();
+        expect(store.get(seenKey("host:other", "command:legacy"))).toBeDefined();
+        const deletes = batches.mock.calls.flatMap(([input]) => input.ops).filter(op => op.kind === "delete");
+        expect(deletes).toEqual([expect.objectContaining({ kind: "delete", key, ifVersion: 1, onConflict: "skip" })]);
+        expect(vi.getTimerCount()).toBe(1); // Deadline obligation is gone, with no recurring replacement.
+        const deadlineReads = tail.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(1_000); await settled();
+        expect(tail).toHaveBeenCalledTimes(deadlineReads);
+        receiver.pause(); expect(vi.getTimerCount()).toBe(0);
+        receiver.resume(); await vi.advanceTimersByTimeAsync(0); await settled();
+        await receiver.close(); expect(vi.getTimerCount()).toBe(0);
+        expect(watches.every(watcher => watcher.close.mock.calls.length > 0)).toBe(true);
+      } finally {
+        await Promise.all(planes.splice(0).map(value => value.close()));
+        vi.useRealTimers();
+      }
     });
 
     // review/astra on #65: a runtime before phase 1 checks the deadline only at admission and knows

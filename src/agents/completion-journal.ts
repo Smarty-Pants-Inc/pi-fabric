@@ -118,17 +118,38 @@ interface CompletionClaim { rootId: string; sessionId: string; recipient?: Compl
 // this pending namespace is scanned, never archive history; no body rewrite is needed.
 type ArchiveStat = fs.Stats | fs.BigIntStats;
 const archiveStat = (file: string): ArchiveStat | undefined => {
-  try { return process.platform === "win32" ? fs.statSync(file, { bigint: true }) : fs.statSync(file); }
+  try { return process.platform === "win32" ? fs.lstatSync(file, { bigint: true }) : fs.statSync(file); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 };
 const archiveStatAsync = async (file: string): Promise<ArchiveStat | undefined> => {
-  try { return process.platform === "win32" ? await fs.promises.stat(file, { bigint: true }) : await fs.promises.stat(file); }
+  try { return process.platform === "win32" ? await fs.promises.lstat(file, { bigint: true }) : await fs.promises.stat(file); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 };
 // NTFS file IDs exceed Number's precision. Adding/removing hard links also changes
 // ctime and nlink, so only stable identity (and Windows body size) may bind aliases.
 export const sameArchiveInode = (a: Pick<ArchiveStat, "dev" | "ino" | "size">, b: Pick<ArchiveStat, "dev" | "ino" | "size">): boolean =>
   a.dev === b.dev && a.ino === b.ino && (process.platform !== "win32" || a.size === b.size);
+export class CompletionArchiveConflictError extends Error {
+  readonly code = "COMPLETION_ARCHIVE_CONFLICT";
+  constructor(readonly source: string, readonly target: string) {
+    super(`Completion archive evidence changed at ${target}: not a regular byte-equal copy of ${source}`);
+    this.name = "CompletionArchiveConflictError";
+  }
+}
+// A restored crash-left body can be a separate copy of an already-published archive.
+// Windows link(EEXIST) keeps that archive, unlike POSIX rename. Accept only regular
+// lstat endpoints with identical bytes; an inode mismatch alone is not a conflict.
+const confirmWindowsArchiveCopy = (source: string, sourceStat: ArchiveStat, target: string, targetStat: ArchiveStat): void => {
+  if (!sourceStat.isFile() || !targetStat.isFile() || sourceStat.size !== targetStat.size) throw new CompletionArchiveConflictError(source, target);
+  if (!sameArchiveInode(sourceStat, targetStat) && !fs.readFileSync(source).equals(fs.readFileSync(target))) throw new CompletionArchiveConflictError(source, target);
+};
+const confirmWindowsArchiveCopyAsync = async (source: string, sourceStat: ArchiveStat, target: string, targetStat: ArchiveStat): Promise<void> => {
+  if (!sourceStat.isFile() || !targetStat.isFile() || sourceStat.size !== targetStat.size) throw new CompletionArchiveConflictError(source, target);
+  if (!sameArchiveInode(sourceStat, targetStat)) {
+    const [sourceBody, targetBody] = await Promise.all([fs.promises.readFile(source), fs.promises.readFile(target)]);
+    if (!sourceBody.equals(targetBody)) throw new CompletionArchiveConflictError(source, target);
+  }
+};
 const archiveCompletion = (source: string): boolean => {
   const target = path.join(path.dirname(source), "archive", path.basename(source));
   const evidence = path.join(path.dirname(source), "archive-pending", path.basename(source));
@@ -163,16 +184,24 @@ const archiveCompletion = (source: string): boolean => {
   }
   const stat = archiveStat(target);
   if (!stat) return false;
-  if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
-  if (process.platform === "win32" && sourceStat && !sameArchiveInode(sourceStat, stat)) {
-    throw new Error(`Completion archive evidence changed at ${target}`);
+  if (!stat.isFile()) {
+    if (process.platform === "win32") throw new CompletionArchiveConflictError(source, target);
+    throw new Error(`Completion archive is not a file at ${target}`);
   }
-  // Windows publication leaves both names; POSIX rename is a no-op if they
-  // already name the same inode after crash recovery/concurrent linking.
-  const leftover = archiveStat(source);
-  if (leftover && sameArchiveInode(leftover, stat)) fs.rmSync(source, { force: true });
-  syncPathNamespace(target, stat); // Archive directory, source directory, then ancestors.
-  if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  if (process.platform === "win32") {
+    syncPathNamespace(target, stat);
+    const leftover = archiveStat(source);
+    // Validate BOTH names before releasing either, including evidence-only recovery.
+    if (leftover) confirmWindowsArchiveCopy(source, leftover, target, stat);
+    if (evidenceStat) confirmWindowsArchiveCopy(evidence, evidenceStat, target, stat);
+    if (leftover) fs.rmSync(source, { force: true });
+  } else {
+    // POSIX rename is a no-op if both names already refer to the same inode.
+    const leftover = archiveStat(source);
+    if (leftover && sameArchiveInode(leftover, stat)) fs.rmSync(source, { force: true });
+    syncPathNamespace(target, stat); // Archive directory, source directory, then ancestors.
+    if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  }
   fs.rmSync(evidence, { force: true });
   recipientCache.delete(source);
   return true;
@@ -207,14 +236,22 @@ const archiveCompletionAsync = async (source: string): Promise<boolean> => {
   }
   const stat = await archiveStatAsync(target);
   if (!stat) return false;
-  if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
-  if (process.platform === "win32" && sourceStat && !sameArchiveInode(sourceStat, stat)) {
-    throw new Error(`Completion archive evidence changed at ${target}`);
+  if (!stat.isFile()) {
+    if (process.platform === "win32") throw new CompletionArchiveConflictError(source, target);
+    throw new Error(`Completion archive is not a file at ${target}`);
   }
-  const leftover = await archiveStatAsync(source);
-  if (leftover && sameArchiveInode(leftover, stat)) await fs.promises.rm(source, { force: true });
-  await syncPathNamespaceAsync(target, stat);
-  if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  if (process.platform === "win32") {
+    await syncPathNamespaceAsync(target, stat);
+    const leftover = await archiveStatAsync(source);
+    if (leftover) await confirmWindowsArchiveCopyAsync(source, leftover, target, stat);
+    if (evidenceStat) await confirmWindowsArchiveCopyAsync(evidence, evidenceStat, target, stat);
+    if (leftover) await fs.promises.rm(source, { force: true });
+  } else {
+    const leftover = await archiveStatAsync(source);
+    if (leftover && sameArchiveInode(leftover, stat)) await fs.promises.rm(source, { force: true });
+    await syncPathNamespaceAsync(target, stat);
+    if (evidenceStat && !sameArchiveInode(evidenceStat, stat)) throw new Error(`Completion archive evidence changed at ${target}`);
+  }
   await fs.promises.rm(evidence, { force: true });
   recipientCache.delete(source);
   return true;

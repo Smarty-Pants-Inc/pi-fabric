@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, sameArchiveInode, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionArchiveConflictError, CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, sameArchiveInode, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
 import { syncPathNamespace, syncPathNamespaceAsync } from "../src/core/atomic-write.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import type { MeshStore } from "../src/mesh/store.js";
@@ -411,18 +411,90 @@ describe("completion receipt-time archive", () => {
     expect(enqueue).not.toHaveBeenCalled(); expect(journal.result(result.id)).toMatchObject({ text: result.text });
   });
 
-  it.each(["sync", "async"] as const)("Windows refuses to replace a conflicting archive inode (%s)", async mode => {
-    const h = setup(); const result = h.seed(1); const crash = crashBeforeArchive(h.file(result.id));
+  it.each([
+    { mode: "sync", evidenceOnly: false }, { mode: "async", evidenceOnly: false },
+    { mode: "sync", evidenceOnly: true }, { mode: "async", evidenceOnly: true },
+  ] as const)("Windows accepts a pre-existing byte-equal archive copy ($mode, evidenceOnly=$evidenceOnly)", async ({ mode, evidenceOnly }) => {
+    const h = setup(); const result = h.seed(1); const source = h.file(result.id);
+    const body = fs.readFileSync(source); const crash = crashBeforeArchive(source);
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow(); crash.mockRestore();
+    const evidence = path.join(h.directory, "archive-pending", path.basename(source));
+    fs.mkdirSync(path.dirname(h.archive(result.id)), { recursive: true });
+    fs.writeFileSync(h.archive(result.id), body); // Separate inode, not another hard link.
+    const before = fs.statSync(h.archive(result.id), { bigint: true });
+    expect(before.ino).not.toBe(fs.statSync(evidence, { bigint: true }).ino);
+    const receipt = fs.readFileSync(h.receipt(result.id));
+    if (evidenceOnly) fs.rmSync(source);
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const remove = mode === "sync" ? vi.spyOn(fs, "rmSync") : vi.spyOn(fs.promises, "rm");
+    const link = mode === "sync" ? vi.spyOn(fs, "linkSync") : vi.spyOn(fs.promises, "link");
+    const enqueue = vi.fn(); const journal = h.journal(enqueue);
+    for (let pass = 0; pass < 2; pass++) {
+      if (mode === "sync") consumeCompletion(h.meshRoot, result.id, "other");
+      else await journal.drain();
+    }
+    expect(remove.mock.calls.filter(([file]) => String(file) === source)).toHaveLength(evidenceOnly ? 0 : 1);
+    expect(remove.mock.calls.some(([file]) => String(file) === evidence)).toBe(true);
+    expect(remove.mock.calls.some(([file]) => String(file) === h.archive(result.id))).toBe(false);
+    expect(link.mock.calls.filter(([, to]) => String(to) === h.archive(result.id))).toHaveLength(evidenceOnly ? (mode === "sync" ? 0 : 1) : 1);
+    expect(fs.existsSync(source)).toBe(false); expect(fs.existsSync(evidence)).toBe(false);
+    expect(fs.readFileSync(h.archive(result.id))).toEqual(body);
+    expect(fs.statSync(h.archive(result.id), { bigint: true })).toMatchObject({ dev: before.dev, ino: before.ino, mtimeNs: before.mtimeNs });
+    expect(fs.readFileSync(h.receipt(result.id))).toEqual(receipt);
+    expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+    expect(enqueue).not.toHaveBeenCalled(); expect(journal.result(result.id)).toMatchObject({ text: result.text });
+  });
+
+  it.each([
+    { mode: "sync", sameSize: false, evidenceOnly: false }, { mode: "async", sameSize: false, evidenceOnly: false },
+    { mode: "sync", sameSize: true, evidenceOnly: false }, { mode: "async", sameSize: true, evidenceOnly: false },
+    { mode: "sync", sameSize: true, evidenceOnly: true }, { mode: "async", sameSize: true, evidenceOnly: true },
+  ] as const)("Windows retains all conflicting archive evidence ($mode, sameSize=$sameSize, evidenceOnly=$evidenceOnly)", async ({ mode, sameSize, evidenceOnly }) => {
+    const h = setup(); const result = h.seed(1); const source = h.file(result.id);
+    const body = fs.readFileSync(source, "utf8"); const crash = crashBeforeArchive(source);
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow(); crash.mockRestore();
+    const evidence = path.join(h.directory, "archive-pending", path.basename(source));
+    fs.mkdirSync(path.dirname(h.archive(result.id)), { recursive: true });
+    const conflict = sameSize ? body.replace("retained result", "altered result!") : "conflicting archive";
+    if (sameSize) expect(Buffer.byteLength(conflict)).toBe(Buffer.byteLength(body));
+    expect(conflict).not.toBe(body); fs.writeFileSync(h.archive(result.id), conflict);
+    const receipt = fs.readFileSync(h.receipt(result.id));
+    if (evidenceOnly) fs.rmSync(source);
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const syncRemove = vi.spyOn(fs, "rmSync"); const asyncRemove = vi.spyOn(fs.promises, "rm");
+    let failure: unknown;
+    try {
+      if (mode === "sync") consumeCompletion(h.meshRoot, result.id, "main");
+      else await h.journal().drain();
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(CompletionArchiveConflictError);
+    expect(failure).toMatchObject({ code: "COMPLETION_ARCHIVE_CONFLICT", target: h.archive(result.id) });
+    expect(syncRemove).not.toHaveBeenCalled(); expect(asyncRemove).not.toHaveBeenCalled();
+    expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe(conflict);
+    if (!evidenceOnly) expect(fs.readFileSync(source, "utf8")).toBe(body);
+    else expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(evidence, "utf8")).toBe(body);
+    expect(fs.readFileSync(h.receipt(result.id))).toEqual(receipt);
+    expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32").each(["sync", "async"] as const)("Windows rejects a byte-equal symlink archive without deleting evidence (%s)", async mode => {
+    const h = setup(); const result = h.seed(1); const source = h.file(result.id); const crash = crashBeforeArchive(source);
     expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow(); crash.mockRestore();
     fs.mkdirSync(path.dirname(h.archive(result.id)), { recursive: true });
-    fs.writeFileSync(h.archive(result.id), "conflicting archive");
+    fs.symlinkSync(source, h.archive(result.id));
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-    if (mode === "sync") expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("Completion archive evidence changed");
-    else await expect(h.journal().drain()).rejects.toThrow("Completion archive evidence changed");
-    expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe("conflicting archive");
-    expect(fs.existsSync(h.file(result.id))).toBe(true);
-    expect(fs.existsSync(path.join(h.directory, "archive-pending", path.basename(h.file(result.id))))).toBe(true);
-    expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+    const syncRemove = vi.spyOn(fs, "rmSync"); const asyncRemove = vi.spyOn(fs.promises, "rm");
+    let failure: unknown;
+    try {
+      if (mode === "sync") consumeCompletion(h.meshRoot, result.id, "main");
+      else await h.journal().drain();
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(CompletionArchiveConflictError);
+    expect(syncRemove).not.toHaveBeenCalled(); expect(asyncRemove).not.toHaveBeenCalled();
+    expect(fs.lstatSync(h.archive(result.id)).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(source)).toBe(true);
+    expect(fs.existsSync(path.join(h.directory, "archive-pending", path.basename(source)))).toBe(true);
   });
 
   it("tolerates a consumer racing synchronous publication and keeps the first receipt", () => {

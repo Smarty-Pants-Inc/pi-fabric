@@ -309,8 +309,11 @@ export class ResidentHost {
     const publishFenced = <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>): Promise<T> => {
       let scoped: ActorRegistryStore[] | undefined;
       if (actorIds && actorIds.size > 0) {
-        const holders = [...actorIds].map(id => knownRegistries.find(known => current(known).byId.has(id))?.store);
-        if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
+        // ponytail: an unreadable snapshot only loses the scoping; the full fence (and its own reads) decide.
+        try {
+          const holders = [...actorIds].map(id => knownRegistries.find(known => current(known).byId.has(id))?.store);
+          if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
+        } catch { scoped = undefined; }
       }
       return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50));
     };

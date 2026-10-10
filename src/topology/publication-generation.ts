@@ -5,32 +5,6 @@ import type { MeshStateEntry } from "../mesh/store.js";
 import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "./host-leases.js";
 import { readParticipantFile } from "./participant-files.js";
 
-/** Cheap invalidation of a prepared ownership observation. Atomic replacements
- * change the file inode / parent change-time, even within one wall-clock tick.
- * Windows directory timestamps are not replacement receipts: include leaf stamps.
- * This is validation, never authority; callers still prepare a fresh directory read. */
-export const publicationGeneration = (meshRoot: string): string => {
-  const stamp = (file: string): string => {
-    try {
-      const stat = fs.statSync(file, { bigint: true });
-      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
-      throw error;
-    }
-  };
-  const files = [path.join(meshRoot, "state.json")];
-  for (const name of ["participants", "host-leases"]) {
-    const directory = path.join(meshRoot, name);
-    files.push(directory);
-    if (process.platform === "win32") {
-      try { files.push(...fs.readdirSync(directory).filter(file => file.endsWith(".json")).sort().map(file => path.join(directory, file))); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    }
-  }
-  return files.map(stamp).join("|");
-};
-
 const stampOf = (file: string): string => {
   try {
     const stat = fs.statSync(file, { bigint: true });
@@ -39,6 +13,47 @@ const stampOf = (file: string): string => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
     throw error;
   }
+};
+
+/** Stamp of one directory beside the mesh (`participants`, `host-leases`): it changes when a file
+ * in it is created, replaced by rename or removed. Windows directory timestamps are not replacement
+ * receipts, so there the leaf stamps are included. Validation only, never authority: a caller that
+ * read the directory before the state transaction (smarty-dev#6477 R11) compares this stamp inside
+ * the transaction and reads again only when it moved. */
+export const meshDirectoryStamp = (meshRoot: string, name: string): string => {
+  const directory = path.join(meshRoot, name);
+  const files = [directory];
+  if (process.platform === "win32") {
+    try { files.push(...fs.readdirSync(directory).filter(file => file.endsWith(".json")).sort().map(file => path.join(directory, file))); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+  return files.map(stampOf).join("|");
+};
+
+/** A mesh whose ACTIVE state backend names its committed revision (smarty-dev#6477 R7, MeshStore).
+ * `stateRevision()` is undefined when state.json is the authority (file, shadow): its stat stands
+ * in. A backend that commits elsewhere (SQLite) returns its commit stamp, comparable across time
+ * and connections. Required, not optional: a source without it would silently stamp a state.json
+ * that SQLite commits never update (pi-fabric#640 review round 1, P1). */
+export interface PublicationGenerationSource {
+  readonly root: string;
+  stateRevision(): string | undefined;
+}
+
+/** Stamp of the committed shared state: the ACTIVE backend's revision when it names one (SQLite),
+ * else the state.json leaf stamp (file, shadow). A bare root names a file-backed mesh (tests, tools
+ * without a store); a store names its backend. */
+const sharedStateStamp = (mesh: string | PublicationGenerationSource): string => {
+  const revision = typeof mesh === "string" ? undefined : mesh.stateRevision();
+  return revision === undefined ? stampOf(path.join(typeof mesh === "string" ? mesh : mesh.root, "state.json")) : `revision:${revision}`;
+};
+
+/** Cheap invalidation of a prepared ownership observation. Atomic replacements
+ * change the file inode / parent change-time, even within one wall-clock tick.
+ * This is validation, never authority; callers still prepare a fresh directory read. */
+export const publicationGeneration = (mesh: string | PublicationGenerationSource): string => {
+  const meshRoot = typeof mesh === "string" ? mesh : mesh.root;
+  return [sharedStateStamp(mesh), meshDirectoryStamp(meshRoot, "participants"), meshDirectoryStamp(meshRoot, "host-leases")].join("|");
 };
 
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -83,6 +98,23 @@ const hostDeadline = (id: string, entry: MeshStateEntry | undefined, lease: Fabr
   return lease?.expiresAt;
 };
 
+/** A store that reads one shared-state key at a time (MeshStore; the file store's get). */
+export interface OwnershipPointReadSource {
+  get(key: string, options?: { fresh?: boolean }): MeshStateEntry | undefined;
+}
+
+/**
+ * smarty-dev#6477: the `openState` of `observeActorOwnership` for a live store. Ownership depends on
+ * a handful of keys per actor (its participant record, its owner host record, its root's lineage
+ * closure), so each is a fresh POINT read: a primary-key lookup on SQLite, the stamp-validated
+ * state cache on file. Never a fresh full-state snapshot (`stateToken({ fresh: true })`): on SQLite
+ * that rebuilds the whole state on every commit anywhere on the hub, and registry saves validate
+ * UNDER the actor-registry locks that the resident host heartbeat needs too. Per-key reads need no
+ * cross-key snapshot: validation compares each key on its own, and the stamp is read before them.
+ */
+export const ownershipPointReads = (mesh: OwnershipPointReadSource) => (): ((key: string) => MeshStateEntry | undefined) =>
+  (key: string) => mesh.get(key, { fresh: true });
+
 /** One prepared observation of the ownership inputs of specific actors. */
 export interface ActorOwnershipObservation {
   /** Narrow validation to the actors the save will actually write (call before unchanged()). */
@@ -106,9 +138,11 @@ export interface ActorOwnershipObservation {
  * a moved or removed participant or a closed lineage still does. Leaf files only, so the
  * Windows leaf-stamp behaviour is the behaviour on every platform.
  * Validation, never authority: callers still decide ownership from a fresh directory read.
+ * `openState` returns a reader of shared-state entries current at the call; pass
+ * `ownershipPointReads(store)` (smarty-dev#6477), never a full-state snapshot.
  */
 export const observeActorOwnership = (
-  meshRoot: string,
+  mesh: string | PublicationGenerationSource,
   actorIds: Iterable<string>,
   openState?: () => (key: string) => MeshStateEntry | undefined,
   options: { now?: () => number } = {},
@@ -118,9 +152,11 @@ export const observeActorOwnership = (
   // kept only while still live at this instant (an already-lapsed lease was not relied on).
   const observedAt = clock();
   const live = (deadline: number | undefined): number => deadline !== undefined && deadline >= observedAt ? deadline : Number.POSITIVE_INFINITY;
-  const statePath = path.join(meshRoot, "state.json");
-  // Leaf stamp first, then content: a write between them changes the stamp and is compared.
-  const stateStamp = stampOf(statePath);
+  const meshRoot = typeof mesh === "string" ? mesh : mesh.root;
+  // Stamp first, then content: a commit between them changes the stamp and is compared. The stamp
+  // follows the ACTIVE backend (pi-fabric#640): SQLite commits never touch state.json, so a
+  // state.json stamp would pass every shared ownership change on SQLite unseen.
+  const stateStamp = sharedStateStamp(mesh);
   const state = openState?.();
   const participants = new Map<string, { key: string; file: string; stamp: string; facts: string; shared: string; owners: string[]; roots: string[]; deadline: number }>();
   const hosts = new Map<string, { file: string; stamp: string; facts: string; shared: string; deadline: number }>();
@@ -182,7 +218,7 @@ export const observeActorOwnership = (
         const host = hosts.get(id)!;
         if (stampOf(host.file) !== host.stamp && leaseFacts(readHostLeaseCurrent(meshRoot, id)) !== host.facts) return false;
       }
-      if (stampOf(statePath) === stateStamp || !openState) return true;
+      if (sharedStateStamp(mesh) === stateStamp || !openState) return true;
       const current = openState();
       return records.every(record => participantFacts(current(record.key)) === record.shared) &&
         [...owners].every(id => hostFacts(current(HOST_PREFIX + digest(id))) === hosts.get(id)!.shared) &&

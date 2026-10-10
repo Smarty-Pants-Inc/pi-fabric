@@ -19,6 +19,7 @@ import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
+import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
@@ -40,7 +41,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   if (process.platform !== "win32" && process.connected && process.send) process.send({ type: "fabric-execution-settled" }, () => resolve());
   else resolve();
 });
-import { retryableProviderError } from "./worker/provider-error.js";
+import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -268,24 +269,16 @@ const writeCrashStatus = (error: unknown): void => {
     // to "Agent transport exited without a result".
   }
 };
-let crashPending = false;
-const finishCrash = async (error: unknown): Promise<void> => {
-  if (crashPending) return;
-  crashPending = true;
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-  try {
-    // A crash result is not an exit receipt. Do not publish it (or exit this
-    // custodian) until every admitted execution obligation has been drained.
-    await executionCleanup();
-    await executionSettled();
-    writeCrashStatus(error);
-    process.exit(1);
-  } catch (cleanupError) {
-    console.error(`Crash cleanup unresolved; retaining execution custody: ${String(cleanupError)}`);
-    // Keep the custodian available to its parent even if no native pipes remain.
-    setInterval(() => {}, 1000);
-  }
-};
+const crash = createCrashFinisher({
+  cleanup: () => executionCleanup(),
+  settled: () => executionSettled(),
+  report: writeCrashStatus,
+  exit: code => process.exit(code),
+  log: text => console.error(text),
+  // Keep the custodian available to its parent even if no native pipes remain.
+  retain: () => { setInterval(() => {}, 1000); },
+});
+const finishCrash = crash.finish;
 process.on("uncaughtException", (error) => { void finishCrash(error); });
 process.on("unhandledRejection", (error) => { void finishCrash(error); });
 
@@ -733,6 +726,23 @@ const main = async (): Promise<void> => {
   let hasFinalText = false;
   let hasFinalResult = false;
   let producedFinalAnswer = false;
+  let completedToolInTurn = false;
+  let hasCompletedToolTurn = false;
+  let streamingToolCallInTurn = false;
+  const unresolvedToolCalls = new Set<string>();
+
+  // Only ordinary tasks with real, completed tool work and retained prose can
+  // expose an interrupted report without claiming success. Never suppress
+  // recovery for cancellation, schema/admission failures, lost events, actors,
+  // or an interrupted turn with unresolved tool work.
+  const canKeepInterruptedOutput = (error: string): boolean => options.runner === "pi" &&
+    !options.actorId && !options.actorName && !options.residentStartupProbe &&
+    hasCompletedToolTurn && !streamingToolCallInTurn && unresolvedToolCalls.size === 0 &&
+    Boolean(record.partialText || record.lastCompleteText) &&
+    modelControl.ready && !providerAborted && !lostResult && !record.errorCode &&
+    terminalStatus !== "stopped" && terminalStatus !== "timed_out" &&
+    record.compaction?.status !== "queued" && record.compaction?.status !== "in_flight" &&
+    record.compaction?.status !== "failed" && interruptedModelStreamError(error);
 
   const update = (): void => updateRunRecord(options.statusFile, record);
   let killTimer: NodeJS.Timeout | undefined;
@@ -1455,11 +1465,37 @@ const main = async (): Promise<void> => {
       toolCallStreamGuard.observe(event);
       if (terminalStatus) return;
     }
+    if (event.type === "message_start" && !terminalStatus &&
+        (event.message as Record<string, unknown> | undefined)?.role === "assistant") {
+      delete record.partialText;
+      streamingToolCallInTurn = false;
+      hasFinalText = false;
+      hasFinalResult = false;
+      update(); // Keep lastCompleteText from the previous turn on disk.
+    }
     if (event.type === "message_update" && !terminalStatus) {
-      const delta = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      const delta = (event.assistantMessageEvent ?? event.event) as Record<string, unknown> | undefined;
+      if (delta && ["toolcall_start", "toolcall_delta", "toolcall_end"].includes(String(delta.type))) {
+        // A generated call is unresolved until its execution ends, not merely
+        // until its argument stream ends. A prior completed turn cannot bless it.
+        streamingToolCallInTurn = true;
+      }
       if (delta && ["text_delta", "thinking_delta", "toolcall_delta"].includes(String(delta.type)) &&
           typeof delta.delta === "string" && delta.delta.length > 0) {
         if (!record.inferenceStarted) { record.inferenceStarted = true; update(); }
+      }
+      const message = event.message as Record<string, unknown> | undefined;
+      if (message?.role === "assistant" && Array.isArray(message.content) && message.content.some(block =>
+        typeof block === "object" && block !== null && block.type === "toolCall")) streamingToolCallInTurn = true;
+      // Native Pi repeats the complete partial message; legacy frames may only
+      // carry a delta. Never append both, or include thinking/tool arguments.
+      const text = message?.role === "assistant" ? extractText(message)
+        : delta?.type === "text_delta" && typeof delta.delta === "string"
+        ? (record.partialText ?? "") + delta.delta : "";
+      if (text) {
+        record.partialText = latestRunText(text);
+        record.text = record.partialText;
+        update(); // Atomic status.json replacement on every text snapshot.
       }
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
@@ -1524,6 +1560,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
       if (typeof event.toolName === "string") {
@@ -1535,6 +1572,8 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
+      completedToolInTurn = true;
       if (event.isError === true) {
         emitLifecycle("pi.tool_error", {
           ...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}),
@@ -1547,6 +1586,8 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "turn_end") {
+      hasCompletedToolTurn ||= completedToolInTurn && !streamingToolCallInTurn && unresolvedToolCalls.size === 0;
+      completedToolInTurn = false;
       emitLifecycle("pi.turn_end", {
         ...(typeof event.turnIndex === "number" ? { turnIndex: event.turnIndex } : {}),
       });
@@ -1571,6 +1612,15 @@ const main = async (): Promise<void> => {
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
+      const toolCalls = Array.isArray(messageRecord.content)
+        ? messageRecord.content.filter((block): block is Record<string, unknown> =>
+          typeof block === "object" && block !== null && block.type === "toolCall") : [];
+      for (const call of toolCalls) unresolvedToolCalls.add(stringField(call.id) ?? "unknown-tool-call");
+      if (toolCalls.length > 0 && messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+        // The complete message identifies every generated call; pending IDs now
+        // carry the obligation until matching tool_execution_end frames arrive.
+        streamingToolCallInTurn = false;
+      }
       const text = extractText(messageRecord);
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
@@ -1580,7 +1630,15 @@ const main = async (): Promise<void> => {
       producedFinalAnswer ||= hasFinalText;
       if (text) {
         record.text = latestRunText(text);
+        if (messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+          record.partialText = record.text;
+        } else {
+          record.lastCompleteText = record.text;
+        }
         process.stdout.write(`\n${text}\n`);
+      }
+      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+        delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
       applyUsage(record, messageRecord);
@@ -1911,6 +1969,9 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    streamingToolCallInTurn = false;
+    unresolvedToolCalls.clear();
+    completedToolInTurn = false;
     sawAgentError = false;
     retryPending = false;
     terminalError = undefined;
@@ -2031,6 +2092,9 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_whitespace_toolcall_retry", ...resume })}\n`);
       toolCallStreamGuard = createToolCallStreamGuard();
     } else {
+      // Reporting retained output must not invoke another model to regenerate
+      // the final answer or replay any already-completed tool work (#7567).
+      if (canKeepInterruptedOutput(terminalError ?? stderr.trim())) break;
       if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
           (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
           record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
@@ -2078,7 +2142,7 @@ const main = async (): Promise<void> => {
   }
   await executionSettled();
 
-  if (crashPending) return; // finishCrash owns result publication after the drain.
+  if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
@@ -2201,6 +2265,16 @@ const main = async (): Promise<void> => {
       (exitCode === 0
         ? `${runnerLabel(options.runner)} agent reported an error before exiting`
         : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);
+  }
+  const interruptedText = record.partialText || record.lastCompleteText;
+  if (record.status === "failed" && interruptedText && canKeepInterruptedOutput(record.error ?? "")) {
+    const warning = `final report interrupted by a model stream error; showing the last persisted output: ${record.error}`;
+    // Retain the native failure/exit code. Partial prose (even a verdict or
+    // valid JSON prefix) must never pass completed-only consumers.
+    record.partialText = interruptedText;
+    record.text = interruptedText;
+    record.warnings = [...(record.warnings ?? []), warning].slice(-20);
+    appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
   }
   if (record.status === "completed" && replyFile) {
     // The reply is the tool call's arguments, and nothing else: final text is never parsed for it,

@@ -8,6 +8,35 @@ inline `messages` array so old loaders can accept and save it safely. Bounded
 filter-skip-only journals remain inline soft telemetry until substantive history
 exists, preserving the existing no-fsync filter poll contract.
 
+## Decoded read cache
+
+Stores for the same normalized path share an immutable decoded view, bounded to
+64 least-recently-read paths and released when the owning manager closes. Every
+read opens the file and checks its descriptor's device, inode, size, nanosecond
+mtime and ctime. Zero inode or timestamp identities are unproven and always
+re-read; atomic replacements remain bound to the opened descriptor.
+
+The read-start age proof requires the filesystem clock to be the host's own.
+On Linux, the registry directory is lazily checked with `statfsSync` and only
+ext2/3/4, XFS, btrfs, tmpfs, overlayfs, f2fs and ZFS are trusted. Normalized aliases
+share a verdict, with at most 64 directory verdicts retained; an evicted or
+explicitly released directory is checked again. NFS, SMB/CIFS, FUSE, unknown or
+unavailable types, and non-Linux platforms (including Windows/macOS, whose type
+values are not comparable) always re-read/re-validate and never retain decoded
+cache entries. Thus a remote server clock behind the client cannot make a fresh
+same-size, same-timestamp-bucket rewrite look old enough for a stale cache hit.
+
+On trusted local filesystems, nonzero timestamps can still be coarse (up to a
+two-second quantum). Each cached generation therefore records its wall-clock
+read-start time. Its bytes
+are reusable only when the descriptor mtime is **strictly older** than that
+recorded time minus two seconds. Recent, exactly-two-second-old and future
+mtimes re-read and re-validate JSON and never return cached bytes, even if
+the identity key is unchanged. A racy entry never becomes trusted just because
+time passes: the next read must first decode it again and record a new read
+time. Once the file has settled, subsequent reads hit. This adds no timer or
+background poll and preserves the device/inode/size/mtime/ctime key.
+
 ## History and crash safety
 
 `<actor-id>/registry/messages.jsonl` is append-only. Each transaction contains
@@ -36,7 +65,7 @@ registry rename and completion of checkpoint publication, an old release may
 obscure that **unacknowledged** head; the previously checkpointed, acknowledged
 history remains recoverable. Checkpoint completion is part of acknowledgment,
 not background work. A leading newline isolates a torn append; readers select
-exact committed ranges rather than parsing the whole growing log. Invalid or
+exact committed ranges and do not parse the whole growing log. Invalid or
 truncated history/checkpoints are errors, not empty guessed histories to save
 back. Paths are derived from actor ids, never from a stored path.
 

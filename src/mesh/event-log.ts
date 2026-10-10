@@ -27,7 +27,7 @@ export interface MeshEvent {
   verification?: "mesh" | "bridge";
   id: string;
   sequence: number;
-  /** Host-only once-publication identity; never accepted from the public mesh provider. */
+  /** Host-only once-publication identity; the provider namespaces trusted component keys. */
   dedupeKey?: string;
   topic: string;
   kind: string;
@@ -40,7 +40,7 @@ export interface MeshEvent {
 
 export interface MeshPublishInput {
   topic: string;
-  /** Host-only durable publication receipt; never accepted by the public provider. */
+  /** Host-only durable publication receipt; model-authored provider calls cannot supply it. */
   dedupeKey?: string;
   /** Host-only durability fence; batches share this barrier across their prefix. */
   durable?: boolean;
@@ -52,8 +52,21 @@ export interface MeshPublishInput {
   signal?: AbortSignal | undefined;
   /** Host-only relay metadata. */
   principal?: FabricPrincipal | undefined;
-  /** A function receives commit time under the lock. */
+  /** A function receives commit time under the lock. Fixed data is encoded before the lock. */
   data?: unknown;
+  /**
+   * Host-only admission check (smarty-dev#6729): runs under `.lock`, inside `fence`, where a
+   * `data` stamp runs, before anything is written; a throw refuses the event. It lets a caller
+   * whose data does not depend on commit time keep a commit-time check and still have its
+   * envelope encoded before the lock.
+   */
+  admit?: () => void;
+  /**
+   * Host-only (smarty-dev#6477 R20): runs the commit step, from the `data` stamp through the live
+   * append, inside a caller's synchronous fence (the bridge's state write fence), under `.lock`.
+   * A fence that throws before running it leaves nothing appended.
+   */
+  fence?: <T>(commit: () => T) => T;
 }
 
 export interface MeshTailResult {
@@ -66,8 +79,12 @@ export interface MeshTailResult {
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
+const DEFAULT_DEDUPE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_DEDUPE_RECEIPTS = 100_000;
 const EVENT_READ_PAGE_BYTES = 4 * 1024 * 1024;
 const EVENT_READ_CHUNK_BYTES = 64 * 1024;
+/** First read of the live log's last line (see #readLastEventSequence). */
+const LAST_LINE_PROBE_BYTES = 16 * 1024;
 // Line ends remembered from recent read({ after }) scans: enough for every reader near the log head.
 const READ_HINT_LINES = 128;
 const CURSOR_OFFSET_BASE = 2 ** 32;
@@ -103,6 +120,19 @@ interface MeshDedupeIntent {
   archiveDir?: string;
 }
 
+/** Durability work a single publish runs AFTER `.lock` is released and before it resolves
+ * (smarty-dev#6477 E1). Set by the committed hold only; a failed attempt never sets it. */
+interface AfterUnlock {
+  finish?: (() => Promise<void> | void) | undefined;
+  /** Set with `finish` when `finish` is the live barrier followed by this receipt step: a batch
+   * runs one barrier for all its events, then each receipt step in order (smarty-dev#6729). */
+  receipt?: (() => Promise<void> | void) | undefined;
+}
+
+// One live-log barrier per root, shared by every confirmation queued before it STARTS. A
+// later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
+const eventBarriers = new Map<string, Promise<void>>();
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -111,9 +141,23 @@ export class MeshDedupeRecoveryError extends Error {
   }
 }
 
+/** New keyed publication cannot fit without losing protected recovery evidence. */
+export class MeshDedupeStoreFullError extends Error {
+  readonly code = "FABRIC_MESH_DEDUPE_STORE_FULL";
+  readonly retryable = true;
+  constructor(readonly maxDedupeReceipts: number) {
+    super(`Mesh dedupe store is full (${maxDedupeReceipts} keys); settle pending intents before publishing a new key`);
+    this.name = "MeshDedupeStoreFullError";
+  }
+}
+
 export interface EventLogOptions {
   maxEventLogBytes?: number;
   retainedEventLogBytes?: number;
+  /** Receipt lifetime from publication; enforced at compaction/capacity pressure. Default 7 days. */
+  dedupeReceiptTtlMs?: number;
+  /** Hard cap on receipt/intent keys; protected pending intents can refuse new keys. Default 100,000. */
+  maxDedupeReceipts?: number;
 }
 
 export class EventLog {
@@ -126,6 +170,8 @@ export class EventLog {
   readonly #generationPath: string;
   readonly #maxEventLogBytes: number;
   readonly #retainedEventLogBytes: number;
+  readonly #dedupeReceiptTtlMs: number;
+  readonly #maxDedupeReceipts: number;
   /**
    * Line ends (sequence, offset) that recent read({ after }) scans passed, by rising sequence. A
    * read starts at the last one at or below its cursor. One remembered point was not enough:
@@ -150,6 +196,14 @@ export class EventLog {
     this.#eventsPath = path.join(root, "events.jsonl");
     this.#counterPath = path.join(root, "sequence");
     this.#generationPath = path.join(root, "generation");
+    this.#dedupeReceiptTtlMs = options.dedupeReceiptTtlMs ?? DEFAULT_DEDUPE_RECEIPT_TTL_MS;
+    this.#maxDedupeReceipts = options.maxDedupeReceipts ?? DEFAULT_MAX_DEDUPE_RECEIPTS;
+    if (!Number.isSafeInteger(this.#dedupeReceiptTtlMs) || this.#dedupeReceiptTtlMs < 1) {
+      throw new Error("dedupeReceiptTtlMs must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.#maxDedupeReceipts) || this.#maxDedupeReceipts < 1) {
+      throw new Error("maxDedupeReceipts must be a positive safe integer");
+    }
     this.#maxEventLogBytes = Math.min(
       CURSOR_OFFSET_BASE - 1,
       Math.max(maxEventBytes + 2, Math.floor(options.maxEventLogBytes ?? DEFAULT_MAX_EVENT_LOG_BYTES)),
@@ -172,7 +226,100 @@ export class EventLog {
     try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
   }
 
-  #readDedupeReceipt(dedupeKey: string): MeshEvent | undefined {
+  /** Fsync the live log and its namespace outside `.lock`. Group commit: callers whose append
+   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). */
+  #confirmEventsAfterRelease(): Promise<void> {
+    const file = this.#eventsPath;
+    const queued = eventBarriers.get(file);
+    if (queued) return queued;
+    const barrier = new Promise<void>((resolve, reject) => {
+      setImmediate(() => {
+        eventBarriers.delete(file);
+        try { this.#confirmEventFile(file); resolve(); }
+        catch (error) { reject(error); }
+      });
+    });
+    eventBarriers.set(file, barrier);
+    return barrier;
+  }
+
+  /** The live barrier stays after release. Receipt installation/removal reacquires .lock
+   * and compares the intent identity: compaction or a retry may already have settled and
+   * evicted it, or a new publication may now own this same key. Never resurrect a receipt. */
+  #finishLiveReceipt(after: AfterUnlock, event: MeshEvent, intentPath: string, receiptPath: string): void {
+    const finalizeReceipt = (): void => {
+      let intent: MeshDedupeIntent;
+      try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
+          intent.reservedSequence !== event.sequence) return;
+      writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
+      this.#removeDedupeIntent(intentPath);
+    };
+    const receipt = (): Promise<void> => this.#lock.withLock(finalizeReceipt, undefined, "publish");
+    after.receipt = receipt;
+    after.finish = async () => {
+      await this.#confirmEventsAfterRelease();
+      await receipt();
+    };
+  }
+
+  /** Pin the checked receipt through its file barrier; a legacy off-lock writer can still
+   * replace either pathname during this CAS hold. Any mismatch preserves the recovery fence.
+   * Windows needs the same file barrier, not an unsupported directory-fsync assumption. */
+  #cleanupReceiptIntent(event: MeshEvent, intentPath: string): Promise<void> {
+    return this.#lock.withLock(() => {
+      const sameInode = (left: fs.Stats, right: fs.Stats): boolean =>
+        left.dev === right.dev && left.ino === right.ino;
+      try {
+        const intentIdentity = fs.lstatSync(intentPath);
+        if (!intentIdentity.isFile()) return;
+        const intentText = fs.readFileSync(intentPath, "utf8");
+        if (!sameInode(intentIdentity, fs.lstatSync(intentPath))) return;
+        const intent = JSON.parse(intentText) as MeshDedupeIntent;
+        if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
+            intent.reservedSequence !== event.sequence) return;
+        const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
+        const receiptIdentity = fs.lstatSync(receiptPath);
+        if (!receiptIdentity.isFile()) return;
+        // Open only once: validation and fsync must refer to this exact inode, never a
+        // second pathname lookup's descriptor. A replaced receipt is never fsynced here.
+        const fd = fs.openSync(receiptPath, process.platform === "win32" ? "r+" : "r");
+        try {
+          const sameReceipt = (stat: fs.Stats): boolean => stat.isFile() &&
+            sameInode(receiptIdentity, stat) && stat.size === receiptIdentity.size;
+          if (!sameReceipt(fs.fstatSync(fd))) return;
+          const text = fs.readFileSync(fd, "utf8");
+          const current = JSON.parse(text) as MeshEvent;
+          if (current.dedupeKey !== intent.dedupeKey || current.id !== event.id ||
+              current.sequence !== event.sequence || Buffer.byteLength(text, "utf8") !== receiptIdentity.size) return;
+          // Size alone cannot detect an in-place rewrite. Reread at offset zero on the
+          // pinned descriptor, and also check that its pathname still names that inode.
+          const unchanged = (): boolean => {
+            if (!sameReceipt(fs.fstatSync(fd))) return false;
+            const bytes = Buffer.allocUnsafe(receiptIdentity.size);
+            return fs.readSync(fd, bytes, 0, bytes.length, 0) === bytes.length &&
+              bytes.equals(Buffer.from(text, "utf8")) && sameReceipt(fs.fstatSync(fd)) &&
+              sameReceipt(fs.lstatSync(receiptPath));
+          };
+          if (!unchanged()) return;
+          fs.fsyncSync(fd);
+          if (!unchanged()) return;
+          syncPathNamespace(receiptPath, receiptIdentity);
+        } finally { fs.closeSync(fd); }
+        // Close before unlink (Windows delete semantics). Recheck after that close too:
+        // neither a replacement receipt nor a replacement reservation authorizes cleanup.
+        const namedReceipt = fs.lstatSync(receiptPath);
+        if (!sameInode(receiptIdentity, namedReceipt) || namedReceipt.size !== receiptIdentity.size ||
+            fs.readFileSync(intentPath, "utf8") !== intentText) return;
+        const namedIntent = fs.lstatSync(intentPath);
+        if (!sameInode(intentIdentity, namedIntent)) return;
+        this.#removeDedupeIntent(intentPath);
+      } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+    }, undefined, "publish");
+  }
+
+  #readDedupeReceipt(dedupeKey: string, confirm = true): MeshEvent | undefined {
     const file = this.#dedupePath(dedupeKey, ".json");
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
@@ -182,7 +329,7 @@ export class EventLog {
       throw new Error("Invalid event publication receipt");
     }
     // A visible rename whose final barrier failed is not yet a durable receipt.
-    this.#confirmEventFile(file);
+    if (confirm) this.#confirmEventFile(file);
     return event;
   }
 
@@ -213,7 +360,7 @@ export class EventLog {
     }
   }
 
-  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive): MeshEvent | undefined {
+  #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -228,7 +375,18 @@ export class EventLog {
       throw new Error("Invalid event publication intent");
     }
     // A crash may also leave both the receipt and its intent. Never replace a receipt.
-    const prior = this.#readDedupeReceipt(intent.dedupeKey);
+    const prior = this.#readDedupeReceipt(intent.dedupeKey, !after);
+    if (prior && after) {
+      // The receipt became visible after the first lookup (including a legacy off-lock
+      // writer). This confirmation-only path does not install a new receipt.
+      const receiptPath = this.#dedupePath(intent.dedupeKey, ".json");
+      after.receipt = undefined;
+      after.finish = async () => {
+        this.#confirmEventFile(receiptPath);
+        await this.#cleanupReceiptIntent(prior, file);
+      };
+      return prior;
+    }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
     if (!event && intent.archiveDir !== undefined && archive?.dir !== intent.archiveDir) {
@@ -274,6 +432,23 @@ export class EventLog {
         event = archived;
       }
     }
+    if (event && !prior && live && !archive && after) {
+      // No-archive recovery of a dead publisher's live append: nothing durable is written
+      // under this append lock. The intent stays through the off-lock live barrier;
+      // receipt installation later reacquires the lock for an identity CAS.
+      this.#finishLiveReceipt(after, event, file, this.#dedupePath(intent.dedupeKey, ".json"));
+      return event;
+    }
+    if (!event && !archive && after) {
+      // No-archive, nothing committed at the intent's offset (a partial or failed append): the
+      // unlink is ordered under the lock (a same-key writer may replace the intent next), its
+      // namespace barrier runs after release. A crash before it may bring the intent back,
+      // which settles to nothing again: no line can ever match its unique event id.
+      fs.rmSync(file, { force: true });
+      after.receipt = undefined;
+      after.finish = () => syncPathNamespace(path.dirname(file));
+      return undefined;
+    }
     if (event && !prior) {
       if (live) {
         this.#confirmEventFile(this.#eventsPath);
@@ -298,7 +473,7 @@ export class EventLog {
     }
   }
 
-  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }): () => MeshEvent {
+  #preparePublish(input: MeshPublishInput, batch?: { appendStarted: boolean; bytes: number }, after?: AfterUnlock): () => MeshEvent {
     this.#validateTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     const principal = input.principal;
@@ -331,15 +506,47 @@ export class EventLog {
       }
       throw error;
     }
+    // Encoded before the lock (smarty-dev#6729): with fixed data, every envelope byte except the
+    // id, sequence and createdAt is known now, so the commit step only stitches those three in.
+    // The line stays byte-identical to JSON.stringify(event): the same fields in the same order.
+    const kind = input.kind?.trim() || "message";
+    const from = jsonClone(input.from);
+    // Old bridges only wrote data.bridge. It can veto a native attestation, but arbitrary
+    // payload data cannot establish bridge verification or any authority.
+    const verificationOf = (eventData: unknown): MeshEvent["verification"] =>
+      input.from.verified === "bridge" ? "bridge"
+        : eventData && typeof eventData === "object" && "bridge" in eventData ? undefined : "mesh";
+    let encoded: { key: string; fields: string; bytes: number; chars: number; verification: MeshEvent["verification"] } | undefined;
+    if (!stamp) {
+      const verification = verificationOf(fixedData);
+      const key = input.dedupeKey ? `,"dedupeKey":${JSON.stringify(input.dedupeKey)}` : "";
+      const fields = `,${JSON.stringify({
+        topic: input.topic, kind, from,
+        ...(principal ? { principal } : {}),
+        ...(verification ? { verification } : {}),
+        ...(input.to ? { to: input.to } : {}),
+        ...(input.text !== undefined ? { text: input.text } : {}),
+        ...(fixedData !== undefined ? { data: fixedData } : {}),
+      }).slice(1, -1)}`;
+      encoded = { key, fields, verification, bytes: Buffer.byteLength(key + fields, "utf8"), chars: key.length + fields.length };
+    }
     return () => {
+      if (after) { after.finish = undefined; after.receipt = undefined; }
       input.signal?.throwIfAborted();
       const receiptPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".json") : undefined;
       const intentPath = input.dedupeKey ? this.#dedupePath(input.dedupeKey, ".pending.json") : undefined;
       if (input.dedupeKey) {
-        const prior = this.#readDedupeReceipt(input.dedupeKey);
+        const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-          if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
+          // A single publish confirms the visible receipt and unlinks after release.
+          if (after) {
+            after.receipt = undefined;
+            after.finish = async () => {
+              this.#confirmEventFile(receiptPath!);
+              await this.#cleanupReceiptIntent(prior, intentPath!);
+            };
+          } else if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
           return prior;
         }
       }
@@ -367,82 +574,104 @@ export class EventLog {
             throw new MeshDedupeRecoveryError("Event archive reboot recovery is unavailable during dedupe recovery", { cause: error });
           }
         }
-        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive);
+        const prior = this.#settleDedupeIntent(intentPath!, input.dedupeKey, archive, after);
         if (prior) return prior;
       }
       if (archive) {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
         if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
       }
-      const createdAt = Date.now();
-      const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
-      const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-      const event: MeshEvent = {
-        id: randomUUID(),
-        ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-        sequence,
-        topic: input.topic,
-        kind: input.kind?.trim() || "message",
-        from: jsonClone(input.from),
-        ...(principal ? { principal } : {}),
-        // Old bridges only wrote data.bridge. It can veto a native attestation, but
-        // arbitrary payload data cannot establish bridge verification or any authority.
-        ...(input.from.verified === "bridge" ? { verification: "bridge" as const }
-          : eventData && typeof eventData === "object" && "bridge" in eventData ? {}
-          : { verification: "mesh" as const }),
-        ...(input.to ? { to: input.to } : {}),
-        ...(input.text !== undefined ? { text: input.text } : {}),
-        ...(eventData !== undefined ? { data: eventData } : {}),
-        createdAt,
+      const append = (): { event: MeshEvent; line: string; bytes: number } => {
+        input.admit?.();
+        const createdAt = Date.now();
+        const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
+        const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
+        const verification = encoded ? encoded.verification : verificationOf(eventData);
+        const event: MeshEvent = {
+          id: randomUUID(),
+          ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
+          sequence,
+          topic: input.topic,
+          kind,
+          from,
+          ...(principal ? { principal } : {}),
+          ...(verification ? { verification } : {}),
+          ...(input.to ? { to: input.to } : {}),
+          ...(input.text !== undefined ? { text: input.text } : {}),
+          ...(eventData !== undefined ? { data: eventData } : {}),
+          createdAt,
+        };
+        // The stitched parts (id, sequence, createdAt) are ASCII: one byte per character.
+        const line = encoded
+          ? `{"id":${JSON.stringify(event.id)}${encoded.key},"sequence":${sequence}${encoded.fields},"createdAt":${createdAt}}`
+          : JSON.stringify(event);
+        const bytes = encoded ? encoded.bytes + line.length - encoded.chars : Buffer.byteLength(line, "utf8");
+        if (bytes > this.maxEventBytes) {
+          throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+        }
+        // One slot per key, including unresolved intents. Admission must fail closed BEFORE
+        // reserving a sequence or appending (failed compaction cannot grow pending files).
+        if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
+          throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
+        }
+        // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
+        // The archive holds the event durably before it goes live (smarty-dev#754); the live
+        // append commits it. If either step fails, the event is cut back out of the archive.
+        // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
+        // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
+        // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
+        atomicWrite(this.#counterPath, sequence);
+        let liveOffset = 0;
+        try { liveOffset = fs.statSync(this.#eventsPath).size; }
+        catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+        if (intentPath) {
+          // A durable negative lookup exists before the intent. Only begin() can replace it
+          // with the synced archive line address, before any live append.
+          archive?.reserveLookup(sequence);
+          // This is the crash fence: the intent is durable before the live append begins.
+          writeFileAtomic(intentPath, JSON.stringify({
+            dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
+            ...(archive ? { archiveDir: archive.dir } : {}),
+          } satisfies MeshDedupeIntent), { durable: true });
+        }
+        const pending = archive?.begin({ event, line });
+        // Test-only process-death fence: unlike an append exception, no rollback can run.
+        if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
+        try {
+          if (batch) batch.appendStarted = true;
+          fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+        } catch (error) {
+          if (pending) archive!.rollback(pending);
+          throw error;
+        }
+        // This distinct fence leaves the live event complete but the sidecar unconfirmed.
+        if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
+        if (pending) archive!.commit(pending);
+        return { event, line, bytes };
       };
-      const line = JSON.stringify(event);
-      if (Buffer.byteLength(line, "utf8") > this.maxEventBytes) {
-        throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
-      }
-      // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
-      // The archive holds the event durably before it goes live (smarty-dev#754); the live
-      // append commits it. If either step fails, the event is cut back out of the archive.
-      // ponytail: the archive's fdatasync (~15 ms on Dev1's NVMe) runs under the lock, so a
-      // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
-      // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
-      atomicWrite(this.#counterPath, sequence);
-      let liveOffset = 0;
-      try { liveOffset = fs.statSync(this.#eventsPath).size; }
-      catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-      if (intentPath) {
-        // A durable negative lookup exists before the intent. Only begin() can replace it
-        // with the synced archive line address, before any live append.
-        archive?.reserveLookup(sequence);
-        // This is the crash fence: the intent is durable before the live append begins.
-        writeFileAtomic(intentPath, JSON.stringify({
-          dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
-          ...(archive ? { archiveDir: archive.dir } : {}),
-        } satisfies MeshDedupeIntent), { durable: true });
-      }
-      const pending = archive?.begin({ event, line });
-      // Test-only process-death fence: unlike an append exception, no rollback can run.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN === "1") process.kill(process.pid, "SIGKILL");
-      try {
-        if (batch) batch.appendStarted = true;
-        fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-      } catch (error) {
-        if (pending) archive!.rollback(pending);
-        throw error;
-      }
-      // This distinct fence leaves the live event complete but the sidecar unconfirmed.
-      if (receiptPath && pending && process.env.PI_FABRIC_TEST_CRASH_BEFORE_ARCHIVE_COMMIT === "1") process.kill(process.pid, "SIGKILL");
-      if (pending) archive!.commit(pending);
+      const { event, bytes } = input.fence ? input.fence(append) : append();
       // Test-only crash fence for the installed-Pi recovery proof; production never sets this.
       if (receiptPath && process.env.PI_FABRIC_TEST_CRASH_AFTER_LIVE_APPEND === "1") process.kill(process.pid, "SIGKILL");
-      if (receiptPath) {
+      if (receiptPath && after && !archive) {
+        // No-archive keyed publish (single or batch): the durable intent (above) is the crash
+        // fence; after release the live barrier runs, then receipt/unlink reacquire .lock
+        // for an identity CAS. Both finish before publication resolves.
+        this.#finishLiveReceipt(after, event, intentPath!, receiptPath);
+      } else if (receiptPath) {
+        // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
         if (intentPath) this.#removeDedupeIntent(intentPath);
       }
-      if (batch) batch.bytes = Buffer.byteLength(line, "utf8") + 1;
+      if (batch) batch.bytes = bytes + 1;
       else {
+        // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
         this.#compactEventLog();
-        if (input.durable && !receiptPath) this.#confirmEventFile(this.#eventsPath);
+        if (input.durable && !receiptPath) {
+          // Unkeyed durable publish: the live-log barrier runs after release (group commit).
+          if (after) after.finish = () => this.#confirmEventsAfterRelease();
+          else this.#confirmEventFile(this.#eventsPath);
+        }
       }
       return event;
     };
@@ -452,41 +681,53 @@ export class EventLog {
     // Freeze ordinary payload/principal bytes once, even if archive validation retries.
     input = this.#capturePublication(input);
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
+    const after: AfterUnlock = {};
+    let event: MeshEvent;
     for (;;) {
-      try { return await this.#lock.withLock(this.#preparePublish(input), undefined, "publish"); }
+      try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after), undefined, "publish"); break; }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
       }
     }
+    // Committed. Never retry from here: a failed barrier must not append the event twice.
+    // The publish resolves only after its bytes (and any receipt) are durable.
+    await after.finish?.();
+    return event;
   }
 
   /** Commits a prefix in order under one lock. At most 256 events and 50 ms of work
    * (checked between events; a synchronous fsync/scheduler stall cannot be preempted).
-   * Events retain publish's append/archive protocol, with one final durability barrier. A failed suffix
-   * is retried by the caller after checkpointing the returned committed prefix.
+   * Events retain publish's append/archive/receipt protocol. Under the lock only the appends
+   * (and a keyed event's intent fence, or an archive-coupled receipt) run; one live-log barrier
+   * runs after release, then each no-archive receipt reacquires .lock for its intent CAS,
+   * in order, before the batch resolves (smarty-dev#6729). A failed suffix is retried by
+   * the caller after checkpointing the returned committed prefix.
    */
   async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
     for (;;) {
+      // The after-release work of each event the hold committed, in commit order.
+      const committed: AfterUnlock[] = [];
+      let events: MeshEvent[];
       try {
-        const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number } }> = [];
+        const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
         for (const input of inputs) {
-          const outcome = { appendStarted: false, bytes: 0 };
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome), outcome }); }
+          const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = {};
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
           catch (error) { if (!prepared.length) throw error; break; }
         }
-        return await this.#lock.withLock(() => {
+        events = await this.#lock.withLock(() => {
           const started = performance.now();
           const events: MeshEvent[] = [];
           let bytes = 0;
-          for (const { commit, outcome } of prepared) {
+          for (const { commit, outcome, after } of prepared) {
             // Keep the entire uncheckpointed prefix inside the retained tail, including
             // a line-boundary slack event, rather than compacting away its recovery IDs.
             if (events.length && (performance.now() - started >= 50 || bytes + 2 * this.maxEventBytes + 1 > this.#retainedEventLogBytes)) break;
-            try { events.push(commit()); bytes += outcome.bytes; }
+            try { events.push(commit()); committed.push(after); bytes += outcome.bytes; }
             catch (error) {
               // After append begins, success may be unknown. Stop rather than replay a
               // possibly complete event; a restarted bridge reconciles its committed IDs.
@@ -495,14 +736,37 @@ export class EventLog {
               break;
             }
           }
+          // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
           this.#compactEventLog();
-          this.#confirmEventFile(this.#eventsPath);
           return events;
         }, undefined, "bridge");
       } catch (error) {
+        // A hold that failed after committing a prefix never retries; its committed receipts
+        // still finish (best effort: an intent left behind recovers like a death after append).
+        if (committed.length) {
+          await this.#finishBatch(committed).catch(() => undefined);
+          throw error;
+        }
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
+        continue;
       }
+      // Test-only process-death fence: committed and released, before any after-release barrier.
+      if (process.env.PI_FABRIC_TEST_CRASH_BEFORE_BATCH_BARRIER === "1") process.kill(process.pid, "SIGKILL");
+      // Committed. Never retry from here: a failed barrier must not append the events twice.
+      await this.#finishBatch(committed);
+      return events;
+    }
+  }
+
+  /** After a batch's release: one live-log barrier for all its appends (each complete before the
+   * barrier starts, so a queued group barrier may be shared), then each event's own step in
+   * commit order: a no-archive keyed receipt and its intent unlink, or a receipt confirmation. */
+  async #finishBatch(committed: AfterUnlock[]): Promise<void> {
+    await this.#confirmEventsAfterRelease();
+    for (const after of committed) {
+      if (after.receipt) await after.receipt();
+      else await after.finish?.();
     }
   }
 
@@ -1000,6 +1264,46 @@ export class EventLog {
     };
   }
 
+  /** Under .lock: reserve capacity before append, or expire receipts during compaction.
+   * One key consumes one slot even while both receipt and pending intent are present. */
+  #pruneDedupeReceipts(reserve = 0): number {
+    const directory = path.join(this.root, "event-receipts");
+    let names: string[];
+    try { names = fs.readdirSync(directory); }
+    catch (error) { if (errorCode(error) === "ENOENT") return 0; throw error; }
+    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
+      .map(name => name.slice(0, -".pending.json".length)));
+    const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+    let count = new Set([...pending, ...receipts.map(name => name.slice(0, -".json".length))]).size;
+    const initialCount = count;
+    const limit = this.#maxDedupeReceipts - reserve;
+    // TTL remains maintenance-driven below capacity; no receipt payload reads are needed.
+    if (reserve && count <= limit) return count;
+    const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
+      const file = path.join(directory, name);
+      const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
+      if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
+          typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
+          !Number.isFinite(event.createdAt)) {
+        throw new Error("Invalid event publication receipt");
+      }
+      return { file, createdAt: event.createdAt, sequence: event.sequence };
+    });
+    candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
+    const now = Date.now();
+    try {
+      for (const receipt of candidates) {
+        if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
+        fs.rmSync(receipt.file, { force: true });
+        count--;
+      }
+    } finally {
+      // Persist removals once per pass, including any completed before a later unlink failed.
+      if (count < initialCount) syncPathNamespace(directory);
+    }
+    return count;
+  }
+
   #compactEventLog(): void {
     // Never rewrite away an event named by a durable intent. Resolve every intent while
     // the publish lock is held, before taking the retained tail snapshot.
@@ -1009,6 +1313,7 @@ export class EventLog {
       const size = fs.fstatSync(descriptor).size;
       if (size <= this.#maxEventLogBytes) return;
       this.#settleDedupeIntents(MeshArchive.fromRoot(this.root));
+      this.#pruneDedupeReceipts();
       const readBytes = Math.min(
         size,
         this.#retainedEventLogBytes + this.maxEventBytes + 1,
@@ -1058,27 +1363,42 @@ export class EventLog {
       descriptor = fs.openSync(this.#eventsPath, "r");
       const size = fs.fstatSync(descriptor).size;
       if (size === 0) return 0;
-      const readBytes = Math.min(size, this.maxEventBytes + 1);
-      const tail = Buffer.allocUnsafe(readBytes);
-      fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
-      const lines = tail.toString("utf8").trim().split("\n");
-      for (let index = lines.length - 1; index >= 0; index--) {
-        const line = lines[index];
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as { sequence?: unknown };
-          if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) {
-            return parsed.sequence;
-          }
-        } catch { /* skip malformed sequence line */ }
+      const window = Math.min(size, this.maxEventBytes + 1);
+      // Every publish commit (each event of a batch) calls this under `.lock`. A small probe of
+      // the window's end usually holds the last line; only if none of its complete lines parses
+      // is the whole window read (smarty-dev#6729).
+      if (window > LAST_LINE_PROBE_BYTES) {
+        const found = this.#lastSequenceIn(descriptor, size, LAST_LINE_PROBE_BYTES, false);
+        if (found !== undefined) return found;
       }
-      return 0;
+      return this.#lastSequenceIn(descriptor, size, window, true) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }
+  }
+
+  /** The last parsable sequence among the lines of the file's last `bytes`, last line first,
+   * decoding only the lines it tries. UTF-8 never has a 0x0a byte inside a character, so these
+   * are the lines a whole-text split yields. A probe (`whole` false) never parses its first
+   * segment, which may be a cut line: undefined sends the caller to the whole window. */
+  #lastSequenceIn(descriptor: number, size: number, bytes: number, whole: boolean): number | undefined {
+    const tail = Buffer.allocUnsafe(bytes);
+    fs.readSync(descriptor, tail, 0, bytes, size - bytes);
+    for (let end = bytes; end > 0;) {
+      const newline = tail.lastIndexOf(0x0a, end - 1);
+      if (newline < 0 && !whole) return undefined;
+      const line = tail.toString("utf8", newline + 1, end).trim();
+      end = Math.max(newline, 0);
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as { sequence?: unknown };
+        if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) return parsed.sequence;
+      } catch { /* skip malformed sequence line */ }
+    }
+    return undefined;
   }
 
   #readSequence(): number {

@@ -76,7 +76,8 @@ describe("bounded FIFO mesh admission", () => {
       const store = new MeshStore(root, 65536, 100);
       await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
       expect(fs.readdirSync(parent)).toEqual(["mesh"]);
-      expect(fs.readdirSync(root)).toEqual([]);
+      // Only the writer census (smarty-dev#6477 L4a) lives in the root; no admission sidecar does.
+      expect(fs.readdirSync(root)).toEqual([".writer-census"]);
     } finally { fs.chmodSync(parent, 0o700); }
   });
 
@@ -100,7 +101,7 @@ describe("bounded FIFO mesh admission", () => {
     }
     const store = new MeshStore(root, 65536, 100);
     await expect(store.exclusive(() => "plain contest")).resolves.toBe("plain contest");
-    expect(fs.readdirSync(root)).toEqual([]);
+    expect(fs.readdirSync(root)).toEqual([".writer-census"]);
   });
 
   it("shares one queue across canonical mesh-root aliases and isolates other roots", () => {

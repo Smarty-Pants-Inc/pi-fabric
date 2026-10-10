@@ -190,7 +190,8 @@ describe("MeshStore", () => {
     expect(readAfter).not.toHaveBeenCalled();
     expect(read).not.toHaveBeenCalled(); // A new key has no intent and performs no history read.
     expect(liveRead.mock.calls.some(([file]) => file === path.join(store.root, "events.jsonl"))).toBe(false);
-    expect(directoryRead.mock.calls.some(([directory]) => directory === path.join(store.root, "event-receipts"))).toBe(false);
+    // One bounded receipt-directory enumeration enforces capacity, never searches event history.
+    expect(directoryRead.mock.calls.filter(([directory]) => directory === path.join(store.root, "event-receipts"))).toHaveLength(1);
   });
 
   it("recovers an invalidated intent by one direct archive lookup, never a history scan", async () => {

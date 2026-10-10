@@ -11,7 +11,7 @@ Refs smarty-dev#5049. Principal view keeps the principal's conversation in the *
 - The command saves project config when trusted, global agent-dir config otherwise, following Fabric settings scope. It bootstraps configuration only, never starts optional runtime engines just to change the display.
 - Existing `ui.incomingMessages` preferences remain compatible per persisted layer: collapsed→on, expanded→off, auto→auto. An explicit `principalView` in that layer wins. There is only one settings row.
 
-On reduces each native incoming agent, actor or mail carrier (including a batched burst) to one dim `↳ sender: [count kind] preview` line, with about 80 body characters. Mixed senders are shown as `sender +N sender(s)`; mixed kinds are listed, rather than attributing the whole burst to its first sender. The kind comes from the delivery/event envelope (`steer`, `followUp`, etc.); `mail.inbound` notices are labeled explicitly. Delivered inbox shadows render nothing; unseen inbox work still appears. **Ctrl+O** temporarily reveals full incoming messages and tool output without changing the persisted preference. Off restores full native incoming rendering and the tool expansion state captured before entering principal view. A fresh session gets a fresh expansion snapshot.
+On reduces each native incoming agent, actor or mail carrier (including a batched burst) to one dim `↳ sender: [count kind] preview` line, with about 80 body characters. Mixed senders are shown as `sender +N sender(s)`; mixed kinds are listed, so the whole burst is never attributed to its first sender. The kind comes from the delivery/event envelope (`steer`, `followUp`, etc.); `mail.inbound` notices are labeled explicitly. Delivered inbox shadows render nothing; unseen inbox work still appears. **Ctrl+O** temporarily reveals full incoming messages and tool output without changing the persisted preference. Off restores full native incoming rendering and the tool expansion state captured before entering principal view. A fresh session gets a fresh expansion snapshot.
 
 Org-labeled incoming replies (`org` or `org-agent`, optionally `@revision`) and explicitly principal-addressed carriers (`to="principal"` in the envelope or `details.to`/`details.data.to`) retain their full native rendering. These labels affect display only, never authority or routing. An originating `principal` receipt is not a destination and does not exempt ordinary chatter. If a burst mixes a principal-facing reply with chatter, the whole carrier remains full so the reply cannot be clipped. If such an inbox burst also carried an already-delivered shadow, the carrier is rendered in the same full native style with only the remaining rows; the shadow stays hidden until expanded. Principal user messages and the local assistant's replies remain native/full. No adjacent delivery entries are merged or rescheduled.
 
@@ -46,7 +46,7 @@ The newest installed runtime on the lane is `623f57905b902feafdaeb6b5aeed9812faf
 
 ## Smallest proposed change to Smarty-Pants-Inc/pi (not applied here)
 
-Add a **per-UI display-only setter**, analogous to `setEditorComponent`, rather than teaching Fabric to patch transcript internals:
+Add a **per-UI display-only setter**, analogous to `setEditorComponent`, so Fabric does not need to patch transcript internals:
 
 ```ts host
 ctx.ui.setUserMessageRenderer(

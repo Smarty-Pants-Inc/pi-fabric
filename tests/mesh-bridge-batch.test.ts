@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { COMMIT_OUTBOX_PREFIX } from "../src/mesh/commit-outbox.js";
 import { readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 
 const roots: string[] = [];
@@ -56,7 +57,8 @@ const perRecord = async (store: MeshStore, presence: BridgePresence, now: number
     await store.put({ key: k, value, identity });
   }
   for (const { record, expiresAt } of presence.hosts) {
-    writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id,
+    // Mirror leases carry the origin's incarnation (L2b owner review: owner-matched unlease).
+    writeHostLease(store.root, { id: record.id, rootId: record.rootId, identityId: record.identity.id, startedAt: record.startedAt,
       updatedAt: Math.min(record.updatedAt, now), expiresAt: Math.min(expiresAt, now + 15_000) });
   }
   for (const entry of old) {
@@ -90,8 +92,16 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     // Ensure even the first pass performs a canonical read, not an ENOENT probe.
     for (const store of [hub, reference]) fs.writeFileSync(path.join(store.root, "state.json"), JSON.stringify({ format: 1, entries: {} }));
     const probe = io(hub);
+    // The hub also holds this link's commit-outbox rows (smarty-dev#6477 L2b, R11): its lease effects
+    // are recorded in the same commit and retired by a later one. Compare the presence records;
+    // those rows also draw from the store's version counter, so versions are compared as an order.
+    const presenceRecords = (store: MeshStore) => {
+      const entries = store.listAll().filter(entry => !entry.key.startsWith(COMMIT_OUTBOX_PREFIX));
+      const rank = new Map([...new Set(entries.map(entry => entry.version))].sort((a, b) => a - b).map((version, index) => [version, index]));
+      return entries.map(entry => ({ ...entry, version: rank.get(entry.version) }));
+    };
     const compare = () => {
-      expect(hub.listAll()).toEqual(reference.listAll());
+      expect(presenceRecords(hub)).toEqual(presenceRecords(reference));
       expect([...readHostLeases(hub.root)]).toEqual([...readHostLeases(reference.root)]);
     };
     await side.mirror(presence);
@@ -117,7 +127,7 @@ describe("one presence transaction (smarty-dev#3752)", () => {
     probe.reset();
     await side.withdraw();
     expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
-    expect(hub.listAll()).toEqual([]);
+    expect(presenceRecords(hub)).toEqual([]);
     expect(readHostLeases(hub.root).size).toBe(0);
     // Tombstone recreation is one commit too, not a failed put + retry per key.
     const restarted = new StoreBridgeSide(hub, "forge");

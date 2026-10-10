@@ -6,8 +6,20 @@ import { writeJsonAtomic } from "../../core/atomic-write.js";
 import { executeFile } from "./process-utils.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
+import { normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
 
 interface Receipt { rc: number | string; text: string; stderr?: string }
+
+/** The fleet launcher returns rc=3 and a concrete PREFLIGHT_REFUSED receipt when a --require path is absent on target. */
+const requiredInputRefusal = (error: unknown, requires: readonly string[] | undefined): string | undefined => {
+  const value = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
+  if (value.code !== 3 && value.code !== "3" || !requires?.length) return undefined;
+  const output = [value.stdout, value.stderr].filter((part): part is string => typeof part === "string").join("\n");
+  const line = output.split(/\r?\n/u).find(entry => entry.startsWith("PREFLIGHT_REFUSED: "));
+  if (!line) return undefined;
+  return requires.find(file => line === `PREFLIGHT_REFUSED: ${file}` || line.startsWith(`PREFLIGHT_REFUSED: ${file}:`));
+};
+
 const render = (template: string, values: Record<string, string>): string => template.replace(/\{([a-zA-Z]+)\}/g, (_match, key: string) => {
   if (values[key] === undefined) throw new Error(`Placement placeholder unavailable: ${key}`);
   return values[key]!;
@@ -26,6 +38,7 @@ const receipt = (input: unknown): Receipt | undefined => {
  * No timers/processes survive outside manager-owned launch/isAlive/stop operations.
  */
 export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig): Promise<AgentTransportHandle> => {
+  const requires = normalizeAgentRequires(request.requires);
   const args = new Map<string, string>();
   for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
   const required = (flag: string): string => {
@@ -46,8 +59,12 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   const environment = taskAgentEnvironment();
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
-  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal) => {
+  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
     const argv = template.map(entry => render(entry, values));
+    // The fleet launcher's current repeatable preflight flag is --require.
+    // Keep paths literal and before the prompt separator, never as task text.
+    const separator = argv.indexOf("--");
+    argv.splice(separator < 0 ? argv.length : separator, 0, ...extraArguments);
     return executeFile(argv[0]!, argv.slice(1), { cwd: request.cwd, env: environment, timeoutMs: Math.max(1, limit), ...(signal ? { signal } : {}), killSignal: "SIGKILL" });
   };
   const audit = (type: string, data: Record<string, unknown>) => fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id: request.id, ...data }) + "\n", { mode: 0o600 });
@@ -142,9 +159,14 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   assertTransportLaunchAllowed(request);
   try {
     let output: string;
-    try { output = (await command(config.command, config.commandTimeoutMs, request.signal)).stdout; }
+    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]))).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
+      const missing = requiredInputRefusal(error, requires);
+      if (missing !== undefined) {
+        const index = requires?.indexOf(missing);
+        throw new RequiredInputMissingError(missing, index !== undefined && index >= 0 ? index : undefined);
+      }
       debt = `Placement launch outcome unknown: ${String(error)}`;
       request.onUnconfirmedExit?.(debt);
       save("failed", "", debt, undefined, String((error as { stderr?: string }).stderr ?? ""));

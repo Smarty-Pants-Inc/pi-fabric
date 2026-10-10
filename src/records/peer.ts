@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import type net from "node:net";
@@ -25,7 +26,7 @@ export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000): Promise<
       return;
     }
     try {
-      child = spawn("python3", ["-c", PEERCRED], { stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
+      child = spawn("python3", ["-c", PEERCRED], { env: childProcessEnvironment(), stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
     } catch {
       resolve(undefined);
       return;

@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
@@ -551,7 +552,7 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
     } else return false;
     const start = childProcess.execFileSync(executable, args, { encoding: "utf8", timeout: 2_000,
       maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+      env: childProcessEnvironment({ ...process.env, LC_ALL: "C", TZ: "UTC" }) }).trim();
     return Date.parse(process.platform === "win32" ? start : `${start} UTC`) > modifiedAt;
   } catch { return false; }
 };

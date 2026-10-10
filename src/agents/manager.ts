@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
@@ -2854,7 +2855,7 @@ export class AgentManager {
       const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
       if (!claimTempRunSweep(request.tempRoot, RETENTION_SWEEP_INTERVAL_MS)) return;
       const child = spawn(runtime!, args, {
-        detached: true, stdio: "ignore", windowsHide: true,
+        env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true,
       });
       child.on("error", () => undefined);
       if (child.pid) {

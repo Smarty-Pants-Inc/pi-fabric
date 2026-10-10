@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "./core/atomic-write.js";
 // mesh-bridge (smarty-dev#2004): link this host's Fabric mesh to one remote host's mesh.
 //
 //   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE --ssh HOST [--ssh-key KEY]
@@ -107,7 +108,7 @@ export const runBridge = async (
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
 
-  const child = spawn(argv[0]!, argv.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn(argv[0]!, argv.slice(1), { env: childProcessEnvironment(), stdio: ["pipe", "pipe", "inherit"] });
   let spawnError: Error | undefined;
   let remote: RemoteBridgeSide | undefined;
   // A transport that cannot start (no ssh, not executable) emits error and close, never exit:

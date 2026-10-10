@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import childProcess from "node:child_process";
 import path from "node:path";
 import { windowsSecurityPowerShell } from "./windows-powershell.js";
@@ -90,7 +91,7 @@ export const windowsDataRoot = (root: string): string => {
   try {
     const command = windowsSecurityPowerShell(INSPECT_ACLS, { ...process.env, PI_FABRIC_ACL_CHAIN: JSON.stringify(chain) });
     const output = childProcess.execFileSync(command.file, command.args, {
-      env: command.env,
+      env: childProcessEnvironment(command.env),
       encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
     });

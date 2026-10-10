@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
 
@@ -42,7 +43,7 @@ export const resetChildPriorityLog = (): void => loggedFailures.clear();
 const defaultDeps = (log: (message: string) => void): ChildPriorityDeps => ({
   getPriority: (pid) => os.getPriority(pid),
   setPriority: (pid, priority) => os.setPriority(pid, priority),
-  ionice: (pid) => spawnSync("ionice", ["-c2", "-n7", "-p", String(pid)], { stdio: ["ignore", "ignore", "pipe"], timeout: 5_000 }),
+  ionice: (pid) => spawnSync("ionice", ["-c2", "-n7", "-p", String(pid)], { env: childProcessEnvironment(), stdio: ["ignore", "ignore", "pipe"], timeout: 5_000 }),
   platform: process.platform,
   log,
 });

@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -4426,7 +4427,7 @@ export class ActorManager {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
+      const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
       if (child.pid) {
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }

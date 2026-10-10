@@ -23,7 +23,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 const fake = `import fs from 'node:fs'; import path from 'node:path';
 const [mode, root, id, ...argv] = process.argv.slice(2);
@@ -59,7 +59,8 @@ const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSession
   const raw = {
     default: "remote", command: [process.execPath, launcher, "launch", results, "{id}", "--host", "auto", "--minutes", "{minutes}", "--cwd", "{cwd}", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
     ...(pollCommand ? { resultCommand: [process.execPath, launcher, "poll", results, "{id}"] } : { resultDirectory: path.join(results, "{id}") }),
-    cancelCommand: [process.execPath, launcher, "cancel", results, "{id}"], pollIntervalMs: 10, commandTimeoutMs: 300,
+    // Cancellation and its receipt each launch Node; 300ms is not a portable startup budget.
+    cancelCommand: [process.execPath, launcher, "cancel", results, "{id}"], pollIntervalMs: 10, commandTimeoutMs: 5_000,
   };
   const config = { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, placement: normalizeFabricConfig({agents:{placement:raw}}).agents.placement! };
   const worker = path.join(root, "local.mjs");
@@ -69,7 +70,7 @@ const fixture = (pollCommand = false, timeoutMs = 1_000, resolveInheritedSession
   const manager = new AgentManager(root, config, { workerPath: worker, runRoot: path.join(root, "runs"), ...(resolveInheritedSessionPins ? { resolveInheritedSessionPins } : {}), ...(live ? { placementConfigPath } : {}) }); managers.push(manager);
   return { root, profile, results, raw, config, manager, launcher };
 };
-const launch = (f: ReturnType<typeof fixture>, task: string, timeoutMs = 80): AgentTransportLaunch => {
+const launch = (f: ReturnType<typeof fixture>, task: string, timeoutMs = 5_000): AgentTransportLaunch => {
   const dir = path.join(f.root, "direct"); fs.mkdirSync(dir, {recursive:true});
   fs.writeFileSync(path.join(dir,"task.txt"),task);
   return { id: "direct-id", name: "direct", cwd: f.root, workerPath: "unused", workerArguments: ["--task-file",path.join(dir,"task.txt"),"--status-file",path.join(dir,"status.json"),"--log-file",path.join(dir,"events.jsonl"),"--timeout-ms",String(timeoutMs),"--model","test/model","--thinking","high"] };
@@ -326,8 +327,10 @@ describe("host process task placement", () => {
   });
   it("bounds broken polling and reports timeout debt without claiming remote exit", async () => {
     const f=fixture(true); f.config.placement.resultCommand=[process.execPath,f.launcher,"bad-poll",f.results,"{id}"];
-    const req=launch(f,"pending",80); const h=await new ProcessTransport(undefined,f.config.placement).launch(req);
-    await new Promise(resolve=>setTimeout(resolve,90));
+    const req=launch(f,"pending"); const h=await new ProcessTransport(undefined,f.config.placement).launch(req);
+    const { deadline } = JSON.parse(fs.readFileSync(path.join(f.root,"direct/placement.json"),"utf8"));
+    // Advance to the recorded deadline, not a sleep with platform-dependent timer/startup jitter.
+    vi.spyOn(Date, "now").mockReturnValue(deadline);
     expect(await h.isAlive()).toBe(false);
     const record=JSON.parse(fs.readFileSync(path.join(f.root,"direct/status.json"),"utf8"));
     expect(record.status).toBe("timed_out"); expect(h.lostContact?.()).toContain("exit unconfirmed");

@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
@@ -112,7 +113,7 @@ export class NodeProcessRuntime {
             "--eval",
             NODE_PROCESS_CHILD_SOURCE,
           ],
-      { stdio: ["ignore", "ignore", "ignore", "ipc"] },
+      { env: childProcessEnvironment(), stdio: ["ignore", "ignore", "ignore", "ipc"] },
     );
     const hostAbortController = new AbortController();
     shareCancellationEffects(hostAbortController.signal, options.signal);

@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn } from "node:child_process";
 import { assertCertificateFacts, consume } from "../verified/policy.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -675,6 +676,7 @@ export class SchemaController {
       try {
         child = spawn(command.command, command.shell ? [] : command.args, {
           cwd: this.cwd,
+          env: childProcessEnvironment(),
           shell: command.shell,
           stdio: ["ignore", "pipe", "pipe"],
           ...(signal ? { signal } : {}),

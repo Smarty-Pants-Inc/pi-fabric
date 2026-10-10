@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
@@ -8,6 +9,11 @@ const fleet = isolateTestFleetEnvironment();
 
 // GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
 const ci = process.env.CI === "true";
+
+// Separate policy projects avoid writing a fixture read by unrelated config tests.
+const policyConstants = (name: string) => ({
+  __FABRIC_HOST_POLICY_PATH__: JSON.stringify(join(temp.TMPDIR, `host-policy-${name}`, "fabric-policy.json")),
+});
 
 const sharedTests = {
   environment: "node",
@@ -33,9 +39,15 @@ export default {
     // Explicit shared options avoid extends merging the broad include into the GC project.
     projects: [
       {
-        test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts"] },
+        define: policyConstants("missing"),
+        test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts", "tests/host-policy.test.ts"] },
       },
       {
+        define: policyConstants("host-policy"),
+        test: { ...sharedTests, name: "host-policy", include: ["tests/host-policy.test.ts"] },
+      },
+      {
+        define: policyConstants("missing"),
         test: {
           ...sharedTests,
           name: "history-gc", include: ["tests/session-entry-retention.test.ts"],

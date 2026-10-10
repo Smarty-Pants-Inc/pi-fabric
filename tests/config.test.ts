@@ -10,6 +10,7 @@ import {
   effectiveToolCaptureConfig,
   loadFabricConfig,
   loadFabricConfigForScope,
+  loadGlobalFabricConfig,
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
@@ -45,7 +46,7 @@ describe("host-only explicit model exceptions (#3134)", () => {
     fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
   });
@@ -104,12 +105,12 @@ describe("host-only processSlice (#4383)", () => {
       expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
     }
   });
-  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+  it.each([true, false])("ignores project overrides and unprovisioned host slices (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
   });
 });
 
@@ -122,6 +123,17 @@ it("normalizes the reader-only idle coalescing window", () => {
 });
 
 describe("Fabric configuration", () => {
+  it("golden: no files preserve main's built-in executor.landlock default across all loaders", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(DEFAULT_FABRIC_CONFIG.executor.landlock).toEqual({ mode: "off", disabled: false });
+    for (const loaded of [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+      loadFabricConfigForScope(options, "global"), loadFabricConfigForScope(options, "project")]) {
+      expect(loaded.executor.landlock).toEqual(DEFAULT_FABRIC_CONFIG.executor.landlock);
+    }
+    expect(fs.readdirSync(agentDir)).toEqual([]);
+    expect(fs.readdirSync(cwd)).toEqual([]);
+  });
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
     expect(normalizeFabricConfig({}).selfReloadConcurrency).toBe(6);

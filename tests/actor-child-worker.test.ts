@@ -25,7 +25,9 @@ const probe = async () => {
       'PI_FABRIC_PARENT_RUN','PI_FABRIC_MAIN_AGENT_ID','PI_FABRIC_SPAWNER_ID',
       'PI_FABRIC_SPAWNER_KIND','PI_FABRIC_SPAWNER_RUN','PI_FABRIC_REPLY_SCHEMA_FILE',
       'PI_FABRIC_REPLY_FILE','PI_FABRIC_REPLY_HOOK','SMARTY_ROLE'];
-    const report = Object.fromEntries(keys.map(key => [key, process.env[key] || '']));
+    const report = Object.fromEntries([...keys.map(key => [key, process.env[key] || '']),
+      ...Object.entries(process.env).filter(([key]) => key.startsWith('PI_FABRIC_LANDLOCK_')),
+      ['FABRIC_CHILD_ENV_MARKER', process.env.FABRIC_CHILD_ENV_MARKER]]);
     console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:JSON.stringify(report)}}));
     console.log(JSON.stringify({type:'agent_settled'}));
     process.exit(0);
@@ -65,6 +67,21 @@ describe.skipIf(!fs.existsSync(workerPath))("#2643 actual worker spawner environ
     expect(resolveFabricIdentity("child-session", environment)).toMatchObject({
       identity: { id: result.id, kind: "agent" }, mainAgentId: "session:root-main",
     });
+  });
+
+  it.each([false, true])("scrubs inherited Landlock controls on a real process task launch (actor parent=%s)", async actorParent => {
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", actorParent ? "b".repeat(32) : undefined);
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", actorParent ? "a".repeat(32) : undefined);
+    vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE", "1");
+    vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE_ONCE", "1");
+    vi.stubEnv("PI_FABRIC_LANDLOCK_FUTURE_ESCAPE", "1");
+    vi.stubEnv("PI_FABRIC_LANDLOCK_SHELL", "/untrusted/shell");
+    vi.stubEnv("PI_FABRIC_LANDLOCK_WRITES", "/");
+    vi.stubEnv("FABRIC_CHILD_ENV_MARKER", "preserved");
+    const { environment } = await probe();
+    expect(Object.keys(environment).filter(key => key.startsWith("PI_FABRIC_LANDLOCK_"))).toEqual([]);
+    expect(environment.FABRIC_CHILD_ENV_MARKER).toBe("preserved");
+    expect(process.env.PI_FABRIC_LANDLOCK_ESCAPE).toBe("1");
   });
 
   it("binds a Main child to Main and a task child's child to that task run", async () => {

@@ -592,6 +592,7 @@ export class FabricState {
           lifecycle: () => generation === this.#generation && !this.#shutDown,
         });
         assertCurrent();
+        candidate.bindLifecycle?.(context, () => generation === this.#generation && !this.#shutDown);
         for (const provider of this.#externalProviders.values()) {
           candidate.registerExternal(provider, { overwrite: true });
         }

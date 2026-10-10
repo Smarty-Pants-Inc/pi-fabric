@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { isStaleExtensionContext, MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -552,10 +552,13 @@ export interface ParticipantDirectoryOptions {
    * Explicit refresh()/quiesce() calls still publish from the owner's last live snapshot.
    */
   live?: () => boolean;
+  /** Unlike a rebindable live token, an obsolete runtime epoch must cancel its timers. */
+  backgroundEpoch?: { epoch: number; current: () => boolean };
   /**
    * Once per outage: more than LIFECYCLE_LOST_TICKS consecutive heartbeats found no live
    * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
-   * must say so visibly instead of vanishing from the directory in silence.
+   * must say so visibly instead of vanishing from the directory in silence. An owned
+   * epoch with a stale binding reports immediately, before cancelling its heartbeat.
    */
   onLifecycleLost?: (ticks: number) => void;
 }
@@ -566,7 +569,7 @@ export const LIFECYCLE_LOST_TICKS = 2;
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
-  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #backgroundRefresh: MeshBackgroundRetry;
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
@@ -627,6 +630,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
+    this.#backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh", 100, 5_000,
+      options.backgroundEpoch ? {
+        ...options.backgroundEpoch,
+        retire: () => this.#stopBackgroundTimers(),
+        onStale: () => this.#lifecycleTick(false, true),
+      } : undefined);
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
     this.#ownIncarnation = options.withPublicationFence
@@ -647,12 +656,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
   get degraded(): boolean { return this.#degraded; }
 
-  #lifecycleTick(live: boolean): void {
+  #lifecycleTick(live: boolean, stale = false): void {
     if (live) {
       this.#retiredTicks = 0;
       this.#degraded = false;
       return;
     }
+    // A stale current binding cannot renew at all: report now, before retiring its timer.
+    if (stale) this.#retiredTicks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS);
     if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
     console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
@@ -669,6 +680,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
     };
   }
 
+  #stopBackgroundTimers(): void {
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    this.#refreshAgain = false;
+    this.#cancelPublicationRetry();
+  }
+
+  /** An activation/ensure with a live binding is the only way to restart a retired epoch. */
+  rebindLifecycle(): void {
+    if (this.#closed || !this.#backgroundRefresh.retired) return;
+    this.#backgroundRefresh.rebind();
+    this.#armHeartbeat();
+  }
+
   async start(): Promise<void> {
     if (this.#timer) return;
     // Restarting this directory is activation too, even if its last local view held a root.
@@ -679,17 +707,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
-    if (this.options.enabled) {
+    this.#armHeartbeat();
+    await this.refresh();
+  }
+
+  #armHeartbeat(): void {
+    if (this.options.enabled && !this.#timer && this.#backgroundRefresh.active) {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
       this.#retiredTicks = 0;
       this.#degraded = false;
       this.#timer = setInterval(() => {
-        if (this.#closed) return;
+        if (this.#closed || !this.#backgroundRefresh.active) return;
         const live = this.#live();
         this.#lifecycleTick(live);
         if (!live) return;
-        void this.#renewActors();
+        void this.#renewActors().catch(error => this.#backgroundRefresh.failure(error));
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;
         // shared-lock-only waits still lapse and confirmation still needs its lock.
@@ -707,13 +740,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }, this.#heartbeatMs);
       this.#timer.unref();
     }
-    await this.refresh();
   }
 
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed || isMeshLockTimeout(this.#refreshError)) return;
+    if (this.#closed || !this.#backgroundRefresh.active || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -724,7 +756,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!this.#refreshScheduled || this.#closed) return;
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      if (!this.#live()) return;
+      if (!this.#backgroundRefresh.active || !this.#live()) return;
       void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
@@ -840,11 +872,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
         }
       }
     } catch (error) {
+      if (isStaleExtensionContext(error)) this.#backgroundRefresh.failure(error);
       // A failed shared write is NOT a terminal liveness transition. An already-admitted
       // live process retains its ownership/incarnation and renews only that file lease.
       // Do not advance confirmedAt, clear the outage, admit an unregistered host, or let
       // canConsumeMesh treat this as a successful commit. Peers still use #484's grace.
-      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing) {
+      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing && !this.#backgroundRefresh.retired) {
         try { this.#renewFileLease(); } catch { /* Preserve the prior lease on file failure too. */ }
       }
       this.#refreshError = error;
@@ -878,13 +911,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #schedulePublicationRetry(): void {
     if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+      !this.#backgroundRefresh.active ||
       !isMeshLockTimeout(this.#refreshError) || this.#publicationRetryTimer || this.#publicationRetrying) return;
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
     const wait = 50 + Math.floor(Math.random() * (this.#publicationRetryDelay - 50));
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
     this.#publicationRetryTimer = setTimeout(() => {
       this.#publicationRetryTimer = undefined;
-      if (!this.#live()) return;
+      if (!this.#backgroundRefresh.active || !this.#live()) return;
       const work = this.#retryPublication();
       this.#publicationRetrying = work;
       void work.finally(() => {
@@ -900,7 +934,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // The failed fence has fully unwound. A FIFO mesh ticket can now wait without
       // occupying either actor registry; admission is not itself a heartbeat receipt.
       await this.options.waitForPublicationRetry!();
-      if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+      if (this.#closed || this.#quiescing || !this.#backgroundRefresh.active || !isMeshLockTimeout(this.#refreshError)) return;
       // Release mesh BEFORE taking registries. Re-select every actor under fresh
       // registry custody, preserving #504/#531 and the registry -> mesh lock order.
       await this.refresh();

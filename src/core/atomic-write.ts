@@ -603,17 +603,64 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
+/** Pi invalidates ctx/pi together; this is terminal for an owned background generation. */
+export const isStaleExtensionContext = (error: unknown): boolean =>
+  error instanceof Error && error.message.startsWith("This extension ctx is stale after session replacement or reload");
+
+export interface MeshBackgroundOwner {
+  epoch: number;
+  current: () => boolean;
+  retire: () => void;
+  onStale?: () => void;
+}
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
   #delay = 0;
   #retryAt = 0;
   #reported = false;
   #running = false;
-  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000) {}
+  #retired = false;
+  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000, readonly owner?: MeshBackgroundOwner) {}
+
+  get retired(): boolean { return this.#retired; }
+
+  /** Check at every timer boundary, including continuations after an awaited tick. */
+  get active(): boolean {
+    if (this.#retired) return false;
+    if (!this.owner) return true;
+    try {
+      if (this.owner.current()) return true;
+    } catch (error) {
+      if (isStaleExtensionContext(error)) { this.#retire(true); return false; }
+      this.failure(error);
+    }
+    this.#retire(false);
+    return false;
+  }
+
+  /** Only an explicit live lifecycle rebind may re-arm a retired owner. */
+  rebind(): void {
+    if (!this.#retired || !this.owner) return;
+    try { if (!this.owner.current()) return; } catch { return; }
+    this.#retired = false;
+    this.success();
+  }
+
+  #retire(stale: boolean): void {
+    if (this.#retired || !this.owner) return;
+    this.#retired = true;
+    this.success();
+    this.owner.retire();
+    console.warn(`[pi-fabric] ${this.label}: retired background timer for epoch ${this.owner.epoch} (${stale ? "stale extension context" : "epoch no longer current"})`);
+    if (stale) this.owner.onStale?.();
+  }
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
   success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
   failure(error: unknown): boolean {
+    if (this.#retired) return false;
+    if (this.owner && isStaleExtensionContext(error)) { this.#retire(true); return false; }
     const transient = isMeshLockTimeout(error);
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
@@ -640,7 +687,7 @@ export class MeshBackgroundRetry {
    * Paths that may no-op can reset explicitly after a confirmed acquisition instead.
    */
   async run(operation: () => unknown | Promise<unknown>, resetOnSuccess = true): Promise<"done" | "retry" | "failed" | "skipped"> {
-    if (this.#running || this.waitMs > 0) return "skipped";
+    if (!this.active || this.#running || this.waitMs > 0) return "skipped";
     this.#running = true;
     try {
       await operation();

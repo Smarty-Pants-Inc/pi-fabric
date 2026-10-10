@@ -64,7 +64,7 @@ Round 4 (c6085436137 P2) preserves the provider's array API and makes incomplete
 
 ## Explicit API (no automatic registration)
 
-```ts
+```ts host
 import { openNatsMeshProvider } from "pi-fabric/mesh";
 const provider = await openNatsMeshProvider(mesh, identity, participants, {
   backend: "nats-kv",

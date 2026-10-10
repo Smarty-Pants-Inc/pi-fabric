@@ -12,7 +12,7 @@ The inspected main already has `StateBackend`, `StateFile`, and `SqliteStateStor
 
 Public API (`pi-fabric/mesh`):
 
-```ts
+```ts host
 const store = await openAsyncMeshStateStore(meshRoot, {
   backend: "nats-kv", // separate experimental selector, NOT mesh.stateBackend
   nats: {
@@ -38,7 +38,7 @@ Fabric valid keys: ASCII alphanumeric first character, then alphanumeric, `.`, `
 - Literal dots become `=2e`, colons become `=3a`; alphanumerics, `_`, and `-` remain literal. `=` is not a valid Fabric key character, so escape syntax cannot collide.
 - Decode rejects unknown/uppercase/non-canonical escapes and validates the resulting Fabric key. No encoded key has `*`, `>`, `/`, or an empty subject token.
 
-Examples: `a.b` -> `k.sa=2eb`; `a/b` -> `k.sa.sb`; `a:b` -> `k.sa=3ab`; `a//b/` -> `k.sa.s.sb.s`. Slash, dot, colon, underscore, dash and empty-segment forms remain distinct.
+Examples: `a.b` -> `k.sa=2eb`; `a/b` -> `k.sa.sb`; `a:b` -> `k.sa=3ab`; `a//b/` -> `k.sa.s.sb.s`. Slash, dot, colon, `_`, dash and empty-segment forms remain distinct.
 
 Slash-terminated prefix filters select **exactly the encoded namespace**: `topology/participants/` uses `k.stopology.sparticipants.>` (never `k.stopology.>`). For a partial final token (`topology/part`), NATS has no partial-token wildcard, so the filter is the complete parent `k.stopology.>` and the adapter applies `decodedKey.startsWith(prefix)`; a first-token partial prefix necessarily uses `k.>`. Limited `list(prefix, limit)` uses exactly one finite header-only pull with at most `min(limit, maxKeys)` **examined candidates**, including mismatches, tombstones and concurrent deletes. It returns live matches sorted within that page, possibly empty despite remaining candidates. `listPage(prefix, limit, startRevision?)` additionally returns `examined` and optional `nextRevision`; continue with the same bucket/prefix until the cursor is undefined. Initial delivery uses LastPerSubject; continuation uses StartSequence over the history-1 stream. Concurrent updates can recur; no atomic snapshot is claimed. Setup, iteration and leader gets share one monotonic `timeoutMs` deadline (`NatsKvListTimeoutError` on expiry); page/consumer cleanup shares one further fixed `timeoutMs` budget. `listAll` explicitly enumerates through `kv.keys(filterSubject)` and leader reads for complete, globally locale-sorted results; it is not the bounded-page operation. Neither path is an atomic multi-key snapshot.
 
@@ -74,7 +74,7 @@ Caller `stop()`, iterator `return()` or `throw()` (even before first next), Abor
 | Bucket bytes | **32 MiB**, configurable only at first provision |
 | Keys | **100,000**, enforced by backing-stream `max_msgs` with history 1, counting live keys **and tombstone subjects** |
 | Retention | one last message per subject; no max_age/TTL, no mirror/sources |
-| Overflow | `DiscardNew`: reject writes rather than evicting values/fences; at a global cap, updates/deletes may also be refused depending on server enforcement |
+| Overflow | `DiscardNew`: reject writes; keep existing values/fences; at a global cap, updates/deletes may also be refused depending on server enforcement |
 | Administrative removal | `deny_delete`, `deny_purge` protect message history; admin stream/account destruction remains an operational prohibition |
 | Replicas | **3**, File storage; no fallback to R1 or memory |
 | Server | stable **2.14.7+**, homogeneous across hosts |
@@ -113,7 +113,7 @@ A PubAck proves durable command admission, **not** successful state commit. Call
 
 ### Recommendation
 
-Keep this store experimental and leave `mesh.stateBackend` and its file default unchanged. Begin **option 1** as a separately reviewed migration: wrap file/SQLite, inventory synchronous and batch/fence callers, then allow KV only for genuinely independent single-key state. If whole-runtime distributed authority must preserve atomic multi-key batches, prototype **option 3** behind that async seam, requiring projector/result, replay, conflict, crash and ownership-fence gates before cutover. Use option 2 only when the product explicitly accepts local authority and eventual cross-host visibility, never as a transparent NATS authority cache. The async-seam continuation implements option 1 only for the audited `shared/` mesh-tool capability; the transactional runtime migration is still held. Local one-host R3 success does not qualify production three-host or power-loss durability.
+Keep this store experimental and leave `mesh.stateBackend` and its file default unchanged. Begin **option 1** as a separately reviewed migration: wrap file/SQLite, inventory synchronous and batch/fence callers, then allow KV only for independent single-key state. If whole-runtime distributed authority must preserve atomic multi-key batches, prototype **option 3** behind that async seam, requiring projector/result, replay, conflict, crash and ownership-fence gates before cutover. Use option 2 only when the product explicitly accepts local authority and eventual cross-host visibility, never as a transparent NATS authority cache. The async-seam continuation implements option 1 only for the audited `shared/` mesh-tool capability; the transactional runtime migration is still held. Local one-host R3 success does not qualify production three-host or power-loss durability.
 
 ## Reproduction and evidence
 

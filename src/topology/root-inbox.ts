@@ -149,7 +149,9 @@ export class RootInboxEventWake {
   readonly #watchRetry = new MeshBackgroundRetry("root inbox watcher", 1_000, 5_000);
   #watchRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #watchAttempts = 0;
-  #watchExhausted = false;
+  #degraded = false;
+  #degradedCount = 0;
+  #degradedTimer: ReturnType<typeof setTimeout> | undefined;
   #started = false;
   #deadline: ReturnType<typeof setTimeout> | undefined;
   #running: Promise<void> | undefined;
@@ -158,8 +160,8 @@ export class RootInboxEventWake {
   #knownRequested: RootInboxKnownWake | undefined;
   #closed = false;
 
-  // `safetyMs`/`observe` remain for caller compatibility only: this observer owns no idle
-  // periodic timer. The actor mesh monitor's 5 s net is the sole idle safety cadence.
+  // `safetyMs`/`observe` remain for caller compatibility only. Healthy idle owns no timer;
+  // exhausted watcher retries earn a per-inbox 5 s degraded drain (#7299 exception).
   constructor(readonly root: string, readonly wake: (knownDeadline?: RootInboxKnownWake) => Promise<void>, readonly safetyMs = 60_000, readonly observe?: () => void) {}
 
   start(): void {
@@ -192,7 +194,7 @@ export class RootInboxEventWake {
     this.cancelKnownDeadline();
     if (this.#closed) return Promise.resolve();
     this.#requested = true;
-    // Attachment repair rides each trusted request (event, deadline, settle), never a tick.
+    // Attachment repair rides trusted requests and, only while degraded, the slow drain.
     this.#watch();
     this.#eventRequested ||= !knownDeadline;
     if (knownDeadline) this.#knownRequested = knownDeadline;
@@ -220,6 +222,8 @@ export class RootInboxEventWake {
     this.cancelKnownDeadline();
     if (this.#watchRetryTimer) clearTimeout(this.#watchRetryTimer);
     this.#watchRetryTimer = undefined;
+    if (this.#degradedTimer) clearTimeout(this.#degradedTimer);
+    this.#degradedTimer = undefined;
     this.#retireWatch();
   }
 
@@ -231,10 +235,12 @@ export class RootInboxEventWake {
   }
 
   #watchFault(error: unknown): void {
-    if (this.#closed || this.#watchRetryTimer || this.#watchExhausted) return;
+    if (this.#closed || this.#watchRetryTimer || this.#degraded) return;
     if (this.#watchAttempts >= 8) {
-      this.#watchExhausted = true;
-      console.warn(`[pi-fabric] root inbox watcher: retry exhausted after 8 attempts; using existing safety-net drain`);
+      this.#degraded = true;
+      this.#degradedCount++;
+      console.warn(`[pi-fabric] root inbox watcher: retry exhausted after 8 attempts; entering degraded mode #${this.#degradedCount}: draining this inbox and retrying attachment every 5 s`);
+      this.#armDegradedDrain();
       return;
     }
     this.#watchRetry.fault(error);
@@ -247,6 +253,19 @@ export class RootInboxEventWake {
       if (this.#watcher) void this.request();
     }, this.#watchRetry.waitMs);
     this.#watchRetryTimer.unref();
+  }
+
+  #armDegradedDrain(): void {
+    if (this.#closed || !this.#degraded || this.#degradedTimer) return;
+    // One fault-only timer per inbox, not a healthy safety net. request() coalesces reads,
+    // tries attachment first, and performs the catch-up read if that attempt succeeds.
+    this.#degradedTimer = setTimeout(() => {
+      this.#degradedTimer = undefined;
+      if (this.#closed || !this.#degraded) return;
+      void this.request();
+      this.#armDegradedDrain();
+    }, 5_000);
+    this.#degradedTimer.unref();
   }
 
   #watch(): void {
@@ -276,8 +295,13 @@ export class RootInboxEventWake {
       // Do not retain a watch if the path changed while subscribing.
       if (identity() !== current) throw new Error("root changed during watcher attachment");
       this.#watchAttempts = 0;
-      this.#watchExhausted = false;
       this.#watchRetry.success();
+      if (this.#degraded) {
+        this.#degraded = false;
+        if (this.#degradedTimer) clearTimeout(this.#degradedTimer);
+        this.#degradedTimer = undefined;
+        console.warn(`[pi-fabric] root inbox watcher: leaving degraded mode #${this.#degradedCount}: watcher attached; stopped the 5 s drain and reading catch-up work`);
+      }
     } catch (error) {
       this.#retireWatch();
       this.#watchAttempts++;

@@ -149,7 +149,7 @@ describe("root mesh event wake observation", () => {
     expect(mock.spy).toHaveBeenCalledTimes(3); expect(wake).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["error", "unavailable"])("caps watch %s recovery at eight attempts, logs exhaustion once and retains trusted recovery", async mode => {
+  it.each(["error", "unavailable"])("degrades watch %s recovery after eight attempts, drains slowly, logs transitions once and resets on recovery", async mode => {
     vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {}), mock = mockWatch();
     const attach = mock.spy.getMockImplementation()!;
@@ -166,17 +166,75 @@ describe("root mesh event wake observation", () => {
       await vi.advanceTimersByTimeAsync(1); expect(mock.spy).toHaveBeenCalledTimes(index + 2);
     }
     const exhaustedCalls = mock.spy.mock.calls.length;
-    expect(wake).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(5 * 60_000); expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls);
-    await observer.request(); // Existing safety/event/turn drains remain usable, even without a watch.
-    expect(wake).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
-    expect(warn.mock.calls.filter(([line]) => String(line).includes("retry exhausted after 8 attempts"))).toHaveLength(1);
-    expect(warn).toHaveBeenCalledTimes(2); // One fault diagnostic, one exhaustion diagnostic.
+    expect(wake).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls); expect(wake).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls + 1); expect(wake).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls + 2); expect(wake).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("entering degraded mode #1"))).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(2); // One fault diagnostic, one degraded-entry diagnostic.
     mock.spy.mockImplementation(attach); await observer.request();
+    expect(wake).toHaveBeenCalledTimes(4); expect(vi.getTimerCount()).toBe(0);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("leaving degraded mode #1"))).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(mock.spy).toHaveBeenCalledTimes(exhaustedCalls + 3); expect(wake).toHaveBeenCalledTimes(4);
     expect(vi.getTimerCount()).toBe(0);
     mock.watcher.emit("error", new Error("new outage after recovery"));
-    expect(vi.getTimerCount()).toBe(1); // Successful recovery reset the exhausted fault state.
+    mock.spy.mockImplementation(() => { throw new Error("watch unavailable again"); });
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("entering degraded mode #2"))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(1);
     observer.close(); expect(vi.getTimerCount()).toBe(0);
+    const closedCalls = mock.spy.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mock.spy).toHaveBeenCalledTimes(closedCalls); expect(wake).toHaveBeenCalledTimes(4);
+  });
+
+  it("delivers durable work within 6 s despite nine ENOSPC attach failures, then reattaches, catches up and clears the degraded timer", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {}), mock = mockWatch();
+    const attach = mock.spy.getMockImplementation()!;
+    let failures = 0;
+    mock.spy.mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      if (failures++ < 9) throw Object.assign(new Error("inotify watch limit reached"), { code: "ENOSPC" });
+      return attach(...args);
+    }) as typeof fs.watch);
+    const { mesh, box, work } = fixture(0, 0), delivered: string[] = [];
+    const wake = vi.fn(async () => {
+      const batch = await box.wake(held, () => true);
+      delivered.push(...(batch?.events.map(event => event.text ?? "") ?? []));
+    });
+    const observer = new RootInboxEventWake(mesh.root, wake); observers.push(observer);
+    observer.start(); await observer.request();
+    await vi.advanceTimersByTimeAsync(13_500); // Eight failed fast attempts: degraded timer only.
+    expect(mock.spy).toHaveBeenCalledTimes(8); expect(vi.getTimerCount()).toBe(1);
+    const healthyWake = vi.fn().mockResolvedValue(undefined);
+    mock.spy.mockImplementationOnce(attach);
+    const healthy = watched(healthyWake, 1); await healthy.request();
+    const publishedAt = Date.now();
+    await work("durable work with no watcher");
+    await vi.advanceTimersByTimeAsync(4_999); expect(delivered).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1); // Ninth attach still ENOSPC, but the inbox drains.
+    await vi.waitFor(() => expect(delivered).toEqual(["durable work with no watcher"]));
+    expect(Date.now() - publishedAt).toBeLessThanOrEqual(6_000);
+    expect(failures).toBe(9); expect(vi.getTimerCount()).toBe(1);
+    expect(healthyWake).toHaveBeenCalledTimes(1); // Degradation is local to one inbox.
+    await box.close();
+    await work("catch-up on recovery");
+    await vi.advanceTimersByTimeAsync(5_000); // Tenth attach succeeds; tick performs catch-up.
+    await vi.waitFor(() => expect(delivered).toEqual(["durable work with no watcher", "catch-up on recovery"]));
+    expect(failures).toBe(10); expect(vi.getTimerCount()).toBe(0);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("entering degraded mode #1"))).toHaveLength(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("leaving degraded mode #1"))).toHaveLength(1);
+    const calls = mock.spy.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(mock.spy).toHaveBeenCalledTimes(calls); expect(wake).toHaveBeenCalledTimes(3);
+    expect(healthyWake).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+    healthy.close(); observer.close();
   });
 
   it("cancels an armed watcher retry on close and never wakes or attaches the retired observer", async () => {
@@ -301,6 +359,55 @@ const startSession = async (capable = true, tokensPerSecond = 1_000, safetyMs = 
 };
 
 describe("changed source activation and Main gate", () => {
+  it("censuses zero root-inbox timers on a healthy native Main, delivers under nine ENOSPC failures, and returns to zero timers on recovery", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0); // Fault-only fast retries each take 1 ms.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const nativeTimeout = globalThis.setTimeout, nativeClear = globalThis.clearTimeout, nativeWatch = fs.watch;
+    const rootTimers = new Set<ReturnType<typeof setTimeout>>();
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((handler: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      const rootOwned = /topology[\\/]root-inbox\.[jt]s/.test(new Error().stack ?? "");
+      const timer = nativeTimeout(() => { rootTimers.delete(timer); handler(...args); }, ms);
+      if (rootOwned) rootTimers.add(timer);
+      return timer;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(timer => {
+      rootTimers.delete(timer as ReturnType<typeof setTimeout>); nativeClear(timer);
+    });
+    const watch = vi.spyOn(fs, "watch"), h = await startSession(true, 1_000, 1);
+    const rootWatches = watch.mock.calls.flatMap((args, index) =>
+      String(args[0]) === h.meshRoot && (args[1] as unknown as fs.WatchOptions | undefined)?.persistent === false
+        ? [watch.mock.results[index]!.value as fs.FSWatcher] : []);
+    expect(rootWatches.length).toBeGreaterThan(0); expect(h.session.isStreaming).toBe(false);
+    expect(rootTimers.size).toBe(0); // Native Main startup/activation, not just an observer fixture.
+    let failures = 0;
+    watch.mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      if (String(args[0]) === h.meshRoot && (args[1] as unknown as fs.WatchOptions | undefined)?.persistent === false && failures++ < 9) {
+        throw Object.assign(new Error("inotify watch limit reached"), { code: "ENOSPC" });
+      }
+      return nativeWatch(...args);
+    }) as typeof fs.watch);
+    rootWatches.at(-1)!.emit("error", new Error("native Main watcher lost"));
+    await vi.waitFor(() => expect(warn.mock.calls.some(([line]) => String(line).includes("entering degraded mode #1"))).toBe(true), { timeout: 2_000 });
+    expect(failures).toBe(8); expect(rootTimers.size).toBe(1);
+    let turns = 0;
+    const unsubscribe = h.session.subscribe(event => { if (event.type === "agent_start") turns++; });
+    h.faux.setResponses([fauxAssistantMessage("degraded inbox event received")]);
+    const publishedAt = Date.now();
+    h.publish("native Main durable event during ENOSPC");
+    await vi.waitFor(() => { expect(h.inbox()).toHaveLength(1); expect(h.session.isStreaming).toBe(false); }, { timeout: 6_000 });
+    const latencyMs = Date.now() - publishedAt;
+    expect(latencyMs).toBeLessThanOrEqual(6_000); expect(failures).toBe(9);
+    expect(JSON.stringify(h.inbox()[0])).toContain("native Main durable event during ENOSPC");
+    expect(turns).toBe(1); expect(rootTimers.size).toBe(1);
+    await vi.waitFor(() => expect(warn.mock.calls.some(([line]) => String(line).includes("leaving degraded mode #1"))).toBe(true), { timeout: 6_000 });
+    expect(failures).toBe(10); expect(rootTimers.size).toBe(0);
+    await new Promise(resolve => nativeTimeout(resolve, 150));
+    expect(h.inbox()).toHaveLength(1); expect(turns).toBe(1); expect(rootTimers.size).toBe(0);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("entering degraded mode #1"))).toHaveLength(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("leaving degraded mode #1"))).toHaveLength(1);
+    console.info(`[P1 evidence] native Main ENOSPC failures=9; durable delivery latency=${latencyMs} ms; recovery attach=10; healthy root-inbox timer census=0 before/after; inbox deliveries=1; triggered turns=1`);
+    unsubscribe();
+  }, 60_000);
   it("wakes an idle native Main exactly once for an event published during a watcher-error gap", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     vi.spyOn(console, "warn").mockImplementation(() => {});

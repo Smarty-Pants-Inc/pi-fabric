@@ -214,7 +214,8 @@ const reportInboxExpiry = (pi: ExtensionAPI, inbox: RootInboxBatch | undefined):
 };
 
 // Mesh notifications wake idle Main; a trusted read may arm one known-work grace/cooldown
-// deadline. Unknown idle work has only >=60 s safety reconciliation (explicit test override).
+// deadline. Healthy idle has no inbox timer; exhausted watcher retries enable a per-inbox
+// 5 s degraded drain that stops as soon as attachment succeeds (smarty-dev#7299).
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
 // Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
@@ -228,11 +229,6 @@ const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   const declared = (pi as { hostCapabilities?: HostCapabilities }).hostCapabilities;
   const capabilities = injected ?? declared;
   return capabilities?.triggeredMessageQueuesBehindPreflight === true && capabilities.promptPendingVisible === true;
-};
-
-const inboxWakeMs = (): number => {
-  const value = Number(process.env.PI_FABRIC_INBOX_WAKE_MS);
-  return Number.isFinite(value) && value > 0 ? value : 60_000;
 };
 
 export default async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
@@ -476,12 +472,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // uses the already active mesh only; records remain optional and are not opened here.
     inboxWake.context = context;
     if (hostQueuesTriggeredBehindPreflight(pi) && state.config.mesh.enabled && state.mainAgentInfo(context).local) {
-      const observer = new RootInboxEventWake(state.mesh.root, (knownDeadline) => wakeIdleMain(knownDeadline), inboxWakeMs(), () => {
-        const context = inboxWake.context;
-        if (context && state.initialized && state.config.mesh.enabled && state.mainAgentInfo(context).local) {
-          state.observeRootInbox(inboxHeldBy(context));
-        }
-      });
+      const observer = new RootInboxEventWake(state.mesh.root, (knownDeadline) => wakeIdleMain(knownDeadline));
       inboxWake.observer = observer;
       observer.start();
     }

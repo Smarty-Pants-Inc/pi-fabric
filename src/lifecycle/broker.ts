@@ -6,6 +6,7 @@ import { meshObserverStamp, meshObserverWatch, meshObserverWatchCurrent } from "
 const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
 const OBSERVED_DIRECTORIES = ["participants", "host-leases"];
 const IDLE_SAFETY_MS = 60_000;
+const WINDOWS_SAFETY_MS = 5_000;
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
@@ -23,6 +24,8 @@ import {
 } from "./types.js";
 
 export interface LifecycleBrokerOptions {
+  /** Host observation policy; injectable for cross-platform probes. */
+  platform?: NodeJS.Platform;
   enabled: boolean;
   pollMs: number;
   maxReadEvents: number;
@@ -80,9 +83,11 @@ export class LifecycleBroker {
     this.#timer = setInterval(() => {
       if (this.#closed || this.#paused) return;
       this.#attachWatcher(true);
-      // Reviewed R-no-polling exception: repair attachment only, never deliver.
-
-    }, Math.max(IDLE_SAFETY_MS, this.#pollMs));
+      // Linux only repairs attachment. Windows avoids handles on mesh paths and
+      // recovers missed lifecycle events/receipts through the fenced drain.
+      if ((this.options.platform ?? process.platform) === "win32") this.#schedulePoll();
+    }, (this.options.platform ?? process.platform) === "win32"
+      ? WINDOWS_SAFETY_MS : Math.max(IDLE_SAFETY_MS, this.#pollMs));
     this.#timer.unref();
     this.#schedulePoll();
   }
@@ -222,7 +227,9 @@ export class LifecycleBroker {
 
   #attachWatcher(reconcile = false): void {
     if (this.#closed || this.#paused) return;
-    for (const directory of OBSERVED_DIRECTORIES) {
+    // Windows root observation is recursive from a stable parent. Do not add
+    // ancillary watches on mesh.root itself, which would pin it during retirement.
+    for (const directory of (this.options.platform ?? process.platform) === "win32" ? [] : OBSERVED_DIRECTORIES) {
       const watchedPath = path.join(this.mesh.root, directory);
       const previous = this.#directoryWatchers.get(directory);
       if (previous && reconcile && !meshObserverWatchCurrent(previous, watchedPath)) {
@@ -233,7 +240,7 @@ export class LifecycleBroker {
         const watcher = meshObserverWatch(watchedPath, { persistent: false }, () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
           this.#schedulePoll();
-        });
+        }, this.options.platform);
         if (!watcher) continue;
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
@@ -250,7 +257,8 @@ export class LifecycleBroker {
       const watcher = meshObserverWatch(this.mesh.root, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#watcher !== watcher) return;
         if (filename !== null) {
-          const file = path.basename(filename.toString());
+          const file = (this.options.platform ?? process.platform) === "win32"
+            ? filename.toString().split(path.sep)[0]! : path.basename(filename.toString());
           if (!OBSERVED_FILES.includes(file)) return;
           if (OBSERVED_DIRECTORIES.includes(file)) this.#attachWatcher(true);
         }
@@ -259,7 +267,7 @@ export class LifecycleBroker {
         const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
         if (stamp !== undefined && stamp === this.#failedStamp) return;
         this.#schedulePoll();
-      });
+      }, this.options.platform);
       if (!watcher) return;
       this.#watcher = watcher;
       watcher.on("error", () => {

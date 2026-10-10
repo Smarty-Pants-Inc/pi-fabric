@@ -62,7 +62,7 @@ backends share that path; a lease-only batch adds no notification or outbox
 snapshot. State, ownership, receipts and versioned CAS remain authoritative.
 Malformed/spoofed hints never authorize delivery.
 
-Generic `state.json`, read-journal/signal, heartbeat and lease writes do not retry
+On Linux, generic `state.json`, read-journal/signal, heartbeat and lease writes do not retry
 pending work. A changed key re-reads just that exact key, compares its attempted
 signature and validates ownership. Completion/receipt and legacy producer-file
 notifications retry only the corresponding known items. Unchanged failed work
@@ -71,6 +71,24 @@ journal. `ResidencyClient.retryDeliveries()` is an explicit recovery hook;
 startup/reconnection also reconciles durable state. Lost notification publication
 or a process crash can be recovered there, not by an idle timer. The minute
 safety timer only repairs watch attachment, never discovers/delivers work.
+
+Windows retains a 5-second trusted safety drain for control, lifecycle and
+residency observation. Native watches observe recursively from stable parent
+paths rather than holding the mesh, journal or run directories open; Windows
+cannot rename a directory pinned by `ReadDirectoryChangesW`. Missing callbacks,
+unsupported watches and directory replacements therefore cannot strand new
+commands, ACKs, completion files or consumed-delivery cleanup. Namespace discovery
+still compares canonical entry signatures, so an unchanged permanently refused
+actor delivery is not re-admitted by the safety tick. Safety observations do not
+reset an outstanding storage-fault backoff. These Windows timers are closed with
+their runtime and add no Linux idle work.
+
+On every platform, an already-observed lease-paused control claim or completed
+outcome owns a bounded retry until its existing deadline/ACK fence settles.
+Detached ASK failure can arrive after its original drain went idle; it retains
+that same claim and result, never replays a completed handler, and cannot depend
+on another filesystem change to resume. Once those obligations settle, Linux
+returns to attachment-only idle maintenance.
 
 The actor mesh monitor is separate. It retains the 5-second
 `MESH_MONITOR_SAFETY_NET_MS` recovery drain and all manager `beforePoll`

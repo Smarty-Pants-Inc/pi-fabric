@@ -47,7 +47,7 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
     watches.push({ dir: String(dir), callback, watcher });
     return watcher;
   }) as unknown as typeof fs.watch);
-  const client = new ResidencyClient({ config, mesh, participants, mainAgent, ...(mainName ? { mainName } : {}) });
+  const client = new ResidencyClient({ platform: "linux", config, mesh, participants, mainAgent, ...(mainName ? { mainName } : {}) });
   return { client, lastKnown, recipient, meshRoot, watches };
 };
 

@@ -31,7 +31,7 @@ const fixture = () => {
     close: vi.fn(), unref: vi.fn(),
   })) as unknown as typeof fs.watch);
   const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
-  const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
+  const client = new ResidencyClient({ platform: "linux", config, mesh, participants: {} as FabricParticipantSource,
     mainAgent: { local: true } as FabricMainAgentTarget });
   return { root, config, client };
 };

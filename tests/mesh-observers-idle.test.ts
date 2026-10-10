@@ -44,8 +44,8 @@ const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve()
 const publish = (mesh: MeshStore) => mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
   kind: "pi.agent_settled", from: { id: "source", name: "source", kind: "main" },
   data: { version: 1, event: "pi.agent_settled", source, occurredAt: Date.now() } });
-async function lifecycle(mesh: MeshStore, deliver = vi.fn()) {
-  const broker = new LifecycleBroker(mesh, identity, participants, { enabled: true, pollMs: 20, maxReadEvents: 100 }, deliver);
+async function lifecycle(mesh: MeshStore, deliver = vi.fn(), platform: NodeJS.Platform = "linux") {
+  const broker = new LifecycleBroker(mesh, identity, participants, { platform, enabled: true, pollMs: 20, maxReadEvents: 100 }, deliver);
   closers.push(() => broker.close());
   await broker.subscribe({ from: "source", to: "target", events: ["pi.agent_settled"], delivery: "followUp", triggerTurn: false });
   return broker;
@@ -58,14 +58,14 @@ describe("event-driven mesh observers", () => {
       fs.renameSync(mesh.root, mesh.root + ".retired"); fs.mkdirSync(mesh.root);
       return Object.assign(new EventEmitter(), { close }) as unknown as FSWatcher;
     });
-    expect(meshObserverWatch(mesh.root, { persistent: false }, () => {})).toBeUndefined();
+    expect(meshObserverWatch(mesh.root, { persistent: false }, () => {}, "linux")).toBeUndefined();
     expect(close).toHaveBeenCalledOnce();
   });
 
   it("retires missing roots, ignores retired callbacks, and attaches a recreated root at safety cadence", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
     const broker = await lifecycle(mesh); broker.start();
-    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(() => ({ accepted: true }));
     await vi.advanceTimersByTimeAsync(0); await flush();
     const retired = [...watches]; fs.renameSync(mesh.root, mesh.root + ".retired");
@@ -101,12 +101,12 @@ describe("event-driven mesh observers", () => {
     await flush(); expect(lists).toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled();
   });
 
-  it("reattaches native root and ancillary inode replacements and wakes on NEW writes before another safety tick", async () => {
+  it.skipIf(process.platform === "win32")("reattaches native root and ancillary inode replacements and wakes on NEW writes before another safety tick", async () => {
     vi.useFakeTimers(); const mesh = store();
     for (const directory of ["participants", "host-leases"]) fs.mkdirSync(path.join(mesh.root, directory));
     const delivered = vi.fn(); const broker = await lifecycle(mesh, delivered); broker.start();
     const handled = vi.fn(() => ({ accepted: true }));
-    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(handled);
     await vi.advanceTimersByTimeAsync(0); await flush();
     fs.renameSync(mesh.root, mesh.root + ".retired"); fs.cpSync(mesh.root + ".retired", mesh.root, { recursive: true });
@@ -131,7 +131,7 @@ describe("event-driven mesh observers", () => {
   it("does not scan lifecycle subscriptions or reread the unchanged control/actor tail during idle safety checks", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
     const broker = await lifecycle(mesh); broker.start();
-    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(() => ({ accepted: true }));
     const beforePoll = vi.fn(() => true);
     const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
@@ -245,7 +245,7 @@ describe("event-driven mesh observers", () => {
 
   it("recovers a missed control append and prevents pause/close callbacks from rearming", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store(); const handler = vi.fn(() => ({ accepted: true }));
-    const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(handler); await vi.advanceTimersByTimeAsync(0);
     await mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
       data: { version: 1, commandId: "missed", targetId: "target", operation: "steer", replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
@@ -283,10 +283,10 @@ describe("event-driven mesh observers", () => {
   });
 
   it("delivers native post-idle appends to lifecycle, control and actor observers", async () => {
-    const mesh = store(); const delivered = vi.fn(); const broker = await lifecycle(mesh, delivered); broker.start();
-    const owner = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "target", pollMs: 20 });
+    const mesh = store(); const delivered = vi.fn(); const broker = await lifecycle(mesh, delivered, process.platform); broker.start();
+    const owner = new FabricControlPlane(mesh, identity, { platform: process.platform, enabled: true, hostId: "target", pollMs: 20 });
     const senderId = { ...identity, id: "sender" };
-    const sender = new FabricControlPlane(mesh, senderId, { enabled: true, hostId: "sender", pollMs: 20 });
+    const sender = new FabricControlPlane(mesh, senderId, { platform: process.platform, enabled: true, hostId: "sender", pollMs: 20 });
     closers.push(() => owner.close(), () => sender.close());
     const handled = vi.fn(() => ({ accepted: true })); owner.start(handled); sender.start(() => ({ accepted: false }));
     const seen = vi.fn(); const actor = new ActorMeshMonitor(mesh, { enabled: true, actorPollMs: 20, maxReadEvents: 100 },
@@ -295,7 +295,7 @@ describe("event-driven mesh observers", () => {
     await new Promise(resolve => setTimeout(resolve, 80));
     await publish(mesh); await mesh.publish({ topic: "fleet.work.native", from: identity });
     await expect(sender.request("target", "target", "steer", { message: "native" })).resolves.toMatchObject({ acknowledged: true });
-    await vi.waitFor(() => { expect(delivered).toHaveBeenCalledOnce(); expect(seen).toHaveBeenCalledOnce(); });
+    await vi.waitFor(() => { expect(delivered).toHaveBeenCalledOnce(); expect(seen).toHaveBeenCalledOnce(); }, { timeout: 6_000 });
     expect(handled).toHaveBeenCalledOnce();
   });
 });

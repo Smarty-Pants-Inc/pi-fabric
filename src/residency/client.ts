@@ -90,6 +90,7 @@ const COMMAND_TIMEOUT_MS = 30_000;
 const HANDOVER_WAIT_MS = 180_000;
 const STATUS_POLL_MS = 100;
 const WATCHDOG_INTERVAL_MS = 5_000;
+const WINDOWS_SAFETY_MS = 5_000;
 const WATCHDOG_MAX_BACKOFF_MS = 60_000;
 // Bounded backoff for an observed fault obligation only; no obligation, no timer.
 const FAULT_RETRY_MIN_MS = 1_000;
@@ -162,6 +163,8 @@ const registeredWorktree = async (gitRoot: string, worktreePath: string): Promis
 };
 
 export interface ResidencyClientOptions {
+  /** Host observation policy; injectable for cross-platform probes. */
+  platform?: NodeJS.Platform;
   config: ResidentHostConfig;
   mesh: MeshStore;
   participants: FabricParticipantSource;
@@ -206,6 +209,8 @@ export class ResidencyClient {
   // Unknown filenames already proven absent at this state stamp (forged/stale hints).
   #unresolvedNames: { stamp: string; names: Set<string> } | undefined;
   #watchdogTimer: NodeJS.Timeout | undefined;
+  #windowsSafetyTimer: NodeJS.Timeout | undefined;
+  #journalSafetyDirty = false;
   #watchdogPass: Promise<void> | undefined;
   #watchdogRequested = false;
   readonly #watchers = new Map<string, { watcher: fs.FSWatcher; identity: string }>();
@@ -287,8 +292,26 @@ export class ResidencyClient {
     this.syncPiModels();
     // Subscribe before discovery: a write during an awaited drain owns a trailing pass.
     this.#refreshWatchers();
-    // No idle periodic timer: native events own delivery, and only an observed fault
-    // obligation (#scheduleFaultRetry) retries its own keys and repairs attachment.
+    // No idle periodic timer on Linux: native events own discovery/retries.
+    // Windows direct directory watches prevent retirement and can miss replacement
+    // events, so retain its 5 s trusted discovery/receipt safety drain.
+    if ((this.options.platform ?? process.platform) === "win32") {
+      this.#windowsSafetyTimer = setInterval(() => {
+        if (this.#closed) return;
+        this.#refreshWatchers();
+        this.#meshDirty = this.#journalDirty = this.#journalSafetyDirty = true;
+        // Exact authenticated completion sources may change without mesh bytes.
+        // Rechecking their fences never re-admits unrelated failed actor messages.
+        for (const keys of this.#completionDeliveries.values()) {
+          for (const key of keys) this.#receiptDeliveries.add(key);
+        }
+        // A safety observation does not reset an outstanding storage backoff.
+        // Its dirty flags remain owned by the already-armed fault retry.
+        if (this.#backgroundDelivery.waitMs === 0) this.#requestDrain(false);
+        this.#scheduleWatchdog(0);
+      }, WINDOWS_SAFETY_MS);
+      this.#windowsSafetyTimer.unref();
+    }
     this.#started = true;
     // File-only recovery is independent of mesh errors and retry backoff.
     this.#scheduleWatchdog(Math.max(20, this.options.config.mesh.actorPollMs));
@@ -310,6 +333,8 @@ export class ResidencyClient {
       } catch (error) { this.#deferRelease(error); }
     }
     this.#releaseAbort.abort();
+    if (this.#windowsSafetyTimer) clearInterval(this.#windowsSafetyTimer);
+    this.#windowsSafetyTimer = undefined;
     if (this.#faultTimer) clearTimeout(this.#faultTimer);
     this.#faultTimer = undefined;
     if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
@@ -1315,11 +1340,24 @@ export class ResidencyClient {
 
   #refreshWatchers(): void {
     if (this.#closed) return;
+    const windows = (this.options.platform ?? process.platform) === "win32";
     const needed = new Set<string>();
-    for (const target of this.#watchDirectories()) {
+    // On Windows, hold only stable parent handles, never mesh/journal/run paths.
+    // Recursive parent events preserve low latency; the 5 s safety drain handles
+    // unsupported recursion, missing filenames and silently lost replacements.
+    const parents = [path.dirname(this.options.config.meshRoot), path.dirname(this.options.config.actorRoot)];
+    const targets = windows ? parents.filter((dir, index) => !parents.some((other, otherIndex) => {
+      if (otherIndex === index) return false;
+      // path.relative follows Windows' case-insensitive drive/path comparison;
+      // textual prefixes can accidentally retain a watch on mesh.root itself.
+      const relative = path.relative(other, dir);
+      return relative === "" ? otherIndex < index : relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    })) : this.#watchDirectories();
+    for (const target of targets) {
       // Parent observation survives atomic directory replacement. Missing paths are
       // observed from their nearest existing ancestor, without recursive-watch assumptions.
-      for (const start of [target, path.dirname(target)]) {
+      for (const start of windows ? [target] : [target, path.dirname(target)]) {
         let dir = start;
         while (!fs.existsSync(dir) && path.dirname(dir) !== dir) dir = path.dirname(dir);
         needed.add(dir);
@@ -1332,13 +1370,16 @@ export class ResidencyClient {
     for (const dir of needed) {
       if (this.#watchers.has(dir)) continue;
       try {
-        const watcher = fs.watch(dir, (event, filename) => {
+        const notify = (event: string, filename: string | Buffer | null) => {
           if (this.#closed) return;
-          this.#fileChanged(dir, filename === null ? null : String(filename));
           const target = filename === null ? dir : path.join(dir, String(filename));
+          // Recursive Windows filenames name descendants relative to the parent.
+          this.#fileChanged(windows && filename !== null ? path.dirname(target) : dir,
+            filename === null ? null : windows ? path.basename(target) : String(filename));
           if (filename === null || (event === "rename" && this.#watchDirectories().some(source =>
             source === target || source.startsWith(`${target}${path.sep}`)))) this.#refreshWatchers();
-        });
+        };
+        const watcher = windows ? fs.watch(dir, { recursive: true }, notify) : fs.watch(dir, notify);
         watcher.unref();
         watcher.on("error", () => {
           watcher.close();
@@ -1571,6 +1612,8 @@ export class ResidencyClient {
   async #drainDeliveryPass(): Promise<void> {
     const meshDirty = this.#meshDirty;
     const journalDirty = this.#journalDirty;
+    const journalSafety = this.#journalSafetyDirty;
+    this.#journalSafetyDirty = false;
     const retryPending = this.#retryDirty;
     const retryJournal = retryPending || this.#journalRetryDirty;
     const faultKeys = [...this.#faultDeliveries];
@@ -1668,7 +1711,7 @@ export class ResidencyClient {
         }
       }
       if (journalDirty || retryJournal || claims.length) await this.#completions.drainChanged(this.options.config.agents.notifyOnComplete,
-        { retryPending: retryJournal, claims });
+        { safety: journalSafety, retryPending: retryJournal, claims });
       journalDrained = true;
       if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;

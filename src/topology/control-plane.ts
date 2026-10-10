@@ -4,11 +4,12 @@ import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWa
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import type { FSWatcher } from "node:fs";
+import fs, { type FSWatcher } from "node:fs";
 import { meshObserverStamp, meshObserverWatch, meshObserverWatchCurrent } from "../actors/mesh-monitor.js";
 
 const OBSERVED_FILES = ["events.jsonl", "generation"];
 const IDLE_SAFETY_MS = 60_000;
+const WINDOWS_SAFETY_MS = 5_000;
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
@@ -243,6 +244,8 @@ const controlSeenRecord = (value: unknown): FabricControlSeenRecord | undefined 
 };
 
 export interface FabricControlPlaneOptions {
+  /** Host observation policy; injectable for cross-platform probes. */
+  platform?: NodeJS.Platform;
   enabled: boolean;
   hostId: string;
   pollMs?: number;
@@ -924,7 +927,15 @@ export class FabricControlPlane {
 
   async #poll(): Promise<void> {
     if (this.#closed || this.#paused || !this.options.enabled) return;
-    if (this.options.canConsumeMesh?.() === false) return;
+    if (this.options.canConsumeMesh?.() === false) {
+      // A denied lease is not itself work. Only an owned obligation or a changed
+      // fixed-file witness (nonempty replay at startup) acquires a Linux retry.
+      const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
+      this.#retryNeeded ||= this.#ownedCommands.size > 0 || this.#sharedClaims.size > 0 ||
+        (this.#stamp === undefined ? (fs.statSync(path.join(this.mesh.root, "events.jsonl"), { throwIfNoEntry: false })?.size ?? 0) > 0
+          : stamp !== this.#stamp);
+      return;
+    }
     if (this.#polling) return this.#polling;
     this.#retryNeeded = false;
     this.#stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
@@ -953,7 +964,7 @@ export class FabricControlPlane {
         if (this.#closed || this.#paused || this.#watcher !== watcher) return;
         if (filename !== null && !OBSERVED_FILES.includes(path.basename(filename.toString()))) return;
         this.#wake();
-      });
+      }, this.options.platform);
       if (!watcher) return;
       this.#watcher = watcher;
       watcher.on("error", () => {
@@ -977,11 +988,11 @@ export class FabricControlPlane {
     const timer = setTimeout(() => {
       if (this.#timer !== timer || this.#closed || this.#paused) return;
       this.#timer = undefined;
-      this.#attachWatcher(waitMs >= IDLE_SAFETY_MS);
-      // Reviewed R-no-polling exception: this minute timeout reattaches only.
-      // Pending commands already own exact acceptance/handler deadlines;
-      // never retry delivery or discover missed commands from a safety tick.
-      if (waitMs >= IDLE_SAFETY_MS) {
+      const windows = (this.options.platform ?? process.platform) === "win32";
+      this.#attachWatcher(waitMs >= (windows ? WINDOWS_SAFETY_MS : IDLE_SAFETY_MS));
+      // Linux retains attachment-only idle maintenance. Windows parent watches
+      // are hints: missed commands/ACKs must enter the trusted fenced drain.
+      if (!windows && waitMs >= IDLE_SAFETY_MS) {
         this.#schedulePoll(IDLE_SAFETY_MS);
         return;
       }
@@ -991,7 +1002,13 @@ export class FabricControlPlane {
         this.#running = false;
         if (this.#closed || this.#paused) return;
         if (result !== "done") this.#retryNeeded = true;
-        this.#schedulePoll(this.#dirty ? 0 : IDLE_SAFETY_MS);
+        // A lease/fault-paused owned command can recover without any new bytes.
+        // This is active work, not Linux idle polling. Windows also observes ACKs
+        // while requests are pending and has a 5 s otherwise-idle safety bound.
+        const active = this.#retryNeeded || this.#sharedClaims.size ||
+          [...this.#ownedCommands.values()].some(owned => !owned.running) || (windows && this.#pending.size);
+        this.#schedulePoll(this.#dirty ? 0 : active ? Math.max(this.#pollMs, this.#backgroundPoll.waitMs + 1)
+          : windows ? WINDOWS_SAFETY_MS : IDLE_SAFETY_MS);
       });
     }, waitMs);
     this.#timer = timer;
@@ -1237,9 +1254,13 @@ export class FabricControlPlane {
       })
       .finally(() => {
         owned.running = false;
-        // A failed write is not a new event: retain it for a real receipt/file
-        // change, rather than recursively re-admitting the same command.
         if (!failed) this.#wake();
+        else if (this.#ownedCommands.get(key) === owned) {
+          // Detached handlers may fail after the drain has already gone idle.
+          // Their exact owned result/claim, not all mesh work, owns the retry.
+          this.#retryNeeded = true;
+          if (!this.#running) this.#schedulePoll(Math.max(this.#pollMs, this.#backgroundPoll.waitMs + 1));
+        }
       });
     if (detachedControlOperation(command.operation)) {
       this.#activeHandlers.add(execution);

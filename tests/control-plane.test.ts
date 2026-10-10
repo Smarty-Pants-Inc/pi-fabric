@@ -31,7 +31,7 @@ const plane = (
   meshRoot: string,
   id: string,
   storeOptions: MeshStoreOptions = {},
-  controlOptions: Pick<FabricControlPlaneOptions, "pollMs" | "acknowledgementTimeoutMs" | "bridgeTimeoutMs" | "readMirroredOwner"> = {},
+  controlOptions: Pick<FabricControlPlaneOptions, "platform" | "pollMs" | "acknowledgementTimeoutMs" | "bridgeTimeoutMs" | "readMirroredOwner"> = {},
 ): FabricControlPlane => {
   const value = new FabricControlPlane(
     new MeshStore(meshRoot, 64 * 1024, 1_000, storeOptions),
@@ -567,7 +567,8 @@ describe("FabricControlPlane", () => {
         return lease;
       });
       const sender = plane(path.join(root, "mesh"), "host:sender", {}, {
-        acknowledgementTimeoutMs: 5_000, bridgeTimeoutMs,
+        // Virtual transport below emits Linux-style directory filenames.
+        platform: "linux", acknowledgementTimeoutMs: 5_000, bridgeTimeoutMs,
         ...(port ? { readMirroredOwner } : {}),
       });
       // Obtain the transport envelope without depending on its private shape.

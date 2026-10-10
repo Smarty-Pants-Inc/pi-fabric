@@ -38,10 +38,19 @@ export function meshObserverWatch(
   directory: string,
   options: { persistent: boolean; recursive?: boolean },
   notify: (event: string, filename: string | Buffer | null) => void,
+  platform: NodeJS.Platform = process.platform,
 ): FSWatcher | undefined {
   const identity = directoryIdentity(directory);
   if (identity === undefined) return undefined;
-  const watcher = fs.watch(directory, options, notify);
+  // ReadDirectoryChangesW pins only the watched directory. Observe recursively
+  // from its stable parent so replacing/retiring the mesh path remains possible.
+  const parent = path.dirname(directory), name = path.basename(directory);
+  const watcher = platform === "win32" ? fs.watch(parent, { ...options, recursive: true }, (event, filename) => {
+    if (filename === null) { notify(event, null); return; }
+    const relative = filename.toString();
+    if (relative === name) notify(event, null);
+    else if (relative.startsWith(`${name}${path.sep}`)) notify(event, relative.slice(name.length + 1));
+  }) : fs.watch(directory, options, notify);
   if (directoryIdentity(directory) !== identity) { watcher.close(); return undefined; }
   watchIdentities.set(watcher, identity);
   return watcher;

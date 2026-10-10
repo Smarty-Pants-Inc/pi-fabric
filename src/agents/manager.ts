@@ -1427,6 +1427,7 @@ export class AgentManager {
           ...(request.actorId ? ["--actor-id", request.actorId] : []),
           ...(request.actorName ? ["--actor-name", request.actorName] : []),
           ...(request.bashTimeoutSeconds !== undefined ? ["--actor-bash-timeout", String(request.bashTimeoutSeconds)] : []),
+          ...(request.bashIdleSeconds !== undefined ? ["--bash-idle-seconds", String(request.bashIdleSeconds)] : []),
           ...(request.capabilityRequirements
             ? ["--capability-requirements", JSON.stringify(request.capabilityRequirements)]
             : []),
@@ -1468,7 +1469,7 @@ export class AgentManager {
                 ? "inherited account pins require the local worker"
                 : !extensions
                   ? "extensions disabled require the local worker"
-                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || request.bashIdleSeconds !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
                     ? "requested worker features cannot be preserved by one-shot placement"
                     : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,

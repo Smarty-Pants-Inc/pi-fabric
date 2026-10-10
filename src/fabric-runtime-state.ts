@@ -714,6 +714,7 @@ export class FabricRuntimeState {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,
           this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
         await inboxMaintenance?.run();
+        await this.#actors?.reconcileSessionOrphans();
       },
       enabled: this.#config.mesh.enabled,
       hostId,

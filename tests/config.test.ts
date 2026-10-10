@@ -112,6 +112,22 @@ describe("host-only processSlice (#4383)", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
   });
 });
+describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {
+  it("defaults to ten minutes and clamps to [1 s, 7 d]", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({}).agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 300_000 } }).agents.stuckPreparingMs).toBe(300_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 5 } }).agents.stuckPreparingMs).toBe(1_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: "soon" } }).agents.stuckPreparingMs).toBe(600_000);
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 7 * 24 * 60 * 60_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(600_000);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 120_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(120_000);
+  });
+});
 
 it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);

@@ -215,6 +215,8 @@ export interface FabricAgentConfig {
   wakeText?: FabricWakeTextConfig;
   /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
   deadRootFilter: FabricDeadRootFilterConfig;
+  /** Host-only: tell the root's Main once an activation stays in preparing this long (smarty-dev#6337). */
+  stuckPreparingMs: number;
 }
 
 export type FabricDeadRootFilterMode = "off" | "on";
@@ -592,6 +594,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     sessionExportDir: "",
     nice: 0,
     deadRootFilter: { mode: "off", exempt: [] },
+    stuckPreparingMs: 600_000,
   },
   jev: { ...DEFAULT_JEV_CONFIG, credentialCommand: [] },
   records: structuredClone(DEFAULT_RECORDS_CONFIG),
@@ -1291,6 +1294,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           : DEFAULT_FABRIC_CONFIG.agents.sessionExportDir,
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
+      stuckPreparingMs: boundedInteger(agents.stuckPreparingMs, DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs, 1_000, 7 * 24 * 60 * 60_000),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
       ...(wakeText ? { wakeText } : {}),
     },
@@ -1764,6 +1768,7 @@ const resolveFabricConfig = (
       delete agents.processSlice;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
+      delete agents.stuckPreparingMs; // Host-only: a lane cannot silence the stuck-preparing owner notice.
       document.agents = agents;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };

@@ -893,3 +893,95 @@ describe("#816 per-actor queue acceptance", () => {
     expect(replies(actors, ids.healthy.id)).toBe(3);
   });
 });
+
+// smarty-dev#6337: a hung preparation never fails, so the failure-streak notice never
+// fires. The resident host's maintenance tick reports it once per stuck episode.
+describe("stuck preparing owner notice (smarty-dev#6337)", () => {
+  const MIN = 60_000;
+  const THRESHOLD = 10 * MIN;
+  afterEach(() => { vi.useRealTimers(); });
+  // Only the reporting tick runs on the fake clock: activation persistence uses
+  // synchronous lock deadlines that a frozen Date would never reach.
+  const at = (ms: number) => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(ms); };
+  const stuckSetup = async (name: string) => {
+    let gate = deferred<void>();
+    let stalled = false;
+    // A binding that never resolves and no 30 s deadline: the activation stays in preparing.
+    const s = setup({ preparationTimeoutMs: 24 * 60 * MIN,
+      resolvePiModel: (model) => stalled ? gate.promise.then(() => model) : model });
+    cleanups.push(async () => { vi.useRealTimers(); gate.resolve(); });
+    const actor = await s.actors.create({ name, model: "provider/test", instructions: "Reply", responseMode: "text", coalesce: false });
+    const stuck = () => s.notices.filter((text) => text.includes("stuck in preparing"));
+    const metrics = () => {
+      const file = path.join(s.root, "mesh", "metrics", "stuck-preparing.jsonl");
+      return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
+    };
+    const begin = async (): Promise<number> => {
+      s.actors.tell(actor.id, "work");
+      stalled = true;
+      await waitFor(() => s.actors.status(actor.id).status === "preparing" && s.actors.status(actor.id).preparing?.phase === "binding");
+      return s.actors.status(actor.id).preparing!.startedAt;
+    };
+    const release = async () => {
+      vi.useRealTimers();
+      gate.resolve();
+      await waitFor(() => s.actors.inFlightCount() === 0 && s.actors.status(actor.id).queued === 0);
+      stalled = false;
+      gate = deferred<void>();
+    };
+    return { ...s, actor, stuck, metrics, begin, release };
+  };
+
+  it("defaults agents.stuckPreparingMs to ten minutes", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);
+  });
+
+  it("sends exactly one notice after the threshold, none before", async () => {
+    const s = await stuckSetup("stuck-prep");
+    const since = await s.begin();
+    at(since + THRESHOLD - 1_000);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(s.stuck()).toEqual([]);
+    expect(s.metrics()).toEqual([]);
+    at(since + THRESHOLD);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1);
+    at(since + 3 * THRESHOLD);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(s.stuck()).toEqual([expect.stringContaining(
+      `Fabric host notice: actor stuck-prep stuck in preparing for 10 min (since ${new Date(since).toISOString()}); its queued events are waiting.`)]);
+    expect(s.metrics()).toEqual([expect.objectContaining({ actorId: s.actor.id, actorName: "stuck-prep", phase: "binding",
+      since: new Date(since).toISOString(), stuckMs: THRESHOLD })]);
+  });
+
+  it("sends none for a preparation that resolves at nine minutes", async () => {
+    const s = await stuckSetup("slow-prep");
+    const since = await s.begin();
+    at(since + 9 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    await s.release();
+    at(since + 11 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(s.stuck()).toEqual([]);
+    expect(s.metrics()).toEqual([]);
+  });
+
+  it("notifies again for a second episode after recovery", async () => {
+    const s = await stuckSetup("flappy-prep");
+    const first = await s.begin();
+    at(first + 11 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1);
+    await s.release();
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    const second = await s.begin();
+    at(second + 9 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    at(second + 12 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(s.stuck()).toEqual([
+      expect.stringContaining(`stuck in preparing for 11 min (since ${new Date(first).toISOString()})`),
+      expect.stringContaining(`stuck in preparing for 12 min (since ${new Date(second).toISOString()})`),
+    ]);
+    expect(s.metrics()).toHaveLength(2);
+  });
+});

@@ -171,6 +171,7 @@ export class ActorDirectory extends ActorManager {
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
+  override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
   override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }

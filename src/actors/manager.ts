@@ -41,6 +41,7 @@ import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoales
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
+import { appendStuckPreparing, stuckPreparingNotice } from "./stuck-preparing.js";
 import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
   FabricActorBindingScope,
@@ -487,6 +488,8 @@ export class ActorManager {
   readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /** smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. */
+  readonly #stuckPreparing = new Map<string, { itemId: string | undefined; since: number; notified: boolean }>();
   /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
   readonly #removals = new Map<string, Promise<void>>();
   /** Revoked actors still owe directory/presence cleanup; persisted independently of the registry. */
@@ -3727,6 +3730,57 @@ export class ActorManager {
     } catch {
       // Best effort: the failures stay in the actor's messages and run records.
     }
+  }
+
+  /**
+   * smarty-dev#6337: an activation hung in preparation never fails, so the
+   * failure-streak notice above never fires. The resident host's maintenance
+   * tick calls this: an actor continuously in preparing (not waiting for a
+   * permit) for thresholdMs gets ONE owner notice per episode. The episode ends
+   * when the actor leaves preparing or starts another activation.
+   */
+  reportStuckPreparing(thresholdMs: number, now = Date.now()): number {
+    if (this.#halted || this.#closing || !(thresholdMs > 0)) {
+      this.#stuckPreparing.clear();
+      return 0;
+    }
+    let sent = 0;
+    const open = new Set<string>();
+    for (const actor of this.#draining.values()) {
+      const preparing = actor.preparing;
+      if (!preparing || preparing.phase === "waiting" || actor.status === "stopped" || actor.removal) continue;
+      if (!this.#canManageCached(actor.id)) continue;
+      open.add(actor.id);
+      const itemId = this.#inFlight.get(actor.id)?.id;
+      let episode = this.#stuckPreparing.get(actor.id);
+      if (!episode || episode.itemId !== itemId) {
+        episode = { itemId, since: preparing.startedAt, notified: false };
+        this.#stuckPreparing.set(actor.id, episode);
+      } else episode.since = Math.min(episode.since, preparing.startedAt);
+      const stuckMs = now - episode.since;
+      if (episode.notified || stuckMs < thresholdMs) continue;
+      episode.notified = true;
+      sent++;
+      const text = stuckPreparingNotice(actor.name, stuckMs, episode.since) +
+        ` Phase: ${preparing.phase}. Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
+      appendStuckPreparing(this.mesh.root, {
+        at: new Date(now).toISOString(), actorId: actor.id, actorName: actor.name, rootId: actor.rootId,
+        phase: preparing.phase, since: new Date(episode.since).toISOString(), stuckMs, queued: actor.queue.length,
+      });
+      const notice: FabricActorMessage = {
+        id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+        source: "fabric-host", createdAt: now, action: "message", text,
+      };
+      try {
+        // The same host alarm channel as the failure-streak notice: it reaches the
+        // root's Main and starts a turn whatever the actor's own delivery.
+        this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+      } catch {
+        // Best effort: the metrics line and the actor's preparing status remain.
+      }
+    }
+    for (const id of this.#stuckPreparing.keys()) if (!open.has(id)) this.#stuckPreparing.delete(id);
+    return sent;
   }
 
   #downgradeOutputPrincipal(actor: ManagedActor, item: ActorQueueItem): void {

@@ -406,8 +406,11 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       fauxAssistantMessage("mailbox followUp processed"),
     ]);
     await session.prompt("fail the stream");
-    expect(session.isStreaming).toBe(false);
+    // During-error work may already have started its one event-driven followUp
+    // when the original prompt's promise resolves. The assertions below still
+    // require exactly one inbox delivery and exactly one additional model call.
     if (timing === "after-error") {
+      expect(session.isStreaming).toBe(false);
       await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
       missedWork("Follow up after stream disconnect.");

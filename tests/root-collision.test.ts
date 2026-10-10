@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -17,6 +19,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(directory => directory.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 const temp = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-root-collision-"));
@@ -136,6 +139,35 @@ describe.each([false, true])("live root collision advisory (filesOnly=%s)", file
     await fork.directory.refresh();
     expect(fork.reported).not.toHaveBeenCalled();
   });
+});
+
+it("does not census participant files on own idle heartbeats; foreign file events invalidate the advisory", async () => {
+  const { make } = await setup(true);
+  const owner = make("owner", "other-lead");
+  await owner.directory.refresh();
+  let notify!: (event: string, filename: string | null) => void;
+  const watcher = Object.assign(new EventEmitter(), { close: vi.fn(), ref: vi.fn(), unref: vi.fn() });
+  vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+    notify = args[2] as typeof notify; return watcher;
+  }) as typeof fs.watch);
+  const local = make("local", "net-lead");
+  await local.directory.refresh();
+  const census = vi.spyOn(local.directory, "list");
+  const stats = vi.spyOn(fs, "statSync");
+  const filename = (id: string) => `${createHash("sha256").update(id).digest("hex")}.json`;
+  for (let n = 0; n < 10; n++) {
+    notify("rename", filename("session:local"));
+    await local.directory.refresh();
+  }
+  expect(census).not.toHaveBeenCalled();
+  expect(stats.mock.calls.filter(([file]) => String(file).endsWith(filename("session:owner")))).toHaveLength(0);
+  owner.rename("net-lead"); await owner.directory.refresh();
+  notify("rename", filename("session:owner"));
+  await local.directory.refresh();
+  expect(census).toHaveBeenCalledOnce();
+  expect(local.reported).toHaveBeenCalledWith(expect.objectContaining({ reason: "duplicate-name" }));
+  await local.directory.close();
+  expect(watcher.close).toHaveBeenCalledOnce();
 });
 
 it("surfaces a duplicate-root advisory in the runtime without starting a turn", async () => {

@@ -19,6 +19,7 @@ import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup } from "./worker/execution-group.js";
+import { executionObserver } from "./worker/execution-observer.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
@@ -247,9 +248,13 @@ const runnerLabel = (runner: string): string =>
   runner === "claude" ? "Claude" : runner === "veda" ? "Veda" : "Pi";
 
 const executionGroups = new WeakMap<ChildProcess, ReturnType<typeof executionGroup>>();
+const executionObservers = new WeakMap<ChildProcess, ReturnType<typeof executionObserver>>();
 let executionCleanup: () => Promise<void> = async () => {};
 const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
-  try { executionGroups.get(child)?.signal(signal); }
+  try {
+    executionObservers.get(child)?.arm();
+    executionGroups.get(child)?.signal(signal);
+  }
   catch (error) { console.error(`Execution cleanup unresolved: ${String(error)}`); }
 };
 
@@ -667,10 +672,13 @@ const main = async (): Promise<void> => {
     } : executionGroup(execution);
     executionGroups.set(execution, group);
     execution.once("close", () => { nativeClosed = true; });
-    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    const groupObserver = executionObserver(execution, group);
+    executionObservers.set(execution, groupObserver);
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
-      const exited = () => nativeClosed && group.exited();
+      groupObserver.arm();
+      // Check membership even while inherited pipes keep native close pending.
+      const exited = () => groupObserver.exited() && nativeClosed;
       const wait = async (ms: number) => {
         const deadline = Date.now() + ms;
         do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
@@ -684,12 +692,15 @@ const main = async (): Promise<void> => {
           if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
         }
       }
-      clearInterval(groupObserver);
     })();
     if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
   };
   let child = spawnChild();
   retainExecutionCustody(child);
+  const writeChildInput = (message: string): void => {
+    executionObservers.get(child)?.arm();
+    child.stdin?.write(message);
+  };
   let childExited = false;
   let piControlLive = false;
   let nativeActivity = false;
@@ -778,7 +789,7 @@ const main = async (): Promise<void> => {
       // Native abort waits for the assistant to finalize/persist. Close stdin
       // only after its acknowledgement; SIGTERM + EOF together can race two
       // shutdowns and exit before an unseeded session becomes durable.
-      child.stdin?.write(`${JSON.stringify({ type: "abort", id: `whitespace-abort-${options.id}` })}\n`);
+      writeChildInput(`${JSON.stringify({ type: "abort", id: `whitespace-abort-${options.id}` })}\n`);
       killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
       return;
@@ -817,6 +828,7 @@ const main = async (): Promise<void> => {
     killChild();
   };
   const closeChild = (): void => {
+    executionObservers.get(child)?.arm();
     piControlLive = false;
     child.stdin?.end();
     recoveryWatchdog.suspend();
@@ -857,12 +869,12 @@ const main = async (): Promise<void> => {
   // Startup and admission share the overall run timeout below, not a shorter cap.
   const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[]): void => {
     if (!provenance?.principal) {
-      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message }) + "\n");
+      writeChildInput(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message }) + "\n");
       return;
     }
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
-    child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
+    writeChildInput(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
   };
   const hasUnsettledFollowUps = (): boolean => {
     const directory = path.join(path.dirname(deliveryDirectory), "follow-ups");
@@ -887,7 +899,7 @@ const main = async (): Promise<void> => {
         if (item.followUpId !== id || item.delivery !== "followUp") continue;
         const receipt = followUpFile(path.dirname(deliveryDirectory), id);
         if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
-        child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+        writeChildInput(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
       } catch { /* Retain malformed/uncertain envelopes; never invent delivery. */ }
     }
   };
@@ -905,7 +917,7 @@ const main = async (): Promise<void> => {
     if (terminalStatus) return;
     const message = resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task;
     if (taskProvenance?.principal) sendPiDelivery(message, taskProvenance, "steer", resumePrompt ? [] : images);
-    else child.stdin?.write(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
+    else writeChildInput(`${JSON.stringify({ type: "prompt", message, ...(!resumePrompt && images.length > 0 ? { images } : {}) })}\n`);
     // ctx.isIdle() remains true during asynchronous prompt preflight. Do not
     // issue a second prompt in that gap; wait for the native agent_start.
     replayAfterStart = true;
@@ -913,7 +925,7 @@ const main = async (): Promise<void> => {
   const createModelControl = (): InstanceType<typeof PiModelControl> => new PiModelControl(options.id, resumedModel ?? options.model, resumedThinking ?? thinking, {
     send(frame) {
       if (terminalStatus) return;
-      child.stdin?.write(`${JSON.stringify(frame)}\n`);
+      writeChildInput(`${JSON.stringify(frame)}\n`);
     },
     observed(model) {
       if (record.model === model) return;
@@ -957,7 +969,7 @@ const main = async (): Promise<void> => {
         contextAdmission = new admissionModule.ActorContextAdmission(options.id,
           resumePrompt ? "Continue the task from the existing session. Do not repeat completed work." : task,
           options.systemPrompt ?? "", estimateActorInput, {
-            send(frame) { if (!terminalStatus) child.stdin?.write(`${JSON.stringify(frame)}\n`); },
+            send(frame) { if (!terminalStatus) writeChildInput(`${JSON.stringify(frame)}\n`); },
             ready: dispatchPiPrompt,
             fail(error) { modelControl.fail(error); },
             reseed(recovery) {
@@ -1064,7 +1076,7 @@ const main = async (): Promise<void> => {
       if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) {
         throw new Error("Child Pi stdin closed before compaction could start");
       }
-      child.stdin.write(`${JSON.stringify(frame)}\n`);
+      writeChildInput(`${JSON.stringify(frame)}\n`);
     },
     close: closeChild,
     update(status) {
@@ -1151,9 +1163,7 @@ const main = async (): Promise<void> => {
     if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) return;
     claudeSentInputs.push({ kind, message });
     if (kind === "follow_up") claudeCanFollowUp = false;
-    child.stdin.write(
-      `${JSON.stringify(claudeCli!.claudeUserMessage(message, inputImages))}\n`,
-    );
+    writeChildInput(`${JSON.stringify(claudeCli!.claudeUserMessage(message, inputImages))}\n`);
     updateClaudeQueue();
   };
 
@@ -1500,6 +1510,7 @@ const main = async (): Promise<void> => {
     }
     if (!terminalStatus) recoveryWatchdog.observe(event);
     if (event.type === "agent_start") {
+      executionObservers.get(child)?.arm();
       nativeActivity = true;
       deferredFollowUpSettle = false;
       if (options.runner === "pi" && replayAfterStart) {
@@ -1553,13 +1564,12 @@ const main = async (): Promise<void> => {
         typeof event.id === "string" &&
         (method === "select" || method === "confirm" || method === "input" || method === "editor")
       ) {
-        child.stdin?.write(
-          `${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
-        );
+        writeChildInput(`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`);
       }
       return;
     }
     if (event.type === "tool_execution_start") {
+      executionObservers.get(child)?.arm();
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
@@ -1736,7 +1746,7 @@ const main = async (): Promise<void> => {
         );
       }
       sections.push(task);
-      child.stdin?.write(sections.join("\n\n"));
+      writeChildInput(sections.join("\n\n"));
       child.stdin?.end();
     } else {
       modelControl.start();
@@ -1849,12 +1859,12 @@ const main = async (): Promise<void> => {
               fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({
                 message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
               }), { mode: 0o600 });
-              child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+              writeChildInput(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
             } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp");
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
+            writeChildInput(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
+            writeChildInput(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
           }

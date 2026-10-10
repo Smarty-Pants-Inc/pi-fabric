@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { RootInbox, type RootInboxBatch, type RootInboxKnownWake, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
@@ -361,12 +361,19 @@ export class FabricRuntimeState {
    * The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox.
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
+  observeRootInbox(session: RootInboxSession): readonly string[] { return this.#rootInbox?.observe(session) ?? []; }
+  get rootInboxKnownWake(): RootInboxKnownWake | undefined { return this.#rootInbox?.knownWake; }
+  /** `options` applies to the turn/settle drain only; `hint` scopes an idle known-deadline wake only. */
+  async nextRootInbox(
+    session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions, hint?: RootInboxKnownWake,
+  ): Promise<RootInboxBatch | undefined> {
+    if (idle && !idle()) return undefined;
     let batch: RootInboxBatch | undefined;
     await this.#inboxRetry.run(async () => {
-      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
+      if (idle && !idle()) return;
+      batch = await (idle ? this.#rootInbox?.wake(session, idle, hint) : this.#rootInbox?.next(session, options));
     });
-    return batch;
+    return idle && !idle() ? undefined : batch;
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */

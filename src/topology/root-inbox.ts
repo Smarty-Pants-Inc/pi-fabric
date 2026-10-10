@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -76,6 +78,14 @@ export interface RootInboxReconcileOptions {
   commitOnly?: boolean;
   /** A turn boundary is positive progress evidence for the pending-batch wedge alarm. */
   turnEnd?: boolean;
+  /** A known-deadline wake admits only these previously observed ids, never unknown work. */
+  admitted?: ReadonlySet<string>;
+}
+
+/** Immutable observation admitted by an event read, not delivery authority. */
+export interface RootInboxKnownWake {
+  readonly dueAt: number;
+  readonly ids: readonly string[];
 }
 
 interface RootInboxState {
@@ -132,8 +142,124 @@ export interface RootInboxSession {
   deliveredAt?: ReadonlyMap<string, number>;
 }
 
+/** Notifications are hints only: the caller owns every host/authority/delivery gate. */
+export class RootInboxEventWake {
+  #watcher: fs.FSWatcher | undefined;
+  #rootIdentity: string | undefined;
+  #started = false;
+  #deadline: ReturnType<typeof setTimeout> | undefined;
+  #running: Promise<void> | undefined;
+  #requested = false;
+  #eventRequested = false;
+  #knownRequested: RootInboxKnownWake | undefined;
+  #closed = false;
+
+  // `safetyMs`/`observe` remain for caller compatibility only: this observer owns no idle
+  // periodic timer. The actor mesh monitor's 5 s net is the sole idle safety cadence.
+  constructor(readonly root: string, readonly wake: (knownDeadline?: RootInboxKnownWake) => Promise<void>, readonly safetyMs = 60_000, readonly observe?: () => void) {}
+
+  start(): void {
+    if (this.#closed || this.#started) return;
+    this.#started = true;
+    this.#watch();
+    // Subscribe before reconciling: publication between activation and this read is retained.
+    void this.request();
+  }
+
+  /** Only a completed trusted wake supplies this observation hint; it never admits work. */
+  armKnownDeadline(hint: RootInboxKnownWake | undefined): void {
+    this.cancelKnownDeadline();
+    const delay = hint === undefined ? 0 : hint.dueAt - Date.now();
+    if (this.#closed || !hint?.ids.length || !Number.isFinite(delay) || delay <= 0) return;
+    const admitted = { dueAt: hint.dueAt, ids: [...hint.ids] };
+    this.#deadline = setTimeout(() => {
+      this.#deadline = undefined;
+      void this.request(admitted);
+    }, Math.min(delay, 2_147_483_647));
+    this.#deadline.unref();
+  }
+
+  cancelKnownDeadline(): void {
+    if (this.#deadline) clearTimeout(this.#deadline);
+    this.#deadline = undefined;
+  }
+
+  request(knownDeadline?: RootInboxKnownWake): Promise<void> {
+    this.cancelKnownDeadline();
+    if (this.#closed) return Promise.resolve();
+    this.#requested = true;
+    // Attachment repair rides each trusted request (event, deadline, settle), never a tick.
+    this.#watch();
+    this.#eventRequested ||= !knownDeadline;
+    if (knownDeadline) this.#knownRequested = knownDeadline;
+    if (this.#running) return this.#running;
+    const task = Promise.resolve().then(async () => {
+      while (this.#requested && !this.#closed) {
+        this.#requested = false;
+        const deadline = this.#eventRequested ? undefined : this.#knownRequested;
+        this.#eventRequested = false;
+        this.#knownRequested = undefined;
+        try { await this.wake(deadline); } catch { /* The next event or explicit turn retries durable work. */ }
+      }
+    });
+    this.#running = task;
+    void task.finally(() => {
+      if (this.#running === task) this.#running = undefined;
+      if (this.#requested && !this.#closed) void this.request();
+    });
+    return task;
+  }
+
+  close(): void {
+    this.#closed = true;
+    this.#requested = false;
+    this.cancelKnownDeadline();
+    this.#retireWatch();
+  }
+
+  #retireWatch(): void {
+    this.#watcher?.close();
+    this.#watcher = undefined;
+    this.#rootIdentity = undefined;
+  }
+
+  #watch(): void {
+    if (this.#closed) return;
+    try {
+      // A directory watcher may silently keep observing a renamed/unlinked inode forever.
+      // Only stat the root itself: unchanged ticks must not enumerate it or reread the log.
+      const identity = (): string => {
+        const stat = fs.statSync(this.root, { bigint: true });
+        return `${stat.dev}:${stat.ino}`;
+      };
+      const current = identity();
+      if (this.#watcher && this.#rootIdentity === current) return;
+      this.#retireWatch();
+      const watcher = fs.watch(this.root, { persistent: false }, (_event, filename) => {
+        if (this.#watcher !== watcher) return;
+        if (filename !== null && path.basename(filename.toString()) !== "events.jsonl") return;
+        void this.request();
+      });
+      this.#watcher = watcher;
+      this.#rootIdentity = current;
+      watcher.on("error", () => {
+        if (this.#watcher !== watcher) return;
+        this.#retireWatch();
+      });
+      // Do not retain a watch if the path changed while subscribing.
+      if (identity() !== current) this.#retireWatch();
+    } catch {
+      this.#retireWatch(); // Missing root/watch support: the next trusted request retries attachment.
+    }
+  }
+}
+
 export class RootInbox {
   #state: RootInboxState | undefined;
+  #wakeProbe: { stamp: string; names: string; dueAt: number; knownDueAt: number; ids: string[]; scoped: boolean } | undefined;
+  #scanDueAt = Number.POSITIVE_INFINITY;
+  #scanKnownDueAt = Number.POSITIVE_INFINITY;
+  #scanKnownIds = new Set<string>();
   #saved: string | undefined;
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
@@ -150,6 +276,29 @@ export class RootInbox {
     readonly options: { now?: () => number; steerGraceMs?: number; pageSize?: number; wakeCooldownMs?: number; horizonMs?: number } = {},
   ) {}
 
+  /** Cached observation only: no stat/read, runtime activation, admission or receipt authority. */
+  get knownWakeDueAt(): number | undefined {
+    const dueAt = this.#wakeProbe?.knownDueAt;
+    return dueAt !== undefined && Number.isFinite(dueAt) ? dueAt : undefined;
+  }
+
+  get knownWake(): RootInboxKnownWake | undefined {
+    const dueAt = this.knownWakeDueAt;
+    return dueAt === undefined ? undefined : { dueAt, ids: [...(this.#wakeProbe?.ids ?? [])] };
+  }
+
+  /** Minute lost-notification observation: no pending save, receipt or delivery.
+   * Hints discovered here are never armed as timer work; the next event/turn
+   * performs the authoritative read. Invalidate only the old empty-log shortcut. */
+  observe(session: RootInboxSession): readonly string[] {
+    this.#wakeProbe = undefined;
+    this.#scanDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownIds.clear();
+    const peek = this.#peek(session);
+    return [...new Set([...peek.map(event => event.id), ...this.#scanKnownIds])].slice(0, MAX_BATCH_EVENTS);
+  }
+
   get key(): string {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
   }
@@ -160,6 +309,8 @@ export class RootInbox {
    * grace and at the batch bounds, so the cursor never passes an event it has not admitted.
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
+    this.#wakeProbe = undefined; // Turn/settle and receipt recovery always use the trusted drain.
+    const admitted = options.admitted;
     const state = this.#load();
     let receiptsChanged = this.#trimReceipts();
     receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
@@ -173,6 +324,11 @@ export class RootInbox {
       const holdsBatch = session.holdsBatch(state.pending.ids);
       if (options.commitOnly && !holdsBatch) {
         await this.#save(receiptsChanged);
+        return { events: [], through: state.after };
+      }
+      // Confirmed held batches may retire normally; a deadline cannot retry an
+      // unconfirmed pending batch that it did not observe.
+      if (admitted && !holdsBatch && state.pending.ids.some(id => !admitted.has(id))) {
         return { events: [], through: state.after };
       }
       const pending = this.#reread(state.after, state.pending);
@@ -208,7 +364,7 @@ export class RootInbox {
     }
     const batch = this.#scan(state.after, session, true, (event) => {
       receiptsChanged = this.#remember(eventReceipts(event)) || receiptsChanged;
-    });
+    }, admitted);
     skippedStale += batch.skippedStale ?? 0;
     if (skippedStale) { batch.skippedStale = skippedStale; batch.horizonMs = this.#horizon(); }
     if (batch.events.length === 0) {
@@ -231,11 +387,31 @@ export class RootInbox {
    * without this idle cooldown, so the cursor never skips an event.
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
-  async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
-    const cooling = this.#now() - this.#wokeAt < (this.options.wakeCooldownMs ?? wakeCooldownMs());
-    const urgent = this.#peek(session).some((event) => URGENT_KINDS.has(event.kind));
-    if (cooling && !urgent) return undefined;
-    const batch = await this.next(session);
+  async wake(session: RootInboxSession, idle: () => boolean, hint?: RootInboxKnownWake): Promise<RootInboxBatch | undefined> {
+    if (!idle()) return undefined;
+    const admitted = hint ? new Set(hint.ids) : undefined;
+    const now = this.#now();
+    const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
+    const cooling = now < cooldownEnd;
+    const stamp = this.#eventStamp();
+    const names = JSON.stringify(this.names());
+    const probe = this.#wakeProbe;
+    if (!admitted && !probe?.scoped && stamp !== undefined && probe?.stamp === stamp && probe.names === names && now < probe.dueAt) return undefined;
+    this.#scanDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownDueAt = Number.POSITIVE_INFINITY;
+    this.#scanKnownIds.clear();
+    const peek = this.#peek(session, admitted);
+    for (const event of peek) if (this.#scanKnownIds.size < MAX_BATCH_EVENTS) this.#scanKnownIds.add(event.id);
+    const ids = [...new Set([...peek.map(event => event.id), ...this.#scanKnownIds])].slice(0, MAX_BATCH_EVENTS);
+    const urgent = peek.some((event) => URGENT_KINDS.has(event.kind));
+    const dueAt = Math.min(this.#scanDueAt, cooling ? cooldownEnd : Number.POSITIVE_INFINITY);
+    const knownDueAt = Math.min(this.#scanKnownDueAt, cooling && peek.length ? cooldownEnd : Number.POSITIVE_INFINITY);
+    if (cooling && !urgent) {
+      this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
+      return undefined;
+    }
+    const batch = await this.next(session, admitted ? { admitted } : {});
+    if (!batch.events.length) this.#wakeProbe = stamp === undefined ? undefined : { stamp, names, dueAt, knownDueAt, ids, scoped: admitted !== undefined };
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
@@ -257,15 +433,16 @@ export class RootInbox {
   }
 
   /** Every event `next` would bring now or in later batches, without the batch bounds or a save. */
-  #peek(session: RootInboxSession): MeshEvent[] {
+  #peek(session: RootInboxSession, admitted?: ReadonlySet<string>): MeshEvent[] {
     const state = this.#load();
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      (!admitted || admitted.has(event.id)) && !this.#stale(event) && !this.#steered(event, session)) : []),
+      ...this.#scan(after, session, false, undefined, admitted).events];
   }
 
-  #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
+  #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void, admitted?: ReadonlySet<string>): RootInboxBatch {
     const now = this.#now();
     const names = new Set(this.names().filter((name) =>
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
@@ -279,8 +456,29 @@ export class RootInbox {
     const result = (): RootInboxBatch => ({ events, through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
-      for (const event of page) {
-        if (event.createdAt > cutoff) return result();
+      for (let index = 0; index < page.length; index++) {
+        const event = page[index]!;
+        // Stop before unknown addressed work: neither deliver nor advance past it.
+        if (admitted && event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined &&
+            names.has(event.to) && !admitted.has(event.id)) return result();
+        if (event.createdAt > cutoff) {
+          const dueAt = event.createdAt + (this.options.steerGraceMs ?? STEER_GRACE_MS);
+          this.#scanDueAt = Math.min(this.#scanDueAt, dueAt);
+          // Observation only: a foreign log head also blocks older own work behind it.
+          // Look no farther than this validated fetched page; never admit an event,
+          // advance the cursor, or fetch another page past the young-head barrier.
+          for (const pending of page.slice(index)) {
+            if (admitted && pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined &&
+                names.has(pending.to) && !admitted.has(pending.id)) break;
+            if (pending.topic.startsWith(WORK_TOPIC_PREFIX) && pending.to !== undefined && names.has(pending.to) &&
+                !this.#stale(pending) && !this.#steered(pending, session) &&
+                !eventReceipts(pending).some((id) => seen.has(id))) {
+              this.#scanKnownDueAt = Math.min(this.#scanKnownDueAt, dueAt);
+              if (this.#scanKnownIds.size < MAX_BATCH_EVENTS) this.#scanKnownIds.add(pending.id);
+            }
+          }
+          return result();
+        }
         if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {
           if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
@@ -420,6 +618,23 @@ export class RootInbox {
     await this.mesh.put({ key: this.key, value: JSON.parse(text) as RootInboxState, identity: this.identity });
     this.#saved = text;
     this.#savedAt = this.#now();
+  }
+
+  // Admission/receipts never use this hint. It only suppresses a repeated idle scan until
+  // new bytes/identity, a name change, or the known grace/cooldown deadline. ctime catches
+  // same-size edits with restored mtime; a failed stat must never supply a cached negative.
+  #eventStamp(): string | undefined {
+    try {
+      return ["events.jsonl", "sequence", "generation", "event-archive.json"].map((name) => {
+        try {
+          const stat = fs.statSync(path.join(this.mesh.root, name), { bigint: true });
+          return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+          throw error;
+        }
+      }).join("/");
+    } catch { return undefined; }
   }
 
   #now(): number {

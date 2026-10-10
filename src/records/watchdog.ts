@@ -27,6 +27,8 @@ export class RecordsWatchdog {
     alarm?: (lag: ConsumerLag) => Promise<void>;
     lagMs?: number;
     intervalMs?: number;
+    /** Main's idle safety check is read-only: no relay, alarm, or turn delivery. */
+    periodicObservationOnly?: boolean;
     /** Minimum time between two alarms for one consumer. */
     realarmMs?: number;
     now?: () => number;
@@ -36,7 +38,12 @@ export class RecordsWatchdog {
 
   start(): void {
     if (this.#timer) return;
-    this.#timer = setInterval(() => { void this.tick().catch(() => undefined); }, this.options.intervalMs ?? 60_000);
+    const observationOnly = this.options.periodicObservationOnly === true;
+    // Reviewed R-no-polling exception: Main may observe lag at most once a
+    // minute, but only a committed publication event or explicit turn wakes it.
+    this.#timer = setInterval(() => {
+      void this.tick(observationOnly).catch(() => undefined);
+    }, observationOnly ? Math.max(60_000, this.options.intervalMs ?? 60_000) : this.options.intervalMs ?? 60_000);
     this.#timer.unref?.();
   }
 
@@ -50,16 +57,17 @@ export class RecordsWatchdog {
     await this.#ticking?.catch(() => undefined);
   }
 
-  async tick(): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
+  async tick(observationOnly = false): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
     if (this.#ticking) await this.#ticking.catch(() => undefined);
-    const run = this.#tick();
+    const run = this.#tick(observationOnly);
     this.#ticking = run;
     try { return await run; } finally { if (this.#ticking === run) this.#ticking = undefined; }
   }
 
-  async #tick(): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
+  async #tick(observationOnly: boolean): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
     const { store, relay, signal } = this.options;
     signal?.throwIfAborted();
+    if (observationOnly) return { lagging: await this.lagging(), woke: false, alarmed: [] };
     await relay?.flush(signal).catch(() => undefined);
     await this.options.check?.(signal);
     signal?.throwIfAborted();

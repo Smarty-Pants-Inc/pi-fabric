@@ -9,6 +9,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-f
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import { isResidencyNotificationKey, publishResidencyNotification } from "./residency-notifications.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
@@ -389,17 +390,38 @@ export class MeshStore {
     return this.#state.listAllShared(prefix, options);
   }
 
-  put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {
-    return this.#state.put(input);
+  async put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {
+    const entry = await this.#state.put(input);
+    publishResidencyNotification(this.root, input.key, true);
+    return entry;
   }
 
-  delete(input: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }> {
-    return this.#state.delete(input);
+  async delete(input: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }> {
+    const result = await this.#state.delete(input);
+    if (result.deleted) publishResidencyNotification(this.root, input.key, false);
+    return result;
+  }
+
+  #notifyResidencyBatch(results: readonly MeshBatchResult[]): void {
+    for (const { key, applied } of results) {
+      if (!applied || !isResidencyNotificationKey(key)) continue;
+      try { publishResidencyNotification(this.root, key, this.#state.get(key, { fresh: true }) !== undefined); }
+      catch { /* A committed batch never fails because an advisory hint failed. */ }
+    }
   }
 
   /** Transaction and callback semantics: StateBackendBatchInput (state-backend.ts). */
-  writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
-    return this.#state.writeBatch(input);
+  async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
+    // Do not add an outbox/snapshot to lease-only batches. If a caller already
+    // has an outbox, publish before it can throw after a successful commit.
+    let notified = false;
+    const results = await this.#state.writeBatch(input.commitOutbox ? { ...input, commitOutbox: effects => {
+      this.#notifyResidencyBatch(effects.results);
+      notified = true;
+      input.commitOutbox!(effects);
+    } } : input);
+    if (!notified) this.#notifyResidencyBatch(results);
+    return results;
   }
 
   confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

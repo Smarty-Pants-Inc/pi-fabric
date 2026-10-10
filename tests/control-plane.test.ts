@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MeshStore,
@@ -17,6 +18,7 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
+const recoverySignals = new Set<ReturnType<typeof setTimeout>>();
 
 const identity = (id: string): MeshIdentity => ({
   id,
@@ -48,6 +50,8 @@ const plane = (
 
 afterEach(async () => {
   await Promise.all(planes.splice(0).map((value) => value.close()));
+  for (const timer of recoverySignals) clearTimeout(timer);
+  recoverySignals.clear();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -572,6 +576,13 @@ describe("FabricControlPlane", () => {
       const admittedAt = Date.now();
       if (mirror) lease = { remoteHost: "forge", expiresAt: admittedAt + 15_000 };
       const events: MeshEvent[] = [];
+      // This virtual transport must provide commit notifications too; elapsed
+      // fake time no longer polls an unpublished in-memory events array.
+      const wakes: Array<(event: string, filename: string) => void> = [];
+      const watch = vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+        wakes.push(args.at(-1) as typeof wakes[number]);
+        return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() });
+      }) as unknown as typeof fs.watch);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       const publish = vi.spyOn(sender.mesh, "publish").mockImplementation(async (input) => {
@@ -583,6 +594,7 @@ describe("FabricControlPlane", () => {
           sequence: events.length + 1, createdAt: committedAt,
         };
         events.push(event);
+        for (const wake of wakes) wake("change", "events.jsonl");
         return event;
       });
       const tail = vi.spyOn(sender.mesh, "tail").mockImplementation((offset) => ({
@@ -605,6 +617,7 @@ describe("FabricControlPlane", () => {
         await sender.close();
         publish.mockRestore();
         tail.mockRestore();
+        watch.mockRestore();
         vi.useRealTimers();
       };
       return { sender, admittedAt, publish, commands, ack, release, dispose, readMirroredOwner,
@@ -1030,7 +1043,17 @@ describe("FabricControlPlane", () => {
       return vi.spyOn(MeshStore.prototype, method).mockImplementation(function (this: MeshStore, input: never) {
         if (!failed && when(this, input)) {
           failed = true;
-          return new Promise((_resolve, reject) => setTimeout(() => reject(lockTimeout()), afterMs));
+          return new Promise((_resolve, reject) => setTimeout(() => {
+            reject(lockTimeout());
+            // Model storage recovery by a real file notification, not a
+            // production retry tick. Retained claims/outcomes still fence replay.
+            const root = this.root.split(`${path.sep}control-seen${path.sep}`)[0]!;
+            const timer = setTimeout(() => {
+              recoverySignals.delete(timer);
+              fs.appendFileSync(path.join(root, "events.jsonl"), "\n");
+            }, 50);
+            recoverySignals.add(timer);
+          }, afterMs));
         }
         return original.call(this, input);
       } as never);

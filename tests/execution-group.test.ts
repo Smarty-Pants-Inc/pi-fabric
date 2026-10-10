@@ -59,10 +59,16 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     const { processes, group, kill } = setup();
     processes.clear();
     expect(group.exited()).toBe(true);
+    vi.mocked(fs.readdirSync).mockClear();
+    vi.mocked(fs.readFileSync).mockClear();
     processes.set(100, { started: "recycled-birth", group: 100 });
+    group.observe();
+    expect(group.exited()).toBe(true);
     group.signal("SIGKILL");
     expect(group.exited()).toBe(true);
     expect(kill).not.toHaveBeenCalled();
+    expect(fs.readdirSync).not.toHaveBeenCalled();
+    expect(fs.readFileSync).not.toHaveBeenCalled();
   });
 
   it("refuses a group whose recorded member moved to a foreign group", () => {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CompletionJournal } from "../src/agents/completion-journal.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -39,31 +40,55 @@ const setup = (metadata: Pick<ResidentHostConfig, "mainName" | "mainStartedAt">,
   const mainAgent = { id: rootId, local: true, deliverAgent: vi.fn() } as unknown as FabricMainAgentTarget;
   const mesh = new MeshStore(meshRoot, 64 * 1024, 100, { readCacheMs: 2_000 });
   const recipient = vi.spyOn(CompletionJournal.prototype, "recipient", "get");
+  // Drive native notifications explicitly: real FS callbacks must not race the fake clock.
+  const watches: Array<{ dir: string; callback: (event: string, filename: string | null) => void; watcher: EventEmitter & { close: ReturnType<typeof vi.fn> } }> = [];
+  vi.spyOn(fs, "watch").mockImplementation(((dir: fs.PathLike, callback: (event: string, filename: string | null) => void) => {
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() });
+    watches.push({ dir: String(dir), callback, watcher });
+    return watcher;
+  }) as unknown as typeof fs.watch);
   const client = new ResidencyClient({ config, mesh, participants, mainAgent, ...(mainName ? { mainName } : {}) });
-  return { client, lastKnown, recipient, meshRoot };
+  return { client, lastKnown, recipient, meshRoot, watches };
 };
 
 // A live-name journal derives its recipient even when pending() finds no results.
 // That metadata must not invoke lastKnown's fresh full-fleet scan every idle poll.
 describe("ResidencyClient completion recipient metadata", () => {
-  it("limits empty delivery state scans to 1 s despite actorPollMs 20, and closes both timers", async () => {
+  it("keeps empty delivery scans idle through non-waking safety checks until a native event, and closes observation resources", async () => {
     vi.useFakeTimers();
-    const { client } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
-    const reads = vi.spyOn(client.options.mesh, "listAll");
+    const { client, meshRoot, watches } = setup({ mainName: "fixed lane", mainStartedAt: 456 });
+    const reads = vi.spyOn(client.options.mesh, "listAllShared");
+    const drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
     const polls = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
     try {
       client.start();
       await vi.advanceTimersByTimeAsync(0);
+      await drain.mock.results[0]!.value;
       expect(polls()).toBe(1);
-      await vi.advanceTimersByTimeAsync(999);
+      await vi.advanceTimersByTimeAsync(59_999);
       expect(polls()).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
+      await drain.mock.results.at(-1)!.value;
+      expect(polls()).toBe(1);
+      const native = watches.find(watch => watch.dir === meshRoot && !watch.watcher.close.mock.calls.length);
+      expect(native).toBeDefined();
+      // A generic state.json commit (heartbeat/lease) is not a delivery change: delivery
+      // keys arrive only through their own residency notification, so no selection runs.
+      native!.callback("change", "state.json");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(polls()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+      // The residency notification directory appearing is a real native event: one
+      // bounded namespace discovery.
+      native!.callback("rename", "residency-notifications");
+      await vi.advanceTimersByTimeAsync(0);
       expect(polls()).toBe(2);
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(polls()).toBe(4);
       await client.close();
-      await vi.advanceTimersByTimeAsync(2_000);
-      expect(polls()).toBe(4);
+      expect(watches.length).toBeGreaterThan(0);
+      expect(watches.every(watch => watch.watcher.close.mock.calls.length > 0)).toBe(true);
+      native!.callback("change", "state.json");
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(polls()).toBe(2);
       expect(vi.getTimerCount()).toBe(0);
     } finally { await client.close(); }
   });

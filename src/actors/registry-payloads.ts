@@ -32,6 +32,8 @@ const tailSnapshot = (file: string): { size: number; generation: string } | unde
   }
 };
 
+const ringDigest = (encoded: string): string => createHash("sha256").update(encoded).digest("hex");
+
 const history = (value: unknown): ActorMessageHistory | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid actor message history reference");
@@ -52,17 +54,38 @@ const history = (value: unknown): ActorMessageHistory | undefined => {
 export class ActorRegistryPayloads {
   readonly #rings = new Map<string, { head: string; messages: unknown[] }>();
   #preparing: Map<string, PreparedTail> | undefined;
+  // smarty-dev#6829: digest of the last-100 ring this process COMMITTED at each actor's head.
+  // A committed head selects an immutable byte range, so a matching in-memory ring needs no
+  // history re-read. Speculative digests are promoted only by accept() after the commit.
+  readonly #committedRings = new Map<string, { head: string; digest: string }>();
+  #speculativeRings: Map<string, { head: string; digest: string }> | undefined;
+
+  /** True when `messages` is exactly the ring this process committed at `head` for `id`. */
+  committedRing(id: string, head: unknown, messages: readonly unknown[]): boolean {
+    const committed = this.#committedRings.get(id);
+    return committed !== undefined && committed.head === JSON.stringify(head) &&
+      committed.digest === ringDigest(JSON.stringify(messages.slice(-HISTORY_LIMIT)));
+  }
 
   /** Encode and read histories before registry acquisition. Offsets are speculative;
    * commit validates every append tail under custody before writing any bytes. */
   prepare(rows: readonly Row[], prior: ReadonlyMap<unknown, Row>) {
     const tails = new Map<string, PreparedTail>();
+    const rings = new Map<string, { head: string; digest: string }>();
     this.#preparing = tails;
+    this.#speculativeRings = rings;
     let metadata: Row[];
     try { metadata = rows.map(row => row === prior.get(row.id) ? row : this.compact(row, prior.get(row.id))); }
-    finally { this.#preparing = undefined; this.#rings.clear(); }
+    finally { this.#preparing = undefined; this.#speculativeRings = undefined; this.#rings.clear(); }
     return {
       metadata,
+      /** After the registry commit: remember the rings whose heads it published. */
+      accept: (heads: readonly Row[]): void => {
+        for (const row of heads) {
+          const ring = typeof row.id === "string" ? rings.get(row.id) : undefined;
+          if (ring && ring.head === JSON.stringify(row.messageHistory)) this.#committedRings.set(row.id as string, ring);
+        }
+      },
       valid: (): boolean => [...tails].every(([file, tail]) => tailSnapshot(file)?.generation === tail.generation),
       commit: (): void => {
         for (const [file, tail] of tails) {
@@ -302,7 +325,10 @@ export class ActorRegistryPayloads {
           while (overlap && !old.slice(-overlap).every((value, index) => value === encoded[index])) overlap--;
           ref = this.#append(id, messages.slice(overlap), ref, overlap === 0);
         }
-        if (ref) this.#rings.set(id, { head: JSON.stringify(ref), messages: structuredClone(messages) });
+        if (ref) {
+          this.#rings.set(id, { head: JSON.stringify(ref), messages: structuredClone(messages) });
+          this.#speculativeRings?.set(id, { head: JSON.stringify(ref), digest: ringDigest(`[${encoded.join(",")}]`) });
+        }
       }
     }
     if (ref) {

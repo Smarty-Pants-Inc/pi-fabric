@@ -360,7 +360,13 @@ describe("AgentCompletionInbox", () => {
     h.boundary();
     expect(prepare).toHaveBeenCalledOnce();
     expect(receipt).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(39);
+    expect(receipt).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1); // Only this known receipt's one-shot owns a retry.
+    expect(receipt).toHaveBeenCalledTimes(2);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(receipt).toHaveBeenCalledTimes(2);
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });

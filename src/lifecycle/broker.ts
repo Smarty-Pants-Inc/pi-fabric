@@ -3,7 +3,8 @@ import type { FSWatcher } from "node:fs";
 import path from "node:path";
 import { meshObserverStamp, meshObserverWatch, meshObserverWatchCurrent } from "../actors/mesh-monitor.js";
 
-const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participants", "host-leases"];
+// Metadata notifications repair observation only. Only event-log entries admit delivery.
+const DELIVERY_FILES = ["events.jsonl"];
 const OBSERVED_DIRECTORIES = ["participants", "host-leases"];
 const IDLE_SAFETY_MS = 60_000;
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
@@ -51,9 +52,10 @@ export class LifecycleBroker {
   #watchRepairTimer: NodeJS.Timeout | undefined;
   readonly #directoryWatchers = new Map<string, FSWatcher>();
   #running = false;
-  #failedStamp: string | undefined;
-  #deliveryFailed = false;
+  #eventStamp: string | undefined;
   #dirty = false;
+  #retryPending = false;
+  readonly #failedAfter = new Map<string, number>();
   #polling: Promise<void> | undefined;
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
@@ -91,11 +93,10 @@ export class LifecycleBroker {
   publish(
     request: FabricLifecyclePublishRequest,
   ): Promise<FabricLifecycleEvent | undefined> {
-    if (
-      !this.options.enabled ||
-      this.#closed ||
-      !this.#isObserved(request.source.id, request.event)
-    ) return Promise.resolve(undefined);
+    if (!this.options.enabled || this.#closed) return Promise.resolve(undefined);
+    // A real boundary for this Main owns recovery even when nobody subscribes to it.
+    if (request.source.id === this.identity.id && request.event.startsWith("pi.")) this.#schedulePoll();
+    if (!this.#isObserved(request.source.id, request.event)) return Promise.resolve(undefined);
     const operation = this.#publishTail.then(async () => {
       const occurredAt = request.occurredAt ?? Date.now();
       const event = await this.mesh.publish({
@@ -112,7 +113,7 @@ export class LifecycleBroker {
           ...(request.data === undefined ? {} : { payload: request.data }),
         },
       });
-      this.#schedulePoll();
+      this.#schedulePoll(false);
       return lifecycleEventFromMesh(event);
     });
     this.#publishTail = operation.then(
@@ -170,7 +171,7 @@ export class LifecycleBroker {
       identity: this.identity,
       ifVersion: 0,
     });
-    this.#schedulePoll();
+    this.#schedulePoll(false); // A new key is not explicit recovery of other failed keys.
     return structuredClone(subscription);
   }
 
@@ -246,13 +247,14 @@ export class LifecycleBroker {
       try {
         const watcher = meshObserverWatch(watchedPath, { persistent: false }, () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          this.#schedulePoll();
+          // Participant/lease changes own attachment observation, not delivery.
+          this.#attachWatcher(true);
         });
         if (!watcher) continue;
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          watcher.close(); this.#directoryWatchers.delete(directory); this.#repairWatchers(); this.#schedulePoll();
+          watcher.close(); this.#directoryWatchers.delete(directory); this.#repairWatchers();
         });
       } catch { /* The safety witness also retries directory attachment. */ }
     }
@@ -267,14 +269,14 @@ export class LifecycleBroker {
         if (!meshObserverWatchCurrent(watcher!, this.mesh.root)) this.#repairWatchers();
         if (filename !== null) {
           const file = path.basename(filename.toString());
-          if (!OBSERVED_FILES.includes(file)) return;
           if (OBSERVED_DIRECTORIES.includes(file)) { this.#attachWatcher(true); this.#repairWatchers(); }
+          if (!DELIVERY_FILES.includes(file)) return;
         }
-        // A failed receipt put can itself produce a native notification.
-        // Do not turn those same failed bytes into a self-sustaining drain.
-        const stamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-        if (stamp !== undefined && stamp === this.#failedStamp) return;
-        this.#schedulePoll();
+        // Lost filenames are only hints: changed lease/state bytes cannot turn
+        // an unchanged event log (including a failed delivery) into new work.
+        const stamp = meshObserverStamp(this.mesh.root, DELIVERY_FILES);
+        if (stamp === undefined || stamp === this.#eventStamp) return;
+        this.#schedulePoll(false);
       });
       if (!watcher) return;
       this.#watcher = watcher;
@@ -282,14 +284,15 @@ export class LifecycleBroker {
         if (this.#watcher !== watcher || this.#closed) return;
         watcher.close(); this.#watcher = undefined;
         this.#repairWatchers();
-        this.#schedulePoll();
       });
     } catch { /* The fixed-file safety witness covers unavailable watches. */ }
   }
 
-  #schedulePoll(): void {
+  #schedulePoll(retryPending = true): void {
     if (this.#closed || this.#paused || !this.options.enabled) return;
+    this.#eventStamp = meshObserverStamp(this.mesh.root, DELIVERY_FILES);
     this.#dirty = true;
+    this.#retryPending ||= retryPending;
     if (this.#pollScheduled || this.#running) return;
     this.#pollScheduled = true;
     this.#backgroundPoll.success(); // Only a real event/explicit resume owns this attempt.
@@ -298,14 +301,10 @@ export class LifecycleBroker {
       if (this.#closed || this.#paused) return;
       this.#running = true;
       this.#dirty = false;
-      this.#deliveryFailed = false;
-      void this.#backgroundPoll.run(() => this.#poll()).then(result => {
+      void this.#backgroundPoll.run(() => this.#poll()).then(() => {
         this.#running = false;
         if (this.#closed || this.#paused) return;
-        if (result !== "done" || this.#deliveryFailed) {
-          this.#failedStamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
-        } else this.#failedStamp = undefined;
-        if (result === "done" && !this.#deliveryFailed && this.#dirty) this.#schedulePoll();
+        if (this.#dirty) this.#schedulePoll(this.#retryPending);
         // Unread work/receipts wait for an event, never a periodic delivery retry.
       });
     });
@@ -315,7 +314,8 @@ export class LifecycleBroker {
     if (this.#closed || this.#paused || !this.options.enabled) return;
     if (this.options.canConsumeMesh?.() === false) return;
     if (this.#polling) return this.#polling;
-    const operation = this.#drain();
+    const retryPending = this.#retryPending; this.#retryPending = false;
+    const operation = this.#drain(retryPending);
     this.#polling = operation;
     try {
       await operation;
@@ -324,7 +324,7 @@ export class LifecycleBroker {
     }
   }
 
-  async #drain(): Promise<void> {
+  async #drain(retryPending: boolean): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
     const listed = new Set<string>();
     let latestSequence: number | undefined;
@@ -333,8 +333,13 @@ export class LifecycleBroker {
       const subscription = lifecycleSubscriptionFromValue(entry.value);
       if (!subscription || entry.key !== subscriptionKey(subscription.id)) continue;
       listed.add(subscription.id);
+      const failedAfter = this.#failedAfter.get(subscription.id);
+      // Event-log changes may advance metadata, but only this delivery key's
+      // new matching entry (or an explicit Main boundary/recovery) retries it.
+      if (!retryPending && failedAfter !== undefined && !this.#hasNewEntry(subscription, failedAfter)) continue;
       if (this.#delivered.has(subscription.id)) {
         // Retry only the cursor/delete receipt; use a fresh poll after success.
+        this.#failedAfter.set(subscription.id, this.mesh.latestSequence());
         await this.#confirmDelivered(subscription.id);
         continue;
       }
@@ -349,9 +354,30 @@ export class LifecycleBroker {
       if (!target || target.stale || !target.local) {
         continue;
       }
-      await this.#drainSubscription(entry, subscription);
+      try { await this.#drainSubscription(entry, subscription); }
+      catch (error) {
+        this.#failedAfter.set(subscription.id, Math.max(latestSequence, this.#failedAfter.get(subscription.id) ?? 0));
+        throw error;
+      }
     }
     for (const id of this.#unsaved.keys()) if (!listed.has(id)) this.#unsaved.delete(id);
+    for (const id of this.#failedAfter.keys()) if (!listed.has(id)) this.#failedAfter.delete(id);
+  }
+
+  #hasNewEntry(subscription: FabricLifecycleSubscription, after: number): boolean {
+    const latest = this.mesh.latestSequence();
+    while (after < latest) {
+      const events = this.mesh.read({ after, limit: this.#maxReadEvents });
+      if (!events.length) return false;
+      for (const event of events) {
+        const lifecycle = lifecycleEventFromMesh(event);
+        if (lifecycle?.source.id === subscription.from && subscription.events.includes(lifecycle.event) &&
+            this.#sourceIsCurrentOwner(lifecycle)) return true;
+      }
+      after = events[events.length - 1]!.sequence;
+    }
+    this.#failedAfter.set(subscription.id, after); // Metadata only: do not rescan unrelated entries.
+    return false;
   }
 
   #cursor(subscription: FabricLifecycleSubscription): number {
@@ -423,7 +449,7 @@ export class LifecycleBroker {
             updatedAt: Date.now(),
             lastError: error instanceof Error ? error.message : String(error),
           };
-          this.#deliveryFailed = true;
+          this.#failedAfter.set(subscription.id, latestSequence);
           await this.#replace(entry, failed).then(() => this.#unsaved.delete(subscription.id));
           return;
         }
@@ -434,6 +460,7 @@ export class LifecycleBroker {
         const delivered = { ...subscription, afterSequence: cursor, updatedAt: Date.now(), lastDeliveredAt, lastEventId };
         delete delivered.lastError;
         this.#delivered.set(subscription.id, { entry, subscription: delivered });
+        this.#failedAfter.set(subscription.id, latestSequence);
         // Preserve the delivery receipt, not the cursor, across lease loss.
         if (this.options.canConsumeMesh?.() === false) return;
         const confirmed = await this.#confirmDelivered(subscription.id);
@@ -519,7 +546,7 @@ export class LifecycleBroker {
             ifVersion: current.version, condition: () => this.options.canConsumeMesh!() }] }))[0]?.applied
         : (await this.mesh.delete({ key: entry.key, ifVersion: current.version })).deleted;
       if (!deleted) throw new Error("Lifecycle once deletion is unconfirmed");
-      this.#delivered.delete(id); this.#unsaved.delete(id);
+      this.#delivered.delete(id); this.#unsaved.delete(id); this.#failedAfter.delete(id);
       return undefined;
     }
     const observed = lifecycleSubscriptionFromValue(current?.value);
@@ -528,7 +555,7 @@ export class LifecycleBroker {
       throw new Error("Lifecycle delivered cursor receipt ownership is unconfirmed");
     }
     const next = await this.#replace(current, subscription);
-    this.#delivered.delete(id); this.#unsaved.delete(id);
+    this.#delivered.delete(id); this.#unsaved.delete(id); this.#failedAfter.delete(id);
     return next;
   }
 

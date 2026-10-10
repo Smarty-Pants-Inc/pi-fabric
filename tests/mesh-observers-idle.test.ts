@@ -101,7 +101,7 @@ describe("event-driven mesh observers", () => {
     for (const watch of retired) watch.notify("change", "late.json");
     await flush(); expect(lists).not.toHaveBeenCalled(); expect(beforePoll).not.toHaveBeenCalled();
     for (const watch of watches.slice(count)) watch.notify("change", "new.json");
-    await flush(); expect(lists).toHaveBeenCalled(); expect(beforePoll).toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled();
+    await flush(); expect(lists).not.toHaveBeenCalled(); expect(beforePoll).toHaveBeenCalled(); expect(tails).not.toHaveBeenCalled();
   });
 
   it("reattaches native root and ancillary inode replacements and wakes on NEW writes before another safety tick", async () => {
@@ -132,7 +132,8 @@ describe("event-driven mesh observers", () => {
     const lists = vi.spyOn(mesh, "listAll"); const tails = vi.spyOn(mesh, "tail");
     beforePoll.mockClear();
     fs.writeFileSync(path.join(mesh.root, "participants", "new.json"), "{}");
-    await vi.waitFor(() => { expect(beforePoll).toHaveBeenCalled(); expect(lists).toHaveBeenCalled(); });
+    await vi.waitFor(() => expect(beforePoll).toHaveBeenCalled());
+    expect(lists).not.toHaveBeenCalled();
     expect(tails).not.toHaveBeenCalled();
   });
   it("repairs Windows-style replacement errors once and admits only NEW notifications, not repair deadlines", async () => {
@@ -256,6 +257,57 @@ describe("event-driven mesh observers", () => {
     await vi.advanceTimersByTimeAsync(120_000); expect(lists).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("does not admit failed lifecycle delivery through changing heartbeat, lease or participant metadata", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    for (const directory of ["participants", "host-leases"]) fs.mkdirSync(path.join(mesh.root, directory));
+    const deliver = vi.fn().mockRejectedValueOnce(new Error("Main delivery unavailable"));
+    const broker = await lifecycle(mesh, deliver); broker.start(); await flush();
+    const rootWatch = watches.find(watch => watch.directory === mesh.root)!;
+    await publish(mesh); rootWatch.notify("change", "events.jsonl"); await flush();
+    expect(deliver).toHaveBeenCalledOnce();
+    const lists = vi.spyOn(mesh, "listAll");
+    for (let n = 0; n < 32; n++) {
+      await mesh.put({ key: "topology/hosts/heartbeat", identity, value: { updatedAt: n } });
+      rootWatch.notify("rename", "state.json"); rootWatch.notify("change", "generation");
+      for (const directory of ["participants", "host-leases"]) {
+        fs.writeFileSync(path.join(mesh.root, directory, "heartbeat.json"), JSON.stringify({ updatedAt: n }));
+        watches.find(watch => watch.directory === path.join(mesh.root, directory))!.notify("change", "heartbeat.json");
+        rootWatch.notify("change", directory);
+      }
+      rootWatch.notify("change", null); await flush();
+    }
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await flush();
+    expect(lists).not.toHaveBeenCalled(); expect(deliver).toHaveBeenCalledOnce();
+    await mesh.publish({ topic: "fleet.work.foreign", from: identity, to: "other" });
+    rootWatch.notify("change", "events.jsonl"); await flush();
+    expect(deliver).toHaveBeenCalledOnce(); lists.mockClear();
+    // One genuine inbox append owns one drain, including recovery of its pending predecessor.
+    await publish(mesh); rootWatch.notify("change", "events.jsonl"); rootWatch.notify("change", null); await flush();
+    expect(lists).toHaveBeenCalledOnce(); expect(deliver).toHaveBeenCalledTimes(3);
+    await broker.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["turn", "recovery"])("admits failed lifecycle delivery only on an explicit %s boundary", async boundary => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    const deliver = vi.fn().mockRejectedValueOnce(new Error("Main delivery unavailable"));
+    const broker = await lifecycle(mesh, deliver); broker.start(); await flush();
+    await publish(mesh); watches[0]!.notify("change", "events.jsonl"); await flush();
+    expect(deliver).toHaveBeenCalledOnce();
+    const lists = vi.spyOn(mesh, "listAll");
+    watches[0]!.emitter.emit("error", new Error("attachment lost")); await flush();
+    await vi.advanceTimersByTimeAsync(100); await flush();
+    expect(lists).not.toHaveBeenCalled(); expect(deliver).toHaveBeenCalledOnce();
+    if (boundary === "turn") {
+      await broker.publish({ source: { ...source, id: identity.id, rootId: identity.id,
+        ownerHostId: identity.id, ownerIdentityId: identity.id }, event: "pi.turn_end" });
+    } else broker.resume();
+    await flush();
+    // publish() also observes subscription metadata with a fresh lookup.
+    expect(lists.mock.calls.filter(([, options]) => options?.fresh !== true)).toHaveLength(1);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    await broker.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("retries unconfirmed lifecycle receipts on file events without redelivery or a retry tick", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store(); const deliver = vi.fn();
     const broker = await lifecycle(mesh, deliver); broker.start(); await flush();
@@ -267,7 +319,7 @@ describe("event-driven mesh observers", () => {
     // The failed put itself emits a notification. Identical failed bytes cannot
     // buy a new attempt (or spin forever); an actual changed event can retry.
     expect(writes).toHaveBeenCalledOnce(); expect(deliver).toHaveBeenCalledOnce();
-    await mesh.publish({ topic: "fabric.test.external-hint", kind: "hint", from: identity });
+    await publish(mesh); // A new entry for this Main's lifecycle delivery key owns receipt recovery.
     watches[0]!.notify("change", "events.jsonl"); await flush();
     expect(writes).toHaveBeenCalledTimes(2); expect(deliver).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(5 * 60_000); expect(writes).toHaveBeenCalledTimes(2);

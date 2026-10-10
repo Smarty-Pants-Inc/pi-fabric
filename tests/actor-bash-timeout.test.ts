@@ -44,7 +44,11 @@ describe("actor bash timeout (smarty-dev#2184)", () => {
     const explicit = { command: "git log --all -S needle", timeout: 1000 };
     applyRunBashDefaults(task, explicit);
     expect(explicit.timeout).toBe(1000);
-    expect(explicit.command.startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    if (process.platform === "win32") {
+      expect(explicit).toEqual({ command: "git log --all -S needle", timeout: 1000 });
+    } else {
+      expect(explicit.command.startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    }
     expect(bashIdleSeconds({})).toBeUndefined();
     const main = { command: "sleep 300" };
     applyRunBashDefaults({}, main);
@@ -59,20 +63,47 @@ describe("actor bash timeout (smarty-dev#2184)", () => {
     expect(windows).toEqual({ command: "sleep 300", timeout: 600 });
   });
 
-  it("wraps marker-prefixed untrusted text and trusts only hook-set args metadata", () => {
+  it.each(["linux", "darwin", "win32"] as const)("wraps marker-prefixed untrusted text and trusts only hook-set args metadata on %s", (platform) => {
     const env = { PI_FABRIC_BASH_IDLE_S: "2" };
     const command = `${BASH_IDLE_MARKER}\nsleep 300`;
     const input = { command };
-    applyRunBashDefaults(env, input);
+    applyRunBashDefaults(env, input, platform);
+    if (platform === "win32") {
+      // smarty-dev#6137: Windows gets the total cap only, with no POSIX wrapper or metadata.
+      expect(input).toEqual({ command, timeout: 600 });
+      expect(Object.getOwnPropertySymbols(input)).toEqual([]);
+      applyRunBashDefaults(env, input, platform);
+      const replay = JSON.parse(JSON.stringify(input)) as typeof input;
+      applyRunBashDefaults(env, replay, platform);
+      expect(replay).toEqual({ command, timeout: 600 });
+      return;
+    }
     expect(input.command).not.toBe(command);
     expect(input.command).toContain(`\n${command}\n`);
     const wrapped = input.command;
-    applyRunBashDefaults(env, input);
+    applyRunBashDefaults(env, input, platform);
     expect(input.command).toBe(wrapped);
     expect(Object.keys(input)).toEqual(["command", "timeout"]);
     const replay = JSON.parse(JSON.stringify(input)) as typeof input;
-    applyRunBashDefaults(env, replay);
+    applyRunBashDefaults(env, replay, platform);
     expect(replay.command).not.toBe(wrapped);
+  });
+
+  it.each([actor, { PI_FABRIC_BASH_IDLE_S: "180" }])("keeps Windows total-cap defaults, overrides and opt-outs for %j", (env) => {
+    for (const [override, expected] of [[undefined, 600], ["45", 45], ["0", undefined]] as const) {
+      const run = { ...env, PI_FABRIC_ACTOR_BASH_TIMEOUT_S: override };
+      const input = { command: "sleep 300" };
+      applyRunBashDefaults(run, input, "win32");
+      expect(input).toEqual({ command: "sleep 300", ...(expected === undefined ? {} : { timeout: expected }) });
+      for (const timeout of [0, 5, 1000]) {
+        const explicit = { command: "sleep 300", timeout };
+        applyRunBashDefaults(run, explicit, "win32");
+        expect(explicit).toEqual({ command: "sleep 300", timeout });
+      }
+    }
+    const main = { command: "sleep 300" };
+    applyRunBashDefaults({}, main, "win32");
+    expect(main).toEqual({ command: "sleep 300" });
   });
 
   it("smarty-dev#6137: the wrapped command trips no shell guard and spawn validates bashIdleSeconds", async () => {
@@ -254,12 +285,20 @@ describe("Fabric bash tool_call hook in an actor run (smarty-dev#2184)", () => {
     vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
     const { input } = await bashCall({ command: "git log --all -S needle" });
     expect(input.timeout).toBe(600);
-    expect(String(input.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
-    expect(input.command).toContain("\ngit log --all -S needle\n");
+    if (process.platform === "win32") {
+      expect(input).toEqual({ command: "git log --all -S needle", timeout: 600 });
+    } else {
+      expect(String(input.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+      expect(input.command).toContain("\ngit log --all -S needle\n");
+    }
     expect((await bashCall({ command: "while true; do sleep 5; done" })).blocked).toBe(true);
     const explicit = (await bashCall({ command: "ls", timeout: 5 })).input;
     expect(explicit.timeout).toBe(5);
-    expect(String(explicit.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    if (process.platform === "win32") {
+      expect(explicit).toEqual({ command: "ls", timeout: 5 });
+    } else {
+      expect(String(explicit.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    }
   });
 });
 
@@ -298,19 +337,28 @@ describe("timeout-only actor bash hook (smarty-dev#2184)", () => {
     expect((await hookCall({ command: "sleep 30" })).timeout).toBeUndefined();
   });
 
-  it("smarty-dev#6137: wraps once, so the second hook leaves the first hook's call alone", async () => {
+  it("smarty-dev#6137: wraps once on POSIX and leaves Windows command text alone across hooks", async () => {
     vi.stubEnv("PI_FABRIC_ACTOR_ID", undefined);
     vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "180");
     vi.stubEnv("PI_FABRIC_ACTOR_BASH_TIMEOUT_S", "0");
     const input = await hookCall({ command: "sleep 30" });
     const once = { ...input };
     expect(once.timeout).toBeUndefined();
-    expect(String(once.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    if (process.platform === "win32") {
+      expect(once).toEqual({ command: "sleep 30" });
+    } else {
+      expect(String(once.command).startsWith(`${BASH_IDLE_MARKER}\n`)).toBe(true);
+    }
     expect(await hookCall(input)).toEqual(once);
     // The second real hook shares the exact args object, not a caller-supplied copy of its text.
     applyRunBashDefaults(process.env, input);
     expect(input).toEqual(once);
-    expect(await hookCall({ ...once })).not.toEqual(once);
+    const replay = await hookCall({ ...once });
+    if (process.platform === "win32") {
+      expect(replay).toEqual(once);
+    } else {
+      expect(replay).not.toEqual(once);
+    }
     vi.stubEnv("PI_FABRIC_BASH_IDLE_S", "0");
     expect(await hookCall({ command: "sleep 30" })).toEqual({ command: "sleep 30" });
   });

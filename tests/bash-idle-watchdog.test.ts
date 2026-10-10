@@ -61,6 +61,8 @@ afterEach(() => {
   }
 });
 
+// smarty-dev#6137: these execution probes require POSIX process groups and TERM/KILL.
+// Windows retains only the total cap; actor-bash-timeout.test.ts checks that command shape.
 describe.skipIf(process.platform === "win32")("bash idle watchdog (smarty-dev#6137)", () => {
   it("kills a silent command after N s plus bounded TERM grace with the timeout result", { timeout: 20_000 }, async () => {
     const result = await run("sleep 300");

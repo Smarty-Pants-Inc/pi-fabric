@@ -114,12 +114,16 @@ export const applyRunBashDefaults = (
   env: Env, input: BashInput,
   platform: NodeJS.Platform = process.platform,
 ): void => {
+  const total = actorBashTimeout(env, input.timeout);
+  if (total !== undefined) input.timeout = total;
+  // ponytail: Windows has no POSIX process groups/setsid or group TERM/KILL signaling.
+  // Keep the total cap above, with no idle watchdog or command rewrite on win32.
+  // A Windows idle-limit implementation remains a platform limit tracked by smarty-dev#6137.
+  if (platform === "win32") return;
   const idle = bashIdleSeconds(env);
   const detached = input.background === true || input.monitor !== undefined;
-  if (idle !== undefined && !detached && platform !== "win32" && typeof input.command === "string" && input[WRAPPED] !== wrapNonce) {
+  if (idle !== undefined && !detached && typeof input.command === "string" && input[WRAPPED] !== wrapNonce) {
     input.command = idleWatchdogCommand(input.command, idle);
     Object.defineProperty(input, WRAPPED, { value: wrapNonce });
   }
-  const total = actorBashTimeout(env, input.timeout);
-  if (total !== undefined) input.timeout = total;
 };

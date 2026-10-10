@@ -578,6 +578,52 @@ export class AgentsProvider implements FabricProvider {
     return request.model ? { ...request, ...modelResolutionMetadata(resolved), model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
   }
 
+  async #routeCreationDefault<T extends {
+    model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
+    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"];
+  }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
+    const config = this.manager.config.router;
+    if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
+    const self = this.participants.self();
+    const runner = request.runner ?? this.manager.config.runner;
+    const defaultModel = request.model ?? this.manager.defaultModel(runner);
+    const defaults = {
+      ...(defaultModel ? { model: defaultModel } : {}),
+      thinking: request.thinking ?? this.manager.config.thinking,
+    };
+    const { routeAgentCreation } = await import("../agents/spawn-router.js");
+    const selected = await routeAgentCreation({
+      config, meshRoot: this.actorManager.mesh.root, kind,
+      role: self.role ?? (kind === "actor" ? "actor" : "task-agent"),
+      ...(request.name !== undefined ? { name: request.name } : {}),
+      cwd: kind === "spawn" ? await this.manager.resolveCwd(request.cwd, context.signal) : this.manager.cwd,
+      project: self.projectRoot ?? self.project ?? this.manager.cwd,
+      ...(kind === "spawn" ? { task: String(args.task) }
+        : typeof args.instructions === "string" ? { task: args.instructions }
+        : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
+      parentId: self.id, defaults,
+      ...(request.complexity ? { complexity: request.complexity } : {}),
+      explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
+      validateModel: model => {
+        this.manager.assertModelAllowed(model, runner);
+        // Non-Pi configured backend defaults are known keys; otherwise require
+        // an exact visible Pi id/alias, never a ranked closest match or a refresh.
+        if (runner !== "pi" && model === this.manager.defaultModel(runner)) return model;
+        const resolved = resolveAvailablePiModel(model, {
+          aliases: this.modelsConfig().aliases,
+          available: context.extensionContext.modelRegistry.getAvailable().map(model => ({
+            provider: String(model.provider), id: String(model.id),
+          })), exact: true, closest: false,
+        });
+        const canonical = `${resolved.provider}/${resolved.id}`;
+        this.manager.assertModelAllowed(canonical, runner);
+        return canonical;
+      },
+      ...(context.signal ? { signal: context.signal } : {}),
+    });
+    return selected ? { ...request, ...selected } : request;
+  }
+
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
     if (args.model !== "auto") return this.#runRequest(args, context, false);
     const runner = args.runner ?? this.manager.config.runner;
@@ -834,7 +880,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = await this.#prepareSpawnRequest(args, context);
+        const request = await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined
@@ -1203,9 +1249,11 @@ export class AgentsProvider implements FabricProvider {
       }
       case "createActor":
       case "create": {
-        const request = await this.#admitActorRequest(
+        const admitted = await this.#admitActorRequest(
           actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context, false,
         );
+        const request = args.scope === "global" ? admitted
+          : await this.#routeCreationDefault("actor", args, admitted, context);
         if (args.scope === "global") {
           checkCommit();
           const { instructionsFile: _file, sha256: _digest, ...base } = request;

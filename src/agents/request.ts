@@ -40,6 +40,9 @@ export const normalizeAgentRunRequest = (
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
+  if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
+    throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
+  }
   const requires = normalizeAgentRequires(args.requires);
   const needs = normalizeAgentCapabilityTokens(args.needs);
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
@@ -50,6 +53,7 @@ export const normalizeAgentRunRequest = (
   }
   return {
     task: String(args.task),
+    ...(args.complexity !== undefined ? { complexity: args.complexity as NonNullable<AgentRunRequest["complexity"]> } : {}),
     runner,
     ...(typeof args.routeClass === "string" ? { routeClass: args.routeClass } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),

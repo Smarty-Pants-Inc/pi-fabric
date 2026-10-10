@@ -72,6 +72,8 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
+  /** Caller classification passed to the optional external spawn router. */
+  complexity?: "simple" | "normal" | "complex" | "delicate";
   /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
   /** Absolute inputs that must exist on the selected execution host before starting. */

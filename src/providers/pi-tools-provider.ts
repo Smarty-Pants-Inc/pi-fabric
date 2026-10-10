@@ -15,7 +15,7 @@ import {
   type ExtensionRunner,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
+import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
@@ -617,15 +617,48 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     this.#assertAllowed(name);
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
-    if (name === "bash" && !this.#landlockEnabled() && !this.#requireCapturedOverrides && !this.#catalog?.get(name)) {
+    // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
+    const middleware = this.#bashMiddleware(name);
+    const runner = this.#catalog?.runner;
+    // Gap B: a catalog is installed but its runner — and the tool_call
+    // preflight extensions rely on — is not yet available. This is the
+    // transient window before the first tool refresh populates the runner.
+    // Running a mutating tool here would silently skip that preflight, so fail
+    // closed for non-read tools and let the model retry once hooks are live.
+    // The no-catalog path (tests, embeds) has no extension system to guard and
+    // keeps the direct-execute fallback below unchanged.
+    if (this.#catalog && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
+      throw new Error(
+        `Pi tool ${name} is unavailable until extension tool hooks initialize; retry once tools are ready`,
+      );
+    }
+    let preflightEmitted = false;
+    if (
+      name === "bash" &&
+      !this.#landlockEnabled() &&
+      !this.#requireCapturedOverrides &&
+      !this.#catalog?.get(name) &&
+      typeof args.command === "string" &&
+      parseGitWorktreeAdd(args.command) !== undefined
+    ) {
+      // Gap A: a well-formed `git worktree add` is intercepted below without a
+      // tool_call event, so a command guard could not block it. Emit the same
+      // preflight first (when a runner is available) so the intercept obeys the
+      // same policy as every other nested bash call. Gate on the parse so an
+      // ordinary bash command still emits its single preflight downstream.
+      if (runner) {
+        await this.#emitToolCallPreflight(name, args, context, runner);
+        preflightEmitted = true;
+      }
       const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
       if (intercepted) {
         this.#attachPreview(name, intercepted, args, context);
         return this.#normalizeResult(name, intercepted, args);
       }
+      // Parsed but not intercepted (e.g. outside a git repo): fall through to a
+      // normal execution. The preflight already fired, so downstream must not
+      // emit it again and re-apply any argument mutation.
     }
-    // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
-    const middleware = this.#bashMiddleware(name);
     if (name === "bash" && this.#landlockEnabled()
       && (this.#requireCapturedOverrides || (this.#catalog?.get(name) && !middleware))) {
       throw new Error("Landlock enforce requires standard local bash or cooperative middleware; refusing an unconfined opaque/managed override");
@@ -642,7 +675,6 @@ export class PiToolsProvider implements FabricProvider {
       return this.#normalizeResult(name, result, args);
     }
     const tool = this.#definitionFor(name, args);
-    const runner = this.#catalog?.runner;
     // Without a runner (e.g. before the first tool refresh populated the
     // catalog) fall back to a direct execute — no extension hooks fire, but
     // the call still works. Once tools are refreshed the runner is available.
@@ -663,7 +695,28 @@ export class PiToolsProvider implements FabricProvider {
       this.#attachPreview(name, result, args, context);
       return this.#normalizeResult(name, result, args);
     }
-    return this.#invokeWithEvents(name, tool, args, context, runner, middleware);
+    return this.#invokeWithEvents(name, tool, args, context, runner, middleware, preflightEmitted);
+  }
+
+  // Emit the tool_call preflight for a nested pi.* call and enforce a block.
+  // Shared by #invokeWithEvents and the git-worktree-add intercept so both obey
+  // the same extension policy through one code path (no duplicated enforcement).
+  async #emitToolCallPreflight(
+    name: PiCoreToolName,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runner: ExtensionRunner,
+  ): Promise<void> {
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+      type: "tool_call",
+      toolName: name,
+      toolCallId: context.nestedToolCallId,
+      input: args,
+    }));
+    context.updateArguments?.(args);
+    if (preflight?.block) {
+      throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
+    }
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so
@@ -681,6 +734,7 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
     middleware: FabricBashMiddlewareV1 | undefined,
+    preflightEmitted = false,
   ): Promise<unknown> {
     const toolCallId = context.nestedToolCallId;
     await runAbortable(context.signal, () => runner.emit({
@@ -695,16 +749,7 @@ export class PiToolsProvider implements FabricProvider {
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
     try {
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-        type: "tool_call",
-        toolName: name,
-        toolCallId,
-        input: args,
-      }));
-      context.updateArguments?.(args);
-      if (preflight?.block) {
-        throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
-      }
+      if (!preflightEmitted) await this.#emitToolCallPreflight(name, args, context, runner);
       executionStarted = true;
       result = await this.#runExecute(
         name,

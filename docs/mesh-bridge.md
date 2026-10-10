@@ -10,11 +10,12 @@ existing events and mirrors root presence. There is no new store or protocol.
   `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
-  lease lasts one source TTL from the local observation, capped at 15 s. It does not use
-  the source's absolute expiry. File-only heartbeats carry their effective renewal time. Presence
-  is refreshed on every bridge (re)connect before startup completes, then every 5 s even without
-  event traffic. Each pass reads the current native records, including file-only roots in
-  `participants/`, rather than replaying a saved projection set. A lapsed mirror is refreshed
+  lease retains the source's expiry, capped at 15 s from the mirror commit. A slow pass can shift
+  that expiry by at most one additional 15 s lease. File-only heartbeats carry their effective
+  renewal time. Presence
+  is refreshed on every bridge (re)connect before startup completes, then on store notifications
+  and actual lease deadlines, not a periodic poll. Each pass reads the current native records, including file-only roots in
+  `participants/`, and does not replay a saved projection set. A lapsed mirror is refreshed
   and revalidated once before an event is refused. A source that stops renewing can remain mirrored
   for at most twice its TTL from its last renewal (at most one extra capped TTL after the last live
   observation). When the bridge stops, its mirrors lapse within 15 s. On a clean stop or
@@ -28,12 +29,21 @@ existing events and mirrors root presence. There is no new store or protocol.
   `data.bridge = {from: <side>, id: <original event id>}`, and an event with a `bridge` field is
   never forwarded again.
 - Per direction the cursor records the last handled source sequence plus a generation-tagged
-  byte offset. Polls tail from that offset without depending on shared sequence-read hints.
-  Idle polls read one boundary byte per side and do not rewrite checkpoints or read routing
-  authority. Offsets checkpoint only a fully handled page; each forwarded event still checkpoints
+  byte offset. Change notifications trigger tails from that offset without depending on shared
+  sequence-read hints. An empty notification-capable bridge has no recurring timer, event read
+  or checkpoint write.
+  Offsets checkpoint only a fully handled page; each forwarded event still checkpoints
   its source sequence and destination mark. On restart the bridge skips ids already bridged after
   that mark, so a crash does not forward an event twice. Old sequence-only cursor files migrate
-  on first use; old v1 agents fall back to sequence reads when they do not advertise tail support.
+  on first use; explicit manual `step()` calls can still read old v1 agents without tail support.
+  Continuous `run()` negotiates change notifications. A new-to-new pair does not poll; when a
+  remote agent explicitly reports pre-capability protocol v1, only that peer's legacy path retains
+  the existing 250 ms poll and logs the compatibility mode once. Protocol v2 requires `changes:true`:
+  a v2 peer that omits or denies it is refused, never silently downgraded. New clients request v2 in
+  `hello`; unversioned old clients still receive a v1-compatible reply from new agents, without
+  unsolicited frames unless requested. The reported version is pinned for that transport. This is a
+  transitional host-by-host rollout path, to remove after the fleet-wide install under
+  https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7886.
   A rewritten log invalidates the offset generation and reconciles by sequence (from the archive
   when available) before returning to byte tails.
 - The remote is not trusted. An event from it crosses only when all of these are true:
@@ -62,7 +72,7 @@ existing events and mirrors root presence. There is no new store or protocol.
 - A mirror never replaces a native record or another bridge's mirror. It writes by
   compare-and-swap only. Each reconciliation compares property-order-independent content
   digests against the destination's current records under its mesh lock: unchanged participant
-  records do not rewrite shared state, but expired/pruned projections can be restored even when
+  records do not rewrite shared state. Expired/pruned projections can still be restored even when
   the source set is unchanged. Host file leases renew separately; compatibility state lease
   checkpoints remain bounded to their existing cadence.
 - Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A remote that misses it
@@ -81,6 +91,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   (a missing or non-executable ssh) fails the bridge with a named error and exit status 1.
 - The agent (the remote end) serves only the bridge operations. It applies the allow-list and
   stamps its pinned `--peer` name on everything it writes, whatever the hub sends.
+- The hub and agent watch the mesh directory and bind watches for `participants/` and
+  `host-leases/`, including their creation and atomic replacement. SQLite WAL updates are
+  notifications too. Watchers are installed before snapshots, and changes during a pass are
+  latched for the next drain. Notifications are hints: canonical reads and ownership fences
+  still decide delivery. A watch failure on a notification-capable link stops it rather than
+  silently dropping events. Remote change frames are negotiated with `hello` and do not occupy the agent's FIFO request
+  queue; there is no hanging wait request in front of a publish.
 
 ## Control deadlines and retention
 

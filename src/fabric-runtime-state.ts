@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RootInbox, type RootInboxBatch, type RootInboxSession } from "./topology/root-inbox.js";
+import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
@@ -38,6 +38,7 @@ import {
   resolveFabricModelGuidance,
   type FabricOwnedModelGuidance,
 } from "./components/model-guidance.js";
+import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import { FabricComponentSupervisor } from "./components/supervisor.js";
 import {
   createProviderComponent,
@@ -117,7 +118,7 @@ import {
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
 import { deliverActorToMain } from "./actors/main-delivery.js";
-import { sendFabricMessage } from "./fabric-provenance.js";
+import { fabricWakeCause, sendFabricMessage } from "./fabric-provenance.js";
 import { AgentsProvider } from "./providers/agents-provider.js";
 import { CompactProvider } from "./providers/compact-provider.js";
 import { CacheProvider } from "./providers/cache-provider.js";
@@ -359,10 +360,10 @@ export class FabricRuntimeState {
    * The inbox batch this Main should see now (smarty-dev#754); undefined when it has no inbox.
    * With `idle`, the batch an idle Main wakes for (smarty-dev#1595), under the wake cooldown.
    */
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
     let batch: RootInboxBatch | undefined;
     await this.#inboxRetry.run(async () => {
-      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session));
+      batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
     });
     return batch;
   }
@@ -405,7 +406,10 @@ export class FabricRuntimeState {
   }
 
   modelGuidance(): FabricOwnedModelGuidance[] {
-    return this.#componentSupervisor?.guidance() ?? [];
+    return [
+      ...(this.#config && !this.#managedHost ? builtinModelGuidance(this.#config) : []),
+      ...(this.#componentSupervisor?.guidance() ?? []),
+    ];
   }
 
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
@@ -1145,7 +1149,7 @@ export class FabricRuntimeState {
       ),
     );
     this.#participants.registerSource(() =>
-      this.#actors!.listOwned().map((actor) =>
+      this.#actors!.listOwned(true).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
     );
@@ -1228,17 +1232,14 @@ export class FabricRuntimeState {
         provider: "jev",
         description: "Shell orchestration and explicit typed Jev decisions",
         create: (component) => {
-          component.guide({
-            label: "jev-programs", models: ["*/*"], targets: ["main", "participant"],
-            content: "Jev supplies typed Choice, Noul, and Score judgments, not generated text. Prefer shell-first orchestration: granted pi.bash runs existing CLIs; tasks.wait/watch await bounded receipts/monitor batches without polling or inference. Use UI-only monitors to avoid Main wakeups. Browser/macOS tools need no Fabric bridge. Code owns commands; never execute a model answer as shell source. Omit jev.evaluate and set maxEvaluations:0 for deterministic programs (host auto approvals remain independent). Use jev.evaluate only for explicit authorized batched questions; jev.run/spawn for isolated TypeScript programs that may loop using input, program.sleep, program.emit, and exact requires capabilities. run/wait return terminal envelopes (join aliases wait for both agents and Jev); inspect state and result/error. Programs and detached tasks are session-owned, not restart-durable. jev.status/stop control programs; tasks.stop separately stops their detached tasks. Observation timeout/cancellation never cancels the task; keep task IDs and finite process deadlines. For Main-turn advisors, spawn with observe, await program.nextEvent without polling, and opt into bounded context fields. program.advise requires jev.advise and explicit delivery; default is record-only. Return the observer ID without waiting in Main; Escape/Main abort cancels observers. Use /login jev, TYPESAFE_API_KEY, /login openrouter, OPENROUTER_API_KEY, /login vercel-ai-gateway, AI_GATEWAY_API_KEY, or a trusted credentialCommand. Credentials stay host-side; status never retrieves a key. See docs/jev.md for schemas, budgets, and shell/CLI composition.",
-          });
           const observationHost = identity.kind === "main" ? new JevObservationHost(context.sessionManager.getSessionId(), advice => {
             sendFabricMessage(this.pi, {
               customType: "pi-fabric-jev",
               content: [`<fabric-jev name=${JSON.stringify(escapeXmlText(advice.name))} id=${JSON.stringify(advice.runId)}>\n${escapeXmlText(advice.message)}\n</fabric-jev>`, actorDeliveryNotice(advice.delivery, advice.triggerTurn)].filter(Boolean).join("\n"),
               display: true,
               details: { runId: advice.runId, eventId: advice.eventId, delivery: { mode: advice.delivery, triggerTurn: advice.triggerTurn } },
-            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh");
+            }, { deliverAs: advice.delivery, triggerTurn: advice.triggerTurn }, identity, "actor", "mesh", undefined,
+              fabricWakeCause({ id: advice.runId, name: advice.name, kind: "agent" }, "host-event", "jev.advice", advice.eventId));
           }) : undefined;
           this.#jevObservationHost = observationHost;
           // A bare `jev.model` alias stays on TypeSafe; `typesafe/...` / `~typesafe/...` uses OpenRouter decisions, and `typesafe-ai/...` uses Vercel AI Gateway.

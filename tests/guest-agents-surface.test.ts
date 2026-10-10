@@ -23,6 +23,13 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types opt-in actor occurrence dedupe (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "alarm", instructions: "Handle alarms", residency: "durable", topics: ["ops.owner"], dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1000 } }); return { dedupeKey: actor.dedupeKey, activation: actor.activation };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode(`await agents.create({ name: "bad", instructions: "x", dedupeKey: 42 });`, guestTypeDeclarations(fullCodeMode), true).errors)
+      .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });

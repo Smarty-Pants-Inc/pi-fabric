@@ -93,7 +93,8 @@ describe("abandoned prepared mesh state", () => {
   it("does not query process birth time for a file at or below one hour old", () => {
     const root = rootOf(), now = Date.now();
     vi.spyOn(Date, "now").mockReturnValue(now);
-    const file = prepared(root, process.ppid, now - 60 * 60_000);
+    // 59 min, not exactly 60: utimes' float seconds can store an mtime a fraction of a ms earlier (smarty-dev#7627).
+    const file = prepared(root, process.ppid, now - 59 * 60_000);
     const birth = vi.spyOn(childProcess, "execFileSync");
     new MeshStore(root, 65536, 100);
     expect(fs.existsSync(file)).toBe(true);

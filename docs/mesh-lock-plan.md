@@ -108,7 +108,7 @@ nice -n 10 taskset -c 4-11 bun scripts/mesh-load.ts --root <scratch-mesh> --seed
   --put-share 0.4 --custody-share 0.4 --target-writes-per-min 2400 --target-processes 12 --max-workers 12 --duration 600
 ```
 
-The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy, instead of queueing them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
+The target is set above what 12 workers can complete with one write in flight each. Each worker therefore paces at its own completion rate and skips (and counts) the writes that come due while it is busy and does not queue them. `--max-workers` pins the process count. With a reachable target, the controller adds a worker only when a whole control window (one that does not include a resize) falls below 90% of the target. It sheds a worker above 110% or above 65% lock busy.
 
 ## 5. Rollback
 
@@ -137,7 +137,8 @@ A reader uses `state.json` only when `backend=file` and it is a real state file 
 ```sh
 fabric-mesh-backend census   --root <mesh>   # the L4a writer census, ADVISORY: "advisory: N writers, M unknown" and each entry; exit 0
 fabric-mesh-backend status   --root <mesh>   # flag, epochs, digests, reader decision, advisory census; 0 fence holds, 3 violated
-fabric-mesh-backend cutover  --root <mesh>   # file -> sqlite (the fenced section above); 0 done, 3 refused
+fabric-mesh-backend cutover  --root <mesh>   # file -> sqlite (the fenced section above); 0 done, 3 refused (also a required reader not ready: docs/mesh-backend.md)
+fabric-mesh-backend reader-proof --root <mesh> --backend sqlite   # this Fabric release proves a real read (readiness gate)
 fabric-mesh-backend rollback --root <mesh>   # sqlite -> file, steps 1 to 5; 0 done (a rerun converges), 3 refused
 fabric-mesh-backend abort-rollback --root <mesh>  # exporting -> sqlite at E+1; 0 done, 3 refused
 ```

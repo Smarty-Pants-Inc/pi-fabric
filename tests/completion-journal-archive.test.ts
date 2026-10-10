@@ -4,7 +4,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, sameArchiveInode, saveCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { syncPathNamespace, syncPathNamespaceAsync } from "../src/core/atomic-write.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import type { MeshStore } from "../src/mesh/store.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
@@ -52,6 +53,43 @@ const noDrainSync = () => {
   });
   return { sync, handles };
 };
+
+describe("completion archive stable identity", () => {
+  it("uses exact bigint IDs above 2^53 despite NTFS ctime and nlink changes", () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const source = { dev: 9n, ino: 2n ** 53n, size: 4096n, ctimeMs: 1n, birthtimeMs: 1n, nlink: 1n };
+    const linked = { ...source, ctimeMs: 2n, birthtimeMs: 3n, nlink: 3n };
+    expect(sameArchiveInode(source, linked)).toBe(true);
+    const different = { ...linked, ino: source.ino + 1n };
+    expect(Number(source.ino)).toBe(Number(different.ino)); // Rounded IDs would alias.
+    expect(sameArchiveInode(source, different)).toBe(false);
+    expect(sameArchiveInode(source, { ...linked, dev: 10n })).toBe(false);
+    expect(sameArchiveInode(source, { ...linked, size: 4097n })).toBe(false);
+  });
+
+  it.each(["sync", "async"] as const)("binds bigint archive identities during %s namespace confirmation", async mode => {
+    const h = setup(); const result = h.seed(1); const file = h.file(result.id);
+    const identity = fs.statSync(file, { bigint: true });
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const replacement = { ...identity, ino: identity.ino + 1n };
+    if (mode === "sync") {
+      expect(() => syncPathNamespace(file, identity)).not.toThrow();
+      expect(() => syncPathNamespace(file, replacement)).toThrow("receipt inode changed");
+    } else {
+      await expect(syncPathNamespaceAsync(file, identity)).resolves.toBeUndefined();
+      await expect(syncPathNamespaceAsync(file, replacement)).rejects.toThrow("receipt inode changed");
+    }
+  });
+
+  it("keeps POSIX numeric dev/ino identity independent of size and link metadata", () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    const source = { dev: 9, ino: 10, size: 4096, ctimeMs: 1, nlink: 1 };
+    const linked = { ...source, size: 4097, ctimeMs: 2, nlink: 3 };
+    expect(sameArchiveInode(source, linked)).toBe(true);
+    expect(sameArchiveInode(source, { ...source, ino: 11 })).toBe(false);
+    expect(sameArchiveInode(source, { ...source, dev: 10 })).toBe(false);
+  });
+});
 
 describe("completion receipt-time archive", () => {
   it("archives on receipt, preserving body and inode, only after receipt barriers", () => {

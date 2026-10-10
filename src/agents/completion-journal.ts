@@ -116,15 +116,19 @@ interface CompletionClaim { rootId: string; sessionId: string; recipient?: Compl
 // before retiring recovery evidence. A durable hard link keeps the body discoverable
 // even without a claim/attempt, or if a crash loses both unsynced rename names. Only
 // this pending namespace is scanned, never archive history; no body rewrite is needed.
-const archiveStat = (file: string): fs.Stats | undefined => {
-  try { return fs.statSync(file); }
+type ArchiveStat = fs.Stats | fs.BigIntStats;
+const archiveStat = (file: string): ArchiveStat | undefined => {
+  try { return process.platform === "win32" ? fs.statSync(file, { bigint: true }) : fs.statSync(file); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 };
-const archiveStatAsync = async (file: string): Promise<fs.Stats | undefined> => {
-  try { return await fs.promises.stat(file); }
+const archiveStatAsync = async (file: string): Promise<ArchiveStat | undefined> => {
+  try { return process.platform === "win32" ? await fs.promises.stat(file, { bigint: true }) : await fs.promises.stat(file); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 };
-const sameArchiveInode = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino === b.ino;
+// NTFS file IDs exceed Number's precision. Adding/removing hard links also changes
+// ctime and nlink, so only stable identity (and Windows body size) may bind aliases.
+export const sameArchiveInode = (a: Pick<ArchiveStat, "dev" | "ino" | "size">, b: Pick<ArchiveStat, "dev" | "ino" | "size">): boolean =>
+  a.dev === b.dev && a.ino === b.ino && (process.platform !== "win32" || a.size === b.size);
 const archiveCompletion = (source: string): boolean => {
   const target = path.join(path.dirname(source), "archive", path.basename(source));
   const evidence = path.join(path.dirname(source), "archive-pending", path.basename(source));

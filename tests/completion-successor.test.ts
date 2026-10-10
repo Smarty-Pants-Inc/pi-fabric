@@ -727,28 +727,44 @@ describe("Astra round 3 legacy retirement ordering", () => {
   }, 60_000); // Twelve real-storage fsync/CAS cycles; do not impose a latency budget on this recovery proof.
 
   // #3178: only the returning exact owner may confirm an interrupted archive before CAS.
-  it("a crash after archive rename retains the legacy claim until the same Main confirms its namespace", async () => {
+  it("a crash after archive publication retains the legacy claim until the same Main confirms its namespace", async () => {
     const h = harness(true); saveCompletion(h.meshRoot, h.recipient, h.result);
     const claim = await legacyClaim(h, h.result.id); receiptBeforeArchive(h.meshRoot, h.result.id, "B");
     h.setLive([h.participant("B", 200)]);
-    const body = bodyPath(h, h.result.id); const rename = fs.promises.rename;
-    const crash = vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-      await rename(source, target);
-      if (String(source) === body) {
+    const body = bodyPath(h, h.result.id);
+    const archive = path.join(path.dirname(body), "archive", path.basename(body));
+    const evidence = path.join(path.dirname(body), "archive-pending", path.basename(body));
+    const method = process.platform === "win32" ? "link" : "rename";
+    const publish = fs.promises[method];
+    const crash = vi.spyOn(fs.promises, method).mockImplementation(async (source, target) => {
+      await publish(source, target);
+      if (String(source) === body && String(target) === archive) {
         expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim);
-        throw new Error("stop after archive rename, before directory barriers");
+        throw new Error("stop after archive publication, before namespace confirmation");
       }
     });
     const b = new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, vi.fn());
-    await expect(b.drain()).rejects.toThrow("stop after archive rename, before directory barriers");
-    expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim); expect(fs.existsSync(body)).toBe(false);
-    expect(fs.existsSync(path.join(path.dirname(body), "archive-pending", path.basename(body)))).toBe(true);
+    await expect(b.drain()).rejects.toThrow("stop after archive publication, before namespace confirmation");
+    expect(h.mesh.get(claim.key, { fresh: true })).toEqual(claim);
+    // Windows link publication leaves the source name until explicit cleanup.
+    expect(fs.existsSync(body)).toBe(process.platform === "win32");
+    expect(fs.existsSync(archive)).toBe(true); expect(fs.existsSync(evidence)).toBe(true);
     crash.mockRestore();
+    const confirm = atomicWrite.syncPathNamespaceAsync; let archiveConfirmed = false;
+    vi.spyOn(atomicWrite, "syncPathNamespaceAsync").mockImplementation(async (...args) => {
+      await confirm(...args); if (String(args[0]) === archive) archiveConfirmed = true;
+    });
+    const remove = h.mesh.delete.bind(h.mesh);
+    const retirement = vi.spyOn(h.mesh, "delete").mockImplementation(async args => {
+      expect(archiveConfirmed).toBe(true); return remove(args);
+    });
     const receipt = path.join(path.dirname(body), "receipts", path.basename(body));
     const read = vi.spyOn(fs.promises, "readFile"); const enqueue = vi.fn(); h.setLive([h.participant("C", 300)]);
     await new CompletionJournal(h.meshRoot, h.recipient, h.participants, h.mesh, enqueue).drain();
     expect(read.mock.calls.some(([file]) => String(file) === receipt)).toBe(true);
-    expect(fs.existsSync(body)).toBe(false); expect(fs.existsSync(path.join(path.dirname(body), "archive", path.basename(body)))).toBe(true);
+    expect(retirement).toHaveBeenCalledExactlyOnceWith({ key: claim.key, ifVersion: claim.version });
+    expect(h.mesh.get(claim.key, { fresh: true })).toBeUndefined();
+    expect(fs.existsSync(body)).toBe(false); expect(fs.existsSync(archive)).toBe(true); expect(fs.existsSync(evidence)).toBe(false);
     expect(fs.existsSync(receipt)).toBe(true); expect(enqueue).not.toHaveBeenCalled();
   });
 

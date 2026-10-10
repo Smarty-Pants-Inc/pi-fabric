@@ -1,6 +1,6 @@
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
-import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
+import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -64,6 +64,8 @@ export interface FabricControlCommand {
   destinationRemoteHost?: string | null;
   message?: string;
   data?: unknown;
+  /** Diagnostic producer metadata, never used for command admission or authority. */
+  wakeCause?: FabricWakeCause | undefined;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
@@ -206,8 +208,11 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   ) {
     return undefined;
   }
-  return { ...data, principal: event.verification === "mesh" || event.verification === "bridge"
-    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand;
+  // Sender diagnostics are never evidence. Derive only from the admitted envelope.
+  const wakeCause = data.operation === "steer" || data.operation === "followUp"
+    ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
+  return withFabricWakeAdmission({ ...data, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
 interface FabricControlSeenRecord {
@@ -263,6 +268,7 @@ export interface FabricControlInput {
   principal?: FabricPrincipal | undefined;
   message?: string;
   data?: unknown;
+  wakeCause?: FabricWakeCause | undefined;
   triggerTurn?: boolean;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
@@ -418,6 +424,8 @@ export class FabricControlPlane {
     ownerIdentityId = ownerHostId,
     options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    // Freeze diagnostic producer attribution before publication or an observation retry yields.
+    input = { ...input, wakeCause: copyFabricWakeCause(input.wakeCause) };
     // One logical message key survives both observation retries and a proven-notRun resend.
     options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID() };
     let notRunAttempt = 0;
@@ -644,6 +652,7 @@ export class FabricControlPlane {
           ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
           ...(input.message !== undefined ? { message: input.message } : {}),
           ...(input.data !== undefined ? { data: input.data } : {}),
+          ...(input.wakeCause !== undefined ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
           ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),

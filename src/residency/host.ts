@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -199,6 +199,14 @@ export class ResidentHost {
   #lockFd: number | undefined;
   #exclusiveCreateLock = false;
   readonly #ownerPath: string;
+  #failure: unknown;
+  /**
+   * Last act just before this host releases owner.json (smarty-dev#7770).
+   * `failure` is the startup error, if any. `owned()` revalidates the root's
+   * fence and owner.json; call it immediately before a root write, and write
+   * nothing there when it is false.
+   */
+  beforeRelease: ((failure: unknown, owned: () => boolean) => void) | undefined;
   readonly #lockPath: string;
   readonly #errorPath: string;
   readonly #requestsPath: string;
@@ -246,7 +254,7 @@ export class ResidentHost {
 
   constructor(
     readonly config: ResidentHostConfig,
-    readonly onIdle: () => void = () => {},
+    readonly onIdle: (reason?: ResidentExitReason) => void = () => {},
     private readonly modelRegistry?: PiModelRegistryView,
     readonly launch?: ResidentHostLaunchContext,
   ) {
@@ -537,6 +545,10 @@ export class ResidentHost {
           config.rootId,
           message.source === "fabric-host" ? undefined : message.principal,
           message.source === "fabric-host" ? "fabric-host" : "actor-output",
+          // Alarms retain the actor's display label, but their producer is this host.
+          fabricWakeCause(message.source === "fabric-host" ? this.identity : { id: actor.id, name: actor.name, kind: "actor" },
+            message.source === "fabric-host" ? "host-event" : "actor",
+            message.source.startsWith("mesh:") || message.source.startsWith("host:") ? message.source.slice(5) : undefined, message.id),
         ));
       },
       {
@@ -711,6 +723,7 @@ export class ResidentHost {
         void this.#retryDeliveries();
       }
     } catch (error) {
+      this.#failure ??= error;
       await this.close();
       throw error;
     }
@@ -936,6 +949,7 @@ export class ResidentHost {
 
   async #handleLifecycle(subscription: FabricLifecycleSubscription, event: FabricLifecycleEvent): Promise<void> {
     const message = `Fabric lifecycle ${event.event} from ${event.source.name} (${event.source.id})${event.status ? ` with status ${event.status}` : ""}.`;
+    const wakeCause = fabricWakeCause(lifecycleSourceIdentity(event.source), "host-event", event.event, event.id);
     if (subscription.to === this.config.rootId) {
       await this.#queueDelivery(
         lifecycleSourceIdentity(event.source),
@@ -943,6 +957,11 @@ export class ResidentHost {
         subscription.delivery,
         subscription.triggerTurn,
         event,
+        undefined,
+        this.config.rootId,
+        undefined,
+        undefined,
+        wakeCause,
       );
       return;
     }
@@ -968,7 +987,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn },
+      { message, data: event, triggerTurn: subscription.triggerTurn, wakeCause },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );
@@ -984,14 +1003,17 @@ export class ResidentHost {
     rootId: string | (() => string) = this.config.rootId,
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
+    wakeCause?: FabricWakeCause,
   ): Promise<void> {
     const id = randomUUID();
+    const diagnostic = copyFabricWakeCause(wakeCause);
     const record = (target: string): ResidentDeliveryRecord => ({
         format: RESIDENT_HOST_FORMAT,
         id,
         rootId: target,
         from,
         ...(source ? { source } : {}),
+        ...(diagnostic ? { wakeCause: diagnostic } : {}),
         ...(principal ? { principal } : {}),
         delivery,
         triggerTurn,
@@ -1204,7 +1226,7 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
-    this.onIdle();
+    this.onIdle("idle-exit");
   }
 
   #trackPublication(promise: Promise<unknown>): void {
@@ -1311,7 +1333,7 @@ export class ResidentHost {
             !exactResidentProcess(plan.launcher)) throw new Error("Resident launcher custody is uncertain");
         // Receipt precedes release of A's stable flock. The Main is no longer the executor.
         writeHandoverState(this.config.residencyRoot, plan, "released");
-        this.onIdle();
+        this.onIdle("handover-release");
         return;
       }
       if (!mainGenerationCurrent(this.config.residencyRoot, plan.main) || !exactResidentProcess(plan.launcher)) {
@@ -1751,7 +1773,7 @@ export class ResidentHost {
     this.#exclusiveCreateLock = true;
     try {
       fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
-    } catch (error) { this.#releaseLock(); throw error; }
+    } catch (error) { this.#releaseLock(error); throw error; }
   }
 
   /** Called only while holding the immutable first-claim establishment guard. */
@@ -1793,11 +1815,33 @@ export class ResidentHost {
       }
       fs.ftruncateSync(this.#lockFd, 0);
       fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
-    } catch (error) { this.#releaseLock(); throw error; }
+    } catch (error) { this.#releaseLock(error); throw error; }
   }
 
-  #releaseLock(): void {
+  /**
+   * True only while this host provably owns its root: host.lock at its path is
+   * still the inode this host locked (the establishment check), and owner.json
+   * names this host (the owner fence check) or, before this host published it,
+   * names no live process (a dead predecessor's record). A replaced lock or a
+   * live other generation's owner.json means the root is not ours to write.
+   */
+  #holdsRoot(): boolean {
+    if (this.#lockFd === undefined) return false;
+    try {
+      const locked = fs.fstatSync(this.#lockFd, { bigint: true });
+      const current = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (current.dev !== locked.dev || current.ino !== locked.ino) return false;
+    } catch { return false; }
+    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (owner?.token === this.#token) return owner.pid === process.pid;
+    return !owner || !residentProcessAlive(owner.pid, owner.processStartTime);
+  }
+
+  #releaseLock(failure = this.#failure): void {
     if (this.#lockFd === undefined) return;
+    if (!(failure instanceof ResidentHostAlreadyRunning)) {
+      try { this.beforeRelease?.(failure, () => this.#holdsRoot()); } catch { /* diagnostics never block release */ }
+    }
     // Remove our publication while holding the claim. POSIX never unlinks its
     // immutable kernel-fence inode; Windows removes only its token-owned claim.
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
@@ -1841,25 +1885,74 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
 
+/** Why a resident host exits (smarty-dev#7770). */
+export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";
+
+/**
+ * Names this host's exit in the root's launcher.log, in the launcher's trace
+ * shape (smarty-dev#7770). Writes only when `owned()` holds, checked right
+ * before the open: the launcher writes nothing after a clean owned exit
+ * (#2010), and nothing may write the root without its fence.
+ * ponytail: synchronous on purpose. The release itself does synchronous I/O on
+ * this filesystem (owner.json unlink), so this adds no new stall class; an
+ * async or timed write could land after the release (#2010). The residual
+ * window between owned() and the open is a few syscalls, reachable only by a
+ * same-uid process; closing it needs an fd-relative open (smarty-dev#7950).
+ */
+export const reportResidentExit = (residencyRoot: string, reason: ResidentExitReason,
+  owned: () => boolean = () => true, constants: Partial<typeof fs.constants> = fs.constants): void => {
+  // Everything slow happens before the ownership check.
+  const line = `${JSON.stringify({ event: "resident-exit", at: Date.now(), reason, pid: process.pid })}\n`;
+  const file = path.join(residencyRoot, "launcher.log");
+  const { O_WRONLY = 0, O_APPEND = 0, O_CREAT = 0, O_NOFOLLOW, O_NONBLOCK } = constants;
+  // Without O_NOFOLLOW a planted symlink would redirect the write; without
+  // O_NONBLOCK a planted FIFO with no reader would block the open: fail closed.
+  if (O_NOFOLLOW === undefined || O_NONBLOCK === undefined) return;
+  const flags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK;
+  const uid = process.getuid?.();
+  let fd: number | undefined;
+  try {
+    if (!owned()) {
+      // No proven fence: the root may be another generation's. stderr only.
+      try { process.stderr.write(`Fabric resident host exit (${reason}) without a proven root fence\n`); } catch { /* best effort */ }
+      return;
+    }
+    // A FIFO without a reader fails at once (ENXIO); one with a reader is
+    // rejected by the regular-file check. A regular file ignores O_NONBLOCK.
+    fd = fs.openSync(file, flags, 0o600);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== uid) return;
+    if (stat.mode & 0o177) fs.fchmodSync(fd, 0o600);
+    // A short line in one write(2) call, appended atomically by O_APPEND.
+    fs.writeSync(fd, line);
+  } catch { /* Diagnostics never block the release. */ }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } } }
+};
+
 const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
 ): Promise<void> => {
-  let finishIdle: (() => void) | undefined;
-  const idle = new Promise<void>((resolve) => {
+  let finishIdle: ((reason: ResidentExitReason) => void) | undefined;
+  const idle = new Promise<ResidentExitReason>((resolve) => {
     finishIdle = resolve;
   });
-  const host = new ResidentHost(config, () => finishIdle?.(), modelRegistry, residentHostLaunchContext(config));
+  let reason: ResidentExitReason | undefined;
+  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry, residentHostLaunchContext(config));
+  // The last act before close releases owner.json (smarty-dev#1882).
+  host.beforeRelease = (failure, owned) =>
+    reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error", owned);
   await host.start();
   if (signal?.aborted) {
+    reason = "stopped";
     await host.close();
     return;
   }
-  await Promise.race([
+  reason = await Promise.race([
     idle,
-    new Promise<void>((resolve) => {
-      const finish = (): void => resolve();
+    new Promise<ResidentExitReason>((resolve) => {
+      const finish = (): void => resolve("stopped");
       signal?.addEventListener("abort", finish, { once: true });
       process.once("SIGTERM", finish);
       process.once("SIGINT", finish);

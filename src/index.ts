@@ -2,7 +2,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
-import { registerFabricPrincipalCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
+import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
@@ -796,8 +796,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     }
   });
 
-  // Keep activation/reload startup first; the renderer's session_start hook
-  // only snapshots display history and must not replace that entry point.
+  // Keep activation/reload startup first; diagnostic and display session_start
+  // observers must not replace that entry point.
+  registerFabricWakeCapture(pi);
   registerIncomingMessageRenderers(pi, () => principalViewIncomingMode(state.provisionalConfig().ui.principalView));
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget

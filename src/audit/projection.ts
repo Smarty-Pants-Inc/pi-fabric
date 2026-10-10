@@ -136,6 +136,7 @@ const idOnlyAgentActions = new Set([
   "agents.cleanup",
   "agents.ask",
   "agents.tell",
+  "agents.send",
   "agents.steer",
   "agents.followUp",
   "agents.setSteeringMode",

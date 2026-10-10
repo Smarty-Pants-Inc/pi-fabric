@@ -929,7 +929,10 @@ type FabricMessageArgs = FabricMessageTarget & {
   /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
   idempotencyKey?: string;
 };
-type FabricMessageSteerArgs = FabricMessageArgs;
+type FabricMessageSteerArgs = FabricMessageArgs & {
+  /** Main only: preempt a running tool via native abort, then steer. No tool retry. */
+  priority?: "interrupt";
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -1044,6 +1047,9 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
+  /** Alias of steer; uses the same authority and default delivery. */
+  send(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
+  send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;

@@ -79,16 +79,17 @@ export class ResidentWakeWatchError extends Error {
 }
 
 const wakeWatchProofs = new Map<string, Promise<void>>();
-const wakeWatchClosers = new Map<string, () => void>();
+const wakeWatchClosers = new Map<string, () => Promise<void>>();
+const wakeWatchClosing = new Map<string, Set<Promise<void>>>();
 const wakeWatchErrors = new Map<string, Set<() => void>>();
 
 /** Subscribe without opening a watcher or arming a timer. */
-export function subscribeResidentWakeWatchErrors(root: string, listener: () => void): () => void {
+export function subscribeResidentWakeWatchErrors(root: string, listener: () => void): () => Promise<void> {
   root = path.resolve(root);
   let listeners = wakeWatchErrors.get(root);
   if (!listeners) wakeWatchErrors.set(root, listeners = new Set());
   listeners.add(listener);
-  return () => {
+  return async () => {
     listeners.delete(listener);
     if (!listeners.size) {
       wakeWatchErrors.delete(root);
@@ -97,7 +98,8 @@ export function subscribeResidentWakeWatchErrors(root: string, listener: () => v
       const close = wakeWatchClosers.get(root);
       wakeWatchClosers.delete(root);
       wakeWatchProofs.delete(root);
-      close?.();
+      if (close) await close();
+      await Promise.all(wakeWatchClosing.get(root) ?? []);
     }
   };
 }
@@ -114,17 +116,33 @@ export function assertResidentWakeWatch(root: string): Promise<void> {
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
     let proven = false;
+    let closed: Promise<void> | undefined;
+    const closeWatcher = (): Promise<void> => {
+      if (closed) return closed;
+      if (!watcher) return Promise.resolve();
+      const closingWatcher = watcher;
+      closed = new Promise<void>(resolve => closingWatcher.once("close", resolve));
+      let pending = wakeWatchClosing.get(root);
+      if (!pending) wakeWatchClosing.set(root, pending = new Set());
+      pending.add(closed);
+      void closed.then(() => {
+        pending.delete(closed!);
+        if (!pending.size) wakeWatchClosing.delete(root);
+      });
+      closingWatcher.close();
+      return closed;
+    };
     const finish = (error?: unknown): void => {
       if (settled) return;
       settled = true;
       if (deadline) clearTimeout(deadline);
       fs.rmSync(probe, { force: true });
-      if (error) { watcher?.close(); wakeWatchClosers.delete(root); reject(error); }
+      if (error) { void closeWatcher(); wakeWatchClosers.delete(root); reject(error); }
       else { proven = true; watcher?.unref?.(); resolve(); }
     };
     wakeWatchClosers.set(root, () => {
       if (!settled) finish(new Error("Resident wake watcher closed with its host"));
-      else watcher?.close();
+      return closeWatcher();
     });
     try {
       watcher = fs.watch(root, (_event, filename) => {
@@ -132,7 +150,7 @@ export function assertResidentWakeWatch(root: string): Promise<void> {
       });
       watcher.once("error", error => {
         wakeWatchProofs.delete(root);
-        if (proven) { watcher?.close(); wakeWatchClosers.delete(root); }
+        if (proven) { void closeWatcher(); wakeWatchClosers.delete(root); }
         else finish(new ResidentWakeWatchError(root, `Resident wake watcher failed: ${String(error)}`, error));
         for (const listener of wakeWatchErrors.get(root) ?? []) listener();
       });

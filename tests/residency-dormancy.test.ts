@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { retainResidentProcessWork } from "../src/residency/process-work.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ARCHIVE_PENDING_FILE } from "../src/agents/archive-custody.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -216,7 +217,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   it("retires an outstanding watcher proof before normal host close returns", async () => {
     const { root, config, host } = fixture();
     const watch = fs.watch;
-    const close = vi.fn();
+    const close = vi.fn(() => { queueMicrotask(() => watcher.emit("close")); });
     const watcher = Object.assign(new EventEmitter(), { close }) as unknown as fs.FSWatcher;
     let probing = false;
     try {
@@ -290,6 +291,73 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(true);
       expect(warn.mock.calls.filter(([line]) => String(line).includes("wake capacity"))).toHaveLength(1);
     } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("waits for native watcher close before releasing the owner, including concurrent close callers", async () => {
+    const { root, config, host } = fixture();
+    const watch = fs.watch;
+    const close = vi.fn();
+    const watcher = Object.assign(new EventEmitter(), { close, unref: vi.fn() }) as unknown as fs.FSWatcher;
+    let notify: fs.WatchListener<string> | undefined;
+    let closing: Promise<void> | undefined;
+    let concurrent: Promise<void> | undefined;
+    try {
+      await host.start();
+      vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+        if (args[0] !== config.residencyRoot) return watch(...args);
+        notify = args[1] as fs.WatchListener<string>;
+        return watcher;
+      });
+      const actor = await host.actors.create({ name: "native-close-order", instructions: "wait", residency: "durable" });
+      await until(() => !!notify);
+      const probe = fs.readdirSync(config.residencyRoot).find(name => name.startsWith(".wake-watch-"))!;
+      notify!("rename", probe);
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      let finished = 0;
+      closing = host.close().then(() => { finished++; });
+      concurrent = host.close().then(() => { finished++; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(close).toHaveBeenCalledOnce();
+      expect(finished).toBe(0);
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(true);
+      watcher.emit("close");
+      await Promise.all([closing, concurrent]);
+      expect(finished).toBe(2);
+      expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
+    } finally {
+      watcher.emit("close");
+      await Promise.all([closing, concurrent]);
+      await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rechecks process-call custody after wake proof and retries only when the real work settles", async () => {
+    const { root, config, host, idle } = fixture();
+    const wake = await import("../src/residency/wake.js");
+    let prove!: () => void;
+    const proof = new Promise<void>(resolve => { prove = resolve; });
+    let releaseWork: (() => void) | undefined;
+    try {
+      await host.start();
+      const probes = vi.spyOn(wake, "assertResidentWakeWatch").mockImplementation(() => proof);
+      const actor = await host.actors.create({ name: "proof-process-race", instructions: "wait", residency: "durable" });
+      await until(() => probes.mock.calls.length === 1);
+      releaseWork = retainResidentProcessWork(config.sessionId);
+      const commits = vi.spyOn(host.actors, "dormantIdleActors");
+      prove();
+      await host.participants.refreshPresence();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(commits).not.toHaveBeenCalled();
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 60_000);
+      await sleep(300);
+      expect(idle).not.toHaveBeenCalled();
+      expect(host.actors.status(actor.id).status).toBe("idle");
+      releaseWork();
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(probes).toHaveBeenCalledTimes(1);
+    } finally { prove(); releaseWork?.(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {
@@ -564,7 +632,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
         if (args[0] !== config.residencyRoot) return originalWatch(...args);
         if (failure === "throw") throw new Error("watch unavailable for root");
-        const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
+        const watcher = Object.assign(new EventEmitter(), {
+          close: vi.fn(() => { queueMicrotask(() => watcher.emit("close")); }),
+        }) as unknown as fs.FSWatcher;
         watchers.push(watcher);
         if (failure === "error") queueMicrotask(() => watcher.emit("error", new Error("watch failed for root")));
         return watcher;

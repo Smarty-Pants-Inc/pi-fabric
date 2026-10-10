@@ -20,6 +20,7 @@ import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
+import { residentProcessWorkPending, subscribeResidentProcessWork } from "./process-work.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -223,7 +224,8 @@ export class ResidentHost {
   #idleCheckRequested = false;
   #idleCheckPending: Promise<void> | undefined;
   #wakeWatchReprobeUsed = false;
-  #wakeWatchErrorUnsubscribe: (() => void) | undefined;
+  #wakeWatchErrorUnsubscribe: (() => Promise<void>) | undefined;
+  #processWorkUnsubscribe: (() => void) | undefined;
   #wakeWatchNeedsReprobe = false;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #pollingRequests = false;
@@ -232,6 +234,7 @@ export class ResidentHost {
   // Host-local only: retain pending promises and at most 256 completed creates for 10 minutes.
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
+  #closePending: Promise<void> | undefined;
   #routeOwner?: ShadowRouteOwner;
   readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
@@ -262,6 +265,7 @@ export class ResidentHost {
     readonly onIdle: (reason?: ResidentExitReason) => void = () => {},
     private readonly modelRegistry?: PiModelRegistryView,
     readonly launch?: ResidentHostLaunchContext,
+    private readonly processWorkSessionId = config.sessionId,
   ) {
     this.#staged = !!launch?.attempt;
     this.hostId = residentHostId(config.rootId);
@@ -665,6 +669,7 @@ export class ResidentHost {
       this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());
       this.actors.subscribe(() => this.#noteActorActivity());
+      this.#processWorkUnsubscribe = subscribeResidentProcessWork(this.processWorkSessionId, () => this.#noteActorActivity());
       this.#wakeWatchErrorUnsubscribe = subscribeResidentWakeWatchErrors(this.config.residencyRoot, () => {
         if (this.#wakeWatchSupported !== true) return; // probe-time errors settle through the promise
         this.#wakeWatchSupported = undefined;
@@ -781,7 +786,12 @@ export class ResidentHost {
   }
 
   async close(): Promise<void> {
-    if (this.#closed || !this.#started) return;
+    if (!this.#started || (this.#closed && !this.#closePending)) return;
+    this.#closePending ??= this.#close().finally(() => { this.#closePending = undefined; });
+    return this.#closePending;
+  }
+
+  async #close(): Promise<void> {
     this.#closed = true;
     // Stops with the host (shutdown and the release handover's exit alike): the lease is released
     // so the successor host's projector takes over at once.
@@ -791,8 +801,13 @@ export class ResidentHost {
     this.#requestTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
-    this.#wakeWatchErrorUnsubscribe?.();
+    const wakeWatchClosed = this.#wakeWatchErrorUnsubscribe?.();
     this.#wakeWatchErrorUnsubscribe = undefined;
+    this.#processWorkUnsubscribe?.();
+    this.#processWorkUnsubscribe = undefined;
+    // FSWatcher.close() schedules native handle closure. Join its close event before
+    // owner release or callers removing the residency directory on Windows.
+    await wakeWatchClosed;
     this.#requestRetention.close();
     await this.#legacyArchive?.close();
     // Stop drains first so an in-flight ask can settle within the actor shutdown grace.
@@ -1327,9 +1342,22 @@ export class ResidentHost {
     return protectedIds;
   }
 
+  #hasHostWork(): boolean {
+    return residentProcessWorkPending(this.processWorkSessionId) || this.#admissions > 0 || this.#boundaryRequests.size > 0 ||
+      this.#publicationFailed || this.actors.inFlightCount() > 0 ||
+      this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running") ||
+      [this.#requestsPath, this.#processingPath].some(directory => {
+        try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
+        catch { return false; }
+      }) || this.#publications.size > 0 || this.#flushingDeliveries !== undefined ||
+      (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")));
+  }
+
   async #checkIdle(includeDormancy = true): Promise<void> {
     if (this.#closed || this.#staged || this.#handover || this.#sleeping) return;
     const now = Date.now();
+    // Startup/reload and open process calls are work even when all actors look idle.
+    if (!this.#ready || this.#hasHostWork()) { this.#idleSince = now; return; }
     if (!includeDormancy && this.#idleCheckPending) return;
     if (includeDormancy) {
       if (this.#wakeWatchNeedsReprobe && !await this.#ensureWakeWatch()) return;
@@ -1343,7 +1371,8 @@ export class ResidentHost {
           this.#idleSince = now;
           return;
         }
-        if (this.#closed || this.#staged || this.#handover || this.#sleeping || !this.#hasWakeConfig()) return;
+        if (this.#closed || !this.#ready || this.#staged || this.#handover || this.#sleeping ||
+            this.#hasHostWork() || !this.#hasWakeConfig()) { this.#idleSince = Date.now(); return; }
         try {
           // The watcher proof may yield to delivery or presence changes. Refresh
           // expected participants; dormantIdleActors rechecks current work custody.
@@ -1365,16 +1394,7 @@ export class ResidentHost {
       return;
     }
     const activeActor = this.#hasActiveActor(now);
-    const activeAgent = this.agents
-      .listForUi()
-      .some((agent) => agent.status === "queued" || agent.status === "running");
-    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
-      try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
-      catch { return false; }
-    });
-    const pendingDelivery = this.#publications.size > 0 || this.#flushingDeliveries !== undefined ||
-      (fs.existsSync(this.#deliveryOutboxPath) && fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")));
-    if (activeActor || activeAgent || pendingRequest || pendingDelivery || this.#admissions || this.#publicationFailed) {
+    if (activeActor || this.#hasHostWork()) {
       this.#idleSince = now;
       return;
     }
@@ -1416,7 +1436,7 @@ export class ResidentHost {
       await this.lifecycle.checkpointForRelease();
       await this.#backgroundDeliveries.checkpointForRelease();
       await this.actors.checkpointForRelease();
-      if (this.#closed || this.#admissions || this.#publications.size || this.actors.hasActiveDurableActor() ||
+      if (this.#closed || this.#hasHostWork() || this.actors.hasActiveDurableActor() ||
           !this.actors.meshCaughtUp() || (this.actors.listOwned().some(actor =>
             actor.residency === "durable" && actor.status !== "stopped") && !this.#hasWakeConfig()) ||
           [this.#requestsPath, this.#processingPath].some(directory =>
@@ -2146,13 +2166,15 @@ const runResidentHost = async (
   config: ResidentHostConfig,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  processWorkSessionId = config.sessionId,
 ): Promise<void> => {
   let finishIdle: ((reason: ResidentExitReason) => void) | undefined;
   const idle = new Promise<ResidentExitReason>((resolve) => {
     finishIdle = resolve;
   });
   let reason: ResidentExitReason | undefined;
-  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry, residentHostLaunchContext(config));
+  const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry,
+    residentHostLaunchContext(config), processWorkSessionId);
   // The last act before close releases owner.json (smarty-dev#1882).
   host.beforeRelease = (failure, owned) =>
     reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error", owned);
@@ -2178,11 +2200,12 @@ export const runResidentHostFromConfigPath = async (
   configPath: string,
   signal?: AbortSignal,
   modelRegistry?: PiModelRegistryView,
+  processWorkSessionId?: string,
 ): Promise<void> => {
   let config: ResidentHostConfig | undefined;
   try {
     config = validateResidentHostConfig(readJson<unknown>(configPath), configPath);
-    await runResidentHost(config, signal, modelRegistry);
+    await runResidentHost(config, signal, modelRegistry, processWorkSessionId);
   } catch (error) {
     if (error instanceof ResidentHostAlreadyRunning) return;
     const residencyRoot = config?.residencyRoot ?? path.dirname(configPath);

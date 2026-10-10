@@ -68,7 +68,13 @@ disk. Activation workers already close at settlement; dormancy also drops the
 completed drain and child-inbox runtime references. A new delivery returns the
 actor to `queued`, restores its transcript, and uses its ordinary serial drain.
 Session-resident actors are unchanged. A live Main's event/directive supervisor
-and actors subscribed to still-live participants are expected, not truly idle.
+and actors subscribed to still-live participants are expected, not idle.
+Startup/reload, open tool calls, running tasks and pending host obligations also
+block dormancy. A process-backed call stays busy until its real tool promise
+settles, even if cancellation has already returned to its caller. These holds
+use session IDs, not retired Pi contexts, and survive a same-process reload.
+A new runtime restores non-stopped actors as idle and rechecks eligibility under
+its own work and owner custody; it does not inherit the old host's idle decision.
 
 A host with only dormant/stopped actors, no running task, and no pending
 request, response/publication or delivery-outbox obligation exits after the
@@ -105,9 +111,11 @@ Old route snapshots without the config fence cannot authorize a wake. Explicit
 client starts still use the ordinary resident startup protocol.
 A throwing idle-check `queueMicrotask` enqueue clears its queued flag, allowing
 the next eligibility event to schedule (smarty-dev#7988).
-The proven native watcher belongs to that host lifetime; close retires it (and
-joins any outstanding eligibility proof), so a successor proves its own watcher
-and Windows teardown is not held by a process-global watched-directory handle.
+The proven native watcher belongs to that host lifetime. Close joins its native
+`close` event, any failed/replaced watch handles and outstanding eligibility
+proof before releasing the owner. Concurrent close callers join the same
+teardown. A successor proves its own watcher, and Windows directory removal
+cannot race a still-closing watched-directory handle.
 
 `MeshStore.publish`/`publishBatch` route wake nudges **after** the existing event
 log durability barrier. Topic/address matches, direct control targets, and
@@ -136,7 +144,7 @@ remains pending; the already-committed archive remains the delivery authority.
 This is reported, not represented as a successful wake.
 
 Direct steer/followUp/ask never wakes during preflight. `wake-routes.json` retains
-the host's actually published participant advertisement for dormant admission,
+the host's published participant advertisement for dormant admission,
 bound to the exact registry root, actor ownership token and resident host. This
 is retained routing authority, not a live lease. Directory availability, owner,
 capability, binding and ACK/control-channel checks run before command publication;

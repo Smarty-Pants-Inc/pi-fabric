@@ -5217,7 +5217,9 @@ export class ActorManager {
       // A temporary hole during revocation is not an invitation to resurrect the registry row.
       if (this.#removeCalls.has(record.id) || this.#removals.has(record.id) || this.#finishCalls.has(record.id) || this.#revoked.has(record.id)) continue;
       if (onlyMissing && this.#actors.has(record.id)) continue;
-      const status = record.status === "stopped" ? "stopped" : record.status === "dormant" ? "dormant" : "idle";
+      // A new runtime is awake. Re-evaluate dormancy under its current work/owner
+      // custody instead of carrying a retired host's idle decision through reload.
+      const status = record.status === "stopped" ? "stopped" : "idle";
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
         record.delivery === "followUp" ||

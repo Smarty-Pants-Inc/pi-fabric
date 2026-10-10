@@ -1,5 +1,6 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
 import { snapshotFabricInvocation } from "../fabric-provenance.js";
+import { retainResidentProcessWork } from "../residency/process-work.js";
 import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
 import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../components/effect-policy.js";
@@ -854,6 +855,7 @@ export class ActionRegistry {
     const consumption = new ResultConsumption();
     const deferConsumption = context.deferResultConsumption;
     let endBindingInvocation: (() => Promise<void>) | undefined;
+    const releaseWork = retainResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.());
     try {
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,
@@ -1195,6 +1197,7 @@ export class ActionRegistry {
     } finally {
       invocationActive = false;
       consumption.abandon();
+      releaseWork();
       if (audit) audit.endedAt ??= Date.now();
       void endBindingInvocation?.().catch(() => undefined);
     }

@@ -16,7 +16,8 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     controller = new AbortController();
-    host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry)
+    // The headless Pi session is not the originating Main session in config.json.
+    host = runResidentHostFromConfigPath(configPath, controller.signal, ctx.modelRegistry, ctx.sessionManager.getSessionId())
       .catch(() => undefined)
       .finally(() => {
         // Natural idle completion shuts down the live session. Teardown already

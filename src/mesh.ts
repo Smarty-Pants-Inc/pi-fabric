@@ -1,3 +1,9 @@
+export { openAsyncMeshStateStore } from "./mesh/state-async.js";
+export type { AsyncMeshStateStore, AsyncMeshStateStoreOptions } from "./mesh/state-async.js";
+export { NatsKvStateStore, encodeNatsKvKey, decodeNatsKvKey, natsKvPrefixFilter, natsKvBucketForRoot,
+  isSupportedNatsKvServer, NATS_KV_MIN_SERVER_VERSION, NATS_KV_MAX_VALUE_BYTES, NATS_KV_MAX_KEYS } from "./mesh/state-nats-kv.js";
+export type { NatsKvStateStoreOptions, NatsKvStateChange, NatsKvStateWatch, NatsKvStateWatchOptions } from "./mesh/state-nats-kv.js";
+
 // Lightweight public mesh entry (pi-fabric/mesh) for host scripts that run outside Pi,
 // such as fleet schedulers and maintenance tools. It loads only the mesh store: no
 // extension, UI, or agent runtime.

@@ -338,4 +338,15 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(fs.readFileSync(log, "utf8").length).toBeGreaterThan(archive.length);
     expect(new ActorRegistryStore(path.dirname(path.dirname(path.dirname(log)))).messages(store.records()[0]!)).toEqual(edited);
   });
+
+  it("forgets a removed actor's committed ring at the next save (smarty-dev#8533)", async () => {
+    const { store, id } = setup();
+    const other = "b".repeat(32), ring = messages(3);
+    const row = (actorId: string) => ({ id: actorId, instructions: "i", status: "idle", messages: ring, registryMessageAppend: [] });
+    await store.update(() => ({ actors: [{ ...row(id), registryMessageAppend: ring }, { ...row(other), registryMessageAppend: ring }], value: true }));
+    await store.update(() => ({ actors: [{ ...row(id), status: "running" }, { ...row(other), status: "running" }], value: true }));
+    expect(store.committedRingIds().sort()).toEqual([other, id].sort());
+    await store.update(() => ({ actors: [{ ...row(id), status: "idle" }], value: true }));
+    expect(store.committedRingIds()).toEqual([id]);
+  });
 });

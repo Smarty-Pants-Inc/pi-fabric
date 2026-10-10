@@ -74,7 +74,7 @@ import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } f
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission } from "./terminal-notices.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager } from "./worktree-manager.js";
 import { writeHandoffSession } from "./handoff.js";
@@ -340,7 +340,6 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   finalAnswerResult?: AgentRunResult;
   finalAnswerCompletion?: Promise<void>;
   terminalNoticeSeen?: Set<string>;
-  terminalAdmissions?: Map<string, { delivery: "steer" | "followUp"; sender?: FabricTurnProvenance["sender"] }>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
   processStop?: Promise<void>;
   processStopPending?: boolean;
@@ -2676,12 +2675,6 @@ export class AgentManager {
       }
     }
     fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
-    if (managed.runner === "pi" && !managed.actorId && managed.transport.kind === "process" && (entry.type === "steer" || entry.type === "follow_up")) {
-      const provenance = copyFabricProvenance(entry.provenance);
-      (managed.terminalAdmissions ??= new Map()).set(messageId, {
-        delivery: entry.type === "steer" ? "steer" : "followUp", ...(provenance ? { sender: provenance.sender } : {}),
-      });
-    }
     return {
       queued: true,
       messageId,
@@ -3421,16 +3414,15 @@ export class AgentManager {
         !receipt || notice.finalAnswerReceiptId !== receipt.id || typeof notice.messageId !== "string" ||
         !/^[a-zA-Z0-9_-]{1,200}$/.test(notice.messageId) || !["steer", "followUp"].includes(notice.delivery)) return;
     if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
+    const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
+    if (!admission || admission.delivery !== notice.delivery) return;
     try {
       const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
-      if (control.state === "delivered") return; // Consumed non-final input is not refused.
+      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const admission = managed.terminalAdmissions?.get(notice.messageId) ?? readTerminalAdmission(managed.runDirectory, notice.messageId);
-    if (!admission || admission.delivery !== notice.delivery) return;
     // Worker event fields cannot select the recipient. Verify supplied attribution
     // against the original trusted admission, then route only that admitted sender.
-    if (notice.sender && (!admission.sender || notice.sender.id !== admission.sender.id || notice.sender.kind !== admission.sender.kind ||
-        notice.sender.verified !== admission.sender.verified || notice.sender.name !== admission.sender.name)) return;
+    if (notice.sender !== undefined && !terminalSenderMatches(notice.sender, admission.sender)) return;
     const attributed: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
       finalAnswerReceiptId: receipt.id, messageId: notice.messageId, delivery: admission.delivery,
       ...(admission.sender ? { sender: admission.sender } : {}) };
@@ -3458,16 +3450,18 @@ export class AgentManager {
       if (!line.trim()) continue;
       const entry = JSON.parse(line) as AgentSteerEntry;
       if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
+      const admission = readTerminalAdmission(managed.runDirectory, entry.id);
+      if (!admission) continue;
       let state: { state?: string } | undefined;
       try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (state?.state === "delivered") continue;
+      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
       // Refused registry entries may already have emitted a worker notice. The
       // original admission id deduplicates both paths, including an unread tail.
       this.#retainTerminalNotice(managed, {
         code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
-        delivery: entry.type === "steer" ? "steer" : "followUp",
-        finalAnswerReceiptId: managed.finalAnswer.id, sender: entry.provenance?.sender,
+        delivery: admission.delivery,
+        finalAnswerReceiptId: managed.finalAnswer.id, ...(admission.sender ? { sender: admission.sender } : {}),
       });
     }
   }

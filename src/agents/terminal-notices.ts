@@ -6,15 +6,50 @@ import type { AgentTerminalNotice } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
+export interface TerminalAdmission {
+  id: string;
+  delivery: "steer" | "followUp";
+  sender?: FabricTurnProvenance["sender"];
+}
+
+/** Malformed provenance is not an anonymous admission. */
+export const terminalAdmissionFromEntry = (value: unknown): TerminalAdmission | undefined => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const entry = value as { id?: unknown; type?: unknown; provenance?: unknown };
+  if (typeof entry.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id) ||
+      (entry.type !== "steer" && entry.type !== "follow_up")) return;
+  const provenance = copyFabricProvenance(entry.provenance);
+  if (entry.provenance !== undefined && !provenance) return;
+  return { id: entry.id, delivery: entry.type === "steer" ? "steer" : "followUp",
+    ...(provenance ? { sender: provenance.sender } : {}) };
+};
+
+/** Compare copied identities, including normalized remote kind and optional name. */
+export const terminalSenderMatches = (value: unknown, sender: TerminalAdmission["sender"]): boolean => {
+  if (value === undefined) return sender === undefined;
+  const copied = copyFabricProvenance({ v: 1, channel: "fabric", via: "steer", sender: value })?.sender;
+  return !!copied && !!sender && copied.id === sender.id && copied.kind === sender.kind &&
+    copied.verified === sender.verified && copied.name === sender.name;
+};
+
+/** A worker row proves consumption only for this exact original admission. */
+export const terminalControlMatchesAdmission = (value: unknown, admission: TerminalAdmission | undefined): boolean => {
+  if (!admission || !value || typeof value !== "object" || Array.isArray(value)) return false;
+  const control = value as { id?: unknown; delivery?: unknown; provenance?: unknown };
+  if (control.id !== admission.id || control.delivery !== admission.delivery) return false;
+  const provenance = copyFabricProvenance(control.provenance);
+  if (control.provenance !== undefined && !provenance) return false;
+  return terminalSenderMatches(provenance?.sender, admission.sender);
+};
+
 /** Manager-owned native ingress journal, not worker event data or final prose. */
-export const readTerminalAdmission = (directory: string, id: string): { delivery: "steer" | "followUp"; sender?: FabricTurnProvenance["sender"] } | undefined => {
+export const readTerminalAdmission = (directory: string, id: string): TerminalAdmission | undefined => {
   try {
     for (const line of fs.readFileSync(path.join(directory, "steer.jsonl"), "utf8").split("\n")) {
       if (!line.trim()) continue;
       const entry = JSON.parse(line);
-      if (entry.id !== id || (entry.type !== "steer" && entry.type !== "follow_up")) continue;
-      const provenance = copyFabricProvenance(entry.provenance);
-      return { delivery: entry.type === "steer" ? "steer" : "followUp", ...(provenance ? { sender: provenance.sender } : {}) };
+      if (entry?.id !== id || (entry.type !== "steer" && entry.type !== "follow_up")) continue;
+      return terminalAdmissionFromEntry(entry);
     }
   } catch { /* Missing/malformed admission never grants a notification recipient. */ }
   return undefined;
@@ -51,12 +86,12 @@ export class TerminalNoticeOutbox {
         if (!line.trim()) continue;
         const entry = JSON.parse(line);
         if ((entry.type !== "steer" && entry.type !== "follow_up") || typeof entry.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
+        const admission = readTerminalAdmission(directory, entry.id);
+        if (!admission) continue;
         let state: { state?: string } | undefined;
         try { state = JSON.parse(fs.readFileSync(path.join(directory, "terminal-controls", `${entry.id}.json`), "utf8")); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-        if (state?.state === "delivered") continue;
-        const admission = readTerminalAdmission(directory, entry.id);
-        if (!admission) continue;
+        if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
         this.retain(directory, { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId,
           finalAnswerReceiptId: receipt.id, messageId: entry.id, delivery: admission.delivery,
           ...(admission.sender ? { sender: admission.sender } : {}) });
@@ -86,8 +121,7 @@ export class TerminalNoticeOutbox {
       const admission = readTerminalAdmission(directory, notice.messageId);
       if (notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
           entry !== `${notice.messageId}.json` || admission?.delivery !== notice.delivery || !admission.sender ||
-          admission.sender.id !== notice.sender?.id || admission.sender.kind !== notice.sender.kind ||
-          admission.sender.verified !== notice.sender.verified || admission.sender.name !== notice.sender.name) continue;
+          !terminalSenderMatches(notice.sender, admission.sender)) continue;
       if (fs.existsSync(`${file}.delivered`)) {
         try {
           const acknowledged = JSON.parse(fs.readFileSync(`${file}.delivered`, "utf8"));

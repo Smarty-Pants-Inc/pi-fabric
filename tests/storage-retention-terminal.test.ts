@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TerminalNoticeOutbox } from "../src/agents/terminal-notices.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission } from "../src/agents/terminal-notices.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { canRemoveTerminalRun } from "../src/storage/retention.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
@@ -56,10 +56,97 @@ describe("terminal-answer retention custody", () => {
     expect(delivered).toHaveLength(1);
     expect(canRemoveTerminalRun(f.run)).toBe(true);
   });
-  it("does not require refusal for controls already consumed by non-final context", () => {
+  it.each(["delivery", "sender", "id", "kind", "name", "verified", "missing-provenance"])("reconstructs original-sender debt for mismatched delivered %s and collects only after its refusal ACK", async mismatch => {
+    const f = fixture();
+    const sender = f.control.provenance.sender;
+    const control = { ...f.control, state: "delivered",
+      ...(mismatch === "delivery" ? { delivery: "followUp" } : {}),
+      ...(mismatch === "id" ? { id: "other-control" } : {}),
+      provenance: mismatch === "missing-provenance" ? undefined : { ...f.control.provenance, sender: {
+        ...sender,
+        ...(mismatch === "sender" ? { id: "session:senderB" } : {}),
+        ...(mismatch === "kind" ? { kind: "agent" } : {}),
+        ...(mismatch === "name" ? { name: "different name" } : {}),
+        ...(mismatch === "verified" ? { verified: "bridge" } : {}),
+      } },
+    };
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), control);
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    const pending = path.join(f.run, "terminal-notices", `${f.id}.json`);
+    new TerminalNoticeOutbox().recover(f.run); // Unavailable route retains the original debt.
+    expect(JSON.parse(fs.readFileSync(pending, "utf8"))).toEqual(f.notice);
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    const delivered: unknown[] = [];
+    const successor = new TerminalNoticeOutbox(notice => { delivered.push(notice); });
+    successor.recover(f.run);
+    await vi.waitFor(() => expect(fs.existsSync(`${pending}.delivered`)).toBe(true));
+    expect(delivered).toEqual([f.notice]);
+    successor.recover(f.run);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(delivered).toHaveLength(1);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+  });
+  it.each(["delivery", "sender", "kind", "name", "verified"])("does not discharge a mismatched row with an incorrectly attributed refusal %s", mismatch => {
+    const f = fixture();
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), { ...f.control, state: "delivered", delivery: "followUp" });
+    writeJsonAtomic(path.join(f.run, "terminal-notices", `${f.id}.json.delivered`), {
+      ...f.notice, ...(mismatch === "delivery" ? { delivery: "followUp" } : {}), sender: {
+        ...f.notice.sender,
+        ...(mismatch === "sender" ? { id: "session:senderB" } : {}),
+        ...(mismatch === "kind" ? { kind: "agent" } : {}),
+        ...(mismatch === "name" ? { name: "different name" } : {}),
+        ...(mismatch === "verified" ? { verified: "bridge" } : {}),
+      },
+    });
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+  });
+  it("requires the original admission even when no final answer was recorded", () => {
+    const f = fixture();
+    fs.rmSync(path.join(f.run, "final-answer.json"));
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), { ...f.control, state: "delivered" });
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), { ...f.control, state: "delivered", delivery: "followUp" });
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    fs.rmSync(path.join(f.run, "steer.jsonl"));
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+  });
+  it("fails closed for unknown rows and does not normalize malformed provenance into anonymous consumption", () => {
+    const f = fixture();
+    const admission = readTerminalAdmission(f.run, f.id)!;
+    for (const value of [undefined, null, 1, "delivered", [], {}, { ...f.control, provenance: null },
+      { ...f.control, provenance: { ...f.control.provenance, sender: { id: "broken" } } }]) {
+      expect(terminalControlMatchesAdmission(value, admission)).toBe(false);
+    }
+    fs.writeFileSync(path.join(f.run, "steer.jsonl"), JSON.stringify({ id: f.id, type: "steer" }) + "\n");
+    const anonymous = readTerminalAdmission(f.run, f.id)!;
+    expect(terminalControlMatchesAdmission({ id: f.id, delivery: "steer" }, anonymous)).toBe(true);
+    expect(terminalControlMatchesAdmission({ id: f.id, delivery: "steer", provenance: null }, anonymous)).toBe(false);
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), { id: f.id, delivery: "steer", state: "delivered", provenance: null });
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+    fs.writeFileSync(path.join(f.run, "steer.jsonl"), JSON.stringify({ id: f.id, type: "steer", provenance: null }) + "\n");
+    expect(readTerminalAdmission(f.run, f.id)).toBeUndefined();
+    expect(canRemoveTerminalRun(f.run)).toBe(false);
+  });
+  it("compares copied sender identity rather than foreign envelope fields", () => {
+    const f = fixture();
+    const provenance = { ...f.control.provenance, sender: { ...f.control.provenance.sender, kind: "main", verified: "bridge", name: 42 } };
+    fs.writeFileSync(path.join(f.run, "steer.jsonl"), JSON.stringify({ id: f.id, type: "steer", provenance }) + "\n");
+    const control = { ...f.control, state: "delivered", provenance: { ...provenance, sender: {
+      ...provenance.sender, kind: "remote", name: undefined, extra: "not identity",
+    } } };
+    writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), control);
+    expect(terminalControlMatchesAdmission(control, readTerminalAdmission(f.run, f.id))).toBe(true);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+  });
+  it("does not require refusal for controls already consumed by non-final context", async () => {
     const f = fixture();
     writeJsonAtomic(path.join(f.run, "terminal-controls", `${f.id}.json`), { ...f.control, state: "delivered" });
     fs.mkdirSync(path.join(f.run, "terminal-notices"));
+    const delivered: unknown[] = [];
+    new TerminalNoticeOutbox(notice => { delivered.push(notice); }).recover(f.run);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(delivered).toEqual([]);
+    expect(fs.readdirSync(path.join(f.run, "terminal-notices"))).toEqual([]);
     expect(canRemoveTerminalRun(f.run)).toBe(true);
   });
   it.each(["mismatched-answer", "mismatched-notice", "unknown-control", "pending-notice", "invalid-answer", "live-worker"])("fails closed for %s", bad => {

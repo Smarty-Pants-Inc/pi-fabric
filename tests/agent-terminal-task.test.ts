@@ -130,11 +130,13 @@ describe("ordinary process-task final answer boundary", () => {
     const consumed = manager.steer(handle.id, "consumed before final", undefined, provenance("sender-consumed"));
     const queued = manager.steer(handle.id, "queued", undefined, provenance("sender-local"));
     const unread = manager.followUp(handle.id, "unread", undefined, { ...provenance("sender-remote"), sender: { id: "sender-remote", kind: "remote", verified: "bridge" } }, { deadlineMs: 60_000 });
-    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${consumed.messageId}.json`), { id: consumed.messageId, delivery: "steer", state: "delivered" });
+    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${consumed.messageId}.json`), { id: consumed.messageId, delivery: "steer", state: "delivered", provenance: provenance("sender-consumed") });
     const receipt = finish(handle.id, "done");
-    fs.appendFileSync(path.join(root, handle.id, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
-      code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId: queued.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender: provenance("sender-local").sender,
-    } }) + "\n");
+    for (const [messageId, sender] of [[queued.messageId, provenance("sender-local").sender], [consumed.messageId, provenance("sender-consumed").sender]] as const) {
+      fs.appendFileSync(path.join(root, handle.id, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
+        code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender,
+      } }) + "\n");
+    }
     await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
     await waitUntil(() => notices.length === 2);
     expect(notices.map(notice => notice.sender?.id).sort()).toEqual(["sender-local", "sender-remote"]);
@@ -142,6 +144,63 @@ describe("ordinary process-task final answer boundary", () => {
     expect(notices.map(notice => notice.messageId).sort()).toEqual([queued.messageId, unread.messageId].sort());
     expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: unread.messageId, state: "cancelled" }));
     expect(canRemoveTerminalRun(path.join(root, handle.id))).toBe(true);
+  });
+
+  it.each([
+    ["delivery", "lifecycle"], ["sender", "lifecycle"], ["id", "lifecycle"],
+    ["delivery", "unread"], ["sender", "unread"], ["id", "unread"],
+  ])("refuses a mismatched delivered %s row through %s exactly once to the original sender", async (mismatch, source) => {
+    const notices: AgentTerminalNotice[] = [];
+    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const sender = { id: "session:senderA", name: "Sender A", kind: "main" as const, verified: "mesh" as const };
+    const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
+    const queued = manager.steer(handle.id, "original admission", undefined, provenance);
+    const directory = path.join(root, handle.id);
+    writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
+      id: mismatch === "id" ? "other-control" : queued.messageId,
+      delivery: mismatch === "delivery" ? "followUp" : "steer", state: "delivered",
+      provenance: mismatch === "sender" ? { ...provenance, sender: { ...sender, id: "session:senderB" } } : provenance,
+    });
+    const receipt = finish(handle.id, "done");
+    expect(canRemoveTerminalRun(directory)).toBe(false);
+    if (source === "lifecycle") {
+      fs.appendFileSync(path.join(directory, "lifecycle.jsonl"), JSON.stringify({ version: 1, event: "message.refused", occurredAt: Date.now(), data: {
+        code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, messageId: queued.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender,
+      } }) + "\n");
+      // Prove the lifecycle skip site independently, before the unread exit scan.
+      await waitUntil(() => notices.length === 1);
+      expect(manager.hasRunCustody(handle.id)).toBe(true);
+    }
+    await manager.wait(handle.id, { timeoutMs: 1000 });
+    close(handle.id);
+    const delivered = path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`);
+    await waitUntil(() => fs.existsSync(delivered));
+    manager.status(handle.id);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
+      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "steer", sender }]);
+    expect(canRemoveTerminalRun(directory)).toBe(true);
+  });
+
+  it("preserves the original followUp kind when the delivered row wrongly names steer", async () => {
+    const notices: AgentTerminalNotice[] = [];
+    const { manager, root, close, finish } = harness(notice => { notices.push(notice); });
+    const handle = await manager.spawn({ task: "ordinary", transport: "process" });
+    const sender = { id: "session:followUp-sender", kind: "main" as const, verified: "mesh" as const };
+    const provenance = { v: 1 as const, channel: "fabric" as const, via: "followUp" as const, sender };
+    const queued = manager.followUp(handle.id, "original followUp", undefined, provenance, { deadlineMs: 60_000 });
+    const directory = path.join(root, handle.id);
+    writeJsonAtomic(path.join(directory, "terminal-controls", `${queued.messageId}.json`), {
+      id: queued.messageId, delivery: "steer", state: "delivered", provenance,
+    });
+    const receipt = finish(handle.id, "done");
+    await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    await waitUntil(() => fs.existsSync(path.join(directory, "terminal-notices", `${queued.messageId}.json.delivered`)));
+    expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
+      finalAnswerReceiptId: receipt.id, messageId: queued.messageId, delivery: "followUp", sender }]);
+    expect(manager.status(handle.id).followUpDeliveries).toContainEqual(expect.objectContaining({ messageId: queued.messageId, state: "cancelled" }));
+    expect(canRemoveTerminalRun(directory)).toBe(true);
   });
 
   it("cannot use a forged worker refusal to notify a different sender", async () => {
@@ -172,6 +231,10 @@ describe("ordinary process-task final answer boundary", () => {
     const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const,
       sender: { id: "session:sender", kind: "main" as const, verified: "mesh" as const } };
     const queued = manager.steer(handle.id, "queued", undefined, provenance);
+    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${queued.messageId}.json`), {
+      id: queued.messageId, delivery: "followUp", state: "delivered",
+      provenance: { ...provenance, sender: { ...provenance.sender, id: "session:wrong-sender" } },
+    });
     finish(handle.id, "done");
     await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);

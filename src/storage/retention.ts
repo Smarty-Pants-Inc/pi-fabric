@@ -7,6 +7,7 @@ import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -254,6 +255,21 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   const answerFile = path.join(root, "final-answer.json");
   const controls = path.join(root, "terminal-controls"), notices = path.join(root, "terminal-notices");
+  // Read original native admissions before trusting any worker consumption row.
+  const admissions = new Map<string, TerminalAdmission>();
+  const steering = path.join(root, "steer.jsonl");
+  if (fs.existsSync(steering)) {
+    if (!ownedStat(steering)?.isFile()) return false;
+    for (const line of fs.readFileSync(steering, "utf8").split("\n")) {
+      if (expired()) return false;
+      if (!line.trim()) continue;
+      const entry = JSON.parse(line);
+      if (entry?.type !== "steer" && entry?.type !== "follow_up") continue;
+      const admission = terminalAdmissionFromEntry(entry);
+      if (!admission || admissions.has(admission.id)) return false;
+      admissions.set(admission.id, admission);
+    }
+  }
   if (!fs.existsSync(answerFile)) {
     if (fs.existsSync(notices) && (!ownedStat(notices)?.isDirectory() || fs.readdirSync(notices).length > 0)) return false;
     if (!fs.existsSync(controls)) return true;
@@ -263,9 +279,9 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     return fs.readdirSync(controls).every(name => {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
       const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
-      return !!control && name === `${control.id}.json` && control.state === "delivered" && ["steer", "followUp"].includes(control.delivery ?? "") &&
+      return !!control && control.state === "delivered" &&
         Object.keys(control).every(key => ["id", "state", "delivery", "provenance"].includes(key)) &&
-        (control.provenance === undefined || !!copyFabricProvenance(control.provenance));
+        terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
     });
   }
   if (!ownedStat(answerFile)?.isFile()) return false;
@@ -273,7 +289,7 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   if (!answer || expired() || record?.id !== answer.runId || record.finalAnswerReceipt?.id !== answer.id ||
       record.finalAnswerReceipt.recordedAt !== answer.recordedAt || record.actorId) return false;
-  const routed = new Map<string, { delivery: string; senderId?: string }>();
+  const routed = new Set<string>();
   if (fs.existsSync(notices)) {
     if (!ownedStat(notices)?.isDirectory()) return false;
     for (const name of fs.readdirSync(notices)) {
@@ -284,11 +300,13 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
           notice.finalAnswerReceiptId !== answer.id || deliveredName !== `${notice.messageId}.json.delivered` ||
           !["steer", "followUp"].includes(notice.delivery ?? "") || !notice.sender?.id ||
           !["mesh", "bridge"].includes(notice.sender.verified ?? "") || !["main", "actor", "agent", "remote"].includes(notice.sender.kind ?? "")) return false;
+      const admission = admissions.get(notice.messageId!);
+      if (!admission || notice.delivery !== admission.delivery || !terminalSenderMatches(notice.sender, admission.sender)) return false;
       if (!name.endsWith(".delivered")) {
         const pending = readJson<unknown>(path.join(notices, name));
         if (JSON.stringify(pending) !== JSON.stringify(notice)) return false;
       }
-      routed.set(notice.messageId!, { delivery: notice.delivery!, senderId: notice.sender.id });
+      routed.add(notice.messageId!);
     }
   }
   const consumed = new Set<string>();
@@ -297,28 +315,17 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     for (const name of fs.readdirSync(controls)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
       const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
-      if (!control || name !== `${control.id}.json` || !["steer", "followUp"].includes(control.delivery ?? "") ||
+      const id = name.slice(0, -5), admission = admissions.get(id);
+      if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
+          !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
           Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
           control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
-      if (control.state === "delivered") consumed.add(control.id!);
-      else if (!["queued", "refused"].includes(control.state ?? "") || routed.get(control.id!)?.delivery !== control.delivery) return false;
+      if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
+      else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
     }
   }
-  const steering = path.join(root, "steer.jsonl");
-  if (fs.existsSync(steering)) {
-    if (!ownedStat(steering)?.isFile()) return false;
-    for (const line of fs.readFileSync(steering, "utf8").split("\n")) {
-      if (expired()) return false;
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line) as { type?: string; id?: string; provenance?: unknown };
-      if (entry.type !== "steer" && entry.type !== "follow_up") continue;
-      if (!entry.id) return false;
-      if (consumed.has(entry.id)) continue;
-      const notice = routed.get(entry.id);
-      const provenance = copyFabricProvenance(entry.provenance);
-      if (!notice || notice.delivery !== (entry.type === "steer" ? "steer" : "followUp") ||
-          !provenance || notice.senderId !== provenance.sender.id) return false;
-    }
+  for (const id of admissions.keys()) {
+    if (expired() || !consumed.has(id) && !routed.has(id)) return false;
   }
   return true;
 };

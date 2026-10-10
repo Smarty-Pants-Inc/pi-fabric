@@ -64,6 +64,9 @@ const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
+// ponytail: bounded; it covers a few publish holds at today's ~250 ms (smarty-dev#8305); still far
+// under LOCK_TIMEOUT_MS 10 s. At 250 ms one hold ahead of the refresh failed the send (smarty-dev#6477).
+export const ROUTING_REFRESH_LOCK_BUDGET_MS = 2_000;
 /**
  * Addressable across a live reload, but a failed reload stops accepting after this lease.
  * quiesce("reload") writes it once, at the start of teardown; nothing renews it until the new
@@ -1396,7 +1399,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.list({ scope: "project", includeStale: true, fresh: true });
         this.#routingReadAt = Date.now();
         this.#routingError = undefined;
-      }, 250);
+      }, ROUTING_REFRESH_LOCK_BUDGET_MS);
     } catch (error) {
       this.#routingError = error;
       throw error;

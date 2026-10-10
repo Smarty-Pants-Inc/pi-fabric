@@ -10,7 +10,7 @@ const SUMMARY_CHARS = 4_000;
 const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
 
-type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
+type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "partialText" | "warnings" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
 type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
 type CompletionMessage = { customType: string; content: string; display: boolean; details: { ids: string[] } };
 
@@ -109,6 +109,8 @@ export class AgentCompletionInbox {
         id: result.id, name: result.name, status: result.status, startedAt: result.startedAt,
         ...(result.finishedAt !== undefined ? { finishedAt: result.finishedAt } : {}),
         text: clip(result.text, SUMMARY_CHARS),
+        ...(result.partialText !== undefined ? { partialText: clip(result.partialText, SUMMARY_CHARS) } : {}),
+        ...(result.warnings?.length ? { warnings: result.warnings.slice(-20).map(warning => clip(warning, SUMMARY_CHARS)) } : {}),
         ...(result.completionDelivery ? { completionDelivery: result.completionDelivery } : {}),
         ...(result.error !== undefined ? { error: clip(result.error, SUMMARY_CHARS) } : {}),
       },
@@ -258,7 +260,9 @@ export class AgentCompletionInbox {
           "Unread background agent results (batched). Incorporate relevant results into the current task. These are run outcomes, not new user requests. Do not restart completed work or reply merely to acknowledge stale/superseded results. A completed run does not necessarily mean its assignment is complete.",
           ...group.map(({ result }) => {
             const seconds = Math.round(Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt) / 1_000);
-            const summary = [result.error, result.text].filter(Boolean).join("\n");
+            const output = result.status !== "completed" && result.partialText !== undefined
+              ? `Partial output (not a completed report):\n${result.partialText}` : result.text;
+            const summary = [result.error, ...(result.warnings ?? []).map(warning => `[pi-fabric warning] ${warning}`), output].filter(Boolean).join("\n");
             const redelivery = result.completionDelivery?.redeliveredFrom;
             const provenance = redelivery ? ` [re-delivered from dead Main session ${oneLine(redelivery)}]` : "";
             return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s${provenance}:\n${clip(summary || "no result", perResult)}`;

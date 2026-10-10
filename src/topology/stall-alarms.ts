@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -30,7 +31,7 @@ const names = (directory: string): string[] => {
 };
 interface InboxOwner {
   rootId: string; sessionId: string; sessionFile?: string | undefined;
-  ownerIdentityId: string; pid: number; processStartedAt?: string | undefined; retired?: true; activationId?: string;
+  ownerIdentityId: string; pid: number; host?: string; name?: string; processStartedAt?: string | undefined; retired?: true; activationId?: string;
 }
 interface InboxRoute { oldRoot: string; newRoot?: string; messageId: string; item?: HeldAgentMessage; done?: true }
 interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
@@ -41,7 +42,7 @@ interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
 export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string): string => {
   const activationId = randomUUID();
   writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId,
-    ownerIdentityId: identity.id, pid: process.pid, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
+    ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
   return activationId;
 };

@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshEvent } from "../mesh/store.js";
-import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance } from "../fabric-provenance.js";
+import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, fabricWakeMessage } from "../fabric-provenance.js";
 import { rootInboxMessage } from "./root-inbox.js";
 
 /** Retained/mixed-version events need positive, recorded admission evidence. */
@@ -13,6 +13,13 @@ export const deliverRootInbox = (
   options: Parameters<ExtensionAPI["sendMessage"]>[1] = { deliverAs: "followUp", triggerTurn: true },
 ): void => {
   if (!events.length) return;
+  const seen = new Set<string>();
+  events = events.filter(event => {
+    const key = JSON.stringify([event.from.kind, event.from.id, event.topic, event.id]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   let start = 0;
   while (start < events.length) {
     const first = events[start]!;
@@ -23,7 +30,13 @@ export const deliverRootInbox = (
       end = start + 1;
       while (end < events.length && JSON.stringify(eventProvenance(events[end]!)) === key) end++;
     }
-    pi.sendMessage(rootInboxMessage(events.slice(start, end)), provenance ? fabricProvenanceOptions(pi, options, provenance) : options);
+    const batch = events.slice(start, end);
+    const message = rootInboxMessage(batch);
+    const wakeCauses = batch.map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
+    // One native message can admit several sources. Keep the whole FIFO cause
+    // list, including on legacy hosts that batch events from different senders.
+    pi.sendMessage(fabricWakeMessage(pi, message, options, wakeCauses),
+      provenance ? fabricProvenanceOptions(pi, options, provenance) : options);
     start = end;
   }
 };

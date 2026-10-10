@@ -197,9 +197,9 @@ describe.each([
   });
 
   it("proxy notices join the first inference and are not repeated", async () => {
-    const h = await indexFixture(capability); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
+    const h = await indexFixture(capability); h.fake.getActiveTools.mockReturnValue(["fabric_exec", "probe_tool"]); // Pi still offers it (smarty-dev#5492)
     vi.spyOn(FabricState.prototype, "cwd", "get").mockReturnValue(process.cwd());
-    vi.spyOn(CapturedToolCatalog.prototype, "list").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
+    vi.spyOn(CapturedToolCatalog.prototype, "listRegistered").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
     const event = { prompt: '<skill name="probe">Use probe_tool</skill>', systemPrompt: "Base", systemPromptOptions: { skills: [] } };
     const first = await h.prompt(event);
     expect(first.map(entry => entry.customType)).toEqual(["pi-fabric-proxy"]);
@@ -293,9 +293,9 @@ describe("round-3 provenance at the capable Pi API boundary", () => {
   });
 
   it("participant-free proxy turn-start notice stays passive and unclaimed", async () => {
-    const h = await indexFixture(); h.fake.getActiveTools.mockReturnValue(["fabric_exec"]);
+    const h = await indexFixture(); h.fake.getActiveTools.mockReturnValue(["fabric_exec", "probe_tool"]); // Pi still offers it (smarty-dev#5492)
     vi.spyOn(FabricState.prototype, "cwd", "get").mockReturnValue(process.cwd());
-    vi.spyOn(CapturedToolCatalog.prototype, "list").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
+    vi.spyOn(CapturedToolCatalog.prototype, "listRegistered").mockReturnValue([{ name: "probe_tool", description: "Probe" } as any]);
     const returned = await h.emit("before_agent_start", { prompt: '<skill name="probe">Use probe_tool</skill>',
       systemPrompt: "Base", systemPromptOptions: { skills: [] } });
     expect(returned.filter(value => value && typeof value === "object" && "message" in value)).toEqual([]);

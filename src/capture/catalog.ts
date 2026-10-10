@@ -14,8 +14,18 @@ export interface CapturedToolEntry {
   risk: FabricRisk;
 }
 
+/** Whether Pi currently offers a registered tool (smarty-dev#5492). */
+export type CapturedToolVisibility = (name: string) => boolean;
+
 export class CapturedToolCatalog {
   readonly #tools = new Map<string, CapturedToolEntry>();
+  // Pi decides which registered tools it offers: an extension hides a tool by
+  // dropping it from the active set (pi.setActiveTools). The source returns a
+  // per-read snapshot predicate; undefined (or a throwing host that is not yet
+  // initialized) means "no host filter". Fabric must not list, describe, prompt
+  // for or invoke a tool its owning extension hid (smarty-dev#5492).
+  #hostVisibility: (() => CapturedToolVisibility | undefined) | undefined;
+  #visibleSignature: string | undefined;
   readonly #listeners = new Set<() => void>();
   // The ExtensionRunner observed during the last tool refresh. Stored even
   // when capture is disabled so PiToolsProvider can replay the tool-execution
@@ -106,22 +116,67 @@ export class CapturedToolCatalog {
     return () => this.#listeners.delete(listener);
   }
 
+  setHostVisibility(source: (() => CapturedToolVisibility | undefined) | undefined): void {
+    this.#hostVisibility = source;
+    this.#visibleSignature = undefined;
+  }
+
+  // Re-read the host's offered set and notify observers (tools.catalog,
+  // provider bindings) when the visible catalog changed without a registry
+  // refresh, e.g. an extension toggled a tool off. Returns whether it emitted.
+  revalidateHostVisibility(): boolean {
+    const signature = this.list().map((entry) => entry.name).join("\n");
+    const previous = this.#visibleSignature;
+    this.#visibleSignature = signature;
+    if (previous === undefined || previous === signature) return false;
+    this.#emit();
+    return true;
+  }
+
+  // Visible to the model only when Pi still offers it (see #hostVisibility).
   get(name: string): CapturedToolEntry | undefined {
-    return this.#tools.get(name);
+    const tool = this.#tools.get(name);
+    if (!tool) return undefined;
+    const visible = this.#visibility();
+    return !visible || visible(name) ? tool : undefined;
   }
 
   require(name: string): CapturedToolEntry {
     const tool = this.#tools.get(name);
     if (!tool) throw new Error(`Unknown captured extension tool: ${name}`);
+    const visible = this.#visibility();
+    if (visible && !visible(name)) {
+      throw new Error(`Extension tool ${name} is hidden by its extension (not in Pi's active tool set)`);
+    }
     return tool;
   }
 
   list(): CapturedToolEntry[] {
+    const visible = this.#visibility();
+    return this.listRegistered().filter((entry) => !visible || visible(entry.name));
+  }
+
+  // Every captured registration, including tools the host currently hides.
+  // For Fabric's own bookkeeping (active-set ownership, repair digest, UI
+  // rendering of past calls), never for model-facing listings or prompts.
+  listRegistered(): CapturedToolEntry[] {
     return [...this.#tools.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
 
+  getRegistered(name: string): CapturedToolEntry | undefined {
+    return this.#tools.get(name);
+  }
+
   get size(): number {
-    return this.#tools.size;
+    return this.list().length;
+  }
+
+  #visibility(): CapturedToolVisibility | undefined {
+    try {
+      return this.#hostVisibility?.();
+    } catch {
+      return undefined;
+    }
   }
 
   #emit(): void {

@@ -117,7 +117,8 @@ export class ActorDirectory extends ActorManager {
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);
-    return { ops: [...first.ops, ...second.ops], committed: () => { first.committed(); second.committed(); } };
+    return { ops: [...first.ops, ...second.ops], actorIds: [...first.actorIds, ...second.actorIds],
+      committed: () => { first.committed(); second.committed(); } };
   }
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
   override reclaim(...args: Parameters<ActorManager["reclaim"]>): ReturnType<ActorManager["reclaim"]> { return this.#isPrimary(args[0]) ? super.reclaim(...args) : this.#secondary.reclaim(...args); }

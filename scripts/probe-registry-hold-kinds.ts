@@ -161,6 +161,7 @@ try {
   const children = Array.from({ length: savers }, (_, index) => new Promise<{ holds: Hold[]; errors: number }>((resolve, reject) => {
     const child = spawn(process.execPath, [import.meta.filename ?? process.argv[1]!, "--role=saver", `--root=${config.actorRoot}`,
       `--index=${index}`, `--savers=${savers}`, `--until=${until}`], { stdio: ["ignore", "pipe", "inherit"] });
+    burners.push(child); // every child is stopped and joined in finally, even when another saver fails
     let out = "";
     child.stdout.on("data", chunk => { out += chunk; });
     child.on("close", code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`saver ${index} exited ${code}`)));
@@ -188,7 +189,12 @@ try {
     saverErrors: others.reduce((total, other) => total + other.errors, 0),
     all: summary(all), byKind: Object.fromEntries(kinds.map(kind => [kind, summary(all.filter(hold => hold.kind === kind))])) };
 } finally {
-  for (const burner of burners) burner.kill();
+  // Stop every child process and wait for it to exit before the fixture directory goes.
+  await Promise.all(burners.map(child => new Promise<void>(resolve => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", () => resolve());
+    child.kill();
+  })));
   await host.close();
   fs.rmSync(base, { recursive: true, force: true });
 }

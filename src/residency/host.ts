@@ -301,17 +301,31 @@ export class ResidentHost {
     // Independent liveness may only renew existing keys with matching lineage tokens;
     // it never claims, creates, removes, or certifies a shared heartbeat.
     const registries = Object.values(residentActorRoots(config)).map((root) => new ActorRegistryStore(root));
-    const publishFenced = <T>(publish: () => Promise<T>): Promise<T> =>
-      ActorRegistryStore.withLocks(registries, () => this.mesh.withTryLock(publish, 50));
+    // smarty-dev#8526: lock only the registries holding the rows of the actors this round writes.
+    // The project registry is ONE lock shared by every resident host of the project; a round that
+    // publishes none of its rows no longer serializes behind (or blocks) other hosts on it.
+    // Any id held by no registry, or a round without an exact actor set, locks every registry.
+    // validPublication still checks every registry's generation under the fence.
+    const publishFenced = <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>): Promise<T> => {
+      let scoped: ActorRegistryStore[] | undefined;
+      if (actorIds && actorIds.size > 0) {
+        const holders = [...actorIds].map(id => knownRegistries.find(known => current(known).byId.has(id))?.store);
+        if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
+      }
+      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50));
+    };
     const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
+    const current = (known: typeof knownRegistries[number]): typeof knownRegistries[number] => {
+      const snapshot = known.store.snapshot(); // cached last-known view unless the atomic generation moved
+      if (snapshot !== known.snapshot) {
+        known.snapshot = snapshot;
+        known.byId = new Map(snapshot.actors.map(row => [row.id, row]));
+      }
+      return known;
+    };
     const actorRenewalAllowed = (record: import("../topology/types.js").FabricParticipantRecord): boolean => {
       for (const known of knownRegistries) {
-        const snapshot = known.store.snapshot(); // cached last-known view unless the atomic generation moved
-        if (snapshot !== known.snapshot) {
-          known.snapshot = snapshot;
-          known.byId = new Map(snapshot.actors.map(row => [row.id, row]));
-        }
-        const row = known.byId.get(record.id);
+        const row = current(known).byId.get(record.id);
         if (row) return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
           record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
       }

@@ -522,12 +522,12 @@ export interface ParticipantDirectoryOptions {
   listReadCacheMs?: number;
   /** Registry -> mesh/key order for shared publication. Accepted actor file copies
    * may follow outside custody with exact token validation under their key lock. */
-  withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
+  withPublicationFence?: <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>) => Promise<T>;
   /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
    * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
   waitForPublicationRetry?: () => Promise<void>;
   /** Extra presence writes share this host's one fenced heartbeat acquisition. */
-  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void };
+  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void; actorIds?: readonly string[] };
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -2074,8 +2074,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return committedAt;
     };
+    // smarty-dev#8526: the actors this round can write, so the fence locks only their registries.
+    // undefined (every registry, as before) when the round also writes a root/legacy record,
+    // removes an own record, or carries a batch op not attributed to an actor id.
+    const fencedActors = ((): ReadonlySet<string> | undefined => {
+      const ids = new Set(publication?.actorIds ?? []);
+      if (publication && publication.ops.length > 0 && publication.actorIds === undefined) return undefined;
+      // Prepared ops are the batch, the statePuts and (only) a legacy session delete.
+      if (ops.length > (publication?.ops.length ?? 0) + statePuts.size || legacyChanged || legacyPut !== undefined) return undefined;
+      if (existing.some(({ participant }) => !desired.has(participant.id)) ||
+        fileEntries.some(entry => { const own = ownParticipant(entry); return own !== undefined && !desired.has(own.id); })) return undefined;
+      for (const record of [...statePuts.values(), ...fileWrites, ...activityWrites, ...copies.map(copy => copy.participant)]) {
+        if (record.kind !== "actor") return undefined;
+        ids.add(record.id);
+      }
+      return ids.size > 0 ? ids : undefined;
+    })();
     const committed = validPublication && this.options.withPublicationFence
-      ? await this.options.withPublicationFence(commitPrepared) : await commitPrepared();
+      ? await this.options.withPublicationFence(commitPrepared, fencedActors) : await commitPrepared();
     // The shared receipt already committed. Copies recheck that exact receipt
     // AND current registry lineage while holding the actor key; adoption takes
     // the same key before changing lineage. New/changed actor files therefore

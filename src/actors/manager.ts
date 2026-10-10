@@ -1026,7 +1026,7 @@ export class ActorManager {
 
   /** Prepared synchronously before the host publication fence; its registry
    * generation is validated under custody before these operations can commit. */
-  presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void } {
+  presenceBatch(full: boolean): { ops: MeshBatchOperation[]; committed: () => void; actorIds: string[] } {
     this.#syncActorsFromRegistry();
     return this.#withOwnershipRead(() => {
       const pending = new Map([...this.#pendingPresence].map(id => [id, this.#presenceRevisions.get(id)]));
@@ -1066,7 +1066,7 @@ export class ActorManager {
           written.set(id, undefined);
         }
       }
-      return { ops, committed: () => {
+      return { ops, actorIds: [...written.keys()], committed: () => {
         for (const [id, serialized] of written) {
           if (serialized === undefined) this.#publishedPresence.delete(id);
           else this.#publishedPresence.set(id, serialized);

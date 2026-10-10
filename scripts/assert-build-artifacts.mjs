@@ -40,6 +40,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/per-call-route.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -196,6 +197,9 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (initialSource.includes("src/agents/per-call-route.ts") || initialSource.includes("src/jev/gateway-transport.ts")) {
+  throw new Error("Per-call routing escaped into startup graph");
+}
 if (/src\/judge(?:\/|-cli)/.test(initialSource)) throw new Error("Judge code escaped into startup graph");
 if (manifest.bin?.["fabric-judge"] !== "./bin/fabric-judge" || !existsSync(join(root, "bin/fabric-judge"))) throw new Error("Missing fabric-judge bin");
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));

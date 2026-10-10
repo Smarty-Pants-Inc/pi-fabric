@@ -22,6 +22,7 @@ const setup = () => {
   const recipient: CompletionRecipient = { rootId: "session:main", sessionId: "main", projectRoot: root, cwd: root, name: "main", startedAt: 1 };
   const result = (index: number): AgentRunResult => ({ id: index.toString(16).padStart(32, "0"), name: "child", task: "task", status: "completed", runner: "pi", transport: "process", cwd: root, text: "x".repeat(100_000), startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 1, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } });
   const file = (id: string) => path.join(meshRoot, "agent-completions", `${createHash("sha256").update(id).digest("hex")}.json`);
+  const archive = (id: string) => path.join(path.dirname(file(id)), "archive", path.basename(file(id)));
   const receipt = (id: string) => path.join(path.dirname(file(id)), "receipts", path.basename(file(id)));
   const entries = new Map<string, any>();
   const mesh = { listAll: () => [...entries.values()], get: (key: string) => entries.get(key), put: async (args: any) => { entries.set(args.key, { key: args.key, value: args.value, updatedBy: args.identity, version: 1 }); }, delete: async (args: any) => { entries.delete(args.key); } } as unknown as MeshStore;
@@ -32,7 +33,7 @@ const setup = () => {
     fs.writeFileSync(file(value.id), JSON.stringify({ format: 1, recipient: address, result: value }));
     return value;
   };
-  return { root, meshRoot, recipient, result, file, receipt, journal, seed, mesh, resetClaims: () => entries.clear() };
+  return { root, meshRoot, recipient, result, file, archive, receipt, journal, seed, mesh, resetClaims: () => entries.clear() };
 };
 
 // Test-only async_hooks seam: before/after delimit each uninterrupted synchronous
@@ -225,53 +226,39 @@ describe("completion journal idle scans", () => {
   });
   it.each([false, true])("forget hides the result immediately while claim retirement is held (refused: %s)", async refused => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
-    await journal.drain(false); // Establish an authenticated claim before cleanup.
+    await journal.drain(false);
     const remove = h.mesh.delete.bind(h.mesh);
     let release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const deletion = vi.spyOn(h.mesh, "delete").mockImplementation(async args => {
-      await held;
-      if (refused) throw new Error("CAS refused");
-      return remove(args);
+      await held; if (refused) throw new Error("CAS refused"); return remove(args);
     });
     try {
       journal.forget(result.id);
       expect(journal.result(result.id)).toBeUndefined();
       expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
-      expect(fs.existsSync(h.file(result.id))).toBe(true);
+      expect(fs.existsSync(h.file(result.id))).toBe(false); expect(fs.existsSync(h.archive(result.id))).toBe(true);
       await vi.waitFor(() => expect(deletion).toHaveBeenCalledTimes(1));
       expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
-      expect(fs.existsSync(h.file(result.id))).toBe(true); // Never unlink before CAS.
     } finally { release(); }
-    if (!refused) await vi.waitFor(() => expect(fs.existsSync(h.file(result.id))).toBe(false));
-    else {
-      // Wait for the held retirement to reject, then retry via the normal drain path.
-      await deletion.mock.results[0]!.value.catch(() => undefined);
-      expect(fs.existsSync(h.file(result.id))).toBe(true);
-      expect(journal.result(result.id)).toBeUndefined();
-    }
-    deletion.mockRestore();
-    await journal.drain();
-    expect(fs.existsSync(h.file(result.id))).toBe(false);
-    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    await deletion.mock.results[0]!.value.catch(() => undefined);
+    deletion.mockRestore(); await journal.drain();
+    expect(fs.existsSync(h.archive(result.id))).toBe(true); expect(fs.existsSync(h.receipt(result.id))).toBe(true);
     expect(journal.result(result.id)).toBeUndefined();
+    expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(0);
   });
 
-  it("forget remains logically absent when receipt confirmation fails, retaining durable recovery", async () => {
-    const h = setup(); const result = h.seed(1); const journal = h.journal();
-    await journal.drain(false);
-    const open = vi.spyOn(fs.promises, "open").mockRejectedValueOnce(new Error("confirmation failed"));
-    journal.forget(result.id);
-    expect(journal.result(result.id)).toBeUndefined();
-    await vi.waitFor(() => expect(open).toHaveBeenCalled());
-    await open.mock.results[0]!.value.catch(() => undefined);
-    expect(fs.existsSync(h.file(result.id))).toBe(true);
+  it("forget remains logically absent when claim retirement fails, retaining archived recovery", async () => {
+    const h = setup(); const result = h.seed(1); const journal = h.journal(); await journal.drain(false);
+    const deletion = vi.spyOn(h.mesh, "delete").mockRejectedValueOnce(new Error("CAS failed"));
+    journal.forget(result.id); expect(journal.result(result.id)).toBeUndefined();
+    await vi.waitFor(() => expect(deletion).toHaveBeenCalled());
+    await deletion.mock.results[0]!.value.catch(() => undefined);
+    expect(fs.existsSync(h.archive(result.id))).toBe(true); expect(fs.existsSync(h.file(result.id))).toBe(false);
     expect(h.mesh.listAll("residency/completion-claims/")).toHaveLength(1);
     expect(h.journal().result(result.id)).toMatchObject({ id: result.id });
-    open.mockRestore();
-    await journal.drain();
-    expect(fs.existsSync(h.file(result.id))).toBe(false);
-    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    deletion.mockRestore(); await journal.drain();
+    expect(fs.existsSync(h.archive(result.id))).toBe(true); expect(fs.existsSync(h.receipt(result.id))).toBe(true);
     expect(journal.result(result.id)).toBeUndefined();
   });
 
@@ -432,20 +419,19 @@ describe("completion journal idle scans", () => {
     }
   }, 15_000);
 
-  it("recovers a crash after the receipt barrier but before envelope unlink without redelivery", async () => {
+  it("recovers a crash after the receipt barrier but before envelope archive without redelivery", async () => {
     const h = setup(); const result = h.seed(1); const journal = h.journal();
-    const rm = fs.rmSync;
-    const unlink = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (String(target) === h.file(result.id)) throw new Error("crash before unlink");
-      rm(target, options);
+    const method = process.platform === "win32" ? "linkSync" : "renameSync"; const publish = fs[method];
+    const crash = vi.spyOn(fs, method).mockImplementation((source, target) => {
+      if (String(source) === h.file(result.id) && String(target) === h.archive(result.id)) throw new Error("crash before archive");
+      publish(source, target);
     });
-    expect(journal.acknowledge(result.id)).toBe(true); // Consumption fences synchronously; cleanup is async.
-    await vi.waitFor(() => expect(unlink.mock.calls.some(([target]) => String(target) === h.file(result.id))).toBe(true));
+    expect(() => journal.acknowledge(result.id)).toThrow("crash before archive");
     expect(completionConsumed(h.meshRoot, result.id)).toBe(true); expect(fs.existsSync(h.file(result.id))).toBe(true);
-    unlink.mockRestore();
+    crash.mockRestore();
     const enqueue = vi.fn(); await h.journal(enqueue).drain();
     expect(enqueue).not.toHaveBeenCalled(); expect(fs.existsSync(h.file(result.id))).toBe(false);
-    expect(fs.existsSync(h.receipt(result.id))).toBe(true);
+    expect(fs.existsSync(h.archive(result.id))).toBe(true); expect(fs.existsSync(h.receipt(result.id))).toBe(true);
   });
 
   it("a fresh process prunes crash-left bodies, keeps receipts, and never republishes or redelivers consumed outcomes", () => {
@@ -460,6 +446,7 @@ describe("completion journal idle scans", () => {
     const h = setup();
     for (let index = 1; index <= 130; index++) {
       const result = h.seed(index); consumeCompletion(h.meshRoot, result.id, h.recipient.sessionId);
+      fs.renameSync(h.archive(result.id), h.file(result.id)); // Receipt-before-archive crash fixture.
     }
     const enqueue = vi.fn(); const journal = h.journal(enqueue); await journal.drain();
     expect(fs.readdirSync(path.dirname(h.file(h.result(1).id))).filter(file => file.endsWith(".json"))).toHaveLength(2);
@@ -479,29 +466,27 @@ describe("completion journal idle scans", () => {
     expect(fs.existsSync(h.file(foreignProject.id))).toBe(true); expect(fs.existsSync(h.file(foreignLane.id))).toBe(true);
   });
 
-  it.skipIf(process.platform === "win32")("reconfirms the entire namespace asynchronously before every destructive prune", async () => {
+  it("archives crash-left bodies only after async receipt and namespace confirmation", async () => {
     const h = setup(); const a = h.seed(1), b = h.seed(2);
     const receipts = path.dirname(h.receipt(a.id)); fs.mkdirSync(receipts, { recursive: true });
     const receipt = (id: string) => JSON.stringify({ id, sessionId: h.recipient.sessionId, consumedAt: 1 });
     fs.writeFileSync(h.receipt(a.id), receipt(a.id)); fs.writeFileSync(h.receipt(b.id), receipt(b.id));
     const counts = new Map<string, number>(); const open = fs.promises.open;
     vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
-      const handle = await open(...args); const sync = handle.sync.bind(handle);
-      vi.spyOn(handle, "sync").mockImplementation(async () => {
-        const file = String(args[0]); counts.set(file, (counts.get(file) ?? 0) + 1); await sync();
-      });
+      const handle = await open(...args);
+      const syncHandle = handle.sync.bind(handle);
+      vi.spyOn(handle, "sync").mockImplementation(async () => { const file = String(args[0]); counts.set(file, (counts.get(file) ?? 0) + 1); await syncHandle(); });
       return handle;
     });
     const sync = vi.spyOn(fs, "fsyncSync"); const journal = h.journal(); await journal.drain();
-    expect(counts.get(h.receipt(a.id))).toBe(1); expect(counts.get(h.receipt(b.id))).toBe(1);
-    expect(counts.get(receipts)).toBe(2);
-    h.seed(1); await journal.drain(); expect(counts.get(h.receipt(a.id))).toBe(2);
-    h.seed(1); const replacement = `${h.receipt(a.id)}.replacement`; fs.writeFileSync(replacement, receipt(a.id));
-    fs.renameSync(replacement, h.receipt(a.id));
+    h.seed(1); await journal.drain();
+    h.seed(1); const replacement = `${h.receipt(a.id)}.replacement`; fs.writeFileSync(replacement, receipt(a.id)); fs.renameSync(replacement, h.receipt(a.id));
     await journal.drain();
-    expect(counts.get(h.receipt(a.id))).toBe(3); expect(counts.get(receipts)).toBe(4);
-    expect(counts.get(path.dirname(receipts))).toBe(4); expect(sync).not.toHaveBeenCalled();
-    expect(fs.existsSync(h.file(a.id))).toBe(false);
+    expect(counts.get(h.receipt(a.id))).toBe(3); expect(counts.get(h.receipt(b.id))).toBe(1);
+    if (process.platform !== "win32") expect(counts.get(receipts)).toBe(4);
+    expect(sync).not.toHaveBeenCalled();
+    expect(fs.existsSync(h.file(a.id))).toBe(false); expect(fs.existsSync(h.archive(a.id))).toBe(true);
+    expect(fs.existsSync(h.archive(b.id))).toBe(true);
   });
   it.each(["torn", "invalid", "dangling"])("keeps unknown %s receipts fail-closed even on plain scans", async fault => {
     const h = setup(); const result = h.seed(1); fs.mkdirSync(path.dirname(h.receipt(result.id)), { recursive: true });

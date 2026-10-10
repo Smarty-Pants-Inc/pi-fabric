@@ -95,8 +95,8 @@ existing events and mirrors root presence. There is no new store or protocol.
   `host-leases/`, including their creation and atomic replacement. SQLite WAL updates are
   notifications too. Watchers are installed before snapshots, and changes during a pass are
   latched for the next drain. Notifications are hints: canonical reads and ownership fences
-  still decide delivery. A watch failure on a notification-capable link stops it rather than
-  silently dropping events. Remote change frames are negotiated with `hello` and do not occupy the agent's FIFO request
+  still decide delivery. A watch failure on a notification-capable link stops it, so it never
+  silently drops events. Remote change frames are negotiated with `hello` and do not occupy the agent's FIFO request
   queue; there is no hanging wait request in front of a publish.
 
 ## Control deadlines and retention

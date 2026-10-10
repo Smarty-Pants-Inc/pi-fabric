@@ -289,6 +289,40 @@ export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);
 };
 
+// Temps this process staged and has not yet renamed or removed (smarty-dev#6622).
+// An exit (a Main /quit, a worker/resident exit or a handled SIGTERM) can end the
+// process while a writer awaits the mesh lock with its staged state temp on disk;
+// a try/finally never runs then. The bounded exit hook below removes them. Every
+// name carries this pid, so the hook never touches a temp another live pid owns.
+const ownedTemporaries = new Set<string>();
+/** At most this many temps are removed by the synchronous exit hook. */
+export const EXIT_TEMP_CLEANUP_LIMIT = 256;
+let temporaryExitHook: (() => void) | undefined;
+
+/** Removes this process's still-staged temps; synchronous, bounded, best-effort. */
+export const removeOwnedTemporaries = (): number => {
+  let removed = 0;
+  for (const file of [...ownedTemporaries].slice(0, EXIT_TEMP_CLEANUP_LIMIT)) {
+    ownedTemporaries.delete(file);
+    try { fs.rmSync(file, { force: true }); removed += 1; } catch { /* Best-effort exit cleanup. */ }
+  }
+  return removed;
+};
+
+/** Registers a temp this process owns (its name must carry process.pid) until the
+ * returned release runs: on process exit it is removed by a bounded hook. */
+export const trackTemporary = (file: string): (() => void) => {
+  ownedTemporaries.add(file);
+  if (!temporaryExitHook) {
+    temporaryExitHook = () => { removeOwnedTemporaries(); };
+    process.once("exit", temporaryExitHook);
+  }
+  return () => { ownedTemporaries.delete(file); };
+};
+
+/** Test/diagnostic view of the temps currently registered for exit cleanup. */
+export const trackedTemporaries = (): readonly string[] => [...ownedTemporaries];
+
 export const writeFileAtomic = (
   filePath: string,
   contents: string | Uint8Array,
@@ -321,6 +355,7 @@ export const writeFileAtomic = (
     }
   }
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const release = trackTemporary(temporary);
   try {
     if (options?.durable) {
       const fd = fs.openSync(temporary, "w", options.mode ?? 0o600);
@@ -340,7 +375,7 @@ export const writeFileAtomic = (
     if (options?.durable) syncDirectoryChain(directory);
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
-    fs.rmSync(temporary, { force: true });
+    try { fs.rmSync(temporary, { force: true }); } finally { release(); }
   }
 };
 
@@ -560,6 +595,7 @@ const writeFileAtomicAsync = async (
     mode: options?.dirMode ?? 0o700,
   });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const release = trackTemporary(temporary);
   try {
     await fs.promises.writeFile(temporary, contents, {
       encoding: "utf8",
@@ -567,7 +603,7 @@ const writeFileAtomicAsync = async (
     });
     await renameAtomicAsync(temporary, filePath, options);
   } finally {
-    await fs.promises.rm(temporary, { force: true });
+    try { await fs.promises.rm(temporary, { force: true }); } finally { release(); }
   }
 };
 

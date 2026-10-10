@@ -169,8 +169,19 @@ export class ActorRegistryStore {
     const prior = new Map(snapshot.actors.map(row => [row.id, row]));
     const smallState = (row: Record<string, unknown>): string =>
       JSON.stringify(Object.keys(row).sort().map(key => [key, row[key]]));
-    const reusable = actors.map(row => {
-      const before = prior.get(String(row.id));
+    const reusable = actors.map(input => {
+      const before = prior.get(String(input.id));
+      // smarty-dev#6829: a loaded actor whose ring is exactly the one this process committed at
+      // the current head selects that head instead of re-reading and re-encoding its history
+      // (the dominant registry lock hold). Any append, reset or in-place change misses the digest.
+      // ponytail: one stringify+sha256 of the ring per save stays; tracking ring identity in the
+      // manager would remove it but must prove every in-place message mutation site.
+      const row: Record<string, unknown> = before && before.messageHistory !== undefined && input.messageHistory === undefined &&
+        input.registryMessageReset !== true && Array.isArray(input.messages) &&
+        !(Array.isArray(input.registryMessageAppend) && input.registryMessageAppend.length > 0) &&
+        this.#payloads.committedRing(String(input.id), before.messageHistory, input.messages)
+        ? (({ messages: _messages, ...rest }) => ({ ...rest, messageHistory: before.messageHistory }))(input)
+        : input;
       if (!before || row === before || row.registryMessageReset === true ||
         (Array.isArray(row.registryMessageAppend) && row.registryMessageAppend.length > 0)) return row;
       const { instructions, messages, registryMessageAppend: _append, registryMessageReset: _reset, ...small } = row;
@@ -226,6 +237,7 @@ export class ActorRegistryStore {
           renamed = true;
           if (durable) syncDirectoryChain(this.#actorRoot);
           this.#payloads.publishHeads(changedHeads);
+          payload.accept(changedHeads);
           this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
         } catch (error) {
           if (renamed) {

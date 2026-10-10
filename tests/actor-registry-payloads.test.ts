@@ -315,4 +315,27 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(store.instructions(store.records()[0]!)).toBe(actor.instructions);
     expect(store.messages(store.records()[0]!)).toEqual(actor.messages.slice(-100));
   });
+
+  it("reuses the committed head for an unchanged loaded ring without re-reading history (smarty-dev#6829)", async () => {
+    const { store, id, log } = setup();
+    const ring = messages(100);
+    const row = { id, instructions: "i".repeat(20_000), status: "idle", messages: ring, registryMessageAppend: [] };
+    await store.update(() => ({ actors: [{ ...row, registryMessageAppend: ring }], value: true }));
+    // One slow save of the loaded ring records its committed digest.
+    await store.update(() => ({ actors: [{ ...row, status: "running" }], value: true }));
+    const head = store.records()[0]!.messageHistory;
+    const archive = fs.readFileSync(log, "utf8");
+    const reads = vi.spyOn(fs, "openSync");
+    await store.update(() => ({ actors: [{ ...row, status: "idle", messages: structuredClone(ring) }], value: true }));
+    expect(reads.mock.calls.filter(([file]) => String(file) === log)).toEqual([]);
+    expect(store.records()[0]).toMatchObject({ status: "idle", messageHistory: head, messages: [] });
+    reads.mockRestore();
+    // Counterexample: an in-place edit without an append marker misses the digest and is archived.
+    const edited = structuredClone(ring);
+    edited[99]!.text = "edited";
+    await store.update(() => ({ actors: [{ ...row, messages: edited }], value: true }));
+    expect(store.records()[0]!.messageHistory).not.toEqual(head);
+    expect(fs.readFileSync(log, "utf8").length).toBeGreaterThan(archive.length);
+    expect(new ActorRegistryStore(path.dirname(path.dirname(path.dirname(log)))).messages(store.records()[0]!)).toEqual(edited);
+  });
 });

@@ -247,6 +247,7 @@ describe("resident queued binding defaults", () => {
     const dir = path.join(state.actorRoot, actor.id);
     const key = (await import("node:crypto")).createHash("sha256").update([identity.id, "session"].join("\0")).digest("hex").slice(0, 16);
     const registry = JSON.parse(fs.readFileSync(path.join(state.actorRoot, "actors.json"), "utf8"));
+    delete registry.actors[0].projectDefaults; // Exercise the pre-resolved-binding registry format.
     registry.actors[0].model = "provider/new"; registry.actors[0].thinking = "max";
     fs.writeFileSync(path.join(state.actorRoot, "actors.json"), JSON.stringify(registry));
     const records = ["mesh:work.items", "host:input", "direct", "direct"].map((source, index) => ({

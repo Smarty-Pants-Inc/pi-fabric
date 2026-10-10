@@ -780,7 +780,8 @@ describe("mesh writer census", () => {
   });
 
   it("is advisory: no exported gate and no verdict in the report (smarty-dev#6982)", async () => {
-    expect(Object.keys(writerCensus).sort()).toEqual(["census"]);
+    // censusSync is the same report, synchronous (the smarty-dev#7815 gate recomputes it under the fence).
+    expect(Object.keys(writerCensus).sort()).toEqual(["census", "censusSync"]);
     const mesh = root();
     fs.mkdirSync(path.join(mesh, ".lock"));
     fs.writeFileSync(path.join(mesh, ".lock", "owner"), `token\n${process.pid}\n${Date.now()}\n`);

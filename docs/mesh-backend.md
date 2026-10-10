@@ -52,8 +52,12 @@ The gate decides from an inventory, never from what readers chose to register:
    cannot run (not Linux, the mesh on NFS, `/proc/sys/fs/leases-enable` not 1, a missing helper, any
    helper error, or the switch process itself holding one of the files), it is `holder@lease-probe`,
    never ready: the gate fails closed. Both pass only with `--accept-unready` of that name.
-   The helper runs only if its sha256 matches `dist/native/manifest.json` (the build manifest that ships
-   with the package); a missing manifest or another hash is `holder@lease-probe` (helper integrity).
+   Helper integrity: the gate opens the helper `O_NOFOLLOW`, hashes the bytes read from that fd, compares
+   them with the sha256 compiled into the gate's own bundle at build time (never `manifest.json`, which
+   is only for the build check), and executes that same fd through `/proc/self/fd/3`, so the checked
+   bytes are the executed bytes. A mismatch, a symlink, no compiled digest, or no `/proc/self/fd` is
+   `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
+   can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
 
    Known limit (smarty-dev#8116, the accepted gap that remains of smarty-dev#7936; acceptance: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): the window runs from the lease probe under the fence (before the switch opens `state.db`) to each commit, still under the fence. A process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock in that window is not detected; WAL connections always hold a lock on `-shm`. The gate does not probe again after its own open (its own fd makes the probe refuse), and the lease cannot be held through the commit: the switch's own open conflicts with it. Each gated switch prints this gap on stderr.
 

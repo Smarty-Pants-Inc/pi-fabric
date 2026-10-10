@@ -242,8 +242,23 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
   return { own, holders: [...holders.values()] };
 };
 
+// Replaced at build time (scripts/build.mjs define, from the twice-built helpers); absent when running src.
+declare const __FABRIC_NATIVE_DIGESTS__: string | undefined;
+/**
+ * The expected sha256 of each native helper, embedded into this bundle at build time.
+ * ponytail: the trust root is the installed package: the digest lives in the same JS that runs the gate,
+ * so a writer who can change it can change the gate itself (the same-uid package-integrity class,
+ * smarty-dev#7800). Tests running src inject it through vitest's define.
+ */
+export const embeddedNativeDigests = (): Record<string, string> => {
+  // No typeof guard: a define replaces the bare identifier; unreplaced, it throws ReferenceError (fail closed).
+  try { return JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>; } catch { return {}; }
+};
+
 /** Injection points of the lease probe (tests). */
-export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string }
+export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string;
+  /** Tests: the expected sha256 instead of the embedded one. */ expectedDigest?: string;
+  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void }
 
 /** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
 export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
@@ -282,19 +297,23 @@ export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}):
   catch (error) { return unavailable(`statfs ${root} failed (${errno(error)})`); }
   const helper = probe.helper ?? leaseHelperPath();
   try { fs.accessSync(helper, fs.constants.X_OK); } catch { return unavailable(`helper ${helper} is missing (bun run build)`); }
-  // Runtime integrity: the helper must be the twice-built binary the package's build manifest records
-  // (scripts/build-landlock.mjs). A missing manifest or another sha256 fails closed.
-  const manifestFile = path.join(path.dirname(helper), "manifest.json");
-  let expected: unknown;
-  try { expected = (JSON.parse(fs.readFileSync(manifestFile, "utf8")) as { helpers?: Record<string, unknown> }).helpers?.["fabric-mesh-lease"]; }
-  catch (error) { return unavailable(`helper integrity: build manifest ${manifestFile} unreadable (${errno(error)})`); }
-  let actual: string;
-  try { actual = createHash("sha256").update(fs.readFileSync(helper)).digest("hex"); }
-  catch (error) { return unavailable(`helper integrity: ${helper} unreadable (${errno(error)})`); }
-  if (typeof expected !== "string" || expected !== actual) {
-    return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the build manifest (${String(expected)})`);
-  }
-  const result = spawnSync(helper, files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] });
+  // Runtime integrity: hash the bytes read from ONE O_NOFOLLOW fd, compare with the digest embedded at build
+  // time (never the writable manifest.json), then execute THAT fd (/proc/self/fd/3 in the child, passed as
+  // its fd 3), so the checked bytes are the executed bytes, with no path swap between hash and exec.
+  const expected = probe.expectedDigest ?? embeddedNativeDigests()["fabric-mesh-lease"];
+  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) return unavailable("helper integrity: no embedded digest in this build");
+  let fd: number;
+  try { fd = fs.openSync(helper, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch (error) { return unavailable(`helper integrity: ${helper} cannot be opened (${errno(error)})`); }
+  let result: { error?: Error; status: number | null; stdout: string };
+  try {
+    const actual = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
+    if (actual !== expected) return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the embedded digest ${expected}`);
+    probe.afterHash?.();
+    // No fd exec, no probe: there is no copy and no path exec (fail closed).
+    if (!fs.existsSync(path.join(procRoot, "self", "fd"))) return unavailable("helper integrity: /proc/self/fd exec is unavailable");
+    result = spawnSync("/proc/self/fd/3", files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe", fd] });
+  } finally { fs.closeSync(fd); }
   if (result.error || (result.status !== 0 && result.status !== 3)) {
     return unavailable(`helper failed (${result.error?.message ?? `exit ${String(result.status)}`}${result.stdout ? `: ${result.stdout.trim()}` : ""})`);
   }

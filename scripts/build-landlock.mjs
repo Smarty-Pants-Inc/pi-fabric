@@ -21,8 +21,9 @@ const flags = (root) => [
 
 const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
 
+/** Returns the sha256 of each helper ({} off Linux): build.mjs embeds them into the bundle. */
 export function buildLandlock() {
-  if (process.platform !== "linux") return;
+  if (process.platform !== "linux") return {};
   const root = resolve(".");
   const cc = process.env.CC || "cc";
   const env = { ...process.env, SOURCE_DATE_EPOCH: "0", LC_ALL: "C" };
@@ -55,7 +56,9 @@ export function buildLandlock() {
     } finally { for (const dir of outputs) rmSync(dir, { recursive: true, force: true }); }
     helpers[helper] = hashes[0];
   }
+  // For assert-build-artifacts.mjs only; the runtime trusts the digests embedded into the bundle.
   writeFileSync("dist/native/manifest.json", `${JSON.stringify({ compiler, flags: flags("<root>"), helpers }, null, 2)}\n`);
+  return helpers;
 }
 
 if (process.argv[1]?.endsWith("build-landlock.mjs")) buildLandlock();

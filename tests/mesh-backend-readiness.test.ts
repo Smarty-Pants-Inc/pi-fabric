@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -458,21 +459,49 @@ sys.stdin.readline()`;
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
 
-  it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper or a missing manifest${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+  it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const copy = tempDir("helper");
     const helper = path.join(copy, "fabric-mesh-lease");
     fs.copyFileSync(leaseHelperPath(), helper);
     fs.chmodSync(helper, 0o700);
-    fs.copyFileSync(path.join(path.dirname(leaseHelperPath()), "manifest.json"), path.join(copy, "manifest.json"));
-    expect(probeStateDbLeases(root, { helper })).toEqual([]); // the untouched copy matches
+    expect(probeStateDbLeases(root, { helper })).toEqual([]); // the untouched copy matches the embedded digest
     fs.appendFileSync(helper, "\0");
+    // A forged manifest.json beside it that matches the tampered bytes changes nothing.
+    const forged = createHash("sha256").update(fs.readFileSync(helper)).digest("hex");
+    fs.writeFileSync(path.join(copy, "manifest.json"), JSON.stringify({ compiler: "gcc version 0", helpers: { "fabric-mesh-lease": forged } }));
     const tampered = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper } });
     expect(tampered.code).toBe(3);
-    expect(tampered.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper integrity: ${helper} sha256 `);
-    expect(tampered.err).toContain("does not match the build manifest");
-    fs.rmSync(path.join(copy, "manifest.json"));
-    expect(probeStateDbLeases(root, { helper })[0]!.reason).toContain(`helper integrity: build manifest ${path.join(copy, "manifest.json")} unreadable (ENOENT)`);
+    expect(tampered.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper integrity: ${helper} sha256 ${forged} does not match the embedded digest `);
+    // A symlinked helper is refused (O_NOFOLLOW), and so is a build without an embedded digest.
+    const link = path.join(copy, "link");
+    fs.symlinkSync(leaseHelperPath(), link);
+    expect(probeStateDbLeases(root, { helper: link })[0]!.reason).toContain(`helper integrity: ${link} cannot be opened (ELOOP)`);
+    expect(probeStateDbLeases(root, { expectedDigest: "" })[0]!.reason).toContain("helper integrity: no embedded digest in this build");
+  });
+
+  it.skipIf(leaseSkip !== "")(`executes the hashed fd: a helper swapped at its path after the hash never runs${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const copy = tempDir("helper");
+    const helper = path.join(copy, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    const file = path.join(root, "state.db");
+    const holder = await pythonHolder(file, "fd");
+    try {
+      // The swapped file would claim every file free; the verified helper reports the real holder.
+      const swap = (): void => {
+        const fake = path.join(copy, "fake");
+        fs.writeFileSync(fake, `#!/bin/sh\nfor f in "$@"; do echo "free $f"; done\n`, { mode: 0o700 });
+        fs.renameSync(fake, helper);
+      };
+      const holders = probeStateDbLeases(root, { helper, afterHash: swap });
+      expect(holders.map(item => item.name)).toEqual(["holder@lease:state.db"]);
+      expect(fs.readFileSync(helper, "utf8")).toContain("#!/bin/sh"); // the path really holds the swapped file
+    } finally { await holder.release(); }
+    // Without /proc/self/fd there is no exec at all: fail closed.
+    expect(probeStateDbLeases(root, { helper: leaseHelperPath(), procRoot: tempDir("noproc"), leasesEnable: "1" })[0]!.reason)
+      .toContain("helper integrity: /proc/self/fd exec is unavailable");
   });
 
   // ponytail: the remaining fail-closed branches (not Linux, leases-enable=0, a missing helper) cannot run end to

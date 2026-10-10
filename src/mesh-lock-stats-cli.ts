@@ -1,7 +1,7 @@
 // fabric-mesh-lock-stats: fleet view of a mesh root's lock (smarty-dev#6477 L8). Read-only; it
 // sums every process's <mesh>/lock-stats/<host>-<pid>.json, see docs/mesh-lock-stats.md.
 import path from "node:path";
-import { LOCK_STATS_RETAIN_MINUTES, readLockStats, summarizeLockStats, type LockStatsSummary } from "./mesh/commit-stats.js";
+import { LOCK_STATS_RETAIN_MINUTES, readLockStats, summarizeLockStats, type LockStatsSummary, type LockStatsWriter } from "./mesh/commit-stats.js";
 import { resolveMeshRoot } from "./participants-cli.js";
 
 const USAGE = `Usage: fabric-mesh-lock-stats [--mesh DIR] [--minutes N] [--top K] [--json]
@@ -41,6 +41,15 @@ const pct = (value: number): string => `${value.toFixed(1)}%`;
 // Labels come from files any process on the root can write: never print raw control or bidi characters.
 const label = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
   (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+// Compact writer kind for the table (full facts are in --json): script, agent, role, ppid.
+const writerLabel = (writer: LockStatsWriter | undefined): string => {
+  if (!writer) return "-";
+  const name = writer.agentName ?? writer.actorName ?? writer.actorId?.slice(0, 8);
+  const role = writer.role ?? writer.smartyRole?.split("@")[0];
+  const text = [writer.argv1, name, role, writer.ppid !== undefined ? `ppid=${writer.ppid}` : undefined]
+    .filter(Boolean).join(" ") || "-";
+  return label(text.length > 60 ? `${text.slice(0, 59)}…` : text);
+};
 const clock = (minute: number): string => new Date(minute * 60_000).toISOString().slice(11, 16);
 const table = (rows: string[][]): string => {
   const widths = rows[0]!.map((_, column) => Math.max(...rows.map(row => row[column]!.length)));
@@ -64,9 +73,9 @@ const formatLockStats = (summary: LockStatsSummary): string => {
       ms(row.holdMeanMs), ms(row.holdP99Ms), ms(row.holdMaxMs), ms(row.waitMeanMs), ms(row.waitP99Ms), ms(row.waitMaxMs),
       String(row.timeouts), String(row.tries)]),
   ]), "", "top pids by hold time:", table([
-    ["host-pid", "acq", "hold", "busy", "hold mean", "wait mean", "wait max", "timeouts", "tries", "top class"],
+    ["host-pid", "acq", "hold", "busy", "hold mean", "wait mean", "wait max", "timeouts", "tries", "top class", "writer"],
     ...summary.pids.map(row => [`${label(row.host)}-${row.pid}`, String(row.n), ms(row.holdMs), pct(row.busyPct), ms(row.holdMeanMs),
-      ms(row.waitMeanMs), ms(row.waitMaxMs), String(row.timeouts), String(row.tries), row.topClass ?? "-"]),
+      ms(row.waitMeanMs), ms(row.waitMaxMs), String(row.timeouts), String(row.tries), row.topClass ?? "-", writerLabel(row.writer)]),
   ]));
   return lines.join("\n");
 };

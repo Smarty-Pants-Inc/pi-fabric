@@ -420,9 +420,11 @@ describe("completion journal idle scans", () => {
   }, 15_000);
 
   it("recovers a crash after the receipt barrier but before envelope archive without redelivery", async () => {
-    const h = setup(); const result = h.seed(1); const journal = h.journal(); const rename = fs.renameSync;
-    const crash = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
-      if (String(source) === h.file(result.id)) throw new Error("crash before archive"); rename(source, target);
+    const h = setup(); const result = h.seed(1); const journal = h.journal();
+    const method = process.platform === "win32" ? "linkSync" : "renameSync"; const publish = fs[method];
+    const crash = vi.spyOn(fs, method).mockImplementation((source, target) => {
+      if (String(source) === h.file(result.id) && String(target) === h.archive(result.id)) throw new Error("crash before archive");
+      publish(source, target);
     });
     expect(() => journal.acknowledge(result.id)).toThrow("crash before archive");
     expect(completionConsumed(h.meshRoot, result.id)).toBe(true); expect(fs.existsSync(h.file(result.id))).toBe(true);

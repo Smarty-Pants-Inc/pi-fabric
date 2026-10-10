@@ -146,13 +146,25 @@ const archiveCompletion = (source: string): boolean => {
   }
   if (archiveStat(source)) {
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    try { renameAtomic(source, target); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (process.platform === "win32") {
+      // MoveFileEx(REPLACE_EXISTING) is not an exclusive publication: two racers
+      // may both succeed. A hard link creates the archive name exactly once,
+      // preserves the durable inode, and leaves source/evidence for crash recovery.
+      try { fs.linkSync(source, target); }
+      catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+    } else {
+      try { renameAtomic(source, target); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
   }
   const stat = archiveStat(target);
   if (!stat) return false;
   if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
-  // POSIX rename is a no-op when crash recovery/concurrent linking left both names.
+  if (process.platform === "win32" && sourceStat && !sameArchiveInode(sourceStat, stat)) {
+    throw new Error(`Completion archive evidence changed at ${target}`);
+  }
+  // Windows publication leaves both names; POSIX rename is a no-op if they
+  // already name the same inode after crash recovery/concurrent linking.
   const leftover = archiveStat(source);
   if (leftover && sameArchiveInode(leftover, stat)) fs.rmSync(source, { force: true });
   syncPathNamespace(target, stat); // Archive directory, source directory, then ancestors.
@@ -181,11 +193,20 @@ const archiveCompletionAsync = async (source: string): Promise<boolean> => {
     }
   }
   await fs.promises.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-  try { await fs.promises.rename(source, target); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (process.platform === "win32") {
+    // EEXIST is a lost publication race, not permission to replace the winner.
+    try { await fs.promises.link(source, target); }
+    catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+  } else {
+    try { await fs.promises.rename(source, target); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
   const stat = await archiveStatAsync(target);
   if (!stat) return false;
   if (!stat.isFile()) throw new Error(`Completion archive is not a file at ${target}`);
+  if (process.platform === "win32" && sourceStat && !sameArchiveInode(sourceStat, stat)) {
+    throw new Error(`Completion archive evidence changed at ${target}`);
+  }
   const leftover = await archiveStatAsync(source);
   if (leftover && sameArchiveInode(leftover, stat)) await fs.promises.rm(source, { force: true });
   await syncPathNamespaceAsync(target, stat);

@@ -10,7 +10,9 @@ import type { MeshStore } from "../src/mesh/store.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 
 const roots: string[] = [];
+const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(() => {
+  Object.defineProperty(process, "platform", platform);
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -31,10 +33,12 @@ const setup = () => {
   return { root, meshRoot, recipient, directory, file, archive, receipt, result, seed, mesh, journal };
 };
 const crashBeforeArchive = (source: string) => {
-  const rename = fs.renameSync;
-  return vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-    if (String(from) === source) throw Object.assign(new Error("crash before archive"), { code: "EIO" });
-    rename(from, to);
+  const method = process.platform === "win32" ? "linkSync" : "renameSync";
+  const publish = fs[method];
+  const target = path.join(path.dirname(source), "archive", path.basename(source));
+  return vi.spyOn(fs, method).mockImplementation((from, to) => {
+    if (String(from) === source && String(to) === target) throw Object.assign(new Error("crash before archive"), { code: "EIO" });
+    publish(from, to);
   });
 };
 const noDrainSync = () => {
@@ -59,6 +63,15 @@ describe("completion receipt-time archive", () => {
       if (String(from) === h.file(result.id)) { expect(receiptSynced || process.platform === "win32").toBe(true); expect(completionConsumed(h.meshRoot, result.id)).toBe(true); }
       rename(from, to);
     });
+    if (process.platform === "win32") {
+      const link = fs.linkSync;
+      vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+        if (String(to) === h.archive(result.id)) {
+          expect(receiptRenamed).toBe(true); expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+        }
+        link(from, to);
+      });
+    }
     consumeCompletion(h.meshRoot, result.id, "main");
     expect(fs.existsSync(h.file(result.id))).toBe(false);
     expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe(body);
@@ -305,30 +318,85 @@ describe("completion receipt-time archive", () => {
     expect(pendingCompletions(h.meshRoot, h.root)).toEqual([]); expect(sync).not.toHaveBeenCalled(); expect(fs.existsSync(h.file(result.id))).toBe(true);
   });
 
-  it("concurrent recovery has exactly one winning rename and ignores the loser's ENOENT", async () => {
+  it.each(["native", "Windows-exclusive"] as const)("concurrent recovery has exactly one winning publication (%s)", async mode => {
     const h = setup(); const result = h.seed(1); const crash = crashBeforeArchive(h.file(result.id));
+    const body = fs.readFileSync(h.file(result.id), "utf8"); const before = fs.statSync(h.file(result.id));
     expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow(); crash.mockRestore();
-    const rename = fs.promises.rename; let arrivals = 0; let wins = 0; let missing = 0; let release!: () => void;
+    const receipt = fs.readFileSync(h.receipt(result.id), "utf8"); const receiptStat = fs.statSync(h.receipt(result.id));
+    // Exercise Windows' exclusive branch on POSIX too; the native filesystem is unchanged.
+    if (mode === "Windows-exclusive") Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const method = process.platform === "win32" ? "link" : "rename";
+    const publish = fs.promises[method]; let arrivals = 0; let wins = 0; let losses = 0; let release!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; });
-    vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-      if (String(from) !== h.file(result.id)) return rename(from, to);
+    vi.spyOn(fs.promises, method).mockImplementation(async (from, to) => {
+      if (String(from) !== h.file(result.id) || String(to) !== h.archive(result.id)) return publish(from, to);
       if (++arrivals === 2) release(); await barrier;
-      try { await rename(from, to); wins++; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") missing++; throw error; }
+      try { await publish(from, to); wins++; }
+      catch (error) {
+        // A link loser may observe the winner's target or its already-removed source.
+        if ((method === "link" ? ["EEXIST", "ENOENT"] : ["ENOENT"]).includes((error as NodeJS.ErrnoException).code ?? "")) losses++;
+        throw error;
+      }
     });
-    const enqueue = vi.fn(); await Promise.all([h.journal(enqueue).drain(), h.journal(enqueue).drain()]);
-    expect({ wins, missing }).toEqual({ wins: 1, missing: 1 }); expect(enqueue).not.toHaveBeenCalled(); expect(fs.existsSync(h.archive(result.id))).toBe(true);
+    const enqueue = vi.fn(); const journals = [h.journal(enqueue), h.journal(enqueue)];
+    await Promise.all(journals.map(journal => journal.drain()));
+    expect({ wins, losses }).toEqual({ wins: 1, losses: 1 }); expect(enqueue).not.toHaveBeenCalled();
+    expect(fs.readdirSync(path.dirname(h.archive(result.id)))).toEqual([path.basename(h.file(result.id))]);
+    expect(fs.existsSync(h.file(result.id))).toBe(false);
+    expect(fs.existsSync(path.join(h.directory, "archive-pending", path.basename(h.file(result.id))))).toBe(false);
+    expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe(body);
+    expect(fs.statSync(h.archive(result.id))).toMatchObject({ dev: before.dev, ino: before.ino });
+    expect(fs.readFileSync(h.receipt(result.id), "utf8")).toBe(receipt);
+    expect(fs.statSync(h.receipt(result.id))).toMatchObject({ ino: receiptStat.ino, mtimeMs: receiptStat.mtimeMs });
+    for (const journal of journals) { expect(journal.pending()).toEqual([]); expect(journal.result(result.id)).toMatchObject({ text: result.text }); }
   });
 
-  it("tolerates a consumer racing the synchronous rename and keeps the first receipt", () => {
-    const h = setup(); const result = h.seed(1); const rename = fs.renameSync; let wins = 0;
-    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (String(from) === h.file(result.id)) {
-        rename(from, to); wins++;
-        // A sibling won after our path check but before our rename syscall.
-        throw Object.assign(new Error("already archived"), { code: "ENOENT" });
+  it.each(["sync", "async"] as const)("Windows resumes a crash after exclusive publication without replacing the archive (%s)", async mode => {
+    const h = setup(); const result = h.seed(1); const body = fs.readFileSync(h.file(result.id), "utf8");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const remove = fs.rmSync;
+    const crash = vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (String(file) === h.file(result.id)) throw new Error("crash after exclusive publication");
+      remove(file, options);
+    });
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("crash after exclusive publication"); crash.mockRestore();
+    const before = fs.statSync(h.archive(result.id)); const receipt = fs.readFileSync(h.receipt(result.id), "utf8");
+    expect(fs.statSync(h.file(result.id))).toMatchObject({ dev: before.dev, ino: before.ino });
+    const enqueue = vi.fn(); const journal = h.journal(enqueue);
+    if (mode === "sync") consumeCompletion(h.meshRoot, result.id, "other");
+    else await journal.drain();
+    expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe(body);
+    expect(fs.statSync(h.archive(result.id))).toMatchObject({ dev: before.dev, ino: before.ino, mtimeMs: before.mtimeMs });
+    expect(fs.readFileSync(h.receipt(result.id), "utf8")).toBe(receipt);
+    expect(fs.existsSync(h.file(result.id))).toBe(false);
+    expect(fs.existsSync(path.join(h.directory, "archive-pending", path.basename(h.file(result.id))))).toBe(false);
+    expect(enqueue).not.toHaveBeenCalled(); expect(journal.result(result.id)).toMatchObject({ text: result.text });
+  });
+
+  it.each(["sync", "async"] as const)("Windows refuses to replace a conflicting archive inode (%s)", async mode => {
+    const h = setup(); const result = h.seed(1); const crash = crashBeforeArchive(h.file(result.id));
+    expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow(); crash.mockRestore();
+    fs.mkdirSync(path.dirname(h.archive(result.id)), { recursive: true });
+    fs.writeFileSync(h.archive(result.id), "conflicting archive");
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    if (mode === "sync") expect(() => consumeCompletion(h.meshRoot, result.id, "main")).toThrow("Completion archive evidence changed");
+    else await expect(h.journal().drain()).rejects.toThrow("Completion archive evidence changed");
+    expect(fs.readFileSync(h.archive(result.id), "utf8")).toBe("conflicting archive");
+    expect(fs.existsSync(h.file(result.id))).toBe(true);
+    expect(fs.existsSync(path.join(h.directory, "archive-pending", path.basename(h.file(result.id))))).toBe(true);
+    expect(completionConsumed(h.meshRoot, result.id)).toBe(true);
+  });
+
+  it("tolerates a consumer racing synchronous publication and keeps the first receipt", () => {
+    const h = setup(); const result = h.seed(1); const method = process.platform === "win32" ? "linkSync" : "renameSync";
+    const publish = fs[method]; let wins = 0;
+    vi.spyOn(fs, method).mockImplementation((from, to) => {
+      if (String(from) === h.file(result.id) && String(to) === h.archive(result.id)) {
+        publish(from, to); wins++;
+        // A sibling won after our path check but before our publication syscall.
+        throw Object.assign(new Error("already archived"), { code: method === "linkSync" ? "EEXIST" : "ENOENT" });
       }
-      rename(from, to);
+      publish(from, to);
     });
     expect(() => consumeCompletion(h.meshRoot, result.id, "main")).not.toThrow();
     const receipt = fs.readFileSync(h.receipt(result.id), "utf8");

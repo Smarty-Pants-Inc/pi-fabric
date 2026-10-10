@@ -137,11 +137,10 @@ export const sessionActorRootGone = (
     const writer = lease?.writer;
     const ownerHost = owner?.host ?? (writer && writer.pid === owner?.pid ? writer.host : undefined);
     // Inbox activation and lease renewal are independent writes. An old inbox
-    // cannot qualify a different present writer, even after the lease expires.
+    // cannot qualify a present live/unknown writer, even with the same reused PID.
     if (writer && (writer.host !== os.hostname() ||
         (owner && (writer.pid !== owner.pid || writer.host !== ownerHost)) ||
-        (censusRecordAlive(writer.pid, writer) && (!owner ||
-          residentProcessAlive(owner.pid as number, owner.processStartedAt as string | undefined))))) return undefined;
+        censusRecordAlive(writer.pid, writer))) return undefined;
     let reason: string | undefined;
     // The directory's clean-close proof is lease independent; preserve its conservative
     // raw-presence policy. Recheck the receipt's age, not just the actor's last update.

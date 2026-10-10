@@ -99,14 +99,14 @@ const oldLease = (meshRoot: string, sessionId: string, changes: Partial<FabricHo
   return lease;
 };
 
-const staleOwnerEvidence = (mesh: MeshStore, sessionId: string) => {
+const staleOwnerEvidence = (mesh: MeshStore, sessionId: string, ownerPid?: number) => {
   const at = Date.now() - 300_000;
   const lease = oldLease(mesh.root, sessionId, { updatedAt: at, expiresAt: at,
     session: { id: sessionId, startedAt: at - 60_000, updatedAt: at, expiresAt: at } });
   const owner = path.join(mesh.root, "main-followups", `${sessionId}.owner.json`);
   fs.mkdirSync(path.dirname(owner), { recursive: true });
   fs.writeFileSync(owner, JSON.stringify({ rootId: lease.id, sessionId, ownerIdentityId: lease.id,
-    pid: lease.writer!.pid, processStartedAt: "1", host: os.hostname(), name: "prior incarnation" }));
+    pid: ownerPid ?? lease.writer!.pid, processStartedAt: "1", host: os.hostname(), name: "prior incarnation" }));
   fs.utimesSync(owner, new Date(at), new Date(at));
   const presence = { key: `topology/participants/${createHash("sha256").update(lease.id).digest("hex")}`,
     version: 1, updatedAt: at, updatedBy: { id: lease.id, kind: "main" as const, name: "old Main" },
@@ -247,12 +247,17 @@ describe("public session-orphan provider reads (#7227)", () => {
   });
 
   describe.each(["session", "project"] as const)("conflicting current evidence in %s storage", scope => {
-    it.each(["live-local-lease", "foreign-lease", "foreign-presence", "different-owner-presence"] as const)(
+    it.each(["live-local-lease", "same-pid-live-lease", "foreign-lease", "foreign-presence", "different-owner-presence"] as const)(
       "%s cannot borrow a stale inbox death verdict or attribution", async evidence => {
         const root = tmp();
         const { actor, store, mesh } = await seed(root, "conflicted", { scope });
-        const { lease, presence } = staleOwnerEvidence(mesh, "conflicted");
-        if (evidence === "live-local-lease") writeHostLease(mesh.root, { ...lease, writer: { ...lease.writer!, pid: process.pid } });
+        const { lease, presence } = staleOwnerEvidence(mesh, "conflicted", evidence === "same-pid-live-lease" ? process.pid : undefined);
+        if (evidence === "live-local-lease" || evidence === "same-pid-live-lease") writeHostLease(mesh.root, { ...lease,
+          writer: { ...lease.writer!, pid: process.pid, startedAt: Math.floor(Date.now() - process.uptime() * 1000) } });
+        if (evidence === "same-pid-live-lease" && process.platform === "linux") {
+          const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+          expect(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]).not.toBe("1");
+        }
         if (evidence === "foreign-lease") writeHostLease(mesh.root, { ...lease, writer: { ...lease.writer!, host: "another-machine" } });
         if (evidence === "foreign-presence") writeParticipantFile(mesh.root, { ...presence,
           value: { ...presence.value, remoteHost: "another-machine" } });
@@ -264,21 +269,23 @@ describe("public session-orphan provider reads (#7227)", () => {
         }
         const before = store.snapshot().bytes;
         const current = open(root, "current");
-        if (scope === "session") {
-          expect((await actors(current.provider)).map(row => row.id)).not.toContain(actor.id);
-          await expect(status(current.provider, actor.id)).rejects.toThrow(/Unknown .*actor/);
-        } else {
-          const read = await status(current.provider, actor.id);
-          expect(read).toMatchObject({ id: actor.id, status: "unknown" });
-          expect(read.sessionOrphan).toBeUndefined();
-          expect(read.lastError).toBeUndefined();
-          expect((await actors(current.provider)).find(row => row.id === actor.id)).toMatchObject({ status: "unknown" });
+        for (let pass = 0; pass < 2; pass++) {
+          expect(await current.directory.reconcileSessionOrphans()).toBe(0);
+          if (scope === "session") {
+            expect((await actors(current.provider)).map(row => row.id)).not.toContain(actor.id);
+            await expect(status(current.provider, actor.id)).rejects.toThrow(/Unknown .*actor/);
+          } else {
+            const read = await status(current.provider, actor.id);
+            expect(read).toMatchObject({ id: actor.id, status: "unknown" });
+            expect(read.sessionOrphan).toBeUndefined();
+            expect(read.lastError).toBeUndefined();
+            expect((await actors(current.provider)).find(row => row.id === actor.id)).toMatchObject({ status: "unknown" });
+          }
+          expect(store.snapshot().bytes).toBe(before);
+          expect(store.snapshot().actors.find(row => row.id === actor.id)?.sessionOrphan).toBeUndefined();
+          expect(current.directory.owns(actor.id)).toBe(false);
+          expect(alarms(mesh)).toEqual([]);
         }
-        expect(await current.directory.reconcileSessionOrphans()).toBe(0);
-        expect(store.snapshot().bytes).toBe(before);
-        expect(store.snapshot().actors.find(row => row.id === actor.id)?.sessionOrphan).toBeUndefined();
-        expect(current.directory.owns(actor.id)).toBe(false);
-        expect(alarms(mesh)).toEqual([]);
       });
   });
 

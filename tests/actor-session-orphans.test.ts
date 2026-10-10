@@ -141,12 +141,37 @@ describe("foreign session actor registry truth", () => {
     expect(alarms(mesh)).toHaveLength(1);
   });
 
-  it.skipIf(process.platform !== "linux")("preserves positive old-incarnation death when the matched PID was reused", async () => {
+  it.skipIf(process.platform !== "linux")("keeps a present unqualified live lease writer unknown despite a reused inbox PID across two full reconciles", async () => {
+    const { root, lease, mesh, store, repair, actor } = fixture();
+    const tick = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    expect(tick.slice(tick.lastIndexOf(")") + 2).trim().split(/\s+/)[19]).not.toBe("1");
+    const at = Date.now() - 300_000;
+    const current = { ...lease, updatedAt: at, expiresAt: at,
+      session: { id: "old", startedAt: at - 60_000, updatedAt: at, expiresAt: at },
+      writer: { ...lease.writer!, pid: process.pid, startedAt: Math.floor(Date.now() - process.uptime() * 1000) } };
+    staleInbox(root, current, process.pid, "1");
+    staleRootPresence(root, current);
+    writeHostLease(root, current);
+    const before = store.snapshot().bytes;
+    for (let pass = 0; pass < 2; pass++) {
+      expect(sessionActorRootGone(mesh, lease.id, () => true)).toBeUndefined();
+      expect(await repair.reconcile()).toBe(0);
+      expect(store.snapshot().bytes).toBe(before);
+      expect(store.records()[0]?.sessionOrphan).toBeUndefined();
+      expect(repair.list()).toEqual([]);
+      expect(repair.resolve(actor.id)).toBeUndefined();
+      expect(alarms(mesh)).toEqual([]);
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("proves old-incarnation death with a reused PID after the lease is missing", async () => {
     const { root, lease, mesh, repair } = fixture();
-    staleInbox(root, lease, process.pid, "0"); // a live PID cannot have this old kernel start tick
-    writeHostLease(root, { ...lease, writer: { ...lease.writer!, pid: process.pid } });
+    staleInbox(root, lease, process.pid, "1");
+    staleRootPresence(root, lease);
+    fs.rmSync(hostLeasePath(root, lease.id));
     expect(sessionActorRootGone(mesh, lease.id, () => true)).toMatchObject({ reason: "Main inbox owner incarnation is dead" });
     expect(await repair.reconcile()).toBe(1);
+    expect(await repair.reconcile()).toBe(0);
     expect(alarms(mesh)).toHaveLength(1);
   });
 

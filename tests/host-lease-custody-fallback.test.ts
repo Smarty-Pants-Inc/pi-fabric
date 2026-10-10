@@ -43,7 +43,7 @@ const setup = (stateBackend: "file" | "sqlite") => {
   return { root, mesh, lease };
 };
 const domainOf = (root: string, hostId: string) => path.join(root, "host-lease-commits",
-  createHash("sha256").update(path.basename(hostLeasePath(root, hostId))).digest("hex"));
+  createHash("sha256").update(path.basename(hostLeasePath(root, hostId))).digest("hex").slice(0, 16));
 const deadPid = (): number => {
   const child = spawnSync(process.execPath, ["-e", ""], { timeout: 5_000 });
   expect(child.error).toBeUndefined(); expect(child.status).toBe(0);

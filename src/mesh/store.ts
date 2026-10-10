@@ -461,7 +461,14 @@ export class MeshStore {
    * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
     options: { ownIncarnation?: string | undefined } = {}): Promise<T> {
-    const domain = path.join(this.root, "host-lease-commits", createHash("sha256").update(path.basename(file)).digest("hex"));
+    const hash = createHash("sha256").update(path.basename(file)).digest("hex");
+    const legacy = path.join(this.root, "host-lease-commits", hash);
+    // One-release compatibility: prefer an existing full-hash domain, including an idle one,
+    // so its old readers/holders still share custody. New domains stay within Windows MAX_PATH.
+    // ponytail: 64-bit prefix collisions among one mesh's hosts are negligible; a collision
+    // only serializes two hosts on the same gate, never bypasses their lease-token checks.
+    const domain = fs.existsSync(legacy) ? legacy
+      : path.join(this.root, "host-lease-commits", hash.slice(0, 16));
     const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true });
     try { return await operation(); } finally { release(); }
   }

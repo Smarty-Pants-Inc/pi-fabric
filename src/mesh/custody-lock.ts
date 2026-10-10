@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
@@ -64,6 +64,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   const ownerPath = path.join(lock, "owner");
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
+  // Keep full UUID ownership receipts; only transient filesystem names need a short token.
+  const pathToken = randomBytes(4).toString("hex");
   const started = Object.hasOwn(options, "ownIncarnation") ? options.ownIncarnation
     : await ownProcessIncarnation().catch(() => undefined);
   const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
@@ -84,7 +86,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     attempts += 1;
     lastAttemptAt = now;
     // Publish a complete owner by rename: the canonical name is never ownerless.
-    const staging = fs.mkdtempSync(`${lock}.pending.${token}.`);
+    const staging = fs.mkdtempSync(`${lock}.p.${pathToken}.`);
     try {
       fs.writeFileSync(path.join(staging, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 });
       try {
@@ -118,7 +120,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     try {
       if (readOwner() !== record) return;
       // Detach before removal: never recursively delete through the canonical name.
-      const released = `${lock}.released.${token}`;
+      const released = `${lock}.released.${pathToken}`;
       fs.renameSync(lock, released);
       fs.rmSync(released, { recursive: true, force: true });
     } catch {

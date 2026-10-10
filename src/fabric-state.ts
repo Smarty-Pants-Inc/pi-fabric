@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { resolveAgentDir } from "./core/agent-dir.js";
+import { resolveAgentDir, resolveMeshDirectory } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
@@ -280,11 +280,7 @@ export class FabricState {
     // Publish this Main in the shared participant directory at startup, so
     // peers can find and steer an idle session before it first uses Fabric.
     if (this.config.mesh.announce) return true;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ??
-      (this.config.mesh.root
-        ? path.resolve(projectRoot, this.config.mesh.root)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    const meshRoot = resolveMeshDirectory(this.config.mesh.root, context.cwd);
     const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const actorRoots = [
       path.join(meshRoot, "actors"),

@@ -126,6 +126,42 @@ describe("mesh-load root safety", () => {
     expect(fs.readdirSync(live)).toEqual([]);
   });
 
+  it.each(["dir", "root"])("refuses every mesh.%s candidate when project root differs from cwd, despite overrides", (key) => {
+    const parent = tempRoot();
+    const cwd = path.join(parent, "cwd");
+    const project = path.join(parent, "project");
+    const agent = path.join(parent, "agent");
+    const configDirs = [path.join(project, ".pi"), path.join(cwd, ".pi"), agent];
+    for (const dir of configDirs) fs.mkdirSync(dir, { recursive: true });
+    const lives = configDirs.map(() => tempRoot());
+    const scratch = tempRoot();
+    const env = { PI_FABRIC_PROJECT_ROOT: project, PI_CODING_AGENT_DIR: agent,
+      PI_FABRIC_MESH_ROOT: path.join(parent, "root-override"), PI_FABRIC_MESH_DIR: path.join(parent, "dir-override") };
+    for (const [index, dir] of configDirs.entries()) {
+      const live = lives[index]!;
+      fs.writeFileSync(path.join(live, "state.db"), "do not open this fake live database");
+      fs.writeFileSync(path.join(dir, "fabric.json"), JSON.stringify({ mesh: { [key]: path.relative(project, live) } }));
+    }
+    expect(cwd).not.toBe(project);
+    for (const live of lives) {
+      for (const extra of [[], ["--worker", "--id", "project-root-guard"], ["--dry-run"]]) {
+        refused(probe(live, env, extra, cwd), "MESH_LOAD_LIVE_ROOT");
+      }
+      expect(fs.readdirSync(live).sort()).toEqual([SCRATCH_MARKER, "state.db"].sort());
+      expect(fs.readFileSync(path.join(live, "state.db"), "utf8")).toBe("do not open this fake live database");
+    }
+    // The project default is protected even when every config and both overrides select elsewhere.
+    const defaultRoot = path.join(project, ".pi", "fabric", "mesh");
+    refused(probe(defaultRoot, env, [], cwd), "MESH_LOAD_LIVE_ROOT");
+    expect(fs.existsSync(defaultRoot)).toBe(false);
+    const allowed = probe(scratch, env, ["--dry-run"], cwd);
+    expect(allowed.error, allowed.stderr).toBeUndefined();
+    expect(allowed.signal, allowed.stderr).toBeNull();
+    expect(allowed.status, allowed.stderr).toBe(0);
+    expect(JSON.parse(allowed.stdout)).toMatchObject({ dryRun: true, root: scratch });
+    expect(fs.readdirSync(scratch)).toEqual([SCRATCH_MARKER]);
+  });
+
   it("refuses every shared-home default mesh and its parent even with an environment override", () => {
     const home = tempRoot();
     const namespace = path.join(home, ".local", "share", "smarty-dev", "fabric-mesh");

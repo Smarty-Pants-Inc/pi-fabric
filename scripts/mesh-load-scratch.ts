@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveMeshRoot } from "../src/participants-cli.js";
+import { resolveAgentDir, resolveMeshDirectory, resolveProjectRoot } from "../src/core/agent-dir.js";
 
 export const SCRATCH_MARKER = ".mesh-load-scratch";
 
@@ -39,13 +40,17 @@ const contains = (parent: string, child: string): boolean => {
 
 const liveRoots = (): string[] => {
   const cwd = process.cwd();
-  const project = process.env.PI_FABRIC_PROJECT_ROOT ?? cwd;
-  const agent = expandHome(process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"));
-  // Reuse the checked-out runtime's ROOT/mesh.root resolver, without loading/migrating config or opening MeshStore.
-  // Also protect the DIR/mesh.dir fleet spelling and every shared-home default mesh, even with an override.
-  const roots = [resolveMeshRoot(), path.join(os.homedir(), ".local", "share", "smarty-dev", "fabric-mesh")];
+  const project = resolveProjectRoot(cwd);
+  const agent = resolveAgentDir();
+  // Use the runtime's resolver for every candidate, not just the winning config/override.
+  // Protect fleet DIR/mesh.dir aliases too, without migrating config or opening a backend.
+  const withoutOverride = { ...process.env, PI_FABRIC_MESH_ROOT: undefined };
+  const roots = [resolveMeshRoot(), resolveMeshDirectory(undefined, cwd),
+    resolveMeshDirectory(undefined, cwd, withoutOverride),
+    path.join(os.homedir(), ".local", "share", "smarty-dev", "fabric-mesh")];
   if (process.env.PI_FABRIC_MESH_DIR?.trim()) roots.push(process.env.PI_FABRIC_MESH_DIR.trim());
-  for (const file of [path.join(agent, "fabric.json"), path.join(cwd, ".pi", "fabric.json")]) {
+  const files = new Set([path.join(agent, "fabric.json"), path.join(project, ".pi", "fabric.json"), path.join(cwd, ".pi", "fabric.json")]);
+  for (const file of files) {
     let document: { mesh?: { dir?: unknown; root?: unknown } };
     try { document = JSON.parse(fs.readFileSync(file, "utf8")) as typeof document; }
     catch (error) {
@@ -53,7 +58,7 @@ const liveRoots = (): string[] => {
       throw error;
     }
     for (const value of [document?.mesh?.dir, document?.mesh?.root]) {
-      if (typeof value === "string" && value.trim()) roots.push(path.resolve(project, expandHome(value.trim())));
+      if (typeof value === "string" && value.trim()) roots.push(resolveMeshDirectory(expandHome(value.trim()), cwd, withoutOverride));
     }
   }
   return roots;

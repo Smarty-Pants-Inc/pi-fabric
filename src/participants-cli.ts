@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolveMeshDirectory } from "./core/agent-dir.js";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { assertMeshStateReadable, MeshStore } from "./mesh/store.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
@@ -65,14 +66,13 @@ const configuredRoot = (config: Record<string, unknown>): string | undefined => 
  */
 export const resolveMeshRoot = (env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): string => {
   if (env.PI_FABRIC_MESH_ROOT) return env.PI_FABRIC_MESH_ROOT;
-  const projectRoot = env.PI_FABRIC_PROJECT_ROOT ?? cwd;
   // ponytail: resolveAgentDir() reads process.env only; this is its rule for an explicit env.
   const agentDir = env.PI_CODING_AGENT_DIR
     ? env.PI_CODING_AGENT_DIR.replace(/^~(?=$|[\\/])/, os.homedir())
     : path.join(os.homedir(), ".pi", "agent");
   const configured = configuredRoot(readJson(path.join(cwd, ".pi", "fabric.json"))) ??
     configuredRoot(readJson(path.join(agentDir, "fabric.json")));
-  return configured ? path.resolve(projectRoot, configured) : path.join(projectRoot, ".pi", "fabric", "mesh");
+  return resolveMeshDirectory(configured, cwd, { ...env, PI_FABRIC_MESH_ROOT: undefined });
 };
 
 interface ParticipantsOptions {

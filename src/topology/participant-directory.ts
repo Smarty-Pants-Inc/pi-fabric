@@ -1908,6 +1908,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
         ? [{ key: entry.key, version: entry.version, participant }] : [];
     });
     const actorCopies: Array<{ key: string; version: number }> = [];
+    // smarty-dev#8526: renewals of actor files this host already owns run after the registry
+    // fence, like actorCopies: the key lock plus a fresh registry-lineage check at the write
+    // decision is the receipt adoption shares (it changes lineage holding this key's lock).
+    const actorRenewals: Array<() => Promise<void>> = [];
+    const renewOutsideFence = (record: FabricParticipantRecord): boolean => !!validPublication &&
+      !!this.options.withPublicationFence && !!this.options.actorRenewalAllowed &&
+      record.kind === "actor" && record.actorOwnershipToken !== undefined;
     const copyCommitted = async (key: string, version: number, participant: FabricParticipantRecord): Promise<void> => {
       if (validPublication && this.options.actorRenewalAllowed && participant.kind === "actor" && participant.actorOwnershipToken !== undefined) {
         actorCopies.push({ key, version });
@@ -1955,8 +1962,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // hold it (review/astra round 4 on #142).
           const key = keyFor(PARTICIPANT_PREFIX, record.id);
           const migrating = existingById.get(record.id)?.entry;
-          const publish = async (): Promise<void> => {
+          const publish = async (afterFence = false): Promise<void> => {
             const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
+              if (afterFence && !this.options.actorRenewalAllowed!(record)) return false;
               const taken = (entry: MeshStateEntry | undefined): boolean => {
                 if (!entry || ownParticipant(entry) !== undefined) return false;
                 const holder = participantFromEntry(entry);
@@ -1970,7 +1978,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
             }
           };
           if (migrating || !ownParticipant(filesByKey.get(key))) await publish();
-          else deferredFileWrites.push(publish);
+          else if (renewOutsideFence(record)) actorRenewals.push(() => publish(true));
+          else deferredFileWrites.push(() => publish());
         }
       }
       for (const copy of copies) await copyCommitted(copy.key, copy.version, copy.participant);
@@ -2076,6 +2085,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // AND current registry lineage while holding the actor key; adoption takes
     // the same key before changing lineage. New/changed actor files therefore
     // need no registry custody, keeping first publication of 50 actors bounded.
+    for (const renew of actorRenewals) await renew();
     for (const copy of actorCopies) await this.#copyCommitted(copy.key, copy.version);
     return committed;
   }

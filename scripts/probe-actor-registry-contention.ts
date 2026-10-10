@@ -26,8 +26,9 @@ if (args.role === "writer") {
   const owned = ids.filter((_, i) => i % writers === index);
   const actors = new Map<string, Record<string, unknown>>();
   for (const row of store.snapshot().actors) if (owned.includes(row.id)) {
-    const { messageHistory: _history, ...loaded } = row;
-    actors.set(row.id, { ...loaded, messages: ring(row.id) });
+    // The manager holds hydrated instructions, never the sidecar digest (smarty-dev#8525).
+    const { messageHistory: _history, instructionsFile: _digest, ...loaded } = row;
+    actors.set(row.id, { ...loaded, instructions: store.instructions(row), messages: ring(row.id) });
   }
   const running = [...actors.values()].filter(row => row.status === "running" || row.status === "idle-running");
   // A running actor changes status or updatedAt every ~1 s (turn start/finish, tool activity).

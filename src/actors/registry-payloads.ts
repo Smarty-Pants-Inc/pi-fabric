@@ -4,6 +4,8 @@ import path from "node:path";
 import { syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
 
 const HISTORY_LIMIT = 100;
+// smarty-dev#8525: longer instructions live in content-addressed sidecars.
+const INLINE_INSTRUCTIONS_BYTES = 1_024;
 
 export interface ActorMessageHistory {
   version: 1;
@@ -59,6 +61,43 @@ export class ActorRegistryPayloads {
   // history re-read. Speculative digests are promoted only by accept() after the commit.
   readonly #committedRings = new Map<string, { head: string; digest: string }>();
   #speculativeRings: Map<string, { head: string; digest: string }> | undefined;
+  // Sidecars this process has verified durable, by actor id: the text and its digest.
+  readonly #instructionFiles = new Map<string, { text: string; hash: string }>();
+
+  /** True when compact() moves this row's inline instructions to a sidecar. */
+  movesInstructions(row: Row): boolean {
+    return typeof row.instructions === "string" && Buffer.byteLength(row.instructions, "utf8") > INLINE_INSTRUCTIONS_BYTES;
+  }
+
+  /** True when `text` is the verified sidecar `hash` for `id`: lets unchanged rows skip hashing. */
+  storedInstructions(id: string, hash: unknown, text: unknown): boolean {
+    const stored = this.#instructionFiles.get(id);
+    return stored !== undefined && stored.hash === hash && stored.text === text;
+  }
+
+  /** Durable sidecar for a long text before any registry row may reference it. Every live
+   * release (since 8b22ce04) reads `instructionsFile` and re-inlines the text on its own
+   * owned-row saves, so the registry never carries a stub (smarty-dev#8525). */
+  #storeInstructions(id: string, text: string): string {
+    const stored = this.#instructionFiles.get(id);
+    if (stored?.text === text) return stored.hash;
+    const hash = createHash("sha256").update(text).digest("hex");
+    const file = path.join(this.directory(id), `instructions-${hash}.txt`);
+    let existing: string | undefined;
+    try { existing = fs.readFileSync(file, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (existing === undefined) writeFileAtomic(file, text, { durable: true });
+    else {
+      if (existing !== text) throw new Error("Corrupt actor instructions payload");
+      // Existence is not a durability receipt (an earlier barrier may have failed after
+      // rename). Writable handle: FlushFileBuffers on Windows needs write access.
+      const fd = fs.openSync(file, "r+");
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      syncPathNamespace(file);
+    }
+    this.#instructionFiles.set(id, { text, hash });
+    return hash;
+  }
 
   /** True when `messages` is exactly the ring this process committed at `head` for `id`. */
   committedRing(id: string, head: unknown, messages: readonly unknown[]): boolean {
@@ -279,12 +318,17 @@ export class ActorRegistryPayloads {
     const compact = { ...row };
     delete compact.registryMessageAppend;
     delete compact.registryMessageReset;
-    // Read the previous PR layout once, but never publish an instructions stub.
-    // Hydrated manager rows are committed inline by the durable atomic registry
-    // writer: never re-fsync an existing instruction file through a read-only
-    // handle (FlushFileBuffers on Windows requires write access).
-    if (row.instructionsFile !== undefined) compact.instructions = this.instructions(row);
-    delete compact.instructionsFile;
+    // smarty-dev#8525: a long text is replaced by its sidecar digest, never by a stub:
+    // the row carries no `instructions` key at all. A row that already names only a
+    // sidecar keeps it unread; any other sidecar row is hydrated, then re-addressed.
+    if (!(row.instructions === undefined && row.instructionsFile !== undefined)) {
+      if (row.instructionsFile !== undefined) compact.instructions = this.instructions(row);
+      delete compact.instructionsFile;
+      if (this.movesInstructions(compact)) {
+        compact.instructionsFile = this.#storeInstructions(id, compact.instructions as string);
+        delete compact.instructions;
+      }
+    }
     // Filter skips are bounded, rebuildable telemetry, not accepted activations.
     // Preserve their existing soft inline journal until substantive history exists;
     // externalizing this case would introduce fsyncs on every filter poll.

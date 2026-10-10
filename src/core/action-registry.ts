@@ -1,5 +1,6 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
 import { snapshotFabricInvocation } from "../fabric-provenance.js";
+import { retainResidentProcessWork } from "../residency/process-work.js";
 import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
 import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../components/effect-policy.js";
@@ -307,9 +308,15 @@ export class ActionRegistry {
   #unavailableResolver: ((name: string) => string | undefined) | undefined;
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
+  #residentProcessWorkSessionId: string | undefined;
 
   constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
     this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
+  }
+
+  /** Native mesh composition opts in; hosted registries never inspect ambient session APIs. */
+  setResidentProcessWorkSession(sessionId: string): void {
+    this.#residentProcessWorkSessionId = sessionId;
   }
 
   /**
@@ -854,6 +861,7 @@ export class ActionRegistry {
     const consumption = new ResultConsumption();
     const deferConsumption = context.deferResultConsumption;
     let endBindingInvocation: (() => Promise<void>) | undefined;
+    const releaseWork = retainResidentProcessWork(this.#residentProcessWorkSessionId);
     try {
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,
@@ -1195,6 +1203,7 @@ export class ActionRegistry {
     } finally {
       invocationActive = false;
       consumption.abandon();
+      releaseWork();
       if (audit) audit.endedAt ??= Date.now();
       void endBindingInvocation?.().catch(() => undefined);
     }

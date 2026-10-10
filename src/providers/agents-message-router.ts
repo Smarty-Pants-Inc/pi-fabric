@@ -113,7 +113,7 @@ export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -671,7 +671,13 @@ export class AgentMessageRouter {
         ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
       },
       participant.ownerIdentityId,
-      { idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
+      {
+        idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null,
+        // Retained dormant authority has no live-owner ACK window yet. Its committed
+        // command must include bounded cold startup, formerly waited out in preflight.
+        ...(participant.stale ? { timeoutMs: 90_000 } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      },
     );
   }
 
@@ -818,6 +824,20 @@ export class AgentMessageRouter {
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
+    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
+    const definition = this.resolveActorTarget(id, false);
+    if (meshRoot && definition.actor?.residency === "durable" &&
+        ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
+        !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {
+      const { dormantActorRoute } = await import("../residency/wake.js");
+      const retained = dormantActorRoute(meshRoot, definition.actor);
+      // No wake effect here. The ordinary caller checks capability/binding/control;
+      // control then admits and commits a command. ONLY its post-commit hook wakes.
+      if (retained) {
+        if (!this.control) throw new Error(`Fabric actor owner ${retained.ownerHostId} has no acknowledged control channel`);
+        return { actor: definition.actor, participant: retained };
+      }
+    }
     const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&

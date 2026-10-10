@@ -48,6 +48,7 @@ import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
+import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
@@ -468,11 +469,12 @@ const main = async (): Promise<void> => {
     fs.rmSync(replyFile!, { force: true });
     piArguments.push("-e", hookPath);
   }
-  // smarty-dev#2184: every Pi actor run gets the bash timeout, also a native-tool one that runs
-  // with --no-extensions (an explicit -e still loads). It comes after Fabric's -e so Fabric's
-  // foreground-wait guard judges the caller's own timeout; with Fabric loaded, the second hook finds
-  // the timeout set and does nothing.
-  if (options.actorId) {
+  // smarty-dev#2184, #6137: every Pi actor run, and every task run with native bash, gets the bash
+  // defaults (total cap, idle watchdog), also one that runs with --no-extensions (an explicit -e
+  // still loads). Fabric's own hook covers its pi.bash. It comes after Fabric's -e so Fabric's
+  // foreground-wait guard judges the caller's own command; with Fabric loaded, the second hook
+  // finds the call already handled and does nothing.
+  if (options.actorId || options.tools.includes("bash")) {
     const hookPath = fileURLToPath(new URL(
       import.meta.url.endsWith(".ts") ? "./guards/actor-bash-hook.ts" : "./guards/actor-bash-hook.js",
       import.meta.url,
@@ -552,6 +554,7 @@ const main = async (): Promise<void> => {
   delete childEnvironment.PI_SESSION_ID;
   delete childEnvironment.PI_SESSION_FILE;
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
+  delete childEnvironment.PI_FABRIC_BASH_IDLE_S;
   delete childEnvironment.PI_FABRIC_PINNED_EXTENSION;
   if (options.runner === "pi" && options.fabricExtensionPath) childEnvironment.PI_FABRIC_PINNED_EXTENSION = pinnedFabricExtension;
   // A task child has its own identity and reply contract, not its actor parent's.
@@ -566,6 +569,13 @@ const main = async (): Promise<void> => {
   if (options.actorId && options.bashTimeoutSeconds !== undefined &&
     Number.isInteger(options.bashTimeoutSeconds) && options.bashTimeoutSeconds >= 0) {
     childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S = String(options.bashTimeoutSeconds);
+  }
+  // smarty-dev#6137: every Pi run Fabric launches (task agent or actor, never a Main) gets the bash
+  // idle watchdog; the variable's presence also gives task agents the total bash cap.
+  if (options.runner === "pi") {
+    childEnvironment.PI_FABRIC_BASH_IDLE_S = String(
+      options.bashIdleSeconds !== undefined && Number.isInteger(options.bashIdleSeconds) && options.bashIdleSeconds >= 0
+        ? options.bashIdleSeconds : DEFAULT_BASH_IDLE_S);
   }
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.

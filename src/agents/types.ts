@@ -72,6 +72,8 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
+  /** Caller classification passed to the optional external spawn router. */
+  complexity?: "simple" | "normal" | "complex" | "delicate";
   /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
   /** Absolute inputs that must exist on the selected execution host before starting. */
@@ -123,6 +125,8 @@ export interface AgentRunRequest {
   nice?: number;
   /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
   bashTimeoutSeconds?: number;
+  /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
+  bashIdleSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -325,6 +329,7 @@ export interface AgentWorkerOptions {
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
   bashTimeoutSeconds?: number;
+  bashIdleSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
   /** Host-only bounded judge: no ambient resources, compaction or retry. */

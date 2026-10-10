@@ -848,6 +848,8 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Fenced terminal foreign session-root record; never grants adoption/restart. */
+  sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */
@@ -981,7 +983,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { complexity?: "simple" | "normal" | "complex" | "delicate"; pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */

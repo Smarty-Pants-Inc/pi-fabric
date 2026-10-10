@@ -64,7 +64,7 @@ describe("same-user resident actor operator", () => {
       await f.host.participants.refresh();
       expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeDefined();
 
-      const dry = await f.cli("stop", victim.name, ["--dry-run"], path.basename(f.config.residencyRoot).slice(0, 12));
+      const dry = await f.cli("stop", victim.name, ["--dry-run", ...f.confirm], path.basename(f.config.residencyRoot).slice(0, 12));
       expect(dry).toMatchObject({ code: 0, err: "" });
       expect(f.host.actors.status(victim.id).status).toBe("running");
       const stopped = await f.cli("stop", victim.name, f.confirm);
@@ -220,7 +220,9 @@ describe("same-user resident actor operator", () => {
       const actor = await f.create("confirm-target");
       writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
         updatedAt: 1, expiresAt: 2 });
-      const dry = await f.cli(action, actor.id, ["--dry-run"]);
+      // A dry run runs every check: without confirmation it refuses as the real run would.
+      expect(await f.cli(action, actor.id, ["--dry-run"])).toMatchObject({ code: 1, err: expect.stringContaining("Missing --confirm-dead-root") });
+      const dry = await f.cli(action, actor.id, ["--dry-run", ...f.confirm]);
       expect(dry).toMatchObject({ code: 0, err: "" });
       const evidence = JSON.parse(dry.out).operatorEvidence;
       expect(evidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId,
@@ -240,16 +242,17 @@ describe("same-user resident actor operator", () => {
     } finally { await f.close(); }
   }, 30_000);
 
-  it.each(["stop", "remove"] as const)("%s refuses an unexpired lease even when confirmed; dry-run reports it", async action => {
+  it.each(["stop", "remove"] as const)("%s refuses an unexpired lease (a live Main) even when confirmed; a live-path dry run refuses it too", async action => {
     const f = await fixture();
     try {
       const actor = await f.create("live-lease");
       const updatedAt = Date.now(), expiresAt = updatedAt + 60_000;
       writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId, updatedAt, expiresAt });
       expect(await f.cli(action, actor.id, f.confirm)).toMatchObject({ code: 1, err: expect.stringContaining("live root lease") });
-      const dry = await f.cli(action, actor.id, ["--dry-run"]);
-      expect(dry.code).toBe(0);
-      expect(JSON.parse(dry.out).operatorEvidence).toMatchObject({ lastLeaseTime: updatedAt, leaseExpiresAt: expiresAt, liveLease: true });
+      // The resident host's dry run runs every check: a live Main refuses, reporting the same evidence.
+      const dry = await f.cli(action, actor.id, ["--dry-run", ...f.confirm]);
+      expect(dry.code).toBe(1); expect(dry.err).toContain("Main has a live root lease");
+      expect(dry.err).toContain(`"lastLeaseTime":${updatedAt},"leaseExpiresAt":${expiresAt},"liveLease":true`);
       expect(f.host.actors.status(actor.id).status).toBe("idle");
     } finally { await f.close(); }
   }, 30_000);
@@ -307,7 +310,7 @@ describe("same-user resident actor operator", () => {
     try {
       const actor = await f.create("bin-target");
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
-      const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run"]);
+      const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run", ...f.confirm]);
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
       const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });

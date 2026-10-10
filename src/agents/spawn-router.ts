@@ -52,8 +52,10 @@ const routerEnv = (): NodeJS.ProcessEnv => {
   }
   return env;
 };
-const reasonCode = (value: string, task?: string): string =>
-  value.length > 0 && !/[^a-z0-9_.:-]/.test(value) && (!task || !value.includes(task)) ? value.slice(0, 64) : "redacted";
+const reasonCode = (value: string): string => value === "normal.implementation" ? "normal.implementation" : "other";
+const policyVersionCode = (value: string): string =>
+  // The final assertion also rejects trailing line terminators, which $ alone accepts.
+  value.length <= 40 && /^(?:[0-9]+\.[0-9]+(?:\.[0-9]+)?|[a-fA-F0-9]{7,40})$(?![\s\S])/.test(value) ? value : "unknown";
 const MAX_LEDGER_BYTES = 8 * 1024 * 1024;
 const ledgerWrites = new Map<string, Promise<void>>();
 
@@ -239,8 +241,8 @@ export const routeAgentCreation = async (options: {
       let model: string;
       try { model = options.validateModel(value.model.trim()); } catch { throw new Error("unknown-or-denied-model"); }
       pick = { model, thinking: value.thinking,
-        ...(typeof value.reason === "string" ? { reason: reasonCode(value.reason, options.task) } : {}),
-        ...(typeof value.policyVersion === "string" ? { policyVersion: reasonCode(value.policyVersion, options.task) } : {}) };
+        ...(typeof value.reason === "string" ? { reason: reasonCode(value.reason) } : {}),
+        ...(typeof value.policyVersion === "string" ? { policyVersion: policyVersionCode(value.policyVersion) } : {}) };
       if (mode === "enforce") {
         selected = { model: pick.model, thinking: pick.thinking };
         actual = { model: pick.model, thinking: pick.thinking };

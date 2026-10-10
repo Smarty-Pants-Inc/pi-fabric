@@ -99,7 +99,7 @@ Example output:
   "model": "provider/model",
   "thinking": "high",
   "reason": "normal.implementation",
-  "policyVersion": "2026-10-v1"
+  "policyVersion": "1.0.0"
 }
 ```
 
@@ -119,11 +119,14 @@ Enabled modes append one JSON line to `<mesh>/router/decisions.jsonl`:
 `ts`, `requestDigest` (SHA-256 of request metadata excluding raw task), `kind`,
 `mode`, `decision` (`explicit`/`default`/`enforce`), `pick`, `actual`, `latencyMs`,
 and `error` (fixed adapter code or null). A valid pick includes its canonical
-model/thinking and optional reason/version codes. Reason and version metadata
-are persisted only as lowercase codes matching `[a-z0-9_.:-]+`, truncated to
-64 characters; other values (including echoes of the supplied task) are replaced
-with `redacted`. Free-form router reasons, raw tasks, and router stderr never
-enter the ledger.
+model/thinking and optional reason/version codes. The closed reason allowlist is
+`normal.implementation` (the documented command reason above); all other string
+reasons are recorded as `other`, never as the router's raw value. `policyVersion`
+is preserved only when it is a numeric `major.minor` or `major.minor.patch`, or a
+7–40-character hexadecimal SHA (case-insensitive), with a maximum of 40 characters.
+No whitespace, suffixes, or truncation are accepted; all other string versions
+are recorded as `unknown`. Free-form router reasons, raw tasks, and router stderr
+never enter the ledger.
 
 The router directory is created with mode 0700 and must be a real directory
 (`lstat`, not a symlink), owned by the current uid with private permissions

@@ -10,7 +10,7 @@ import { routeAgentCreation, type SpawnRouterRequest } from "../src/agents/spawn
 const roots: string[] = [];
 const root = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-router-")); roots.push(dir); return dir; };
 afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
-const pick = { model: "provider/model-b", thinking: "high", reason: "normal.policy", policyVersion: "v1" };
+const pick = { model: "provider/model-b", thinking: "high", reason: "normal.implementation", policyVersion: "1.0.0" };
 const defaults = { model: "provider/model-a", thinking: "medium" as const };
 const command = (dir: string, body = `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`): string[] => [
   process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
@@ -128,27 +128,39 @@ describe("external spawn router behavior", () => {
     expect(request(dir).task).toBe(opts.task);
     expect(JSON.stringify(decisions(dir))).not.toContain(opts.task);
   });
-  it.each([
-    ["normal.policy:task-agent_1-v2", "normal.policy:task-agent_1-v2"],
-    ["a".repeat(100), "a".repeat(64)],
-    ["private task 🦉", "redacted"],
-    ["policy\nsecret-token", "redacted"],
-    ["policy\n", "redacted"],
-    ["policy\r\n", "redacted"],
-    ["UPPERCASE", "redacted"],
-    ["", "redacted"],
-  ])("stores only a bounded reason/version code for %s", async (reason, expected) => {
+  it.each(["normal.policy", "normal.implementation:secret-token", "normal.implementation\n", "policy", "a".repeat(100), "private task 🦉", "UPPERCASE", ""])("maps unrecognized reason %s to other", async reason => {
     const dir = root(); const opts = options(dir);
-    const body = `process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: ${JSON.stringify(reason)}, policyVersion: ${JSON.stringify(reason)} }));`;
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, reason }))});`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
-    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: expected, policyVersion: expected }, error: null });
-    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(opts.task);
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: pick.policyVersion }, error: null });
+  });
+  it.each(["1.2", "1.2.3", `${"1".repeat(36)}.1.0`, "abcdef0", "a".repeat(40), "ABCDEF0123456789"])("preserves the documented reason and valid version %s", async policyVersion => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { ...pick, policyVersion }, error: null });
+  });
+  it.each(["v1", "2026-10-v1", "abcdef", "a".repeat(41), `${"1".repeat(37)}.1.0`, "1", "1.2.3.4", "1.2.3-secret", "1.2\n", "abcdef0\r\n", "1.2\u2028", "1.2\u2029", " 1.2", "1.2 ", ""])("maps invalid version %s to unknown without truncation", async policyVersion => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: pick.reason, policyVersion: "unknown" }, error: null });
+  });
+  it.each(["shadow", "enforce"] as const)("never records task-secret fragments echoed through either metadata field in %s mode", async mode => {
+    const dir = root(); const fragment = "secret-token"; const opts = { ...options(dir), task: `deploy ${fragment} to production` };
+    const logs = [vi.spyOn(console, "log"), vi.spyOn(console, "warn"), vi.spyOn(console, "error")].map(spy => spy.mockImplementation(() => {}));
+    const body = `const fragment = JSON.parse(input).task.split(' ')[1]; process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: fragment, policyVersion: fragment }));`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, mode, includeTask: true, command: command(dir, body) } })).toEqual(mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : undefined);
+    expect(request(dir).task).toBe(opts.task);
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: "unknown" }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(fragment);
+    for (const log of logs) expect(JSON.stringify(log.mock.calls)).not.toContain(fragment);
   });
   it.each(["secret-task", "private task 🦉"])("redacts task text echoed through router metadata (%s)", async task => {
     const dir = root(); const opts = { ...options(dir), task };
     const body = `const task = JSON.parse(input).task; process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: task, policyVersion: task }));`;
     expect(await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
-    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "redacted", policyVersion: "redacted" }, error: null });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: "unknown" }, error: null });
     expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(task);
   });
   it("explicit model/thinking starts no router but logs the actual binding", async () => {

@@ -107,6 +107,12 @@ const lazyEntryPoints = [
 
 buildLandlock();
 
+// The production authority path is a literal. Only Vitest may substitute a
+// private fixture path; there is no production rollout/requirement switch.
+const hostPolicyConstants = {
+  __FABRIC_HOST_POLICY_PATH__: JSON.stringify("/etc/smarty/fabric-policy.json"),
+};
+
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
   // Both facades only re-export host metadata. Resolve to their implementation
@@ -128,6 +134,7 @@ const result = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   splitting: true,
   sourcemap: true,
   metafile: true,
@@ -159,6 +166,7 @@ const standalone = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   metafile: true,
   logLevel: "info",
@@ -186,6 +194,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   logLevel: "info",
 });
@@ -213,6 +222,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   logLevel: "info",
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });

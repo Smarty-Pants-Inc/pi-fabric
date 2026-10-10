@@ -21,8 +21,6 @@ import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
-import os from "node:os";
-import { archiveActorForRemoval, assertOwnershipProvable, pinActorTree, validMainStoppedAudit, type MainStoppedAudit } from "../actors/remove-offline.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -43,7 +41,7 @@ import { AgentManager } from "../agents/manager.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, meshProcessStartedAt, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
@@ -66,7 +64,6 @@ import {
   commitResidentRequest,
   readResidentRequestDecision,
   residentDeliveryPrefix,
-  residentActorRoots,
   residentHostId,
   residentRemovalsPath,
   residentResultPath,
@@ -123,6 +120,12 @@ const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
 };
 
+const residentActorRoots = (config: ResidentHostConfig): { project: string; session: string } =>
+  config.sessionActorRoot
+    ? { project: config.actorRoot, session: config.sessionActorRoot }
+    : config.mesh.actorScope === "session"
+      ? { project: path.dirname(config.actorRoot), session: config.actorRoot }
+      : { project: config.actorRoot, session: path.join(config.actorRoot, config.sessionId) };
 
 const readJson = <T>(filePath: string): T | undefined => {
   try {
@@ -1529,68 +1532,27 @@ export class ResidentHost {
         if ((command.action !== "stop" && command.action !== "remove") ||
             typeof command.id !== "string" || !command.id.trim() ||
             (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
-            (command.dryRun !== undefined && typeof command.dryRun !== "boolean") ||
-            (command.mainStoppedAudit !== undefined && !validMainStoppedAudit(command.mainStoppedAudit, this.config.rootId))) {
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
           throw new Error("Invalid resident operator actor request");
         }
-        // Input errors first, on every platform: resolve the actor before any liveness or identity check.
+        const evidence = readResidentOperatorEvidence(this.config, this.mesh);
+        const check = () => assertResidentOperatorConfirmed(
+          readResidentOperatorEvidence(this.config, this.mesh), command.confirmDeadRoot);
+        assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
         if (candidates.length !== 1) throw new Error(candidates.length
           ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
         const actor = candidates[0]!;
-        // smarty-dev#7817: this host's own root-lease heartbeat is not a live Main.
-        const self = { pid: process.pid, host: os.hostname(), startedAt: meshProcessStartedAt };
-        // The live path needs no startup claim: this running host holds host.lock for its whole life, so no
-        // other resident host can start on this root while it executes the removal (smarty-dev#7817).
-        // Remove needs the operator's --main-stopped assertion (smarty-dev#7956 carries automatic proof);
-        // it never overrides a live lease or a fresh, reloading or doubtful root participant.
-        const mainStopped = command.action === "remove" ? command.mainStoppedAudit !== undefined : undefined;
-        const options = { mainStopped: mainStopped === true };
-        const evidence = readResidentOperatorEvidence(this.config, this.mesh, self, options);
-        const check = () => assertResidentOperatorConfirmed(
-          readResidentOperatorEvidence(this.config, this.mesh, self, options), command.confirmDeadRoot, false, mainStopped);
-        // smarty-dev#7817: verify the actor tree's containment and ownership before any mutation (stop included).
-        const sessionDir = path.dirname(actor.sessionFile ?? "");
-        const removeChecks = (): void => {
-          if (!actor.sessionFile || path.basename(sessionDir) !== actor.id ||
-              !Object.values(residentActorRoots(this.config)).includes(path.dirname(sessionDir))) {
-            throw new Error(`Actor ${actor.id} session is outside this resident's actor roots`);
-          }
-          // Refuses where file ownership cannot be proven (smarty-dev#7858), before the stop.
-          assertOwnershipProvable();
-          pinActorTree(sessionDir).close();
-        };
-        if (command.action === "remove" && command.dryRun === true) {
-          // A remove dry run runs every check a real removal runs, and changes nothing (smarty-dev#7817).
-          try { assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, false, mainStopped); removeChecks(); }
-          catch (error) { throw new ResidentActorAuthorizationError(`would refuse: ${errorMessage(error)}`); }
-          response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now(),
-            plan: { archiveRoot: path.join(this.config.residencyRoot, "archives"),
-              audit: { ...(command.mainStoppedAudit as MainStoppedAudit), toolEvidence: evidence.toolEvidence } } };
-        } else if (command.dryRun === true) {
-          assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, true, mainStopped);
+        if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
-          assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, false, mainStopped);
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
-          if (command.action === "remove") removeChecks();
           const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
           boundaryAdmitted?.();
           const stopped = await pending;
-          // Archive first, before the removal deletes or revokes anything.
-          if (command.action === "remove") {
-            const row = new ActorRegistryStore(path.dirname(sessionDir)).snapshot().actors.find(entry => entry.id === actor.id);
-            if (stopped.sessionFile !== actor.sessionFile || !row) throw new Error(`Actor ${actor.id} registry row not found for its removal archive`);
-            // The same lstat-verified, pinned walk as the offline path, taken again after the stop; tar follows nothing.
-            const tree = pinActorTree(sessionDir);
-            try { archiveActorForRemoval(path.join(this.config.residencyRoot, "archives"), this.config.rootId, row, tree,
-              Date.now(), { ...(command.mainStoppedAudit as MainStoppedAudit), requestId,
-                toolEvidence: readResidentOperatorEvidence(this.config, this.mesh, self, options).toolEvidence! }); }
-            finally { tree.close(); }
-          }
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
             : await this.#removeResidentActor(actor.id, requestId, () => check());

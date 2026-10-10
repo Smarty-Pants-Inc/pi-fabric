@@ -116,7 +116,7 @@ export const acquireMainPublicationFence = async (meshRoot: string, rootId: stri
 };
 
 /**
- * THE path that deletes a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
+ * THE path that removes (moves to its archive) a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
  * Main publication fence, run the final check under it, delete, release in finally. A Main cannot publish
  * its root participant between the check and the delete. The live host path is smarty-dev#8090.
  */

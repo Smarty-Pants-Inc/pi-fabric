@@ -8,7 +8,10 @@ import { residentProcessAlive } from "./residency/process-identity.js";
 const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
 const help = `${usage}
 
-remove needs --main-stopped. --main-stopped is an OPERATOR ATTESTATION, not a machine proof: the operator
+When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
+path is unchanged; smarty-dev#8090). The offline removal archives the actor by one rename of its directory into
+<residency>/archives/<id>.<time>.<rand>/ (same filesystem only) beside its registry row and audit record;
+deleting archives is left to retention (smarty-dev#7916). --main-stopped is an OPERATOR ATTESTATION, not a machine proof: the operator
 states that the root's Main process is gone. Chief-of-staff accepted it on 2026-10-09 for the operator of the
 dead Main's own fleet, or Light for the #7231 waves; nobody else uses it. The automatic proof is smarty-dev#7956.
 It needs --evidence <text> or --evidence-file <path> (read as text, capped at 64 KiB): the Herdr pane/agent
@@ -103,6 +106,8 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
       io.out(JSON.stringify({ resident: directory, action, ...response }) + "\n");
       return response.cleaned === false ? 1 : 0;
     }
+    // The live resident's own remove path is unchanged here (smarty-dev#8090); the attestation is offline-only.
+    if (mainStopped) throw new Error("--main-stopped applies only to an offline removal (dead resident host); the live resident path is smarty-dev#8090");
     // The runtime exchange deliberately unrefs its polling timer. A standalone operator process must
     // stay alive until the acknowledged response is printed: one ref'd timer for the wait's own
     // deadline, cleared when the wait settles. No periodic timer.
@@ -110,7 +115,7 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const keepAlive = setTimeout(() => {}, client.commandTimeoutMs + 1_000);
     try {
       const response = await client.operatorActor(action,
-        values["--actor"], { dryRun, ...confirmation });
+        values["--actor"], { dryRun, ...(confirmation.confirmDeadRoot !== undefined ? { confirmDeadRoot: confirmation.confirmDeadRoot } : {}) });
       io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;
     } finally { clearTimeout(keepAlive); }

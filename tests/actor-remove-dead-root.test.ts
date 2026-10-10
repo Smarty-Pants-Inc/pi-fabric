@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -96,10 +97,6 @@ const fixture = async () => {
 };
 
 describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead root (smarty-dev#7817)", () => {
-  const selfLease = (f: Awaited<ReturnType<typeof fixture>>, incarnationAgeMs: number) =>
-    writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
-      startedAt: Date.now() - incarnationAgeMs, updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
-      writer: { pid: process.pid, host: os.hostname(), releaseSha: "test", lockProtocol: 1, stateBackend: "file", startedAt: meshProcessStartedAt } });
   const fresh = ROOT_PARTICIPANT_FRESH_MS;
   const participantFile = (f: Awaited<ReturnType<typeof fixture>>) =>
     path.join(f.config.meshRoot, "participants", createHash("sha256").update(f.config.rootId).digest("hex") + ".json");
@@ -107,11 +104,11 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     expect(f.registered(id)).toBe(true); expect(f.archives()).toEqual([]);
   };
 
-  it.each(["live", "offline"] as const)("%s: no --main-stopped refuses; --main-stopped without evidence refuses", async mode => {
+  it("offline: no --main-stopped refuses; --main-stopped without evidence refuses", async () => {
     const f = await fixture();
     try {
       const actor = await f.create("unasserted");
-      if (mode === "offline") await f.killResident();
+      await f.killResident();
       const unflagged = await f.cli(actor.id, ["--confirm-dead-root", f.config.rootId]);
       expect(unflagged.code).toBe(1);
       expect(unflagged.err).toContain("the root's Main may be running; confirm it is stopped and pass --main-stopped (automatic proof: smarty-dev#7956)");
@@ -128,12 +125,12 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     ["a reloading root participant", "reloading", "Main identity cannot be verified: root participant is reloading; refusing (smarty-dev#7956)"],
     ["no root participant record (identity unavailable)", undefined, "no root participant record; automatic proof for roots whose records are gone: smarty-dev#7956"],
     ["a stale participant whose owner lease expired", 2 * fresh, undefined],
-  ] as const)("case 1: --main-stopped under a resident-renewed lease with %s", async (_name, participant, refusal) => {
+  ] as const)("offline: --main-stopped with %s", async (_name, participant, refusal) => {
     const f = await fixture();
     try {
       const actor = await f.create("leftover");
-      // The root lease, renewed by the resident host itself (this process), with no Main session.
-      selfLease(f, 2 * fresh);
+      await f.killResident();
+      if (participant === undefined) fs.unlinkSync(participantFile(f));
       if (participant === "reloading") writeParticipantFile(f.config.meshRoot, {
         key: "topology/participants/" + createHash("sha256").update(f.config.rootId).digest("hex"),
         value: { id: f.config.rootId, rootId: f.config.rootId, kind: "root", ownerHostId: f.config.rootId, status: "reloading",
@@ -147,64 +144,19 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
         return;
       }
       expect(result).toMatchObject({ code: 0, err: "" });
-      await f.host.actors.removalSettled(actor.id);
       expect(f.registered(actor.id)).toBe(false);
       // The audit record: operator, root id, time and evidence.
       const audit = f.archives().find(file => file.endsWith(`${actor.id}.operator.json`))!;
       const record = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "archives", audit), "utf8"));
       expect(record).toMatchObject({ mainStopped: true, rootId: f.config.rootId, operatorAttestation: EVIDENCE,
-        operator: { user: process.env.USER ?? null, pid: process.pid }, requestId: expect.any(String) });
+        operator: { user: process.env.USER ?? null, pid: process.pid } });
       expect(Date.now() - Date.parse(record.assertedAt)).toBeLessThan(60_000);
-      // The tool's own snapshot: root lease (the resident's heartbeat), each participant and its pid check.
-      expect(record.toolEvidence).toMatchObject({ host: os.hostname(), capturedAt: expect.any(String),
-        rootLease: { present: true, writer: { pid: process.pid, isResident: true } } });
+      // The tool's own snapshot: each participant and its pid check.
+      expect(record.toolEvidence).toMatchObject({ host: os.hostname(), capturedAt: expect.any(String) });
       expect(record.toolEvidence.participants).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: "file", ownerHostId: f.config.rootId, lastSeen: expect.any(Number), pid: 2147483647,
           host: os.hostname(), identity: "gone: Main pid 2147483647 does not exist on this host" })]));
       expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining(["SHA256SUMS", `${actor.id}.registry.json`]));
-    } finally { await f.close(); }
-  }, 40_000);
-
-  it("case 1: a resident-renewed lease without --main-stopped is a live Main for stop", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("stop-only");
-      selfLease(f, 2 * fresh);
-      let err = "";
-      const code = await main(["stop", "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot,
-        "--confirm-dead-root", f.config.rootId], { out: () => {}, err: text => { err += text; } });
-      expect(code).toBe(1); expect(err).toContain("live root lease");
-      expect(f.host.actors.status(actor.id).status).toBe("idle");
-    } finally { await f.close(); }
-  }, 40_000);
-
-  it("case 1: a fresh root participant owned by the resident host id is Main evidence, not set aside", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("resident-owned");
-      selfLease(f, 2 * fresh);
-      f.mainParticipant(Date.now(), residentHostId(f.config.rootId));
-      const result = await f.cli(actor.id);
-      expect(result.code).toBe(1); expect(result.err).toContain("Main is live: root participant is fresh");
-      expect(f.registered(actor.id)).toBe(true);
-      expect(f.archives()).toEqual([]);
-    } finally { await f.close(); }
-  }, 40_000);
-
-  it("live path: a symlink in the actor tree refuses before the stop; nothing changed", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("live-linked");
-      f.mainParticipant(Date.now() - 2 * fresh);
-      const actorDir = path.dirname(f.host.actors.status(actor.id).sessionFile!);
-      fs.mkdirSync(actorDir, { recursive: true });
-      fs.symlinkSync(path.join(f.config.meshRoot, "elsewhere"), path.join(actorDir, "escape"));
-      const before = f.host.actors.status(actor.id).status;
-      const result = await f.cli(actor.id);
-      expect(result.code).toBe(1); expect(result.err).toContain("symlink");
-      expect(f.host.actors.status(actor.id).status).toBe(before);
-      expect(f.registered(actor.id)).toBe(true);
-      expect(f.archives()).toEqual([]);
     } finally { await f.close(); }
   }, 40_000);
 
@@ -219,7 +171,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
     try {
       const actor = await f.create("identity");
-      selfLease(f, 2 * fresh);
+      await f.killResident();
       await vi.waitFor(() => expect(processStartTime(child.pid!)).toBeDefined());
       const startTime = start === "same" ? processStartTime(child.pid!) : start === "other" ? "1" : undefined;
       f.mainParticipant(Date.now() - 2 * fresh, f.config.rootId, start === "nopid" ? { host } : { pid: child.pid!, host, ...(startTime ? { startTime } : {}) });
@@ -230,16 +182,15 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
         return;
       }
       expect(result).toMatchObject({ code: 0, err: "" });
-      await f.host.actors.removalSettled(actor.id);
       expect(f.registered(actor.id)).toBe(false);
     } finally { child.kill(); await f.close(); }
   }, 40_000);
 
-  it.each(["live", "offline"] as const)("%s: an unknown actor prefix is reported before any liveness or identity check", async mode => {
+  it("offline: an unknown actor prefix is reported before any liveness or identity check", async () => {
     const f = await fixture();
     try {
       const actor = await f.create("prefix");
-      if (mode === "offline") { await f.killResident(); fs.unlinkSync(participantFile(f)); }
+      await f.killResident(); fs.unlinkSync(participantFile(f));
       // No participant record: identity is unavailable, yet the input error comes first.
       const result = await f.cli(actor.id.slice(0, 8));
       expect(result.code).toBe(1); expect(result.err).toContain(`Unknown Fabric actor: ${actor.id.slice(0, 8)}`);
@@ -310,19 +261,17 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     } finally { await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   }, 40_000);
 
-  it.each(["live", "offline"] as const)("%s: a remove dry run against a live root reports the refusal and changes nothing", async mode => {
+  it("offline: a remove dry run against a live root reports the refusal and changes nothing", async () => {
     const f = await fixture();
     try {
       const actor = await f.create("dry-live");
-      if (mode === "offline") await f.killResident();
+      await f.killResident();
       f.mainParticipant(Date.now()); // the root's Main is live
       const before = fs.readdirSync(f.config.residencyRoot).sort();
       const dry = await f.cli(actor.id, [...f.confirmed, "--dry-run"]);
       expect(dry.code).toBe(1); expect(dry.err).toContain("would refuse: Main is live: root participant is fresh");
       expectUnchanged(f, actor.id);
-      // Offline, nothing is written at all (the live host keeps its own request bookkeeping).
-      if (mode === "offline") expect(fs.readdirSync(f.config.residencyRoot).sort()).toEqual(before);
-      expect(f.host.actors.status(actor.id).status).not.toBe("stopped");
+      expect(fs.readdirSync(f.config.residencyRoot).sort()).toEqual(before);
       expect(fs.existsSync(path.join(f.config.meshRoot, "main-publication-fences"))).toBe(false);
     } finally { await f.close(); }
   }, 40_000);
@@ -442,28 +391,17 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     const cleared = vi.spyOn(globalThis, "clearTimeout");
     try {
       const actor = await f.create("timer");
-      selfLease(f, 2 * fresh);
-      f.mainParticipant(Date.now() - 2 * fresh);
-      let result: Awaited<ReturnType<typeof f.cli>>;
-      try { result = await f.cli(actor.id); } finally { timeout.mockRestore(); }
-      expect(result).toMatchObject({ code: 0, err: "" });
+      let code: number;
+      try {
+        code = await main(["stop", "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, "--dry-run"],
+          { out: () => {}, err: () => {} });
+      } finally { timeout.mockRestore(); }
+      expect(code).toBe(0);
       expect(interval).not.toHaveBeenCalled();
       // The one ref'd deadline timer is cleared when the wait settles.
       const keepAlive = timeouts.find(handle => typeof handle === "object" && (handle as NodeJS.Timeout).hasRef?.());
       expect(cleared.mock.calls.some(([handle]) => handle === keepAlive)).toBe(true);
     } finally { interval.mockRestore(); cleared.mockRestore(); await f.close(); }
-  }, 40_000);
-
-  it("case 1: a live root lease written by another process (a Main) is never set aside", async () => {
-    const f = await fixture();
-    try {
-      const other = await f.create("kept");
-      writeHostLease(f.config.meshRoot, { id: f.config.rootId, rootId: f.config.rootId, identityId: f.config.rootId,
-        startedAt: 1, updatedAt: Date.now(), expiresAt: Date.now() + 60_000,
-        writer: { pid: 1, host: os.hostname(), releaseSha: "test", lockProtocol: 1, stateBackend: "file", startedAt: 1 } });
-      expect((await f.cli(other.id)).err).toContain("live root lease");
-      expect(f.registered(other.id)).toBe(true);
-    } finally { await f.close(); }
   }, 40_000);
 
   it("case 2: --evidence-file is read as text, capped at 64 KiB, into the audit record", async () => {
@@ -481,7 +419,7 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
     } finally { await f.close(); }
   }, 40_000);
 
-  it.each(["live", "offline"] as const)("%s: without provable file ownership (no getuid) removal refuses before any change", async mode => {
+  it("offline: without provable file ownership (no getuid) removal refuses before any change", async () => {
     const f = await fixture();
     const getuid = process.getuid;
     try {
@@ -489,34 +427,80 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
-      if (mode === "offline") await f.killResident();
-      const status = mode === "live" ? f.host.actors.status(actor.id).status : undefined;
+      await f.killResident();
       (process as { getuid?: unknown }).getuid = undefined;
       let result: Awaited<ReturnType<typeof f.cli>>;
       try { result = await f.cli(actor.id); } finally { (process as { getuid?: unknown }).getuid = getuid; }
       expect(result.code).toBe(1); expect(result.err).toContain("file ownership cannot be proven (smarty-dev#7858)");
       expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
-      if (mode === "live") expect(f.host.actors.status(actor.id).status).toBe(status);
     } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }
   }, 40_000);
 
-  it("case 2: a symlink in the actor tree refuses before the archive; nothing deleted, registry untouched", async () => {
+  it("offline: a nested dir swapped for a symlink before the rename leaves the outside target untouched", async () => {
     const f = await fixture();
     try {
-      const actor = await f.create("linked");
+      const actor = await f.create("nested-swap");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(path.join(actorDir, "runs"), { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      const outside = path.join(f.config.meshRoot, "outside"); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
+      await f.killResident();
+      offlineRemovalHooks.afterStep = step => {
+        if (step !== "bindings") return;
+        fs.rmSync(path.join(actorDir, "runs"), { recursive: true }); fs.symlinkSync(outside, path.join(actorDir, "runs"));
+      };
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      expect(result).toMatchObject({ code: 0, err: "" });
+      const tree = path.join(JSON.parse(result.out).archive, "tree");
+      // One rename moved the directory, link included; nothing was followed or deleted outside.
+      expect(fs.lstatSync(path.join(tree, "runs")).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+      expect(fs.readFileSync(path.join(tree, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.existsSync(actorDir)).toBe(false);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("offline: the actor root swapped for a symlink makes the rename move only the link; the post-check refuses", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("root-swap");
       const actorDir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
-      const outside = path.join(f.config.meshRoot, "outside.txt"); fs.writeFileSync(outside, "keep");
-      fs.symlinkSync(outside, path.join(actorDir, "escape"));
+      const outside = path.join(f.config.meshRoot, "outside"); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "keep.txt"), "keep");
       await f.killResident();
-      const result = await f.cli(actor.id);
-      expect(result.code).toBe(1); expect(result.err).toContain("symlink");
+      offlineRemovalHooks.afterStep = step => {
+        if (step !== "bindings") return;
+        fs.renameSync(actorDir, `${actorDir}.moved`); fs.symlinkSync(outside, actorDir);
+      };
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { delete offlineRemovalHooks.afterStep; }
+      expect(result.code).toBe(1);
+      const output = JSON.parse(result.out);
+      expect(output).toMatchObject({ cleaned: false, pending: expect.stringContaining("replaced before the archive rename") });
+      // The link was moved back; its target and the real directory are untouched; the removal record stays.
+      expect(fs.lstatSync(actorDir).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(path.join(output.archive, "tree"))).toBe(false);
+      expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+      expect(fs.readFileSync(path.join(`${actorDir}.moved`, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
+    } finally { await f.close(); }
+  }, 40_000);
+
+  it("offline: an archive target that already exists is refused, never merged", async () => {
+    const f = await fixture();
+    const mkdir = fs.mkdirSync;
+    try {
+      const actor = await f.create("exclusive");
+      await f.killResident();
+      const spy = vi.spyOn(fs, "mkdirSync").mockImplementation(((target: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+        if (String(target).includes(`${path.sep}archives${path.sep}${actor.id}.`)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+        return mkdir(target, options);
+      }) as typeof fs.mkdirSync);
+      let result: Awaited<ReturnType<typeof f.cli>>;
+      try { result = await f.cli(actor.id); } finally { spy.mockRestore(); }
+      expect(result.code).toBe(1); expect(result.err).toContain("Archive target already exists");
       expect(f.registered(actor.id)).toBe(true);
-      expect(f.archives()).toEqual([]);
-      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
-      expect(fs.readFileSync(outside, "utf8")).toBe("keep");
-      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
     } finally { await f.close(); }
   }, 40_000);
 
@@ -545,30 +529,6 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(fs.existsSync(actorDir)).toBe(step !== "tree");
       expect(presence).not.toHaveBeenCalled();
       bindings.mockRestore(); presence.mockRestore();
-    } finally { await f.close(); }
-  }, 40_000);
-
-  it("case 2: a file swapped between the walk and the removal stops the removal and keeps the marker", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("swapped");
-      const actorDir = path.join(f.config.actorRoot, actor.id);
-      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
-      await f.killResident();
-      const withLock = ActorRegistryStore.prototype.withLock;
-      const spy = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, ...args) {
-        // After the walk and the archive, before the tree removal: replace a walked file.
-        const replacement = path.join(actorDir, "replacement");
-        fs.writeFileSync(replacement, "swapped\n"); fs.renameSync(replacement, path.join(actorDir, "session.jsonl"));
-        return withLock.apply(this, args as Parameters<typeof withLock>);
-      });
-      let result: Awaited<ReturnType<typeof f.cli>>;
-      try { result = await f.cli(actor.id); } finally { spy.mockRestore(); }
-      expect(result.code).toBe(1);
-      expect(JSON.parse(result.out)).toMatchObject({ cleaned: false, pending: expect.stringContaining("changed before removal") });
-      expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(true);
-      expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("swapped\n");
-      expect(f.archives().map(file => path.basename(file))).toEqual(expect.arrayContaining([`${actor.id}.tar`, "SHA256SUMS"]));
     } finally { await f.close(); }
   }, 40_000);
 
@@ -628,13 +588,53 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(fs.existsSync(actorDir)).toBe(false);
       expect(fs.existsSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`))).toBe(false);
       const archived = f.archives();
-      expect(archived.map(file => path.basename(file)).sort()).toEqual(["SHA256SUMS", `${actor.id}.operator.json`, `${actor.id}.registry.json`, `${actor.id}.tar`].sort());
+      expect(archived.map(file => path.basename(file)).sort()).toEqual(["SHA256SUMS", `${actor.id}.operator.json`, `${actor.id}.registry.json`, "tree"].sort());
+      expect(path.basename(output.archive)).toMatch(new RegExp(`^${actor.id}\\.\\d{8}T\\d{6}Z\\.[0-9a-f-]{36}$`));
       expect(JSON.parse(fs.readFileSync(path.join(output.archive, `${actor.id}.operator.json`), "utf8")))
         .toMatchObject({ rootId: f.config.rootId, operatorAttestation: EVIDENCE, operator: { user: process.env.USER ?? null } });
-      const tar = path.join(output.archive, `${actor.id}.tar`);
-      expect(fs.readFileSync(path.join(output.archive, "SHA256SUMS"), "utf8")).toContain(createHash("sha256").update(fs.readFileSync(tar)).digest("hex"));
+      // The actor directory was moved whole into the archive, not deleted.
+      expect(fs.readFileSync(path.join(output.archive, "tree", "session.jsonl"), "utf8")).toBe("history\n");
+      const row = path.join(output.archive, `${actor.id}.registry.json`);
+      expect(fs.readFileSync(path.join(output.archive, "SHA256SUMS"), "utf8")).toContain(createHash("sha256").update(fs.readFileSync(row)).digest("hex"));
     } finally { await f.close(); }
   }, 40_000);
+
+  // The race tests above call main() in-process: their injections must land between two steps, which a child cannot time.
+  it("e2e through the real bin: dry run shows the plan, removal archives by rename with the audit, a second run and a live Main refuse", async () => {
+    const f = await fixture();
+    const run = promisify(execFile);
+    const bin = (actor: string, ...flags: string[]) => run(process.execPath, [path.resolve("bin/fabric-actors"), "remove",
+      "--resident", f.config.residencyRoot, "--actor", actor, "--mesh-root", f.config.meshRoot, ...flags]);
+    const confirmed = ["--confirm-dead-root", f.config.rootId, "--main-stopped", "--evidence", EVIDENCE];
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
+    try {
+      const actor = await f.create("e2e"), guarded = await f.create("e2e-guarded");
+      const actorDir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(actorDir, { recursive: true }); fs.writeFileSync(path.join(actorDir, "session.jsonl"), "history\n");
+      await f.killResident();
+      const dry = JSON.parse((await bin(actor.id, ...confirmed, "--dry-run")).stdout);
+      expect(dry).toMatchObject({ offline: true, dryRun: true, plan: { archiveRoot: path.join(f.config.residencyRoot, "archives"),
+        audit: { rootId: f.config.rootId, operatorAttestation: EVIDENCE } } });
+      expect(f.archives()).toEqual([]);
+      const removed = JSON.parse((await bin(actor.id, ...confirmed)).stdout);
+      expect(removed).toMatchObject({ offline: true, cleaned: true });
+      expect(fs.readFileSync(path.join(removed.archive, "tree", "session.jsonl"), "utf8")).toBe("history\n");
+      expect(JSON.parse(fs.readFileSync(path.join(removed.archive, `${actor.id}.operator.json`), "utf8")))
+        .toMatchObject({ rootId: f.config.rootId, operatorAttestation: EVIDENCE, toolEvidence: { participants: expect.any(Array) } });
+      expect(f.registered(actor.id)).toBe(false);
+      // A second run for the same actor refuses and leaves the archive as it was.
+      const archived = f.archives();
+      await expect(bin(actor.id, ...confirmed)).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining(`Unknown Fabric actor: ${actor.id}`) });
+      expect(f.archives()).toEqual(archived);
+      // A live Main (a running process recorded in the root participant) refuses.
+      await vi.waitFor(() => expect(processStartTime(child.pid!)).toBeDefined());
+      f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS, f.config.rootId,
+        { pid: child.pid!, host: os.hostname(), startTime: processStartTime(child.pid!)! });
+      await expect(bin(guarded.id, ...confirmed)).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Main is live: Main process") });
+      expect(f.registered(guarded.id)).toBe(true);
+      expect(f.archives()).toEqual(archived);
+    } finally { child.kill(); await f.close(); }
+  }, 60_000);
 });
 
 describe("ResidentActorClient wait is event-driven (smarty-dev#7817)", () => {

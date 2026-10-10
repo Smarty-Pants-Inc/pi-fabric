@@ -10,9 +10,9 @@ fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --con
   --main-stopped --evidence-file <herdr-and-ps-check.txt>
 ```
 
-## Remove: `--main-stopped` is an operator attestation (smarty-dev#7817)
+## Offline remove (dead resident host): `--main-stopped` is an operator attestation (smarty-dev#7817)
 
-`remove` also needs `--main-stopped` with `--evidence <text>` or `--evidence-file <path>` (text, capped at
+When the root's resident host is dead, `remove` runs offline in the CLI and also needs `--main-stopped` with `--evidence <text>` or `--evidence-file <path>` (text, capped at
 64 KiB). **`--main-stopped` is an OPERATOR ATTESTATION, not a machine proof.** Chief-of-staff accepted it on
 2026-10-09 for the operator of the dead Main's own fleet, or Light for the #7231 waves. The automatic proof is
 **smarty-dev#7956**. The evidence (the Herdr pane/agent listing and the process check for that Main's session) is
@@ -20,7 +20,14 @@ kept as `operatorAttestation`, with the operator (`$USER`, `PI_FABRIC_AGENT_NAME
 the time. The tool adds its own observation at removal time (`toolEvidence`): every root participant record
 (pid, host, release, last seen), a `/proc/<pid>` check of each pid on this host with its start time against
 the record, the owner lease state, and the time. The record is archived as `<id>.operator.json` (in
-`SHA256SUMS`, beside the actor's tar and registry row) and, offline, kept in the removal record.
+`SHA256SUMS`, beside the registry row) and kept in the removal record.
+
+The actor is never deleted: its directory is moved by ONE `rename(2)` into a fresh, exclusive archive directory
+`<residency>/archives/<id>.<time>.<random>/tree` (created by `mkdir`, so an existing name refuses; never
+overwritten or merged). `rename` follows no link; the moved entry must be the pinned directory (same inode, this
+user), or it is moved back and the removal refuses. A cross-filesystem archive (EXDEV) refuses; there is no copy.
+Deleting archives is left to retention (smarty-dev#7916). A live resident's own `remove` path is unchanged
+(no `--main-stopped`; smarty-dev#8090).
 
 With `--main-stopped` the tool verifies every root participant record's Main process (pid, host, start time):
 the pid must be gone from this host, or reused with a different start time. A record without that identity,
@@ -32,8 +39,7 @@ The offline remover holds the root's Main publication fence (an exclusive flock 
 does not publish its participant while it is held. The kernel drops it when the remover dies; there is no
 time-based expiry. The live host path's equivalent is smarty-dev#8090.
 
-The attestation never overrides an observation: a live root lease (other than the resident's own heartbeat),
-a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When
+The attestation never overrides an observation: a live root lease, a fresh, reloading or unreadable root participant, or a participant process alive on this host refuses. When
 the resident host itself is dead, `remove` runs offline under its `host.lock` fence (dead holders, a claimable
 flock, no waiter), re-checking before each destructive step. Where file ownership cannot be proven
 (no `getuid`, Windows) remove refuses (smarty-dev#7858).

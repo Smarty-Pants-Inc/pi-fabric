@@ -567,8 +567,6 @@ export interface ResidentOperatorActorCommand {
   id: string;
   dryRun?: boolean;
   confirmDeadRoot?: string;
-  /** remove: the operator's audited assertion that the root's Main process is gone (smarty-dev#7817). */
-  mainStoppedAudit?: unknown;
   requestId: string;
   rootId: string;
   createdAt: number;
@@ -656,8 +654,6 @@ export interface ResidentCommandResponse {
   actor?: FabricActorInfo;
   actors?: FabricActorInfo[];
   operatorEvidence?: import("./operator-safety.js").ResidentOperatorEvidence;
-  /** remove --dry-run: where the archive would go and the audit record it would keep (smarty-dev#7817). */
-  plan?: { archiveRoot: string; audit: unknown };
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;

@@ -106,3 +106,18 @@ Not tested:
 The default `sync_interval` (2 min) is 30–260x faster, but an acked write then survives only a
 process crash. The nats factory must refuse a server that reports `sync_always: false` in
 `/varz`, unless the operator explicitly accepts that durability.
+
+## Network prerequisite for a multi-host cluster
+
+On our tailnet, lane hosts reach each other only on ICMP and TCP 22. The block is the tailnet
+ACL, not the host firewalls (smarty-dev#7504 c6086641424). The 3-host bench never clustered for
+this reason. An R3 cluster needs these TCP ports opened on `tailscale0` only:
+
+| port | purpose | from | to |
+|---|---|---|---|
+| 6222 | cluster routes (replication, Raft) | each cluster node | each other cluster node |
+| 4222 | clients (Mains, residents, bridges) | every fleet host that runs Fabric | each cluster node |
+| 8222 | HTTP monitoring (`/varz`, `/jsz`) | the fleet host | each cluster node |
+
+That ACL change needs the product owner's yes (smarty-dev#7504 c6095415747). Until then, tests run
+on one host, or across hosts through `ssh -L` tunnels.

@@ -95,7 +95,7 @@ All of these run only inside the `publish`/`publishBatch` lock. None has its own
 | X9 | `topology/participant-files.ts:422` | `sweepParticipantLockLeftovers` | `participants/.locks/` listing, mtimes | remove old `*.tmp`, `*.dead` | `custody` |
 | X10 | `topology/host-reaper.ts:161` | `reapDeadHostRecords`: forwards to X9 | as X9 | as X9 | `custody` |
 | X11 | `topology/host-reaper.ts:200` | `reapDeadHostRecords`: forwards to X8 via `removeParticipantFileIf` | as X8 | as X8 | `custody` |
-| X12 | `topology/participant-directory.ts:1247` | `refreshRoutingView` (250 ms budget) | `state.json` (`assertMeshStateReadable`), participant list (state + `participants/*.json`) | memory only | `state` (read) |
+| X12 | `topology/participant-directory.ts:1247` | `refreshRoutingView` (2 s budget, `ROUTING_REFRESH_LOCK_BUDGET_MS`) | `state.json` (`assertMeshStateReadable`), participant list (state + `participants/*.json`) | memory only | `state` (read) |
 | X13 | `residency/host.ts:329` | `waitForPublicationRetry`: acquire and release only | nothing | nothing | `state` (wait only) |
 | X14 | `residency/host.ts:941` | `#queueDelivery` with a function `rootId` | state via `rootId()` (lineage proof) | `residency/.../outbox/<id>.json` (durable) | **`state` + `custody`** |
 | X15 | `actors/manager.ts:5309` | `#confirmAdoption`, inside the actor registry lock | state: participant, legacy session, lineage closure (`#lineageMayBeAlive` → `topology/participant-directory.ts:1164`); `participants/<h>.json` presence | actor registry commit (`prepared.commit()`); participant key lock create/release (`withParticipantFileTryLock`) | **`state` + registry** |

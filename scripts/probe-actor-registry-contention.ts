@@ -3,8 +3,9 @@
 // ~22 KB instructions each, 19 running), written by several processes at once.
 // Each writer owns a slice of the actors, flips status/updatedAt of its running ones,
 // and saves through ActorRegistryStore.update with the manager's validate() clauses.
-// Run (isolated, two CPUs, CPU-saturated like a load-50 host):
-//   taskset -c 0,1 bun scripts/probe-actor-registry-contention.ts --writers=6 --busy=4 --duration=20000
+// Defaults are the measured #6829 shape (16 writers, 22 KB instructions, loaded 100 x 6 KB rings).
+// Run (isolated, one CPU, CPU-saturated like a load-50 host), as measured for pi-fabric#800:
+//   taskset -c 4 bun scripts/probe-actor-registry-contention.ts --busy=3 --duration=30000
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -15,7 +16,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(arg => arg.replace(/^-
 const ACTORS = Number(args.actors ?? 89), RUNNING = Number(args.running ?? 19);
 const INSTRUCTIONS = Number(args.instructions ?? 22_000);
 // Loaded actors keep their last-100 ring in memory, as the manager does after first use.
-const MESSAGES = Number(args.messages ?? 0), MESSAGE_BYTES = Number(args.messageBytes ?? 2_000);
+const MESSAGES = Number(args.messages ?? 100), MESSAGE_BYTES = Number(args.messageBytes ?? 6_000);
 const ring = (id: string) => Array.from({ length: MESSAGES }, (_, j) => ({ id: `m-${id}-${j}`, actorId: id, direction: j % 2 ? "out" : "in",
   source: "direct", createdAt: 1 + j, text: "x".repeat(MESSAGE_BYTES) }));
 
@@ -82,7 +83,7 @@ if (args.role === "writer") {
   process.exit(0);
 }
 
-const writers = Number(args.writers ?? 6), busy = Number(args.busy ?? 4), duration = Number(args.duration ?? 20_000);
+const writers = Number(args.writers ?? 16), busy = Number(args.busy ?? 3), duration = Number(args.duration ?? 30_000);
 const root = fs.mkdtempSync(path.join(args.tmp ?? os.tmpdir(), "registry-contention-"));
 const now = Date.now();
 // Distinct persona texts per actor (the live fleet had ~2.3 actors per distinct text).

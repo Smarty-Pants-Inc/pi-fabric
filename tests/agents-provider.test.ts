@@ -6277,7 +6277,7 @@ describe("own-root resident setters and authoritative status", () => {
 });
 
 describe("external spawn router hook (#2890)", () => {
-  const pick = { model: "provider/model-b", thinking: "high", reason: "normal.task", policyVersion: "v1" };
+  const pick = { model: "provider/model-b", thinking: "high", reason: "policy:task/normal", policyVersion: "v1" };
   const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {}) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-spawn-router-")); roots.push(dir);
     const inputPath = path.join(dir, "requests.jsonl");

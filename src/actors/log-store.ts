@@ -108,7 +108,8 @@ export class ActorLogStore {
         /* best-effort recursive run retention */
       }
     }
-    this.pruneRuns(actor);
+    // Archive exactly this run. The manager's bounded retention sweep owns
+    // pruning; a supervisor completion must not traverse the actor's full history.
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {

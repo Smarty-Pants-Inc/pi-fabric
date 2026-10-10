@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
+import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic, writeJsonAtomicAsync } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
 import type { MeshStore } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
@@ -218,6 +218,14 @@ const readReplayFence = <T>(file: string, label = "Completion"): T | undefined =
   }
 };
 const readReplayFenceAsync = async <T>(file: string, label = "Completion"): Promise<T | undefined> => {
+  // Idle fences are usually absent. One lstat proves that absence without
+  // opening a missing file AND then issuing a second failed metadata operation.
+  // lstat (not stat) preserves fail-closed handling of dangling receipt symlinks.
+  try { await fs.promises.lstat(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`${label} replay fence is unreadable at ${file}: ${String(error)}`);
+  }
   try { return JSON.parse(await fs.promises.readFile(file, "utf8")) as T; }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -264,7 +272,7 @@ const readReceipt = (file: string, id?: string): CompletionReceipt | undefined =
 };
 export const completionConsumed = (meshRoot: string, id: string): boolean =>
   readReceipt(receiptPath(meshRoot, id), id) !== undefined;
-const completionConsumedAsync = async (meshRoot: string, id: string): Promise<boolean> =>
+export const completionConsumedAsync = async (meshRoot: string, id: string): Promise<boolean> =>
   await readReceiptAsync(receiptPath(meshRoot, id), id) !== undefined;
 export const consumeCompletion = (meshRoot: string, id: string, sessionId: string): void => {
   const file = receiptPath(meshRoot, id);
@@ -290,6 +298,71 @@ export const saveCompletion = (meshRoot: string, recipient: CompletionRecipient,
     consumeCompletion(meshRoot, result.id, recipient.sessionId);
   }
   fs.rmSync(candidatePath(meshRoot, result.id), { force: true });
+};
+// Successful publications may be reused for idle import, never as a replay fence
+// or cleanup authority. A replaced/in-place-written envelope must be confirmed again.
+const published = new Map<string, string>();
+const publicationPasses = new Map<string, Promise<void>>();
+export const completionPublishedAsync = async (meshRoot: string, id: string): Promise<boolean> => {
+  const file = envelopePath(meshRoot, id), stamp = published.get(file);
+  if (stamp === undefined) return false;
+  try { if (fingerprint(await fs.promises.stat(file)) === stamp) return true; }
+  catch { /* Missing/unknown is not a successful publication. */ }
+  published.delete(file);
+  return false;
+};
+const confirmPublication = async (file: string, value: unknown): Promise<string> => {
+  const handle = await fs.promises.open(file, process.platform === "win32" ? "r+" : "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || JSON.stringify(JSON.parse(await handle.readFile("utf8"))) !== JSON.stringify(value)) {
+      throw new Error(`Completion file changed before durability confirmation at ${file}`);
+    }
+    await handle.sync();
+    await syncPathNamespaceAsync(file, stat);
+    if (fingerprint(await handle.stat()) !== fingerprint(stat)) throw new Error(`Completion file changed during confirmation at ${file}`);
+    return fingerprint(stat);
+  } finally { await handle.close(); }
+};
+export const consumeCompletionAsync = async (meshRoot: string, id: string, sessionId: string): Promise<void> => {
+  const file = receiptPath(meshRoot, id);
+  const existing = await readReceiptAsync(file, id);
+  if (existing) await confirmReceipt(file, existing);
+  else {
+    const receipt = { id, sessionId, consumedAt: Date.now() };
+    await writeJsonAtomicAsync(file, receipt);
+    await confirmReceipt(file, receipt);
+  }
+};
+/** Idle legacy import must not run per-envelope fsync loops on Main's event loop.
+ * Coalesce overlapping saves for the same stable id; synchronous foreground
+ * save/consume APIs retain their existing immediate durability contract.
+ */
+export const saveCompletionAsync = (meshRoot: string, recipient: CompletionRecipient, result: AgentRunResult): Promise<void> => {
+  if (result.actorId) return Promise.resolve();
+  const file = envelopePath(meshRoot, result.id);
+  const active = publicationPasses.get(file);
+  if (active) return active;
+  const pass = (async () => {
+    if (await completionConsumedAsync(meshRoot, result.id)) {
+      await consumeCompletionAsync(meshRoot, result.id, recipient.sessionId);
+    } else {
+      await legacyCompletionConsumedAsync(meshRoot, recipient.rootId, result.id);
+      // Reuse does not authorize deleting a newly created candidate/namespace.
+      if (await completionPublishedAsync(meshRoot, result.id)) return;
+      let value = await readAsync<CompletionEnvelope>(file);
+      if (!(value?.format === 1 && value.result?.id === result.id)) {
+        value = { format: 1, recipient, result };
+        await writeJsonAtomicAsync(file, value);
+      }
+      const stamp = await confirmPublication(file, value);
+      published.set(file, stamp);
+      if (published.size > 1024) published.delete(published.keys().next().value!);
+    }
+    await fs.promises.rm(candidatePath(meshRoot, result.id), { force: true });
+  })().finally(() => { if (publicationPasses.get(file) === pass) publicationPasses.delete(file); });
+  publicationPasses.set(file, pass);
+  return pass;
 };
 /** Logical settlement must use the immutable host-owned launch address, not today's /name. */
 export const completionRecipientFromRun = (meshRoot: string, runDirectory: string): CompletionRecipient | undefined => {
@@ -349,7 +422,7 @@ const promoteOrphanAsync = async (meshRoot: string, projectRoot: string, project
     typeof candidate.recipient.projectRoot !== "string" || await canonicalAsync(candidate.recipient.projectRoot) !== await canonicalAsync(projectRoot)) return;
   if (!await completionConsumedAsync(meshRoot, candidate.result.id) &&
     !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
-    saveCompletion(meshRoot, candidate.recipient, candidate.result);
+    await saveCompletionAsync(meshRoot, candidate.recipient, candidate.result);
   }
 };
 const promoteOrphans = (meshRoot: string, projectRoot: string,
@@ -389,7 +462,7 @@ const savedCompletion = (meshRoot: string, projectRoot: string, id: string): Com
     canonical(value.recipient.projectRoot) !== canonical(projectRoot)) return undefined;
   return value;
 };
-const legacyCompletionConsumedAsync = async (meshRoot: string, rootId: string, id: string): Promise<boolean> => {
+export const legacyCompletionConsumedAsync = async (meshRoot: string, rootId: string, id: string): Promise<boolean> => {
   const file = path.join(meshRoot, "residency", key(rootId), "agents", `${id}.json`);
   const metadata = await readReplayFenceAsync<{ rootId?: string; id?: string; completionConsumedAt?: number }>(file, "Legacy completion");
   if (metadata === undefined) return false;
@@ -519,6 +592,15 @@ export class CompletionJournal {
       throw new Error(`Missing admitted completion recipient for ${result.id}`);
     }
     saveCompletion(this.meshRoot, admitted ?? this.recipient, result);
+  }
+  async saveAsync(result: AgentRunResult, admittedRecipient?: CompletionRecipient): Promise<void> {
+    if (result.actorId) return;
+    const admitted = result.logFile
+      ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : admittedRecipient;
+    if (!admitted && typeof this.recipientSource === "function") {
+      throw new Error(`Missing admitted completion recipient for ${result.id}`);
+    }
+    await saveCompletionAsync(this.meshRoot, admitted ?? this.recipient, result);
   }
   forget(id: string): void {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);

@@ -1,7 +1,7 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
-import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
+import { CompletionJournal, completionRecipientFromRun, completionConsumed, completionConsumedAsync, completionPublishedAsync, consumeCompletion, consumeCompletionAsync, legacyCompletionConsumed, legacyCompletionConsumedAsync, saveCompletionAsync, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
@@ -178,6 +178,8 @@ export class ResidencyClient {
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
+  readonly #completionConfigs = new Map<string, { stamp: string; config: ResidentHostConfig }>();
+  readonly #completionImports = new Map<string, { version: number; id: string; sessionId: string; nextCheckAt: number }>();
   readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
@@ -1103,6 +1105,26 @@ export class ResidencyClient {
           ? Number.parseInt(config.sessionId.replaceAll("-", "").slice(0, 12), 16) : 0) };
   }
 
+  async #completionConfig(file: string): Promise<ResidentHostConfig | undefined> {
+    const identity = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    try {
+      const stamp = identity(await fs.promises.stat(file, { bigint: true }));
+      const cached = this.#completionConfigs.get(file);
+      if (cached?.stamp === stamp) return cached.config;
+      this.#completionConfigs.delete(file);
+      const handle = await fs.promises.open(file, "r");
+      try {
+        const config = JSON.parse(await handle.readFile("utf8")) as ResidentHostConfig;
+        // Bind cached bytes to the OPENED inode, not just equal path stats
+        // surrounding a replace/restore race (A -> B -> A).
+        if (identity(await handle.stat({ bigint: true })) !== stamp ||
+            identity(await fs.promises.stat(file, { bigint: true })) !== stamp) return undefined;
+        this.#completionConfigs.set(file, { stamp, config });
+        if (this.#completionConfigs.size > 1024) this.#completionConfigs.delete(this.#completionConfigs.keys().next().value!);
+        return config;
+      } finally { await handle.close(); }
+    } catch { this.#completionConfigs.delete(file); return undefined; }
+  }
   /** Import authenticated legacy resident envelopes too: upgrading must not strand B72 work. */
   async #adoptCompletion(entry: MeshStateEntry): Promise<void> {
     const value = entry.value as Partial<ResidentDeliveryRecord> | undefined;
@@ -1112,24 +1134,51 @@ export class ResidencyClient {
       !entry.key.startsWith(residentDeliveryPrefix(value.rootId))) return;
     const id = value.agentCompletionId ?? value.from.id;
     if (id !== value.from.id) return;
-    if (completionConsumed(this.options.config.meshRoot, id)) {
+    const imported = this.#completionImports.get(entry.key);
+    // Unchanged, successfully imported FOREIGN sources need maintenance, not
+    // admission. Defer a no-action recheck for at most 5 s. The exact owner
+    // still checks its own journal/delivery fences at the normal cadence.
+    if (imported?.version === entry.version && imported.id === id && Date.now() < imported.nextCheckAt) return;
+    if (await completionConsumedAsync(this.options.config.meshRoot, id)) {
       await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
+      this.#completionImports.delete(entry.key);
+      return;
+    }
+    if (imported?.version === entry.version && imported.id === id && await completionPublishedAsync(this.options.config.meshRoot, id)) {
+      // The already-confirmed immutable outcome no longer depends on producer
+      // config/status bytes. New receipt evidence is ALWAYS read afresh.
+      if (await legacyCompletionConsumedAsync(this.options.config.meshRoot, value.rootId, id)) {
+        await consumeCompletionAsync(this.options.config.meshRoot, id, imported.sessionId);
+      }
+      imported.nextCheckAt = Date.now() + 5_000;
       return;
     }
     const root = residentRoot(this.options.config.meshRoot, value.rootId);
-    const config = readJson<ResidentHostConfig>(path.join(root, "config.json"));
+    const config = await this.#completionConfig(path.join(root, "config.json"));
     if (!config || config.rootId !== value.rootId || path.resolve(config.residencyRoot) !== root ||
       typeof config.projectRoot !== "string" || typeof config.cwd !== "string" ||
-      !samePath(config.projectRoot, this.options.config.projectRoot)) return;
-    if (legacyCompletionConsumed(this.options.config.meshRoot, value.rootId, id)) {
-      consumeCompletion(this.options.config.meshRoot, id, config.sessionId);
+      (config.projectRoot !== this.options.config.projectRoot && !samePath(config.projectRoot, this.options.config.projectRoot))) return;
+    if (await legacyCompletionConsumedAsync(this.options.config.meshRoot, value.rootId, id)) {
+      await consumeCompletionAsync(this.options.config.meshRoot, id, config.sessionId);
       return;
     }
-    const result = readJson<AgentRunResult>(residentResultPath(root, id)) ??
-      readJson<AgentRunResult>(path.join(root, "runs", id, "status.json"));
+    // A successful import is stable-id discovery, NOT receipt/cleanup authority.
+    // Keep reading both replay fences above, but do not parse or sync unchanged bodies.
+    if (await completionPublishedAsync(this.options.config.meshRoot, id)) {
+      this.#completionImports.set(entry.key, { version: entry.version, id, sessionId: config.sessionId, nextCheckAt: Date.now() + 5_000 });
+      if (this.#completionImports.size > 1024) this.#completionImports.delete(this.#completionImports.keys().next().value!);
+      return;
+    }
+    const readResult = async (file: string): Promise<AgentRunResult | undefined> => {
+      try { return JSON.parse(await fs.promises.readFile(file, "utf8")) as AgentRunResult; } catch { return undefined; }
+    };
+    const result = await readResult(residentResultPath(root, id)) ??
+      await readResult(path.join(root, "runs", id, "status.json"));
     if (!result || result.id !== id || !terminal(result.status)) return;
     const admitted = completionRecipientFromRun(this.options.config.meshRoot, path.join(root, "runs", id));
-    saveCompletion(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
+    await saveCompletionAsync(this.options.config.meshRoot, admitted ?? this.#recipient(config), result);
+    this.#completionImports.set(entry.key, { version: entry.version, id, sessionId: config.sessionId, nextCheckAt: Date.now() + 5_000 });
+    if (this.#completionImports.size > 1024) this.#completionImports.delete(this.#completionImports.keys().next().value!);
   }
 
   #drainDeliveries(): Promise<void> {
@@ -1196,7 +1245,7 @@ export class ResidencyClient {
     if (value.from.kind === "agent" && typeof completionId === "string" && completionId === value.from.id) {
       const metadata = this.#metadata(completionId);
       if (metadata?.completionConsumedAt) this.#completions.acknowledge(completionId);
-      if (metadata?.completionConsumedAt || completionConsumed(this.options.config.meshRoot, completionId)) {
+      if (metadata?.completionConsumedAt || await completionConsumedAsync(this.options.config.meshRoot, completionId)) {
         await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
         return;
       }
@@ -1204,8 +1253,9 @@ export class ResidencyClient {
       if (!metadata || !this.options.config.agents.notifyOnComplete) return;
       // One logical completion key across resident envelopes and the session inbox. Keep
       // the source until Main consumes it, not just until its in-memory inbox accepts it.
+      if (await completionPublishedAsync(this.options.config.meshRoot, completionId)) return;
       const result = this.statusAgent(completionId);
-      if (terminal(result.status) && "startedAt" in result) this.#completions.save(result as AgentRunResult);
+      if (terminal(result.status) && "startedAt" in result) await this.#completions.saveAsync(result as AgentRunResult);
       return;
     }
     // smarty-dev#2236: one record reached Main twice (a failed delete, or a second drainer that

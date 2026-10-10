@@ -607,12 +607,13 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
 export class MeshBackgroundRetry {
   #delay = 0;
   #retryAt = 0;
-  #reported = false;
+  #lastReportedAt: number | undefined;
+  #suppressed = 0;
   #running = false;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000) {}
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
+  success(): void { this.#delay = 0; this.#retryAt = 0; }
   failure(error: unknown): boolean {
     const transient = isMeshLockTimeout(error);
     if (!transient) {
@@ -626,12 +627,19 @@ export class MeshBackgroundRetry {
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
     const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
-    this.#retryAt = Date.now() + delayMs;
-    if (!this.#reported) {
-      // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
-      // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
-      this.#reported = true;
+    const now = Date.now();
+    this.#retryAt = now + delayMs;
+    const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
+    // ponytail: at most one lock-retry warning per instance per 60 s, even across
+    // successful acquisitions; the first warning is immediate and includes holder diagnostics.
+    if (elapsedMs >= 60_000) {
+      const summary = this.#suppressed > 0
+        ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
+      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`);
+      this.#lastReportedAt = now;
+      this.#suppressed = 0;
+    } else {
+      this.#suppressed++;
     }
     return transient;
   }

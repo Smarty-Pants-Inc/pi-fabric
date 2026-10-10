@@ -14,7 +14,7 @@ Stores for the same normalized path share an immutable decoded view, bounded to
 64 least-recently-read paths and released when the owning manager closes. Every
 read opens the file and checks its descriptor's device, inode, size, nanosecond
 mtime and ctime. Zero inode or timestamp identities are unproven and always
-re-read; atomic replacements remain bound to the descriptor actually opened.
+re-read; atomic replacements remain bound to the opened descriptor.
 
 The read-start age proof requires the filesystem clock to be the host's own.
 On Linux, the registry directory is lazily checked with `statfsSync` and only
@@ -31,7 +31,7 @@ two-second quantum). Each cached generation therefore records its wall-clock
 read-start time. Its bytes
 are reusable only when the descriptor mtime is **strictly older** than that
 recorded time minus two seconds. Recent, exactly-two-second-old and future
-mtimes re-read and re-validate JSON rather than returning cached bytes, even if
+mtimes re-read and re-validate JSON and never return cached bytes, even if
 the identity key is unchanged. A racy entry never becomes trusted just because
 time passes: the next read must first decode it again and record a new read
 time. Once the file has settled, subsequent reads hit. This adds no timer or

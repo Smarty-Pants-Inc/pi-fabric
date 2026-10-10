@@ -360,6 +360,28 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { prove(); releaseWork?.(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("waits for mesh catch-up before pausing clean exit without restarting the idle window", async () => {
+    const { root, host, idle } = fixture();
+    let caughtUp = false;
+    try {
+      await host.start();
+      const actor = await host.actors.create({ name: "late-native-watch", instructions: "wait", residency: "durable" });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      const current = host.actors.meshCaughtUp.bind(host.actors);
+      vi.spyOn(host.actors, "meshCaughtUp").mockImplementation(() => caughtUp && current());
+      const checkpoint = vi.spyOn(host.actors, "checkpointForRelease");
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      await sleep(150);
+      expect(idle).not.toHaveBeenCalled();
+      expect(checkpoint).not.toHaveBeenCalled();
+      caughtUp = true;
+      // No new clock advance or quiet-period timer: the same idle window must finish.
+      await until(() => idle.mock.calls.length === 1);
+      expect(checkpoint).toHaveBeenCalledOnce();
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {
     const { root, config, host, idle } = fixture();
     try {

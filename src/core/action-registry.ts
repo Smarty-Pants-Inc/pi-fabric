@@ -308,9 +308,15 @@ export class ActionRegistry {
   #unavailableResolver: ((name: string) => string | undefined) | undefined;
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
+  #residentProcessWorkSessionId: string | undefined;
 
   constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
     this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
+  }
+
+  /** Native mesh composition opts in; hosted registries never inspect ambient session APIs. */
+  setResidentProcessWorkSession(sessionId: string): void {
+    this.#residentProcessWorkSessionId = sessionId;
   }
 
   /**
@@ -855,7 +861,7 @@ export class ActionRegistry {
     const consumption = new ResultConsumption();
     const deferConsumption = context.deferResultConsumption;
     let endBindingInvocation: (() => Promise<void>) | undefined;
-    const releaseWork = retainResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.());
+    const releaseWork = retainResidentProcessWork(this.#residentProcessWorkSessionId);
     try {
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,

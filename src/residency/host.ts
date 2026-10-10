@@ -1461,6 +1461,11 @@ export class ResidentHost {
       this.#idleSince = now;
       return;
     }
+    // Native watch delivery is asynchronous (especially on Windows). Ignored presence
+    // events can leave the cursor behind after the actor is already dormant. Keep the
+    // consumer gate open until it catches up; that is progress, not new host work and
+    // must not restart the idle window. The final checkpoint still fences racing work.
+    if (!this.actors.meshCaughtUp()) return;
     // Publish the closing boundary before shutting any consumer gate: a racing publisher
     // now queues a wake whose one-shot launcher waits for this exact owner to exit.
     this.#sleeping = true;

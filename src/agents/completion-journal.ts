@@ -4,7 +4,7 @@ import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
 import { syncPathNamespace, syncPathNamespaceAsync, writeJsonAtomic } from "../core/atomic-write.js";
 import { residentProcessAlive } from "../residency/process-identity.js";
-import type { MeshStore } from "../mesh/store.js";
+import type { MeshStore, MeshStateEntry } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord, AgentRunResult } from "./types.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 
@@ -336,21 +336,21 @@ export const saveWorkerCompletion = (statusFile: string, result: AgentRunRecord)
   }
 };
 const promoteOrphanAsync = async (meshRoot: string, projectRoot: string, project: string, target: string,
-  accepts: (recipient: CompletionRecipient) => Promise<boolean>): Promise<void> => {
+  accepts: (recipient: CompletionRecipient) => Promise<boolean>): Promise<boolean> => {
   const file = path.basename(target);
   const address = await readRecipientAsync(target, true);
-  if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) return;
+  if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) return false;
   const fence = path.join(directory(meshRoot), "receipts", file);
-  if (await readReceiptAsync(fence)) return;
+  if (await readReceiptAsync(fence)) return false;
   const candidate = await readAsync<CompletionCandidate>(target);
   if (candidate?.format !== 1 || !candidate.result || !candidate.recipient || !candidate.supervisor ||
     !Number.isSafeInteger(candidate.supervisor.pid) || candidate.supervisor.pid <= 0 ||
     typeof candidate.result.id !== "string" || file !== `${key(candidate.result.id)}.json` ||
-    typeof candidate.recipient.projectRoot !== "string" || await canonicalAsync(candidate.recipient.projectRoot) !== await canonicalAsync(projectRoot)) return;
-  if (!await completionConsumedAsync(meshRoot, candidate.result.id) &&
-    !residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) {
-    saveCompletion(meshRoot, candidate.recipient, candidate.result);
-  }
+    typeof candidate.recipient.projectRoot !== "string" || await canonicalAsync(candidate.recipient.projectRoot) !== await canonicalAsync(projectRoot)) return false;
+  if (await completionConsumedAsync(meshRoot, candidate.result.id)) return false;
+  if (residentProcessAlive(candidate.supervisor.pid, candidate.supervisor.processStartedAt)) return true;
+  saveCompletion(meshRoot, candidate.recipient, candidate.result);
+  return false;
 };
 const promoteOrphans = (meshRoot: string, projectRoot: string,
   accepts: (recipient: CompletionRecipient) => boolean = () => true): void => {
@@ -463,14 +463,20 @@ const pendingCompletionsExcept = (meshRoot: string, projectRoot: string,
   return files(directory(meshRoot)).flatMap(file => pendingCompletion(meshRoot, projectRoot, project, path.join(directory(meshRoot), file), accepts, consumed));
 };
 const scanPendingCompletions = async (meshRoot: string, projectRoot: string,
-  accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>): Promise<CompletionEnvelope[]> => {
+  accepts: (recipient: CompletionRecipient) => Promise<boolean>, consumed?: ReadonlySet<string>,
+  changed?: readonly string[], pendingAttempt?: (target: string, live: boolean) => void): Promise<CompletionEnvelope[]> => {
   const promotionProject = await canonicalAsync(projectRoot);
-  for await (const target of scanTargets([path.join(directory(meshRoot), "attempts")])) {
-    await promoteOrphanAsync(meshRoot, projectRoot, promotionProject, target, accepts);
+  const attempts = path.join(directory(meshRoot), "attempts");
+  for await (const target of changed ? scanSlices(changed.filter(target => path.dirname(target) === attempts)) : scanTargets([attempts])) {
+    const live = await promoteOrphanAsync(meshRoot, projectRoot, promotionProject, target, accepts);
+    pendingAttempt?.(target, live);
   }
   const project = await canonicalAsync(projectRoot);
   const pending: CompletionEnvelope[] = [];
-  for await (const target of scanTargets([directory(meshRoot)])) {
+  // An orphan promotion writes the envelope with this same basename. Inspect that
+  // exact path in this pass even if its watch notification has not arrived yet.
+  const envelopes = changed && [...new Set(changed.map(target => path.join(directory(meshRoot), path.basename(target))))];
+  for await (const target of envelopes ? scanSlices(envelopes) : scanTargets([directory(meshRoot)])) {
     pending.push(...await pendingCompletionAsync(meshRoot, projectRoot, project, target, accepts, consumed));
   }
   return pending;
@@ -481,6 +487,142 @@ export const pendingCompletionResult = (envelope: CompletionEnvelope): AgentRunR
 });
 
 export class CompletionJournal {
+  // Physical identities are discovery hints only, never routing/receipt authority.
+  // The bounded recipient cache below is unchanged; this index holds no bodies.
+  readonly #observed = new Map<string, string>();
+  readonly #directoryStamps = new Map<string, string>();
+  readonly #dirty = new Set<string>();
+  readonly #dirtyReceipts = new Set<string>();
+  readonly #pendingAttempts = new Set<string>();
+  readonly #pendingReceipts = new Set<string>();
+  readonly #projects = new Map<string, { path: string; canonical: string }>();
+  readonly #quietPending = new Set<string>();
+  #deliveryPolicy: boolean | undefined;
+  #recipientProject: string | undefined;
+  #discover = true;
+
+  /** Filename notifications must invalidate even same-size, restored-mtime repairs. */
+  changed(kind: "envelopes" | "attempts" | "receipts", filename: string | null): void {
+    if (filename === null) { this.#discover = true; return; }
+    if (!isJournalFile(filename)) return;
+    const root = directory(this.meshRoot);
+    if (kind === "receipts") {
+      this.#dirtyReceipts.add(filename);
+      for (const target of [path.join(root, filename), path.join(root, "attempts", filename)]) {
+        recipientCache.delete(target);
+        this.#dirty.add(target);
+      }
+    } else {
+      const target = path.join(root, ...(kind === "attempts" ? ["attempts"] : []), filename);
+      recipientCache.delete(target); // A filename event outranks even a repeated physical stamp.
+      this.#dirty.add(target);
+    }
+  }
+
+  get hasPendingAttempts(): boolean { return this.#pendingAttempts.size > 0; }
+  get hasPendingChanges(): boolean { return this.#pendingAttempts.size > 0 || this.#pendingReceipts.size > 0 || this.#dirty.size > 0; }
+
+  async #stamp(target: string): Promise<string> {
+    try { return recipientStamp(await fs.promises.stat(target, { bigint: true })); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown"; }
+  }
+
+  /** Automatic reconciliation: unchanged passes do no file or mesh reads. Safety
+   * callers run at >=60 s; only changed physical files enter the trusted drain. */
+  async drainChanged(deliver = true, options: {
+    safety?: boolean; retryPending?: boolean; claims?: readonly Readonly<MeshStateEntry>[];
+  } = {}): Promise<void> {
+    const root = directory(this.meshRoot);
+    // A notification reload is not a filesystem change. Revisit only previously
+    // validated exact-owner work, never rediscover foreign envelopes for policy.
+    if (deliver && this.#deliveryPolicy !== true) for (const target of this.#quietPending) this.#dirty.add(target);
+    this.#deliveryPolicy = deliver;
+    if (this.#discover) {
+      const recipient = this.recipient; // Keep initial live-name metadata behavior.
+      if (fs.existsSync(root)) await canonicalAsync(recipient.projectRoot);
+    }
+    if (this.#discover || options.safety) {
+      const discover = this.#discover;
+      this.#discover = false; // Events during awaited discovery retain a trailing pass.
+      for (const [kind, dir] of [["envelopes", root], ["attempts", path.join(root, "attempts")],
+        ["receipts", path.join(root, "receipts")]] as const) {
+        const stamp = await this.#stamp(dir);
+        if (discover || stamp === "unknown" || this.#directoryStamps.get(dir) !== stamp) {
+          let entries: string[];
+          try { entries = await fs.promises.readdir(dir); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.#discover = true;
+            entries = [];
+          }
+          for (const filename of entries.filter(isJournalFile)) {
+            const target = path.join(dir, filename);
+            const physical = await this.#stamp(target);
+            if (physical === "unknown" || this.#observed.get(target) !== physical) this.changed(kind, filename);
+            this.#observed.set(target, physical);
+          }
+        }
+        this.#directoryStamps.set(dir, stamp);
+      }
+      if (options.safety) {
+        for (const [target, previous] of this.#observed) {
+          const stamp = await this.#stamp(target);
+          if (stamp === "unknown" || stamp !== previous) {
+            const parent = path.dirname(target);
+            this.changed(parent.endsWith(`${path.sep}receipts`) ? "receipts" : parent.endsWith(`${path.sep}attempts`) ? "attempts" : "envelopes", path.basename(target));
+            if (stamp === "absent") this.#observed.delete(target);
+            else this.#observed.set(target, stamp);
+          }
+        }
+        // A project symlink may move without changing an envelope. Re-resolve
+        // only exact-addressed work, never foreign project metadata.
+        if (this.#projects.size && await canonicalAsync(this.recipient.projectRoot) !== this.#recipientProject) {
+          for (const target of this.#projects.keys()) this.#dirty.add(target);
+        }
+        for (const [target, project] of this.#projects) {
+          const current = await canonicalAsync(project.path);
+          if (current !== project.canonical) { this.#dirty.add(target); project.canonical = current; }
+        }
+      }
+    }
+    if (options.retryPending) {
+      for (const target of this.#pendingAttempts) this.#dirty.add(target);
+      for (const filename of this.#pendingReceipts) this.changed("receipts", filename);
+    }
+    if (options.claims) for (const claim of options.claims) {
+      if (!await this.#canRetireClaimAsync(claim)) continue;
+      this.changed("receipts", `${claim.key.slice(claimPrefix.length)}.json`);
+    }
+    const changed = [...this.#dirty], receipts = [...this.#dirtyReceipts];
+    this.#dirty.clear();
+    this.#dirtyReceipts.clear();
+    for (const target of changed) this.#pendingAttempts.delete(target);
+    for (const filename of receipts) this.#pendingReceipts.delete(filename);
+    if (!changed.length && !options.claims?.length) return;
+    try {
+      // A repaired receipt can retire a bodyless claim too. Re-read only its
+      // exact validated key; the trusted drain gates ownership before fence access.
+      const claims = new Map((options.claims ?? []).map(claim => [claim.key, claim]));
+      for (const filename of receipts) {
+        const ck = `${claimPrefix}${filename.slice(0, -5)}`;
+        const claim = this.mesh.get(ck, { fresh: true });
+        if (claim) claims.set(ck, claim);
+      }
+      for (const target of changed) {
+        const stamp = await this.#stamp(target);
+        // Reconcile deletions without retaining tombstones in the safety index.
+        if (stamp === "absent") this.#observed.delete(target);
+        else this.#observed.set(target, stamp);
+      }
+      await this.#drain(deliver, changed, [...claims.values()]);
+    } catch (error) {
+      // Retain failure as known work, not as admission for an unrelated file
+      // event. Only this file/receipt changing or explicit recovery retries it.
+      for (const target of changed) this.#pendingAttempts.add(target);
+      for (const filename of receipts) this.#pendingReceipts.add(filename);
+      throw error;
+    }
+  }
+
   readonly #enqueued = new Set<string>();
   // A monotonic local suppression fence, not a cached durability confirmation.
   // Destructive claim retirement continues to reopen/sync its exact receipt.
@@ -519,12 +661,14 @@ export class CompletionJournal {
       throw new Error(`Missing admitted completion recipient for ${result.id}`);
     }
     saveCompletion(this.meshRoot, admitted ?? this.recipient, result);
+    this.changed("envelopes", `${key(result.id)}.json`);
   }
   forget(id: string): void {
     const envelope = savedCompletion(this.meshRoot, this.recipient.projectRoot, id);
     if (envelope && !this.#canRead(envelope)) return;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     this.#forgotten.add(id);
+    this.#quietPending.delete(envelopePath(this.meshRoot, id));
     this.#rememberConsumed(id);
     this.#enqueued.delete(id);
     this.#consumed.delete(id);
@@ -553,14 +697,18 @@ export class CompletionJournal {
     if (envelope ? !this.#canRead(envelope) : !localRunSettled) return false;
     consumeCompletion(this.meshRoot, id, this.recipient.sessionId);
     if (envelope) this.#remember(envelope);
+    this.#quietPending.delete(envelopePath(this.meshRoot, id));
     this.#rememberConsumed(id);
     this.#enqueued.delete(id);
     void this.#retireClaim(id).catch(() => undefined);
     return true;
   }
   async drain(deliver = true): Promise<void> {
+    await this.#drain(deliver);
+  }
+  async #drain(deliver: boolean, changed?: readonly string[], suppliedClaims?: readonly Readonly<MeshStateEntry>[]): Promise<void> {
     const recipient = this.recipient; // Keep live Main renames visible even during an empty poll.
-    const claims = this.mesh.listAll(claimPrefix);
+    const claims = suppliedClaims ?? this.mesh.listAll(claimPrefix);
     // An absent journal has no bodies/attempts to inspect. Do not issue directory
     // scans or async canonicalization on the ordinary empty-root idle path.
     // Existing journals and bodyless claims still use bounded asynchronous scans.
@@ -574,8 +722,16 @@ export class CompletionJournal {
       if (typeof receipt?.id === "string" && claim.key === claimKey(receipt.id)) {
         // A failed CAS/delete must leave its evidence for the next pass, not retry
         // a replacement version through the envelope-pruning loop below.
-        if (!await this.#retireClaim(receipt.id, claim)) return;
-        if (++retired === 128) break;
+        if (!await this.#retireClaim(receipt.id, claim)) {
+          if (changed) this.#pendingReceipts.add(`${key(receipt.id)}.json`);
+          return;
+        }
+        if (++retired === 128) {
+          if (changed) for (const remaining of claims.slice(claims.indexOf(claim) + 1)) {
+            if (await this.#canRetireClaimAsync(remaining)) this.changed("receipts", `${remaining.key.slice(claimPrefix.length)}.json`);
+          }
+          break;
+        }
       }
     }
     const accepts = async (address: CompletionRecipient): Promise<boolean> =>
@@ -583,10 +739,14 @@ export class CompletionJournal {
     // Bound crash-left cleanup; receipt barriers use the async filesystem, never the UI thread.
     let pruned = 0;
     const project = await canonicalAsync(recipient.projectRoot);
-    for await (const target of scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
+    if (changed) this.#recipientProject = project;
+    for await (const target of changed ? scanSlices(changed) : scanTargets([directory(this.meshRoot), path.join(directory(this.meshRoot), "attempts")])) {
       const file = path.basename(target);
       let address = await readRecipientAsync(target, true);
-      if (!address || !await accepts(address) || await canonicalAsync(address.projectRoot) !== project) continue;
+      if (!address || !await accepts(address)) { this.#projects.delete(target); this.#quietPending.delete(target); continue; }
+      const addressProject = await canonicalAsync(address.projectRoot);
+      if (changed) this.#projects.set(target, { path: address.projectRoot, canonical: addressProject });
+      if (addressProject !== project) continue;
       // Reuse only rejects unchanged foreign entries. Cleanup authority always reopens
       // the exact address, then confirms the exact receipt and full namespace below.
       address = await readRecipientAsync(target);
@@ -600,12 +760,18 @@ export class CompletionJournal {
       if (claim) {
         if (!await this.#canRetireClaimAsync(claim)) continue;
         await this.#retireClaim(receipt.id, claim);
-        if (this.mesh.get(claimKey(receipt.id), { fresh: true })) continue;
+        if (this.mesh.get(claimKey(receipt.id), { fresh: true })) {
+          if (changed) this.#pendingReceipts.add(file);
+          continue;
+        }
       } else {
         await confirmReceipt(fence, receipt);
         fs.rmSync(target, { force: true });
       }
-      if (++pruned === 128) break;
+      if (++pruned === 128) {
+        if (changed) for (const remaining of changed.slice(changed.indexOf(target) + 1)) this.#dirty.add(remaining);
+        break;
+      }
     }
     // The inbox already owns enqueued notices until its durable carrier confirms
     // them. Avoid reopening their legacy metadata during every idle pass: on
@@ -613,7 +779,8 @@ export class CompletionJournal {
     // Receipt confirmation/claim cleanup above is deliberately NOT suppressed.
     const suppressed = new Set(this.#suppressed);
     for (const id of this.#enqueued) suppressed.add(`${key(id)}.json`);
-    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, suppressed);
+    const pending = await scanPendingCompletions(this.meshRoot, recipient.projectRoot, accepts, suppressed, changed,
+      (target, live) => { if (live) this.#pendingAttempts.add(target); else this.#pendingAttempts.delete(target); });
     if (!pending.length) return;
     for await (const envelope of scanSlices(pending)) {
       if (this.#enqueued.has(envelope.result.id) || !await this.#canDeliverAsync(envelope)) continue;
@@ -627,12 +794,16 @@ export class CompletionJournal {
           await this.mesh.put({ key: ck, ifVersion: claim?.version ?? 0,
             identity: { id: this.recipient.rootId, name: "main", kind: "main" },
             value: { rootId: this.recipient.rootId, sessionId: this.recipient.sessionId, recipient: this.recipient } satisfies CompletionClaim });
-        } catch { continue; } // Another admission changed the claim; leave the source pending.
+        } catch {
+          if (changed) this.#pendingAttempts.add(envelopePath(this.meshRoot, envelope.result.id));
+          continue;
+        } // Another admission changed the claim; leave the source pending.
       }
       if (await completionConsumedAsync(this.meshRoot, envelope.result.id)) { await this.#retireClaim(envelope.result.id); continue; }
       // Notification policy suppresses only inbox enqueue, not exact-root ownership.
       // A quiet owner can still list and explicitly consume its settled result.
-      if (!deliver) continue;
+      if (!deliver) { this.#quietPending.add(envelopePath(this.meshRoot, envelope.result.id)); continue; }
+      this.#quietPending.delete(envelopePath(this.meshRoot, envelope.result.id));
       this.#enqueued.add(envelope.result.id);
       try {
         this.enqueue(envelope.result, () => {
@@ -643,7 +814,10 @@ export class CompletionJournal {
             void this.#retireClaim(envelope.result.id).catch(() => undefined);
           } finally { this.#enqueued.delete(envelope.result.id); }
         });
-      } catch { this.#enqueued.delete(envelope.result.id); } // Source stays pending if admission failed.
+      } catch {
+        this.#enqueued.delete(envelope.result.id);
+        if (changed) this.#pendingAttempts.add(envelopePath(this.meshRoot, envelope.result.id));
+      } // Source stays pending if admission failed.
     }
   }
   async #canRetireClaimAsync(snapshot: NonNullable<ReturnType<MeshStore["get"]>>): Promise<boolean> {

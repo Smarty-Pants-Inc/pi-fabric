@@ -43,6 +43,22 @@ describe("background mesh retry boundary", () => {
     retry.success(); random.mockReturnValue(0.75); retry.failure(busy()); expect(retry.waitMs).toBe(75);
   });
 
+  it("backs off explicitly admitted watcher faults, deduplicates diagnostics and resets after recovery", async () => {
+    vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const retry = new MeshBackgroundRetry("watcher", 1_000, 5_000);
+    for (const expected of [500, 1_000, 2_000, 2_500, 2_500]) {
+      retry.fault(new Error("lost filesystem watcher"));
+      expect(retry.waitMs).toBe(expected); expect(retry.waitMs).toBeLessThanOrEqual(5_000);
+      await vi.advanceTimersByTimeAsync(expected);
+    }
+    expect(warn).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0); // Owner arms any timer.
+    retry.success(); retry.fault(new Error("new watcher outage"));
+    expect(retry.waitMs).toBe(500); expect(warn).toHaveBeenCalledTimes(2);
+    vi.spyOn(Math, "random").mockReturnValue(0); retry.fault(new Error("zero draw"));
+    expect(retry.waitMs).toBe(1);
+  });
+
   it("contains sync/async non-lock bugs visibly without imposing lock backoff", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const retry = new MeshBackgroundRetry("handler");

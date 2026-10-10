@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { kernelFenceAvailable } from "../src/residency/file-lock.js";
 
 vi.mock("../src/residency/file-lock.js", async (original) => ({
   ...await original<typeof import("../src/residency/file-lock.js")>(), kernelFenceAvailable: vi.fn(() => true),
 }));
-afterEach(() => vi.mocked(kernelFenceAvailable).mockReturnValue(true));
+afterEach(() => { vi.restoreAllMocks(); vi.mocked(kernelFenceAvailable).mockReturnValue(true); });
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
@@ -25,8 +26,12 @@ const fixture = () => {
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 50 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
+  // These fixtures exercise clock deadlines, not OS callback scheduling.
+  vi.spyOn(fs, "watch").mockImplementation((() => Object.assign(new EventEmitter(), {
+    close: vi.fn(), unref: vi.fn(),
+  })) as unknown as typeof fs.watch);
   const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
-  const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
+  const client = new ResidencyClient({ platform: "linux", config, mesh, participants: {} as FabricParticipantSource,
     mainAgent: { local: true } as FabricMainAgentTarget });
   return { root, config, client };
 };
@@ -80,8 +85,9 @@ describe("resident watchdog", () => {
   });
 
   it("keeps watchdog restart independent of mesh delivery outage backoff", async () => {
-    // Pin retry jitter; the 1 s delivery floor dominates these early retry delays.
-    // Watchdog recovery retains its independent original cadence.
+    // A faulted delivery pass owns one bounded retry of its exact inputs (1 s, 2 s, 4 s ...),
+    // with one deduplicated diagnostic. Host custody recovery keeps its own 5 s cadence,
+    // independent of that backoff, and a healthy pass disarms the fault timer.
     const random = vi.spyOn(Math, "random").mockReturnValue(0.999999);
     const { root, config, client } = fixture();
     fs.mkdirSync(config.actorRoot, { recursive: true });
@@ -89,30 +95,53 @@ describe("resident watchdog", () => {
       { id: "a", rootId: config.rootId, residency: "durable", status: "idle" },
     ] }));
     const start = vi.spyOn(client, "ensureHost").mockResolvedValue({} as Awaited<ReturnType<typeof client.ensureHost>>);
-    const read = vi.spyOn(client.options.mesh, "listAll").mockImplementation(() => {
-      throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+    const select = client.options.mesh.listAllShared.bind(client.options.mesh);
+    const read = vi.spyOn(client.options.mesh, "listAllShared").mockImplementation((prefix, options) => {
+      if (prefix === "residency/deliveries/") throw new MeshLockTimeoutError("fixture delivery outage", 1, 100);
+      return select(prefix, options);
     });
+    const polls = () => read.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.useFakeTimers();
     try {
       client.start();
       await vi.advanceTimersByTimeAsync(50);
       expect(start).toHaveBeenCalledOnce();
-      expect(read).toHaveBeenCalledOnce();
+      expect(polls()).toBe(1);
+      expect(read.mock.results.find((_, index) => read.mock.calls[index]?.[0] === "residency/deliveries/")?.type).toBe("throw");
       await vi.advanceTimersByTimeAsync(949);
-      expect(read).toHaveBeenCalledOnce();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(read).toHaveBeenCalledTimes(2);
-      await vi.advanceTimersByTimeAsync(1_000);
-      expect(read).toHaveBeenCalledTimes(3);
+      expect(polls()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1); // t=1000: first fault retry, still in outage.
+      expect(polls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(polls()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1); // t=3000: backoff doubled to 2 s.
+      expect(polls()).toBe(3);
       expect(warn).toHaveBeenCalledOnce();
-      read.mockReturnValue([]);
-      await vi.advanceTimersByTimeAsync(1_000);
-      // Successor completion reconciliation also scans claims after a successful delivery pass.
-      // Count delivery polls, not that separate scan, to keep the backoff assertion unchanged.
-      expect(read.mock.calls.filter(([prefix]) => prefix?.startsWith("residency/deliveries/"))).toHaveLength(4);
+      // Keep the canonical selector unavailable through the next known-work recovery:
+      // the watchdog restarts on its own schedule, untouched by the delivery backoff.
+      await vi.advanceTimersByTimeAsync(2_050);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(polls()).toBe(3);
+      read.mockImplementation(select);
+      await vi.advanceTimersByTimeAsync(1_949); // t=6999: next retry is due at 7000.
+      expect(polls()).toBe(3);
+      await vi.advanceTimersByTimeAsync(1); // No event: the owned obligation recovers.
+      expect(polls()).toBe(4);
+      expect(read.mock.results.some((result, index) =>
+        read.mock.calls[index]?.[0] === "residency/deliveries/" && result.type === "return" && Array.isArray(result.value))).toBe(true);
       expect(warn).toHaveBeenCalledOnce();
+      const recoveredPolls = polls();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(polls()).toBe(recoveredPolls);
+      // A generic state.json commit is not a delivery event and buys no selection.
+      const call = vi.mocked(fs.watch).mock.calls.find(([dir]) => String(dir) === config.meshRoot)!;
+      const notify = call.at(-1) as (event: string, filename: string) => void;
+      notify("change", "state.json"); await vi.advanceTimersByTimeAsync(0);
+      expect(polls()).toBe(recoveredPolls);
       await client.close();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(polls()).toBe(recoveredPolls);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       await client.close();

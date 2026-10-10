@@ -52,6 +52,60 @@ budgets remain unchanged. A client attaching between owner publication and the
 maintenance receipt waits for that existing generation and does not launch
 a competitor.
 
+## Event-driven completion retries
+
+Main's residency client observes `residency-notifications/<sha256(key)>.json`
+under the mesh root. `MeshStore.put`, successful deletes and applied batch
+operations publish/remove these advisory per-key files only for
+`residency/deliveries/` and `residency/completion-claims/`. File, shadow and SQLite
+backends share that path; a lease-only batch adds no notification or outbox
+snapshot. State, ownership, receipts and versioned CAS remain authoritative.
+Malformed/spoofed hints never authorize delivery.
+
+On Linux, generic `state.json`, read-journal/signal, heartbeat and lease writes do not retry
+pending work. A changed key re-reads just that exact key, compares its attempted
+signature and validates ownership. Completion/receipt and legacy producer-file
+notifications retry only the corresponding known items. Unchanged failed work
+is retained separately from admitted dirty work, including in the completion
+journal. `ResidencyClient.retryDeliveries()` is an explicit recovery hook;
+startup/reconnection also reconciles durable state. Lost notification publication
+or a process crash can be recovered there, not by an idle timer. The minute
+safety timer only repairs watch attachment, never discovers/delivers work.
+
+Windows retains a 5-second trusted safety drain for control, lifecycle and
+residency observation. Native watches observe recursively from stable parent
+paths, so the mesh, journal and run directories are never held open; Windows
+cannot rename a directory pinned by `ReadDirectoryChangesW`. Missing callbacks,
+unsupported watches and directory replacements therefore cannot strand new
+commands, ACKs, completion files or consumed-delivery cleanup. Namespace discovery
+still compares canonical entry signatures, so an unchanged permanently refused
+actor delivery is not re-admitted by the safety tick. Safety observations do not
+reset an outstanding storage-fault backoff. These Windows timers are closed with
+their runtime and add no Linux idle work.
+
+On every platform, an already-observed lease-paused control claim or completed
+outcome owns a bounded retry until its existing deadline/ACK fence settles.
+Detached ASK failure can arrive after its original drain went idle; it retains
+that same claim and result, never replays a completed handler, and cannot depend
+on another filesystem change to resume. Once those obligations settle, Linux
+returns to attachment-only idle maintenance.
+
+The actor mesh monitor is separate. It retains the 5-second
+`MESH_MONITOR_SAFETY_NET_MS` recovery drain and all manager `beforePoll`
+maintenance from main, including registry, ownership, filters and child results.
+Unsupported or failed actor watches retain the `actorPollMs` fallback. This PR
+carries the non-drain parts of closed pi-fabric#724; it does not claim the
+smarty-dev#7299 fault-armed exception exit. External registry, ownership and
+child-completion wake triggers must be proven before that drain can be removed.
+
+Successful Main settlement also reconciles young inbox work and re-arms its
+exact known-item one-shot grace/cooldown deadline. A busy-time watch event cannot
+cancel that hint permanently; the deadline still passes all normal idle,
+preflight, capability and ownership gates, and does not admit unrelated records.
+
+See [Linux idle CPU replay](idle-cpu-benchmark.md) for the 300-second same-seed
+measurement and 600-second duration bounds.
+
 ## Context and lifecycle
 
 Residency does not share agent contexts. Each actor or agent retains its own

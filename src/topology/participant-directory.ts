@@ -48,6 +48,7 @@ import {
   type ParticipantFileLockOptions,
   participantFilePresent,
   participantFilesOnly,
+  participantFilesCachedStamp,
   readParticipantFile,
   readParticipantFiles,
   removeParticipantFileIf,
@@ -583,6 +584,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #parsedEntries = new Map<string, { source: Readonly<MeshStateEntry>; entry: MeshStateEntry }>();
   readonly #reportedCollisions = new Set<string>();
   readonly #reportedRootCollisions = new Set<string>();
+  #collisionFilesWatch: fs.FSWatcher | undefined;
+  #collisionFilesIdentity: string | undefined;
+  #collisionWatchCheckedAt = Number.NEGATIVE_INFINITY;
+  #collisionDirty = true;
+  #fileCensusDirty = true;
+  #ownedFileKeys: Set<string> | undefined;
+  #fileCensusRetryAt = Number.POSITIVE_INFINITY;
+  #peerFilesDirty = true;
+  #peerFileEntries: readonly MeshStateEntry[] | undefined;
+  #peerFilesCheckedAt = Number.NEGATIVE_INFINITY;
+  #collisionInputs: string | undefined;
+  #collisionLegacy: string | undefined;
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
   /** Consecutive heartbeats skipped for want of a live lifecycle; degraded past the limit. */
@@ -1111,9 +1124,69 @@ export class ParticipantDirectory implements FabricParticipantSource {
     });
   }
 
+  // Advisory census only. Foreign file events invalidate it; our own heartbeat rename
+  // does not require statting every fleet participant again. Routing/ownership reads
+  // still use their existing fresh file and CAS gates, independent of this cache.
+  #watchCollisionFiles(): void {
+    if (Date.now() - this.#collisionWatchCheckedAt < 60_000) return;
+    this.#collisionWatchCheckedAt = Date.now();
+    const directory = path.join(this.mesh.root, "participants");
+    try {
+      const stat = fs.statSync(directory, { bigint: true });
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (this.#collisionFilesWatch && this.#collisionFilesIdentity === identity) return;
+      this.#collisionFilesWatch?.close();
+      this.#collisionFilesWatch = undefined;
+      this.#collisionDirty = true;
+      this.#fileCensusDirty = true;
+      this.#peerFilesDirty = true;
+      const watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
+        if (this.#collisionFilesWatch !== watcher || this.#closed) return;
+        const name = filename?.toString();
+        if (name !== undefined && !/^[0-9a-f]{64}\.json$/.test(name)) return;
+        if (name === `${keyFor(PARTICIPANT_PREFIX, this.options.rootId).slice(PARTICIPANT_PREFIX.length)}.json` ||
+            [...this.#localRecords.keys()].some(id =>
+              name === `${keyFor(PARTICIPANT_PREFIX, id).slice(PARTICIPANT_PREFIX.length)}.json`)) return;
+        this.#collisionDirty = true;
+        this.#fileCensusDirty = true;
+        this.#peerFilesDirty = true;
+      });
+      this.#collisionFilesWatch = watcher;
+      this.#collisionFilesIdentity = identity;
+      watcher.on("error", () => {
+        if (this.#collisionFilesWatch !== watcher) return;
+        watcher.close();
+        this.#collisionFilesWatch = undefined;
+        this.#collisionDirty = true;
+        this.#fileCensusDirty = true;
+        this.#peerFilesDirty = true;
+      });
+      const after = fs.statSync(directory, { bigint: true });
+      if (`${after.dev}:${after.ino}` !== identity) {
+        watcher.close(); this.#collisionFilesWatch = undefined;
+      }
+    } catch {
+      this.#collisionFilesWatch?.close();
+      this.#collisionFilesWatch = undefined;
+      this.#collisionDirty = true;
+      this.#fileCensusDirty = true;
+      this.#peerFilesDirty = true;
+    }
+  }
+
   // Check initial registration AND heartbeat renames, using both file and legacy/state peers.
   // This is an alert, not a race-free exclusive claim or a fork-ancestry inference.
   #reportRootCollisions(root: FabricParticipantRecord): void {
+    this.#watchCollisionFiles();
+    const inputs = JSON.stringify([root.name, root.sessionId, root.cwd]);
+    // Legacy/state publication has no file event. Compare only foreign participant
+    // bytes, not the state token that our own lease publication changes each heartbeat.
+    const ownKey = keyFor(PARTICIPANT_PREFIX, this.options.rootId);
+    const legacy = JSON.stringify(this.mesh.listAllShared(PARTICIPANT_PREFIX).filter(entry => entry.key !== ownKey));
+    if (!this.#collisionDirty && inputs === this.#collisionInputs && legacy === this.#collisionLegacy) return;
+    this.#collisionDirty = false;
+    this.#collisionInputs = inputs;
+    this.#collisionLegacy = legacy;
     // Advisory only: collision alerts may lag the bounded idle view. They must not bypass
     // coalescing on every heartbeat; ownership/lineage/delivery reads below stay fresh.
     for (const peer of this.list({ scope: "project", kinds: ["root"] })) {
@@ -1626,6 +1699,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#collisionFilesWatch?.close();
+    this.#collisionFilesWatch = undefined;
+    this.#collisionFilesIdentity = undefined;
+    this.#collisionDirty = true;
+    this.#fileCensusDirty = true;
+    this.#peerFilesDirty = true;
+    this.#peerFileEntries = undefined;
+    this.#ownedFileKeys = undefined;
+    this.#collisionWatchCheckedAt = Number.NEGATIVE_INFINITY;
     this.#cancelPublicationRetry();
     await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
@@ -1665,6 +1747,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Return the actual shared commit/acquisition time, not the completion time
   // of fallible post-commit file copies. An unchanged change-only refresh proves nothing.
   async #refresh(full: boolean): Promise<number | false> {
+    if (this.options.enabled) this.#watchCollisionFiles();
     // Claim before capturing a publication generation, but reselect ALL sources
     // afterwards: neither a label's mesh write nor an awaited claim may leave
     // actor ownership observations selected against an older generation.
@@ -1797,7 +1880,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // below still use CAS and fresh locked checks; no shared entry is modified here.
     const stateEntries = this.mesh.listAllShared(PARTICIPANT_PREFIX, read);
     const stateByKey = new Map(stateEntries.map((entry) => [entry.key, entry]));
-    const fileEntries = readParticipantFiles(this.mesh.root);
+    // Enumerate unknown/stale own keys only at activation or a foreign directory
+    // event (minute repair when watching is unavailable). Each heartbeat still
+    // freshly reads every desired/previously-owned key; all writes and removals
+    // retain their locked fresh ownership checks. Never cache delivery authority.
+    if (this.#fileCensusDirty || !this.#ownedFileKeys || now >= this.#fileCensusRetryAt) {
+      this.#ownedFileKeys = new Set(this.#peerFiles().filter(entry => ownParticipant(entry)).map(entry => entry.key));
+      this.#fileCensusDirty = false;
+      // Incomplete or same-timestamp-tick scans must not become permanent negatives.
+      this.#fileCensusRetryAt = participantFilesCachedStamp(this.mesh.root) === undefined
+        ? now + 60_000 : Number.POSITIVE_INFINITY;
+    }
+    const fileKeys = new Set([...this.#ownedFileKeys,
+      ...[...desired.keys(), ...this.#localRecords.keys()].map(id => keyFor(PARTICIPANT_PREFIX, id)),
+      ...stateEntries.filter(entry => ownParticipant(entry)).map(entry => entry.key)]);
+    const fileEntries = [...fileKeys].flatMap(key => {
+      const entry = readParticipantFile(this.mesh.root, key);
+      if (entry && ownParticipant(entry)) this.#ownedFileKeys!.add(key);
+      else this.#ownedFileKeys!.delete(key);
+      return entry ? [entry] : [];
+    });
     const filesByKey = new Map(fileEntries.map((entry) => [entry.key, entry]));
     const existing = stateEntries.flatMap((entry) => {
       const participant = ownParticipant(entry);
@@ -2261,6 +2363,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return leaseAt;
   }
 
+  // Peer capability/key discovery is event-invalidated observation, not ownership
+  // authority. A minute metadata repair covers dropped directory notifications;
+  // actual routing, takeover, migration write and removal gates still read fresh.
+  #peerFiles(): readonly MeshStateEntry[] {
+    if (this.#peerFilesDirty || !this.#peerFileEntries || Date.now() - this.#peerFilesCheckedAt >= 60_000) {
+      this.#peerFileEntries = readParticipantFiles(this.mesh.root);
+      this.#peerFilesCheckedAt = Date.now();
+      this.#peerFilesDirty = false;
+      this.#fileCensusDirty = true;
+    }
+    return this.#peerFileEntries;
+  }
+
   /** No operator switch needed: a live older reader makes us dual-renew again. */
   #legacyRenewalsRequired(now: number, snapshot?: object): boolean {
     const read = snapshot ? { snapshot } : {};
@@ -2273,7 +2388,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (entry.updatedBy.id !== this.options.identity.id && isLiveLegacyRootEntry(entry, now, this.mesh.root) &&
         (!isObject(entry.value) || entry.value.livenessLeaseFiles !== 1)) return true;
     }
-    for (const entry of this.#participantEntries(read)) {
+    for (const entry of mergeParticipantEntries(this.#peerFiles(), this.mesh.listAll(PARTICIPANT_PREFIX, read)).entries) {
       const peer = participantFromEntry(entry);
       const owner = peer && hosts.get(peer.ownerHostId);
       if (peer && peer.ownerHostId !== this.options.hostId && peer.remoteHost === undefined &&

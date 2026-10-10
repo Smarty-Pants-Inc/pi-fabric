@@ -155,7 +155,9 @@ describe("optimistic mesh write snapshots", () => {
     await new MeshStore(root, 65536, 100).writeBatch({ identity, ops: [
       { kind: "put", key: "other/heartbeat/a", value: (now: number) => ({ now }) },
     ] });
-    expect(reads).toBe(3); expect(parses).toBe(3); expect(encodings).toBe(2);
+    // The delete still reads fresh canonical bytes, but reuses its byte-equal
+    // immutable committed tree. Only the two cold stores need a full parse.
+    expect(reads).toBe(3); expect(parses).toBe(2); expect(encodings).toBe(2);
     assertNoStaging(root);
   });
 

@@ -15,7 +15,7 @@ import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
 import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
-import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
+import { AgentInputError, normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 
 const regularFile = (file: string): boolean => {
@@ -79,7 +79,16 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (placement) {
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
       const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
+      // The corpus need is never placed off the Main, whatever a launcher claims
+      // (smarty-dev#6779, #2890). Like smarty-task-ryzen2 --host H --needs corpus,
+      // a placement that pins an explicit remote host refuses it instead of re-routing.
+      const host = placement.command[placement.command.indexOf("--host") + 1];
+      if (needs?.includes("corpus") && !needs.includes("local") && placement.default !== "local"
+        && placement.command.includes("--host") && host !== undefined && host !== "auto") {
+        throw new AgentInputError("needs", `needs corpus: run on the Main host; agents.placement pins remote host ${host}; no worker started`);
+      }
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
+        : needs?.includes("corpus") ? "corpus"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;

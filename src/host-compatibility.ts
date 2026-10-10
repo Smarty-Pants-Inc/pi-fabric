@@ -19,6 +19,14 @@ export class AgentInputError extends Error {
   }
 }
 
+// ponytail: a fixed list, not a placement decider (smarty-dev#6779). A prompt or
+// cwd naming the Main's private corpus or per-user runtime dir only adds the
+// "corpus" need; placement (and the #2890 router) still makes the one decision.
+const CORPUS_MARKERS = ["org-context/tree", "org-search", "/run/user/"];
+export const withCorpusNeed = (needs: string[] | undefined, task: string, cwd = ""): string[] | undefined =>
+  needs?.includes("corpus") || !CORPUS_MARKERS.some(marker => task.includes(marker) || cwd.includes(marker))
+    ? needs : [...needs ?? [], "corpus"];
+
 /** Needs and launcher guarantees share the same canonical token vocabulary. */
 export const normalizeAgentCapabilityTokens = (value: unknown, field = "needs"): string[] | undefined => {
   if (value === undefined) return undefined;

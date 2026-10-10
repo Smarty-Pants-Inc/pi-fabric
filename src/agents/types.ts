@@ -220,6 +220,8 @@ export interface AgentRunRecord {
   budget?: FabricBudgetSummary;
   /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
+  /** `remote <host>` when host placement ran this task on a work host. */
+  placement?: string;
   /** Linux process birth identity, persisted by the worker to detect PID reuse. */
   processStartTime?: string;
   /** Latest native runner session; joins Pi gateway session_id to this run. */
@@ -283,6 +285,8 @@ export interface AgentHandleInfo {
   recursive?: boolean;
   residency?: FabricParticipantResidency;
   sessionId?: string;
+  /** `remote <host>` when host placement ran this task on a work host. */
+  placement?: string;
   runnerSessionId?: string;
   attachCommand?: string;
   branch?: string;
@@ -410,6 +414,8 @@ export interface AgentTransportHandle {
   fabricRelease?: string;
   kind: FabricAgentTransport;
   sessionId?: string;
+  /** `remote <host>` once a placement launcher accepted the task. */
+  placement?: string;
   attachCommand?: string;
   /** Event custody is opt-in only after a verified, owned cgroup-v2 receipt.
    * Missing/failed admission keeps the legacy checked-query contract. */

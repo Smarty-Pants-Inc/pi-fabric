@@ -117,9 +117,10 @@ describe("host process task placement", () => {
   });
   it("matches NFKC and Unicode-White_Space canonicalized compound capabilities and needs", async () => {
     const f = fixture();
-    f.config.placement.capabilities = ["ＣＯＭＰＵＴＥ\u0085ＣＯＲＰＵＳ"];
-    expect(await f.manager.run({ task: "canonical", needs: ["ｃｏｍｐｕｔｅ\u0085ｃｏｒｐｕｓ", "COMPUTE"] })).toMatchObject({ status: "completed", text: "REMOTE: canonical" });
-    expect(normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["ＣＯＭＰＵＴＥ\u0085ＣＯＲＰＵＳ", "compute"] } } }).agents.placement?.capabilities).toEqual(["compute", "corpus"]);
+    // corpus is never placed remotely (smarty-dev#6779), so this uses gpu.
+    f.config.placement.capabilities = ["ＣＯＭＰＵＴＥ\u0085ＧＰＵ"];
+    expect(await f.manager.run({ task: "canonical", needs: ["ｃｏｍｐｕｔｅ\u0085ｇｐｕ", "COMPUTE"] })).toMatchObject({ status: "completed", text: "REMOTE: canonical" });
+    expect(normalizeFabricConfig({ agents: { placement: { ...f.raw, capabilities: ["ＣＯＭＰＵＴＥ\u0085ＧＰＵ", "compute"] } } }).agents.placement?.capabilities).toEqual(["compute", "gpu"]);
   });
   it.each(["compute/slash", "ＣＯＭＰＵＴＥ／ＦＡＳＴ"])("rejects capability token %s outside the ASCII grammar", token => {
     const f = fixture();
@@ -266,7 +267,7 @@ describe("host process task placement", () => {
     const f=fixture(); const h=await f.manager.spawn({task:"x",transport:"process",needs:[need]});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
-    expect(lines).toEqual([expect.objectContaining({reason:`unmet needs: ${need}`,needs:[need]})]);
+    expect(lines).toEqual([expect.objectContaining({reason:need==="corpus"?"corpus":`unmet needs: ${need}`,needs:[need]})]);
     expect(fs.existsSync(f.results)).toBe(false);
   });
   it.each([false,true])("preserves argv and maps spawn/wait results (command polling=%s)", async pollCommand => {
@@ -276,6 +277,53 @@ describe("host process task placement", () => {
     const result=await f.manager.wait(h.id);
     expect(result).toMatchObject({status:"completed",text:`REMOTE: ${task}`,exitCode:0});
     expect(JSON.parse(fs.readFileSync(path.join(f.results,h.id,"argv.json"),"utf8"))).toEqual(["--host","auto","--minutes","1","--cwd",f.root,"--model","test/model","--thinking","high","--",task]);
+  });
+  it.each([
+    ["Read ~/.local/share/smarty-dev/org-context/tree/github first", "org-context/tree"],
+    ["Run org-search 'placement' and summarize", "org-search"],
+    ["Read the prompt in /run/user/1000/fabric/task.md", "/run/user/"],
+  ])("adds the corpus need for a corpus prompt without needs (smarty-dev#6779): %s", async (task, _marker) => {
+    const f=fixture();
+    for (const [needs, expected] of [[undefined,["corpus"]],[["compute"],["compute","corpus"]],[["corpus"],["corpus"]]] as const) {
+      const h=await f.manager.spawn({task,transport:"process",...(needs ? {needs:[...needs]} : {})});
+      expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
+      const lines=fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line)).filter(line=>line.type==="placement.local");
+      expect(lines).toEqual([expect.objectContaining({reason:"corpus",needs:expected})]);
+    }
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("adds the corpus need when the cwd names the corpus (smarty-dev#6779)", async () => {
+    const f=fixture(); const cwd=path.join(f.root,"org-context","tree"); fs.mkdirSync(cwd,{recursive:true});
+    const result=await f.manager.run({task:"plain",transport:"process",cwd});
+    expect(result.text).toBe("LOCAL");
+    expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8")).toContain('"reason":"corpus","needs":["corpus"]');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("never places a corpus need off the Main, even when the launcher claims corpus (smarty-dev#6779)", async () => {
+    const f=fixture(); f.config.placement.capabilities=["corpus"];
+    const result=await f.manager.run({task:"x",transport:"process",needs:["corpus"]});
+    expect(result.text).toBe("LOCAL");
+    expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!,"events.jsonl"),"utf8")).toContain('"reason":"corpus"');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it("refuses a corpus need when placement pins an explicit remote host, without re-routing (smarty-dev#6779)", async () => {
+    const f=fixture(); f.config.placement.command=f.config.placement.command.map(entry=>entry==="auto"?"ryzen3":entry);
+    await expect(f.manager.run({task:"Read org-context/tree/github",transport:"process"})).rejects.toMatchObject({code:"FABRIC_AGENT_INPUT_ERROR",field:"needs",launchOutcome:"unlaunched"});
+    const req=launch(f,"x"); req.needs=["corpus"];
+    await expect(new ProcessTransport(undefined,f.config.placement).launch(req)).rejects.toThrow("pins remote host ryzen3");
+    expect(fs.existsSync(f.results)).toBe(false);
+    expect(fs.existsSync(path.join(f.root,"direct","status.json"))).toBe(false);
+    // Counterexample: the same pinned placement still launches a task without the corpus need.
+    expect(await f.manager.run({task:"plain",transport:"process"})).toMatchObject({status:"completed",text:"REMOTE: plain"});
+  });
+  it("shows the remote host in the spawn result (smarty-dev#6779)", async () => {
+    const f=fixture(); const h=await f.manager.spawn({task:"pending",transport:"process"});
+    expect(h.placement).toBe("remote ryzen2");
+    expect(f.manager.status(h.id)).toMatchObject({placement:"remote ryzen2"});
+    await f.manager.stop(h.id);
+    const local=await f.manager.spawn({task:"x",transport:"process",needs:["corpus"]});
+    expect(local.placement).toBeUndefined();
+    await f.manager.wait(local.id);
   });
   it("ships a Git source cwd with --src rather than the target-only --cwd flag", async () => {
     const f=fixture(); execFileSync("git",["init","--quiet",f.root]);

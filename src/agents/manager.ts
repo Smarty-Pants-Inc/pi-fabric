@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { normalizeAgentRequires } from "./input-validation.js";
-import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
+import { AgentInputError, normalizeAgentCapabilityTokens, withCorpusNeed } from "../host-compatibility.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -1092,7 +1092,7 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    const needs = normalizeAgentCapabilityTokens(request.needs);
+    const needs = withCorpusNeed(normalizeAgentCapabilityTokens(request.needs), request.task, request.cwd);
     const requires = normalizeAgentRequires(request.requires);
     // Session transports are disabled until they can retain execution custody.
     // Refuse input declarations explicitly rather than silently skipping preflight.
@@ -4000,6 +4000,7 @@ export class AgentManager {
       ...(managed.recursive ? { recursive: true } : {}),
       ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
       ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
+      ...(managed.transport.placement ? { placement: managed.transport.placement } : {}),
       ...(managed.transport.attachCommand
         ? { attachCommand: managed.transport.attachCommand }
         : {}),
@@ -4072,6 +4073,7 @@ export class AgentManager {
       ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
       ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
       ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
+      ...(managed.transport.placement ? { placement: managed.transport.placement } : {}),
       ...(managed.transport.attachCommand
         ? { attachCommand: managed.transport.attachCommand }
         : {}),

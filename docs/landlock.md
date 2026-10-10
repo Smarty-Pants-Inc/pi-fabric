@@ -5,7 +5,11 @@ This opt-in Linux feature confines **local `pi.bash` calls through Fabric**
 independent early warning. Native tools outside Fabric, `user_bash`, direct
 `extensions.*`, PowerShell, and trusted Node/Bun/CPython executor escape hatches
 are **not** covered. This is a filesystem safety boundary, not a hostile-code or
-whole-session sandbox. Do not advertise those other execution paths as confined.
+whole-session sandbox. `enforce` applies to the Bash route only: actor/task launches,
+process transports and executor runtimes are not Landlock-enforced. Non-Bash
+enforcement is tracked in [smarty-dev#7935](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7935).
+Reserved `PI_FABRIC_LANDLOCK_*` controls are scrubbed at those child-launch
+boundaries; environment scrubbing is not kernel confinement.
 
 ## Modes and the honest trial
 
@@ -20,17 +24,19 @@ The authorized fallback is implemented:
 { "executor": { "landlock": { "mode": "enforce" } } }
 ```
 
-- `mode: "off"` is the default until rollout; bash behavior is unchanged.
+- `mode: "off"` is the default with missing root policy or a valid root `off` baseline; bash behavior is unchanged. Present but unprovable policy selects strict `enforce` (no kill switch or escape grant).
 - `mode: "enforce"` requires Linux with active Landlock ABI >=4. Unsupported
   kernels, missing helper, malformed policy, setup failures and incompatible
   opaque/managed overrides fail closed, never retry through an unconfined shell.
 - macOS and Windows leave the wrapper **disabled**, even if `enforce` is selected.
-- Put `executor.landlock.disabled: true` in the **global agent `fabric.json`** to
-  kill confinement fleet-wide. Project values for `disabled` are ignored, so a
-  lane cannot defeat that kill switch. The host file is re-read on every
-  enforced local bash call, so already-running lanes stop confining on their
-  next call without a reload (already-spawned confined children stay confined).
-  The settings UI exposes both keys; change the save scope to global for the switch.
+- Put `executor.landlock.disabled: true` only in valid **root-owned
+  `/etc/smarty/fabric-policy.json`** to kill confinement fleet-wide. Agent-dir
+  and project values are always ignored. The root file is revalidated on every
+  enforced local bash call, so already-running lanes observe root changes on
+  their next call without a reload (already-spawned children stay confined).
+  Missing, unsafe or unstable root policy revokes a disable grant. The settings
+  UI explains these keys but cannot save root authority; switching save scope
+  to global does not authorize the kill switch.
 
 Run the 24-hour **enforce trial on one approved lane**, not a fictitious warn
 soak. Neither this change nor its tests enable a trial or change installed/global
@@ -38,19 +44,45 @@ configuration. Review the policy first; fleet enforcement is a separate rollout.
 
 ### Per-command escape
 
-Use the exact leading assignment in a `pi.bash` command:
+Only a valid root-owned `/etc/smarty/fabric-policy.json` with
+`executor.landlock.allowEscape: true` authorizes per-command escapes. The grant
+is denied by default and cannot be set by agent-dir or project configuration.
+Root must publish this policy by **atomic rename**, not an in-place rewrite;
+short or metadata-changing reads are invalid and grant no escape authority.
+See [root-owned host policy](configuration.md#root-owned-host-policy).
+
+With that explicit owner-approved grant, use the exact leading assignment in a
+`pi.bash` command:
 
 ```sh
 PI_FABRIC_LANDLOCK_ESCAPE=1 your-command arguments
 ```
 
-Fabric removes this reserved prefix, records an `escape` event **before spawning**,
-and runs that one command unconfined through the same cooperative filters.
-Every use emits a visible escape notice and is appended to
+Without the root grant, Fabric strips the reserved prefix, warns once per
+process, and runs the command **confined**; its journal event is `enforce`, not
+`escape`. Root grants are revalidated on every enforced call: removing the grant
+or making the policy missing, unsafe or unstable revokes escape authority for
+already-running lanes.
+
+Escape handling lives in the Bash Landlock operations wrapper, after the
+`pi.bash` route selects it. Its decision does not enforce the production
+actor/task, process-transport or executor launch routes. It runs after cooperative preparation and strips repeated
+leading assignments after exact trusted PID/middleware decorations. Explicit or
+inherited child environment `PI_FABRIC_LANDLOCK_ESCAPE=1` requests the same
+root-gated escape. The reserved variable is removed from child environment for
+both denied and granted requests, so a grant does not propagate implicitly.
+The native helper also strips prefixes and scrubs the variable for every direct
+helper caller; it always confines and cannot authorize an escape from env.
+
+With the grant, Fabric records an `escape` event **before spawning**, and runs
+that one command unconfined through the same cooperative filters. Every use
+emits a visible escape notice and is appended to
 `<session cwd>/.pi/landlock-audit.jsonl`. If mandatory logging fails, no command
-runs. An assignment inside the shell body, quoted/encoded spelling, `env ...`, or
-an ambient inherited flag cannot lift a restriction already imposed by the
-kernel. The escape does not bypass the text guard, approvals or timeouts.
+runs. An assignment inside a running shell body, quoted/encoded spelling or
+`env ...` cannot lift a restriction already imposed by the kernel. Descendants
+inherit that restriction across exec/spawn; this does not newly confine the
+unrelated executor/agent launchers excluded at the top of this document.
+The escape does not bypass the text guard, approvals or timeouts.
 
 The journal records UTC time, role, execution cwd, shell job directory and a
 SHA-256 command digest (not potentially secret-bearing command text). Enforced
@@ -62,8 +94,8 @@ Audit opens pin `.pi` and reject symlinks, hard links and non-regular files.
 
 ## Paul's one-glance write policy
 
-[`config/landlock-roles.json`](../config/landlock-roles.json) is the **only policy
-file**. `default` entries apply to every role; `roles` appends reviewed additions
+[`config/landlock-roles.json`](../config/landlock-roles.json) is the **only write-grant
+list** (root-only mode/disable/escape authority is separate host policy). `default` entries apply to every role; `roles` appends reviewed additions
 for the role in host `SMARTY_ROLE` (the `@commit` suffix is stripped). All three
 roles currently inherit the same minimal list. Unknown roles receive only that
 list, never a wider fallback. Each entry has a one-line reason.
@@ -175,7 +207,7 @@ The kernel tests use actual `ActionRegistry` / `PiToolsProvider`, Pi's real
 assert `tool_call`/`tool_result`, no standalone override fallback, real `EACCES`
 for rm/find/Python/Perl/tee, allowed lane/private temp writes, out-of-lane `cwd`
 and symlink/BASH_ENV protection, run/git grants, escape journals, cancellation,
-background inheritance and off behavior. Kernel tests skip only on non-Linux;
+background inheritance, denied ungranted escapes, root-granted escape logs and off behavior. Kernel tests skip only on non-Linux;
 an unsupported Linux host fails with an explicit ABI check. Literal text guards
 are tested independently: an earlier friendly refusal is not claimed as a
 kernel denial. The optional benchmark interleaves actual calls in fresh modes,

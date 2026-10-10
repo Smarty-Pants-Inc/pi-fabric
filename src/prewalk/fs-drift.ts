@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
@@ -71,6 +72,7 @@ const listGitFiles = async (
 ): Promise<{ root: string; files: string[] } | undefined> => {
   try {
     const top = await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+      env: childProcessEnvironment(),
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 1 << 20,
     });
@@ -79,7 +81,7 @@ const listGitFiles = async (
     const listed = await execFileAsync(
       "git",
       ["-C", root, "ls-files", "-co", "--exclude-standard", "-z"],
-      { timeout: GIT_TIMEOUT_MS, maxBuffer: 64 << 20 },
+      { env: childProcessEnvironment(), timeout: GIT_TIMEOUT_MS, maxBuffer: 64 << 20 },
     );
     return { root, files: listed.stdout.split("\0").filter((file) => file.length > 0 && !isFabricStateRelativePath(file)) };
   } catch {

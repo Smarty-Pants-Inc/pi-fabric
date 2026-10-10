@@ -20,7 +20,7 @@ const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const helper = path.resolve("dist/native/fabric-landlock");
 
 const harness = (settings: LandlockSettings = { mode: "enforce", disabled: false },
-  opt: { opaque?: boolean; managed?: boolean; blocked?: boolean; gate?: { entered: () => void; open: Promise<void> } } = {}) => {
+  opt: { opaque?: boolean; managed?: boolean; blocked?: boolean; escapeEnv?: string; gate?: { entered: () => void; open: Promise<void> } } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-test-"));
   roots.push(root);
   const cwd = path.join(root, "lane");
@@ -38,6 +38,7 @@ const harness = (settings: LandlockSettings = { mode: "enforce", disabled: false
         delete filtered.FABRIC_TEST_SECRET;
         // Even a cooperative env rewrite must not widen kernel policy.
         filtered.PI_FABRIC_LANDLOCK_WRITES = "/";
+        if (opt.escapeEnv !== undefined) filtered.PI_FABRIC_LANDLOCK_ESCAPE = opt.escapeEnv;
         return { ...rest, env: filtered };
       },
     },
@@ -116,7 +117,7 @@ describe("Landlock settings", () => {
     fs.mkdirSync(agentDir); fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { landlock: { disabled: true } } }));
     fs.writeFileSync(path.join(cwd, ".pi/fabric.json"), JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: false } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock).toEqual({ mode: "enforce", disabled: true });
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock).toEqual({ mode: "enforce", disabled: false });
   });
 });
 
@@ -202,8 +203,24 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     expect(fs.existsSync(path.join(h.cwd, ".pi/landlock-audit.jsonl"))).toBe(false);
   });
 
-  it("logs every per-command escape, then confines the next command; live kill switch is honored", async () => {
+  it("keeps an ungranted leading escape confined and warns once", async () => {
     const h = harness();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`;
+    for (let i = 0; i < 2; i++) {
+      const result = await h.invoke({ command, settle: true });
+      expect(result.ok).toBe(false);
+      expect(result.output).toContain("Permission denied");
+    }
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    expect(h.audit().map(row => row.event)).toEqual(["enforce", "enforce"]);
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("allowEscape"))).toHaveLength(1);
+    // The reserved assignment is removed even when its authority is denied.
+    expect((await h.invoke({ command: "PI_FABRIC_LANDLOCK_ESCAPE=1 printf %s \"${PI_FABRIC_LANDLOCK_ESCAPE-unset}\"" })).output).toBe("unset");
+  });
+
+  it("logs every root-granted per-command escape, then confines the next command; live kill switch is honored", async () => {
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true });
     const command = `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`;
     for (let i = 0; i < 2; i++) expect((await h.invoke({ command })).output).toContain("Landlock escape: unconfined");
     expect(h.audit().filter(row => row.event === "escape")).toHaveLength(2);
@@ -212,6 +229,40 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     expect((await h.invoke({ command: `printf denied > ${quote(path.join(h.sibling, "victim"))}`, settle: true })).ok).toBe(false);
     h.settings.disabled = true;
     expect((await h.invoke({ command: `printf disabled > ${quote(path.join(h.sibling, "victim"))}` })).ok).toBe(true);
+  });
+
+  it.each([false, true])("consumes spawnHook/inherited env after middleware; grant=%s", async allowEscape => {
+    for (const request of ["spawnHook", "inherited"] as const) {
+      vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE", request === "inherited" ? "1" : undefined);
+      const h = harness({ mode: "enforce", disabled: false, allowEscape },
+        request === "spawnHook" ? { escapeEnv: "1" } : {});
+      const command = `printf '%s:%s:%s\\n' "$LANDLOCK_PREFIX" "$LANDLOCK_SPAWN" "\${PI_FABRIC_LANDLOCK_ESCAPE-unset}"; printf changed > ${quote(path.join(h.sibling, "victim"))}`;
+      const result = await h.invoke({ command, settle: true });
+      expect(result.ok).toBe(allowEscape);
+      expect(result.output).toContain("preserved:preserved:unset");
+      expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe(allowEscape ? "changed" : "keep-me");
+      expect(h.audit().at(-1).event).toBe(allowEscape ? "escape" : "enforce");
+    }
+  });
+
+  it("scrubs non-request escape env values even with a grant", async () => {
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true }, { escapeEnv: "0" });
+    expect((await h.invoke({ command: "printf %s \"${PI_FABRIC_LANDLOCK_ESCAPE-unset}\"" })).output).toBe("unset");
+    expect(h.audit()[0].event).toBe("enforce");
+  });
+
+  it("revokes a grant while middleware prepares before entering the common launch boundary", async () => {
+    let entered!: () => void; let release!: () => void;
+    const reached = new Promise<void>(done => { entered = done; });
+    const open = new Promise<void>(done => { release = done; });
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true }, { gate: { entered, open } });
+    const pending = h.invoke({ command: `PI_FABRIC_LANDLOCK_ESCAPE=1 printf changed > ${quote(path.join(h.sibling, "victim"))}`, settle: true });
+    await reached;
+    h.settings.allowEscape = false;
+    release();
+    expect((await pending).ok).toBe(false);
+    expect(fs.readFileSync(path.join(h.sibling, "victim"), "utf8")).toBe("keep-me");
+    expect(h.audit()[0].event).toBe("enforce");
   });
 
   it("does not treat a shell-body environment assignment as a kernel escape", async () => {
@@ -232,7 +283,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
   });
 
   it("never escapes if mandatory logging fails", async () => {
-    const h = harness();
+    const h = harness({ mode: "enforce", disabled: false, allowEscape: true });
     fs.mkdirSync(path.join(h.cwd, ".pi"));
     fs.symlinkSync(path.join(h.sibling, "victim"), path.join(h.cwd, ".pi/landlock-audit.jsonl"));
     const result = await h.invoke({ command: `PI_FABRIC_LANDLOCK_ESCAPE=1 printf bad > ${quote(path.join(h.sibling, "victim"))}`, settle: true });
@@ -342,7 +393,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     const pending = new Promise<{ exitCode: number | null }>((done, reject) => { settle = done; fail = reject; });
     const ops = { exec: () => pending };
     const runDir = fs.mkdtempSync(path.join(root, "run-"));
-    const execution = confinement.operations(ops, ops, "/bin/sh", runDir, false, "delayed launch")
+    const execution = confinement.operations(ops, ops, "/bin/sh", runDir, () => ({ mode: "enforce", disabled: false }), "delayed launch")
       .exec("delayed launch", root, { onData: () => {} });
     confinement.close(); // shell store closed / job aborted; launch still unresolved
     expect(confinement.pendingOperations).toBe(1);
@@ -371,6 +422,13 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     };
     const live = spawnSync("sh", ["-c", "sleep 30 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" });
     const livePid = Number(live.stdout.trim());
+    // This synthetic old-ledger test owns just the fixture process inventory.
+    // Unrelated same-uid no_new_privs jobs on a busy shared host intentionally
+    // veto real cleanup; they must not turn this deterministic sweep probe flaky.
+    const readdir = fs.readdirSync;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((directory: fs.PathLike, ...args: unknown[]) =>
+      String(directory) === "/proc" ? [String(process.pid), String(livePid)]
+        : (readdir as (...input: unknown[]) => unknown)(directory, ...args)) as typeof fs.readdirSync);
     try {
       const done = retained("done00", {});
       const unknown = retained("unk000", { unconfirmed: true });
@@ -543,7 +601,7 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     await expect(h.registry.close()).resolves.toBeUndefined();
   });
 
-  it("F2: a host kill-switch flip reaches already-active lanes on their next call; project cannot override", async () => {
+  it("F2: a missing root policy keeps already-active lanes confined; agent edits cannot override", async () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-landlock-host-"));
     roots.push(agentDir);
     const hostFile = path.join(agentDir, "fabric.json");
@@ -567,8 +625,8 @@ for action, expected in [(lambda: os.truncate(p+'/victim', 0), errno.EACCES), (l
     }
     fs.writeFileSync(hostFile, JSON.stringify({ executor: { landlock: { mode: "enforce", disabled: true } } }));
     for (const lane of lanes) {
-      expect((await lane.invoke({ command: `printf released > ${quote(path.join(lane.sibling, "victim"))}` })).ok).toBe(true);
-      expect(fs.readFileSync(path.join(lane.sibling, "victim"), "utf8")).toBe("released");
+      expect((await lane.invoke({ command: `printf still-confined > ${quote(path.join(lane.sibling, "victim"))}`, settle: true })).ok).toBe(false);
+      expect(fs.readFileSync(path.join(lane.sibling, "victim"), "utf8")).toBe("keep-me");
     }
   });
 

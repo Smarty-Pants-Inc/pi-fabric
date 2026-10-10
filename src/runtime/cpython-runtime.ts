@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -151,7 +152,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
           cwd: options.cwd ?? process.cwd(),
           // -I ignores PYTHON* and user site packages; -B avoids bytecode writes.
           // Keep ordinary environment for trusted native code, not a false secrecy claim.
-          env: ipc ? { ...process.env, FABRIC_IPC_PORT: String(ipc.port), FABRIC_IPC_TOKEN: ipc.token } : process.env,
+          env: childProcessEnvironment(ipc ? { ...process.env, FABRIC_IPC_PORT: String(ipc.port), FABRIC_IPC_TOKEN: ipc.token } : process.env),
           detached: process.platform !== "win32",
           stdio: command.seccomp ? ["ignore", "pipe", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe", "pipe"],
         });

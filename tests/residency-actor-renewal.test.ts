@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -48,6 +49,9 @@ describe("resident actor participant renewal without a Main", () => {
     { mode: "shared", restore: false, touch: true },
   ])("keeps idle actors fresh for three renewal periods ($mode, restore=$restore, touch=$touch)", async ({ mode, restore, touch }) => {
     const { root, config, host: original, observer } = fixture();
+    // Renewal assertions deliberately hold seeded statuses constant; restored
+    // actors otherwise have an immediate autonomous dormancy eligibility edge.
+    vi.spyOn(ActorDirectory.prototype, "hasDormantIdleActor").mockReturnValue(false);
     let host = original;
     let now = Date.now();
     // Keep real I/O and timers: only move the wall clock between awaited heartbeats.

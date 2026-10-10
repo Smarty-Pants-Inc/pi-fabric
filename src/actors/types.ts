@@ -131,7 +131,7 @@ export function validateActorDedupeKey(value: unknown): asserts value is string 
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
-export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+export type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 

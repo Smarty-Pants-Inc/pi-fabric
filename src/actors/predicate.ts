@@ -5,6 +5,8 @@ import type {
   FabricActorValidWhileSource,
 } from "./types.js";
 
+import type { FabricActorRecordsSnapshot } from "./records.js";
+
 const PREDICATE_VERSION = 1;
 const MAX_PREDICATE_SOURCE_CHARS = 16_000;
 // Loaded runners may spend more than 100ms preparing the sandbox/program.
@@ -32,14 +34,19 @@ const predicateProgram = (source: string, invoke: boolean): string => [
         '  }',
         '  return value;',
         '};',
-        'const decision = predicate(freeze(JSON.parse(π.facts)));',
+        'const facts = JSON.parse(π.facts);',
+        'if (Object.hasOwn(facts.current, "records")) {',
+        '  const records = new Map(facts.current.records.map(([key, value]) => [key, freeze(value)]));',
+        '  facts.current.records = Object.freeze({ get: Object.freeze((key) => records.get(key)) });',
+        '}',
+        'const decision = predicate(freeze(facts));',
         'if (decision && typeof decision.then === "function") throw new TypeError("validWhile must return synchronously");',
         'return decision;',
       ].join("\n")
     : 'return true;',
 ].join("\n");
 
-const execute = async (source: FabricActorValidWhileSource, facts?: FabricActorValidityFacts) => {
+const execute = async (source: FabricActorValidWhileSource, facts?: FabricActorValidityFacts, records?: FabricActorRecordsSnapshot) => {
   const result = await (await runtime()).execute(
     predicateProgram(source.source, facts !== undefined),
     async () => {
@@ -50,7 +57,10 @@ const execute = async (source: FabricActorValidWhileSource, facts?: FabricActorV
       timeoutMs: PREDICATE_TIMEOUT_MS,
       memoryLimitBytes: PREDICATE_MEMORY_BYTES,
       maxLogChars: 0,
-      strings: facts === undefined ? {} : { facts: JSON.stringify(facts) },
+      strings: facts === undefined ? {} : { facts: JSON.stringify({
+        ...facts,
+        current: { ...facts.current, ...(records !== undefined ? { records } : {}) },
+      }) },
     },
   );
   if (result.terminationReason !== "completed") {
@@ -76,8 +86,9 @@ export const validateActorValidWhile = async (
 export const evaluateActorValidWhile = async (
   source: FabricActorValidWhileSource,
   facts: FabricActorValidityFacts,
+  records?: FabricActorRecordsSnapshot,
 ): Promise<{ valid: boolean; reason?: string }> => {
-  const value = await execute(source, facts);
+  const value = await execute(source, facts, records);
   if (typeof value === "boolean") return { valid: value };
   if (typeof value === "object" && value !== null && !Array.isArray(value)) {
     const decision = value as Partial<FabricActorValidityDecision>;

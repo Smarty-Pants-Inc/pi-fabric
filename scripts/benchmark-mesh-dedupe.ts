@@ -68,7 +68,8 @@ try {
       active = undefined;
     }
   }
-  if (forbiddenHistoryReads || receiptDirectoryScans) throw new Error("New-key publication did history-size work");
+  if (forbiddenHistoryReads) throw new Error("New-key publication did history-size work");
+  if (receiptDirectoryScans !== 26 * cases.length) throw new Error("Expected one capacity enumeration per new key");
   const reports = cases.map(item => {
     const times = item.holds.slice(1).sort((a, b) => a - b);
     const bytes = item.reads.slice(1);
@@ -80,7 +81,7 @@ try {
   });
   if (reports[0]!.maxMetadataReadBytes !== reports[1]!.maxMetadataReadBytes) throw new Error("Read work grew with history");
   console.log(JSON.stringify({ reports, forbiddenHistoryReads, receiptDirectoryScans,
-    note: "Read bytes are fixed-size sequence/torn-tail/archive-append metadata, not dedupe history scans. No compaction or reboot backfill is included." }, null, 2));
+    note: "Read bytes are fixed-size sequence/torn-tail/archive-append metadata, not dedupe history scans. One bounded receipt/intent capacity enumeration per new key. No compaction or reboot backfill is included." }, null, 2));
 } finally {
   fs.writeFileSync = original.write; fs.renameSync = original.rename; fs.readSync = original.read;
   fs.readFileSync = original.fullRead; fs.readdirSync = original.readdir;

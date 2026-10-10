@@ -19,7 +19,7 @@ P1-a commit: `de21ea8d6abac9cbb19f18df9d9743b6a9b696f4`.
 
 ## Round 2 acceptance
 
-- [x] P1-a source suite: completed first tool turn, then cuts at tool start/delta/end, snapshot-only call, generated `toolUse`, execution, and unresolved parallel sibling all remain failures without retention warning. A genuinely completed streamed tool turn still qualifies.
+- [x] P1-a source suite: completed first tool turn, then cuts at tool start/delta/end, snapshot-only call, generated `toolUse`, execution, and unresolved parallel sibling all remain failures without retention warning. A fully completed streamed tool turn still qualifies.
 - [x] Source and freshly built dist probes: partial text remains readable with non-success status and native exit code; repeated wait/status and persisted record match.
 - [x] Completed-only judge rejects a partial verdict even with an otherwise valid durable reply.
 - [x] Background/handoff delivery preserves warnings, labels partial output, and never reports success.

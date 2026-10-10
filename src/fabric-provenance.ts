@@ -6,6 +6,8 @@ export {
   currentFabricPrincipal,
   snapshotFabricInvocation,
   invocationFabricPrincipal,
+  withFabricHostCaller,
+  fabricHostCallerId,
   principalFromReceipt,
   registerFabricPrincipalCapture,
   registerFabricWakeCapture,

@@ -515,6 +515,9 @@ export interface ParticipantDirectoryOptions {
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
+  /** Complete runtime mesh activation before any presence write. A lock timeout
+   * follows the same startup warning and background refresh retry as publication. */
+  beforePublication?: () => Promise<void>;
   /** Prepare outside custody; validate exact registry generations inside the
    * existing publication fence before any ownership/presence write. */
   preparePublicationFence?: () => () => boolean;
@@ -789,6 +792,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Include preparation in #refreshing so a cold heartbeat coalesces and close
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
+      if (this.#closed) return false;
+      if (this.options.beforePublication) await this.options.beforePublication();
       if (this.#closed) return false;
       if (this.#prepareFileLocks) {
         await prepareParticipantFileLocks(this.mesh);

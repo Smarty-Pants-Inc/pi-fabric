@@ -23,6 +23,24 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each([false, true])("types records-backed validity and registers the option (fullCodeMode=%s)", fullCodeMode => {
+    const code = `return agents.create({ name: "org", instructions: "Work.", records: { topic: "org.records", maxEntries: 32, maxAgeMs: 21_600_000 },
+      validWhile: ({ activation, current }) => {
+        if (activation.kind !== "mesh" || typeof activation.data?.key !== "string") return true;
+        const record = current.records?.get(activation.data.key);
+        const at: string | undefined = record?.at;
+        const fresh: boolean | undefined = record?.fresh;
+        return fresh !== true || record?.state !== "answered";
+      } });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "create")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.records).toMatchObject({ type: "object", required: ["topic"], additionalProperties: false,
+      properties: { maxAgeMs: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 21_600_000 } } });
+    expect(typeCheckFabricCode(`await agents.create({ name: "bad", instructions: "Work.", validWhile: ({ current }) => {
+      current.records?.set("key", { state: "open" }); return true; } });`, guestTypeDeclarations(fullCodeMode), true).errors.map(e => e.message))
+      .toEqual([expect.stringContaining("Property 'set' does not exist")]);
+  });
+
   it.each([false, true])("types and registers spawn complexity hints (fullCodeMode=%s)", fullCodeMode => {
     for (const complexity of ["simple", "normal", "complex", "delicate"]) {
       expect(typeCheckFabricCode(`return await agents.spawn({ task: "work", complexity: "${complexity}" });`, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);

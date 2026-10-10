@@ -705,7 +705,7 @@ export class FabricRuntimeState {
     );
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? "", mainName() === "main" ? "" : mainName()])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     let inboxMaintenance: MainInboxMaintenance | undefined;

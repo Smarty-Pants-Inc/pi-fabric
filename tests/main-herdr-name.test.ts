@@ -9,7 +9,7 @@ import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
 import { rootParticipantName } from "../src/topology/participant-name.js";
 
-// smarty-dev#6758: an unnamed Main takes its Herdr agent name; name:<x> selects one live Main.
+// smarty-dev#6758: Herdr names and panes are Main display metadata, not new routing targets.
 
 const temp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "fabric-herdr-name-"));
 
@@ -46,9 +46,9 @@ describe.skipIf(process.platform === "win32")("readHerdrAgentName", () => {
 
   it("keeps main when herdr is slow, within the timeout", async () => {
     const dir = temp();
-    const bin = stubHerdr(dir, `sleep 5; echo '${agentJson("late")}'`);
+    const bin = stubHerdr(dir, "exec sleep 5");
     const started = Date.now();
-    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: bin }, 200)).toBeUndefined();
+    expect(await readHerdrAgentName({ HERDR_PANE_ID: "w3Q:p1", HERDR_BIN_PATH: bin })).toBeUndefined();
     expect(Date.now() - started).toBeLessThan(3000);
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -97,19 +97,20 @@ const main = (cwd: string, sessionId: string, sessionName?: string) => {
 };
 
 describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
-  it("publishes Herdr names and panes in agents.sessions and routes name:<x> only to one live Main", async () => {
+  it("publishes display names and panes, reads Herdr once per start/reload, and rejects name-prefixed targets", async () => {
     const root = temp();
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
     vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
-    vi.stubEnv("HERDR_BIN_PATH", stubHerdr(root, [
+    const herdrBody = (bName: string) => [
       'case "$3" in',
       `  w1:p1) echo '${agentJson("lane-a")}' ;;`,
-      `  w2:p1) echo '${agentJson("lane-b")}' ;;`,
+      `  w2:p1) echo '${agentJson(bName)}' ;;`,
       `  w3:p1|w4:p1) echo '${agentJson("lane-dup")}' ;;`,
       `  w5:p1) echo '${agentJson("lane-e")}' ;;`,
       "  *) exit 1 ;;",
       "esac",
-    ].join("\n")));
+    ].join("\n");
+    vi.stubEnv("HERDR_BIN_PATH", stubHerdr(root, herdrBody("lane-b")));
     const config = normalizeFabricConfig({ fullCodeMode: false,
       mesh: { enabled: true, root: path.join(root, "mesh"), actorPollMs: 20 },
       agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
@@ -122,6 +123,7 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
     const dup2 = main(root, "dddddddd-0000-4000-8000-000000000004");
     const named = main(root, "eeeeeeee-0000-4000-8000-000000000005", "pi-named");
     const all = [a, b, dup1, dup2, named];
+    const calls = () => fs.readFileSync(path.join(root, "calls"), "utf8").trim().split("\n");
     try {
       for (const [m, pane] of [[a, "w1:p1"], [b, "w2:p1"], [dup1, "w3:p1"], [dup2, "w4:p1"], [named, "w5:p1"]] as const) {
         vi.stubEnv("HERDR_PANE_ID", pane);
@@ -135,42 +137,46 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
         // A valid Pi session name wins over the Herdr name.
         expect.objectContaining({ id: named.id, name: "pi-named", herdrPane: "w5:p1" }),
       ])), { timeout: 8000, interval: 100 });
+      expect(calls().sort()).toEqual([1, 2, 3, 4, 5].map(n => `agent get w${n}:p1`));
 
-      for (const action of ["followUp", "steer"] as const) {
-        await expect(a.invoke(`agents.${action}`, { id: "name:lane-b", message: `to lane-b ${action}` }))
-          .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
-        expect(b.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
-          customType: "pi-fabric-agent-message", content: expect.stringContaining(`to lane-b ${action}`),
-          details: expect.objectContaining({ from: expect.objectContaining({ id: a.id }), delivery: action }),
-        }), expect.objectContaining({ deliverAs: action }));
-      }
-      // A Main can address itself by its own Herdr name.
-      await expect(a.invoke("agents.followUp", { id: "name:lane-a", message: "self" }))
-        .resolves.toMatchObject({ routed: "main", queued: true });
+      // A Herdr rename is not polled by directory reads/heartbeats; reload reads once again.
+      stubHerdr(root, herdrBody("lane-renamed"));
+      await b.invoke("agents.sessions");
+      expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: b.id, name: "lane-b", herdrPane: "w2:p1" }),
+      ]));
+      expect(calls()).toHaveLength(5);
+      await b.runtime.shutdown("reload");
+      vi.stubEnv("HERDR_PANE_ID", "w2:p1");
+      await b.runtime.initialize(b.context, config);
+      await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: b.id, name: "lane-renamed", herdrPane: "w2:p1" }),
+      ])), { timeout: 8000, interval: 100 });
+      expect(calls()).toHaveLength(6);
+      expect(calls().filter(call => call === "agent get w2:p1")).toHaveLength(2);
 
+      // Use the real public provider/router: name:x is an ordinary unknown target,
+      // even if its suffix is an existing, duplicate, or principal display name.
       const commandsBefore = a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 });
-      const ambiguous = await a.invoke("agents.followUp", { id: "name:lane-dup", message: "never guess" })
-        .catch((error: unknown) => error) as Error & { code?: string };
-      expect(ambiguous.message).toContain("Ambiguous Fabric Main name: name:lane-dup");
-      for (const text of [dup1.id, dup2.id, "pane w3:p1", "pane w4:p1"]) expect(ambiguous.message).toContain(text);
-      const absent = await a.invoke("agents.steer", { id: "name:nobody", message: "never guess" })
-        .catch((error: unknown) => error) as Error;
-      expect(absent.message).toContain("No live Fabric Main is named nobody");
-      // The Herdr name of a Pi-named Main is not a selector.
-      await expect(a.invoke("agents.followUp", { id: "name:lane-e", message: "x" })).rejects.toThrow("No live Fabric Main");
+      for (const action of ["followUp", "steer", "tell"] as const) {
+        for (const id of ["name:x", "name:lane-renamed", "name:lane-a", "name:lane-dup", "name:org"]) {
+          const error = await a.invoke(`agents.${action}`, { id, message: "never by name prefix" }).catch(error => error) as Error & { code?: string };
+          expect(error).toBeInstanceOf(Error);
+          expect(error.name).toBe("Error");
+          expect(error.message).toBe(`Unknown Fabric participant: ${id} (no record on this mesh root: the session has ended, has not joined yet, or uses another mesh root)`);
+          expect(error.code).toBeUndefined();
+        }
+      }
       expect(a.runtime.mesh.read({ topic: "fabric.control.command", limit: 100 })).toEqual(commandsBefore);
-      for (const m of [dup1, dup2, named]) expect(m.sendMessage).not.toHaveBeenCalled();
+      for (const m of all) expect(m.sendMessage).not.toHaveBeenCalled();
 
-      // Existing exact targets are unchanged.
-      await expect(a.invoke("agents.followUp", { id: dup1.id, message: "exact id" }))
+      // Exact session targets retain ordinary delivery despite duplicate display labels.
+      await expect(a.invoke("agents.followUp", { id: dup1.id, message: "exact session still works" }))
         .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
-
-      // The duplicate resolves once only one live Main keeps the name.
-      await dup1.runtime.shutdown();
-      await expect(a.invoke("agents.followUp", { id: "name:lane-dup", message: "only live" }))
-        .resolves.toMatchObject({ routed: "mesh", acknowledged: true });
-      expect(dup2.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
-        content: expect.stringContaining("only live") }), expect.anything());
+      expect(dup1.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        content: expect.stringContaining("exact session still works"),
+      }), expect.objectContaining({ deliverAs: "followUp" }));
+      expect(dup2.sendMessage).not.toHaveBeenCalled();
     } finally {
       for (const m of all.reverse()) await m.runtime.shutdown();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

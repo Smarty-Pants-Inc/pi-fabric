@@ -28,6 +28,18 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Main display names
+
+An interactive local Main publishes its valid Pi session name, or its Herdr agent name when
+unnamed, or `main` on any lookup failure. At start and each reload it reads
+`herdr agent get <pane>` once using `execFile`, without a shell, with a 2 s timeout;
+there is no polling. Print/JSON roots and child runtimes do not query Herdr.
+`agents.sessions()` shows the participant's `name` and optional `herdrPane`.
+
+These names and panes are unauthenticated display metadata under the same-UID boundary,
+not routing custody or authority. Use the exact `session:<uuid>` participant id to target a
+Main. Name-based routing work is deferred to smarty-dev#8130.
+
 ### Opt-in process task placement
 
 A Main can route ordinary `transport: "process"` Pi task agents through a host-configured external launcher. Unconfigured hosts remain local. See [process placement configuration](configuration.md#process-task-placement) for the `smarty-task-ryzen2 --host auto` example and polling contract.

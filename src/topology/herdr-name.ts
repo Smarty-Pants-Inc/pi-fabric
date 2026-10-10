@@ -13,7 +13,8 @@ export const herdrPaneId = (environment: NodeJS.ProcessEnv = process.env): strin
 /**
  * The Herdr agent name of this pane (smarty-dev#6758), read once with `herdr agent get <pane>`.
  * No shell, a hard timeout, and any failure (no pane, missing binary, slow, bad JSON, invalid
- * name) yields undefined so the caller keeps "main". Names are selectors, never authority.
+ * name) yields undefined so the caller keeps "main". Names are unauthenticated display
+ * metadata, never identity, routing custody, or authority.
  */
 export const readHerdrAgentName = (
   environment: NodeJS.ProcessEnv = process.env,

@@ -73,6 +73,7 @@ import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
+import { classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
@@ -193,7 +194,7 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  activationBlocked?: ActivationBlock;
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
@@ -439,6 +440,36 @@ export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 /** A `pending` re-alarm claim older than this was left by a crash: a later sweep takes it over.
  * Far above a publish's bounded mesh-lock wait (10 s), so a live slow publish is not doubled. */
 export const ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS = 5 * 60 * 1000;
+/** smarty-dev#8487: a transient activation failure blocks routing only for a bounded
+ * backoff, doubling with each consecutive failure up to the cap; a later run that
+ * completes still clears it. Only explicitly transient causes expire (see
+ * ./activation-failure.ts); permanent, security and unrecognised failures need an
+ * operator or a completed run, as before. */
+export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MS = 5 * 60 * 1000;
+export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS = 60 * 60 * 1000;
+export const activationBlockBackoffMs = (count: number): number => Math.min(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
+  ACTOR_TRANSIENT_BLOCK_BACKOFF_MS * 2 ** Math.min(16, Math.max(0, Math.floor(count) - 1)));
+/** When a transient block stops gating routing; undefined for a block only a completed run clears.
+ * A record from an older writer has no retryAt: its episode start bounds it instead. */
+const activationBlockExpiresAt = (blocked: { code: string; since: number; count: number; retryAt?: number }): number | undefined =>
+  TRANSIENT_ACTIVATION_BLOCK_CODES.has(blocked.code) ? blocked.retryAt ?? blocked.since + activationBlockBackoffMs(blocked.count) : undefined;
+const activationBlockExpired = (blocked: Parameters<typeof activationBlockExpiresAt>[0] | undefined, now = Date.now()): boolean => {
+  const at = blocked ? activationBlockExpiresAt(blocked) : undefined;
+  return at !== undefined && now >= at;
+};
+type ActivationBlock = { reason: string; code: string; since: number; count: number; retryAt?: number; classification: string };
+/** A stored block without a classification comes from an older writer: re-derive its class from
+ * its stored reason with today's rules, so only a recognisably transient one can expire. */
+const restoredActivationBlock = (stored: { reason: string; code: string; since: number; count: number;
+  retryAt?: unknown; classification?: unknown }): ActivationBlock => {
+  const derived = typeof stored.classification === "string"
+    ? { code: stored.code, classification: stored.classification }
+    : (({ code, classification }) => ({ code, classification: `${classification} (re-derived from an older record's stored reason)` }))(
+      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" }));
+  return { reason: stored.reason, code: derived.code, since: stored.since, count: stored.count, classification: derived.classification,
+    ...(TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code) && typeof stored.retryAt === "number" && Number.isFinite(stored.retryAt)
+      ? { retryAt: stored.retryAt } : {}) };
+};
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
@@ -555,6 +586,8 @@ export class ActorManager {
   readonly #listeners = new Set<() => void>();
   readonly #meshListeners = new Set<() => void>();
   #retentionTimer: NodeJS.Timeout | undefined;
+  /** One unref'd wake per transient activation block, to republish its actor record at expiry. */
+  readonly #blockExpiryTimers = new Map<string, { at: number; timer: NodeJS.Timeout }>();
   readonly #meshRetentionSweepPath: string | undefined;
   #retentionSweep: Promise<void> | undefined;
   #initialRetentionPending = true;
@@ -2733,6 +2766,8 @@ export class ActorManager {
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#retentionTimer = undefined;
+    for (const { timer } of this.#blockExpiryTimers.values()) clearTimeout(timer);
+    this.#blockExpiryTimers.clear();
     // Cancellation is monotonic: pending claims must settle before the enclosing
     // runtime releases host custody or certifies terminal lineage closure.
     await Promise.allSettled([...this.#adoptionPending.values()]);
@@ -3456,7 +3491,7 @@ export class ActorManager {
               };
               this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false, result.warnings);
               continue;
             }
             throw new Error(result.error || `Actor run ${result.status}`);
@@ -3469,6 +3504,7 @@ export class ActorManager {
           delete actor.failureStreak;
           if (actor.activationBlocked) {
             delete actor.activationBlocked;
+            this.#armActivationBlockExpiry(actor);
             // Best effort: a stale claim names an older since, so it never gates a new block.
             void this.mesh.delete({ key: actorRealarmKey(actor.id) }).catch(() => undefined);
           }
@@ -3669,7 +3705,8 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false,
+    evidence?: readonly string[]): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3686,18 +3723,19 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
-    const code = preparation ? "failing-preparation"
-      : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
-      : /Context exceeds window/i.test(lastError) ? "context-overflow"
-      : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
-      : "unknown";
+    // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
+    const { code, transient, classification } = classifyActivationFailure({ lastError, error, evidence, preparation });
     const reason = lastError.slice(0, 300);
     const previous = actor.activationBlocked;
+    const now = Date.now();
+    const count = previous?.code === code ? previous.count + 1 : 1;
     actor.activationBlocked = {
-      reason, code, since: previous?.code === code ? previous.since : Date.now(),
-      count: previous?.code === code ? previous.count + 1 : 1,
+      reason, code, since: previous?.code === code ? previous.since : now, count, classification,
+      // A transient failure (smarty-dev#8487) gates routing for a doubling backoff, not forever.
+      ...(transient ? { retryAt: now + activationBlockBackoffMs(count) } : {}),
     };
-    actor.updatedAt = Date.now();
+    this.#armActivationBlockExpiry(actor, now);
+    actor.updatedAt = now;
     void this.#publishPresence(actor).catch(() => undefined);
     // Deterministic budget failures need operator action, not three silent
     // activations. Existing host reporting bypasses mailbox/silent delivery.
@@ -3722,7 +3760,7 @@ export class ActorManager {
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code, classification,
         since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
         routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
@@ -3737,6 +3775,40 @@ export class ActorManager {
     } catch {
       // Best effort: the failures stay in the actor's messages and run records.
     }
+  }
+
+  // Expiry is evaluated lazily wherever the block is read (#publicInfo). Routers read the
+  // published actor record, so one unref'd wake republishes it when the backoff ends;
+  // it is replaced on a further failure and cleared on success or close.
+  #armActivationBlockExpiry(actor: ManagedActor, now = Date.now()): void {
+    const blocked = actor.activationBlocked;
+    const at = blocked ? activationBlockExpiresAt(blocked) : undefined;
+    const armed = this.#blockExpiryTimers.get(actor.id);
+    if (armed && armed.at === at) return;
+    if (armed) {
+      clearTimeout(armed.timer);
+      this.#blockExpiryTimers.delete(actor.id);
+    }
+    if (at === undefined || at <= now || this.#closing) return;
+    const timer = setTimeout(() => {
+      if (this.#blockExpiryTimers.get(actor.id)?.timer === timer) this.#blockExpiryTimers.delete(actor.id);
+      this.#activationBlockExpiryWake(actor.id);
+      // A skewed far-future retryAt re-arms in bounded steps, never with an overflowing delay.
+    }, Math.min(at - now, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS));
+    timer.unref();
+    this.#blockExpiryTimers.set(actor.id, { at, timer });
+  }
+
+  #activationBlockExpiryWake(id: string): void {
+    const actor = this.#actors.get(id);
+    if (!actor?.activationBlocked || this.#closing) return;
+    if (!activationBlockExpired(actor.activationBlocked)) {
+      this.#armActivationBlockExpiry(actor);
+      return;
+    }
+    this.#emitChange();
+    if (this.#canManage(id)) void this.#writePresence(id).catch(() => undefined);
+    if (actor.queue.length > 0 && !this.#halted) this.#ensureDrain(actor);
   }
 
   #downgradeOutputPrincipal(actor: ManagedActor, item: ActorQueueItem): void {
@@ -4485,7 +4557,7 @@ export class ActorManager {
     };
     if (covers(this.mesh.get(key))) return;
     const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
-      since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
       pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
     const claimed = { since: blocked.since, slot, at: now, owner: this.identity.id, state: "pending" };
     void (async () => {
@@ -4676,6 +4748,8 @@ export class ActorManager {
   #presenceValue(actor: ManagedActor): FabricActorInfo | undefined {
     let value: FabricActorInfo;
     try {
+      // A restored transient block needs its expiry wake too (smarty-dev#8487).
+      this.#armActivationBlockExpiry(actor);
       // Exclude our own diagnostic so a repaired value can fit again.
       const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false, true);
       value = legacy;
@@ -5336,7 +5410,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count } }
+          ? { activationBlocked: restoredActivationBlock(record.activationBlocked) }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"
@@ -5923,6 +5997,8 @@ export class ActorManager {
     // Shared observers cannot know a legacy row's last admitted binding. An
     // omitted model/thinking means unknown, not this reader's session overlay.
     const effective = registryView ? actor.resolvedBinding ?? {} : this.#runBinding(actor);
+    // An expired transient block no longer gates routing; its history stays visible (smarty-dev#8487).
+    const blockExpired = activationBlockExpired(actor.activationBlocked);
     return {
       id: actor.id,
       scope: this.#actorScope,
@@ -5941,7 +6017,7 @@ export class ActorManager {
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status: actor.status === "stopped" ? "stopped"
-        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER
+        : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
         ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.preparing ? { preparing: { ...actor.preparing,
@@ -5996,7 +6072,11 @@ export class ActorManager {
       ...(actor.missingCapabilities
         ? { missingCapabilities: [...actor.missingCapabilities] }
         : {}),
-      ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
+      ...(actor.activationBlocked ? blockExpired
+        ? { activationBlockExpired: { lastBlockedReason: actor.activationBlocked.reason, code: actor.activationBlocked.code,
+          classification: actor.activationBlocked.classification, since: actor.activationBlocked.since, count: actor.activationBlocked.count,
+          expiredAt: activationBlockExpiresAt(actor.activationBlocked)! } }
+        : { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),
       ...(actor.records ? { records: { ...actor.records } } : {}),
       queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),

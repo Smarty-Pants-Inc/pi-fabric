@@ -3,11 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  assertWindowsRequestsDirectoryPrivate, parseWindowsAclReport, prepareResidentRequestsDirectory,
-  readWindowsDirectoryAcl, windowsRequestsAclViolations, windowsSystemExecutable, WindowsRequestsGuard,
-  WINDOWS_REQUESTS_ACL_TTL_MS, type WindowsDirectoryAcl,
+  assertWindowsRequestsDirectoryPrivate, parseWindowsAclReport, parseWindowsFileAclBatch, prepareResidentRequestsDirectory,
+  readWindowsDirectoryAcl, windowsRequestFileViolations, windowsRequestsAclViolations, windowsSystemExecutable, WindowsRequestsGuard,
+  WINDOWS_REQUESTS_ACL_TTL_MS, type WindowsDirectoryAcl, type WindowsRequestFileReport,
 } from "../src/residency/windows-acl.js";
 
 const user = "S-1-5-21-1111111111-2222222222-3333333333-1001";
@@ -237,6 +237,118 @@ describe("Windows resident requests DACL policy", () => {
     });
   });
 
+  describe("pending request files (planted before the directory DACL was tightened)", () => {
+    const ARCHIVE = 0x20, REPARSE_POINT = 0x400;
+    const fileReport = (...lines: string[]): WindowsRequestFileReport => ({ attributes: ARCHIVE, acl: parseWindowsAclReport(report(...lines)) });
+    const privateFile = () => fileReport(`ace Allow ${user} ${FULL}`, `ace Allow S-1-5-18 ${FULL}`, `ace Allow S-1-5-32-544 ${FULL}`);
+    const regular = { regularFile: true, symbolicLink: false };
+
+    it("accepts a regular file owned by this user with only trusted writers", () => {
+      expect(windowsRequestFileViolations({ ...regular, report: privateFile() })).toEqual([]);
+      // Administrators-owned (an elevated creator) and read-only extra entries are still trusted.
+      const adminOwned = { attributes: ARCHIVE, acl: parseWindowsAclReport(report(`ace Allow ${user} ${FULL}`, `ace Allow S-1-5-32-545 ${READ_EXECUTE}`)
+        .replace(`owner ${user}`, "owner S-1-5-32-544")) };
+      expect(windowsRequestFileViolations({ ...regular, report: adminOwned })).toEqual([]);
+    });
+
+    it("refuses a file owned by another account, even with a private DACL", () => {
+      const planted = { attributes: ARCHIVE, acl: parseWindowsAclReport(report(`ace Allow ${user} ${FULL}`).replace(`owner ${user}`, `owner ${other}`)) };
+      expect(windowsRequestFileViolations({ ...regular, report: planted }))
+        .toEqual([`owned or writable by other accounts (${other} (owner))`]);
+    });
+
+    it.each([["(W)", WRITE], ["(M)", MODIFY], ["(F)", FULL], ["GENERIC_WRITE", 0x40000000], ["WRITE_DAC", 0x40000]])(
+      "refuses a file that grants another account %s", (_label, rights) => {
+        expect(windowsRequestFileViolations({ ...regular, report: fileReport(`ace Allow ${user} ${FULL}`, `ace Allow ${other} ${rights}`) }))
+          .toEqual([`owned or writable by other accounts (${other})`]);
+      });
+
+    it("refuses a NULL-DACL file, a reparse point, a symlink or junction, and a non-regular entry", () => {
+      expect(windowsRequestFileViolations({ ...regular, report: { attributes: ARCHIVE, acl: parseWindowsAclReport(reportWith("D:NO_ACCESS_CONTROL")) } }))
+        .toEqual(["owned or writable by other accounts (S-1-1-0 (NULL DACL))"]);
+      expect(windowsRequestFileViolations({ ...regular, report: { ...privateFile(), attributes: ARCHIVE | REPARSE_POINT } as WindowsRequestFileReport }))
+        .toEqual(["a reparse point"]);
+      expect(windowsRequestFileViolations({ regularFile: false, symbolicLink: true, report: { ...privateFile(), attributes: REPARSE_POINT } as WindowsRequestFileReport }))
+        .toEqual(["a symlink or junction", "a reparse point"]);
+      expect(windowsRequestFileViolations({ regularFile: false, symbolicLink: false, report: privateFile() })).toEqual(["not a regular file"]);
+      expect(windowsRequestFileViolations({ ...regular, report: { error: "Get-Acl failed" } })).toEqual(["unverifiable DACL (Get-Acl failed)"]);
+    });
+
+    it("parses one batch report per file; a bad file is an error entry, a bad batch throws", () => {
+      const one = (sddl: string, ...lines: string[]) => [`attributes ${ARCHIVE}`, reportWith(sddl, ...lines)].join("\r\n");
+      const batch = ["file 0", one(PRIVATE_SDDL, `ace Allow ${user} ${FULL}`), "file 1", "error", "file 2",
+        one(PRIVATE_SDDL), "file 3", reportWith(PRIVATE_SDDL, `ace Allow ${user} ${FULL}`), "batch-end", ""].join("\r\n");
+      const reports = parseWindowsFileAclBatch(batch, 4);
+      expect(reports[0]).toMatchObject({ attributes: ARCHIVE, acl: { owner: user, aces: [{ sid: user }] } });
+      expect(reports[1]).toEqual({ error: "Get-Acl failed" });
+      expect(reports[2]).toMatchObject({ error: expect.stringMatching(/no access rules/) });
+      expect(reports[3]).toEqual({ error: "missing file attributes" });
+      expect(() => parseWindowsFileAclBatch(batch, 3)).toThrow(/covers 4 of 3/);
+      expect(() => parseWindowsFileAclBatch(batch.replace("batch-end", ""), 4)).toThrow(/truncated/);
+      expect(() => parseWindowsFileAclBatch(batch.replace("file 1", "file 2"), 4)).toThrow(/out-of-order/);
+      expect(() => parseWindowsFileAclBatch(`stray\nfile 0\nerror\nbatch-end`, 1)).toThrow(/unparseable/);
+    });
+
+    const screenSetup = async (readFileAcls: (files: string[]) => Promise<WindowsRequestFileReport[]>, platform: NodeJS.Platform = "win32") => {
+      const directory = path.join(tempRoot(), "requests");
+      const guard = new WindowsRequestsGuard(directory, {
+        platform, deps: { readAcl: async () => parseWindowsAclReport(ownerOnly), restrict: async () => undefined, readFileAcls },
+      });
+      await guard.prepare();
+      return { directory, guard };
+    };
+
+    it("simulated win32 quarantines planted files in one batch read and returns only valid requests", async () => {
+      const calls: string[][] = [];
+      const byName: Record<string, () => WindowsRequestFileReport> = {
+        "valid.json": privateFile,
+        "foreign-owner.json": () => ({ attributes: ARCHIVE, acl: parseWindowsAclReport(report(`ace Allow ${user} ${FULL}`).replace(`owner ${user}`, `owner ${other}`)) }),
+        "foreign-ace.json": () => fileReport(`ace Allow ${user} ${FULL}`, `ace Allow ${other} ${MODIFY}`),
+        "reparse.json": () => ({ ...privateFile(), attributes: REPARSE_POINT } as WindowsRequestFileReport),
+        "link.json": privateFile,
+        "unreadable.json": () => ({ error: "Get-Acl failed" }),
+      };
+      const { directory, guard } = await screenSetup(async files => { calls.push(files); return files.map(file => byName[path.basename(file)]!()); });
+      for (const name of Object.keys(byName)) if (name !== "link.json") fs.writeFileSync(path.join(directory, name), "{}");
+      fs.symlinkSync(path.join(directory, "valid.json"), path.join(directory, "link.json"));
+      const alarms = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const names = [...Object.keys(byName), "vanished.json"];
+      await expect(guard.screenPending(names)).resolves.toEqual(["valid.json"]);
+      expect(calls).toHaveLength(1); // one Get-Acl process for the whole batch; a vanished entry is not queried
+      expect(calls[0]!.map(file => path.basename(file))).toEqual(Object.keys(byName));
+      const left = fs.readdirSync(directory).sort();
+      expect(left.filter(name => name.endsWith(".json"))).toEqual(["valid.json"]);
+      for (const name of ["foreign-owner.json", "foreign-ace.json", "reparse.json", "link.json", "unreadable.json"]) {
+        expect(left.some(entry => entry.startsWith(`${name}.quarantine-`))).toBe(true);
+      }
+      expect(alarms.mock.calls.map(([line]) => String(line)).filter(line => line.includes("ALARM: quarantined"))).toHaveLength(5);
+      expect(alarms.mock.calls.map(([line]) => String(line)).join("\n")).toMatch(new RegExp(`foreign-owner\\.json.*${other} \\(owner\\)`));
+      alarms.mockRestore();
+    });
+
+    it("simulated win32 consumes nothing while the batch read fails, then serves again", async () => {
+      let fail = true;
+      const { directory, guard } = await screenSetup(async files => {
+        if (fail) throw new Error("spawn powershell.exe ENOENT");
+        return files.map(() => privateFile());
+      });
+      fs.writeFileSync(path.join(directory, "a.json"), "{}");
+      const alarms = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await expect(guard.screenPending(["a.json"])).resolves.toEqual([]);
+      await expect(guard.screenPending(["a.json"])).resolves.toEqual([]);
+      expect(alarms).toHaveBeenCalledOnce(); // one alarm per distinct failure, not one per poll
+      expect(fs.readdirSync(directory)).toEqual(["a.json"]); // untouched, not quarantined
+      fail = false;
+      await expect(guard.screenPending(["a.json"])).resolves.toEqual(["a.json"]);
+      alarms.mockRestore();
+    });
+
+    it("POSIX screens nothing", async () => {
+      const { guard } = await screenSetup(async () => { throw new Error("unexpected file DACL query"); }, "linux");
+      await expect(guard.screenPending(["x.json"])).resolves.toEqual(["x.json"]);
+    });
+  });
+
   it.skipIf(process.platform === "win32")("non-Windows keeps the 0700 mkdir without a DACL query", async () => {
     const directory = path.join(tempRoot(), "requests");
     await prepareResidentRequestsDirectory(directory, process.platform, {
@@ -258,6 +370,20 @@ describe.skipIf(process.platform !== "win32")("Windows resident requests DACL (r
     await promisify(execFile)(windowsSystemExecutable("icacls.exe"), [directory, "/grant", "*S-1-5-32-545:(OI)(CI)(W)"], { windowsHide: true });
     await expect(prepareResidentRequestsDirectory(directory))
       .rejects.toThrow(/Refusing to serve resident requests: .*writable by other accounts \(S-1-5-32-545\)/);
+  }, 60_000);
+
+  it("quarantines a pending request file that grants BUILTIN\\Users write and keeps a private one", async () => {
+    const directory = path.join(tempRoot(), "requests");
+    const guard = new WindowsRequestsGuard(directory);
+    await guard.prepare();
+    fs.writeFileSync(path.join(directory, "valid.json"), "{}");
+    fs.writeFileSync(path.join(directory, "planted.json"), "{}");
+    await promisify(execFile)(windowsSystemExecutable("icacls.exe"), [path.join(directory, "planted.json"), "/grant", "*S-1-5-32-545:(W)"], { windowsHide: true });
+    const alarms = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(guard.screenPending(["valid.json", "planted.json"])).resolves.toEqual(["valid.json"]);
+    expect(fs.readdirSync(directory).filter(name => name.endsWith(".json"))).toEqual(["valid.json"]);
+    expect(alarms.mock.calls.map(([line]) => String(line)).join("\n")).toMatch(/ALARM: quarantined .*planted\.json.*S-1-5-32-545/);
+    alarms.mockRestore();
   }, 60_000);
 
   it("refuses the next batch once the verified requests directory is replaced while running", async () => {

@@ -12,9 +12,12 @@ const userSid = "S-1-5-21-1000000001-1000000002-1000000003-1001";
  */
 export const installSimulatedWindowsRequestsAcl = (): void => {
   if (nativePlatform === "win32" || vi.isMockFunction(windowsRequestsAclAdapters.readAcl)) return;
-  vi.spyOn(windowsRequestsAclAdapters, "readAcl").mockResolvedValue({
-    user: userSid, owner: userSid, dacl: "present",
+  const privateAcl = () => ({
+    user: userSid, owner: userSid, dacl: "present" as const,
     aces: [userSid, "S-1-5-18", "S-1-5-32-544"].map(sid => ({ type: "Allow" as const, sid, rights: 2032127 })),
   });
+  vi.spyOn(windowsRequestsAclAdapters, "readAcl").mockImplementation(async () => privateAcl());
   vi.spyOn(windowsRequestsAclAdapters, "restrict").mockResolvedValue(undefined);
+  // Request files the host itself wrote: FILE_ATTRIBUTE_ARCHIVE, inherited private DACL.
+  vi.spyOn(windowsRequestsAclAdapters, "readFileAcls").mockImplementation(async files => files.map(() => ({ attributes: 0x20, acl: privateAcl() })));
 };

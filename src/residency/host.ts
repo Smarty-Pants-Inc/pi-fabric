@@ -1156,7 +1156,9 @@ export class ResidentHost {
         console.error(`[pi-fabric] ${error instanceof Error ? error.message : String(error)}`);
         return;
       }
-      for (const entry of entries.slice(0, 32)) {
+      // Windows: a file planted before the DACL was tightened keeps its own owner and
+      // DACL. Each file is validated first; a violating one is quarantined, never consumed.
+      for (const entry of await this.#requestsGuard.screenPending(entries.slice(0, 32))) {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);

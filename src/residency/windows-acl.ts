@@ -41,16 +41,44 @@ export function windowsPowerShellPath(): string {
 
 // No double quotes: Windows argv quoting of " is unreliable for powershell.exe -Command.
 // SIDs come from GetAccessRules(..., SecurityIdentifier), so output is locale independent.
+// One report of $acl; `emit` wraps each line expression (console write or buffered add).
+const aclReportStatements = (emit: (expression: string) => string): string[] => [
+  emit("'user ' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"),
+  emit("'owner ' + $acl.GetOwner($sid).Value"),
+  // The raw DACL in SDDL: empty when absent, D:NO_ACCESS_CONTROL when NULL. GetAccessRules hides both.
+  emit("'dacl ' + $acl.GetSecurityDescriptorSddlForm('Access')"),
+  `foreach ($r in $acl.GetAccessRules($true, $true, $sid)) { ${emit("'ace ' + $r.AccessControlType.ToString() + ' ' + $r.IdentityReference.Value + ' ' + [string][int64]$r.FileSystemRights.value__")} }`,
+  emit("'end'"),
+];
+const writeLine = (expression: string) => `[Console]::Out.WriteLine(${expression})`;
 const aclReportScript = [
   "$ErrorActionPreference = 'Stop'",
   "$sid = [System.Security.Principal.SecurityIdentifier]",
   "$acl = Get-Acl -LiteralPath $env:FABRIC_ACL_PATH",
-  "[Console]::Out.WriteLine('user ' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)",
-  "[Console]::Out.WriteLine('owner ' + $acl.GetOwner($sid).Value)",
-  // The raw DACL in SDDL: empty when absent, D:NO_ACCESS_CONTROL when NULL. GetAccessRules hides both.
-  "[Console]::Out.WriteLine('dacl ' + $acl.GetSecurityDescriptorSddlForm('Access'))",
-  "foreach ($r in $acl.GetAccessRules($true, $true, $sid)) { [Console]::Out.WriteLine('ace ' + $r.AccessControlType.ToString() + ' ' + $r.IdentityReference.Value + ' ' + [string][int64]$r.FileSystemRights.value__) }",
-  "[Console]::Out.WriteLine('end')",
+  ...aclReportStatements(writeLine),
+].join("; ");
+
+/**
+ * Batch report for pending request files, one constant script for all of them.
+ * Paths arrive newline-separated in FABRIC_ACL_PATHS. Each file yields
+ * `file <index>`, then `attributes <FileAttributes>` (from the entry itself, so a
+ * reparse point reports ReparsePoint) and the same report as one directory, or
+ * `error` alone when it cannot be read. A file's lines are buffered and written
+ * only once complete, so a failure never leaves a partial report.
+ */
+const aclBatchReportScript = [
+  "$ErrorActionPreference = 'Stop'",
+  "$sid = [System.Security.Principal.SecurityIdentifier]",
+  "$i = 0",
+  "foreach ($p in $env:FABRIC_ACL_PATHS.Split([char]10)) { try { " + [
+    "$o = [System.Collections.Generic.List[string]]::new()",
+    "$o.Add('attributes ' + [string][int64]([System.IO.File]::GetAttributes($p)))",
+    "$acl = Get-Acl -LiteralPath $p",
+    ...aclReportStatements(expression => `$o.Add(${expression})`),
+    writeLine("'file ' + $i"),
+    "foreach ($l in $o) { [Console]::Out.WriteLine($l) }",
+  ].join("; ") + " } catch { " + writeLine("'file ' + $i") + "; " + writeLine("'error'") + " }; $i++ }",
+  writeLine("'batch-end'"),
 ].join("; ");
 
 const sddlDaclFlags = /^(?:P|AI|AR|NO_ACCESS_CONTROL)*$/;
@@ -121,6 +149,80 @@ export function windowsRequestsAclViolations(acl: WindowsDirectoryAcl): string[]
   return [...extra];
 }
 
+/** FILE_ATTRIBUTE_DIRECTORY and FILE_ATTRIBUTE_REPARSE_POINT (symlinks, junctions, other reparse tags). */
+export const WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x10;
+export const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+/** One pending request file: its attributes and ACL, or why they could not be read. */
+export type WindowsRequestFileReport = { attributes: number; acl: WindowsDirectoryAcl } | { error: string };
+
+/**
+ * Parse the batch report for `count` files. A malformed batch throws (nothing is
+ * judged); a malformed or unreadable single file becomes an `error` entry.
+ */
+export function parseWindowsFileAclBatch(output: string, count: number): WindowsRequestFileReport[] {
+  const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.at(-1) !== "batch-end") throw new Error("truncated file DACL batch report");
+  const sections: string[][] = [];
+  for (const line of lines.slice(0, -1)) {
+    if (line.startsWith("file ")) {
+      if (line !== `file ${sections.length}`) throw new Error(`out-of-order file DACL batch report: ${line.slice(0, 120)}`);
+      sections.push([]);
+    } else if (sections.length === 0) throw new Error(`unparseable file DACL batch line: ${line.slice(0, 120)}`);
+    else sections.at(-1)!.push(line);
+  }
+  if (sections.length !== count) throw new Error(`file DACL batch report covers ${sections.length} of ${count} files`);
+  return sections.map((section): WindowsRequestFileReport => {
+    if (section.length === 1 && section[0] === "error") return { error: "Get-Acl failed" };
+    const match = /^attributes (\d+)$/.exec(section[0] ?? "");
+    if (!match) return { error: "missing file attributes" };
+    try {
+      return { attributes: Number(match[1]), acl: parseWindowsAclReport(section.slice(1).join("\n")) };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+
+/** What the host knows about a pending request before it may consume it. */
+export interface WindowsRequestFileEvidence {
+  /** From lstat: a regular file, and not a symlink or junction (lstat does not follow either). */
+  regularFile: boolean;
+  symbolicLink: boolean;
+  /** The batch report for this file. */
+  report: WindowsRequestFileReport;
+}
+
+/**
+ * Reasons a pending request file must not be consumed; empty means it may be.
+ * It must be a regular file that is not a reparse point, owned by this user,
+ * SYSTEM or Administrators (the set trusted for the directory), and no other SID
+ * may hold an allowed write-class right on it. A directory DACL tightened after
+ * the file was planted does not change the file's own owner or DACL.
+ */
+export function windowsRequestFileViolations(evidence: WindowsRequestFileEvidence): string[] {
+  const violations: string[] = [];
+  if (evidence.symbolicLink) violations.push("a symlink or junction");
+  else if (!evidence.regularFile) violations.push("not a regular file");
+  if ("error" in evidence.report) return [...violations, `unverifiable DACL (${evidence.report.error})`];
+  const { attributes, acl } = evidence.report;
+  if ((attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT) !== 0) violations.push("a reparse point");
+  if ((attributes & WINDOWS_FILE_ATTRIBUTE_DIRECTORY) !== 0 && evidence.regularFile) violations.push("a directory");
+  const foreign = windowsRequestsAclViolations(acl);
+  if (foreign.length > 0) violations.push(`owned or writable by other accounts (${foreign.join(", ")})`);
+  return violations;
+}
+
+/** One Get-Acl process for all pending files: the constant batch script, fixed argv, paths in the environment. */
+export async function readWindowsFileAcls(files: string[]): Promise<WindowsRequestFileReport[]> {
+  if (files.length === 0) return [];
+  if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
+  const { stdout } = await execFileAsync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", aclBatchReportScript], {
+    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, FABRIC_ACL_PATHS: files.join("\n") },
+  });
+  return parseWindowsFileAclBatch(stdout, files.length);
+}
+
 export async function readWindowsDirectoryAcl(directory: string): Promise<WindowsDirectoryAcl> {
   if (/[\r\n]/.test(directory)) throw new Error("path contains a line break");
   const { stdout } = await execFileAsync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", aclReportScript], {
@@ -144,9 +246,13 @@ export async function restrictWindowsDirectory(directory: string, userSid: strin
 export interface WindowsRequestsAclDeps {
   readAcl: (directory: string) => Promise<WindowsDirectoryAcl>;
   restrict: (directory: string, userSid: string) => Promise<void>;
+  /** Batch reader for pending request files; defaults to the product adapter below. */
+  readFileAcls?: (files: string[]) => Promise<WindowsRequestFileReport[]>;
 }
 /** Platform adapters, read per call; tests that inject win32 on another OS replace these explicitly. */
-export const windowsRequestsAclAdapters: WindowsRequestsAclDeps = { readAcl: readWindowsDirectoryAcl, restrict: restrictWindowsDirectory };
+export const windowsRequestsAclAdapters: Required<WindowsRequestsAclDeps> = {
+  readAcl: readWindowsDirectoryAcl, restrict: restrictWindowsDirectory, readFileAcls: readWindowsFileAcls,
+};
 
 /** Fail closed unless only this user, SYSTEM and Administrators own or may write the directory. */
 export async function assertWindowsRequestsDirectoryPrivate(directory: string,
@@ -256,6 +362,9 @@ export class WindowsRequestsGuard {
   #platform: NodeJS.Platform | undefined;
   #verified: { identity: string; at: number } | undefined;
   #refusal: Error | undefined;
+  #screenFailure: string | undefined;
+  /** Refused files whose quarantine rename failed: never consumed, alarmed once. */
+  readonly #unquarantined = new Set<string>();
   readonly #deps: () => WindowsRequestsAclDeps;
   readonly #now: () => number;
   readonly #identity: (directory: string) => string;
@@ -277,6 +386,58 @@ export class WindowsRequestsGuard {
     this.#platform = this.#options.platform ?? process.platform;
     const identity = await prepareResidentRequestsDirectory(this.directory, this.#platform, this.#deps());
     if (identity !== undefined) this.#verified = { identity, at: this.#now() };
+  }
+
+  /**
+   * Windows: the pending entries (names in this directory) that may be consumed.
+   * The directory DACL says nothing about files planted before it was tightened,
+   * so each file is checked (see windowsRequestFileViolations) with one batch ACL
+   * read. A violating or unverifiable file is renamed to a quarantine name (no
+   * `.json` suffix, so it is never enumerated again) with a logged alarm, and is
+   * never returned. If the batch read itself fails nothing is returned this time.
+   * POSIX returns the entries unchanged.
+   */
+  async screenPending(entries: string[]): Promise<string[]> {
+    if (this.#platform !== "win32" || entries.length === 0) return entries;
+    const candidates: { entry: string; file: string; regularFile: boolean; symbolicLink: boolean }[] = [];
+    for (const entry of entries) {
+      const file = path.join(this.directory, entry);
+      if (this.#unquarantined.has(file)) continue; // refused and logged once already
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(file); } catch { continue; } // gone: consumed or removed meanwhile
+      candidates.push({ entry, file, regularFile: stat.isFile(), symbolicLink: stat.isSymbolicLink() });
+    }
+    if (candidates.length === 0) return [];
+    let reports: WindowsRequestFileReport[];
+    try {
+      const readFileAcls = this.#deps().readFileAcls ?? windowsRequestsAclAdapters.readFileAcls;
+      reports = await readFileAcls(candidates.map(candidate => candidate.file));
+      if (reports.length !== candidates.length) throw new Error(`expected ${candidates.length} file reports, got ${reports.length}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== this.#screenFailure) {
+        console.error(`[pi-fabric] Not consuming resident requests in ${this.directory}: cannot verify the request files (${message}); retrying`);
+      }
+      this.#screenFailure = message;
+      return [];
+    }
+    this.#screenFailure = undefined;
+    const accepted: string[] = [];
+    candidates.forEach((candidate, index) => {
+      const violations = windowsRequestFileViolations({ ...candidate, report: reports[index]! });
+      if (violations.length === 0) { accepted.push(candidate.entry); return; }
+      const quarantine = `${candidate.file}.quarantine-${randomUUID()}`;
+      try {
+        fs.renameSync(candidate.file, quarantine);
+        console.error(`[pi-fabric] ALARM: quarantined resident request ${candidate.file} as ${path.basename(quarantine)} ` +
+          `without consuming it: ${violations.join("; ")}`);
+      } catch (error) {
+        this.#unquarantined.add(candidate.file);
+        console.error(`[pi-fabric] ALARM: refusing resident request ${candidate.file} (${violations.join("; ")}); ` +
+          `quarantine failed (${error instanceof Error ? error.message : String(error)}), so it is skipped`);
+      }
+    });
+    return accepted;
   }
 
   /** Throws (and latches) unless the verified requests directory is still in place and private. */

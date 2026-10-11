@@ -12,6 +12,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { LIVENESS_POLICY_KEY } from "../src/topology/host-leases.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 
 const roots: string[] = [], hosts: ResidentHost[] = [], reads: Promise<unknown>[] = [];
 // Every gate a test holds (fake native reads, retry admission, platform stubs) is
@@ -141,6 +142,8 @@ const busyCases = ([1, 2] as const).flatMap(protocol => [...new Set([process.pla
 // selects the mesh lock taken inside that fence, after the native read has been prepared.
 it.each(busyCases)("busy participant-key native recovery prepares outside both registry fences (protocol=$protocol platform=$platform)", async ({ protocol, platform }) => {
   if (platform !== process.platform) {
+    // An injected win32 has no Get-Acl: the host's requests DACL check needs the simulated adapter.
+    if (platform === "win32") installSimulatedWindowsRequestsAcl();
     const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { ...descriptor, value: platform });
     releases.push(() => Object.defineProperty(process, "platform", descriptor));

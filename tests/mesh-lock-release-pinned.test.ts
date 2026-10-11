@@ -81,3 +81,28 @@ describe.runIf(process.platform === "linux")("mesh locks release only the direct
     expect(fs.readdirSync(root).filter(name => name.startsWith(".lock") || name.startsWith(MESH_CUSTODY_LOCK_NAME))).toEqual([]);
   });
 });
+
+// pi-fabric#889 review: without a pin (non-Linux; here /proc/self/fd made unreadable) the custody release is main's,
+// and like main it can be called again after a transient failure, so a live owner never keeps the lock.
+describe("the unpinned custody release keeps main's retry", () => {
+  it("a release whose rename failed transiently succeeds when it is called again", async () => {
+    const root = tempRoot();
+    const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file).startsWith("/proc/self/fd/")) throw Object.assign(new Error("EACCES: no fd traversal"), { code: "EACCES" });
+      return (read as (...args: unknown[]) => unknown)(file, options);
+    }) as typeof fs.readFileSync);
+    const release = await acquireMeshCustodyLock(root, 1_000, { ownIncarnation: undefined });
+    const rename = fs.renameSync;
+    let failures = 1;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(from) === lock && failures-- > 0) throw Object.assign(new Error("EBUSY: transient"), { code: "EBUSY" });
+      return rename(from, to);
+    }) as typeof fs.renameSync);
+    release();
+    expect(fs.existsSync(path.join(lock, "owner"))).toBe(true); // the transient failure kept it
+    release();
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+});

@@ -121,11 +121,15 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // never a check-then-rename by name that a reclaimed, stalled holder could run against its successor.
   const pin = pinFenceLock(lock, record);
   if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(` (custody lock ${lock} was reclaimed before entry)`, attempts, maxGapMs);
+  // The pinned release closes its fd, so it runs once; main's release below may be called again after a failure.
   let done = false;
   return () => {
-    if (done) return;
-    done = true;
-    if (pin !== undefined) { releaseFenceLock(lock, record, {}, pin); return; }
+    if (pin !== undefined) {
+      if (done) return;
+      done = true;
+      releaseFenceLock(lock, record, {}, pin);
+      return;
+    }
     // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
     try {
       if (readOwner() !== record) return;

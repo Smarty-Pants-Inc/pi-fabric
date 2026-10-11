@@ -1437,9 +1437,15 @@ export class ResidentHost {
           typeof participant.ownerIncarnation !== "string" || !participant.ownerIncarnation ||
           participant.ownerIncarnation === this.participants.ownerIncarnation ||
           !dormancy || dormancy.ownerIncarnation !== participant.ownerIncarnation ||
-          dormancy.configDigest !== dormantActorConfigDigest(actor)) continue;
+          typeof dormancy.configDigest !== "string" || dormancy.configDigest !== this.#dormantConfigDigest(actor.id)) continue;
       this.#retainedIncarnations.set(actor.id, { epoch: participant.ownerIncarnation });
     }
+  }
+
+  /** The whole persisted definition minus named runtime fields (#774); undefined when not loaded here. */
+  #dormantConfigDigest(actorId: string): string | undefined {
+    const definition = this.actors.dormantDefinition(actorId);
+    return definition ? dormantActorConfigDigest(definition) : undefined;
   }
 
   /** A retained epoch covers only commands published before this host's own route; later ones drop it. */
@@ -1470,8 +1476,10 @@ export class ResidentHost {
           // digest; the woken host's routes omit it, so no later restart inherits the epoch.
           const dormant = actor.status === "dormant" ||
             (dormancyProtected !== undefined && actor.status === "idle" && !dormancyProtected.has(actor.id));
-          const dormancy = dormant && typeof participant?.ownerIncarnation === "string" && participant.ownerIncarnation
-            ? { ownerIncarnation: participant.ownerIncarnation, configDigest: dormantActorConfigDigest(actor) } : undefined;
+          const configDigest = dormant && typeof participant?.ownerIncarnation === "string" && participant.ownerIncarnation
+            ? this.#dormantConfigDigest(actor.id) : undefined;
+          const dormancy = configDigest && participant?.ownerIncarnation
+            ? { ownerIncarnation: participant.ownerIncarnation, configDigest } : undefined;
           return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}),
             ...(dormancy ? { dormancy } : {}) };
         }) };

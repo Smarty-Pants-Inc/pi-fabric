@@ -1090,6 +1090,23 @@ export class ActorManager {
   /** Whether this runtime loaded the actor's registry row as dormant, i.e. it woke that actor's dormant route. */
   loadedDormant(id: string): boolean { return this.#loadedDormant.has(id); }
 
+  /**
+   * The persisted definition a dormant generation sleeps under (#774): the exact registry row plus
+   * the execution inputs resolved outside it (scope, lineage, session model/thinking binding and the
+   * host default timeout). The residency digest excludes only named runtime fields from it.
+   */
+  dormantDefinition(id: string): Record<string, unknown> | undefined {
+    const actor = this.#actors.get(id);
+    if (!actor) return undefined;
+    return {
+      ...this.#serializedActor(actor),
+      scope: this.#actorScope,
+      ownershipToken: this.#lineage(actor),
+      effectiveBinding: this.#runBinding(actor),
+      effectiveTimeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
+    };
+  }
+
   /** Whether at least one owned durable actor can be made dormant right now. */
   hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
     if (!this.#persistent || this.#closing || this.#releasePaused) return false;

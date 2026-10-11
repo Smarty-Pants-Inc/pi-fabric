@@ -13,7 +13,8 @@ import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors, type ResidentWakeRoutes } from "../src/residency/wake.js";
 import { superviseWake } from "../src/residency/launcher.js";
-import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable } from "../src/residency/wake-index.js";
+import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable, DORMANT_RUNTIME_FIELDS, dormantActorConfigDigest } from "../src/residency/wake-index.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { requestResidentWake, ResidentWakeConfigMismatch } from "../src/residency/wake.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -978,10 +979,10 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
 // for the backlog published before the successor's own fresh route.
 describe("retained dormant route epoch", () => {
   const stale = { name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION };
-  const dormantRoute = async () => {
+  const dormantRoute = async (create: { delivery?: "followUp"; triggerTurn?: boolean } = {}) => {
     const f = fixture();
     await f.host.start();
-    const actor = await f.host.actors.create({ name: "retained-route", instructions: "process", residency: "durable" });
+    const actor = await f.host.actors.create({ name: "retained-route", instructions: "process", residency: "durable", ...create });
     await until(() => f.host.actors.status(actor.id).status === "dormant");
     f.host.actors.pauseForRelease(); await f.host.actors.checkpointForRelease(); await f.host.close();
     const routeFile = path.join(f.config.residencyRoot, "wake-routes.json");
@@ -1033,6 +1034,131 @@ describe("retained dormant route epoch", () => {
       await sleep(100);
       expect(route.seen).toEqual([]);
       expect(successor.actors.status(route.actor.id).status).not.toBe("stopped");
+    } finally { await route.cleanup(); }
+  }, 20_000);
+
+  // #774 review P1: the digest binds the WHOLE persisted definition. Each persisted execution
+  // setting below must refuse the retained epoch when it changes while dormant; a runtime-only
+  // change (DORMANT_RUNTIME_FIELDS) must not. "session binding" is the persisted per-session
+  // model/thinking overlay, the one execution input stored outside the registry row.
+  const executionChanges: { [field: string]: { [key: string]: unknown } } = {
+    name: { name: "retained-route-renamed" },
+    instructions: { instructions: "process differently" },
+    events: { events: ["tool_error"] },
+    topics: { topics: ["retained.changed"] },
+    delivery: { delivery: "nextTurn" },
+    // Loaded only with steer/followUp delivery, so this case creates the actor with followUp.
+    triggerTurn: { triggerTurn: true },
+    responseMode: { responseMode: "directive" },
+    coalesce: { coalesce: false },
+    coalesceKey: { coalesceKey: "data.key" },
+    dedupeKey: { dedupeKey: "data.key" },
+    residency: { residency: "session" },
+    runner: { runner: "claude" },
+    kernel: { kernel: "python" },
+    pythonRuntime: { pythonRuntime: "cpython" },
+    extensions: { extensions: false },
+    runnerSessionId: { runnerSessionId: "runner-session-2" },
+    model: { model: "test/changed-model" },
+    modelReason: { modelReason: "changed reason" },
+    thinking: { thinking: "high" },
+    routeClass: { routeClass: "status-groom" },
+    protected: { protected: true },
+    tools: { tools: ["read"] },
+    transport: { transport: "tmux" },
+    timeoutMs: { timeoutMs: 1_234 },
+    nice: { nice: 5 },
+    bashTimeoutSeconds: { bashTimeoutSeconds: 7 },
+    inferenceContext: { inferenceContext: "activation" },
+    activation: { activation: { minIntervalMs: 2_000 } },
+    activationFilter: { activationFilter: [{ id: "skip-noise", topic: ["fleet.noise"] }] },
+    activationFilterExpiresAt: { activationFilterExpiresAt: Date.now() + 3_600_000 },
+    requirements: { requirements: [{ ref: "mesh.read", optional: true }] },
+    validWhile: { validWhile: { version: 1, source: "() => true" } },
+    records: { records: { topic: "retained.records" } },
+    project: { project: "elsewhere" },
+    supervisorFor: { supervisorFor: "session:dormancy" },
+    adoptedAt: { adoptedAt: 1 },
+    adoptedFrom: { adoptedFrom: ["session:predecessor"] },
+  };
+  // Excluded runtime fields a dormant row can carry; status/stopReason/sessionOrphan/removal and
+  // message storage belong to non-dormant or history rows and are covered by the digest test below.
+  const runtimeChanges: { [field: string]: { [key: string]: unknown } } = {
+    createdAt: { createdAt: 1 },
+    updatedAt: { updatedAt: 2 },
+    filterSkipped: { filterSkipped: { count: 3, lastKey: "k", lastTopic: "t", lastAt: 4 } },
+    filteredCount: { filteredCount: 5 },
+    lastFilteredAt: { lastFilteredAt: 6 },
+    activationBlocked: { activationBlocked: { reason: "transient", code: "provider-transient", since: 1, count: 1, retryAt: 2 } },
+    failureStreak: { failureStreak: { count: 1, notified: false } },
+    lastRunId: { lastRunId: "7".repeat(32) },
+    lastError: { lastError: "earlier failure" },
+    presenceError: { presenceError: "earlier presence failure" },
+    resolvedBinding: { resolvedBinding: { model: "test/last-run", thinking: "low" } },
+    capabilityDigest: { capabilityDigest: "8".repeat(64) },
+    sessionFile: { sessionFile: "/elsewhere/session.jsonl" },
+  };
+  const changeWhileDormant = async (route: Awaited<ReturnType<typeof dormantRoute>>, change: { [key: string]: unknown } | "session binding") => {
+    const pending = route.send("followUp", route.epoch, "addressed to the dormant generation");
+    await until(() => route.commands().length === 1);
+    if (change === "session binding") {
+      await new ActorBindingStore(route.config.sessionId, route.config.actorRoot).setModel(route.actor.id, "test/session-model");
+    } else {
+      const registry = new ActorRegistryStore(route.config.actorRoot);
+      registry.write(registry.records().map(row => row.id === route.actor.id ? { ...row, ...change } as typeof row : row));
+    }
+    await route.wakeSuccessor();
+    return pending;
+  };
+
+  it.each([...Object.keys(executionChanges), "session binding"])("refuses the retained epoch after persisted execution field %s changes while dormant", async field => {
+    const route = await dormantRoute(field === "triggerTurn" ? { delivery: "followUp", triggerTurn: false } : {});
+    try {
+      expect(await changeWhileDormant(route, field === "session binding" ? field : executionChanges[field]!)).toMatchObject(stale);
+      await sleep(50);
+      expect(route.seen).toEqual([]);
+    } finally { await route.cleanup(); }
+  }, 20_000);
+
+  it.each(Object.keys(runtimeChanges))("keeps the retained epoch after runtime field %s changes while dormant", async field => {
+    const route = await dormantRoute();
+    try {
+      expect(await changeWhileDormant(route, runtimeChanges[field]!)).toMatchObject({ acknowledged: true });
+    } finally { await route.cleanup(); }
+  }, 20_000);
+
+  it("digests every persisted definition field except the named runtime fields", async () => {
+    const route = await dormantRoute();
+    try {
+      // A fully populated dormant row: every change above at once (runner/residency stay compatible).
+      const { runner: _runner, residency: _residency, triggerTurn: _triggerTurn, ...execution } = Object.assign({}, ...Object.values(executionChanges)) as { [key: string]: unknown };
+      const registry = new ActorRegistryStore(route.config.actorRoot);
+      registry.write(registry.records().map(row => row.id === route.actor.id
+        ? { ...row, ...execution, ...Object.assign({}, ...Object.values(runtimeChanges)) } as typeof row : row));
+      const successor = new ResidentHost(route.config, () => {});
+      try {
+        await successor.start();
+        const definition = successor.actors.dormantDefinition(route.actor.id)!;
+        expect(Object.keys(definition)).toEqual(expect.arrayContaining(["transport", "bashTimeoutSeconds", "model", "thinking",
+          "instructions", "tools", "residency", "topics", "activationFilter", "effectiveBinding", "effectiveTimeoutMs"]));
+        // Inputs the row cannot change directly: identity, scope, lineage (adoptedAt/adoptedFrom/rootId cases),
+        // session binding ("session binding" case) and the default timeout (timeoutMs case / host config).
+        const derived = ["id", "rootId", "scope", "ownershipToken", "effectiveBinding", "effectiveTimeoutMs"];
+        const unclassified = Object.keys(definition).filter(field => !DORMANT_RUNTIME_FIELDS.has(field) &&
+          !Object.hasOwn(executionChanges, field) && !derived.includes(field));
+        // A new persisted field is digested by default; give it a refusal case above (or, only if it
+        // is runtime state, add it to DORMANT_RUNTIME_FIELDS).
+        expect(unclassified).toEqual([]);
+        const digest = dormantActorConfigDigest(definition);
+        for (const field of Object.keys(definition)) {
+          const changed = dormantActorConfigDigest({ ...definition, [field]: { changed: field } });
+          if (DORMANT_RUNTIME_FIELDS.has(field)) expect(changed, field).toBe(digest);
+          else expect(changed, field).not.toBe(digest);
+        }
+        for (const field of DORMANT_RUNTIME_FIELDS) {
+          expect(dormantActorConfigDigest({ ...definition, [field]: { changed: field } }), field).toBe(digest);
+        }
+      } finally { await successor.close(); }
     } finally { await route.cleanup(); }
   }, 20_000);
 

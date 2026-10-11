@@ -2,7 +2,8 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, requireNamespaceBarrier, syncPathNamespaceDurable } from "../core/atomic-write.js";
+import { meshEventsNotDurable } from "./not-durable.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -237,21 +238,28 @@ export class EventLog {
     return path.join(this.root, "event-receipts", createHash("sha256").update(dedupeKey).digest("hex") + suffix);
   }
 
-  #confirmEventFile(file: string): void {
+  /** `durable`: the mesh.sync barrier, whose namespace step fails closed where there is none (win32). */
+  #confirmEventFile(file: string, durable = false): void {
     const fd = fs.openSync(file, process.platform === "win32" ? "r+" : "r");
-    try { fs.fsyncSync(fd); syncPathNamespace(file, fs.fstatSync(fd)); } finally { fs.closeSync(fd); }
+    try {
+      fs.fsyncSync(fd);
+      if (durable) syncPathNamespaceDurable(file, fs.fstatSync(fd), meshEventsNotDurable);
+      else syncPathNamespace(file, fs.fstatSync(fd));
+    } finally { fs.closeSync(fd); }
   }
 
   /** Fsync the live log and its namespace outside `.lock`. Group commit: callers whose append
-   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). */
-  #confirmEventsAfterRelease(): Promise<void> {
+   * completed before the barrier starts share one fsync (the jbd2 commit is the cost). A durable
+   * caller joining a queued publish barrier gets the same barrier: the variants differ only where
+   * sync() already refused, before any I/O. */
+  #confirmEventsAfterRelease(durable = false): Promise<void> {
     const file = this.#eventsPath;
     const queued = eventBarriers.get(file);
     if (queued) return queued;
     const barrier = new Promise<void>((resolve, reject) => {
       setImmediate(() => {
         eventBarriers.delete(file);
-        try { this.#confirmEventFile(file); resolve(); }
+        try { this.#confirmEventFile(file, durable); resolve(); }
         catch (error) { reject(error); }
       });
     });
@@ -271,13 +279,18 @@ export class EventLog {
    * every line before it. Never the reservation counter (latestSequence): a publisher advances that
    * under `.lock` before it appends, so a reserved sequence may not be in the log yet
    * (pi-fabric#894). Zero when the live log holds no complete event.
+   *
+   * Fails closed with MeshEventsNotDurableError on a platform with no namespace barrier (win32),
+   * before any I/O: neither the live log's renames nor the archive's new segments can be confirmed
+   * there (pi-fabric#894 CODE_REVIEW), so no claim is made, even for an empty root.
    */
   async sync(): Promise<number> {
+    requireNamespaceBarrier(meshEventsNotDurable);
     if (!fs.existsSync(this.#eventsPath)) return 0;
     // Sample first, then queue the barrier: a queued barrier has not started (it runs in a later
     // setImmediate), so its fsync begins after this read in every case.
     const through = this.#readCommittedSequence();
-    await this.#confirmEventsAfterRelease();
+    await this.#confirmEventsAfterRelease(true);
     return through;
   }
 

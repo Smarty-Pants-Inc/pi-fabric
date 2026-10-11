@@ -282,9 +282,39 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     return { entries, directories, parents };
 };
 
+/**
+ * Whether syncPathNamespace can confirm a directory entry on this platform. Windows has no directory
+ * fsync, so every namespace barrier below is skipped there (NTFS journals names, but nothing here
+ * confirms it). The single platform fact behind syncPathNamespace, its async form, syncDirectoryChain
+ * and the fail-closed durability variant.
+ */
+export const namespaceBarrierAvailable = (): boolean => process.platform !== "win32";
+
+/** Builds the caller's typed not-durable error (for mesh.sync: a MeshSyncNotDurableError code). */
+export type NamespaceNotDurable = (platform: NodeJS.Platform) => Error;
+
+/**
+ * Refuses, before any I/O, a durability barrier that would need a namespace (directory) step on a
+ * platform without one (pi-fabric#894): a barrier that reports success to a caller, which then
+ * advances an external cursor or delivered mark, must never skip the directory fsync silently.
+ */
+export const requireNamespaceBarrier = (notDurable: NamespaceNotDurable): void => {
+  if (!namespaceBarrierAvailable()) throw notDurable(process.platform);
+};
+
+/**
+ * syncPathNamespace for a durability barrier (mesh.sync, smarty-dev#9313): fails closed with
+ * notDurable(platform) where syncPathNamespace would skip the directory fsync (win32), instead of
+ * returning as if the namespace were confirmed. Ordinary atomic writes keep syncPathNamespace.
+ */
+export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefined, notDurable: NamespaceNotDurable): void => {
+  requireNamespaceBarrier(notDurable);
+  syncPathNamespace(target, receipt);
+};
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     const synced = new Set<string>();
     for (const parent of before.parents.reverse()) {
       for (let current = parent; ; current = path.dirname(current)) {
@@ -312,7 +342,7 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
  * that a newly created or replaced child directory is durably linked. */
 export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Promise<void> => {
   const before = namespaceSnapshot(target, receipt);
-  if (process.platform !== "win32") {
+  if (namespaceBarrierAvailable()) {
     for (const [directory, expected] of [...before.directories].reverse()) {
       const handle = await fs.promises.open(directory, fs.constants.O_RDONLY);
       try {
@@ -336,7 +366,7 @@ export const isNamespaceRace = (error: unknown): boolean => error instanceof Err
 
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
-  if (process.platform !== "win32") syncPathNamespace(directory);
+  if (namespaceBarrierAvailable()) syncPathNamespace(directory);
 };
 
 // Temps this process staged and has not yet renamed or removed (smarty-dev#6622).

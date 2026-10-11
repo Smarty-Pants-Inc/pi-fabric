@@ -22,6 +22,7 @@ import {
 } from "./state-file.js";
 import { validateMeshStateKey } from "./state-sqlite.js";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { MeshSyncNotDurableError } from "./not-durable.js";
 
 // ------------------------------------------------------------------ the JetStream port
 
@@ -159,11 +160,9 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
  * is on disk only after the server's sync interval, so durability cannot be confirmed. Not retryable: the caller must
  * not advance an external cursor or delivered mark on it (smarty-dev#9313).
  */
-export class MeshStateNatsNotDurableError extends Error {
-  readonly code = "FABRIC_MESH_STATE_NATS_NOT_DURABLE";
-  readonly retryable = false;
+export class MeshStateNatsNotDurableError extends MeshSyncNotDurableError {
   constructor(readonly syncAlways: boolean | undefined) {
-    super(`FABRIC_MESH_STATE_NATS_NOT_DURABLE: Fabric mesh state durability is not confirmed: nats-server reported sync_always ${String(syncAlways)} at open and the backend was opened with acceptPeriodicSync, so an acked commit may not survive a power loss until the server's sync interval; not durable`);
+    super("FABRIC_MESH_STATE_NATS_NOT_DURABLE", "state", `nats-server reported sync_always ${String(syncAlways)} at open and the backend was opened with acceptPeriodicSync, so an acked commit may not survive a power loss until the server's sync interval`);
     this.name = "MeshStateNatsNotDurableError";
   }
 }

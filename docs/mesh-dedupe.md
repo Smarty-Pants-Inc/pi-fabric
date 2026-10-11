@@ -76,9 +76,13 @@ SQLite state commits with `synchronous=NORMAL`. The barrier is:
   already fdatasynced per publish). SQLite state: the store's PASSIVE checkpoint
   barrier (no copy or fsync under SQLite's writer lock, smarty-dev#6100), retried
   within `budgetMs`. File state: an fsync of `state.json` and its namespace.
-  On Windows there is no directory fsync for the rename that replaces
-  `state.json`, so file state rejects with `MeshStateFileNotDurableError`
-  (`FABRIC_MESH_STATE_FILE_NOT_DURABLE`, not retryable): not durable.
+  On Windows there is no directory fsync, so every namespace step of the
+  barrier fails closed before any I/O: the event log rejects with
+  `MeshEventsNotDurableError` (`FABRIC_MESH_EVENTS_NOT_DURABLE`), which
+  `mesh.sync` therefore surfaces on Windows whatever the state backend, and
+  file state rejects with `MeshStateFileNotDurableError`
+  (`FABRIC_MESH_STATE_FILE_NOT_DURABLE`). All refusals are one shape,
+  `MeshSyncNotDurableError` (`code` per backend, `retryable: false`): not durable.
   Shadow state syncs its authority, `state.json`, and so rejects the same way. NATS state resolves at once
   when the server reported `sync_always` at open; a backend opened with
   `acceptPeriodicSync` cannot confirm durability, so the barrier rejects with

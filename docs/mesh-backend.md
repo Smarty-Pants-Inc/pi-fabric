@@ -59,7 +59,23 @@ The gate decides from an inventory, never from what readers chose to register:
    `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
 
-   Known limit (smarty-dev#8116, the accepted gap that remains of smarty-dev#7936; acceptance: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): the window runs from the lease probe under the fence (before the switch opens `state.db`) to each commit, still under the fence. A process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock in that window is not detected; WAL connections always hold a lock on `-shm`. The gate does not probe again after its own open (its own fd makes the probe refuse), and the lease cannot be held through the commit: the switch's own open conflicts with it. Each gated switch prints this gap on stderr.
+   The fenced window (smarty-dev#8116): under the fence the helper runs as `fabric-mesh-lease --watch`. Its
+   inotify watches (the directories of `state.db`, `-wal` and `-shm`, plain and under `state-shadow/`, and
+   each existing file's inode) go up BEFORE the lease probe, so an open after the probe is an event,
+   whatever the opener's dumpability or locks. The final report is taken BEFORE the switch's own first open
+   of these files (pi-fabric#881), so every open by name in that window but the probe's own is foreign and
+   refuses. Closes are never netted and nothing is subtracted: inotify merges an event with an identical one
+   at the queue tail, whoever opened. The verdict stands for the checks before each commit. An inode opened through
+   another name (a hard link), a moved file, a removed file name (a hard link elsewhere can keep its inode open;
+   pi-fabric#881), a mode, owner or link-count change (IN_ATTRIB) on a watched file or directory (smarty-dev#9473), lost events (queue overflow), a `state-shadow/` that appeared, a watched
+   directory or file inode deleted, moved or dropped by inotify (its replacement would be unwatched),
+   or a helper that does not report within 10 s is never ready (`holder@lease:<file>` or
+   `holder@lease-probe`). On Linux a probe that cannot run is `holder@lease-probe` even when no SQLite file
+   exists yet. Neither simpler option works: any open breaks a held write lease, the switch's own
+   included, and a re-probe after the switch's own open always refuses.
+   Residual (smarty-dev#8116): r0, an open after the report (from the switch's own open of `state.db` to each
+   commit) is not watched; r1, a file created inside the window is watched by name until the helper adds its
+   inode watch, microseconds later, so a hard-link open in that gap is not seen.
 
    On Linux, the census's SQLite-file evidence (`state-database`) is replaced by this scan, so
    `fabric@unknown` no longer covers it: each holder is named and accepted only by its own

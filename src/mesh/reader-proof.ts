@@ -258,7 +258,40 @@ export const embeddedNativeDigests = (): Record<string, string> => {
 /** Injection points of the lease probe (tests). */
 export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string;
   /** Tests: the expected sha256 instead of the embedded one. */ expectedDigest?: string;
-  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void }
+  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void;
+  /** Tests: the install root above `helper` (default: its directory for an injected helper, else installRoot()). */ trustRoot?: string }
+
+/**
+ * The trusted install root (smarty-dev#8145): the package directory, two levels above this module both in
+ * src/ (src/mesh/) and in the bundle (dist/<dir>/). Above it, a release directory or node_modules is the
+ * installer's; inside it, nothing may be writable by another user.
+ */
+export const installRoot = (): string => fileURLToPath(new URL("../..", import.meta.url));
+
+/**
+ * Why `file` is unsafe to trust, or undefined: on its REAL path (ancestor symlinks resolved), the file and
+ * every directory up to and including the real `root` must be inside `root`, no symlink, owned by this
+ * user (or root) and not group/other-writable. With `fd`, the checked file must be the opened one.
+ */
+const unsafeChain = (file: string, root: string, fd?: number): string | undefined => {
+  let real: string, top: string;
+  try { real = fs.realpathSync(file); top = fs.realpathSync(root); }
+  catch (error) { return `${file} cannot be resolved (${errno(error)})`; }
+  const inside = path.relative(top, real);
+  if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
+  const euid = process.geteuid?.();
+  for (let at = real; ; at = path.dirname(at)) {
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
+    if (at === real && fd !== undefined) {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino) return `${file} changed while it was checked`;
+    }
+    const why = stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid);
+    if (why) return `${at} is ${why}`;
+    if (at === top) return undefined;
+  }
+};
 
 /** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
 export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
@@ -307,13 +340,11 @@ export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}):
   catch (error) { return unavailable(`helper integrity: ${helper} cannot be opened (${errno(error)})`); }
   let result: { error?: Error; status: number | null; stdout: string };
   try {
-    // smarty-dev#8145: another user who can write the helper or its directory could change what runs.
-    // Owned by us (or root) and not group/other-writable, checked on the opened fd and the directory.
-    const euid = process.geteuid?.();
-    for (const [what, stat] of [[helper, fs.fstatSync(fd)], [path.dirname(helper), fs.statSync(path.dirname(helper))]] as const) {
-      const unsafe = ownership(stat, stat.uid === 0 ? 0 : euid);
-      if (unsafe) return unavailable(`helper integrity: ${what} is ${unsafe}`);
-    }
+    // smarty-dev#8145: another user who can write the helper, the gate's own module, or any directory
+    // above them up to the install root could change what runs: refuse unless the whole chain is ours.
+    const unsafe = unsafeChain(helper, probe.trustRoot ?? (probe.helper ? path.dirname(probe.helper) : installRoot()), fd)
+      ?? unsafeChain(fileURLToPath(import.meta.url), installRoot());
+    if (unsafe) return unavailable(`helper integrity: ${unsafe}`);
     const actual = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
     if (actual !== expected) return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the embedded digest ${expected}`);
     probe.afterHash?.();

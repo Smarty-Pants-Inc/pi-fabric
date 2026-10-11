@@ -473,18 +473,29 @@ const [helper] = process.argv.slice(1);
 fs.linkSync(helper, helper + ".real");
 fs.writeFileSync(helper + ".fake", '#!/bin/sh\\nfor f in "$@"; do echo "free $f"; done\\n', { mode: 0o700 });
 // Hard links, not rewrites: a swap is two syscalls, so it lands often inside the hash-to-exec window.
+// Every 64 swaps it publishes its count: the barrier that shows the swaps overlapped each probe.
 for (let i = 0; ; i++) {
   fs.linkSync(helper + (i % 2 ? ".real" : ".fake"), helper + ".next");
   fs.renameSync(helper + ".next", helper);
+  if (i % 64 === 0) fs.writeFileSync(helper + ".swaps", String(i));
 }`, helper], { stdio: "ignore" });
+    const swaps = (): number => { try { return Number(fs.readFileSync(`${helper}.swaps`, "utf8")); } catch { return -1; } };
     const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
     try {
+      const started = Date.now();
+      while (swaps() < 64) {
+        if (Date.now() - started > 10_000) throw new Error("the racer did not start swapping");
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
       for (let run = 0; run < 8; run++) {
+        const before = swaps();
         const result = spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
           "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
         expect(result.status, result.stderr).toBe(3);
         // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
         expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
+        // The swaps went on during the whole run: its probes ran while swapped files were in place.
+        expect(swaps()).toBeGreaterThan(before);
       }
       expect(await backendOf(root)).toBe("importing");
     } finally {
@@ -492,6 +503,47 @@ for (let i = 0; ; i++) {
       await holder.release();
     }
   }, 120_000);
+
+  // smarty-dev#8145 round 1 (SEC P1): the whole real chain up to the install root, not only the helper's directory.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable or symlinked directory between the helper and the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("chain");
+    const native = path.join(pkg, "dist/native");
+    fs.mkdirSync(native, { recursive: true, mode: 0o700 });
+    const helper = path.join(native, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+    const dist = fs.realpathSync(path.join(pkg, "dist"));
+    fs.chmodSync(dist, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${dist} is group/other-writable (mode 770)`) });
+    fs.chmodSync(dist, 0o700);
+    // dist/native as a symlink to a directory outside the package: its real path is not under the install root.
+    const elsewhere = tempDir("elsewhere");
+    fs.renameSync(native, path.join(elsewhere, "native"));
+    fs.symlinkSync(path.join(elsewhere, "native"), native);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`is outside the install root ${fs.realpathSync(pkg)}`) });
+  });
+
+  it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("bundle");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    // dist/mesh holds the gate (mesh-backend-cli.js), not the helper: only the bundle chain covers it.
+    const mesh = fs.realpathSync(path.join(pkg, "dist/mesh"));
+    fs.chmodSync(mesh, 0o775);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    expect(refused.stderr).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper integrity: ${mesh} is group/other-writable (mode 775)`);
+    fs.chmodSync(mesh, 0o700);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+  });
 
   it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();

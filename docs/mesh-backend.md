@@ -58,9 +58,11 @@ The gate decides from an inventory, never from what readers chose to register:
    bytes are the executed bytes. A mismatch, a symlink, no compiled digest, or no `/proc/self/fd` is
    `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
-   The helper and its directory must be owned by this user (or root) and not group- or other-writable,
-   checked on the opened fd at each probe and on `dist/native` by the build check; otherwise it is
-   `holder@lease-probe` (smarty-dev#8145). A same-user in-place write between the hash and the exec
+   The helper and the gate's own bundle, and every directory on their real paths up to the install root
+   (the package directory), must be owned by this user (or root), not group- or other-writable, and
+   inside that root (no symlink out of it), checked at each probe; otherwise it is
+   `holder@lease-probe` (smarty-dev#8145). The build strips group/other write from `dist/`, and the
+   build check refuses any such entry or symlink in `dist/`. A same-user in-place write between the hash and the exec
    remains the accepted smarty-dev#7800 class: Node has no `memfd_create` to exec a sealed copy.
 
    Known limit (smarty-dev#8116, the accepted gap that remains of smarty-dev#7936; acceptance: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): the window runs from the lease probe under the fence (before the switch opens `state.db`) to each commit, still under the fence. A process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock in that window is not detected; WAL connections always hold a lock on `-shm`. The gate does not probe again after its own open (its own fd makes the probe refuse), and the lease cannot be held through the commit: the switch's own open conflicts with it. Each gated switch prints this gap on stderr.

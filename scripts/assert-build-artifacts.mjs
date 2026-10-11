@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -110,13 +110,19 @@ if (process.platform === "linux") {
   // The native helpers are the twice-built, byte-identical outputs recorded in the manifest (build-landlock.mjs).
   const manifest = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
   if (!/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? ""))) throw new Error(`Native manifest names no gcc or clang compiler: ${manifest.compiler}`);
-  // smarty-dev#8145: the lease probe refuses a helper (or its directory) that another user can write.
-  for (const file of ["native", "native/fabric-landlock", "native/fabric-mesh-lease"]) {
-    const { mode, uid } = statSync(join(dist, file));
-    if ((mode & 0o022) !== 0 || uid !== process.geteuid()) {
-      throw new Error(`dist/${file} must be owned by uid ${process.geteuid()} and not group/other-writable (uid ${uid}, mode ${(mode & 0o777).toString(8)})`);
+  // smarty-dev#8145: the lease probe refuses a helper or gate bundle whose chain up to the package root
+  // another user can write: the package root, and everything in dist/, ours, no group/other write, no symlink.
+  const owned = (file, label) => {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+    if ((stat.mode & 0o022) !== 0 || stat.uid !== process.geteuid()) {
+      throw new Error(`${label} must be owned by uid ${process.geteuid()} and not group/other-writable (uid ${stat.uid}, mode ${(stat.mode & 0o777).toString(8)})`);
     }
-  }
+    if (stat.isDirectory()) for (const name of readdirSync(file)) owned(join(file, name), `${label}/${name}`);
+  };
+  owned(dist, "dist");
+  const top = lstatSync(root);
+  if ((top.mode & 0o022) !== 0 || top.uid !== process.geteuid()) throw new Error(`the package root ${root} must be owned by uid ${process.geteuid()} and not group/other-writable`);
   for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {

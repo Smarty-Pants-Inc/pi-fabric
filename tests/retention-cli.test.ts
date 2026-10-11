@@ -30,6 +30,9 @@ const make = () => {
   }
   write(path.join(actor, "session.jsonl.20260927T150000000Z.bak"), "old");
   write(path.join(actor, "session.jsonl.20260928T150000000Z.bak"), "new");
+  // Rotation order is trusted data (smarty-dev#7916): mtimes follow the rotations, never one shared millisecond.
+  fs.utimesSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"), 1_000, 1_000);
+  fs.utimesSync(path.join(actor, "session.jsonl.20260928T150000000Z.bak"), 1_001, 1_001);
   write(path.join(actor, "session.jsonl"), "live");
   // A valid, empty mesh state: --apply refuses on any doubt about state.json (smarty-dev#7916).
   write(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));

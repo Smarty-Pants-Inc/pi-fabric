@@ -38,8 +38,10 @@ const deadRootMesh = (actorStatus = "idle") => {
   const inflight = run(path.join(runs, "inflight"), { status: "running", updatedAt: NOW - 9 * DAY });
   // A removed actor's directory: no registry row, no latest run to keep.
   const orphan = run(path.join(registry, "removed-actor", "runs", "orphan"), { status: "failed", finishedAt: NOW - 10 * DAY });
-  for (const stamp of ["20260920T150000000Z", "20260921T150000000Z", "20260922T150000000Z"]) {
+  for (const [order, stamp] of ["20260920T150000000Z", "20260921T150000000Z", "20260922T150000000Z"].entries()) {
     write(path.join(actor, `session.jsonl.${stamp}.bak`), stamp);
+    // Rotation order is trusted data (smarty-dev#7916): mtimes follow the rotations, never one shared millisecond.
+    fs.utimesSync(path.join(actor, `session.jsonl.${stamp}.bak`), 1_000 + order, 1_000 + order);
   }
   write(path.join(actor, "session.jsonl"), "live");
   return { root, registry, actor, runs, old, latest, young, inflight, orphan };

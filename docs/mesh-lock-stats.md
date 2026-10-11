@@ -68,7 +68,7 @@ keeps the separate facts in `pids[].writer`.
 
 The minute files say how busy the lock was, not which hold made a waiter give up. For that, the two
 parties report it themselves at the source (smarty-dev#9290), so a watcher such as commswatch tails a
-file instead of sampling `.lock` every 50 ms. Both locks are covered: the mesh `.lock` (`store:
+file, so nothing has to sample `.lock` every 50 ms. Both locks are covered: the mesh `.lock` (`store:
 "mesh-lock"`) and the SQLite state writer lock (`store: "sqlite"`, `BEGIN IMMEDIATE` through
 `COMMIT`/`ROLLBACK`, including the R20 write fence).
 

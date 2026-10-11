@@ -300,15 +300,16 @@ describe("notification-driven mesh maintenance", () => {
     const directory = root();
     const maintainer = await openStore(directory, { checkpoint: "maintainer", checkpointIntervalMs: 20 });
     const writer = await openStore(directory);
-    // Wait for the initial, actual-work checkpoint, then observe the next one.
+    // Wait for the initial, actual-work checkpoint, then observe the next one. The maintainer timer runs the
+    // settled checkpoint (smarty-dev#6100).
     const initial = new Promise<void>(resolve => {
-      const original = maintainer.checkpoint.bind(maintainer);
-      vi.spyOn(maintainer, "checkpoint").mockImplementation((threshold) => { const result = original(threshold); resolve(); return result; });
+      const original = maintainer.checkpointSettled.bind(maintainer);
+      vi.spyOn(maintainer, "checkpointSettled").mockImplementation(async (threshold) => { const result = await original(threshold); resolve(); return result; });
     });
     await bounded(initial);
     const notified = new Promise<void>(resolve => {
-      const original = SqliteStateStore.prototype.checkpoint.bind(maintainer);
-      vi.mocked(maintainer.checkpoint).mockImplementation((threshold) => { const result = original(threshold); resolve(); return result; });
+      const original = SqliteStateStore.prototype.checkpointSettled.bind(maintainer);
+      vi.mocked(maintainer.checkpointSettled).mockImplementation(async (threshold) => { const result = await original(threshold); resolve(); return result; });
     });
     await writer.put({ key: "external", value: 1, identity });
     await bounded(notified);

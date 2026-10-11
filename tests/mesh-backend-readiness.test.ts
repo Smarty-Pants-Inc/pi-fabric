@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
@@ -487,6 +488,7 @@ for (let i = 0; ; i++) {
         if (Date.now() - started > 10_000) throw new Error("the racer did not start swapping");
         await new Promise(resolve => setTimeout(resolve, 5));
       }
+      let overlapped = 0;
       for (let run = 0; run < 8; run++) {
         const before = swaps();
         const result = spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
@@ -494,9 +496,11 @@ for (let i = 0; ; i++) {
         expect(result.status, result.stderr).toBe(3);
         // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
         expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
-        // The swaps went on during the whole run: its probes ran while swapped files were in place.
-        expect(swaps()).toBeGreaterThan(before);
+        // The swaps went on during the run: its probe ran while swapped files were going in and out.
+        if (swaps() > before) overlapped++;
       }
+      // Under a loaded host a short run may see no published count; at least one run must have overlapped.
+      expect(overlapped).toBeGreaterThan(0);
       expect(await backendOf(root)).toBe("importing");
     } finally {
       racer.kill("SIGKILL");
@@ -593,11 +597,15 @@ for (let i = 0; ; i++) {
     fs.unlinkSync(bundle);
     fs.symlinkSync(path.join(copy, "cli.js"), bundle);
     fs.chmodSync(mesh, 0o770);
+    // Walking down from the root, the writable dist/mesh refuses first; with it fixed, the symlinked bundle does.
+    const writable = cli();
+    expect(writable.status, writable.stderr).toBe(3);
+    expect(writable.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 770)\n`);
+    fs.chmodSync(mesh, 0o700);
     const linked = cli();
     expect(linked.status, linked.stderr).toBe(3);
     expect(linked.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${bundle} is a symlink inside the install root\n`);
     expect(fs.existsSync(marker)).toBe(false);
-    fs.chmodSync(mesh, 0o700);
     fs.unlinkSync(bundle);
     fs.writeFileSync(bundle, real, { mode: 0o600 });
     // (2) dist/mesh itself is an in-root symlink to the real directory.
@@ -606,12 +614,40 @@ for (let i = 0; ; i++) {
     const dir = cli();
     expect(dir.status, dir.stderr).toBe(3);
     expect(dir.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is a symlink inside the install root\n`);
-    // (3) The normal layout passes.
     fs.unlinkSync(mesh);
     fs.renameSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    // (2b) dist/ itself is an in-root symlink to a trusted copy: refused as a symlink, never resolved.
+    const dist = path.join(pkgReal, "dist");
+    fs.renameSync(dist, path.join(pkgReal, "dist-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist-real"), dist);
+    const top = cli();
+    expect(top.status, top.stderr).toBe(3);
+    expect(top.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${dist} is a symlink inside the install root\n`);
+    fs.unlinkSync(dist);
+    fs.renameSync(path.join(pkgReal, "dist-real"), dist);
+    // (3) The normal layout passes.
     const ready = cli();
     expect(ready.status, ready.stderr).toBe(0);
     expect(await backendOf(root)).toBe("sqlite");
+  });
+
+  // pi-fabric#880 review round 5 (CODE P1): launched through a symlinked package-root alias with the symlink-preserving
+  // flags, the bin must still load the CANONICAL bundle it checked, never the alias (which another uid could swap).
+  it.skipIf(binSkip !== "")(`the operator's bin loads the canonical bundle when launched through a package-root alias${binSkip ? ` (skipped: ${binSkip})` : ""}`, () => {
+    const parent = tempDir("alias");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    // The bundle records the URL it was loaded as.
+    const seen = path.join(parent, "loaded-as");
+    fs.writeFileSync(path.join(pkg, "dist/mesh/mesh-backend-cli.js"),
+      `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(seen)}, import.meta.url);\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const alias = path.join(parent, "alias");
+    fs.symlinkSync(pkg, alias);
+    const result = spawnSync(process.execPath, [path.join(alias, "bin/fabric-mesh-backend"), "--help"], { encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, NODE_OPTIONS: "--preserve-symlinks --preserve-symlinks-main" } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.readFileSync(seen, "utf8")).toBe(pathToFileURL(path.join(fs.realpathSync(pkg), "dist/mesh/mesh-backend-cli.js")).href);
   });
 
   it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {

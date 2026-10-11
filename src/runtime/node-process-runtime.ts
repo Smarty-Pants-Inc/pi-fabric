@@ -284,11 +284,11 @@ export class NodeProcessRuntime {
         }
         const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
         if (waitsForHuman) humanWait.enter();
-        const task = runAbortable(hostAbortController.signal, () =>
+        const hostTask = runAbortable(hostAbortController.signal, () =>
           hostCall(message.ref, message.args, hostAbortController.signal),
-        ).finally(() => {
-          if (waitsForHuman) humanWait.leave();
-        }).then(
+        );
+        // Only a human-wait call gets the extra settlement hop (ordinary delivery timing unchanged).
+        const task = (waitsForHuman ? hostTask.finally(() => humanWait.leave()) : hostTask).then(
           (value) => {
             if (settled || finishing || !child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }

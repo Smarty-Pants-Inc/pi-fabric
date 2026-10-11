@@ -68,9 +68,11 @@ export async function openFabricSettings(
   // The lease spans ensure(): a shutdown or replacement that resets approvals
   // while ensure() is pending retires this flow before it touches `context`.
   const lease = await deps.state.ensure(context);
-  if (!lease.current()) return;
+  // Fixtures and embeds whose ensure() returns no lease keep the approval-generation fence.
+  const leaseCurrent = (): boolean => (lease as { current?: () => boolean } | undefined)?.current?.() ?? true;
+  if (!leaseCurrent()) return;
   const generation = deps.state.sessionApprovals?.generation;
-  const live = (): boolean => lease.current() && generation === deps.state.sessionApprovals?.generation;
+  const live = (): boolean => leaseCurrent() && generation === deps.state.sessionApprovals?.generation;
 
   const agentDir = resolveAgentDir();
   const projectTrusted = context.isProjectTrusted();

@@ -1142,15 +1142,15 @@ export class QuickJsRuntime {
           }
           const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
           if (waitsForHuman) humanWait.enter();
-          const task = runAbortable(hostAbortController.signal, () => {
+          const hostTask = runAbortable(hostAbortController.signal, () => {
             // Argument decoding and deadline policy also consume wall time.
             // Recheck immediately before admitting actual host work.
             if (deadlineReached()) { expireDeadline(); throw executionDeadline.reason; }
             return hostCall(reference, args, hostAbortController.signal);
-          })
-            .finally(() => {
-              if (waitsForHuman) humanWait.leave();
-            })
+          });
+          // Only a human-wait call gets the extra settlement hop: ordinary replies keep
+          // their delivery timing relative to the execution gate and receipts.
+          const task = (waitsForHuman ? hostTask.finally(() => humanWait.leave()) : hostTask)
             .then((value) => {
               if (closing || promise.alive === false) return;
               if (deadlineReached()) { expireDeadline(); return; }

@@ -902,7 +902,8 @@ describe("FabricSettingsComponent", () => {
       await openFabricSettings(context, { state, applyFabricMode() {}, capturedTools: { list: () => [] } as unknown as CapturedToolCatalog });
       sessionApprovals.generation++;
       Object.defineProperty(context, "ui", { get() { staleReads++; throw new Error("stale ctx"); } });
-      reject(new Error("old discovery failed"));
+      // Discovery is lazy (upstream): with the picker never opened there is no background work.
+      reject?.(new Error("old discovery failed"));
       await new Promise(resolve => setImmediate(resolve));
       expect(staleReads).toBe(0);
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }

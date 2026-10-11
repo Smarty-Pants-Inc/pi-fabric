@@ -352,9 +352,9 @@ export class CPythonRuntime implements FabricKernelRuntime {
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
         if (executionDeadline.reached) { expireDeadline(); return; }
         if (waitsForHuman) humanWait.enter();
-        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).finally(() => {
-          if (waitsForHuman) humanWait.leave();
-        }).then(
+        const hostTask = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
+        // Only a human-wait call gets the extra settlement hop (ordinary delivery timing unchanged).
+        const task = (waitsForHuman ? hostTask.finally(() => humanWait.leave()) : hostTask).then(
           (value) => send({ type: "response", id, ok: true, value }, () => options.onHostResultDelivered?.(args)),
           (error) => send({ type: "response", id, ok: false, error: errorText(error), ...(isPiShellRef(ref) ? { bashExit: piBashExitMetadata(error) } : {}) }),
         ).finally(() => { hostTasks.delete(task); callIds.delete(id); });

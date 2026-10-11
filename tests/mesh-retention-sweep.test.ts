@@ -60,6 +60,19 @@ describe("mesh-wide age-based run retention", () => {
     expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toHaveLength(3);
   });
 
+  // pi-fabric#850: the live dry run reported 7627 runs as "not terminal or run tree not proven safe". The report now
+  // names the check that refused each run, and the bytes each refusal class holds.
+  it("reports which check refused each expired run, with the bytes it holds", async () => {
+    const mesh = deadRootMesh();
+    write(path.join(mesh.old, "status.json"), JSON.stringify({ status: "completed", finishedAt: NOW - 8 * DAY }));
+    write(path.join(mesh.orphan, "surprise.bin"), "x".repeat(1000));
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    const item = plan.summary.deleters.pruneActorRunArchives!;
+    expect(item.refused).toMatchObject({ "worker exit is unconfirmed: unknown root identity": 1, "unknown entry surprise.bin": 1, "status is running": 1 });
+    expect(item.refusedBytes["unknown entry surprise.bin"]).toBeGreaterThan(1000);
+    expect(summaryLines(true, plan.summary).join("\n")).toMatch(/refused 1 \(0\.000 GiB\): unknown entry surprise\.bin/);
+  });
+
   it("without runRetentionMs removes nothing (compaction-only contract unchanged)", async () => {
     const mesh = deadRootMesh();
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true });
@@ -304,20 +317,37 @@ describe("final pre-delete check fences", () => {
     return other;
   };
 
-  for (const [name, rows] of [
-    ["a cross-root reference", [{ id: "adopter", status: "running", inFlightRun: { id: "old", startedAt: NOW, ageS: 0 } }]],
-    ["no reference (fail closed)", []],
-  ] as const) {
-    it(`keeps a run when a registry root with ${name} is created after discovery`, async () => {
-      const mesh = deadRootMesh();
-      const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, [...rows]));
-      const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-      expect(injected()).toBe(true);
-      expect(applied.removedRuns).not.toContain(mesh.old);
-      expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
-      expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/registry roots changed/) });
-    });
-  }
+  // pi-fabric#850: a registry root created after discovery joins the sweep and is read at the same final check. Its
+  // reference keeps the run; without one the run is still collected (the live fleet always gains a session mid-sweep).
+  it("keeps a run when a registry root with a cross-root reference is created after discovery", async () => {
+    const mesh = deadRootMesh();
+    const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, [{ id: "adopter", status: "running", inFlightRun: { id: "old", startedAt: NOW, ageS: 0 } }]));
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.removedRuns).toContain(mesh.orphan);
+    expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
+    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+  });
+
+  it("still collects an unreferenced run when an unrelated registry root is created after discovery", async () => {
+    const mesh = deadRootMesh();
+    const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, []));
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
+    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+  });
+
+  it("stops every later delete when the registry tree becomes uncertain after discovery", async () => {
+    const mesh = deadRootMesh();
+    const elsewhere = tmp("fabric-linked-registry-");
+    const injected = onStatusRead(mesh.old, () => fs.symlinkSync(elsewhere, path.join(mesh.root, "actors", "01a118ab-linked"), "dir"));
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/uncertain/) });
+  });
 
   // smarty-dev#7916 (ASK 2 condition a): the per-delete check stats only actors/ and its non-registry children. A new
   // registry at actors/<session>/actors.json that references the run stops the --apply delete, whether its session
@@ -342,7 +372,9 @@ describe("final pre-delete check fences", () => {
         expect(injected()).toBe(true);
         expect(applied.removedRuns).not.toContain(mesh.old);
         expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
-        expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/registry roots changed/) });
+        expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+        // The unreferenced expired run of a removed actor is still collected.
+        expect(applied.removedRuns).toContain(mesh.orphan);
       } finally {
         const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
         delete verifiedRemoveTestHooks.beforeOpen;
@@ -357,7 +389,7 @@ describe("final pre-delete check fences", () => {
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(resident);
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
-    expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/registry roots changed/) });
+    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
   });
 
   it("keeps a run another registry references during the size scan", async () => {

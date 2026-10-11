@@ -46,7 +46,7 @@ describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (sm
     let started = performance.now();
     const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     const dryMs = performance.now() - started;
-    expect(plan.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1 });
+    expect(plan.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1, rootRewalks: 0 });
     expect(plan.removedRuns).toHaveLength(REGISTRIES);
     expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(REGISTRIES);
     expect(plan.summary.deleters.pruneActorSessionBackups?.removed).toBe(REGISTRIES);
@@ -54,7 +54,7 @@ describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (sm
     const applied = await sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
     const applyMs = performance.now() - started;
     expect(applied.skipped).toEqual([]);
-    expect(applied.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1 });
+    expect(applied.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1, rootRewalks: 0 });
     expect(applied.removedRuns.sort()).toEqual(plan.removedRuns.sort());
     console.log(JSON.stringify({ registries: REGISTRIES, runs: REGISTRIES * 3, dryRunMs: Math.round(dryMs), applyMs: Math.round(applyMs),
       summary: summaryLines(true, plan.summary).slice(-2) }));

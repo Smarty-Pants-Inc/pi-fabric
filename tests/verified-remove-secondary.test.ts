@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { pruneResidentChildLogs, pruneWedgeEvidence } from "../src/residency/launcher.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
@@ -104,6 +104,18 @@ describe.skipIf(process.platform !== "linux")("secondary deleters remove only th
       store.prune(1000);
       probe.expectNothingDeleted();
     });
+    // pi-fabric#850 round 1 SEC P1 (2): the age comes from the same stat as the removal. A second stat that meets a
+    // swapped-in old inode (put back before the removal) must not make a fresh group look expired.
+    it("keeps a fresh group when a second stat would meet a swapped-in old inode", () => {
+      const { store, file } = completions();
+      fs.utimesSync(file, new Date(), new Date());
+      const stat = fs.statSync;
+      const oldStat = Object.assign(Object.create(Object.getPrototypeOf(fs.statSync(file))), fs.statSync(file), { mtimeMs: old.getTime() });
+      const spy = vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) =>
+        target === file ? oldStat : (stat as (...args: unknown[]) => unknown)(target, ...rest)) as typeof fs.statSync);
+      try { store.prune(1000); } finally { spy.mockRestore(); }
+      expect(fs.readFileSync(file, "utf8")).toBe("receipt");
+    });
   });
 
   describe("pruneWedgeEvidence", () => {
@@ -142,6 +154,29 @@ describe.skipIf(process.platform !== "linux")("secondary deleters remove only th
       sweep();
       for (const kind of ["responses", "decisions", "acknowledgements"]) expect(fs.existsSync(file(kind))).toBe(false);
     });
+    // pi-fabric#850 round 1 SEC P1 (1): an expired acknowledgement is read and judged; a same-uid writer then replaces it
+    // with a newer valid one before the removal. The newer acknowledgement, and everything else, stays.
+    it("keeps a newer acknowledgement swapped in after the expired one was judged", () => {
+      const { file, sweep } = requests();
+      const ackPath = file("acknowledgements");
+      const newer = { ...JSON.parse(fs.readFileSync(ackPath, "utf8")), acknowledgedAt: Date.now() };
+      const read = fs.readFileSync;
+      let swapped = false;
+      const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        const result = (read as (...args: unknown[]) => unknown)(target, ...rest);
+        if (!swapped && target === ackPath) {
+          swapped = true;
+          fs.writeFileSync(`${ackPath}.new`, JSON.stringify(newer), { mode: 0o600 });
+          fs.renameSync(`${ackPath}.new`, ackPath);
+        }
+        return result;
+      }) as typeof fs.readFileSync);
+      try { sweep(); } finally { spy.mockRestore(); }
+      expect(swapped).toBe(true);
+      expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(newer);
+      for (const kind of ["responses", "decisions"]) expect(fs.existsSync(file(kind))).toBe(true);
+    });
+
     it.each(SWAPS)("deletes nothing after a %s swap of the response, and stops there", (swap) => {
       const { file, sweep } = requests();
       const probe = arm(file("responses"), swap);

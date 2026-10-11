@@ -215,6 +215,54 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(shape(path.join(outside, "original"))).toMatchObject({ "reply.json": '{"text":"done"}' });
   });
 
+  // pi-fabric#850 round 1 P1: the name-based unlink is bound because no other uid can change any entry in the tree.
+  it.each([["the target", ""], ["a nested directory", "nested"]])("refuses a tree where %s is writable by group or others, and deletes nothing", async (_name, sub) => {
+    const { verifiedRemove } = await import("../src/storage/verified-remove.js");
+    const target = run(path.join(tmp("fabric-vr-open-"), "old"));
+    const open = path.join(target, sub);
+    if (sub) fs.mkdirSync(open);
+    fs.chmodSync(open, 0o777);
+    const before = shape(target);
+    const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test" });
+    expect(result).toMatchObject({ removed: false, reason: expect.stringMatching(/writable by group or others/) });
+    expect(shape(target)).toEqual(before);
+  });
+
+  it("removes only from inside a private graveyard that no other uid can traverse", async () => {
+    const { verifiedRemove } = await import("../src/storage/verified-remove.js");
+    const parent = tmp("fabric-vr-private-");
+    const target = run(path.join(parent, "old"));
+    let seen: { mode: number; uid: number; entries: string[] } | undefined;
+    const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", proceed: () => {
+      const grave = fs.readdirSync(parent).find(name => name.startsWith(".retention-graveyard-"))!;
+      const stat = fs.lstatSync(path.join(parent, grave));
+      seen = { mode: stat.mode & 0o777, uid: stat.uid, entries: fs.readdirSync(path.join(parent, grave)) };
+      return true;
+    } });
+    expect(result).toMatchObject({ removed: true });
+    expect(seen).toMatchObject({ mode: 0o700, uid: process.geteuid!(), entries: [expect.stringMatching(/^old\.[0-9a-f-]{36}$/)] });
+    expect(fs.readdirSync(parent)).toEqual([]);
+  });
+
+  // pi-fabric#850 round 1 P2: off Linux, main's removal is counted like the verified path.
+  it("off Linux, a dry run counts main's removal with its bytes and changes nothing", async () => {
+    const { verifiedRemove, startRemovalTally, stopRemovalTally } = await import("../src/storage/verified-remove.js");
+    const target = run(path.join(tmp("fabric-vr-darwin-"), "old"));
+    const before = shape(target);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    const tally = startRemovalTally();
+    let fallbackRan = false;
+    try {
+      const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", dryRun: true, fallback: () => (fallbackRan = true) });
+      expect(result).toMatchObject({ removed: true, bytes: expect.any(Number) });
+      expect((result as { bytes: number }).bytes).toBeGreaterThan(LOG.length);
+      expect(tally.test).toMatchObject({ removed: 1, bytes: (result as { bytes: number }).bytes });
+    } finally { stopRemovalTally(); Object.defineProperty(process, "platform", platform); }
+    expect(fallbackRan).toBe(false);
+    expect(shape(target)).toEqual(before);
+  });
+
   it("a dry run verifies the whole tree and reports its bytes, and changes nothing", async () => {
     const { verifiedRemove } = await import("../src/storage/verified-remove.js");
     const target = run(path.join(tmp("fabric-vr-dry-"), "old"));

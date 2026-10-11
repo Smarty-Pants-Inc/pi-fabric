@@ -121,10 +121,11 @@ export interface MeshRetentionSummary {
   /** Why --apply would refuse now (hold, epoch, state.json doubt, platform), or undefined. */
   applyRefusal?: string;
   /** Actor registries read by this sweep: count, total parses, the most parses of one registry (1 unless it changed). */
-  registries: { count: number; parses: number; maxParsesPerRegistry: number };
+  registries: { count: number; parses: number; maxParsesPerRegistry: number; rootRewalks: number };
 }
-// The last sweep's registry parse counts, for its summary (the sweep has many early returns).
+// The last sweep's registry parse counts and root re-walks, for its summary (the sweep has many early returns).
 let registryParses: ReadonlyMap<string, number> = new Map();
+let registryRewalks = 0;
 export const sweepMeshRetention = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number;
   /** Remove terminal actor runs older than this, mesh-wide (the actor archive TTL). Unset: compaction only. */
@@ -133,12 +134,13 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   residentRunRetentionMs?: number;
 } = {}) => {
   const tally = startRemovalTally();
-  registryParses = new Map();
+  registryParses = new Map(); registryRewalks = 0;
   try {
     const result = await sweep(meshRoot, options);
     const parses = [...registryParses.values()];
     const summary: MeshRetentionSummary = { deleters: tally, registries: {
-      count: parses.length, parses: parses.reduce((sum, count) => sum + count, 0), maxParsesPerRegistry: Math.max(0, ...parses) } };
+      count: parses.length, parses: parses.reduce((sum, count) => sum + count, 0), maxParsesPerRegistry: Math.max(0, ...parses),
+      rootRewalks: registryRewalks } };
     if (ownedStat(meshRoot)?.isDirectory()) { const refusal = applyRefusal(meshRoot); if (refusal !== undefined) summary.applyRefusal = refusal; }
     return { ...result, summary };
   } finally { stopRemovalTally(); }
@@ -151,10 +153,13 @@ export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): st
     bytes += item.bytes;
     const refused = Object.values(item.refused).reduce((sum, count) => sum + count, 0);
     lines.push(`${name}: ${dryRun ? "would delete" : "deleted"} ${item.removed} (${item.bytes} bytes), refused ${refused}`);
-    for (const [reason, count] of Object.entries(item.refused)) lines.push(`  refused ${count}: ${reason}`);
+    for (const [reason, count] of Object.entries(item.refused)) {
+      const held = item.refusedBytes[reason];
+      lines.push(`  refused ${count}${held ? ` (${(held / 1024 ** 3).toFixed(3)} GiB)` : ""}: ${reason}`);
+    }
   }
   if (summary.applyRefusal) lines.push(`--apply would refuse now: ${summary.applyRefusal}`);
-  lines.push(`registries: ${summary.registries.count} read, ${summary.registries.parses} parses (at most ${summary.registries.maxParsesPerRegistry} per registry)`);
+  lines.push(`registries: ${summary.registries.count} read, ${summary.registries.parses} parses (at most ${summary.registries.maxParsesPerRegistry} per registry), roots re-walked ${summary.registries.rootRewalks} times`);
   lines.push(`${dryRun ? "WOULD_FREE_GIB" : "FREED_GIB"}=${(bytes / 1024 ** 3).toFixed(3)}`);
   return lines;
 };
@@ -196,8 +201,6 @@ const sweep = async (meshRoot: string, options: {
   // pi-fabric#645 review round 4: every final pre-delete check re-discovers the registry roots. A root
   // created (or removed) since discovery may hold a cross-root reference the reread of `registries`
   // cannot see: every later delete fails closed and the sweep reports it. Sticky once changed.
-  const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
-  const discovered = rootSet(registries);
   // ponytail: the per-delete check relies on one invariant: an actor registry lives only at actors/actors.json (the
   // project registry) or actors/<session>/actors.json (a session registry). Enforced where every registry is created:
   // fabric-runtime-state.ts `actorRoots` ({ project: <mesh>/actors, session: <mesh>/actors/<session id> }) feeds
@@ -205,7 +208,11 @@ const sweep = async (meshRoot: string, options: {
   // actors/ or an actors.json appearing in actors/ or in one of its directories that had none. The check lists actors/
   // (one readdir) and probes actors.json in those directories (one lstat each); it never stats the ~10k actor homes
   // below, which cost minutes per sweep on Ryzen 1 (smarty-dev#7916). Names, not mtimes: within one coarse clock tick
-  // a directory's mtime need not change. A changed listing re-walks the whole tree, as before (pi-fabric#645 round 4).
+  // a directory's mtime need not change. A change re-walks the whole tree (pi-fabric#645 round 4) and, since
+  // pi-fabric#850, replaces the registry list in place: a new root joins and refs.fresh() parses it in the same final
+  // check, so a reference it holds keeps the run; a vanished root leaves (its actors and their runs went with it).
+  // The live dry run on Ryzen 1 (05:39Z) showed why: a new Main session appears within any 2-minute sweep, and the
+  // former sticky stop refused every later candidate (0 bytes freed). Only an uncertain walk still stops the sweep.
   const names = (): string => { try { return fs.readdirSync(actorsRoot).sort().join("\0"); } catch { return "\0unreadable"; } };
   const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
     .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
@@ -214,21 +221,20 @@ const sweep = async (meshRoot: string, options: {
   let rootsChanged = false;
   const registryRootsChanged = (): boolean => {
     if (rootsChanged) return true;
-    let changed = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined);
-    if (!changed && names() !== listing) {
-      // A name came or went: re-walk, and accept it only when the registry roots are exactly the discovered ones.
-      // The listing is taken before the walk: a name added during it differs again at the next check.
-      const before = names();
-      let current: string | undefined;
-      try { const found: string[] = []; discover(actorsRoot, 0, found); current = rootSet(found); } catch { /* uncertain: changed */ }
-      if (current !== discovered) changed = true;
-      else { listing = before; watch = unregistered(); }
-    }
-    if (changed) {
+    const appeared = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined);
+    if (!appeared && names() === listing) return false;
+    // The listing is taken before the walk: a name added during it differs again at the next check.
+    const before = names();
+    const found: string[] = [];
+    try { discover(actorsRoot, 0, found); }
+    catch {
       rootsChanged = true;
-      skipped.push({ path: actorsRoot, reason: "actor registry roots changed during the sweep; no further run is deleted" });
+      skipped.push({ path: actorsRoot, reason: "actor registry roots are uncertain; no further run is deleted" });
+      return true;
     }
-    return rootsChanged;
+    registries.splice(0, registries.length, ...found);
+    listing = before; watch = unregistered(); registryRewalks++;
+    return false;
   };
   // The dead host's flock fence on one residency root: claimed, re-proven and released around
   // that root's own work only (smarty-dev#7766). Holding every idle root's host.lock for the
@@ -293,9 +299,11 @@ const sweep = async (meshRoot: string, options: {
     registryParses = refs.parses;
     const retained = refs.snapshot();
     if (retained.has("*")) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [...skipped, { path: meshRoot, reason: "unknown actor run references" }] };
+    // Roots first: a root that appeared is in the list before refs.fresh() reads every registry.
     const referencedNow = (id: string): boolean => {
+      if (registryRootsChanged()) return true;
       const current = refs.fresh();
-      return current.has("*") || current.has(id) || registryRootsChanged();
+      return current.has("*") || current.has(id);
     };
     const registryRows = (registryRoot: string): Record<string, any>[] => {
       const rows = refs.actors(registryRoot);
@@ -329,7 +337,8 @@ const sweep = async (meshRoot: string, options: {
       } else compactRuns(path.join(root, "runs"), veto);
     });
     // With runRetentionMs the mesh-wide pass below covers these actors (and every other one).
-    for (const registryRoot of residents.size && options.runRetentionMs === undefined ? registries : []) {
+    // Copies: registryRootsChanged replaces the list's contents during the sweep.
+    for (const registryRoot of residents.size && options.runRetentionMs === undefined ? [...registries] : []) {
       // One resident root at a time, under that root's own brief fence (smarty-dev#7766).
       const prune = (rootId: string, veto: () => boolean) => {
         // Match ActorRegistryStore/retainedActorRunIds: owned registries contain
@@ -367,7 +376,7 @@ const sweep = async (meshRoot: string, options: {
       // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
       // Early skips judge from the sweep's snapshot; the final pre-delete check is referencedNow (smarty-dev#7916).
       const referenced = (id: string): boolean => { const ids = refs.snapshot(); return ids.has("*") || ids.has(id); };
-      for (const registryRoot of registries) {
+      for (const registryRoot of [...registries]) {
         try {
           const rows = new Map<string, Record<string, any>>();
           for (const actor of registryRows(registryRoot)) if (actor && typeof actor.id === "string") rows.set(actor.id, actor);

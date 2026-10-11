@@ -20,29 +20,39 @@ import { randomUUID } from "node:crypto";
  * pin as mesh/fence-lock.ts). Where that is unavailable (not Linux: macOS, Windows), a deleter that main already ran
  * in-process passes its unchanged main-branch removal as `fallback`, so nothing regresses there; without a fallback
  * nothing is deleted. The verified path off Linux is carried by smarty-dev#7858.
- * Residual: unlink and rmdir take a name, so a same-uid process that finds the random graveyard name and swaps an
- * entry inside our private graveyard between step 5's check and its unlink can make us remove its own file. That
- * file is already its own; no other user's file and nothing outside the graveyard can be reached.
+ * Every directory in the tree must be ours and closed (no group/other write), checked at the walk and again at each
+ * removal step: no other uid can then change any entry, by path (the 0700 graveyard blocks it) or through a
+ * descriptor opened earlier (write permission follows the current mode, which only the owner or root can change).
+ * Residual: unlink and rmdir take a name, so only our own uid (which owns every entry already) or root can swap an
+ * entry between a check and its unlink. No other user's file and nothing outside the graveyard can be reached.
  */
 
 export type VerifiedRemoveResult = { removed: true; bytes: number } | { removed: false; reason: string; graveyard?: string };
 
 /** Per-deleter counts for the retention CLI's report: removed (or, in a dry run, would be), bytes, refusals by reason.
  * ponytail: a module-level tally the one-shot CLI turns on; in-process sweeps leave it off and pay nothing. */
-export interface DeleterTally { removed: number; bytes: number; refused: Record<string, number>; examples: Record<string, string[]> }
+export interface DeleterTally {
+  removed: number; bytes: number; refused: Record<string, number>;
+  /** Bytes held by refused targets, by reason, where the deleter measured them. */
+  refusedBytes: Record<string, number>;
+  examples: Record<string, string[]>;
+}
 let tally: Record<string, DeleterTally> | undefined;
 export const startRemovalTally = (): Record<string, DeleterTally> => (tally = {});
 export const stopRemovalTally = (): void => { tally = undefined; };
-const entry = (deleter: string): DeleterTally => (tally![deleter] ??= { removed: 0, bytes: 0, refused: {}, examples: {} });
+/** Whether a report is being collected: deleters compute detailed refusal reasons and sizes only then. */
+export const removalTallyOn = (): boolean => tally !== undefined;
+const entry = (deleter: string): DeleterTally => (tally![deleter] ??= { removed: 0, bytes: 0, refused: {}, refusedBytes: {}, examples: {} });
 export const countRemoval = (deleter: string, bytes: number): void => {
   if (!tally) return;
   const item = entry(deleter); item.removed++; item.bytes += bytes;
 };
 /** A refusal (by the deleter's own judgment or by this helper). `reason` is a fixed category; up to 3 example paths. */
-export const countRefusal = (deleter: string, reason: string, target?: string): void => {
+export const countRefusal = (deleter: string, reason: string, target?: string, bytes = 0): void => {
   if (!tally) return;
   const item = entry(deleter);
   item.refused[reason] = (item.refused[reason] ?? 0) + 1;
+  if (bytes) item.refusedBytes[reason] = (item.refusedBytes[reason] ?? 0) + bytes;
   if (target !== undefined) { const examples = item.examples[reason] ??= []; if (examples.length < 3) examples.push(target); }
 };
 
@@ -68,6 +78,11 @@ const fdStat = (file: string, directory: boolean): fs.Stats => {
   try { return fs.fstatSync(fd); } finally { fs.closeSync(fd); }
 };
 const same = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino === b.ino;
+/** No other uid can change a directory's entries: ours (checked by callers) and not group/other-writable. Write
+ * permission is checked against the CURRENT mode at each create/unlink/rename, also through a descriptor opened
+ * earlier, and only the owner or root can change the mode. A POSIX ACL that grants another user write shows as the
+ * group write bit (the ACL mask), so it is refused too. (pi-fabric#850 round 1 P1.) */
+const closed = (stat: fs.Stats): boolean => (stat.mode & 0o022) === 0;
 const kind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
 /** The judged inode, ours, same type, same mtime. `moved`: after the rename only dev/ino/uid/type are compared. */
 const verify = (file: string, judged: fs.Stats, uid: number, moved = false): void => {
@@ -77,6 +92,7 @@ const verify = (file: string, judged: fs.Stats, uid: number, moved = false): voi
   if (!same(stat, judged)) refuse("target inode was replaced since judgment");
   if (kind(stat) !== kind(judged)) refuse("type changed since judgment");
   if (!moved && stat.mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
+  if (stat.isDirectory() && !closed(stat)) refuse("a directory in the tree is writable by group or others");
 };
 const open = (file: string): number => {
   try { return fs.openSync(file, O_PATH | NOFOLLOW | DIRECTORY); }
@@ -92,15 +108,24 @@ const verifyTree = (fd: number, uid: number, depth: number): number => {
     if (!stat.isDirectory()) { bytes += stat.isFile() ? stat.size : 0; continue; }
     const child = open(at(fd, name));
     try {
-      if (!same(fs.fstatSync(child), stat)) refuse("an entry in the tree changed during the walk");
+      const opened = fs.fstatSync(child);
+      if (!same(opened, stat)) refuse("an entry in the tree changed during the walk");
+      if (!closed(opened)) refuse("a directory in the tree is writable by group or others");
       bytes += verifyTree(child, uid, depth + 1);
     } finally { fs.closeSync(child); }
   }
   return bytes;
 };
-/** Remove `name` below `parent`, each entry verified again; unlink and rmdir never follow a link. */
+/** Remove `name` below `parent`, each entry verified again; unlink and rmdir never follow a link.
+ * Binding (pi-fabric#850 round 1 P1): `parent` is an fd on a directory proven ours and closed (no group/other write)
+ * when it was opened, and checked again here, so between this lstat and the unlink no other uid can create, replace
+ * or rename an entry in it, even through a descriptor opened before the move (write permission is checked against
+ * the current mode). The whole tree also sits below our 0700 graveyard, so no other uid can reach it by path. The
+ * name-based unlink is therefore exposed only to our own uid (which already owns every entry) and root. */
 const removeTree = (parent: number, name: string, uid: number, depth: number): void => {
   if (depth > MAX_DEPTH) refuse("tree is too deep");
+  const held = fs.fstatSync(parent);
+  if (held.uid !== uid || !closed(held)) refuse("a directory in the tree is writable by group or others");
   const stat = fs.lstatSync(at(parent, name));
   if (stat.uid !== uid) refuse("an entry in the tree is not owned by this user");
   if (!stat.isDirectory()) { fs.unlinkSync(at(parent, name)); return; }
@@ -110,6 +135,16 @@ const removeTree = (parent: number, name: string, uid: number, depth: number): v
     for (const child of fs.readdirSync(at(fd))) removeTree(fd, child, uid, depth + 1);
   } finally { fs.closeSync(fd); }
   fs.rmdirSync(at(parent, name));
+};
+
+/** Regular-file bytes below a path, by lstat (no link followed); for the off-Linux report only. */
+const pathBytes = (file: string, depth = 0): number => {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isDirectory()) return stat.isFile() ? stat.size : 0;
+    if (depth >= MAX_DEPTH) return 0;
+    return fs.readdirSync(file).reduce((sum, name) => sum + pathBytes(path.join(file, name), depth + 1), 0);
+  } catch { return 0; }
 };
 
 export const verifiedRemove = (target: string, judged: fs.Stats | undefined, options: {
@@ -130,10 +165,14 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
   if (process.platform !== "linux" && options.fallback) {
-    if (options.dryRun) return { removed: true, bytes: options.freed ?? (judged?.isFile() ? judged.size : 0) };
+    // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2).
+    const bytes = options.freed ?? pathBytes(target);
+    if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
     let removed = false;
     try { removed = options.fallback(); } catch { /* main's best effort */ }
-    return removed ? { removed: true, bytes: 0 } : no("removal failed (main's path on this platform)");
+    if (!removed) return no("removal failed (main's path on this platform)");
+    countRemoval(deleter, bytes);
+    return { removed: true, bytes };
   }
   if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
     return no("file ownership cannot be proven on this platform (no getuid); nothing is deleted");

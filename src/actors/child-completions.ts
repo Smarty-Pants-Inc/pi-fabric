@@ -346,8 +346,12 @@ export class ActorChildCompletionStore {
         if (!id || keepIds.has(id)) continue;
         const file = path.join(this.directory, name);
         const group = groups.get(id) ?? { files: [], newest: 0 };
-        group.files.push({ file, stat: ownedStat(file) });
-        group.newest = Math.max(group.newest, fs.statSync(file).mtimeMs);
+        // One stat for both the age and the removal (pi-fabric#850 round 1 SEC P1): a second stat could describe a
+        // swapped-in older inode and make a fresh group look expired. Without an owned stat (a link, hard-linked or
+        // not ours) Linux removes nothing; off Linux main's age stat and removal stay (smarty-dev#7858).
+        const stat = ownedStat(file);
+        group.files.push({ file, stat });
+        group.newest = Math.max(group.newest, stat?.mtimeMs ?? (process.platform === "linux" ? Infinity : fs.statSync(file).mtimeMs));
         groups.set(id, group);
       }
     } catch { return; }

@@ -3,7 +3,7 @@ import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
-import { countRefusal, verifiedRemove } from "./verified-remove.js";
+import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
@@ -398,6 +398,26 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
+/** Why safeRunTree refused a run, as a fixed category for the retention report (ids and paths removed). Report only:
+ * it repeats the checks in safeRunTree's order and is not a deletion authority. */
+const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
+  const exit = runTreeExitVeto(root, 0, noDeadline, true, acceptPidReuse);
+  if (exit) return exit.replace(/ \([^)]*\)$/, "");
+  const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId) ? Number(record.sessionId) : undefined;
+  if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return "saved worker PID is live";
+  try {
+    if (!safeTerminalArtifacts(root, noDeadline)) return "terminal answer, notices or controls not proven consumed";
+    for (const name of fs.readdirSync(root)) {
+      const stat = ownedStat(path.join(root, name));
+      if (!stat) return "an entry is a link, hard-linked or not ours";
+      const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
+        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+      if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
+    }
+  } catch { return "run tree unreadable"; }
+  return "follow-ups, deliveries, handoff or nested run not proven safe";
+};
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
@@ -615,13 +635,13 @@ export const registryReferences = (actorRoots: readonly string[], options: { req
   const cache = new Map<string, { stamp: string; ids: string[]; actors: Record<string, any>[] }>();
   const parses = new Map<string, number>();
   let last = new Set<string>();
-  const files = actorRoots.map(root => path.join(root, "actors.json"));
+  // `actorRoots` is read on every call: the mesh sweep replaces its contents when registry roots come or go.
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const fresh = (): Set<string> => {
     const refs = new Set<string>();
     try {
-      for (const [index, root] of actorRoots.entries()) {
-        const file = files[index]!;
+      for (const root of actorRoots) {
+        const file = path.join(root, "actors.json");
         // The per-delete cost: one lstat of actors.json while it is unchanged. The full checks run on a change.
         const cached = cache.get(root);
         const quick = cached && fs.lstatSync(file, { throwIfNoEntry: false });
@@ -878,12 +898,16 @@ export const pruneActorRunArchives = (options: {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const directory = path.join(options.runsDirectory, entry.name);
-    if (entry.name === options.latestRunId || options.isRetained?.(entry.name)) { countRefusal("pruneActorRunArchives", "latest or referenced run", directory); continue; }
+    // Reported refusals carry their size (the CLI's report only; in-process sweeps measure nothing).
+    const refuse = (reason: string) => countRefusal("pruneActorRunArchives", reason, directory, removalTallyOn() ? options.measure?.(directory) ?? 0 : 0);
+    if (entry.name === options.latestRunId || options.isRetained?.(entry.name)) { refuse("latest or referenced run"); continue; }
     // The judged stat, before the judgment reads anything; the removal requires it unchanged.
     const judged = ownedStat(directory);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) {
-      countRefusal("pruneActorRunArchives", "not terminal or run tree not proven safe", directory); continue;
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status)) { refuse(`status is ${record ? String(record.status) : "unreadable"}`); continue; }
+    if (!safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) {
+      if (removalTallyOn()) refuse(runTreeRefusal(directory, options.acceptPidReuse === true));
+      continue;
     }
     if (now - recordAgeReference(record, judged?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, {
@@ -897,7 +921,7 @@ export const pruneActorRunArchives = (options: {
     }
     const bytes = options.measure?.(directory) ?? 0;
     const isRetained = options.isRetained;
-    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives")) continue;
+    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes)) continue;
     removed.push(directory);
     options.onRemove?.(directory, bytes);
   }
@@ -917,9 +941,10 @@ export const pruneActorRunArchives = (options: {
  * next sweep treats it as an ordinary run entry. */
 export const removeUnreferencedRun = (
   directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
+  bytes = 0,
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
-  if (check()) { countRefusal(deleter, "referenced at the final check", directory); return false; }
+  if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
 };

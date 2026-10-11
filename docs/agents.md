@@ -451,6 +451,8 @@ Extension-enabled Pi children inherit the parent’s full-code mode, including o
 
 `agents.spawn()` and `agents.create()` accept `residency: "session" | "durable"`. The default is `session`. It keeps the usual lifecycle: the current Pi host owns the participant and stops or suspends it when the host shuts down. The model chooses `durable` during execution. Users do not configure it as a setting.
 
+A session actor is suspended, not stopped, when its Main reloads or exits. If the Main stays gone past the restart grace (120 s, with proof that its process died), a peer Main or its resident host retires the actor in its registry: it is `stopped` with `stopReason: "host-exit"` and a `sessionOrphan` marker. When the same session starts again (`pi --session <id>`, a herdr relaunch, or a resume), Fabric restarts every such actor in that session. Each keeps its id, instructions, filters, topics and mailbox. It resumes from the session's saved mesh cursor, so a long downtime replays only the last few minutes. Fabric never restarts a stopped actor whose `stopReason` is `explicit` (`agents.stop` or `agents.remove`) or `directive` (the actor stopped itself). It also never restarts an older stopped row that has no reason or root-gone marker. The owning Main removes a stopped actor of its own with `agents.remove({ id })` (smarty-dev#9241).
+
 ```ts
 const audit = await agents.spawn({
   name: "integration-audit",

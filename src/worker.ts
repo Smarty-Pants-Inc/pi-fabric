@@ -223,6 +223,16 @@ const numberField = (value: unknown): number => (typeof value === "number" ? val
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
+/** smarty-dev#3238 round 3: why a silently overflowed answer ("stop"/"length" over the window) is withheld. */
+const silentOverflowError = (message: Record<string, unknown>, contextWindow: number): string => {
+  const usage = typeof message.usage === "object" && message.usage !== null && !Array.isArray(message.usage)
+    ? message.usage as Record<string, unknown> : {};
+  const count = (value: unknown): number => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const input = count(usage.input) + count(usage.cacheRead);
+  return `Context overflow: the provider ended the turn with stopReason "${String(message.stopReason)}" with ${input} input tokens ` +
+    `against a ${contextWindow}-token window; its answer is unchecked and was not delivered`;
+};
+
 const assistantError = (message: Record<string, unknown>): string => {
   const details: string[] = [];
   const direct = stringField(message.errorMessage) ?? stringField(message.error);
@@ -1782,19 +1792,27 @@ const main = async (): Promise<void> => {
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
       }
-      hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
-        messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
+      // smarty-dev#3238 round 3: the run's latest model turn, judged by Pi's own classifier whatever
+      // its stopReason. A provider that answers "stop" (or "length") with usage above the window has
+      // overflowed silently (pi-ai isContextOverflow case 2/3): Pi keeps that answer without
+      // retrying, so it is unchecked. Such a turn fails like an error turn and is never final. A
+      // later turn that fits (Pi's own recovery) supersedes it, as it supersedes an error turn.
+      const overflowTurn = Boolean(options.actorId && piContextOverflow &&
+        piContextOverflow(messageRecord, childContextWindow ?? 0));
+      if (options.actorId) contextOverflowSignal = overflowTurn;
+      const failedTurn = messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted" || overflowTurn;
+      hasFinalText = Boolean(text) && !failedTurn && messageRecord.stopReason !== "toolUse";
       producedFinalAnswer ||= hasFinalText;
       if (text) {
         record.text = latestRunText(text);
-        if (messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+        if (failedTurn) {
           record.partialText = record.text;
         } else {
           record.lastCompleteText = record.text;
         }
         process.stdout.write(`\n${text}\n`);
       }
-      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+      if (!failedTurn) {
         delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
@@ -1804,22 +1822,21 @@ const main = async (): Promise<void> => {
       if (options.actorId && childContextWindow && contextTokens > 0) {
         record.contextUsage = { tokens: contextTokens, contextWindow: childContextWindow };
       }
-      // smarty-dev#3238 round 2: the run's latest model turn, judged by Pi's own classifier. A
-      // provider overflow that Pi's recovery later fixes is superseded by the next assistant turn.
-      if (piContextOverflow && (messageRecord.stopReason === "error" || messageRecord.stopReason === "length")) {
-        contextOverflowSignal = piContextOverflow(messageRecord, childContextWindow ?? 0);
-      } else if (options.actorId) contextOverflowSignal = false;
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
       }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
-      if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {
+      if (failedTurn && !terminalStatus) {
         sawAgentError = true;
         providerAborted ||= messageRecord.stopReason === "aborted";
-        terminalError = assistantError(messageRecord);
-        recoveryWatchdog.arm(terminalError);
+        const silentOverflow = overflowTurn && messageRecord.stopReason !== "error";
+        terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
+        // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
+        // recovery is pending; any other failed turn may still be recovered by Pi.
+        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();
         sawAgentError = false;

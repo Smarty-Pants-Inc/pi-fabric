@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager, ACTOR_ACTIVATION_OVERFLOW_KIND, actorEventRef } from "../src/actors/manager.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
@@ -55,11 +56,22 @@ const setup = () => {
     ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Prompt) : [];
   const overflowEvents = () => mesh.read({ topic: "fabric.actor.output" }).filter((event) => event.kind === ACTOR_ACTIVATION_OVERFLOW_KIND);
   const ownerAlarms = () => mesh.read({ topic: "ops.owner" }).filter((event) => event.kind === "actor.alarm");
+  // The fixture's side-effecting tool executions (TOOL_THEN_OVERFLOW_ON_HISTORY), one line each.
+  const toolRuns = (): unknown[] => fs.existsSync(`${log}.tools`)
+    ? fs.readFileSync(`${log}.tools`, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as unknown) : [];
+  // Every worker result the actor manager received, in order.
+  const results: AgentRunResult[] = [];
+  const run = agents.run.bind(agents);
+  const recordResults = () => vi.spyOn(agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+    const result = await run(...args);
+    results.push(result);
+    return result;
+  });
   const create = (name: string, extra: Record<string, unknown> = {}) => actors.create({
     name, instructions: "Review the event.", model: "test/overflow", tools: [], extensions: false,
     transport: "process", residency: "durable", delivery: "mailbox", ...extra,
   });
-  return { dir, agents, mesh, actors, alarms, prompts, overflowEvents, ownerAlarms, create, makeActors };
+  return { dir, agents, mesh, actors, alarms, prompts, overflowEvents, ownerAlarms, create, makeActors, toolRuns, results, recordResults };
 };
 
 const header = (file: string): string => JSON.parse(fs.readFileSync(file, "utf8").split("\n", 1)[0]!).id as string;
@@ -197,7 +209,12 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     const actor = await s.create("provider");
     await s.actors.ask(actor.id, "FIRST_REVIEW");
     const carried = header(actor.sessionFile!);
+    s.recordResults();
     await expect(s.actors.ask(actor.id, "PROVIDER_OVERFLOW_ON_HISTORY")).resolves.toMatchObject({ text: "verdict: ok" });
+    // Round 3: the overflowed run executed no tool call, so replaying the event is safe.
+    expect(s.results.map(({ status, errorCode, toolCalls }) => ({ status, errorCode, toolCalls }))).toEqual([
+      { status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 }, { status: "completed", errorCode: undefined, toolCalls: 0 },
+    ]);
     expect(s.prompts()).toEqual([
       { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
       { history: true, overflow: true, session: carried, marker: "PROVIDER_OVERFLOW_ON_HISTORY" },
@@ -205,6 +222,58 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     ]);
     expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
     expect(s.overflowEvents()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  // Round 3 (PR #853 review, P1 src/worker.ts): a provider "stop" with usage over the window is a
+  // silent overflow (pi-ai isContextOverflow); Pi keeps that answer, so the worker must fail closed.
+  it("fails closed on a stop answer whose usage exceeds the window: CONTEXT_OVERFLOW, nothing delivered", async () => {
+    const s = setup();
+    s.recordResults();
+    const actor = await s.create("silent");
+    await expect(s.actors.ask(actor.id, "SILENT_OVERFLOW", { pr: 41 }))
+      .rejects.toThrow(/Context overflow: the provider ended the turn with stopReason "stop" with 280000 input tokens against a 272000-token window/);
+    expect(s.results).toEqual([expect.objectContaining({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 })]);
+    // A fresh session ran the event exactly once: no retry loop.
+    expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([{ history: false, marker: "SILENT_OVERFLOW" }]);
+    // The unchecked answer reached no one: no actor output and no mesh output carries it.
+    expect(s.actors.messages(actor.id, 50).some((message) => message.text?.includes("verdict: ok"))).toBe(false);
+    expect(s.mesh.read({ topic: "fabric.actor.output" }).some((event) => event.text?.includes("verdict: ok"))).toBe(false);
+    expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({
+      reason: "no verdict (context overflow)", eventRef: expect.objectContaining({ pr: 41 }) }) })]);
+    expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
+    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "context-overflow", count: 1 });
+  }, TEST_GUARD_MS);
+
+  // Round 3 (PR #853 review, P1 src/actors/manager.ts): a retry replays the event. After a tool ran,
+  // a replay could repeat its side effects, so the overflow settles like a fresh-session overflow.
+  it("does not replay an event whose run executed a tool before it overflowed: no retry, overflow notice and alarm", async () => {
+    const s = setup();
+    s.recordResults();
+    const actor = await s.create("tooling");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    const carried = header(actor.sessionFile!);
+    await expect(s.actors.ask(actor.id, "TOOL_THEN_OVERFLOW_ON_HISTORY", { pr: 88 })).rejects.toThrow(/prompt is too long/);
+    expect(s.results.at(-1)).toMatchObject({ status: "failed", errorCode: "CONTEXT_OVERFLOW", toolCalls: 1 });
+    // One run on the carried session, never a fresh-session replay; the side effect happened once.
+    expect(s.prompts()).toEqual([
+      { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
+      { history: true, overflow: true, session: carried, marker: "TOOL_THEN_OVERFLOW_ON_HISTORY" },
+    ]);
+    expect(s.toolRuns()).toHaveLength(1);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    const overflowMessages = s.actors.messages(actor.id, 50)
+      .map((message) => (message.data as { contextOverflow?: Record<string, unknown> } | undefined)?.contextOverflow)
+      .filter((value): value is Record<string, unknown> => value !== undefined);
+    expect(overflowMessages).toEqual([expect.objectContaining({ retry: false, toolCalls: 1, eventRef: expect.objectContaining({ pr: 88 }) })]);
+    // Settled exactly like a fresh-session overflow: the explicit notice, the alarm, a failed activation.
+    expect(s.overflowEvents()).toEqual([expect.objectContaining({ data: expect.objectContaining({
+      reason: "no verdict (context overflow)", eventRef: expect.objectContaining({ pr: 88 }) }) })]);
+    expect(s.ownerAlarms()).toEqual([expect.objectContaining({ data: expect.objectContaining({ actorId: actor.id, reason: "context_window" }) })]);
+    expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "context-overflow", count: 1 });
+    expect(s.actors.status(actor.id).status).not.toBe("stopped");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(s.prompts()).toHaveLength(2);
+    expect(s.toolRuns()).toHaveLength(1);
   }, TEST_GUARD_MS);
 
   it("retries on a fresh session after a restart between the retry's queue checkpoint and the archive", async () => {

@@ -6,6 +6,9 @@
 // holds a conversation, FILL_CONTEXT succeeds with 90% of the window used.
 // Round 2: PROVIDER_OVERFLOW_ON_HISTORY refuses a carried run in a provider's own wording (typed by
 // pi-ai isContextOverflow), QUOTED_PHRASE fails with a non-overflow error that quotes the phrase.
+// Round 3: SILENT_OVERFLOW answers "stop" with usage above the window (pi-ai isContextOverflow case 2;
+// Pi keeps such an answer without retrying). TOOL_THEN_OVERFLOW_ON_HISTORY runs one side-effecting
+// tool (logged to FAKE_PI_LOG.tools) and then overflows on the next model turn of a carried session.
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
@@ -53,15 +56,54 @@ process.stdin.on("data", (chunk) => {
       const history = journal.some((entry) => entry.type === "message");
       const providerOverflow = task.includes("PROVIDER_OVERFLOW_ON_HISTORY") && history;
       const quoted = task.includes("QUOTED_PHRASE");
-      const overflow = task.includes("OVERFLOW_ALWAYS") || (task.includes("OVERFLOW_ON_HISTORY") && history);
+      const silent = task.includes("SILENT_OVERFLOW");
+      const toolThenOverflow = task.includes("TOOL_THEN_OVERFLOW_ON_HISTORY") && history;
+      const overflow = task.includes("OVERFLOW_ALWAYS") || silent ||
+        (task.includes("OVERFLOW_ON_HISTORY") && !task.includes("TOOL_THEN_OVERFLOW_ON_HISTORY") && history) || toolThenOverflow;
       if (process.env.FAKE_PI_LOG) {
         fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
           history, overflow, session: journal.find((entry) => entry.type === "session")?.id,
-          marker: (task.match(/\b(?:OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|QUOTED_PHRASE|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
+          marker: (task.match(/\b(?:OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|TOOL_THEN_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|SILENT_OVERFLOW|QUOTED_PHRASE|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
         }) + "\n");
       }
       append({ role: "user", content: task, timestamp: Date.now() });
       emit({ type: "agent_start" });
+      if (silent) {
+        // The provider accepted more input than the window and still answered "stop".
+        const message = { role: "assistant", provider, model: model.id, content: [{ type: "text", text: "verdict: ok" }], stopReason: "stop",
+          usage: { input: WINDOW + 8000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: WINDOW + 8010 }, timestamp: Date.now() };
+        append(message);
+        emit({ type: "message_start", message });
+        emit({ type: "message_end", message });
+        emit({ type: "turn_end", message, toolResults: [] });
+        emit({ type: "agent_end" });
+        emit({ type: "agent_settled", outcome: "completed" });
+        continue;
+      }
+      if (toolThenOverflow) {
+        const call = { type: "toolCall", id: "call-side-effect", name: "bash", arguments: { command: "post-review-comment" } };
+        const toolTurn = { role: "assistant", provider, model: model.id, content: [call], stopReason: "toolUse",
+          usage: { input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 1010 }, timestamp: Date.now() };
+        append(toolTurn);
+        emit({ type: "message_start", message: toolTurn });
+        emit({ type: "message_end", message: toolTurn });
+        emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+        if (process.env.FAKE_PI_LOG) fs.appendFileSync(`${process.env.FAKE_PI_LOG}.tools`, `${JSON.stringify({ tool: call.name, marker: "TOOL_THEN_OVERFLOW_ON_HISTORY" })}\n`);
+        const toolResult = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: "posted" }], isError: false, timestamp: Date.now() };
+        emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: { content: toolResult.content }, isError: false });
+        append(toolResult);
+        emit({ type: "message_start", message: toolResult });
+        emit({ type: "message_end", message: toolResult });
+        emit({ type: "turn_end", message: toolTurn, toolResults: [toolResult] });
+        emit({ type: "turn_start" });
+        const message = { role: "assistant", provider, model: model.id, content: [], stopReason: "error", errorMessage: PROVIDER_OVERFLOW,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }, timestamp: Date.now() };
+        append(message);
+        emit({ type: "message_end", message });
+        emit({ type: "agent_end" });
+        emit({ type: "agent_settled", outcome: "error" });
+        continue;
+      }
       if (overflow || quoted) {
         const message = { role: "assistant", provider, model: model.id, content: [], stopReason: "error",
           errorMessage: quoted ? QUOTED : providerOverflow ? PROVIDER_OVERFLOW : OVERFLOW,

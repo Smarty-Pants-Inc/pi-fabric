@@ -3484,7 +3484,11 @@ export class ActorManager {
             // smarty-dev#3238 round 2: only the worker's typed code, set from a structured overflow
             // signal, retries or reports an overflow; error text that quotes the phrase never does.
             const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !abortController.signal.aborted && !runStopped;
-            if (contextOverflow && !item.overflowRetried && !this.#closing && (actor.status as string) !== "stopped" &&
+            // smarty-dev#3238 round 3: a retry replays the whole event. Once a tool has run, its side
+            // effects may already have happened, and nothing makes a replay idempotent: retry only a
+            // run that executed no tool call (the worker counts each tool_execution_start).
+            const toolsRan = result.toolCalls !== 0;
+            if (contextOverflow && !toolsRan && !item.overflowRetried && !this.#closing && (actor.status as string) !== "stopped" &&
                 this.#sessionCarriedHistory(actor, sessionBytesBefore)) {
               // smarty-dev#3238: carried history left this event no room. Reset the session at this
               // boundary and run the same event once more, ahead of newer work, on a fresh session.
@@ -3501,6 +3505,15 @@ export class ActorManager {
                 data: { contextOverflow: { retry: true, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
               });
               continue;
+            }
+            if (contextOverflow && toolsRan) {
+              // Settles exactly like a fresh-session overflow (notice, alarm, failed activation); say why.
+              this.#recordMessage(this.#liveActor(actor), {
+                id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+                createdAt: Date.now(),
+                reason: `context overflow after ${Number.isFinite(result.toolCalls) ? result.toolCalls : "unknown"} tool call(s): not retrying the event, a replay could repeat their side effects`,
+                data: { contextOverflow: { retry: false, toolCalls: result.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
+              });
             }
             if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id, result.error ?? "");
             if (actor.responseMode === "directive") {

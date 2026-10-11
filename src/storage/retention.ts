@@ -11,6 +11,7 @@ import {
   writeJsonAtomic,
 } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
+import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
@@ -430,6 +431,26 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     return true;
   } catch { return false; }
 };
+/** Why safeRunTree refused a run, as a fixed category for the retention report (ids and paths removed). Report only:
+ * it repeats the checks in safeRunTree's order and is not a deletion authority. */
+const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
+  const exit = runTreeExitVeto(root, 0, noDeadline, true, acceptPidReuse);
+  if (exit) return exit.replace(/ \([^)]*\)$/, "");
+  const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId) ? Number(record.sessionId) : undefined;
+  if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return "saved worker PID is live";
+  try {
+    if (!safeTerminalArtifacts(root, noDeadline)) return "terminal answer, notices or controls not proven consumed";
+    for (const name of fs.readdirSync(root)) {
+      const stat = ownedStat(path.join(root, name));
+      if (!stat) return "an entry is a link, hard-linked or not ours";
+      const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
+        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+      if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
+    }
+  } catch { return "run tree unreadable"; }
+  return "follow-ups, deliveries, handoff or nested run not proven safe";
+};
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
 export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
@@ -445,12 +466,14 @@ export const canRemoveManagedRunRoot = (root: string): boolean => {
   const owner = readJson<RunRootOwner>(ownerPath(root));
   return validOwner(owner) && owner.pid === process.pid && safeRootContents(root, true, owner);
 };
+/** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
+const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
-    if (!ownedStat(root)?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
+    const judged = ownedStat(root);
+    if (!judged?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
     if (fs.readdirSync(root).some((name) => name !== RUN_ROOT_OWNER_FILE)) return false;
-    fs.rmSync(root, { recursive: true, force: true });
-    return true;
+    return verifiedRemove(root, judged, { deleter: "removeEmptyRunRoot", fallback: rmTree(root) }).removed;
   } catch { return false; }
 };
 const pruneClosedRunRoot = (
@@ -476,8 +499,10 @@ const pruneClosedRunRoot = (
       continue;
     }
     if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
-    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired, false, owner)) continue;
-    try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
+    // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
+    const judged = ownedStat(directory);
+    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired, false, owner)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
+    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
   }
   return removed;
 };
@@ -499,7 +524,10 @@ export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, no
   try {
     for (const other of fs.readdirSync(meshRoot)) {
       const match = other.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(other.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
-      if (match && Number(match[1]) < slot - 1) fs.rmSync(path.join(meshRoot, other), { force: true });
+      if (match && Number(match[1]) < slot - 1) {
+        const file = path.join(meshRoot, other);
+        verifiedRemove(file, ownedStat(file), { deleter: "claimMeshRetentionSweep", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+      }
     }
   } catch { /* stale slot files are tiny; the next claim retries */ }
   return true;
@@ -582,9 +610,10 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
-      if (!safeRunTree(directory, false, 0, expired, false, owner)) continue;
+      const judged = ownedStat(directory);
+      if (!safeRunTree(directory, false, 0, expired, false, owner)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.
-      try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
+      verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
@@ -617,30 +646,78 @@ const rowRunIds = (actor: RegistryRunRow): string[] => {
  * An unreadable registry is a wildcard veto, never proof that a reference is absent.
  * `requireRegistries`: a registry root without actors.json is uncertain, not empty
  * (the mesh sweep's final pre-delete check over registries it discovered). */
-export const retainedActorRunIds = (actorRoots: readonly string[], options: { requireRegistries?: boolean } = {}): Set<string> => {
-  const refs = new Set<string>();
-  try {
-    for (const root of actorRoots) {
-      try { fs.lstatSync(root); }
-      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
-      const file = path.join(root, "actors.json");
-      try { fs.lstatSync(file); }
-      catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
-      // actor includes instructions and up to 100 message bodies, so even one
-      // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
-      // JSON contract rather than inventing a fleet-size limit that disables all
-      // retention. Ownership, JSON/schema errors and unsafe references still veto.
-      const registry = readJson<{ actors?: RegistryRunRow[] }>(file, Number.MAX_SAFE_INTEGER);
-      if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
-      for (const actor of registry.actors) {
-        if (!actor || typeof actor.id !== "string") throw new Error("Unknown actor run reference");
-        for (const id of rowRunIds(actor)) refs.add(id);
+export const retainedActorRunIds = (actorRoots: readonly string[], options: { requireRegistries?: boolean } = {}): Set<string> =>
+  registryReferences(actorRoots, options).snapshot();
+
+export interface RegistryReferences {
+  /** The references as last read; no filesystem access. For early skips only, never for a delete. */
+  snapshot(): Set<string>;
+  /** Re-checks every registry's identity (lstat) and re-parses only a registry whose actors.json changed. The final
+   * pre-delete check. An unreadable, unsafe or vanished registry is a wildcard veto. */
+  fresh(): Set<string>;
+  /** The rows of a registry as last parsed, or undefined when it is unreadable. */
+  actors(root: string): Record<string, any>[] | undefined;
+  /** Parses per registry root (smarty-dev#7916: one per sweep unless the registry itself changed). */
+  readonly parses: ReadonlyMap<string, number>;
+}
+/** Registry references read once per sweep (smarty-dev#7916, measured on Ryzen 1: the sweep re-parsed every registry
+ * for every candidate run and did not finish in 30 min over 606 registries). Each registry is parsed once, then only
+ * when its actors.json identity (dev, ino, size, mtime, ctime) changes; the per-delete check costs one lstat per
+ * registry, not a parse. */
+export const registryReferences = (actorRoots: readonly string[], options: { requireRegistries?: boolean } = {}): RegistryReferences => {
+  const cache = new Map<string, { stamp: string; ids: string[]; actors: Record<string, any>[] }>();
+  const parses = new Map<string, number>();
+  let last = new Set<string>();
+  // `actorRoots` is read on every call: the mesh sweep replaces its contents when registry roots come or go.
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const fresh = (): Set<string> => {
+    const refs = new Set<string>();
+    try {
+      for (const root of actorRoots) {
+        const file = path.join(root, "actors.json");
+        // The per-delete cost: one lstat of actors.json while it is unchanged. The full checks run on a change.
+        const cached = cache.get(root);
+        const quick = cached && fs.lstatSync(file, { throwIfNoEntry: false });
+        if (cached && quick && quick.isFile() && quick.nlink === 1 && (uid === undefined || quick.uid === uid) &&
+            `${quick.dev}:${quick.ino}:${quick.size}:${quick.mtimeMs}:${quick.ctimeMs}` === cached.stamp) {
+          for (const id of cached.ids) refs.add(id);
+          continue;
+        }
+        try { fs.lstatSync(root); }
+        catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") { cache.delete(root); continue; } throw error; }
+        if (!ownedStat(root)?.isDirectory()) throw new Error("Unsafe actor root");
+        try { fs.lstatSync(file); }
+        catch (error) { if (!options.requireRegistries && (error as NodeJS.ErrnoException).code === "ENOENT") { cache.delete(root); continue; } throw error; }
+        const stat = ownedStat(file);
+        if (!stat?.isFile()) throw new Error("Unsafe actor registry");
+        // Taken before the read: a change during the read gives a new stamp, so the next check re-parses.
+        const stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+        let entry = cache.get(root);
+        if (entry?.stamp !== stamp) {
+          cache.delete(root);
+          parses.set(root, (parses.get(root) ?? 0) + 1);
+          // ActorRegistryStore's writer/reader has no byte-size protocol limit: every
+          // actor includes instructions and up to 100 message bodies, so even one
+          // ordinary actor can exceed the 1-MiB summary-file guard. Match that existing
+          // JSON contract rather than inventing a fleet-size limit that disables all
+          // retention. Ownership, JSON/schema errors and unsafe references still veto.
+          const registry = readJson<{ actors?: RegistryRunRow[] }>(file, Number.MAX_SAFE_INTEGER);
+          if (!Array.isArray(registry?.actors)) throw new Error("Unreadable actor registry");
+          const ids: string[] = [];
+          for (const actor of registry.actors) {
+            if (!actor || typeof actor.id !== "string") throw new Error("Unknown actor run reference");
+            ids.push(...rowRunIds(actor));
+          }
+          entry = { stamp, ids, actors: registry.actors as Record<string, any>[] };
+          cache.set(root, entry);
+        }
+        for (const id of entry.ids) refs.add(id);
       }
-    }
-  } catch { refs.add("*"); }
-  return refs;
+    } catch { refs.add("*"); }
+    return (last = refs);
+  };
+  fresh();
+  return { snapshot: () => last, fresh, actors: root => cache.get(root)?.actors, parses };
 };
 /** The final pre-delete check of every mesh retention removal (pi-fabric#645 review rounds 1-2):
  * re-reads every registry uncached immediately before a run is deleted. An unreadable registry
@@ -739,9 +816,18 @@ export const compactTerminalRunEvents = (
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
-    if (!options.dryRun) {
-      try { writeFileAtomic(file, Buffer.concat([EVENT_TAIL_MARKER, retained])); }
-      finally {
+    const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
+    let replaced = false;
+    try {
+      // The judged events.jsonl goes through the one verified removal (smarty-dev#7916): verified, moved into the
+      // graveyard and verified again; the new tail then takes the free name (link fails on EEXIST), and only then
+      // is the judged inode removed. A failed publish moves it back.
+      replaced = verifiedRemove(file, stat, { deleter: "compactTerminalRunEvents", freed: stat.size - next.length,
+        ...(options.dryRun ? { dryRun: true } : {}),
+        proceed: () => publishExclusive(file, next),
+        fallback: () => { writeFileAtomic(file, next); return true; } }).removed;
+    } finally {
+      if (!options.dryRun) {
         // Residency expiry (and legacy timestamp fallback) uses directory mtime.
         // Creating/renaming the atomic tail must not restart that retention clock.
         const current = ownedStat(directory);
@@ -751,9 +837,23 @@ export const compactTerminalRunEvents = (
         }
       }
     }
+    if (!replaced) return false;
     options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
     return true;
   } catch { return false; }
+};
+
+/** Publish `data` at `file` only while the name is free: an O_EXCL|O_NOFOLLOW private temp beside it, then link
+ * (EEXIST never replaces anything), then the temp goes. */
+const publishExclusive = (file: string, data: Buffer): boolean => {
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.linkSync(temp, file);
+    return true;
+  } catch { return false; }
+  finally { try { fs.unlinkSync(temp); } catch { /* never created */ } }
 };
 
 /** Immutable, ordinary rotation history only. Malformed-session orphan backups are
@@ -771,16 +871,30 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
       if (!name.startsWith(prefix)) return [];
       const match = /^(\d{8}T\d{9}Z)(?:-(\d+))?\.bak$/.exec(name.slice(prefix.length));
       const stat = ownedStat(path.join(directory, name));
-      return match && stat?.isFile() ? [{ name, stamp: match[1]!, suffix: Number(match[2] ?? 0), stat }] : [];
-    }).sort((a, b) => a.stamp.localeCompare(b.stamp) || a.suffix - b.suffix);
+      const stamp = match?.[1];
+      const at = stamp === undefined ? NaN : Date.parse(`${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}.${stamp.slice(15, 18)}Z`);
+      return match && stat?.isFile() ? [{ name, stamp: match[1]!, suffix: Number(match[2] ?? 0), stat, at }] : [];
+    });
+    // smarty-dev#7916 design 3: the order comes from trusted data (mtime, then the rotation's ctime, then the inode),
+    // never the name or the wall clock. On doubt the newest is kept: the newest by that order AND the newest by name,
+    // and every backup whose name is dated in the future (or unparsable) stays.
+    const byName = [...backups].sort((a, b) => a.stamp.localeCompare(b.stamp) || a.suffix - b.suffix);
+    const byAge = [...backups].sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || a.stat.ctimeMs - b.stat.ctimeMs || a.stat.ino - b.stat.ino);
+    const now = Date.now();
+    const keep = new Set([byName.at(-1)?.name, byAge.at(-1)?.name]);
+    for (const backup of backups) {
+      if (!(backup.at <= now)) {
+        keep.add(backup.name);
+        countRefusal("pruneActorSessionBackups", "future-dated or unparsable backup name", path.join(directory, backup.name));
+      }
+    }
     const removed: string[] = [];
-    for (const backup of backups.slice(0, -1)) {
+    for (const backup of byAge) {
+      if (keep.has(backup.name)) continue;
       const file = path.join(directory, backup.name);
-      const checked = ownedStat(file);
-      if (!checked || checked.dev !== backup.stat.dev || checked.ino !== backup.stat.ino ||
-          checked.size !== backup.stat.size || checked.mtimeMs !== backup.stat.mtimeMs) continue;
       if (options.stop?.()) break;
-      if (!options.dryRun) fs.unlinkSync(file);
+      if (!verifiedRemove(file, backup.stat, { deleter: "pruneActorSessionBackups", ...(options.dryRun ? { dryRun: true } : {}),
+        fallback: () => { fs.unlinkSync(file); return true; } }).removed) continue;
       options.onPrune?.({ path: file, bytes: backup.stat.size });
       removed.push(file);
     }
@@ -815,11 +929,20 @@ export const pruneActorRunArchives = (options: {
   let entries: fs.Dirent[];
   try { entries = fs.readdirSync(options.runsDirectory, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === options.latestRunId || options.isRetained?.(entry.name)) continue;
+    if (!entry.isDirectory()) continue;
     const directory = path.join(options.runsDirectory, entry.name);
+    // Reported refusals carry their size (the CLI's report only; in-process sweeps measure nothing).
+    const refuse = (reason: string) => countRefusal("pruneActorRunArchives", reason, directory, removalTallyOn() ? options.measure?.(directory) ?? 0 : 0);
+    if (entry.name === options.latestRunId || options.isRetained?.(entry.name)) { refuse("latest or referenced run"); continue; }
+    // The judged stat, before the judgment reads anything; the removal requires it unchanged.
+    const judged = ownedStat(directory);
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-    if (!record?.status || !TERMINAL_STATUSES.has(record.status) || !safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) continue;
-    if (now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < options.retentionMs) {
+    if (!record?.status || !TERMINAL_STATUSES.has(record.status)) { refuse(`status is ${record ? String(record.status) : "unreadable"}`); continue; }
+    if (!safeRunTree(directory, false, 0, noDeadline, options.acceptPidReuse === true)) {
+      if (removalTallyOn()) refuse(runTreeRefusal(directory, options.acceptPidReuse === true));
+      continue;
+    }
+    if (now - recordAgeReference(record, judged?.mtimeMs ?? now) < options.retentionMs) {
       compactTerminalRunEvents(directory, {
         ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
         ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
@@ -831,27 +954,35 @@ export const pruneActorRunArchives = (options: {
     }
     const bytes = options.measure?.(directory) ?? 0;
     const isRetained = options.isRetained;
-    if (!removeUnreferencedRun(directory, isRetained && (() => isRetained(entry.name, true)), options.dryRun)) continue;
+    if (!removeUnreferencedRun(directory, judged, isRetained && (() => isRetained(entry.name, true)), options.dryRun, "pruneActorRunArchives", bytes)) continue;
     removed.push(directory);
     options.onRemove?.(directory, bytes);
   }
   return removed;
 };
 
-/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4). Without
- * `referenced` a plain delete. With it: check; rename the run to a sibling tombstone; check again; then
- * delete the tombstone, or rename it back when the re-check finds a reference (a throwing check counts
- * as a reference). A dry run takes only the first check. Returns whether the run was (or would be) removed.
+/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4), through the one verified
+ * removal (smarty-dev#7916): check; verify the judged inode and its tree; move it into the graveyard and verify it
+ * again; check again (`proceed`); then delete it, or move it back when the re-check finds a reference (a throwing
+ * check counts as a reference). A dry run takes the first check and the full verification, with no move or delete.
+ * Returns whether the run was (or would be) removed. Off Linux main's tombstone path below runs (smarty-dev#7858).
  * ponytail: no fence excludes registry writers. ActorRegistryStore's lock is an exclusive, async mkdir
  * lock with no shared mode; holding every registry's lock across each delete would stall every actor's
  * saves, and these sweeps are synchronous. The tombstone narrows the remaining window to a reference
  * written after the re-check, which names a run already renamed away: its writer finds the run missing,
  * exactly as after any completed deletion. A tombstone left by a crash is a run proven unreferenced; the
  * next sweep treats it as an ordinary run entry. */
-export const removeUnreferencedRun = (directory: string, referenced?: () => boolean, dryRun = false): boolean => {
+export const removeUnreferencedRun = (
+  directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
+  bytes = 0,
+): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
-  if (check()) return false;
-  if (dryRun) return true;
+  if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
+  return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
+    fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
+};
+/** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */
+const mainRemoveUnreferencedRun = (directory: string, referenced: (() => boolean) | undefined, check: () => boolean): boolean => {
   if (!referenced) {
     try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }
   }

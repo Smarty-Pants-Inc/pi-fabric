@@ -1,5 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
@@ -210,8 +209,6 @@ export interface FabricRuntimeStateOptions {
 
 // ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
 const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
-/** Owner incarnation per host id for this process; a reload keeps it, a restart does not. */
-const PROCESS_OWNER_INCARNATIONS = new Map<string, string>();
 
 // A detached callback can outlive its ctx (reload, session replacement). Reading a stale
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
@@ -812,12 +809,6 @@ export class FabricRuntimeState {
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
-    // One owner incarnation for this runtime: the participant records advertise it and the
-    // control plane (constructed after mesh activation) fences commands for earlier ones.
-    // Fork (smarty-dev#2160 item 4): a reload in the same process is the same owner and
-    // retains sender messages, so the incarnation is per process and host, not per initialize.
-    let ownerIncarnation = PROCESS_OWNER_INCARNATIONS.get(hostId);
-    if (!ownerIncarnation) PROCESS_OWNER_INCARNATIONS.set(hostId, ownerIncarnation = randomUUID());
     const mesh = this.#mesh;
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
@@ -859,7 +850,6 @@ export class FabricRuntimeState {
           reason: "no live session ctx (session replaced or reloaded)",
         }).catch(() => undefined);
       },
-      ownerIncarnation,
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -925,13 +915,19 @@ export class FabricRuntimeState {
       if (!isMeshLockTimeout(error)) throw error;
       initialMeshError = error;
     }
+    // Capture this activation's directory: no control may claim/run before its epoch
+    // commits, after failed renewal, or through a replacement generation's lease.
+    const controlParticipants = participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      // Both gates: this activation's custody/succession completed (main) AND its
+      // directory epoch is committed under a live, renewed lease (#709).
+      canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
-      canConsumeMesh: () => meshActivationReady,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
-      incarnation: ownerIncarnation,
       captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>

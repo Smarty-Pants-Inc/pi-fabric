@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
 import { currentOwnerIdentity, ownerIdentityFields, ownerLiveness } from "../core/atomic-write.js";
+import { verifiedRemove } from "./verified-remove.js";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
 export const SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -196,7 +197,11 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) continue;
       if (candidate.owner.closedAt === undefined && ownerAlive(candidate.owner)) continue;
       if (candidate.childPid !== undefined && childAlive(candidate.owner, candidate.childPid)) continue;
-      await fs.promises.rm(candidate.directory, { recursive: true, force: true });
+      // smarty-dev#7916: only the judged root inode and a tree of our own entries; off Linux main's removal
+      // (smarty-dev#7858). No getuid on Linux means no ownership proof: nothing is removed.
+      const directory = candidate.directory;
+      if (!verifiedRemove(directory, candidate.root, { deleter: "sweepScratch",
+        fallback: () => { fs.rmSync(directory, { recursive: true, force: true }); return true; } }).removed) continue;
       result.removed.push(candidate.directory);
       if (candidate.cache) { totalBytes -= candidate.bytes; totalItems--; }
     } catch { /* best effort */ }

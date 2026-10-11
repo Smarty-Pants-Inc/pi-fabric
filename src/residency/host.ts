@@ -47,7 +47,7 @@ import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIde
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
-import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
@@ -276,8 +276,6 @@ export class ResidentHost {
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #scheduleTimer: NodeJS.Timeout | undefined;
   #scheduleWakeAt: number | undefined;
-  /** One incarnation per host process: participant records and the control plane share it. */
-  readonly #ownerIncarnation = randomUUID();
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
   readonly #boundaryRequests = new Map<string, Promise<void>>();
@@ -408,7 +406,6 @@ export class ResidentHost {
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
-      ownerIncarnation: this.#ownerIncarnation,
       reapDeadHosts: false,                                    // its session's runtime sweeps
       presencePass: async () => {
         await rootPresenceAlarms(this.mesh, this.identity, this.hostId,
@@ -417,11 +414,12 @@ export class ResidentHost {
       },
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
+      ownerIncarnation: this.participants.ownerIncarnation,
+      controlIncarnationFence: config.mesh.controlIncarnationFence,
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
-      incarnation: this.#ownerIncarnation,
       canConsumeMesh: () => this.#ready && this.participants.canConsumeMesh(),
       captureOwnerLease: (ownerHostId, ownerIdentityId, targetId) =>
         this.participants.captureControlOwnerLease(ownerHostId, ownerIdentityId, targetId),
@@ -1070,7 +1068,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn, wakeCause, ...(target.ownerIncarnation ? { ownerIncarnation: target.ownerIncarnation } : {}) },
+      { message, data: event, triggerTurn: subscription.triggerTurn, ownerIncarnation: controlOwnerIncarnation(target), wakeCause },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );

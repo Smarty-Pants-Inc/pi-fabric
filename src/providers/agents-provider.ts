@@ -49,6 +49,7 @@ import {
 } from "../lifecycle/types.js";
 import {
   FabricControlPlane,
+  controlOwnerIncarnation,
   type FabricControlCommand,
   type FabricControlAcceptance,
 } from "../topology/control-plane.js";
@@ -1353,13 +1354,14 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
+        const ownerIncarnation = controlOwnerIncarnation(participant);
         const ownRoot = participant.rootId === this.mainAgent.id;
         const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
         }
-        if (!this.control || participant.controlProtocol === "legacy") {
+        if (!this.control) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }
         context.signal?.throwIfAborted();
@@ -1369,13 +1371,11 @@ export class AgentsProvider implements FabricProvider {
           "ask",
           {
             principal: invocationFabricPrincipal(context),
+            ownerIncarnation,
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
             ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
-            ...(participant.ownerIncarnation
-              ? { ownerIncarnation: participant.ownerIncarnation }
-              : {}),
           },
           participant.ownerIdentityId,
           {
@@ -2166,12 +2166,13 @@ export class AgentsProvider implements FabricProvider {
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }
+    const ownerIncarnation = controlOwnerIncarnation(participant);
     if (!this.control) throw new Error("Fabric control plane is unavailable");
     const result = await this.control.request(
       participant.ownerHostId,
       participant.id,
       "stop",
-      participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {},
+      { ownerIncarnation },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
     );

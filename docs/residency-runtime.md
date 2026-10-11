@@ -82,6 +82,10 @@ retain main's existing behavior; no new bounded-close or whole-attempt containme
 guarantee is claimed. Those features require a separate fabric-v2 follow-up with
 checked whole-attempt exit and completed-drain proofs before recovery admission.
 
+### Owner incarnation fencing
+
+A resident's root-derived host ID (`residentHostId(rootId)`) and durable actor IDs survive relaunch, and a relaunched host replays the control log from offset 0, so a stop or ask meant for the previous process could otherwise reach a durable actor's next turn. Its control-owner incarnation does not survive: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; there is no stale automatic resend. Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
+
 ### Lease-fenced consumption and accepted-work custody
 
 A file-only heartbeat is liveness, not permission to consume mesh work. Control,
@@ -115,17 +119,6 @@ under the mesh lock, and its actor monitor delivers them. Pending schedules alon
 with no durable participant, do not keep the host running; Fabric adds no system
 daemon, so such a schedule is released the next time any Fabric process touches
 the mesh root.
-
-### Stale commands after restart
-
-A restarted host keeps its `residentHostId(rootId)` and replays the control log
-from offset 0, so a stop or ask meant for the previous process could otherwise
-reach a durable actor's next turn. Each host process publishes its participant
-records with a fresh `ownerIncarnation`, and requesters stamp that value on each
-command. The new host refuses an unclaimed command for an earlier incarnation
-with an immediate rejection and does not execute it; the caller re-resolves the
-participant and decides whether to resend. See
-[stale commands after restart](agents.md#stale-commands-after-restart).
 
 ## Containers and PID namespaces
 

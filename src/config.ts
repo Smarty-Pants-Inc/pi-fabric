@@ -353,6 +353,11 @@ export interface FabricRetentionConfig {
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
   maxSessionBytes: number;
+  /** How long a transient activation block (provider stream error, timeout, preparation or lock
+   * timeout) gates routing before the actor gets a probe run (default 10 min; smarty-dev#6509). */
+  transientBlockCooldownMs?: number;
+  /** Cap of the doubling backoff after failed probes (default 60 min). */
+  transientBlockMaxMs?: number;
 }
 
 export type MeshLockProtocol = 1 | 2;
@@ -659,6 +664,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
+    transientBlockCooldownMs: 10 * 60_000,
+    transientBlockMaxMs: 60 * 60_000,
   },
   mesh: {
     controlIncarnationFence: "warn",
@@ -1415,6 +1422,18 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes,
         0,
         Number.MAX_SAFE_INTEGER,
+      ),
+      transientBlockCooldownMs: boundedInteger(
+        actors.transientBlockCooldownMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockCooldownMs!,
+        1_000,
+        24 * 60 * 60_000,
+      ),
+      transientBlockMaxMs: boundedInteger(
+        actors.transientBlockMaxMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockMaxMs!,
+        1_000,
+        7 * 24 * 60 * 60_000,
       ),
     },
     mesh: {

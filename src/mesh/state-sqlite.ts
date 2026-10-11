@@ -28,8 +28,8 @@
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
  * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 0).
  * Fairness (smarty-dev#9805): a newcomer that finds anyone queued takes its ticket before its first attempt, so it
- * never barges the head, and the head waits for the release inside SQLite's busy handler (HEAD_BUSY_MS) instead of
- * a JavaScript sleep. Only a writer that finds the queue empty tries once directly (the uncontended path: one readdir). The wait honours `writeSignal`, the
+ * never barges the head, and the head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it
+ * synchronously, so it is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Only a writer that finds the queue empty tries once directly (the uncontended path: one readdir). The wait honours `writeSignal`, the
  * `withTryLock` budget and `lockTimeoutMs`, and times out with the existing `MeshLockTimeoutError`.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
@@ -512,8 +512,10 @@ const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 // acquisition, so no checkpointer (stuck in an fsync, crashed, or several raising flags in turn) parks a writer.
 const CHECKPOINT_FLAG_STALE_MS = 250;
 const WRITER_YIELD_BUDGET_MS = 250;
-// The FIFO head's in-SQLite wait per attempt (smarty-dev#9805): long enough to catch a release, short for the loop.
-const HEAD_BUSY_MS = 50;
+// The FIFO head's in-SQLite wait per attempt (smarty-dev#9805, pi-fabric#936 round 2): node:sqlite runs the busy
+// handler synchronously, so this blocks the event loop; 5 ms (the busy_timeout clamp) plus a 1 ms re-poll.
+const HEAD_BUSY_MS = 5;
+const HEAD_REPOLL_MS = 1;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -1590,6 +1592,7 @@ export class SqliteStateStore {
       for (;;) {
         const iteration = performance.now();
         let yielding = false;
+        let headWaitMs = 0;
         this.#signal?.throwIfAborted();
         this.#assertOpen();
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
@@ -1604,7 +1607,7 @@ export class SqliteStateStore {
           let begun = false;
           // smarty-dev#9805: the FIFO head waits for the release inside SQLite's busy handler (up to HEAD_BUSY_MS of its
           // budget) instead of a JavaScript sleep, so it takes the lock when the holder lets go.
-          const headWaitMs = ticket?.queued ? Math.max(0, Math.min(HEAD_BUSY_MS, Math.floor(deadline - now))) : 0;
+          headWaitMs = ticket?.queued ? Math.max(0, Math.min(HEAD_BUSY_MS, Math.floor(deadline - now))) : 0;
           if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${headWaitMs}`);
           try {
             this.#db.exec("BEGIN IMMEDIATE");
@@ -1642,7 +1645,9 @@ export class SqliteStateStore {
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
-        await delay(Math.min(deadline - now, cap * (0.5 + Math.random() / 2)), this.#signal);
+        // The FIFO head re-polls at once (it alone may contend); everyone else keeps the jittered sleep.
+        const head = headWaitMs > 0;
+        await delay(Math.min(deadline - now, head ? HEAD_REPOLL_MS : cap * (0.5 + Math.random() / 2)), this.#signal);
         if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {

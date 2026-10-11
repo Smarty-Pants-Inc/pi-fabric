@@ -16,7 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
-import { ActorDirectory } from "./actors/directory.js";
+import { ActorDirectory, haltEvery } from "./actors/directory.js";
 import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
 import { isPiShellRef } from "./core/pi-tools.js";
@@ -1712,8 +1712,10 @@ export class FabricRuntimeState {
   haltMain(): void { this.#mainAgent?.halt(); }
 
   haltAdvisors(): number {
-    const actors = this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0;
-    return actors + (this.#jevObservationHost?.halt() ?? 0);
+    return haltEvery([
+      () => this.#config?.mesh.enabled ? this.#actors?.haltAll().halted ?? 0 : 0,
+      () => this.#jevObservationHost?.halt() ?? 0,
+    ]);
   }
 
   noteMainActivity(context: ExtensionContext): void {

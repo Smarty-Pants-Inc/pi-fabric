@@ -15,6 +15,22 @@ non-interactive roots and mesh-bridge mirrors cannot adopt results. If several
 successors exist, the newest wins (root ID breaks timestamp ties). An already-live
 claimant retains its unconsumed admission; a dead claimant can be replaced.
 
+Consumed envelopes are moved, without rewriting their bodies, to
+`agent-completions/archive/<sha256(run-id)>.json` only after their shared
+consumption receipt is durably written. Receipts remain in `receipts/` as replay
+fences. A crash between the receipt and rename leaves a live envelope; the next
+owner drain validates the receipt, skips delivery, and retries the rename.
+Concurrent renames are idempotent: a losing `ENOENT` means another consumer
+already moved the source. Unreceipted envelopes remain live.
+
+Idle discovery lists only the live directory and `attempts/`, never `archive/`
+or the historical receipt directory. It does not fsync or rewrite existing
+receipts during drain. Explicit receipt-write retries still confirm durability
+before archiving. Archived bodies remain available to targeted status/wait by
+run ID after restart, with the same exact root/session access checks. Archive
+retention is separate from live discovery; this change does not delete history
+or transfer claim-cleanup authority to another Main.
+
 The run ID is the stable completion key. Mesh CAS claims arbitrate competing
 Mains, and durable shared receipts suppress replay to subsequent successors.
 Inbox delivery is receipted after Pi's session entries contain the completion

@@ -25,9 +25,11 @@
  * Acquisition (review-opus P1-1; the design's FULL measurement): `DatabaseSync` is synchronous, so
  * SQLite's own busy handler would freeze the caller's event loop and is unfair (sleep-and-poll with
  * growing sleeps). `busy_timeout` is clamped to <= 5 ms (default 2 ms); a busy `BEGIN IMMEDIATE` is
- * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms (long waiters poll as often as
- * newcomers), and a waiter older than `fifoAfterMs` joins the existing advisory `MeshLockTicket` FIFO
- * (keyed on `state.db`, separate from the `.lock` queue). The wait honours `writeSignal`, the
+ * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
+ * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 0).
+ * Fairness (smarty-dev#9805): a newcomer that finds anyone queued takes its ticket before its first attempt, so it
+ * never barges the head, and the head waits for the release inside SQLite's busy handler (HEAD_BUSY_MS) instead of
+ * a JavaScript sleep. Only a writer that finds the queue empty tries once directly (the uncontended path: one readdir). The wait honours `writeSignal`, the
  * `withTryLock` budget and `lockTimeoutMs`, and times out with the existing `MeshLockTimeoutError`.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
@@ -108,7 +110,7 @@ import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
 import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
-import { MeshLockTicket } from "./lock-queue.js";
+import { MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
@@ -369,7 +371,7 @@ export interface SqliteStateStoreOptions {
   lockTimeoutMs?: number;
   /** SQLite's synchronous busy handler, clamped to 0..5 ms. Default 2 ms. */
   busyTimeoutMs?: number;
-  /** A waiter older than this joins the advisory FIFO ticket queue. Default 25 ms. */
+  /** A waiter older than this joins the advisory FIFO ticket queue. Default 0 (smarty-dev#9805: no barging window). */
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
@@ -510,6 +512,8 @@ const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 // acquisition, so no checkpointer (stuck in an fsync, crashed, or several raising flags in turn) parks a writer.
 const CHECKPOINT_FLAG_STALE_MS = 250;
 const WRITER_YIELD_BUDGET_MS = 250;
+// The FIFO head's in-SQLite wait per attempt (smarty-dev#9805): long enough to catch a release, short for the loop.
+const HEAD_BUSY_MS = 50;
 // The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
 const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
 // After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
@@ -747,7 +751,7 @@ export class SqliteStateStore {
     this.#maxTombstones = Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES));
     this.#lockTimeoutMs = Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     this.#busyTimeoutMs = clampBusy(options.busyTimeoutMs);
-    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 25);
+    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 0);
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
     this.#emergencyBytes = Math.max(this.#checkpointBytes, options.emergencyCheckpointBytes ?? 64 * 1024 * 1024);
@@ -1577,6 +1581,11 @@ export class SqliteStateStore {
     let yieldedMs = 0;
     let waiting = true;
     this.#writesWaiting += 1;
+    // smarty-dev#9805: a newcomer that finds anyone queued queues behind them, never barging the FIFO head.
+    if (this.#queueBusy()) {
+      ticket = this.#ticket(Math.max(0, deadline - started));
+      if (ticket) this.#stats.fifoJoins += 1;
+    }
     try {
       for (;;) {
         const iteration = performance.now();
@@ -1593,6 +1602,10 @@ export class SqliteStateStore {
           last = now;
           attempts += 1;
           let begun = false;
+          // smarty-dev#9805: the FIFO head waits for the release inside SQLite's busy handler (up to HEAD_BUSY_MS of its
+          // budget) instead of a JavaScript sleep, so it takes the lock when the holder lets go.
+          const headWaitMs = ticket?.queued ? Math.max(0, Math.min(HEAD_BUSY_MS, Math.floor(deadline - now))) : 0;
+          if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${headWaitMs}`);
           try {
             this.#db.exec("BEGIN IMMEDIATE");
             begun = true;
@@ -1600,6 +1613,8 @@ export class SqliteStateStore {
             if (isTransient(error) && transient < TRANSIENT_RETRIES) { transient += 1; this.#stats.transientRetries += 1; }
             else if (isBusy(error)) this.#stats.busyRetries += 1;
             else throw error;
+          } finally {
+            if (headWaitMs > this.#busyTimeoutMs) this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
           }
           if (begun) {
             this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
@@ -1639,6 +1654,15 @@ export class SqliteStateStore {
   // One stat per attempt: a fresh flag means a TRUNCATE checkpoint wants the writer lock.
   #checkpointPending(): boolean {
     return checkpointFlagRaised(this.root);
+  }
+
+  // The FIFO directory of this database, resolved once (an unusable one: no queue, the plain contest).
+  #queueDirectory: string | null | undefined;
+  #queueBusy(): boolean {
+    if (this.#queueDirectory === undefined) {
+      try { this.#queueDirectory = meshLockQueueDirectory(this.file); } catch { this.#queueDirectory = null; }
+    }
+    return this.#queueDirectory !== null && meshLockQueueBusy(this.#queueDirectory);
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {

@@ -15,11 +15,12 @@ import {
   type ExtensionRunner,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
+import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
 import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import type { LandlockBashConfinement, LandlockSettings } from "../core/landlock.js";
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
@@ -33,6 +34,7 @@ import {
   formatShellHangNotice,
   raceShellHang,
   trackShellOperations,
+  shellTrackingPrefix,
 } from "../core/shell-jobs.js";
 import { parseShellMonitor, shellMonitorSchema } from "../core/shell-monitor.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
@@ -467,18 +469,20 @@ export class PiToolsProvider implements FabricProvider {
     const cwd = typeof args[PI_BASH_CWD_KEY] === "string" ? args[PI_BASH_CWD_KEY] : this.#cwd;
     if (name === "bash") {
       const options = middleware?.options;
-      let local = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
-      if (this.#landlockEnabled()) {
-        const { LandlockBashConfinement, groupOperations, landlockCommand } = await import("../core/landlock.js");
+      const nativeLocal = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      let local: typeof nativeLocal = { exec: (command, launchCwd, launchOptions) =>
+        nativeLocal.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) };
+      const landlockSettings = this.#getLandlockSettings?.();
+      if (process.platform === "linux" && landlockSettings?.mode === "enforce" && !landlockSettings.disabled) {
+        const { LandlockBashConfinement, groupOperations } = await import("../core/landlock.js");
         this.#landlock ??= new LandlockBashConfinement(this.#cwd);
         const originalCommand = String(args.command ?? "");
-        const { escape, command } = landlockCommand(originalCommand);
-        args.command = command;
         // S2: each command leads its own process group; the host keeps its kernel id.
         const shell = getShellConfig(options?.shellPath);
         local = this.#landlock.operations(
           groupOperations(this.#landlock.helperPath, ["-c"]), groupOperations(shell.shell, shell.args),
-          shell.shell, path.dirname(job.pidPath), escape, originalCommand,
+          shell.shell, path.dirname(job.pidPath), () => this.#getLandlockSettings?.(), originalCommand,
+          [shellTrackingPrefix(job.pidPath, "bash"), ...(options?.commandPrefix ? [`${options.commandPrefix}\n`] : [])],
         );
         // S2: temp custody starts before middleware may delay the inner launch.
         holds.push(this.#landlock.hold());
@@ -498,8 +502,10 @@ export class PiToolsProvider implements FabricProvider {
       if (job.options.monitor) throw new Error("PowerShell monitors require host shell operations support");
       return this.#definitionFor(name, args);
     }
+    const nativeOperations = operationsFactory();
     return create(cwd, {
-      operations: trackShellOperations(operationsFactory(), job, "powershell"),
+      operations: trackShellOperations({ exec: (command, launchCwd, launchOptions) =>
+        nativeOperations.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) }, job, "powershell"),
     });
   }
 
@@ -617,15 +623,48 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     this.#assertAllowed(name);
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
-    if (name === "bash" && !this.#landlockEnabled() && !this.#requireCapturedOverrides && !this.#catalog?.get(name)) {
+    // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
+    const middleware = this.#bashMiddleware(name);
+    const runner = this.#catalog?.runner;
+    // Gap B: a catalog is installed but its runner — and the tool_call
+    // preflight extensions rely on — is not yet available. This is the
+    // transient window before the first tool refresh populates the runner.
+    // Running a mutating tool here would silently skip that preflight, so fail
+    // closed for non-read tools and let the model retry once hooks are live.
+    // The no-catalog path (tests, embeds) has no extension system to guard and
+    // keeps the direct-execute fallback below unchanged.
+    if (this.#catalog && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
+      throw new Error(
+        `Pi tool ${name} is unavailable until extension tool hooks initialize; retry once tools are ready`,
+      );
+    }
+    let preflightEmitted = false;
+    if (
+      name === "bash" &&
+      !this.#landlockEnabled() &&
+      !this.#requireCapturedOverrides &&
+      !this.#catalog?.get(name) &&
+      typeof args.command === "string" &&
+      parseGitWorktreeAdd(args.command) !== undefined
+    ) {
+      // Gap A: a well-formed `git worktree add` is intercepted below without a
+      // tool_call event, so a command guard could not block it. Emit the same
+      // preflight first (when a runner is available) so the intercept obeys the
+      // same policy as every other nested bash call. Gate on the parse so an
+      // ordinary bash command still emits its single preflight downstream.
+      if (runner) {
+        await this.#emitToolCallPreflight(name, args, context, runner);
+        preflightEmitted = true;
+      }
       const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
       if (intercepted) {
         this.#attachPreview(name, intercepted, args, context);
         return this.#normalizeResult(name, intercepted, args);
       }
+      // Parsed but not intercepted (e.g. outside a git repo): fall through to a
+      // normal execution. The preflight already fired, so downstream must not
+      // emit it again and re-apply any argument mutation.
     }
-    // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
-    const middleware = this.#bashMiddleware(name);
     if (name === "bash" && this.#landlockEnabled()
       && (this.#requireCapturedOverrides || (this.#catalog?.get(name) && !middleware))) {
       throw new Error("Landlock enforce requires standard local bash or cooperative middleware; refusing an unconfined opaque/managed override");
@@ -642,7 +681,6 @@ export class PiToolsProvider implements FabricProvider {
       return this.#normalizeResult(name, result, args);
     }
     const tool = this.#definitionFor(name, args);
-    const runner = this.#catalog?.runner;
     // Without a runner (e.g. before the first tool refresh populated the
     // catalog) fall back to a direct execute — no extension hooks fire, but
     // the call still works. Once tools are refreshed the runner is available.
@@ -663,7 +701,28 @@ export class PiToolsProvider implements FabricProvider {
       this.#attachPreview(name, result, args, context);
       return this.#normalizeResult(name, result, args);
     }
-    return this.#invokeWithEvents(name, tool, args, context, runner, middleware);
+    return this.#invokeWithEvents(name, tool, args, context, runner, middleware, preflightEmitted);
+  }
+
+  // Emit the tool_call preflight for a nested pi.* call and enforce a block.
+  // Shared by #invokeWithEvents and the git-worktree-add intercept so both obey
+  // the same extension policy through one code path (no duplicated enforcement).
+  async #emitToolCallPreflight(
+    name: PiCoreToolName,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runner: ExtensionRunner,
+  ): Promise<void> {
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+      type: "tool_call",
+      toolName: name,
+      toolCallId: context.nestedToolCallId,
+      input: args,
+    }));
+    context.updateArguments?.(args);
+    if (preflight?.block) {
+      throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
+    }
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so
@@ -681,6 +740,7 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
     middleware: FabricBashMiddlewareV1 | undefined,
+    preflightEmitted = false,
   ): Promise<unknown> {
     const toolCallId = context.nestedToolCallId;
     await runAbortable(context.signal, () => runner.emit({
@@ -695,16 +755,7 @@ export class PiToolsProvider implements FabricProvider {
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
     try {
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-        type: "tool_call",
-        toolName: name,
-        toolCallId,
-        input: args,
-      }));
-      context.updateArguments?.(args);
-      if (preflight?.block) {
-        throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
-      }
+      if (!preflightEmitted) await this.#emitToolCallPreflight(name, args, context, runner);
       executionStarted = true;
       result = await this.#runExecute(
         name,

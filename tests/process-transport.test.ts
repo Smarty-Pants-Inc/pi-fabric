@@ -195,6 +195,18 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
+  it("never auto-selects a v1 worker without the receipt/attributed-refusal boundary", async () => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(2);
+    const f = fixture();
+    const legacy = f.release("legacy-terminal-protocol", 1);
+    f.select(legacy);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await probe(f, f.parent);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 1");
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 2");
+  });
+
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {
     const f = fixture(false);
     f.select(f.release("native-incompatible", WORKER_PROTOCOL_VERSION + 1));
@@ -291,7 +303,13 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       expect(await workerStarted(f.root)).toBe(pid);
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8").slice(fs.readFileSync(`/proc/${pid}/stat`, "utf8").lastIndexOf(")") + 2).split(" ");
       expect(Number(stat[2])).toBe(pid); // field 5 is PGID
-      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 6)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", "--"]);
+      const scopeArgs = fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n");
+      expect(scopeArgs.slice(0, 5)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect"]);
+      expect(scopeArgs[5]).toMatch(/^--unit=fabric-scope-.+\.scope$/);
+      expect(scopeArgs[6]).toBe("--");
+      // A fake systemd-run admits into the caller cgroup, not our unique scope.
+      expect(handle.liveness).toBeUndefined();
+      expect(handle.treeClosed).toBeUndefined();
       expect(await handle.isAlive()).toBe(true); expect(warn).not.toHaveBeenCalled();
     } finally { await handle.stop(); await handle.waitForClose?.(); }
     expect(await handle.isAlive()).toBe(false); expect(handle.lostContact?.()).toBeUndefined();

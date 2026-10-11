@@ -395,7 +395,11 @@ export interface FabricProvider {
    * before generic key repair can rename or consume a field. Runs before
    * repair; prepareArguments runs after it.
    */
-  guardArguments?(actionName: string, args: Record<string, unknown>): Record<string, unknown>;
+  guardArguments?(
+    actionName: string,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+  ): Record<string, unknown>;
   /**
    * Static recovery text appended to a schema-validation failure. Must not
    * echo argument values: the message enters durable traces.

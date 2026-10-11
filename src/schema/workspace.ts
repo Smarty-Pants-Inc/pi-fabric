@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -29,6 +30,7 @@ const digest = (value: string | Buffer): string =>
 
 const git = (cwd: string, args: string[]): Buffer =>
   execFileSync("git", ["-C", cwd, ...args], {
+    env: childProcessEnvironment(),
     encoding: "buffer",
     maxBuffer: 128 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],

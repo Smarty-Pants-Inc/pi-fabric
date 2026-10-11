@@ -7,8 +7,11 @@ import type { FabricCapabilityRequirement } from "../components/types.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { ActorWakeText } from "./wake-text.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
+export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -117,10 +120,24 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
   }
 }
 
+/** An explicit occurrence path into the full mesh event, such as "data.key". */
+export function validateActorDedupeKey(value: unknown): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length > 200 || !COALESCE_KEY_PATTERN.test(value)) {
+    throw new Error(`Invalid actor dedupeKey: ${String(value)} (use a dotted path such as data.key)`);
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
-export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed";
+export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+/**
+ * Why a stopped actor stopped (smarty-dev#9241). explicit: agents.stop/remove; directive: the actor's
+ * own stop directive; host-exit: its session Main exited and the root-gone reconciler retired it.
+ * Only host-exit is restarted, by the same session's next start. A reload never stops an actor.
+ */
+export type FabricActorStopReason = "explicit" | "directive" | "host-exit";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -184,6 +201,8 @@ export type FabricActorActivation =
       sequence: number;
       createdAt: number;
       topic: string;
+      /** Immutable triggering mesh data, separate from current records. */
+      data?: unknown;
     };
 
 export interface FabricActorValidityFacts {
@@ -194,7 +213,29 @@ export interface FabricActorValidityFacts {
     taskRevision: number;
     idle: boolean;
     now: number;
+    records?: FabricActorRecordsView;
   };
+  /** Untrusted, bounded GitHub text from the local ingress receipt, when agents.wakeText hydrated it (smarty-dev#6144). */
+  wakeText?: ActorWakeText;
+}
+
+/** Leading-edge admission policy for host agent_settled observations only. */
+export interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; 0 disables. Runtime windows reset on restart. */
+  minIntervalMs: number;
+}
+
+export function normalizeActorActivation(value: unknown): FabricActorActivationPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== "minIntervalMs")) {
+    throw new Error("Invalid actor activation: use { minIntervalMs: non-negative integer }");
+  }
+  const minIntervalMs = (value as { minIntervalMs?: unknown }).minIntervalMs;
+  if (typeof minIntervalMs !== "number" || !Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0) {
+    throw new Error("Invalid actor activation.minIntervalMs: use a non-negative safe integer in milliseconds");
+  }
+  return { minIntervalMs };
 }
 
 /** Public creation input; file instructions are resolved only by the actor owner. */
@@ -220,6 +261,12 @@ export interface FabricActorRequest {
    * same topic with the same value there is replaced by the newer one, in its queue place.
    */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
+  /** Optional per-source leading-edge minimum interval for agent_settled only; omitted is off. */
+  activation?: FabricActorActivationPolicy;
   /**
    * Skip-only rules checked before a queued event runs the model: preset names ("hold",
    * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
@@ -263,6 +310,20 @@ export interface FabricActorRequest {
   requires?: readonly (string | FabricCapabilityRequirement)[];
   /** Serialized guest predicate evaluated before work and before delivery. */
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
+}
+
+export interface FabricActorSessionOrphan {
+  oldRoot: string;
+  oldHost: string;
+  lastUpdated: number;
+  orphanedAt: number;
+  reason: string;
+  leadName?: string;
+  role?: string;
+  /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
+  alarmPublishedAt?: number;
 }
 
 export interface FabricActorInfo {
@@ -274,11 +335,19 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** Immutable interrupt delegation minted only by the owning Main at supervisor creation. */
+  supervisorFor?: string;
+  /** Exact registry lineage token; changes on adoption, including a return to the same root. */
+  ownershipToken?: string;
   /** The session that owns and runs the actor (from its `session:<id>` root), whoever reads it. */
   ownerSessionId?: string;
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
+  /** Present only while stopped; missing on a legacy stop means explicit. */
+  stopReason?: FabricActorStopReason;
+  /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */
+  sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
@@ -289,6 +358,11 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
@@ -324,9 +398,24 @@ export interface FabricActorInfo {
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
   queued: number;
   messages: number;
   createdAt: number;

@@ -62,8 +62,10 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
-  /** Required placement capabilities; any unmet need keeps process tasks local. */
+  /** Required placement capabilities; local always pins to Main, and unmet needs stay local. */
   needs?: string[];
+  /** Up to 64 absolute selected-host inputs, each at most 4096 UTF-8 bytes and without NUL. */
+  requires?: string[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
@@ -192,6 +194,7 @@ interface FabricParticipantInfo {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   status: string;
@@ -277,7 +280,22 @@ interface FabricLifecycleSubscription {
   lastEventId?: string;
   lastError?: string;
 }
+interface FabricTargetTerminalError extends Error {
+  readonly code: "FABRIC_TARGET_TERMINAL";
+  readonly targetId: string;
+  readonly finalAnswerReceiptId: string;
+}
+interface FabricTargetTerminalNotice {
+  code: "FABRIC_TARGET_TERMINAL";
+  targetId: string;
+  messageId: string;
+  delivery: "steer" | "followUp";
+  finalAnswerReceiptId: string;
+  sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
+}
 interface FabricAgentHandle {
+  /** Durable answer boundary; does not confirm native worker/tree exit. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */
   fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];
@@ -679,10 +697,13 @@ interface FabricActorHostSignal {
 type FabricActorActivation =
   | { readonly kind: "hostEvent"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly event: FabricActorHostEvent; readonly mainRevision: number; readonly taskRevision: number; readonly signal?: FabricActorHostSignal }
   | { readonly kind: "direct"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number }
-  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string };
+  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string; readonly data?: any };
+interface FabricActorRecordsOptions { topic: string; maxEntries?: number; maxAgeMs?: number }
+interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string; readonly fresh: boolean }
+interface FabricActorRecordsView { readonly get: (key: string) => Readonly<FabricActorRecord> | undefined }
 interface FabricActorValidityFacts {
   readonly activation: Readonly<FabricActorActivation>;
-  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number }>;
+  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number; records?: FabricActorRecordsView }>;
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
@@ -708,6 +729,11 @@ interface FabricActorActivationSkipRule {
 }
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
+/** Leading plus latest-trailing admission for host agent_settled only, per actor/source session. */
+interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; omitted activation or 0 is off. Pending retains its original boundary on restart. */
+  minIntervalMs: number;
+}
 /** Exactly one instruction source; file bytes are verified on the owning host. */
 type FabricActorInstructionsSource =
   | { instructions: string; instructionsFile?: never; sha256?: never }
@@ -725,6 +751,11 @@ interface FabricActorRequestBase {
   coalesce?: boolean;
   /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
+  /** Immediate leading agent_settled plus latest trailing at the original boundary; other kinds unaffected. */
+  activation?: FabricActorActivationPolicy;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
   /** Per-activation shadow routing; requires explicit model/thinking. */
@@ -746,6 +777,8 @@ interface FabricActorRequestBase {
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
+  /** Bounded host projection; default 512 entries, cap 4096, maxAgeMs default 6 h. Unknown is undefined. */
+  records?: FabricActorRecordsOptions;
   residency?: FabricParticipantResidency;
 }
 type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource & (
@@ -766,12 +799,16 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
   runner: FabricAgentRunner;
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
-type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed";
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 interface FabricActorInfo {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -797,6 +834,10 @@ interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
@@ -820,15 +861,33 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
   residency: FabricParticipantResidency;
   queued: number;
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Stopped only: explicit (agents.stop/remove), directive (its own stop) or host-exit (its session Main exited; that session's restart revives it). */
+  stopReason?: "explicit" | "directive" | "host-exit";
+  /** Fenced terminal foreign session-root record; never grants adoption. Its own session's restart revives it. */
+  sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */
@@ -908,7 +967,10 @@ type FabricMessageArgs = FabricMessageTarget & {
   /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
   idempotencyKey?: string;
 };
-type FabricMessageSteerArgs = FabricMessageArgs;
+type FabricMessageSteerArgs = FabricMessageArgs & {
+  /** Main only: preempt a running tool via native abort, then steer. No tool retry. */
+  priority?: "interrupt";
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -962,7 +1024,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { complexity?: "simple" | "normal" | "complex" | "delicate"; pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
@@ -1023,6 +1085,9 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
+  /** Alias of steer; uses the same authority and default delivery. */
+  send(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
+  send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;

@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { assertMeshStateReadable, MeshStore } from "./mesh/store.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
 import type { FabricParticipantInfo, FabricParticipantKind } from "./topology/types.js";
@@ -121,7 +122,15 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   // The store reads a damaged or envelope-invalid state.json (`{}`, `null`) as an empty state. For
   // a reader that keeps its last snapshot on failure, that must fail, not print [] (pi-fabric#157).
   // An absent state.json is an empty mesh.
+  // The backend is decided ONCE, here: a marker removed after this read cannot turn the SQLite read into a
+  // file read of a missing state.json (an empty mesh). The SQLite open re-checks the marker and refuses then.
+  const moved = readMeshStateMovedMarker(root) !== undefined;
   try {
+    // Any state.db without the marker (lstat: a link or a stray file counts) is a switched root that lost its
+    // marker or a half-done switch: never read it as an empty file mesh.
+    if (!moved && fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false })) {
+      throw new Error("state.db exists but state.json is not the moved marker");
+    }
     assertMeshStateReadable(root);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -129,7 +138,10 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
   }
   const id = `participants-cli:${process.pid}:${Date.now()}`;
   // An identity no participant has: this reader is not a host, so every entry lists local: false.
-  const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS);
+  // A root switched to SQLite (state.json is the moved marker) is read from state.db, whatever this
+  // process's configured backend is (smarty-dev#6477: the probe failed on every release after the switch).
+  const store = new ReadOnlyMeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS,
+    moved ? { stateBackend: "sqlite" } : {});
   const directory = new ParticipantDirectory(store, {
     enabled: true,
     hostId: id,
@@ -138,13 +150,17 @@ const listParticipants = (options: ParticipantsOptions = {}): FabricParticipantI
     reapDeadHosts: false,
   });
   // Scope project: the whole mesh without the reader's own synthetic self entry.
-  const participants = directory.list({
-    scope: "project",
-    fresh: true,
-    ...(options.includeStale ? { includeStale: true } : {}),
-    ...(options.kinds ? { kinds: options.kinds } : {}),
-  });
-  return participants;
+  try {
+    return directory.list({
+      scope: "project",
+      fresh: true,
+      ...(options.includeStale ? { includeStale: true } : {}),
+      ...(options.kinds ? { kinds: options.kinds } : {}),
+    });
+  } finally {
+    // Release the state.db handle: an open handle holds the file (Windows EBUSY) after the CLI returns.
+    store.closeState();
+  }
 };
 
 export const main = async (

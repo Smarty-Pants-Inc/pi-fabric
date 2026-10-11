@@ -40,6 +40,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/spawn-router.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -76,6 +77,7 @@ const lazy = [
   "worker/activation-window.js",
   "worker/activation-compaction.js",
   "worker/context-admission.js",
+  "worker/context-reseed.js",
   "worker/reply-tool.js",
   "worker/principal-delivery.js",
   "guards/foreground-wait.js",
@@ -90,7 +92,9 @@ const lazy = [
   "worker/run-record.js",
   "worker/session-export.js",
 ];
-const entries = [...stable, ...lazy];
+// Executable-only entry: syntax/declarations/maps are required, but importing it runs a command.
+const executable = ["bash-idle-watchdog.js"];
+const entries = [...stable, ...lazy, ...executable];
 const declarations = entries.map((file) => file.replace(/\.js$/, ".d.ts"));
 const required = [
   "worker-protocol.json",
@@ -99,9 +103,34 @@ const required = [
   ...declarations,
   ...declarations.map((file) => `${file}.map`),
 ];
-if (process.platform === "linux") required.push("native/fabric-landlock");
+if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease", "native/manifest.json");
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
+if (process.platform === "linux") {
+  // The native helpers are the twice-built, byte-identical outputs recorded in the manifest (build-landlock.mjs).
+  const manifest = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
+  // smarty-dev#8121: the pinned zig (native/toolchain.json), or an unpinned host gcc/clang.
+  const pinned = manifest.toolchain === "pinned" && /^zig \d+\.\d+\.\d+ \(/.test(String(manifest.compiler ?? ""));
+  if (!pinned && (manifest.toolchain !== "unpinned" || !/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? "")))) {
+    throw new Error(`Native manifest names no pinned zig and no unpinned gcc or clang compiler: ${manifest.toolchain} ${manifest.compiler}`);
+  }
+  // CI and release builds ship the helpers: only a local development build may stay on the host compiler.
+  if (!pinned && (process.env.CI === "true" || process.env.FABRIC_NATIVE_CC_PINNED === "1")) {
+    throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
+  }
+  if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
+  for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
+    const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
+    if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {
+      throw new Error(`Native helper ${helper} sha256 ${actual} differs from the build manifest (${manifest.helpers?.[helper]})`);
+    }
+  }
+  // The operator's readiness gate trusts only the digest compiled into its bundle (reader-proof.ts).
+  const cli = readFileSync(join(dist, "mesh/mesh-backend-cli.js"), "utf8");
+  if (!cli.includes(`"fabric-mesh-lease":"${manifest.helpers["fabric-mesh-lease"]}"`)) {
+    throw new Error("dist/mesh/mesh-backend-cli.js does not embed the fabric-mesh-lease digest of the build manifest (a lost esbuild define)");
+  }
+}
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
 const workerProtocol = JSON.parse(readFileSync(join(dist, "worker-protocol.json"), "utf8"));
@@ -181,7 +210,7 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
+for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
@@ -195,6 +224,10 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
+  .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
+  throw new Error("Spawn router adapter escaped into the eager/provider static graph");
+}
 if (/src\/judge(?:\/|-cli)/.test(initialSource)) throw new Error("Judge code escaped into startup graph");
 if (manifest.bin?.["fabric-judge"] !== "./bin/fabric-judge" || !existsSync(join(root, "bin/fabric-judge"))) throw new Error("Missing fabric-judge bin");
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));

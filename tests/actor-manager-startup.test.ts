@@ -56,8 +56,9 @@ function fixture(count: number) {
 }
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function eventually(predicate: () => boolean) {
-  const deadline = Date.now() + 10_000;
+// A failure deadline, not a performance budget: the asserted bounds are per-turn work.
+async function eventually(predicate: () => boolean, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) { if (Date.now() >= deadline) throw new Error("Retention did not complete"); await turn(); }
 }
 
@@ -105,7 +106,10 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       // No archive traversal or deletion on the constructor stack.
       expect(totalRuns).toBe(0);
       expect(fs.existsSync(f.runDir(0, 0))).toBe(true);
-      await eventually(() => !fs.existsSync(f.runDir(199, 8)));
+      // 2,000 real archive sweeps (plus the 6,000-file fixture above) are filesystem
+      // bound: a loaded Linux runner or Windows (Defender, NTFS) can take tens of
+      // seconds. Wall time stays unasserted; the per-turn work bounds below are the gate.
+      await eventually(() => !fs.existsSync(f.runDir(199, 8)), 45_000);
       await turn();
       // A recurring setImmediate observes every maintenance turn. A microtask
       // yield (or no yield) cannot reset the counter, even on a fast filesystem.
@@ -122,16 +126,17 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
         longestSliceMs: longest, totalRuns, maxRunsPerTurn: Math.max(...runsPerTurn),
         runsPerTurnLimit: batchSize * runsPerActor, workTurns: runsPerTurn.length }) + "\n");
     } finally { active = false; clearImmediate(heartbeat!); }
-  });
+  }, 60_000);
 
   it("yields Windows startup maintenance between actors without adding per-run filesystem work", async () => {
     const f = fixture(17);
     vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const lstat = fs.lstatSync;
-    let statusProbes = 0;
+    let statusProbes = 0, probesThisTurn = 0;
+    const probesPerTurn: number[] = [];
     vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
       if (path.basename(String(file)) === "status.json" && String(file).includes(`${path.sep}runs${path.sep}run-`)) {
-        statusProbes++;
+        statusProbes++; probesThisTurn++;
         // Controlled metadata latency, independent of whether this host has NTFS.
         // Eight actors share 72 candidates: four status probes/run at 2 ms each
         // exceed the existing heartbeat bound. One actor still does identical work.
@@ -143,8 +148,13 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     await turn();
     let previous = performance.now(), longest = 0, active = true;
     let heartbeat: NodeJS.Immediate;
+    // A recurring setImmediate observes every maintenance turn. Count the slow
+    // metadata work each turn performs instead of timing it: a shared Windows
+    // runner can deschedule any turn for seconds, but cannot change this count.
     const beat = () => {
       const now = performance.now(); longest = Math.max(longest, now - previous); previous = now;
+      if (probesThisTurn) probesPerTurn.push(probesThisTurn);
+      probesThisTurn = 0;
       if (active) heartbeat = setImmediate(beat);
     };
     heartbeat = setImmediate(beat);
@@ -152,9 +162,15 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
       f.make();
       await eventually(() => !fs.existsSync(f.runDir(16, 8)));
       await turn();
-      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest }) + "\n");
-      expect(statusProbes).toBe(17 * 9 * 4); // Same four status metadata probes per candidate as main.
-      expect(longest).toBeLessThan(250);
+      const probesPerActor = 9 * 4; // Nine expired runs, four status metadata probes each.
+      process.stdout.write(JSON.stringify({ probe: "Windows startup metadata latency", statusProbes, longestSliceMs: longest,
+        maxProbesPerTurn: Math.max(...probesPerTurn), workTurns: probesPerTurn.length }) + "\n");
+      expect(statusProbes).toBe(17 * probesPerActor); // Same four status metadata probes per candidate as main.
+      // Windows yields after every actor: no turn may carry a second actor's metadata
+      // work (8 actors/turn would be 288 probes), and the sweep spans one turn per actor.
+      expect(Math.max(...probesPerTurn)).toBe(probesPerActor);
+      expect(probesPerTurn.length).toBe(17);
+      expect(probesPerTurn.every((count) => count === probesPerActor)).toBe(true);
       for (let actor = 0; actor < 17; actor++) expect(fs.existsSync(f.runDir(actor, 9))).toBe(true);
     } finally { active = false; clearImmediate(heartbeat!); }
   });
@@ -229,7 +245,8 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
   });
 
   it("reads a shared foreign lineage once per synchronous refresh, never once per actor", () => {
-    const f = fixture(200);
+    // Three retention batches (8 per batch) tell once-per-refresh from once-per-actor; 200 actors took ~4 s (smarty-dev#7834).
+    const f = fixture(17);
     const lineageAlive = vi.fn(() => true);
     const manager = f.make({ rootId: "session:other", canManageActor: () => undefined,
       snapshotActorOwnership: () => new Map(), lineageAlive });

@@ -24,6 +24,8 @@ import type {
 } from "../src/lifecycle/types.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  loadFabricConfig,
+  normalizeFabricConfig,
   type FabricAgentConfig,
   type FabricModelsConfig,
 } from "../src/config.js";
@@ -55,7 +57,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { FabricExecutionService } from "../src/execution-service.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
+import type { AgentRunRecord, AgentRunRequest } from "../src/agents/types.js";
 import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
@@ -82,6 +84,7 @@ const usage = {
 
 const visiblePiModels = [
   { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
   { provider: "cliproxyapi", id: "gpt-6-astra" },
   { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
@@ -93,6 +96,28 @@ const visiblePiModels = [
   { provider: "provider", id: "model-a" },
   { provider: "provider", id: "model-b" },
 ];
+
+describe("records option", () => {
+  it.each(["create", "createActor"])("%s retains and normalizes records through the provider", async action => {
+    const { provider, actors } = setup();
+    const result = await provider.invoke(action, { name: "records-org", instructions: "Work.",
+      records: { topic: "org.records", maxEntries: 10_000, maxAgeMs: 1_234 } }, context) as FabricActorInfo;
+    expect(result.records).toEqual({ topic: "org.records", maxEntries: 4096, maxAgeMs: 1_234 });
+    expect(actors.status(result.id).records).toEqual(result.records);
+    await expect(provider.invoke(action, { name: "records-invalid", instructions: "Work.",
+      records: { topic: 7 } }, context)).rejects.toThrow(/records topic/);
+    await expect(provider.invoke(action, { name: "records-invalid-age", instructions: "Work.",
+      records: { topic: "org.records", maxAgeMs: 0 } }, context)).rejects.toThrow(/maxAgeMs/);
+  });
+  it("retains records in a global template and its live import", async () => {
+    const { provider } = setup();
+    const template = await provider.invoke("create", { scope: "global", name: "records-template", instructions: "Work.",
+      records: { topic: "org.records" } }, context) as { id: string; records: unknown };
+    expect(template.records).toEqual({ topic: "org.records", maxEntries: 512, maxAgeMs: 21_600_000 });
+    const imported = await provider.invoke("import", { id: template.id }, context) as FabricActorInfo;
+    expect(imported.records).toEqual(template.records);
+  });
+});
 
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
@@ -574,7 +599,7 @@ describe("fleet model policy (#2490)", () => {
   it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
-      agentsConfig: policy, callerThinking: "max",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
     const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
@@ -748,7 +773,7 @@ const setup = (
           (options.scope !== "lineage" || participant.rootId === identity.id),
       ),
     get: (id) => members.find((participant) => participant.id === id),
-    self: () => ({
+    self: () => ({ ownerIncarnation: "fixture:owner",
       format: 1,
       id: identity.id,
       kind: "root",
@@ -813,6 +838,74 @@ const setup = (
     actorDeliveries,
   };
 };
+
+describe("configured task model precedence (#2890, #6062)", () => {
+  const sol = "cliproxyapi/gpt-6.1-sol";
+  const opus = "cliproxyapi-anthropic/claude-opus-5-5";
+  const callers = (["main", "actor", "agent"] as const)
+    .flatMap(kind => (["run", "spawn"] as const).map(action => [kind, action] as const));
+  const parentContext = {
+    ...context,
+    extensionContext: {
+      ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext,
+  };
+  const callerOptions = (kind: "main" | "actor" | "agent", agentsConfig: FabricAgentConfig) => ({
+    identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+    ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
+    agentsConfig,
+    callerThinking: "xhigh",
+  });
+
+  for (const scope of ["global", "project"] as const) {
+    it.each(callers)(`${scope} model/effort wins for %s caller via %s`, async (kind, action) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-task-default-"));
+      roots.push(root);
+      const cwd = path.join(root, "workspace"); const agentDir = path.join(root, "agent");
+      fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+      fs.mkdirSync(agentDir);
+      if (scope === "project") {
+        fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { model: opus, thinking: "low" } }));
+      }
+      const configPath = scope === "global" ? path.join(agentDir, "fabric.json") : path.join(cwd, ".pi", "fabric.json");
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { model: sol, thinking: "high" } }));
+      const config = loadFabricConfig({ cwd, agentDir, projectTrusted: true });
+      const { provider, agents } = setup([], [], undefined, { ...callerOptions(kind, config.agents), cwd });
+      const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+      expect(child).toMatchObject({ model: sol, thinking: "high" });
+      if (action === "spawn") expect((await agents.wait(child.id)).status).toBe("completed");
+      else expect(child.status).toBe("completed");
+    });
+  }
+
+  it.each(callers)("unconfigured model inherits %s caller via %s, not the remote Main", async (kind, action) => {
+    const config = normalizeFabricConfig({ agents: { thinking: "high" } });
+    const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
+    const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "xhigh" });
+    if (action === "spawn") await agents.wait(child.id);
+  });
+
+  it.each(callers)("explicit model/effort beats configured defaults for %s caller via %s", async (kind, action) => {
+    const config = normalizeFabricConfig({ agents: { model: sol, thinking: "high" } });
+    const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
+    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "low" });
+    if (action === "spawn") await agents.wait(child.id);
+  });
+
+  it.each([undefined, "high"] as const)("configured thinking %s has precedence over an alias, not built-in medium", async thinking => {
+    const config = normalizeFabricConfig({ agents: { model: "task-default", ...(thinking ? { thinking } : {}) } });
+    const { provider, agents } = setup([], [], undefined, {
+      ...callerOptions("main", config.agents),
+      modelsConfig: { aliases: { "task-default": { targets: [sol], thinking: "low" } } },
+    });
+    const child = await provider.invoke("spawn", { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: sol, thinking: thinking ?? "low" });
+    await agents.wait(child.id);
+  });
+});
 
 describe("#2643 immediate bound spawner routing", () => {
   it.each(["session", "durable"] as const)("routes a %s actor child's spawner followUp to the actor, not root Main", async (residency) => {
@@ -1307,7 +1400,7 @@ describe("Main remote ASK observation ownership", () => {
       const connected = bridge;
       pump = (async () => { while (pumping) { await connected.step(); await new Promise(resolve => setTimeout(resolve, 20)); } })();
     }
-    const member: FabricParticipantInfo = { format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: owner.identity.id, ownerHostId: ownerId, ownerIdentityId: owner.identity.id, status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "stop", "actor-bindings"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false, ...(route === "mesh" ? { remoteHost: "remote-machine" } : {}) };
+    const member: FabricParticipantInfo = { format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: owner.identity.id, ownerHostId: ownerId, ownerIdentityId: owner.identity.id, ownerIncarnation: ownerControl.incarnation, status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "stop", "actor-bindings"], startedAt: 1, updatedAt: 1, controlProtocol: "v1", local: false, stale: false, ...(route === "mesh" ? { remoteHost: "remote-machine" } : {}) };
     const sender = setup([], [member], senderControl);
     const stop = vi.spyOn(owner.agents, "stop");
     const run = vi.spyOn(owner.agents, "run");
@@ -1364,7 +1457,7 @@ describe("Main remote ASK observation ownership", () => {
         // A bridged deadline cannot be shortened below 30 s. Bound this deliberately
         // unsupported actor ACK with explicit observation cancellation, not a short deadline.
         const stopController = new AbortController();
-        const stopping = senderControl.request(ownerId, actor.id, "stop", {}, ownerId,
+        const stopping = senderControl.request(ownerId, actor.id, "stop", { ownerIncarnation: ownerControl.incarnation }, ownerId,
           { timeoutMs: 500, routedRemoteHost: "remote-machine", signal: stopController.signal }).catch(error => {
             expect(error.message).toContain("cancelled");
           });
@@ -2334,10 +2427,40 @@ describe("AgentsProvider runner support", () => {
     expect(status).not.toHaveBeenCalled();
   });
 
+  it.each(["legacy", "v1"] as const)("remote ask uses the unfenced legacy path for an epochless %s peer", async controlProtocol => {
+    const id = "actor:older";
+    const member = { format: 1, id, kind: "actor", rootId: "session:older", ownerHostId: "host:older", ownerIdentityId: "session:older",
+      name: "old actor", status: "idle", runner: "pi", transport: "host", capabilities: ["ask"],
+      startedAt: 1, updatedAt: 2, controlProtocol, local: false, stale: false } as FabricParticipantInfo;
+    const requestResult = vi.fn().mockResolvedValue({ id: "legacy-reply", text: "done" });
+    const request = vi.fn();
+    const { provider, actors } = setup([], [member], { request, requestResult } as unknown as FabricControlPlane);
+    const legacy = vi.spyOn(actors, "steerRemote");
+    await expect(provider.invoke("ask", { id, message: "legacy delivery", data: { ownerIncarnation: "payload-forgery" } }, context))
+      .resolves.toMatchObject({ id: "legacy-reply" });
+    expect(requestResult.mock.calls[0]![3].ownerIncarnation).toBeUndefined();
+    expect(request).not.toHaveBeenCalled(); expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("remote ask stamps the target's current directory epoch, not caller data", async () => {
+    const id = "actor:fenced";
+    const member = { format: 1, id, kind: "actor", rootId: "session:owner", ownerHostId: "host:owner", ownerIdentityId: "session:owner",
+      ownerIncarnation: "current:ask-1", name: "fenced actor", status: "idle", runner: "pi", transport: "host", capabilities: ["ask"],
+      startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false } as FabricParticipantInfo;
+    const requestResult = vi.fn().mockResolvedValue({ id: "reply", text: "done" });
+    const { provider } = setup([], [member], { requestResult } as unknown as FabricControlPlane);
+    for (const epoch of ["current:ask-1", "current:ask-2"]) {
+      member.ownerIncarnation = epoch;
+      await expect(provider.invoke("ask", { id, message: "fenced", data: { ownerIncarnation: "payload-forgery" } }, context))
+        .resolves.toMatchObject({ id: "reply" });
+      expect(requestResult.mock.calls.at(-1)![3]).toMatchObject({ ownerIncarnation: epoch });
+    }
+  });
+
   it.each(["followUp", "steer", "tell"])("%s refreshes an exact-id negative lookup using the same peers directory", async (action) => {
     const id = "session:remote-root";
     const peer = { id, host: "forge" } as FabricPeerInfo;
-    const root = { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
+    const root = { ownerIncarnation: "fixture:owner", format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id,
       name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
       startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false, stale: false, remoteHost: "forge" } as FabricParticipantInfo;
     const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh", messageId: "fresh" });
@@ -2346,7 +2469,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("peers", {}, context)).resolves.toEqual([peer]);
     await expect(provider.invoke(action, { id, message: "hello" }, context)).resolves.toMatchObject({ messageId: "fresh" });
     expect(request).toHaveBeenCalledExactlyOnceWith(id, id, action === "steer" ? "steer" : "followUp",
-      { message: "hello", data: undefined, principal: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge", idempotencyKey: expect.any(String) });
+      { ownerIncarnation: "fixture:owner", message: "hello", data: undefined, principal: undefined, ...(action === "steer" ? {} : { triggerTurn: true }) }, id, { routedRemoteHost: "forge", idempotencyKey: expect.any(String) });
   });
 
   it.each(["followUp", "steer", "tell"])("%s names a peers-listed root whose mirror is not admissible", async (action) => {
@@ -2359,6 +2482,7 @@ describe("AgentsProvider runner support", () => {
 
   it.each([
     ["directory-unavailable", "FabricDirectoryUnavailableError", "FABRIC_DIRECTORY_UNAVAILABLE"],
+    ["incarnation-required", "FabricControlIncarnationRequiredError", "FABRIC_CONTROL_INCARNATION_REQUIRED"],
     ["not-yet-mirrored", "FabricParticipantNotYetMirroredError", "FABRIC_PARTICIPANT_NOT_YET_MIRRORED"],
     ["non-interactive", "FabricParticipantNonInteractiveError", "FABRIC_PARTICIPANT_NON_INTERACTIVE"],
     ["ambiguous", "FabricProjectAgentAmbiguousError", "FABRIC_PROJECT_AGENT_AMBIGUOUS"],
@@ -2367,11 +2491,12 @@ describe("AgentsProvider runner support", () => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-guest-error-"));
     roots.push(lane);
     const id = "session:11111111-1111-4111-8111-111111111111";
-    const base = { format: 1, id, rootId: id, ownerHostId: id, ownerIdentityId: id, kind: "root",
+    const base = { ownerIncarnation: "fixture:owner", format: 1, id, rootId: id, ownerHostId: id, ownerIdentityId: id, kind: "root",
       name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
       startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
       role: "project-agent", project: projectOf(lane) } as FabricParticipantInfo;
-    const members = scenario === "non-interactive" ? [{ ...base, interactive: false }]
+    const members = scenario === "incarnation-required" ? [{ ...base, ownerIncarnation: "" }]
+      : scenario === "non-interactive" ? [{ ...base, interactive: false }]
       : scenario === "ambiguous" ? [base, { ...base, id: "session:22222222-2222-4222-8222-222222222222" }] : [];
     const peers = scenario === "not-yet-mirrored" ? [{ id, host: "forge" } as FabricPeerInfo] : [];
     const { provider, participants } = setup(peers, members, undefined, { cwd: lane });
@@ -2427,7 +2552,7 @@ describe("AgentsProvider runner support", () => {
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
     fs.mkdirSync(path.join(lane, ".local"));
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
-    const base = { format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
+    const base = { ownerIncarnation: "fixture:owner", format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
       stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
     const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
@@ -2438,8 +2563,15 @@ describe("AgentsProvider runner support", () => {
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.
+  // smarty-dev#7554: run outside the checkout, whose lane may carry its own .local/lead marker.
+  const leaderlessProject = () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-project-"));
+    roots.push(cwd);
+    return { cwd, project: projectOf(cwd), context: { ...context, cwd } };
+  };
+
   it("returns this session's project agent", async () => {
-    const project = projectOf(process.cwd());
+    const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
@@ -2453,7 +2585,7 @@ describe("AgentsProvider runner support", () => {
       ...base, id: "session:other", rootId: "session:other", ownerHostId: "session:other", ownerIdentityId: "session:other",
       sessionId: "other", role: "project-agent", project: "/elsewhere", cwd: "/elsewhere",
     } as FabricParticipantInfo;
-    const { provider } = setup([], [other, lead]);
+    const { provider } = setup([], [other, lead], undefined, { cwd });
     await expect(provider.invoke("projectAgent", {}, context)).resolves.toMatchObject({ id: "session:lead" });
     expect((await provider.describe("projectAgent", context))?.risk).toBe("read");
   });
@@ -2461,7 +2593,7 @@ describe("AgentsProvider runner support", () => {
   // smarty-dev#2045 (security review F1 on pi-fabric#132): a mirrored root's role and project are
   // the remote's own claims and never make it this project's leader.
   it("never returns a mirrored root as the project agent, even newer than the native one", async () => {
-    const project = projectOf(process.cwd());
+    const { cwd, project, context } = leaderlessProject();
     const base = {
       format: 1 as const, kind: "root" as const, name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"] as FabricParticipantInfo["capabilities"],
@@ -2475,9 +2607,9 @@ describe("AgentsProvider runner support", () => {
       ...base, id: "session:remote", rootId: "session:remote", ownerHostId: "session:remote", ownerIdentityId: "session:remote",
       sessionId: "remote", startedAt: 99, remoteHost: "forge",
     } as FabricParticipantInfo;
-    await expect(setup([], [lead, mirrored]).provider.invoke("projectAgent", {}, context))
+    await expect(setup([], [lead, mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
       .resolves.toMatchObject({ id: "session:lead" });
-    await expect(setup([], [mirrored]).provider.invoke("projectAgent", {}, context))
+    await expect(setup([], [mirrored], undefined, { cwd }).provider.invoke("projectAgent", {}, context))
       .rejects.toThrow(`No live project agent for ${project}`);
     // Resident delivery never elects a replacement: even a recorded integrator cannot inherit
     // a dead root's actor output, and an unrecorded mirror cannot either.
@@ -2489,14 +2621,14 @@ describe("AgentsProvider runner support", () => {
 
   it("lists current and peer roots as symmetric session agents", async () => {
     const roots: FabricParticipantInfo[] = [
-      {
+      { ownerIncarnation: "fixture:owner",
         format: 1, id: "session:test", kind: "root", rootId: "session:test",
         ownerHostId: "session:test", ownerIdentityId: "session:test", name: "main",
         status: "idle", runner: "pi", transport: "host",
         capabilities: ["steer", "followUp", "fabric"], sessionId: "test",
         startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: true, stale: false,
       },
-      {
+      { ownerIncarnation: "fixture:owner",
         format: 1, id: "session:peer", kind: "root", rootId: "session:peer",
         ownerHostId: "session:peer", ownerIdentityId: "session:peer", name: "main",
         status: "running", runner: "pi", transport: "host",
@@ -2511,7 +2643,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it("creates, lists, and removes source-qualified lifecycle subscriptions", async () => {
-    const target: FabricParticipantInfo = {
+    const target: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1,
       id: "session:test",
       kind: "root",
@@ -2617,7 +2749,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it("rejects remote Main delivery after its capabilities are withdrawn", async () => {
-    const remoteRoot: FabricParticipantInfo = {
+    const remoteRoot: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1,
       id: "session:test",
       kind: "root",
@@ -2651,7 +2783,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it("tells a sender that a quiesced Main is shutting down (smarty-dev#1113)", async () => {
-    const stopping: FabricParticipantInfo = {
+    const stopping: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1, id: "session:test", kind: "root", rootId: "session:test", ownerHostId: "session:test",
       ownerIdentityId: "session:test", name: "main", status: "stopping", runner: "pi", transport: "host",
       capabilities: [], cwd: process.cwd(), sessionId: "test", startedAt: 1, updatedAt: 2, controlProtocol: "v1",
@@ -2665,7 +2797,7 @@ describe("AgentsProvider runner support", () => {
   });
 
   it("projects remote agents through members, scoped list, and status", async () => {
-    const remote: FabricParticipantInfo = {
+    const remote: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1,
       id: "agent:remote",
       kind: "agent",
@@ -2743,8 +2875,14 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("list", {}, context)).resolves.toBeInstanceOf(Array);
   });
 
-  it.each([undefined, "handoff-review"])("defers handoff until the finalized outer Fabric result and records its class: %s", async routeClass => {
+  it.each([[undefined, false], ["handoff-review", false], [undefined, true]] as const)("defers handoff until the finalized outer Fabric result and records its class: %s, interrupted=%s", async (routeClass, interrupted) => {
     const { provider, root, agents } = setup();
+    const warning = "final report interrupted by a model stream error; showing the last persisted output";
+    if (interrupted) {
+      const wait = agents.wait.bind(agents);
+      vi.spyOn(agents, "wait").mockImplementation(async (...args) => ({ ...await wait(...args), status: "failed",
+        text: "VERDICT: PASS", partialText: "VERDICT: PASS", error: "stream disconnected", warnings: [warning], exitCode: 1 }));
+    }
     const source = SessionManager.create(process.cwd(), path.join(root, "source-session"));
     source.appendMessage({
       role: "user",
@@ -2836,9 +2974,10 @@ describe("AgentsProvider runner support", () => {
 
     expect(result).toMatchObject({
       handedOff: true,
-      completed: true,
-      status: "completed",
-      implementation: "fake worker complete",
+      completed: !interrupted,
+      status: interrupted ? "failed" : "completed",
+      implementation: interrupted ? "VERDICT: PASS" : "fake worker complete",
+      ...(interrupted ? { partialText: "VERDICT: PASS", warnings: [warning], exitCode: 1, error: "stream disconnected" } : {}),
       agent: { model: "anthropic/executor" },
     });
     const expectedClass = { routeClass: routeClass ?? "handoff", routeClassSource: routeClass !== undefined ? "explicit" : "derived", protected: true };
@@ -2846,7 +2985,7 @@ describe("AgentsProvider runner support", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, "runs", result.agent.id, "status.json"), "utf8")))
       .toMatchObject(expectedClass);
     expect(updates).toContainEqual(expect.stringContaining("caller is waiting"));
-    expect(updates).toContainEqual(expect.stringContaining("completed implementation"));
+    expect(updates).toContainEqual(expect.stringContaining(interrupted ? "ended with failed" : "completed implementation"));
     const task = fs.readFileSync(
       path.join(root, "runs", result.agent.id, "task.txt"),
       "utf8",
@@ -4024,7 +4163,7 @@ describe("#2726 resident actor live read views", () => {
     const actor = passive.status(created.id);
     expect(passive.owns(actor.id)).toBe(false);
     expect(actor).toMatchObject({ status: stopped ? "stopped" : "idle", queued: 0, lastRunId: "settled-review-run" });
-    const cached: FabricParticipantInfo = {
+    const cached: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1, id: actor.id, kind: "actor", rootId: state.identity.id,
       ownerHostId: "resident:owner", ownerIdentityId: "resident:owner", parentId: state.identity.id,
       name: "owner display name must not replace definition", status: "idle", residency: "durable",
@@ -4340,6 +4479,73 @@ describe("AgentsProvider retained run authorization", () => {
 });
 
 describe("AgentsProvider shared actor definitions", () => {
+  it.each([false, true])("round 2 members keeps a legacy binding unknown under a diverging overlay with project defaults=%s (#7682, #8487)", async hasDefaults => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "legacy-member", instructions: "Observe.",
+      ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
+    });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].projectDefaults;
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const reader = new ActorManager("test", state.identity, state.mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(reader);
+    await reader.setModel(actor.id, "provider/reader-overlay");
+    await reader.setThinking(actor.id, "high");
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => reader.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, reader, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      const members = await provider.invoke("members", { kinds: ["actor"] }, context) as FabricParticipantInfo[];
+      expect(members).toHaveLength(1);
+      expect(members[0]?.id).toBe(actor.id);
+      // The owner's overlay now differs from the row's persisted model/thinking, so a run
+      // would not pin them: unknown (pi-fabric#843), and never the overlay itself.
+      expect(members[0]?.model).toBeUndefined();
+      expect(members[0]?.thinking).toBeUndefined();
+      expect(reader.status(actor.id)).toMatchObject({ model: "provider/reader-overlay", thinking: "high" });
+    } finally { await directory.close(); }
+  });
+
+  it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
+    const state = setup();
+    const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    const directory = new ParticipantDirectory(state.mesh, { enabled: true,
+      hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
+    directory.registerSource(() => state.actors.listOwned(true).map(info =>
+      actorParticipantRecord(info, state.mainAgent.id, state.identity.id, state.identity.id, state.identity.id)));
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent,
+      directory, undefined, state.lifecycle);
+    try {
+      await directory.start();
+      await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+      await state.actors.setThinking(actor.id, "xhigh");
+      await state.actors.ask(actor.id, "first run");
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" }),
+      ]);
+      await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
+        binding: { model: "provider/foreign", thinking: "low" },
+      });
+      await directory.refresh();
+      expect(await provider.invoke("members", { kinds: ["actor"] }, context)).toEqual([
+        expect.objectContaining({ id: actor.id, model: "provider/foreign", thinking: "low" }),
+      ]);
+      expect(state.actors.status(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6-luna",
+        projectDefaults: { model: "anthropic/claude-opus-5-5" } });
+    } finally { await directory.close(); }
+  });
+
   it("refuses an unbound public log cursor instead of silently reusing bytes", async () => {
     const { provider, actors } = setup();
     const actor = await actors.create(createRequest as FabricActorRequest);
@@ -4353,7 +4559,7 @@ describe("AgentsProvider shared actor definitions", () => {
     const members: FabricParticipantInfo[] = [];
     const { provider, actors } = setup([], members);
     const actor = await actors.create(createRequest as FabricActorRequest);
-    members.push({
+    members.push({ ownerIncarnation: "fixture:owner",
       format: 1,
       id: actor.id,
       kind: "actor",
@@ -4432,7 +4638,7 @@ describe("AgentsProvider shared actor definitions", () => {
     await actors.cede(actor.id);
     await actors.setModel(actor.id, "provider/session");
     await actors.setThinking(actor.id, "low");
-    members.push({
+    members.push({ ownerIncarnation: "fixture:owner",
       format: 1,
       id: actor.id,
       kind: "actor",
@@ -4495,7 +4701,7 @@ describe("AgentsProvider shared actor definitions", () => {
 
   // smarty-dev#1323: a spawner could not steer its durable child ("Unknown Fabric participant").
   it("routes steer and followUp to a remote agent through its owner", async () => {
-    const child: FabricParticipantInfo = {
+    const child: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1, id: "4d7629e5a6e54f8aa913fa099d379593", kind: "agent", rootId: "session:test",
       ownerHostId: "resident:5c7d5dcf0ec46f0d40d91176", ownerIdentityId: "identity:resident", parentId: "session:test",
       name: "handoff", status: "running", residency: "durable", runner: "pi", transport: "process",
@@ -4507,16 +4713,16 @@ describe("AgentsProvider shared actor definitions", () => {
       const idempotencyKey = `retry-${kind}`;
       await expect(provider.invoke(kind, { id: child.id, message: `correct it (${kind})`, data: { key: "k" }, idempotencyKey }, context))
         .resolves.toMatchObject({ acknowledged: true });
-      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { message: `correct it (${kind})`, data: { key: "k" }, principal: undefined }, child.ownerIdentityId, { routedRemoteHost: null, idempotencyKey });
+      expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, kind, { ownerIncarnation: "fixture:owner", message: `correct it (${kind})`, data: { key: "k" }, principal: undefined }, child.ownerIdentityId, { routedRemoteHost: null, idempotencyKey });
     }
     await expect(provider.stopParticipant(child.id)).resolves.toMatchObject({ acknowledged: true });
-    expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", {}, child.ownerIdentityId, { routedRemoteHost: null });
+    expect(request).toHaveBeenLastCalledWith(child.ownerHostId, child.id, "stop", { ownerIncarnation: child.ownerIncarnation }, child.ownerIdentityId, { routedRemoteHost: null });
     const unsteerable = setup([], [{ ...child, capabilities: ["stop"] }], { request } as unknown as FabricControlPlane).provider;
     await expect(unsteerable.routeMessage(child.id, "no", undefined, "steer")).rejects.toThrow("does not support steer");
   });
 
   it("routes ask and tell for a remote actor absent from the local registry", async () => {
-    const participant: FabricParticipantInfo = {
+    const participant: FabricParticipantInfo = { ownerIncarnation: "fixture:owner",
       format: 1,
       id: "actor:resident-child",
       kind: "actor",
@@ -4564,7 +4770,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "host:resident",
       participant.id,
       "ask",
-      { message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
+      { ownerIncarnation: "fixture:owner", message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
       "identity:resident",
       { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
     );
@@ -4580,6 +4786,20 @@ describe("AgentsProvider shared actor definitions", () => {
       expect.objectContaining({ message: "queue", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } }),
       "identity:resident",
       { routedRemoteHost: null, idempotencyKey: expect.any(String) },
+    );
+
+    // smarty-dev#6729: the outcome-unknown error names an idempotencyKey retry; tell must accept it.
+    const tell = await provider.describe("tell", context);
+    const tellProperties = (tell?.inputSchema as { properties: Record<string, unknown>; additionalProperties: boolean }).properties;
+    expect(tellProperties.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 200 });
+    await provider.invoke("tell", { id: participant.id, message: "queue", idempotencyKey: "tell-retry" }, context);
+    expect(request).toHaveBeenLastCalledWith(
+      "host:resident",
+      participant.id,
+      "followUp",
+      expect.objectContaining({ message: "queue" }),
+      "identity:resident",
+      { routedRemoteHost: null, idempotencyKey: "tell-retry" },
     );
   });
 
@@ -4677,6 +4897,7 @@ describe("AgentsProvider shared actor definitions", () => {
       rootId: ownerIdentity.id,
       ownerHostId: "host:a",
       ownerIdentityId: ownerIdentity.id,
+      ownerIncarnation: ownerControl.incarnation,
       parentId: ownerIdentity.id,
       name: actor.name,
       status: "idle",
@@ -4696,7 +4917,7 @@ describe("AgentsProvider shared actor definitions", () => {
     ): FabricParticipantSource => ({
       list: () => [participantFor(local)],
       get: (id) => id === actor.id ? participantFor(local) : undefined,
-      self: () => ({
+      self: () => ({ ownerIncarnation: "fixture:owner",
         format: 1,
         id: identity.id,
         kind: "root",
@@ -4805,7 +5026,8 @@ describe("AgentsProvider shared actor definitions", () => {
       fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };
     expect(registry.actors).toContainEqual(
-      expect.objectContaining({ id: actor.id, model: "provider/project-default" }),
+      expect.objectContaining({ id: actor.id, model: "provider/project-default", thinking: "medium",
+        resolvedBinding: { model: "provider/model-b", thinking: "medium" } }),
     );
   });
 
@@ -5276,6 +5498,24 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: "not a path" }, context)).rejects.toThrow("Invalid actor coalesceKey");
     await expect(provider.invoke("setCoalesceKey", { id: actor.id }, context)).rejects.toThrow("coalesceKey is required");
     await expect(provider.invoke("create", { name: "bad", instructions: "x", coalesceKey: "" }, context)).rejects.toThrow("Invalid actor coalesceKey");
+  });
+
+  it("creates and imports an actor with an explicit dedupeKey independently of coalesceKey", async () => {
+    const { provider } = setup();
+    const actor = await provider.invoke("create", {
+      name: "owner-alarm", instructions: "Handle alarms.", topics: ["ops.owner"],
+      dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 },
+    }, context) as { id: string; dedupeKey?: string; coalesceKey?: string };
+    expect(actor).toMatchObject({ dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1_000 } });
+    await expect(provider.invoke("status", { id: actor.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    await expect(provider.invoke("setCoalesceKey", { id: actor.id, coalesceKey: null }, context)).resolves.toMatchObject({ dedupeKey: "data.key" });
+    const template = await provider.invoke("create", {
+      name: "alarm-template", instructions: "Handle alarms.", scope: "global", dedupeKey: "data.key", activation: { minIntervalMs: 1_000 },
+    }, context) as { id: string };
+    await expect(provider.invoke("import", { id: template.id }, context)).resolves.toMatchObject({ dedupeKey: "data.key", activation: { minIntervalMs: 1_000 } });
+    for (const dedupeKey of ["", "not a path", "data..key", "x".repeat(201), 42, null]) {
+      await expect(provider.invoke("create", { name: "bad-dedupe", instructions: "x", dedupeKey }, context)).rejects.toThrow("Invalid actor dedupeKey");
+    }
   });
 
   // smarty-dev#1579: the skip-only activation filter, set at creation or later, project or global.
@@ -5969,7 +6209,7 @@ describe("own-root resident setters and authoritative status", () => {
     await state.actors.setModel(actor.id, "provider/session");
     await state.actors.setThinking(actor.id, "high");
     owned = false;
-    members.push({ ...state.participants.self(), id: actor.id, kind: "actor", rootId: state.identity.id,
+    members.push({ ...state.participants.self(), ownerIncarnation: "fixture:owner", id: actor.id, kind: "actor", rootId: state.identity.id,
       ownerHostId: residentHostId(state.identity.id), ownerIdentityId: residentHostId(state.identity.id),
       local: false, residency: "durable", capabilities: ["ask", "steer", "followUp", "actor-bindings"], name: actor.name,
     });
@@ -6120,7 +6360,7 @@ describe("own-root resident setters and authoritative status", () => {
   it("sends only raw own-root ask/tell overrides; steer defaults are not auto-resolved into pins", async () => {
     const state = await remoteState();
     await state.provider.invoke("ask", { id: state.actor.id, message: "default" }, context);
-    expect(state.requestResult.mock.calls[0]?.[3]).toEqual({ message: "default", bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
+    expect(state.requestResult.mock.calls[0]?.[3]).toEqual({ ownerIncarnation: "fixture:owner", message: "default", bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
     await state.provider.invoke("tell", { id: state.actor.id, message: "partial", thinking: "xhigh" }, context);
     expect(state.request.mock.calls[0]?.[3]).toMatchObject({ binding: { thinking: "xhigh" }, bindingProvenance: { kind: "owner-defaults", rootId: state.identity.id } });
     expect(state.request.mock.calls[0]?.[3]).not.toHaveProperty("binding.model");
@@ -6171,3 +6411,143 @@ describe("own-root resident setters and authoritative status", () => {
   });
 });
 
+describe("external spawn router hook (#2890)", () => {
+  const pick = { model: "provider/model-b", thinking: "high", reason: "policy:task/normal", policyVersion: "v1" };
+  // `configured` is the persisted agents.model/thinking; pass {} for a host with no configured default.
+  const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {},
+    configured: Partial<FabricAgentConfig> = { model: "provider/model-a", thinking: "medium" }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-spawn-router-")); roots.push(dir);
+    const inputPath = path.join(dir, "requests.jsonl");
+    const command = [process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
+      require('node:fs').appendFileSync(process.argv[1], input); ${body ?? `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`}
+    });`, inputPath];
+    const state = setup([], [], undefined, { agentsConfig: { ...configured, ...agentsConfig,
+      router: { command, mode, timeoutMs: 400 } } });
+    const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    return { ...state, dir, inputPath, logs, requests };
+  };
+  it.each(["off", "shadow", "enforce"] as const)("%s selects the expected actual worker model/thinking", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "implementation", name: "normal child", complexity: "normal", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual);
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    if (mode === "off") {
+      expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+    } else {
+      expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+      expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", name: "normal child", requestedComplexity: "normal", parentId: state.identity.id,
+        defaults: { model: "provider/model-a", thinking: "medium" } })]);
+      expect(state.requests()[0]).not.toHaveProperty("task");
+    }
+  });
+  it("advertises all four caller complexity classes in the spawn schema", async () => {
+    const state = routerSetup("off");
+    const spawn = await state.provider.describe("spawn", context);
+    expect(spawn?.inputSchema).toMatchObject({ properties: { complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"] } } });
+  });
+  it.each(["shadow", "enforce"] as const)("accepts delicate and forwards it verbatim in %s mode", async mode => {
+    const state = routerSetup(mode);
+    const child = await state.provider.invoke("spawn", { task: "delicate implementation", complexity: "delicate", transport: "process" }, context) as AgentHandleInfo;
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", requestedComplexity: "delicate" })]);
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+  });
+  it.each([
+    [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
+    [{ thinking: "xhigh" }, { model: "provider/model-a", thinking: "xhigh" }],
+  ])("caller override %j bypasses router and is logged explicit", async (overrides, actual) => {
+    const state = routerSetup("enforce");
+    const child = await state.provider.invoke("spawn", { task: "explicit", ...overrides }, context) as AgentHandleInfo;
+    expect(child).toMatchObject(actual); await state.agents.wait(child.id);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual, error: null })]);
+  });
+  it.each([
+    ["process.stdout.write('garbage');", "invalid-json"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/unknown', thinking: 'high' }));", "unknown-or-denied-model"],
+    ["setInterval(() => {}, 1000);", "timeout"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'invalid' }));", "invalid-output"],
+  ])("router error %s keeps worker defaults and records %s", async (body, error) => {
+    const state = routerSetup("enforce", body);
+    const child = await state.provider.invoke("spawn", { task: "fallback" }, context) as AgentHandleInfo;
+    const actual = { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual); expect(await state.agents.wait(child.id)).toMatchObject({ status: "completed", ...actual });
+    expect(state.logs()).toEqual([expect.objectContaining({ actual, error })]);
+  });
+  it("does not fuzzy-match or bypass host deny policy for a router pick", async () => {
+    for (const model of ["provider/modle-b", "provider/model-b"]) {
+      const state = routerSetup("enforce", `process.stdout.write(JSON.stringify({ model: ${JSON.stringify(model)}, thinking: 'high' }));`, { deniedModels: ["provider/model-b"] });
+      const child = await state.provider.invoke("spawn", { task: "protected fallback" }, context) as AgentHandleInfo;
+      expect(child.model).toBe("provider/model-a"); await state.agents.wait(child.id);
+      expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
+    }
+  });
+  const inheritedSpawn = async (state: ReturnType<typeof routerSetup>) => {
+    const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
+    const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, undefined, state.lifecycle,
+      undefined, undefined, true, undefined, () => "max");
+    const child = await provider.invoke("spawn", { task: "inherited" }, inherited) as AgentHandleInfo;
+    await state.agents.wait(child.id);
+    return child;
+  };
+  // Without a configured agents.model the caller's inherited binding is the static default (#699 keeps this).
+  it("uses inherited model/thinking as the static default but does not mistake inheritance for explicit", async () => {
+    const state = routerSetup("shadow", undefined, {}, {});
+    const child = await inheritedSpawn(state);
+    expect(child).toMatchObject({ model: "provider/session", thinking: "max" });
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "default", pick, actual: { model: "provider/session", thinking: "max" }, error: null })]);
+  });
+  it("lets an enforce pick override the inherited static default", async () => {
+    const state = routerSetup("enforce", undefined, {}, {});
+    const child = await inheritedSpawn(state);
+    expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "enforce", pick, actual: { model: pick.model, thinking: pick.thinking }, error: null })]);
+  });
+  // #699: a configured agents.model wins over the inherited binding as the static default; the router still runs.
+  it.each(["shadow", "enforce"] as const)("%s: a configured agents.model wins over the inherited model as the router's static default", async mode => {
+    const state = routerSetup(mode);
+    const child = await inheritedSpawn(state);
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual);
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/model-a", thinking: "medium" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null })]);
+  });
+  it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
+    const state = routerSetup("enforce");
+    const actor = await state.provider.invoke(action, { name: "router actor", instructions: "private actor instructions" }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.actors.definition(actor.id)).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
+    expect(state.logs()).toHaveLength(1);
+  });
+  it.each(["complex", "delicate"] as const)("forwards the selected model and %s complexity to a durable spawn without a second router call", async complexity => {
+    const state = routerSetup("enforce");
+    const spawnAgent = vi.fn(async (request: AgentRunRequest) => ({ id: "durable-test", name: "durable", runner: "pi", transport: "process", cwd: process.cwd(), status: "running", model: request.model, thinking: request.thinking }));
+    (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
+    const child = await state.provider.invoke("spawn", { task: "durable", complexity, residency: "durable" }, context) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity }), undefined);
+    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]); expect(state.logs()).toHaveLength(1);
+  });
+  it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
+    const state = routerSetup("enforce");
+    await state.provider.invoke("create", { name: "template", instructions: "later", scope: "global" }, context);
+    await state.provider.invoke("run", { task: "one-off" }, context);
+    expect(fs.existsSync(state.inputPath)).toBe(false);
+    expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+  });
+  it("validates complexity before command or launch", async () => {
+    const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");
+    try {
+      await expect(state.provider.invoke("spawn", { task: "bad hint", complexity: "extreme" }, context)).rejects.toThrow("Invalid agent complexity: expected simple, normal, complex or delicate");
+      expect(launch).not.toHaveBeenCalled(); expect(fs.existsSync(state.inputPath)).toBe(false);
+      expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+    } finally { launch.mockRestore(); }
+  });
+});

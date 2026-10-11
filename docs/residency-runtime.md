@@ -49,7 +49,7 @@ Older hosts without that optional flag retain their existing readiness contract.
 The default usable-start observation budget includes the mandatory 30-second
 empty legacy mesh-lock grace plus bounded boot/acquisition time; explicit caller
 budgets remain unchanged. A client attaching between owner publication and the
-maintenance receipt waits for that existing generation instead of launching
+maintenance receipt waits for that existing generation and does not launch
 a competitor.
 
 ## Context and lifecycle
@@ -72,13 +72,17 @@ retain main's existing behavior; no new bounded-close or whole-attempt containme
 guarantee is claimed. Those features require a separate fabric-v2 follow-up with
 checked whole-attempt exit and completed-drain proofs before recovery admission.
 
+### Owner incarnation fencing
+
+A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; there is no stale automatic resend. Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
+
 ### Lease-fenced consumption and accepted-work custody
 
 A file-only heartbeat is liveness, not permission to consume mesh work. Control,
 actor mesh, and lifecycle consumers require a confirmed shared-lock renewal.
 An overdue consumer requests a prompt renewal attempt, but stays fenced until
 that real acquisition succeeds. Initial publication failure keeps the same
-host start pending rather than publishing a usable owner prematurely.
+host start pending and does not publish a usable owner prematurely.
 
 Control admission checks the lease under both the shared claim lock and the
 host-local claim lock. The resident rechecks after awaited binding resolution,

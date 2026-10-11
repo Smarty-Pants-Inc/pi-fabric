@@ -33,7 +33,7 @@ const host = (meshRoot: string, name: string, timing: { heartbeatMs: number; lea
   });
   directory.registerSource(() => [rootRecord(identity.id, name)]);
   const control = new FabricControlPlane(new MeshStore(meshRoot, 64 * 1024, 1_000), identity, {
-    enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 2_000,
+    enabled: true, hostId: identity.id, ownerIncarnation: directory.ownerIncarnation, pollMs: 20, acknowledgementTimeoutMs: 2_000,
   });
   closers.push(async () => { await control.close(); await directory.close(); });
   return { identity, directory, control };

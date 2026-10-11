@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
+import { normalizeFabricConfig } from "../src/config.js";
 
 const defaults = {
   runner: "pi" as const,
@@ -13,8 +14,8 @@ const defaults = {
 };
 
 describe("parent run inheritance (#2490)", () => {
-  const parent = { ...defaults, model: "shallow", inheritedModel: { provider: "cliproxyapi", id: "gpt-6.1-sol" }, inheritedThinking: "max" as const };
-  it("inherits the actual Pi model and effort ahead of configured defaults", () => {
+  const parent = { ...defaults, inheritedModel: { provider: "cliproxyapi", id: "gpt-6.1-sol" }, inheritedThinking: "max" as const };
+  it("inherits the actual Pi model and effort when no model is configured", () => {
     expect(normalizeAgentRunRequest({ task: "review" }, parent)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
   });
   it("lets an explicit model or effort override inheritance independently", () => {
@@ -25,6 +26,47 @@ describe("parent run inheritance (#2490)", () => {
     const request = normalizeAgentRunRequest({ task: "review", runner: "claude" }, parent);
     expect(request.model).toBeUndefined();
     expect(request.thinking).toBeUndefined();
+  });
+});
+
+describe("configured task defaults (#2890, #6062)", () => {
+  const parent = {
+    inheritedModel: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    inheritedThinking: "xhigh",
+  };
+  const configured = {
+    ...defaults,
+    ...normalizeFabricConfig({ agents: { model: "shallow", thinking: "high" } }).agents,
+    models: defaults.models,
+    ...parent,
+  };
+
+  it("uses the configured model and effort instead of the caller's binding", () => {
+    const request = normalizeAgentRunRequest({ task: "review" }, configured);
+    // The manager still applies configured defaults; do not turn a default into an explicit pin.
+    expect(request.model).toBeUndefined();
+    expect(request.model ?? configured.model).toBe("shallow");
+    expect(request.thinking).toBe("high");
+  });
+
+  it("keeps explicit model and effort highest, and configured effort ahead of aliases", () => {
+    expect(normalizeAgentRunRequest({ task: "review", model: "flat" }, configured))
+      .toMatchObject({ model: "flat", thinking: "high" });
+    expect(normalizeAgentRunRequest({ task: "review", model: "shallow", thinking: "off" }, configured))
+      .toMatchObject({ model: "shallow", thinking: "off" });
+  });
+
+  it("does not let built-in thinking mask the configured model's alias", () => {
+    const config = normalizeFabricConfig({ agents: { model: "shallow" } }).agents;
+    expect(normalizeAgentRunRequest({ task: "review" }, { ...defaults, ...config, ...parent }).thinking).toBe("low");
+  });
+
+  it("keeps inheritance when only thinking is configured, or the model is blank", () => {
+    for (const model of [undefined, "  "]) {
+      const config = normalizeFabricConfig({ agents: { model, thinking: "high" } }).agents;
+      expect(normalizeAgentRunRequest({ task: "review" }, { ...defaults, ...config, ...parent }))
+        .toMatchObject({ model: "cliproxyapi-anthropic/claude-opus-5-5", thinking: "xhigh" });
+    }
   });
 });
 
@@ -66,5 +108,27 @@ describe("alias thinking levels", () => {
     const request = normalizeAgentRunRequest({ task: "t" }, { ...defaults, model: "shallow" });
     expect(request.model).toBeUndefined();
     expect(request.thinking).toBe("low");
+  });
+});
+
+describe("denied configured default falls back to the caller (#2890, review P2)", () => {
+  const caller = { inheritedModel: { provider: "dest", id: "caller" }, inheritedThinking: "high" };
+  const inherited = { model: "dest/caller", thinking: "high" };
+  it.each([
+    ["exact", "dest/denied", ["dest/denied"]],
+    ["case and whitespace variant", "  Dest/Denied ", ["dest/denied"]],
+    ["denied list variant", "dest/denied", [" DEST/DENIED "]],
+  ])("treats a %s as denied", (_label, model, deniedModels) => {
+    expect(normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model, deniedModels }))
+      .toMatchObject(inherited);
+  });
+  it("treats an alias whose target is denied as denied", () => {
+    expect(normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model: "Shallow", deniedModels: ["google/gemini-2.5-flash"] }))
+      .toMatchObject(inherited);
+  });
+  it("keeps an allowed configured model", () => {
+    // An allowed configured default stays a default (the manager applies it), never the caller's binding.
+    const request = normalizeAgentRunRequest({ task: "t" }, { ...defaults, ...caller, model: "dest/ok", deniedModels: ["dest/denied"] });
+    expect(request.model ?? "dest/ok").toBe("dest/ok");
   });
 });

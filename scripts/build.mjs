@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { build } from "esbuild";
+import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
@@ -13,6 +13,7 @@ const primaryEntryPoints = [
   "src/actors-cli.ts",
   "src/judge-cli.ts",
   "src/releases-cli.ts",
+  "src/mesh-lock-stats-cli.ts",
   "src/mcp.ts",
   "src/agents.ts",
   "src/agents/worker-protocol.ts",
@@ -39,6 +40,7 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
+  "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
   "src/core/pattern-kill.ts",
@@ -49,12 +51,15 @@ const lazyEntryPoints = [
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/spawn-router.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
+  "src/provider-error-class.ts",
+  "src/topology/root-inbox-context.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
@@ -91,6 +96,7 @@ const lazyEntryPoints = [
   "src/worker/session-id.ts",
   "src/worker/model-control.ts",
   "src/worker/context-admission.ts",
+  "src/worker/context-reseed.ts",
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
@@ -101,7 +107,19 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
 ];
 
-buildLandlock();
+// smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).
+const nativeDigests = buildLandlock();
+const nativeDefine = { __FABRIC_NATIVE_DIGESTS__: JSON.stringify(JSON.stringify(nativeDigests)) };
+// Every bundle gets the digests merged into its own `define`: a second `define:` key in a call (another
+// change's constants) would otherwise silently replace them, and the gate then fails closed for every
+// operator ("no embedded digest in this build"; smarty-dev#7651). assert-build-artifacts checks the result.
+const build = (options) => esbuild({ ...options, define: { ...options.define, ...nativeDefine } });
+
+// The production authority path is a literal. Only Vitest may substitute a
+// private fixture path; there is no production rollout/requirement switch.
+const hostPolicyConstants = {
+  __FABRIC_HOST_POLICY_PATH__: JSON.stringify("/etc/smarty/fabric-policy.json"),
+};
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
@@ -124,6 +142,7 @@ const result = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   splitting: true,
   sourcemap: true,
   metafile: true,
@@ -143,8 +162,11 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // self-contained file that carries its own copy of the host packages it uses.
 // ponytail: typebox (agent-result schema checks) is their only host import
 // today; scripts/smoke-package-install.mjs fails if one gains another.
+// fabric-mesh-backend (smarty-dev#6477 W1) is here too: its writer census shares host-leases.ts with
+// index.js, and a split build would carve that out of index.js into one more startup chunk.
 const standalone = await build({
-  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts"],
+  entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
+    "src/mesh/mesh-backend-cli.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
@@ -152,6 +174,7 @@ const standalone = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   metafile: true,
   logLevel: "info",
@@ -179,6 +202,21 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
+  sourcemap: true,
+  logLevel: "info",
+});
+
+// The bash tool_call envelope invokes a real file: the fleet guard refuses computed -e code.
+// Keep watchdog/group custody code out of the extension graph and out of inline shell operands.
+await build({
+  entryPoints: ["src/bash-idle-watchdog.ts"],
+  outfile: "dist/bash-idle-watchdog.js",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
   sourcemap: true,
   logLevel: "info",
 });
@@ -192,6 +230,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   logLevel: "info",
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });

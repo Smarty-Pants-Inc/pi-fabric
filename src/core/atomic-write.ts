@@ -642,22 +642,48 @@ export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   return undefined;
 };
 
+export const DEFAULT_MESH_RETRY_WARNING_WINDOW_MS = 60_000;
+
+/** `PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS`: positive milliseconds; blank or invalid uses 60 s. */
+export const meshRetryWarningWindowMs = (): number => {
+  const raw = process.env.PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS;
+  const value = Number(raw);
+  return raw?.trim() && Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MESH_RETRY_WARNING_WINDOW_MS;
+};
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
   #delay = 0;
   #retryAt = 0;
-  #reported = false;
+  #lastReportedAt: number | undefined;
+  #suppressed = 0;
   #running = false;
-  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000) {}
+  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000,
+    readonly warningWindowMs = meshRetryWarningWindowMs()) {}
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
-  success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
+  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
+  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). */
+  success(): void {
+    this.#resetBackoff();
+    if (!this.#suppressed || this.#lastReportedAt === undefined) return;
+    const now = Date.now();
+    const elapsedMs = now - this.#lastReportedAt;
+    if (elapsedMs < this.warningWindowMs) return;
+    // Final summary: retries suppressed after the last line are reported once the window
+    // has passed, so an outage that ends inside a window is not silently dropped. It takes
+    // that window's single line; a later outage inside it is counted, not printed.
+    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    this.#lastReportedAt = now;
+    this.#suppressed = 0;
+  }
   failure(error: unknown): boolean {
     const transient = isMeshLockTimeout(error);
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
-      this.success();
+      // Not proof that the lock is free: no recovery summary, suppression is kept.
+      this.#resetBackoff();
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
@@ -665,12 +691,20 @@ export class MeshBackgroundRetry {
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
     const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
-    this.#retryAt = Date.now() + delayMs;
-    if (!this.#reported) {
-      // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
-      // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
-      this.#reported = true;
+    const now = Date.now();
+    this.#retryAt = now + delayMs;
+    const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
+    // At most one lock-retry line per instance per window (default 60 s), even across
+    // successful acquisitions: a flapping lock must not print one warning per short outage.
+    // The first warning is immediate and carries the holder diagnostics.
+    if (elapsedMs >= this.warningWindowMs) {
+      const summary = this.#suppressed > 0
+        ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
+      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`);
+      this.#lastReportedAt = now;
+      this.#suppressed = 0;
+    } else {
+      this.#suppressed++;
     }
     return transient;
   }

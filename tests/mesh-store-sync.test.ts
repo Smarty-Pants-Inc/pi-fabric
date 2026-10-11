@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
+import { expectSyncDurableOrRefused, meshSyncRefusalCode, meshSyncRefusedOnThisPlatform } from "./helpers/mesh-sync-platform.js";
 
 // smarty-dev#9313: MeshStore.sync() is the barrier a trusted producer awaits before it fsyncs its
 // own cursor or delivered mark. A SIGKILL cannot drop the page cache, so the two-process test also
@@ -56,13 +57,20 @@ const runUntilKilled = async (root: string, backend: "file" | "sqlite", ackPath:
   expect(child.signalCode).toBe("SIGKILL");
 };
 
-// File state has no namespace barrier on Windows: its sync() refuses there (see the platform-stubbed tests below).
-const windowsFile = (backend: "file" | "sqlite"): boolean => backend === "file" && process.platform === "win32";
-
 describe.each(["file", "sqlite"] as const)("MeshStore.sync durability barrier (%s state)", backend => {
-  it.skipIf(windowsFile(backend))("a SIGKILLed producer's reopened mesh holds every event and state record its synced cursor covers", async () => {
+  it("a SIGKILLed producer's reopened mesh holds every event and state record its synced cursor covers (win32: the barrier refuses, so it never acks)", async () => {
     const root = tempRoot("mesh-sync-crash-"), out = tempRoot("mesh-sync-ack-");
     const ackPath = path.join(out, "cursor.jsonl");
+    if (meshSyncRefusedOnThisPlatform()) {
+      // No namespace barrier: the producer's first sync rejects, so it exits before it advances its cursor.
+      const producer = spawnSync(process.execPath, [path.resolve("tests/fixtures/mesh-sync-crash.mjs"), root, backend, ackPath, out], {
+        cwd: process.cwd(), encoding: "utf8", timeout: 20_000 });
+      expect(producer.error).toBeUndefined();
+      expect(producer.status, producer.stderr).not.toBe(0);
+      expect(producer.stderr).toContain(meshSyncRefusalCode("FABRIC_MESH_EVENTS_NOT_DURABLE"));
+      expect(readAcks(ackPath)).toEqual([]);
+      return;
+    }
     await runUntilKilled(root, backend, ackPath, out, 4);
     const acks = readAcks(ackPath);
     expect(acks.length).toBeGreaterThanOrEqual(4);
@@ -103,18 +111,18 @@ describe.each(["file", "sqlite"] as const)("MeshStore.sync durability barrier (%
     }
   }, 40_000);
 
-  it.skipIf(windowsFile(backend))("syncs an empty root, and its own commits, without creating anything", async () => {
+  it("syncs an empty root, and its own commits, without creating anything (win32: refuses, typed)", async () => {
     const root = tempRoot("mesh-sync-empty-");
     const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
     try {
-      await store.sync();
+      await expectSyncDurableOrRefused(store.sync(), { through: 0 });
       expect(fs.existsSync(path.join(root, "events.jsonl"))).toBe(false);
       expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
       expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
       const identity = { id: "sync-test", name: "sync-test", kind: "agent" as const };
       await store.publish({ topic: "ops.sync", from: identity });
       await store.put({ key: "forwarder/failed/1", value: 1, identity });
-      await Promise.all([store.sync(), store.sync(0)]);
+      await Promise.all([store.sync(), store.sync(0)].map(sync => expectSyncDurableOrRefused(sync, { through: expect.any(Number) })));
       await expect(store.sync(Number.NaN)).rejects.toThrow("budgetMs");
       await expect(store.sync(-1)).rejects.toThrow("budgetMs");
     } finally { store.closeState(); }

@@ -9,6 +9,7 @@ import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/s
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
 import type { MeshIdentity } from "../src/mesh/event-log.js";
 import type { MeshStoreContext } from "../src/mesh/mesh-lock.js";
+import { expectSyncDurableOrRefused, meshSyncRefusalCode } from "./helpers/mesh-sync-platform.js";
 import { fakeJetStream, type FakeJetStreamServer } from "./helpers/nats-jetstream-fake.js";
 
 // smarty-dev#7504 phase 1: the single-host JetStream state backend (docs/mesh-backends.md option (c)) against an
@@ -265,12 +266,14 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
         await store.put({ key: "shared/a", value: 1, identity });
         const event = await store.publish({ topic: "ops.sync", from: identity });
         if (syncAlways) {
-          await expect(store.sync()).resolves.toEqual({ through: event.sequence });
-          await expect(provider.invoke("sync", {}, host)).resolves.toEqual({ synced: true, through: event.sequence });
+          await expectSyncDurableOrRefused(store.sync(), { through: event.sequence });
+          await expectSyncDurableOrRefused(provider.invoke("sync", {}, host), { synced: true, through: event.sequence });
         } else {
-          await expect(store.sync()).rejects.toBeInstanceOf(MeshStateNatsNotDurableError);
+          // The event barrier runs first: on win32 it refuses before the NATS state barrier is reached.
+          const code = meshSyncRefusalCode("FABRIC_MESH_STATE_NATS_NOT_DURABLE");
+          await expect(store.sync()).rejects.toMatchObject({ code, retryable: false });
           await expect(provider.invoke("sync", {}, host)).rejects.toMatchObject({
-            code: "FABRIC_MESH_STATE_NATS_NOT_DURABLE", message: expect.stringContaining("not durable") });
+            code, message: expect.stringContaining("not durable") });
         }
       } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
     }
@@ -430,7 +433,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       expect(store.get("shared/a")).toMatchObject({ value: { n: 1 }, version: written.version });
       expect(store.listAll("shared/").map(entry => entry.key)).toEqual(["shared/a"]);
       expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
-      await expect(store.sync()).resolves.toEqual({ through: expect.any(Number) });
+      await expectSyncDurableOrRefused(store.sync(), { through: expect.any(Number) });
     } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   });
 

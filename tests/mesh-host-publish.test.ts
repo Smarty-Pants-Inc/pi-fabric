@@ -15,6 +15,7 @@ import { MeshDedupeStoreFullError, MeshStore, type MeshEvent, type MeshIdentity,
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshHostPublishError, MeshProvider } from "../src/providers/mesh-provider.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
+import { expectSyncDurableOrRefused } from "./helpers/mesh-sync-platform.js";
 
 const roots: string[] = [];
 const closes: Array<() => Promise<void>> = [];
@@ -284,14 +285,14 @@ return { denied, ordinary, batchPresent: "publishBatch" in mesh };
     expect(h.store.read()).toHaveLength(1);
   }, 30_000);
 
-  // File state sync refuses on Windows (no namespace barrier; see mesh-store-sync.test.ts).
-  it.skipIf(backend === "file" && process.platform === "win32")("gives trusted host components the mesh.sync barrier and refuses forged or public callers (smarty-dev#9313)", async () => {
+  // On win32 the event barrier refuses (no namespace barrier; see mesh-store-sync.test.ts), typed and not retryable.
+  it("gives trusted host components the mesh.sync barrier and refuses forged or public callers (smarty-dev#9313)", async () => {
     const h = await harness(backend);
     const host = await h.publisher();
     const sync = vi.spyOn(h.store, "sync");
     const event = await host.call("mesh.publish", { topic: "github.delivery", text: "covered" }) as MeshEvent;
-    expect(await host.call("mesh.sync", {})).toEqual({ synced: true, through: event.sequence });
-    expect(await host.call("mesh.sync", { budgetMs: 5_000 })).toEqual({ synced: true, through: event.sequence });
+    await expectSyncDurableOrRefused(host.call("mesh.sync", {}), { synced: true, through: event.sequence });
+    await expectSyncDurableOrRefused(host.call("mesh.sync", { budgetMs: 5_000 }), { synced: true, through: event.sequence });
     expect(sync.mock.calls).toEqual([[undefined], [5_000]]);
     for (const budgetMs of [-1, 60_001, "5", null, Number.NaN]) {
       await expect(host.call("mesh.sync", { budgetMs })).rejects.toThrow(/budgetMs|Invalid arguments/);

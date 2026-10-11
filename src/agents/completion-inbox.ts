@@ -45,10 +45,15 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         this.#confirmHeld();
         const stopReason = event.message?.role === "assistant" ? event.message.stopReason : undefined;
-        if (ctx.signal?.aborted || stopReason === "aborted" || stopReason === "error") {
+        // Only an owner cancel parks results until Main's next run (smarty-dev#733).
+        if (ctx.signal?.aborted || stopReason === "aborted") {
           this.#suspended = true;
           return;
         }
+        // A provider error or refusal (pi-ai maps Anthropic `refusal` to "error") ends the run, and
+        // Pi starts no run for a steer queued now. Keep results pending, not suspended: the idle
+        // flush armed at agent_settled, or a later enqueue, wakes Main (smarty-dev#6134, as #4012).
+        if (stopReason === "error") return;
         this.#flush();
       });
     // Any new run ends a suspension, not only typed input: after an abort the inbox must not

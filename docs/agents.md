@@ -388,6 +388,46 @@ Existing workers are not retroactively changed by rebuilding or reloading the pa
 
 Pi workers with extensions enabled also inherit the parent session's `pi-multiprovider` `/switch-account` pin, when that extension is installed. Fabric forwards the pin as `PI_MULTIPROVIDER_SESSION_PINS`; the child rebinds it to its own session id. This is host state, not a model argument. Claude and Veda runners, and `extensions: false` children, do not receive it. A resolved request or parent-session account pin keeps one-shot placed tasks local with audit reason `inherited account pins require the local worker`, so the existing pin forwarding/rebinding contract is not silently dropped.
 
+### Profile guards through custom Pi launchers
+
+Native `cli.js` launchers keep Pi's resource discovery and trust behavior. When a
+custom or shell launcher has no discoverable native SDK, Fabric still passes
+`--no-extensions` to prevent automatic discovery of another Fabric generation.
+For extension-enabled runs it also passes explicit `-e` paths for the selected
+personal profile's non-Fabric extensions and installed package extensions.
+The profile is `PI_CODING_AGENT_DIR`, or `~/.pi/agent`; relative settings paths
+resolve from that profile directory. Fabric does not install missing packages or
+replay project resources, and its pinned Fabric extension loads separately. An
+installed npm package whose version does not satisfy the configured spec is
+skipped with a warning, because Pi would otherwise reinstall it.
+Explicitly disabled extensions and resident startup probes do not replay profile
+hooks.
+
+Include and exclude filters match each extension's path as listed, or as reached
+through a selected directory, exactly as Pi matches them, even when that
+directory is a symlink. Exclusions also match the symlink target's path, so an
+exclusion written against the target holds too. Each file is then passed once:
+as in Pi, its highest-ranked entry decides whether it loads, and an excluded
+entry is not overridden by a lower-ranked entry for the same file. Top-level
+settings outrank packages, and a top-level exclusion also wins when a package
+lists the identical path (Pi would keep the package entry there). A top-level
+inclusion of that identical path does not re-enable a package's exclusion,
+matching Pi.
+
+The worker log's `fabric_profile_extensions` event records extension basenames,
+`loadedCount` (paths supplied to Pi), and `skippedCount`. Missing or invalid
+entries are skipped independently with one counted `worker_warning` per entry;
+these warnings also appear in the run receipt. Pi remains responsible for loading
+the supplied extension modules.
+
+The replay fails closed. If the profile's `settings.json` exists but cannot be
+read or is not a JSON object, Fabric refuses to launch the task: the run fails
+before the launcher starts, with an error naming the settings file and the
+reason (never its contents), and the worker log records a
+`fabric_profile_extensions_refused` event. A missing `settings.json` means no
+profile configuration, so there is nothing to replay and the task launches.
+Native `cli.js` launchers are unaffected.
+
 ### Choose the child's language
 
 `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` accept `kernel: "typescript" | "python" | "inherit"`. Omit it or use `"inherit"` to inherit the caller's `executor.kernel`; use a concrete value so a skill or model can choose its strongest language for the task. Workflow agents, `rlm.query`, and council members/synthesis forward the same option. This selects the **child's** Fabric language, not the language of the current `fabric_exec` program; that program still uses its configured kernel.

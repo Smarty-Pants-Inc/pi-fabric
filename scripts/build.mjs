@@ -100,6 +100,7 @@ const lazyEntryPoints = [
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
+  "src/worker/profile-extensions.ts",
   "src/worker/task-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",

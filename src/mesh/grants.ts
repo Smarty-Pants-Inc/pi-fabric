@@ -9,9 +9,10 @@ import { validateMeshTopic, type MeshEvent, type MeshIdentity, type MeshStore } 
  * Scoped external grants: a bearer token that lets an outside process append
  * events to exactly one mesh topic. Only the token's SHA-256 is stored, in a
  * private `grants.json` beside the mesh state. Every mutation runs under the
- * mesh lock through {@link MeshStore.transact}, so use counts decrement
- * atomically with the event append. Authority is local file access to the mesh
- * root; the grant narrows what a token holder without that access can do.
+ * mesh lock through {@link MeshStore.transact}. Each use is durably reserved
+ * before append; an interrupted publication stays spent rather than replaying.
+ * Authority is local file access to the mesh root; the grant narrows what a
+ * token holder without that access can do.
  */
 
 export const MESH_GRANT_TOKEN_ENV = "PI_FABRIC_MESH_TOKEN";
@@ -42,6 +43,8 @@ interface MeshGrantRecord extends MeshGrantInfo {
   hash: string;
   /** The minting store's event ceiling, so the CLI honours a configured mesh. */
   maxEventBytes: number;
+  /** Durable reservation receipt; an uncertain append never refunds this use. */
+  lastEventId?: string;
 }
 
 interface MeshGrantFile {
@@ -63,7 +66,8 @@ const isGrantRecord = (value: unknown): value is MeshGrantRecord => {
     typeof grant.hash === "string" && /^[0-9a-f]{64}$/.test(grant.hash) &&
     Number.isSafeInteger(grant.expiresAt) && Number.isSafeInteger(grant.uses) &&
     Number.isSafeInteger(grant.maxUses) && Number.isSafeInteger(grant.maxEventBytes) &&
-    (grant.kind === undefined || typeof grant.kind === "string");
+    (grant.kind === undefined || typeof grant.kind === "string") &&
+    (grant.lastEventId === undefined || typeof grant.lastEventId === "string");
 };
 
 const readGrants = (store: Pick<MeshStore, "root">): MeshGrantFile => {
@@ -92,7 +96,7 @@ const writeGrants = (store: Pick<MeshStore, "root">, grants: MeshGrantRecord[]):
   if (Buffer.byteLength(serialized, "utf8") > MAX_GRANT_FILE_BYTES) {
     throw new Error(`Fabric mesh grants exceed ${MAX_GRANT_FILE_BYTES} bytes`);
   }
-  writeFileAtomic(grantsPath(store), serialized, { mode: 0o600 });
+  writeFileAtomic(grantsPath(store), serialized, { mode: 0o600, durable: true });
 };
 
 const info = (grant: MeshGrantRecord): MeshGrantInfo => ({
@@ -177,7 +181,10 @@ export function listMeshGrants(store: Pick<MeshStore, "root">, now = Date.now())
 /**
  * Appends one untrusted external event authorized by `token`. The token hash
  * is compared in constant time against every stored grant, and the use count
- * decrements in the same locked write as the append.
+ * is durably reserved under the mesh lock before append. Recovery treats an
+ * interrupted append as spent (at-most-once attempts), never as permission to
+ * publish a fresh event. The persisted event ID lets an operator inspect an
+ * uncertain result; a failed append can consume a use without delivering it.
  */
 export async function postWithMeshGrant(
   store: Pick<MeshStore, "root" | "transact">,
@@ -212,7 +219,13 @@ export async function postWithMeshGrant(
       throw new Error(`Fabric mesh grant does not cover kind ${input.kind}`);
     }
     const kind = input.kind ?? match.kind ?? "external";
+    const eventId = randomUUID();
+    const updated: MeshGrantRecord = { ...match, uses: match.uses - 1, lastEventId: eventId };
+    // Write-ahead debit: failure here has no publication effects; failure after
+    // here remains spent across reloads, even if append committed then threw.
+    writeGrants(store, grants.map((grant) => grant === match ? updated : grant));
     const event = append({
+      id: eventId,
       topic: match.topic,
       kind,
       from: { id: `external:${match.grantId}`, name: "external", kind: "agent" },
@@ -222,8 +235,6 @@ export async function postWithMeshGrant(
       grantId: match.grantId,
       maxEventBytes: match.maxEventBytes,
     });
-    const updated: MeshGrantRecord = { ...match, uses: match.uses - 1 };
-    writeGrants(store, grants.map((grant) => grant === match ? updated : grant));
     return { event, grant: info(updated) };
   });
 }

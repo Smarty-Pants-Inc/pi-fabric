@@ -42,8 +42,9 @@ Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refus
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
 release. Required: each distinct release of a live Fabric writer (host leases and process records),
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
-only override. It needs --alarm-owner ROOT and --alarm-cc ROOT (the chief-of-staff copy): an accepted override
-alarms both (mesh ops.owner, addressed to each root, never a broadcast) before the switch, else it refuses
+only override. It needs --alarm-owner ROOT and --alarm-cc ROOT (the chief-of-staff copy; one root each, never a
+principal instance org or org-*): every listed reader is alarmed to both (mesh ops.owner, addressed, never a
+broadcast) before the fence, else it refuses; under the fence an unalarmed accepted reader refuses the commit
 (smarty-dev#9436). The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
 
@@ -116,7 +117,15 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let alarmOwner: string | undefined;
   let alarmCc: string | undefined;
   const alarmRoot = (flag: string, value: string): string => {
-    if (!/^[^\s]{1,256}$/.test(value)) throw new UsageError(`Bad ${flag} ${value} (a participant or root id, no spaces)`);
+    // One root name (a participant id or a session root): no wildcard, list or broadcast form.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/.test(value)) {
+      throw new UsageError(`Bad ${flag} ${value} (one participant or root id: letters, digits, . _ : @ -; no wildcard or list)`);
+    }
+    // ponytail: Fabric keeps no list of principal instances, so a fixed deny list: `org` and every `org-*` (org-kate)
+    // are principal instances, never alarm targets (R-org-delegate; pi-fabric#919 review).
+    if (value === "org" || value.startsWith("org-")) {
+      throw new UsageError(`Bad ${flag} ${value}: a principal instance (org, org-*) is never an alarm target; name the owning lead`);
+    }
     return value;
   };
   const requireReaders: InstalledReader[] = [];
@@ -374,8 +383,8 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
 interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[];
   overrideAlarm?: OverrideAlarm }
 
-/** smarty-dev#9436: what an accepted override alarmed: the roots, the readers, the published event ids. */
-interface OverrideAlarm { owner: string; cc: string; accepted: string[]; events: string[]; failed?: string }
+/** smarty-dev#9436: what an override alarmed: the roots, every listed reader (armed), those accepted, the event ids. */
+interface OverrideAlarm { owner: string; cc: string; armed: string[]; accepted: string[]; events: string[] }
 
 export const OVERRIDE_ALARM_KIND = "mesh-backend.accepted-unready";
 
@@ -384,21 +393,37 @@ export const OVERRIDE_ALARM_KIND = "mesh-backend.accepted-unready";
  * chief-of-staff copy, never a broadcast. Event log only, outside the fence; the store is closed at once, so this
  * process's census record never joins the gate's inventory.
  */
+/** One recipient's outcome: sent (the event id), failed (why), or not sent (an earlier send failed). */
+type AlarmDelivery = { to: string; role: "owner" | "cc"; state: "sent"; id: string } | { to: string; role: "owner" | "cc"; state: "failed"; reason: string }
+  | { to: string; role: "owner" | "cc"; state: "not sent" };
+
+/** Some recipient was not alarmed: carries every recipient's state (pi-fabric#919 SEC P2: a sent id is never lost). */
+class OverrideAlarmError extends Error {
+  constructor(readonly deliveries: AlarmDelivery[]) {
+    super(deliveries.map(delivery => `${delivery.role} ${delivery.to} ${delivery.state === "sent" ? `sent (event ${delivery.id})`
+      : delivery.state === "failed" ? `failed (${delivery.reason})` : "not sent"}`).join("; "));
+  }
+}
+
 const raiseOverrideAlarm = async (options: Options, accepted: ReaderReadiness["unready"], phase: string): Promise<string[]> => {
   const { MeshStore } = await import("./store.js");
   const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol });
   try {
-    const text = `fabric-mesh-backend ${options.command} on ${options.root} accepted unready reader(s) by --accept-unready (${phase}): `
+    const text = `fabric-mesh-backend ${options.command} on ${options.root}: --accept-unready override of reader(s) (${phase}): `
       + `${accepted.map(reader => `${reader.name} (${reader.reason})`).join("; ")} (smarty-dev#9436)`;
-    const events: string[] = [];
-    for (const to of [options.alarmOwner!, options.alarmCc!]) {
-      const event = await store.publish({ topic: "ops.owner", kind: OVERRIDE_ALARM_KIND, to, text,
-        from: { id: "fabric-mesh-backend", name: "fabric-mesh-backend", kind: "agent" },
-        data: { root: options.root, command: options.command, phase, accepted: accepted.map(reader => ({ name: reader.name, reason: reader.reason })),
-          owner: options.alarmOwner, cc: options.alarmCc } });
-      events.push(event.id);
+    const deliveries: AlarmDelivery[] = [];
+    for (const [role, to] of [["owner", options.alarmOwner!], ["cc", options.alarmCc!]] as const) {
+      if (deliveries.some(delivery => delivery.state !== "sent")) { deliveries.push({ to, role, state: "not sent" }); continue; }
+      try {
+        const event = await store.publish({ topic: "ops.owner", kind: OVERRIDE_ALARM_KIND, to, text,
+          from: { id: "fabric-mesh-backend", name: "fabric-mesh-backend", kind: "agent" },
+          data: { root: options.root, command: options.command, phase, accepted: accepted.map(reader => ({ name: reader.name, reason: reader.reason })),
+            owner: options.alarmOwner, cc: options.alarmCc } });
+        deliveries.push({ to, role, state: "sent", id: event.id });
+      } catch (error) { deliveries.push({ to, role, state: "failed", reason: error instanceof Error ? error.message : String(error) }); }
     }
-    return events;
+    if (deliveries.some(delivery => delivery.state !== "sent")) throw new OverrideAlarmError(deliveries);
+    return deliveries.map(delivery => (delivery as { id: string }).id);
   } finally { store.closeState(); }
 };
 
@@ -468,13 +493,25 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [], stop: () => fencedWatch?.stop() };
   // smarty-dev#9436: every unready reader that passed `evaluate` was accepted by --accept-unready: alarm its owner and
   // the chief-of-staff copy BEFORE the switch, or refuse it (an accepted override is never silent).
-  if (readiness.unready.length > 0) {
+  // pi-fabric#919 review P1: a listed reader may first turn unready UNDER the fence, where no alarm can be sent (the
+  // commit hook is synchronous inside the transaction; the event log takes the mesh lock the fence holds). So every
+  // name in --accept-unready is alarmed here, before the fence, with both sends confirmed: unready ones as accepted,
+  // ready ones as accepted if they turn unready. Under the fence, an accepted reader outside this set refuses.
+  if (options.acceptUnready.length > 0) {
+    const armed = options.acceptUnready.map(name => readiness.unready.find(reader => reader.name === name)
+      ?? { name, reason: "ready now; accepted if it turns unready under the fence" });
     try {
-      gate.overrideAlarm = { owner: options.alarmOwner!, cc: options.alarmCc!, accepted: readiness.unready.map(reader => reader.name),
-        events: await raiseOverrideAlarm(options, readiness.unready, "before the switch") };
+      gate.overrideAlarm = { owner: options.alarmOwner!, cc: options.alarmCc!, armed: options.acceptUnready,
+        accepted: readiness.unready.map(reader => reader.name), events: await raiseOverrideAlarm(options, armed, "before the switch") };
     } catch (error) {
-      throw new MeshBackendRefusedError(`the accepted-override alarm to ${options.alarmOwner} and ${options.alarmCc} could not be raised: `
-        + `${(error as Error).message} (an accepted --accept-unready is never silent; smarty-dev#9436)`);
+      const deliveries = error instanceof OverrideAlarmError ? error.deliveries : undefined;
+      for (const delivery of deliveries ?? []) {
+        warn(`fabric-mesh-backend: override alarm ${delivery.role} ${delivery.to}: ${delivery.state === "sent" ? `sent, event ${delivery.id}`
+          : delivery.state === "failed" ? `FAILED: ${delivery.reason}` : "not sent (an earlier send failed)"}\n`);
+      }
+      throw Object.assign(new MeshBackendRefusedError(`the accepted-override alarm to ${options.alarmOwner} and ${options.alarmCc} could not be raised: `
+        + `${(error as Error).message} (an accepted --accept-unready is never silent; smarty-dev#9436)`),
+        deliveries ? { overrideAlarm: { owner: options.alarmOwner, cc: options.alarmCc, deliveries } } : {});
     }
   }
   try {
@@ -504,6 +541,13 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     underFence = true;
     outer?.(commit);
     gate.final = evaluate(commit, ` (under the fence, before the ${commit.phase} commit)`);
+    // Never commit with an unsent override alarm: an accepted reader must be one alarmed before the fence. A throw
+    // here rolls the commit's transaction back.
+    const unsent = gate.final.unready.filter(reader => !(gate.overrideAlarm?.armed ?? []).includes(reader.name));
+    if (unsent.length > 0) {
+      throw new MeshBackendRefusedError(`accepted reader(s) ${unsent.map(reader => reader.name).join(", ")} were not alarmed before the fence `
+        + `(under the fence, before the ${commit.phase} commit; smarty-dev#9436)`);
+    }
     gate.checked.push(commit.phase);
     if (ownFds) gate.ownStateDbFds = ownFds;
   };
@@ -595,18 +639,8 @@ export const main = async (argv: string[], io: {
           : abortMeshRollback(options.root, library))) };
     if (gate) {
       const final = gate.final ?? gate.readiness;
-      // A reader first accepted under the fence (after the alarm above) alarms now, after the fence is released.
-      const late = final.unready.filter(reader => !(gate!.overrideAlarm?.accepted ?? []).includes(reader.name));
-      if (late.length > 0) {
-        const alarm: OverrideAlarm = gate.overrideAlarm ?? { owner: options.alarmOwner!, cc: options.alarmCc!, accepted: [], events: [] };
-        try { alarm.events.push(...await raiseOverrideAlarm(options, late, "under the fence")); }
-        catch (error) {
-          alarm.failed = (error as Error).message;
-          warn(`fabric-mesh-backend: ALARM accepted-override alarm failed after the switch: ${alarm.failed} (smarty-dev#9436)\n`);
-        }
-        alarm.accepted.push(...late.map(reader => reader.name));
-        gate.overrideAlarm = alarm;
-      }
+      // Accepted under the fence too: every one was alarmed before the fence (the commit hook refused otherwise).
+      if (gate.overrideAlarm) gate.overrideAlarm.accepted = final.unready.map(reader => reader.name);
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
       if (gate.overrideAlarm) result.overrideAlarm = gate.overrideAlarm;
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
@@ -620,7 +654,9 @@ export const main = async (argv: string[], io: {
     const message = error instanceof Error ? error.message : String(error);
     if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
     if (options.json) {
-      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message, alarms }, null, 2)}\n`);
+      const overrideAlarm = (error as { overrideAlarm?: unknown }).overrideAlarm;
+      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message,
+        ...(overrideAlarm ? { overrideAlarm } : {}), alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;

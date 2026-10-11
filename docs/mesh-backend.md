@@ -107,10 +107,13 @@ POSIX owner (no `process.geteuid`), so nothing can be verified there and the gat
 no `--accept-unready` lifts it (until Windows ACL checks exist: smarty-dev#7548).
 
 `--accept-unready NAME,...` is the only override. It requires `--alarm-owner ROOT` and `--alarm-cc ROOT` (the
-chief-of-staff copy; Fabric has no resolver for it): when the gate accepts an unready reader, the CLI publishes one
-`ops.owner` event of kind `mesh-backend.accepted-unready` addressed to each root, never a broadcast, BEFORE the switch,
-and refuses the switch if it cannot. A reader first accepted under the fence is alarmed after the switch. The roots,
-the accepted readers and the event ids are in the switch records and the JSON result (`overrideAlarm`; smarty-dev#9436).
+chief-of-staff copy; Fabric has no resolver for it), each one root name (no wildcard or list) and never a principal
+instance (`org`, `org-*`). Before the fence, the CLI publishes one `ops.owner` event of kind
+`mesh-backend.accepted-unready` addressed to each root (never a broadcast) naming EVERY listed reader, unready now or
+accepted if it turns unready under the fence, and refuses the switch unless both sends are confirmed. Under the fence,
+before each commit, an accepted reader that was not alarmed refuses (the commit rolls back), so a switch never commits
+with an unsent override alarm. The roots, the listed (`armed`) and accepted readers and the event ids are in the
+switch records and the JSON result (`overrideAlarm`; smarty-dev#9436, pi-fabric#919).
 
 Order of a switch (crash reruns included):
 

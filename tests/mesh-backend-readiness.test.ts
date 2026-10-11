@@ -176,8 +176,9 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(alarms.map(event => event.to)).toEqual(["session:owner", "session:chief"]); // each addressed: no broadcast
     expect(alarms[0]).toMatchObject({ topic: "ops.owner", data: { phase: "before the switch", accepted: [{ name: "fabric@unknown" }],
       owner: "session:owner", cc: "session:chief" } });
-    expect(alarms[0]!.text).toContain("accepted unready reader(s) by --accept-unready");
-    const overrideAlarm = { owner: "session:owner", cc: "session:chief", accepted: ["fabric@unknown"], events: alarms.map(event => event.id) };
+    expect(alarms[0]!.text).toContain("--accept-unready override of reader(s) (before the switch): fabric@unknown");
+    const overrideAlarm = { owner: "session:owner", cc: "session:chief", armed: ["fabric@unknown"], accepted: ["fabric@unknown"],
+      events: alarms.map(event => event.id) };
     expect(JSON.parse(accepted.out)).toMatchObject({ ok: true, overrideAlarm });
     const [intent, outcome] = records(root);
     expect(intent).toMatchObject({ phase: "intent", overrideAlarm });
@@ -192,15 +193,74 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
       "--accept-unready", "fabric@unknown"], anonymousWriter);
     publish.mockRestore();
     expect(refused.code).toBe(3);
-    expect(refused.err).toContain("the accepted-override alarm to session:owner and session:chief could not be raised: event log unwritable");
+    expect(refused.err).toContain("the accepted-override alarm to session:owner and session:chief could not be raised: "
+      + "owner session:owner failed (event log unwritable); cc session:chief not sent");
     expect(await backendOf(root)).toBe("none");
     expect(records(root)).toEqual([]);
-    // The flags without an unready reader to accept: the switch is ready on its own and alarms nobody.
+    // A listed reader that is ready now is still alarmed before the fence (armed), since it may turn unready under it.
     expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0);
-    const ready = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+    const ready = await run(["cutover", "--root", root, "--json", "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
       "--accept-unready", "fabric@unknown"]);
     expect(ready.code, ready.err).toBe(0);
-    expect(await ownerAlarms(root)).toEqual([]);
+    expect((await ownerAlarms(root)).map(event => event.data)).toMatchObject([
+      { accepted: [{ name: "fabric@unknown", reason: "ready now; accepted if it turns unready under the fence" }] }, {}]);
+    expect(JSON.parse(ready.out).overrideAlarm).toMatchObject({ armed: ["fabric@unknown"], accepted: [] });
+  });
+
+  // pi-fabric#919 review P1: a listed reader that first turns unready UNDER the fence. Its alarm was sent and confirmed
+  // before the fence (owner and cc); if either send fails, there is no switch and nothing changes.
+  const failingCc = async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const real = MeshStore.prototype.publish;
+    return vi.spyOn(MeshStore.prototype, "publish").mockImplementation(function (this: InstanceType<typeof MeshStore>, input) {
+      return input.to === "session:chief" ? Promise.reject(new Error("cc unreachable")) : real.call(this, input);
+    });
+  };
+  it("a reader that turns unready under the fence never commits with an unsent alarm: a failed cc send leaves no switch (pi-fabric#919)", async () => {
+    const root = await fileRoot();
+    const builtins = [{ name: "factory", installRoot: installRoot("r1") }];
+    expect(await proveFactory(root)).toBe(0);
+    const proofFile = path.join(root, "readers", "factory.json");
+    const removeProofUnderFence = { beforeCommit: (commit: { phase: string }) => { if (commit.phase === "importing") fs.rmSync(proofFile, { force: true }); } };
+    const publish = await failingCc();
+    const refused = await run(["cutover", "--root", root, "--json", "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+      "--accept-unready", "factory"], { builtins, options: removeProofUnderFence });
+    publish.mockRestore();
+    expect(refused.code).toBe(3);
+    // pi-fabric#919 SEC P2: the owner's event went out before the cc failed; its id is reported, per recipient.
+    const [ownerEvent] = await ownerAlarms(root);
+    expect(ownerEvent).toMatchObject({ to: "session:owner" });
+    expect(JSON.parse(refused.out)).toMatchObject({ ok: false, refused: true, overrideAlarm: { owner: "session:owner", cc: "session:chief",
+      deliveries: [{ to: "session:owner", role: "owner", state: "sent", id: ownerEvent!.id },
+        { to: "session:chief", role: "cc", state: "failed", reason: "cc unreachable" }] } });
+    expect(refused.err).toContain(`override alarm owner session:owner: sent, event ${ownerEvent!.id}`);
+    expect(refused.err).toContain("override alarm cc session:chief: FAILED: cc unreachable");
+    expect(refused.err).toContain(`could not be raised: owner session:owner sent (event ${ownerEvent!.id}); cc session:chief failed (cc unreachable)`);
+    expect(await backendOf(root)).toBe("none"); // no switch: state unchanged
+    expect(records(root)).toEqual([]);
+    expect(fs.existsSync(proofFile)).toBe(true); // refused before the fence: the under-fence change never ran
+    // With both sends confirmed, the same under-fence change is accepted: its alarm went out before the fence.
+    const accepted = await run(["cutover", "--root", root, "--json", "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+      "--accept-unready", "factory"], { builtins, options: removeProofUnderFence });
+    expect(accepted.code, accepted.err).toBe(0);
+    const alarms = await ownerAlarms(root);
+    expect(alarms.filter(event => event.to === "session:chief")).toHaveLength(1); // the refused run's owner event + this run's two
+    expect(alarms.at(-1)).toMatchObject({ to: "session:chief", data: { phase: "before the switch", accepted: [{ name: "factory" }] } });
+    expect(JSON.parse(accepted.out)).toMatchObject({ readers: { acceptedUnready: [{ name: "factory" }] },
+      overrideAlarm: { armed: ["factory"], accepted: ["factory"] } });
+  });
+
+  it("refuses a principal instance or a non-single root as an alarm target (pi-fabric#919)", async () => {
+    const root = await fileRoot();
+    for (const flag of ["--alarm-owner", "--alarm-cc"]) {
+      for (const value of ["org", "org-kate", "org-anyone", "*", "session:*", "fabric-store,chief-of-staff", "lead>"]) {
+        const roots = flag === "--alarm-owner" ? [flag, value, "--alarm-cc", "session:chief"] : ["--alarm-owner", "session:owner", flag, value];
+        const refused = await run(["cutover", "--root", root, ...roots, "--accept-unready", "fabric@unknown"], anonymousWriter);
+        expect(refused.code, `${flag} ${value}`).toBe(2);
+        expect(refused.err).toContain(`Bad ${flag} ${value}`);
+      }
+    }
+    expect(await backendOf(root)).toBe("none");
   });
 
   it("lets reader-proof prove only this Fabric release, and install only non-Fabric proofs", async () => {

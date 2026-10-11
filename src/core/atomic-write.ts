@@ -729,8 +729,12 @@ export interface MeshBackgroundOwner {
   retire: () => void;
   /** Fabric-owned obsolescence fact. Error text is never consulted. */
   obsolete?: () => boolean;
-  /** Current-owner probe and tick failures stay retryable under the owning lifecycle policy. */
-  onFailure?: (error: unknown, consecutiveFailures: number) => void;
+  /** Only a failed lifecycle PROBE (`current()` false or throwing) reaches this, with the
+   * consecutive probe-failure count. Operation errors (a mesh-lock timeout, a WAL-cap refusal,
+   * any other owned background-operation error) only earn retry backoff: they never count
+   * toward a lost lifecycle while the owner is still current (pi-fabric#808 review). */
+  onFailure?: (error: unknown, consecutiveProbeFailures: number) => void;
+  /** A probe succeeded after probe failures, or a live rebind. */
   onRecovery?: () => void;
 }
 
@@ -751,14 +755,22 @@ export class MeshBackgroundRetry {
   #suppressed = 0;
   #running = false;
   #retired = false;
-  #consecutiveFailures = 0;
+  /** Consecutive failed owner probes; operation errors never touch it. */
+  #probeFailures = 0;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000, readonly owner?: MeshBackgroundOwner,
     readonly warningWindowMs = meshRetryWarningWindowMs()) {}
 
   get retired(): boolean { return this.#retired; }
 
-  /** Check at every timer boundary, including continuations after an awaited tick. */
-  get active(): boolean {
+  /** Check at every timer boundary, including continuations after an awaited tick.
+   * Operation-retry paths: false while retired, obsolete, not current, or in backoff. */
+  get active(): boolean { return this.#probe(true); }
+
+  /** The owner lifecycle gate alone: retired, obsolete or a failed current() probe. Operation
+   * backoff never suppresses it, so a heartbeat keeps renewing leases through lock outages. */
+  get lifecycleActive(): boolean { return this.#probe(false); }
+
+  #probe(respectBackoff: boolean): boolean {
     if (this.#retired) return false;
     if (!this.owner) return true;
     try {
@@ -766,14 +778,32 @@ export class MeshBackgroundRetry {
         this.#retire();
         return false;
       }
-      if (this.waitMs > 0) return false;
-      if (this.owner.current()) return true;
-      this.failure(new Error("background owner is not current"));
+      if (respectBackoff && this.waitMs > 0) return false;
+      if (this.owner.current()) {
+        this.#probeRecovered();
+        return true;
+      }
+      this.#probeFailure(new Error("background owner is not current"));
       return false;
     } catch (error) {
-      this.failure(error);
+      this.#probeFailure(error);
       return false;
     }
+  }
+
+  #probeRecovered(): void {
+    if (this.#probeFailures === 0) return;
+    this.#probeFailures = 0;
+    this.owner?.onRecovery?.();
+  }
+
+  /** A failed lifecycle probe: the only signal that counts toward a lost owner lifecycle. */
+  #probeFailure(error: unknown): void {
+    if (this.#retired) return;
+    if (this.owner?.obsolete?.() === true) { this.#retire(); return; }
+    this.#probeFailures += 1;
+    this.owner?.onFailure?.(error, this.#probeFailures);
+    this.#backoff(error);
   }
 
   /** A live rebind resets outage state; a superseded owner can never be re-armed. */
@@ -784,6 +814,8 @@ export class MeshBackgroundRetry {
     } catch { return; }
     this.#retired = false;
     this.success();
+    this.#probeFailures = 0;
+    this.owner.onRecovery?.();
   }
 
   #retire(): void {
@@ -796,11 +828,10 @@ export class MeshBackgroundRetry {
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
   #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
-  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). */
+  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305).
+   * Not a lifecycle probe: owner recovery is reported by #probeRecovered and rebind only. */
   success(): void {
     this.#resetBackoff();
-    this.#consecutiveFailures = 0;
-    this.owner?.onRecovery?.();
     if (!this.#suppressed || this.#lastReportedAt === undefined) return;
     const now = Date.now();
     const elapsedMs = now - this.#lastReportedAt;
@@ -812,11 +843,14 @@ export class MeshBackgroundRetry {
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
+  /** An operation error: retry backoff only, never a lifecycle-probe failure (see onFailure). */
   failure(error: unknown): boolean {
     if (this.#retired) return false;
     if (this.owner?.obsolete?.() === true) { this.#retire(); return false; }
-    this.#consecutiveFailures += 1;
-    this.owner?.onFailure?.(error, this.#consecutiveFailures);
+    return this.#backoff(error);
+  }
+
+  #backoff(error: unknown): boolean {
     // Only a typed deferred write (a lock timeout or a WAL-cap refusal) earns lock backoff/deduplication.
     const transient = isMeshWriteDeferred(error);
     if (!transient && !this.owner) {
@@ -856,8 +890,12 @@ export class MeshBackgroundRetry {
   /** Polls retry unchanged state on a later tick after backoff; contains sync handlers too.
    * Paths that may no-op can reset explicitly after a confirmed acquisition instead.
    */
-  async run(operation: () => unknown | Promise<unknown>, resetOnSuccess = true): Promise<"done" | "retry" | "failed" | "skipped"> {
-    if (!this.active || this.#running || this.waitMs > 0) return "skipped";
+  async run(operation: () => unknown | Promise<unknown>, resetOnSuccess = true,
+    options: { ignoreBackoff?: boolean } = {}): Promise<"done" | "retry" | "failed" | "skipped"> {
+    // A scheduled heartbeat has its own cadence: operation backoff must not skip its renewal.
+    if (options.ignoreBackoff) {
+      if (!this.lifecycleActive || this.#running) return "skipped";
+    } else if (!this.active || this.#running || this.waitMs > 0) return "skipped";
     this.#running = true;
     try {
       await operation();

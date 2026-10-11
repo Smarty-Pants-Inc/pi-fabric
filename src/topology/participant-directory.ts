@@ -680,6 +680,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       options.backgroundEpoch ? {
         ...options.backgroundEpoch,
         retire: () => this.#stopBackgroundTimers(),
+        // Probe failures only: lock/WAL-cap/operation errors back off but never mean "ctx lost".
         onFailure: (_error, failures) => this.#lifecycleTick(false, failures),
         onRecovery: () => this.#lifecycleTick(true),
       } : undefined);
@@ -775,7 +776,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#retiredTicks = 0;
       this.#degraded = false;
       this.#timer = setInterval(() => {
-        if (this.#closed || !this.#backgroundRefresh.active) return;
+        // The lifecycle gate, not operation backoff: a mesh-lock timeout, WAL-cap refusal or
+        // other operation error must never skip actor/file/host lease renewal (pi-fabric#808).
+        if (this.#closed || !this.#backgroundRefresh.lifecycleActive) return;
         const live = this.#live();
         if (!this.options.backgroundEpoch) this.#lifecycleTick(live);
         if (!live) return;
@@ -792,7 +795,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return;
         }
         if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
-          void this.#backgroundRefresh.run(() => this.refresh(), false);
+          void this.#backgroundRefresh.run(() => this.refresh(), false, { ignoreBackoff: true });
         }
       }, this.#heartbeatMs);
       this.#timer.unref();

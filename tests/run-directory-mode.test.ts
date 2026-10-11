@@ -167,6 +167,73 @@ it.skipIf(process.platform === "win32")("refuses a foreign-owned group-writable 
   expect(fs.readdirSync(runs)).toEqual([]);
 });
 
+// pi-fabric#875 round 4 (SEC P1): a healed archive directory may hold entries planted while it was writable. Entries
+// are created O_EXCL|O_NOFOLLOW through the held fd; an existing one is replaced only when it is our regular file.
+const plantedArchive = () => {
+  const fixture = archiveFixture();
+  fs.writeFileSync(path.join(fixture.source, "reply.json"), '{"text":"archived"}');
+  const archive = path.join(fixture.root, "actor", "runs", "run-1");
+  fs.mkdirSync(archive, { recursive: true });
+  for (const directory of [path.join(fixture.root, "actor", "runs"), archive]) fs.chmodSync(directory, 0o775);
+  return { ...fixture, archive };
+};
+it.skipIf(process.platform === "win32")("never writes through a symlink planted in a healed archive directory", async () => {
+  const { root, source, sessionFile, store, archive } = plantedArchive();
+  const victim = path.join(root, "victim");
+  fs.writeFileSync(victim, "victim", { mode: 0o600 });
+  fs.symlinkSync(victim, path.join(archive, "status.json"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  await store.retainRun({ sessionFile }, "run-1", source);
+  expect(fs.readFileSync(victim, "utf8")).toBe("victim");
+  expect(fs.lstatSync(path.join(archive, "status.json")).isSymbolicLink()).toBe(true);
+  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
+  expect(mode(archive)).toBe(0o755); // healed
+  expect(fs.readFileSync(path.join(archive, "reply.json"), "utf8")).toBe('{"text":"archived"}');
+});
+
+it.skipIf(process.platform === "win32")("writes new archive entries 0600, and replaces an existing entry only when it is our own regular file", async () => {
+  const { source, sessionFile, store, archive } = plantedArchive();
+  fs.writeFileSync(path.join(archive, "status.json"), "stale", { mode: 0o644 });
+  await store.retainRun({ sessionFile }, "run-1", source);
+  expect(fs.readFileSync(path.join(archive, "status.json"), "utf8")).toBe("{}");
+  for (const file of ["status.json", "reply.json"]) expect(mode(path.join(archive, file)), file).toBe(0o600);
+  expect(fs.readdirSync(archive).filter(name => name.endsWith(".tmp"))).toEqual([]);
+});
+
+// pi-fabric#875 round 4 (CODE P1): no path-based fallback. Without a working fd base, creation fails closed.
+it.skipIf(process.platform === "win32")("fails closed with no fd-relative path, and creates nothing", async () => {
+  const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-nofd-");
+  privateDirTestHooks.fdBases = [path.join(root, "no-such-fd-base")];
+  try { expect(() => mkdirPrivate(path.join(root, "run"))).toThrow(/no fd-relative path/); }
+  finally { delete privateDirTestHooks.fdBases; }
+  expect(fs.existsSync(path.join(root, "run"))).toBe(false);
+});
+
+it.skipIf(process.platform === "win32" || !fs.existsSync("/dev/fd"))("works through a /dev/fd base", async () => {
+  const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-devfd-");
+  privateDirTestHooks.fdBases = ["/dev/fd"];
+  try { mkdirPrivate(path.join(root, "a", "run")); }
+  finally { delete privateDirTestHooks.fdBases; }
+  expect(mode(path.join(root, "a", "run"))).toBe(0o700);
+});
+
+// pi-fabric#875 round 4 (CODE P2-a): never heal through a symlink, even root's.
+it.skipIf(process.platform === "win32")("does not heal through a root-owned symlink below the anchor (injected lstat)", async () => {
+  const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
+  const anchor = tmp("fabric-private-heal-link-");
+  const outside = path.join(tmp("fabric-private-outside-"), "owned");
+  fs.mkdirSync(outside); fs.chmodSync(outside, 0o775);
+  const link = path.join(anchor, "runs");
+  fs.symlinkSync(outside, link);
+  privateDirTestHooks.linkStat = (directory, stat) => directory === link ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 0 }) : stat;
+  try { expect(() => mkdirPrivate(path.join(link, "run-1"), anchor)).toThrow(/writable by group or others/); }
+  finally { delete privateDirTestHooks.linkStat; }
+  expect(mode(outside)).toBe(0o775);
+  expect(fs.readdirSync(outside)).toEqual([]);
+});
+
 // pi-fabric#875 round 2 P1-a: existing ancestors and a competing creator are validated, never skipped.
 it.skipIf(process.platform === "win32")("mkdirPrivate refuses a symlinked existing ancestor and writes nothing through it", async () => {
   const { mkdirPrivate } = await import("../src/storage/private-dir.js");

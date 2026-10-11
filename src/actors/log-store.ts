@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
-import { closeDirectory, openPrivateDir, type PrivateDirectory } from "../storage/private-dir.js";
+import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
 
 /** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
@@ -115,25 +115,38 @@ export class ActorLogStore {
         const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
         const source = readRouteDispatchReceipt(receipt);
         if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-        // Durable archive confirmation precedes source cleanup (F2 custody). Its directory barriers need the real path,
-        // so the path must still name the held directory.
+        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
+        // fsynced through their fds, then the chain above by path, which must still name the held directory.
+        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
+          throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
+        }
         const named = fs.statSync(dest), opened = fs.statSync(held.path);
         if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
-        writeJsonAtomic(path.join(dest, "route-dispatch-receipt.json"), source, { durable: true });
+        syncDirectoryChain(dest);
       }
+      // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
+      // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
+      // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
       for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
         const src = path.join(runDirectory, file);
-        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(held.path, file));
+        if (!fs.existsSync(src)) continue;
+        try {
+          if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
+        } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
       }
       const nested = path.join(runDirectory, "nested");
       if (fs.existsSync(nested)) {
         try {
+          // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
+          fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
+          if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
           fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
           // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
           // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
           if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
-        } catch {
-          /* best-effort recursive run retention */
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
+          /* otherwise best-effort recursive run retention */
         }
       }
     } finally { held.close(); }

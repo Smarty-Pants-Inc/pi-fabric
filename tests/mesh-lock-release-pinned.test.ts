@@ -40,7 +40,9 @@ const stallAfterOwnerCheck = (lock: string, ours: () => string | undefined) => {
   return () => fired;
 };
 
-describe("mesh locks release only the directory they hold (smarty-dev#8777)", () => {
+// The pin needs /proc/self/fd (Linux). Non-Linux keeps main's release; its stalled-holder race is tracked in
+// smarty-dev#9569.
+describe.runIf(process.platform === "linux")("mesh locks release only the directory they hold (smarty-dev#8777)", () => {
   it.each([1, 2] as const)("a reclaimed mesh .lock holder (protocol %i) never removes its successor's lock", async protocol => {
     const root = tempRoot();
     const lock = path.join(root, ".lock");

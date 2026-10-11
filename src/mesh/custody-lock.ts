@@ -121,11 +121,21 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // never a check-then-rename by name that a reclaimed, stalled holder could run against its successor.
   const pin = pinFenceLock(lock, record);
   if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(` (custody lock ${lock} was reclaimed before entry)`, attempts, maxGapMs);
-  let released = false;
+  let done = false;
   return () => {
-    if (released) return;
-    released = true;
-    releaseFenceLock(lock, record, {}, pin);
+    if (done) return;
+    done = true;
+    if (pin !== undefined) { releaseFenceLock(lock, record, {}, pin); return; }
+    // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
+    try {
+      if (readOwner() !== record) return;
+      // Detach before removal: never recursively delete through the canonical name.
+      const released = `${lock}.released.${pathToken}`;
+      fs.renameSync(lock, released);
+      fs.rmSync(released, { recursive: true, force: true });
+    } catch {
+      // Already recovered or replaced: never delete a successor.
+    }
   };
 };
 

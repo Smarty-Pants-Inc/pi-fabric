@@ -1515,7 +1515,7 @@ describe("MeshStore lock recovery", () => {
   // the held directory, then rmdirs the name only while it is still that directory. An interruption between the
   // two leaves an EMPTY canonical (recovered after the ownerless grace), and a resumed rmdir fails closed on a
   // recorded successor (ENOTEMPTY), so it never cleans one.
-  it.each([1, 2] as const)("interrupted release (protocol %s) never cleans a live successor on resume", async (lockProtocol) => {
+  it.runIf(process.platform === "linux").each([1, 2] as const)("interrupted pinned release (protocol %s) never cleans a live successor on resume", async (lockProtocol) => {
     vi.useFakeTimers({ now: 1_000_000 });
     const store = createStore({ lockTimeoutMs: 100, lockProtocol });
     const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol });
@@ -1543,6 +1543,45 @@ describe("MeshStore lock recovery", () => {
         fs.readFileSync(ownerPath, "utf8") === successor && fs.statSync(lock).ino === inode;
     });
     expect(successorUnchanged).toBe(true);
+  });
+
+  // Non-Linux keeps main's release (rename the whole lock away, then remove it recursively).
+  it.skipIf(process.platform === "linux").each([1, 2] as const)("interrupted release (protocol %s) never exposes an ownerless canonical or cleans a live successor on resume", async (lockProtocol) => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const store = createStore({ lockTimeoutMs: 100, lockProtocol });
+    const other = new MeshStore(store.root, 64 * 1024, 100, { lockTimeoutMs: 100, lockProtocol });
+    const lock = path.join(store.root, ".lock");
+    const ownerPath = path.join(lock, "owner");
+    const remove = fs.rmSync.bind(fs);
+    let cleanupPath: string | undefined;
+    let ownerlessCanonical = false;
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      const name = String(file);
+      if (!cleanupPath && (name === lock || name.startsWith(`${lock}.released.`))) {
+        cleanupPath = name;
+        fs.unlinkSync(path.join(name, "owner")); // recursive removal interrupted after unlink
+        ownerlessCanonical = fs.existsSync(lock) && !fs.existsSync(ownerPath);
+        if (fs.existsSync(lock)) {
+          const past = new Date(Date.now() - 30_001);
+          fs.utimesSync(lock, past, past);
+        }
+        throw new Error("simulated interrupted cleanup");
+      }
+      return remove(file, options);
+    });
+    await store.exclusive(() => "released");
+    expect(cleanupPath).toBeDefined();
+    let successorUnchanged = false;
+    await other.exclusive(() => {
+      const successor = fs.readFileSync(ownerPath, "utf8");
+      const inode = fs.statSync(lock).ino;
+      remove(cleanupPath!, { recursive: true, force: true }); // resume exact old cleanup
+      successorUnchanged = fs.existsSync(ownerPath) &&
+        fs.readFileSync(ownerPath, "utf8") === successor && fs.statSync(lock).ino === inode;
+    });
+    expect(ownerlessCanonical).toBe(false);
+    expect(successorUnchanged).toBe(true);
+    expect(fs.existsSync(cleanupPath!)).toBe(false);
   });
 
   it("bounded lock backoff keeps the uncontended first attempt immediate", async () => {

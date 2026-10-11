@@ -1,4 +1,4 @@
-import crypto, { randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
@@ -104,7 +104,7 @@ const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undef
  * 343-413, custody-lock.ts:107-134, proven by tests/mesh-fence-lock.test.ts for both trees). Even then it
  * empties our own receipt; it never touches a successor's record.
  *
- * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `r.<8 random hex>`, never
+ * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `owner.released.<token>`, never
  * out of the directory), verified, and either removed with an rmdir or linked back without clobbering; a foreign
  * record that cannot go back stays in `<lock>`, so the directory stays non-empty and nobody else can mkdir,
  * publish into or rmdir it. Residual there: only after a live owner's lock was replaced (the same precondition)
@@ -131,86 +131,18 @@ export const releaseFenceLock = (lock: string, record: string,
   const ownerPath = path.join(lock, "owner");
   try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; }
   hooks.afterCheck?.();
-  const taken = takeOwner(lock, ownerPath);
-  if (taken === undefined) return;
+  const taken = path.join(lock, `owner.released.${record.split("\n")[0] ?? ""}`);
+  try { fs.renameSync(ownerPath, taken); } catch { return; }
   hooks.afterTake?.();
   let ours = false;
   try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
   if (ours) {
     try { fs.unlinkSync(taken); } catch { /* best effort */ }
-    removeReleasedLock(lock);
+    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
     return;
   }
   try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
   catch { /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }
-};
-
-let takeRefusedWarned = false;
-/**
- * Move `<lock>/owner` to a fresh short name inside `<lock>` without ever replacing an existing entry. Short:
- * Windows takes the unpinned release, and a deep mesh root must stay under MAX_PATH (smarty-dev#8777). A random
- * name can collide, and rename (or MoveFileEx REPLACE_EXISTING) replaces whatever holds it, a symlink included, so
- * the move is link (EEXIST never replaces) then unlink: a collision retries with a new name, 5 times, then the
- * release fails closed with the owner left in place. Only releaseFenceLock reads the name back.
- */
-const takeOwner = (lock: string, ownerPath: string): string | undefined => {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const taken = path.join(lock, `r.${crypto.randomBytes(4).toString("hex")}`);
-    try {
-      fs.linkSync(ownerPath, taken);
-    } catch (error) {
-      const code = codeOf(error);
-      if (code === "EEXIST") continue;
-      if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") return undefined;
-      // ponytail: a filesystem without hard links gets a guarded rename, and only inside OUR private lock
-      // directory (our uid, mode 0700), where no other user can plant an entry between the check and the rename.
-      try {
-        const directory = fs.lstatSync(lock);
-        const ours = directory.isDirectory() && (process.getuid === undefined || directory.uid === process.getuid()) &&
-          (process.platform === "win32" || (directory.mode & 0o077) === 0);
-        if (!ours || fs.existsSync(taken)) return undefined;
-        fs.renameSync(ownerPath, taken);
-        return taken;
-      } catch { return undefined; }
-    }
-    try { fs.unlinkSync(ownerPath); } catch { try { fs.unlinkSync(taken); } catch { /* best effort */ } return undefined; }
-    return taken;
-  }
-  if (!takeRefusedWarned) {
-    takeRefusedWarned = true;
-    try { console.warn(`[pi-fabric] mesh lock ${lock} not released: no free release name after 5 tries; the owner stays`); } catch { /* never mask */ }
-  }
-  return undefined;
-};
-
-let releaseLeftWarned = false;
-/**
- * rmdir the released `<lock>` (unpinned path). On Windows the unlinked owner can stay delete-pending, or another
- * process can still hold a handle, for a moment: rmdir then fails ENOTEMPTY, EPERM or EBUSY (pi-fabric#889 CI).
- * ponytail: the retry stays synchronous and short, 5 attempts 20 ms apart (~80 ms of event-loop block at worst):
- * the callers release synchronously (holdMeshFenceSync, the custody release `() => void`, MeshLock's finally),
- * and a longer block would stall every other fiber on this loop for a cosmetic cleanup.
- * Race with a successor: between attempts a successor can only publish into THIS directory (a resumed protocol-1
- * `wx` owner write; mkdir and the protocol-2 rename both fail while the name exists). Safety does not rest on the
- * owner check below: rmdir removes only an EMPTY directory, so once a successor's owner is in it every later
- * attempt fails ENOTEMPTY; the check only stops retrying early. Still failing: log once and leave the empty
- * directory (the earlier behaviour); the ownerless-lock recovery reclaims it after its grace.
- */
-const removeReleasedLock = (lock: string): void => {
-  for (let attempt = 1; ; attempt++) {
-    try { fs.rmdirSync(lock); return; } catch (error) {
-      const code = codeOf(error);
-      if (!(code === "ENOTEMPTY" || code === "EPERM" || code === "EBUSY") || fs.existsSync(path.join(lock, "owner"))) return;
-      if (attempt >= 5) {
-        if (!releaseLeftWarned) {
-          releaseLeftWarned = true;
-          try { console.warn(`[pi-fabric] mesh lock ${lock} released but its empty directory stays (${code}); stale-lock recovery reclaims it`); } catch { /* never mask a release */ }
-        }
-        return;
-      }
-      sleepSync(20);
-    }
-  }
 };
 
 /**

@@ -217,12 +217,24 @@ export class MeshLock {
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
     // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
-    // reclaimed, remove its successor's lock. Before the pin exists the release takes the unpinned path.
+    // reclaimed, remove its successor's lock. Before a pin exists, and off Linux, the release is main's below.
     let pin: number | undefined;
     const releaseOwned = (): void => {
       const held = pin;
       pin = undefined;
-      releaseFenceLock(this.#lockPath, ownerRecord, {}, held);
+      if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
+      // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
+      try {
+        if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
+          // Detach the complete owned directory before unlinking anything inside it.
+          // Interrupted/resumed recursive cleanup must never follow the canonical name.
+          const released = `${this.#lockPath}.released.${token}`;
+          fs.renameSync(this.#lockPath, released);
+          fs.rmSync(released, { recursive: true, force: true });
+        }
+      } catch {
+        // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
+      }
     };
     const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
     try {

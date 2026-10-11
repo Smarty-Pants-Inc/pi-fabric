@@ -209,6 +209,8 @@ export interface FabricRuntimeStateOptions {
 
 // ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
 const MAIN_ACTOR_MESH_REPLAY_MS = 10 * 60_000;
+/** Owner incarnation per host id for this process; a reload keeps it, a restart does not. */
+const PROCESS_OWNER_INCARNATIONS = new Map<string, string>();
 
 // A detached callback can outlive its ctx (reload, session replacement). Reading a stale
 // ctx throws, and a throw there is uncaught and exits Pi, so the notice is dropped.
@@ -794,7 +796,10 @@ export class FabricRuntimeState {
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     // One owner incarnation for this runtime: the participant records advertise it and the
     // control plane (constructed after mesh activation) fences commands for earlier ones.
-    const ownerIncarnation = randomUUID();
+    // Fork (smarty-dev#2160 item 4): a reload in the same process is the same owner and
+    // retains sender messages, so the incarnation is per process and host, not per initialize.
+    let ownerIncarnation = PROCESS_OWNER_INCARNATIONS.get(hostId);
+    if (!ownerIncarnation) PROCESS_OWNER_INCARNATIONS.set(hostId, ownerIncarnation = randomUUID());
     const mesh = this.#mesh;
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;

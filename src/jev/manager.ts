@@ -254,7 +254,16 @@ export class JevProgramManager {
             } catch (error) {
               // A failed dispatch may still have billed. Do not let a guest catch
               // it and start another inference with a fabricated zero usage count.
-              if (inference && !accounted) { inferenceBlocked = true; info.usage.input_tokens = null; info.usage.output_tokens = null; }
+              if (inference && !accounted) {
+                // A malformed but billed response reports its usage; account it exactly.
+                const usage = (error as { jevUsage?: { input: number; output: number } } | undefined)?.jevUsage;
+                if (ref === "jev.evaluate" && usage) {
+                  info.usage.input_tokens = info.usage.input_tokens === null ? null : info.usage.input_tokens + usage.input;
+                  info.usage.output_tokens = info.usage.output_tokens === null ? null : info.usage.output_tokens + usage.output;
+                  reportedTokens += usage.input + usage.output;
+                  inferenceBlocked ||= reportedTokens >= maxTokens;
+                } else { inferenceBlocked = true; info.usage.input_tokens = null; info.usage.output_tokens = null; }
+              }
               throw error;
             } finally {
               if (inference) evaluating = false;

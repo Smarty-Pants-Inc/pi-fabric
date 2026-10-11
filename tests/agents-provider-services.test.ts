@@ -773,9 +773,10 @@ describe("agents provider message routing service boundaries", () => {
     const principal = { id: "paul", binding: "voice-call" as const };
     const signal = new AbortController().signal;
     const own = { ...command(operation), principal, binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: actors.identity.id } };
-    const check = (options: unknown) => {
-      if (operation === "ask") expect(actors.ask).toHaveBeenLastCalledWith("child", "hello", undefined, signal, options);
-      else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, options);
+    // Upstream sender stamps: an unstamped control carries sender: null.
+    const check = (options: object) => {
+      if (operation === "ask") expect(actors.ask).toHaveBeenLastCalledWith("child", "hello", undefined, signal, { ...options, sender: null });
+      else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, { ...options, sender: null });
     };
     await expect(router.acceptControl(own, actors.identity, signal, "mesh")).resolves.toMatchObject({ accepted: true });
     check({ overrides: own.binding, provenance: expect.objectContaining({ principal }) });

@@ -188,6 +188,7 @@ export class JevClient {
     if (!reader) throw new Error(`${this.route.label} returned an empty response`);
     const chunks: Uint8Array[] = [];
     let bytes = 0;
+    let parsed: unknown;
     try {
       for (;;) {
         const { value, done } = await runAbortable(timedSignal, () => reader.read());
@@ -196,9 +197,18 @@ export class JevClient {
         if (bytes > 1_048_576) throw new Error("oversize");
         chunks.push(value);
       }
-      return checkResponse(JSON.parse(Buffer.concat(chunks).toString("utf8")), request);
+      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      return checkResponse(parsed, request);
     } catch {
-      throw new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
+      const error = new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
+      // A malformed answer was still billed: keep the reported usage so the caller
+      // can account it instead of treating the spend as unknown.
+      const usage = (parsed as { usage?: { input_tokens?: unknown; output_tokens?: unknown } } | undefined)?.usage;
+      if (usage && Number.isSafeInteger(usage.input_tokens) && Number.isSafeInteger(usage.output_tokens) &&
+          (usage.input_tokens as number) >= 0 && (usage.output_tokens as number) >= 0) {
+        Object.assign(error, { jevUsage: { input: usage.input_tokens as number, output: usage.output_tokens as number } });
+      }
+      throw error;
     } finally { await reader.cancel().catch(() => undefined); }
   }
   async drainCredentials(): Promise<void> {

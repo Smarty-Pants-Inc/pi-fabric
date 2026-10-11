@@ -16,8 +16,8 @@ describe("classifyProviderError (smarty-dev#8742)", () => {
 
   it("classifies the incident's gateway 409 from status and body, as Anthropic and OpenAI SDKs format it", () => {
     expect(classifyProviderError(failed(anthropic(409, "invalid_request_error", affinity)))).toEqual({
-      retryable: false, status: 409, basis: "body",
-      short: `409 invalid_request_error: ${affinity}`,
+      retryable: false, status: 409, type: "invalid_request_error", code: "compaction_affinity_missing", basis: "body",
+      short: "409 invalid_request_error: compaction_affinity_missing",
     });
     const openai = `openai API error (409): ${JSON.stringify({ type: "invalid_request_error", message: affinity })}`;
     expect(classifyProviderError(failed(openai))).toMatchObject({ retryable: false, status: 409 });
@@ -69,13 +69,29 @@ describe("classifyProviderError (smarty-dev#8742)", () => {
   });
 
   it("falls back to the exact gateway token only when no status or body survived", () => {
-    expect(classifyProviderError(failed(`Provider error: ${affinity}`))).toMatchObject({ retryable: false, basis: "text" });
-    expect(classifyProviderError(failed("the request was invalid"))).toMatchObject({ retryable: true, basis: "default" });
+    expect(classifyProviderError(failed(`Provider error: ${affinity}`))).toMatchObject({ retryable: false, basis: "text", short: "compaction_affinity_missing" });
+    expect(classifyProviderError(failed("the request was invalid"))).toMatchObject({ retryable: true, basis: "default", short: "unclassified" });
   });
 
-  it("keeps the short form on one bounded line", () => {
-    const short = classifyProviderError(failed(anthropic(400, "invalid_request_error", `line one\nline two ${"y".repeat(400)}`)))!.short;
-    expect(short).not.toContain("\n");
-    expect(short.length).toBeLessThanOrEqual(160);
+  // PR #841 security review P1: the short form reaches peers, ops.owner and the mesh bridge.
+  it("never copies provider text into the short form: only status, a known type and a fixed code", () => {
+    const secret = "SECRET-sk-ant-0123 echoed prompt: the user's password is hunter2";
+    const cases: Array<[string, string]> = [
+      [anthropic(400, "invalid_request_error", `line one\n${secret} ${"y".repeat(400)}`), "400 invalid_request_error"],
+      [anthropic(403, `${secret}_error`, secret), "403"],                       // unknown type: dropped
+      [`400: ${JSON.stringify({ code: secret, message: secret })}`, "400"],     // unknown code: dropped
+      [anthropic(409, "invalid_request_error", `${affinity} ${secret}`), "409 invalid_request_error: compaction_affinity_missing"],
+      [`openai API error (401): ${JSON.stringify({ type: "authentication_error", message: secret })}`, "401 authentication_error"],
+      [`400 {"type":"error","error":{"type":"invalid_request_error","message":"${secret}... [truncated 9000 chars]`, "400 invalid_request_error"],
+      [`Provider error: ${affinity}; ${secret}`, "compaction_affinity_missing"],
+      [`socket hang up: ${secret}`, "unclassified"],
+      [`503 ${secret}`, "503"],
+    ];
+    for (const [errorMessage, short] of cases) {
+      const verdict = classifyProviderError(failed(errorMessage))!;
+      expect(verdict.short).toBe(short);
+      expect(JSON.stringify(verdict)).not.toMatch(/SECRET|hunter2|echoed/);
+    }
+    expect(classifyProviderError(failed(`429 ${secret}`, { diagnostics: [{ type: "provider_limit" }] }))!.short).toBe("provider_limit");
   });
 });

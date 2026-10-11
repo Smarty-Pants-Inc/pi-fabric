@@ -153,22 +153,43 @@ const PROVIDER_DEAD_MESSAGE_ALARMS = 50;
  * existing mesh bridge to remote senders and the age pass never repeats it.
  */
 export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
-  event: { error: string; since: string; cause: string; held: ReadonlyArray<{ id: string; from: string; sentAt: number }> },
-  ownerIdentityId?: string): Promise<void> => {
+  event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
   const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];
-  const reason = `provider-dead (non-retryable: ${event.error})`;
+  const fields = providerDeadAlarmFields(event);
+  const reason = fields.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${fields.error})`;
   for (const to of owners) await mesh.publish({
     topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
     dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
-    text: `Main ${rootId} ${reason}: ${event.cause}; ${event.held.length} held message(s) unread`,
-    data: { rootId, ...event, held: event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS), heldCount: event.held.length } });
+    text: `Main ${rootId} ${reason}: ${fields.cause}; ${event.held.length} held message(s) unread`,
+    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS), heldCount: event.held.length } });
   for (const item of event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS)) {
     for (const to of new Set([item.from, ...owners])) await mesh.publish({
       topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to,
       dedupeKey: `inbox-age:${item.id}:${to}`, text: `Undelivered Main message ${item.id} to ${rootId}: ${reason}`,
-      data: { messageId: item.id, rootId, sentAt: item.sentAt, reason: "provider-dead", error: event.error } });
+      data: { messageId: item.id, rootId, sentAt: item.sentAt, reason: "provider-dead", error: fields.error } });
   }
 };
+
+/** What a provider-dead alarm may carry: the shape of FabricMainProviderDeadEvent, nothing else. */
+export interface ProviderDeadAlarmEvent {
+  kind?: "non-retryable" | "unclassified";
+  error: string; status?: number; type?: string; code?: string; failures?: number;
+  since: string; cause: string;
+  held: ReadonlyArray<{ id: string; from: string; sentAt: number }>;
+}
+
+/**
+ * smarty-dev#8742 security review: alarm data is an explicit allowlist (status, known type, fixed
+ * code, Fabric's own cause), so a field an event happens to carry can never ride along to ops.owner,
+ * held messages' senders or the mesh bridge. Provider message text is never one of them.
+ */
+export const providerDeadAlarmFields = (event: Omit<ProviderDeadAlarmEvent, "held">) => ({
+  kind: event.kind ?? "non-retryable", error: event.error, since: event.since, cause: event.cause,
+  ...(event.status === undefined ? {} : { status: event.status }),
+  ...(event.type === undefined ? {} : { type: event.type }),
+  ...(event.code === undefined ? {} : { code: event.code }),
+  ...(event.failures === undefined ? {} : { failures: event.failures }),
+});
 
 export class MainInboxMaintenance {
   readonly #receipts = new Map<string, SessionReceiptManager>();

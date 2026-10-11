@@ -60,12 +60,12 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     const held = h.main.deliverAgent({ from: from("lead"), message: "status?", delivery: "followUp" });
     expect(held.triggered).toBe(false);
     expect(held.reason).toBe("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing); compacting once to recover");
-    // The control plane drops a reason over 200 characters: a long provider error must still fit.
+    // A long provider message never reaches the receipt (security review P1); it stays well under
+    // the control plane's 200-character reason limit.
     const long = setup(flushMs);
     long.emit("turn_end", errorTurn(`409 ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `compaction_affinity_missing ${"z".repeat(300)}` } })}`));
     const longReason = long.main.deliverAgent({ from: from("lead"), message: "x", delivery: "followUp" }).reason!;
-    expect(longReason.length).toBeLessThanOrEqual(200);
-    expect(longReason).toMatch(/^provider-dead \(non-retryable: 409 invalid_request_error: compaction_affinity_missing z+…\); compacting once to recover$/);
+    expect(longReason).toBe("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing); compacting once to recover");
     long.main.closeFollowUpDrain();
     expect(h.compactions).toHaveLength(0);                // never inside the failing hook
     h.settleError();
@@ -108,8 +108,11 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     h.emit("session_compact_failed", { reason: "manual", aborted: false, willRetry: false, errorMessage: "Compaction failed: summarizer 409" });
     h.compactions[0]!.onError?.(new Error("Compaction failed: summarizer 409"));
     expect(h.alarms).toHaveLength(1);
-    expect(h.alarms[0]).toMatchObject({ cause: "compaction-failed", status: 409, detail: "summarizer 409",
-      error: "409 invalid_request_error: compaction_affinity_missing", since: "2026-10-11T08:00:00.000Z" });
+    expect(h.alarms[0]).toEqual({ kind: "non-retryable", cause: "compaction-failed", status: 409,
+      type: "invalid_request_error", code: "compaction_affinity_missing",
+      error: "409 invalid_request_error: compaction_affinity_missing", since: "2026-10-11T08:00:00.000Z",
+      held: [expect.objectContaining({ from: "agent-lead" })] });
+    expect(JSON.stringify(h.alarms)).not.toContain("summarizer");          // compaction error text stays local
     expect(h.alarms[0]!.held.map(item => item.from)).toEqual(["agent-lead"]);
     expect(h.notify).toHaveBeenCalledWith(expect.stringMatching(/^provider-dead \(non-retryable: 409 invalid_request_error: compaction_affinity_missing\): the recovery compaction failed/), "warning");
     const receipt = h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
@@ -195,6 +198,107 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     h.state.idle = true;
     expect(h.main.deliverAgent({ from: from("a"), message: "x", delivery: "followUp" }).reason).toMatch(/^provider-backoff until /);
     expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+});
+
+// PR #841 security review P1: provider text never leaves the Main; unclassified failures fail loud.
+describe.each([120_000, 0])("Main provider-dead hardening (flushMs=%s, PR #841 round 2)", (flushMs) => {
+  const secret = "SECRET-sk-ant-0123 echoed prompt: password hunter2";
+  const leakTurn = errorTurn(`409 ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `compaction_affinity_missing ${secret}` } })}`);
+  const leaked = (value: unknown) => /SECRET|hunter2|echoed/.test(JSON.stringify(value));
+
+  it("keeps provider message text out of receipts, notices and the alarm event", () => {
+    const h = setup(flushMs);
+    h.emit("turn_end", leakTurn);
+    const first = h.main.deliverAgent({ from: from("lead"), message: "status?", delivery: "followUp" });
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    h.compactOk();
+    vi.advanceTimersByTime(25);
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    h.emit("turn_end", leakTurn);
+    h.settleError();
+    const after = h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
+    expect(h.alarms).toHaveLength(1);
+    expect(h.alarms[0]).toMatchObject({ kind: "non-retryable", cause: "failed-after-compaction", error: "409 invalid_request_error: compaction_affinity_missing" });
+    expect(after.reason).toBe("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing); ops alarmed, held until owner input");
+    for (const value of [first, after, h.alarms, h.notify.mock.calls, h.main.providerDeadState]) expect(leaked(value)).toBe(false);
+    h.main.closeFollowUpDrain();
+  });
+
+  /** One failed run with an error that carries no status, body or known token. */
+  const failRun = (h: ReturnType<typeof setup>, errorMessage = "Connection error.") => {
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    h.emit("turn_end", errorTurn(errorMessage));
+    h.settleError();
+  };
+
+  it("alarms provider-dead (unclassified) on the third unclassified failure in a row and stops silent backoff", () => {
+    const h = setup(flushMs);
+    failRun(h, `fetch failed: ${secret}`);
+    const first = h.main.deliverAgent({ from: from("lead"), message: "status?", delivery: "followUp" });
+    expect(first.reason).toBe("provider-backoff until 2026-10-11T08:01:00.000Z");   // a blip: backoff, no alarm
+    vi.advanceTimersByTime(60_000);
+    expect(h.sent).toHaveLength(1);                                                  // the backoff retry
+    failRun(h, "terminated");
+    expect(h.alarms).toHaveLength(0);
+    // Owner input is not success: it does not reset the count.
+    h.emit("input", { source: "interactive" });
+    h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
+    failRun(h, `socket hang up ${secret}`);
+    expect(h.alarms).toEqual([{ kind: "unclassified", cause: "unclassified-repeated", error: "unclassified", failures: 3,
+      since: "2026-10-11T08:01:00.000Z", held: expect.any(Array) }]);
+    expect(h.notify).toHaveBeenCalledWith(expect.stringMatching(/^provider-dead \(unclassified\): 3 provider failures in a row without an HTTP status or error body\. The provider's error text is in the session log\./), "warning");
+    const receipt = h.main.deliverAgent({ from: from("other"), message: "x", delivery: "followUp" });
+    expect(receipt.triggered).toBe(false);
+    expect(receipt.reason).toBe("provider-dead (unclassified); 3 failures in a row, ops alarmed, held until owner input");
+    // No silent backoff loop: hours pass with no send, no compaction and no second alarm.
+    const sends = h.sent.length;
+    vi.advanceTimersByTime(14 * 60 * 60_000);
+    expect(h.sent).toHaveLength(sends);
+    expect(h.compactions).toHaveLength(0);
+    expect(h.alarms).toHaveLength(1);
+    for (const value of [h.alarms, h.notify.mock.calls, receipt]) expect(leaked(value)).toBe(false);
+    // A human /compact earns one attempt; failing the same way holds again without a second alarm.
+    h.emit("session_compact", { reason: "manual" });
+    vi.advanceTimersByTime(25);
+    expect(h.sent.length).toBe(sends + 1);
+    failRun(h);
+    expect(h.alarms).toHaveLength(1);
+    expect(h.main.providerDeadState).toMatchObject({ kind: "unclassified", phase: "alarmed" });
+    // A successful turn ends the incident and resets the count.
+    h.emit("input", { source: "interactive" });
+    h.state.idle = false;
+    h.emit("agent_start", {});
+    h.emit("turn_end", okTurn);
+    expect(h.main.providerDeadState).toBeUndefined();
+    failRun(h);
+    failRun(h);
+    expect(h.alarms).toHaveLength(1);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("resets the unclassified count on any successful turn, so isolated blips never alarm", () => {
+    const h = setup(flushMs);
+    for (let round = 0; round < 4; round++) {
+      failRun(h);
+      failRun(h);
+      h.state.idle = false;
+      h.emit("agent_start", {});
+      h.emit("turn_end", okTurn);
+      h.state.idle = true;
+      h.emit("agent_settled", { outcome: "completed" });
+    }
+    // A classified retryable error between them neither counts nor resets.
+    failRun(h);
+    failRun(h, `529 ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}`);
+    failRun(h);
+    expect(h.alarms).toHaveLength(0);
+    failRun(h);
+    expect(h.alarms).toEqual([expect.objectContaining({ kind: "unclassified", failures: 3 })]);
     h.main.closeFollowUpDrain();
   });
 });

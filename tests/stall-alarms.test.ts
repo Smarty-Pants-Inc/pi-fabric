@@ -427,3 +427,19 @@ it("publishes provider-dead alarms on ops.owner, firing each held message's inbo
   await mesh.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: A, to: "session:lead", dedupeKey: "inbox-age:m1:session:lead", data: {} });
   expect(mesh.read({ topic: "ops.owner", after: 0, limit: 100 })).toHaveLength(5);
 });
+
+// PR #841 security review P1: alarm data is an allowlist; provider text never rides along.
+it("publishes only allowlisted provider-dead fields, and labels an unclassified incident", async () => {
+  const { mesh } = setup();
+  const leaky = { kind: "unclassified" as const, error: "unclassified", failures: 3, since: "2026-10-11T09:00:00.000Z",
+    cause: "unclassified-repeated", held: [{ id: "m2", from: "session:lead", sentAt: 2 }],
+    message: "SECRET provider echo", detail: "SECRET compaction text", errorMessage: "SECRET raw" };
+  await providerDeadAlarms(mesh, A, A.id, leaky);
+  const alarms = mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
+  expect(JSON.stringify(alarms)).not.toContain("SECRET");
+  const dead = alarms.find(alarm => alarm.kind === "fabric.main.provider-dead")!;
+  expect(dead.text).toBe(`Main ${A.id} provider-dead (unclassified): unclassified-repeated; 1 held message(s) unread`);
+  expect(Object.keys(dead.data as object).sort()).toEqual(["cause", "error", "failures", "held", "heldCount", "kind", "rootId", "since"]);
+  expect(alarms.find(alarm => alarm.kind === "inbox.age.alarm" && alarm.to === "session:lead")!.text)
+    .toBe(`Undelivered Main message m2 to ${A.id}: provider-dead (unclassified)`);
+});

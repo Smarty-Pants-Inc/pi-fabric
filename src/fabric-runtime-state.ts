@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -1965,7 +1965,8 @@ export class FabricRuntimeState {
    * provider-backoff-released; the ops.owner alarms reuse the inbox-age addressing and bridge.
    */
   #alarmProviderDead(rootId: string, event: FabricMainProviderDeadEvent): void {
-    void this.publishOpsEvent("fabric.main.wake", "fabric.main.provider-dead", { rootId, ...event }).catch(() => undefined);
+    void this.publishOpsEvent("fabric.main.wake", "fabric.main.provider-dead",
+      { rootId, ...providerDeadAlarmFields(event), held: event.held, heldCount: event.held.length }).catch(() => undefined);
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
     const mesh = this.#mesh, identity = this.#identity;
     const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;

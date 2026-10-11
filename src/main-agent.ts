@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { MeshIdentity } from "./mesh/store.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
-import { classifyProviderError } from "./provider-error-class.js";
+import { classifyProviderError, type ProviderErrorClass } from "./provider-error-class.js";
 
 const MAIN_AGENT_ALIAS = "main";
 // Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
@@ -98,25 +98,52 @@ export interface FabricAgentMessageResult extends Partial<FabricFollowUpQueueDep
   stalled?: true;
 }
 
-/** smarty-dev#8742: one non-retryable provider incident on this Main. */
+/** smarty-dev#8742: one provider-dead incident on this Main. */
 type ProviderDeadState = {
+  /** non-retryable: a classified 4xx/gateway rejection; unclassified: repeated failures with no status or body. */
+  kind: "non-retryable" | "unclassified";
+  /** Allowlisted tokens only (status, known error type, fixed code); never provider text. */
   error: string;
   status?: number;
+  type?: string;
+  code?: string;
+  /** Consecutive unclassified failures when the incident was raised. */
+  failures?: number;
   since: number;
   phase: "recovering" | "compacting" | "probation" | "alarmed";
   alarmed: boolean;
 };
 
-/** smarty-dev#8742: a non-retryable provider error survived its one compaction recovery. */
+/** Unclassified failures in a row (no successful turn between them) before Main alarms (smarty-dev#8742). */
+export const UNCLASSIFIED_PROVIDER_DEAD_AFTER = 3;
+
+/** `provider-dead (non-retryable: <allowlisted short>)` or `provider-dead (unclassified)`. */
+const providerDeadLabel = (dead: { kind: "non-retryable" | "unclassified"; error: string }): string =>
+  dead.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${dead.error})`;
+
+/**
+ * smarty-dev#8742: a provider-dead Main. Every field is allowlisted: the HTTP status, a known error
+ * type, a fixed code and Fabric's own cause. Provider message text never appears here, because this
+ * event is published to ops.owner, to held messages' senders and across the mesh bridge; it stays
+ * in the failed assistant message in the local session log.
+ */
 export interface FabricMainProviderDeadEvent {
-  /** One short line: status, error type, provider message. */
+  kind: "non-retryable" | "unclassified";
+  /** One short line from allowlisted tokens, e.g. `409 invalid_request_error: compaction_affinity_missing`. */
   error: string;
   status?: number;
-  /** When the first non-retryable error of this incident arrived (ISO). */
+  type?: string;
+  code?: string;
+  /** Consecutive unclassified failures (kind unclassified). */
+  failures?: number;
+  /** When the incident began (ISO). */
   since: string;
-  /** The recovery compaction failed, or the one attempt after it failed non-retryably again. */
-  cause: "compaction-failed" | "failed-after-compaction";
-  detail?: string;
+  /**
+   * compaction-failed: the recovery compaction failed. failed-after-compaction: the one attempt
+   * after it failed non-retryably again. unclassified-repeated: UNCLASSIFIED_PROVIDER_DEAD_AFTER
+   * failures in a row without an HTTP status, error body or known token.
+   */
+  cause: "compaction-failed" | "failed-after-compaction" | "unclassified-repeated";
   /** Peer messages Fabric holds unread for this Main, oldest first. */
   held: Array<{ id: string; from: string; sentAt: number }>;
 }
@@ -380,6 +407,10 @@ export class MainAgentController implements FabricMainAgentTarget {
   // input or a successful turn. One alarm per incident.
   #providerDead: ProviderDeadState | undefined;
   #providerDeadTimer: ReturnType<typeof setTimeout> | undefined;
+  // smarty-dev#8742: an unclassified failure (no status, body or known token: a network blip, or a
+  // dead provider Fabric cannot recognise) is backoff until the third settle in a row; then alarm.
+  #unclassifiedFailures = 0;
+  #runUnclassified = false;
   // Preserve an unreadable owner index until explicit user input authorizes replacing it.
   #haltIndexUnknown = false;
   #closed = false;
@@ -1116,11 +1147,16 @@ export class MainAgentController implements FabricMainAgentTarget {
       else if (reason === "error") {
         // smarty-dev#8742: a request the provider will reject again is not backoff.
         const failure = classifyProviderError(event.message);
-        if (failure && !failure.retryable) this.#recordNonRetryable(failure.short, failure.status);
+        // Counted at settle, after Pi's own retries: one failed run is one failure.
+        this.#runUnclassified = failure?.basis === "default";
+        const dead = this.#providerDead;
+        if (failure && !failure.retryable) this.#recordNonRetryable(failure);
+        // An unclassified incident's one post-compaction attempt failed the same way: hold again, no second alarm.
+        else if (this.#runUnclassified && dead?.kind === "unclassified" && dead.phase === "probation") this.#raiseProviderDead("unclassified-repeated");
         else this.#recordProviderFailure(true);
       } else if (reason !== undefined) {
         const dead = this.#providerDead;
-        if (dead?.phase === "probation") this.#notify(`Main provider recovered after compaction (was non-retryable: ${dead.error})`, "info");
+        if (dead?.phase === "probation") this.#notify(`Main provider recovered after compaction (was ${providerDeadLabel(dead).slice("provider-dead (".length, -1)})`, "info");
         this.#recoverProvider();
         this.#suspended = false;
       }
@@ -1129,7 +1165,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (ctx.signal?.aborted || isCompactionCancelled(this.#compactionDecline) ||
         (event.outcome === "aborted" && !this.#compactionDecline)) this.halt();
       // turn_end already classified a non-retryable failure: recover at idle, never back off.
-      else if (event.outcome === "error" && this.#providerDead) this.#armProviderDeadTimer();
+      else if (event.outcome === "error" && this.#providerDead) { this.#runUnclassified = false; this.#armProviderDeadTimer(); }
+      // The third unclassified failure in a row raises provider-dead instead of more silent backoff.
+      else if (event.outcome === "error" && this.#countUnclassified()) { /* alarmed and held */ }
       else if (event.outcome === "error") this.#recordProviderFailure();
       else if (event.outcome === "completed") this.#recoverProvider();
       // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
@@ -1175,7 +1213,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       } else if (!event.aborted && !event.willRetry && this.#providerDead &&
         (this.#providerDead.phase === "recovering" || this.#providerDead.phase === "compacting")) {
         // The one recovery compaction failed, including a benign no-op: alarm, never back off.
-        this.#raiseProviderDead("compaction-failed", message ?? "Compaction failed");
+        // Its error text may echo provider content: it stays out of the alarm (smarty-dev#8742).
+        this.#raiseProviderDead("compaction-failed");
       } else if (!event.aborted && !event.willRetry && !benign) {
         this.#recordProviderFailure(true);
       }
@@ -1465,7 +1504,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#clearProviderDead();
     this.#providerAttemptInFlight = false;
     this.#providerFailed = false;
-    if (resetFailures) this.#providerFailures = 0;
+    // Only a successful turn (not owner input) resets the unclassified-failure count.
+    if (resetFailures) { this.#providerFailures = 0; this.#unclassifiedFailures = 0; this.#runUnclassified = false; }
     this.#providerRetryAt = 0;
     this.#providerFailureRecorded = false;
     this.#stopProviderWake();
@@ -1504,13 +1544,16 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!dead) {
       return this.#providerAttemptInFlight ? "provider-retry in flight" : `provider-backoff until ${new Date(this.#providerRetryAt).toISOString()}`;
     }
-    const state = dead.phase === "alarmed" ? "; ops alarmed, held until owner input"
+    const alarmed = dead.kind === "unclassified" ? `; ${dead.failures ?? UNCLASSIFIED_PROVIDER_DEAD_AFTER} failures in a row, ops alarmed, held until owner input`
+      : "; ops alarmed, held until owner input";
+    const state = dead.phase === "alarmed" ? alarmed
       : dead.phase === "probation" ? "; retry after compaction in flight" : "; compacting once to recover";
     // Control acknowledgements carry a reason of at most 200 characters; a longer one is dropped,
-    // which would turn this receipt back into a silent triggered:false.
-    const room = 200 - "provider-dead (non-retryable: )".length - state.length;
-    const error = dead.error.length > room ? `${dead.error.slice(0, room - 1)}…` : dead.error;
-    return `provider-dead (non-retryable: ${error})${state}`;
+    // which would turn this receipt back into a silent triggered:false. The label is built from
+    // allowlisted tokens, so this bound is defence in depth.
+    const label = providerDeadLabel(dead);
+    const room = 200 - state.length;
+    return `${label.length > room ? `${label.slice(0, room - 1)}…` : label}${state}`;
   }
 
   #notify(message: string, level: "info" | "warning"): void {
@@ -1523,18 +1566,24 @@ export class MainAgentController implements FabricMainAgentTarget {
    * compaction_affinity_missing). Retrying the same context fails the same way, so this never
    * enters backoff: compact once at idle, allow one attempt, then alarm.
    */
-  #recordNonRetryable(error: string, status?: number): void {
+  #recordNonRetryable(failure: ProviderErrorClass): void {
     this.#providerAttemptInFlight = false;
     this.#stopProviderWake();
     const dead = this.#providerDead;
+    const fields = {
+      error: failure.short, ...(failure.status === undefined ? {} : { status: failure.status }),
+      ...(failure.type === undefined ? {} : { type: failure.type }), ...(failure.code === undefined ? {} : { code: failure.code }),
+    };
     if (dead?.phase === "probation") {
-      dead.error = error;
-      if (status === undefined) delete dead.status; else dead.status = status;
+      // The incident becomes this classified rejection, whatever began it; still one alarm.
+      delete dead.status; delete dead.type; delete dead.code; delete dead.failures;
+      Object.assign(dead, { kind: "non-retryable" as const }, fields);
       this.#raiseProviderDead("failed-after-compaction");
       return;
     }
     if (dead) return;                                    // one incident, one recovery
-    this.#providerDead = { error, ...(status === undefined ? {} : { status }), since: Date.now(), phase: "recovering", alarmed: false };
+    const error = failure.short;
+    this.#providerDead = { kind: "non-retryable", ...fields, since: Date.now(), phase: "recovering", alarmed: false };
     // Hold peer wakes without a retry deadline: #providerHeld, never #providerBackoffActive.
     this.#providerFailed = true;
     this.#providerRetryAt = 0;
@@ -1579,14 +1628,14 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** The same path a human /compact takes; compaction extensions may drop provider-bound blocks. */
   #compactForRecovery(dead: ProviderDeadState, ctx: ExtensionContext): void {
     dead.phase = "compacting";
-    const failed = (error: unknown): void => {
+    const failed = (): void => {
       if (this.#providerDead !== dead || dead.phase !== "compacting") return;
-      this.#raiseProviderDead("compaction-failed", error instanceof Error ? error.message : String(error));
+      this.#raiseProviderDead("compaction-failed");
     };
     try {
       ctx.compact({ onComplete: () => { if (this.#providerDead === dead) this.#providerCompacted(); }, onError: failed });
-    } catch (error) {
-      failed(error);
+    } catch {
+      failed();
     }
   }
 
@@ -1615,14 +1664,37 @@ export class MainAgentController implements FabricMainAgentTarget {
         customType: "pi-fabric-provider-retry", display: true,
         content: "Continue the interrupted turn: the provider rejected the previous request as non-retryable, and Fabric compacted the session once to recover. This is Fabric's one automatic retry.",
       }, { deliverAs: "followUp", triggerTurn: true });
-    } catch (error) {
+    } catch {
       this.#providerAttemptInFlight = false;
-      this.#raiseProviderDead("failed-after-compaction", error instanceof Error ? error.message : String(error));
+      this.#raiseProviderDead("failed-after-compaction");
     }
   }
 
+  /**
+   * smarty-dev#8742: a failed run whose error carried no status, body or known token. A network blip
+   * stays on backoff; the UNCLASSIFIED_PROVIDER_DEAD_AFTER-th such settle in a row, with no
+   * successful turn between, raises the provider-dead alarm instead of more silent backoff.
+   */
+  #countUnclassified(): boolean {
+    if (!this.#runUnclassified) return false;
+    this.#runUnclassified = false;
+    this.#unclassifiedFailures++;
+    if (this.#unclassifiedFailures < UNCLASSIFIED_PROVIDER_DEAD_AFTER) return false;
+    this.#providerAttemptInFlight = false;
+    this.#stopProviderWake();
+    this.#providerDead = { kind: "unclassified", error: "unclassified", failures: this.#unclassifiedFailures,
+      since: Date.now(), phase: "alarmed", alarmed: false };
+    this.#providerFailed = true;
+    this.#providerRetryAt = 0;
+    this.#providerFailureRecorded = true;
+    this.#providerReleaseUntil = undefined;
+    this.#stopWake();
+    this.#raiseProviderDead("unclassified-repeated");
+    return true;
+  }
+
   /** Terminal for the incident: hold work, no timers, one loud alarm. */
-  #raiseProviderDead(cause: FabricMainProviderDeadEvent["cause"], detail?: string): void {
+  #raiseProviderDead(cause: FabricMainProviderDeadEvent["cause"]): void {
     const dead = this.#providerDead;
     if (!dead) return;
     this.#stopProviderDeadTimer();
@@ -1633,15 +1705,18 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#stopProviderWake();
     if (dead.alarmed) return;
     dead.alarmed = true;
-    const why = cause === "compaction-failed"
-      ? `the recovery compaction failed${detail ? `: ${detail.replace(/\s+/g, " ").trim().slice(0, 160)}` : ""}`
+    const why = cause === "compaction-failed" ? "the recovery compaction failed"
+      : cause === "unclassified-repeated" ? `${dead.failures ?? UNCLASSIFIED_PROVIDER_DEAD_AFTER} provider failures in a row without an HTTP status or error body`
       : "the one retry after compaction failed again";
-    const message = `provider-dead (non-retryable: ${dead.error}): ${why}. Held peer messages stay journalled and ops.owner is alarmed; fix the provider, then send any input to resume.`;
+    // Fixed text and allowlisted tokens only; the provider's own error text stays in the session log.
+    const message = `${providerDeadLabel(dead)}: ${why}. The provider's error text is in the session log. Held peer messages stay journalled and ops.owner is alarmed; fix the provider, then send any input to resume.`;
     this.#notify(message, "warning");
     try {
       this.onProviderDead?.({
-        error: dead.error, ...(dead.status === undefined ? {} : { status: dead.status }),
-        since: new Date(dead.since).toISOString(), cause, ...(detail ? { detail: detail.slice(0, 1000) } : {}),
+        kind: dead.kind, error: dead.error, ...(dead.status === undefined ? {} : { status: dead.status }),
+        ...(dead.type === undefined ? {} : { type: dead.type }), ...(dead.code === undefined ? {} : { code: dead.code }),
+        ...(dead.failures === undefined ? {} : { failures: dead.failures }),
+        since: new Date(dead.since).toISOString(), cause,
         held: this.#held.map(item => ({ id: item.id, from: item.from.id, sentAt: item.sentAt })),
       });
     } catch (error) {

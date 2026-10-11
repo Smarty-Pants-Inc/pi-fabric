@@ -165,8 +165,9 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
   if (process.platform !== "linux" && options.fallback) {
-    // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2).
-    const bytes = options.freed ?? pathBytes(target);
+    // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2). The size
+    // walk runs only for a report: in-process sweeps keep main's filesystem cost (actor-manager-startup #4250 guard).
+    const bytes = options.freed ?? (tally ? pathBytes(target) : 0);
     if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
     let removed = false;
     try { removed = options.fallback(); } catch { /* main's best effort */ }

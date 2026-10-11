@@ -136,6 +136,75 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     h.main.closeFollowUpDrain();
   });
 
+  // PR #841 security review (round 2) P1: Pi's native compaction deadline can settle Fabric's own recovery
+  // compaction as aborted:true, with a TimeoutError as the operation signal's reason. Only an explicit owner
+  // cancel is not a failed recovery; every other end raises the one alarm from the failure event itself.
+  it.each([
+    ["Pi's native deadline, settled as aborted (TimeoutError)", true, true, undefined],
+    ["Pi's native deadline, settled as a failure", false, true, "Compaction failed: Compaction exceeded its 20-minute deadline"],
+    ["an extension veto", true, false, undefined],
+  ])("alarms once and holds when the recovery compaction ends by %s (security review P1)", (_label, aborted, timeout, errorMessage) => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.main.deliverAgent({ from: from("lead"), message: "busy work", delivery: "followUp" });
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    const operation = new AbortController();
+    h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    if (timeout) operation.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+    h.emit("session_compact_failed", { reason: "manual", aborted, willRetry: false, ...(errorMessage === undefined ? {} : { errorMessage }) });
+    // The failure event alone raises the alarm; it does not depend on a later ctx.compact callback.
+    expect(h.alarms).toEqual([expect.objectContaining({ kind: "non-retryable", cause: "compaction-failed", status: 409,
+      type: "invalid_request_error", code: "compaction_affinity_missing", held: [expect.objectContaining({ from: "agent-lead" })] })]);
+    expect(h.main.providerDeadState).toMatchObject({ kind: "non-retryable", phase: "alarmed", alarmed: true });
+    expect(h.notify).toHaveBeenCalledWith(expect.stringMatching(/^provider-dead \(non-retryable: 409 invalid_request_error: compaction_affinity_missing\): the recovery compaction failed/), "warning");
+    expect(JSON.stringify([h.alarms, h.notify.mock.calls])).not.toContain("deadline");
+    // Pi then rejects ctx.compact: still exactly one alarm.
+    h.compactions[0]!.onError?.(new Error("Compaction cancelled"));
+    expect(h.alarms).toHaveLength(1);
+    // Held, not halted: peer work stays journalled under the provider-dead receipt, with no timer and no send.
+    const receipt = h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
+    expect(receipt.triggered).toBe(false);
+    expect(receipt.reason).toBe("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing); ops alarmed, held until owner input");
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(14 * 60 * 60_000);
+    h.emit("agent_settled", { outcome: "error" });
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.sent).toHaveLength(0);
+    expect(h.compactions).toHaveLength(1);
+    expect(h.alarms).toHaveLength(1);
+    expect(h.main.queueDepth().pendingFollowUps).toBe(2);
+    // Owner input ends the incident.
+    h.emit("input", { source: "interactive" });
+    expect(h.main.providerDeadState).toBeUndefined();
+    h.main.closeFollowUpDrain();
+  });
+
+  it("keeps an owner cancel of the recovery compaction an owner stop, with no alarm from the failure event (security review P1)", () => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    const operation = new AbortController();
+    h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    operation.abort();                                  // Escape: a plain abort, not the deadline
+    h.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false });
+    expect(h.alarms).toHaveLength(0);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    // Halted: a peer message neither triggers nor gets a provider-dead receipt.
+    const receipt = h.main.deliverAgent({ from: from("peer"), message: "ping", delivery: "followUp" });
+    expect(receipt.triggered).toBe(false);
+    expect(receipt.reason ?? "").not.toMatch(/^provider-dead/);
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.sent.every(entry => entry.options.triggerTurn === false)).toBe(true);   // passive context only
+    expect(h.compactions).toHaveLength(1);
+    expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+
   it("alarms once when the one retry after compaction fails non-retryably again", () => {
     const h = setup(flushMs);
     h.emit("turn_end", errorTurn(affinity));

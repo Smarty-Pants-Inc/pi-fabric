@@ -1209,15 +1209,21 @@ export class MainAgentController implements FabricMainAgentTarget {
       const message = event.errorMessage?.replace(/^Compaction failed: /, "");
       const benign = message === "Already compacted" || message === "Nothing to compact (session too small)" ||
         message === "Compaction cancelled";
+      const dead = this.#providerDead;
       if (ownerCancelled) this.halt();
-      else if (event.aborted && event.reason !== "manual" && operation && !operation.aborted) {
+      else if (dead?.phase === "compacting" && event.reason === "manual") {
+        // Fabric's own recovery compaction (ctx.compact is always "manual") ended without an owner
+        // cancel: Pi's native deadline (aborted or not), an error, a veto or a no-op. Recovery failed:
+        // one alarm and hold, never a silent provider-dead (smarty-dev#8742 item 4). Its error text
+        // may echo provider content: it stays out of the alarm.
+        this.#raiseProviderDead("compaction-failed");
+      } else if (event.aborted && event.reason !== "manual" && operation && !operation.aborted) {
         // Pi settles an automatic extension veto as aborted. Retain its provenance
         // rather than converting the outcome into a durable owner stop.
         this.#compactionDecline = operation;
-      } else if (!event.aborted && !event.willRetry && this.#providerDead &&
-        (this.#providerDead.phase === "recovering" || this.#providerDead.phase === "compacting")) {
-        // The one recovery compaction failed, including a benign no-op: alarm, never back off.
-        // Its error text may echo provider content: it stays out of the alarm (smarty-dev#8742).
+      } else if (!event.aborted && !event.willRetry && dead &&
+        (dead.phase === "recovering" || dead.phase === "compacting")) {
+        // Another compaction failed during the incident, including a benign no-op: alarm, never back off.
         this.#raiseProviderDead("compaction-failed");
       } else if (!event.aborted && !event.willRetry && !benign) {
         this.#recordProviderFailure(true);

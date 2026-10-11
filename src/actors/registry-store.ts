@@ -535,6 +535,21 @@ export class ActorRegistryStore {
 
   /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
+    // smarty-dev#7791: an unchanged registry is answered from one stat of the path, with no open. stat follows the
+    // path exactly as open does, so it names the inode the open would read; the hit rule is the open path's own
+    // (same generation, local clock already proven for that dev:ino, bytes older than the racy window). Anything
+    // else (changed, missing, unproven) takes the descriptor-bound path below.
+    const cached = registryReadCache.get(this.#registryPath);
+    if (cached) {
+      let stat: fs.BigIntStats | undefined;
+      try { stat = fs.statSync(this.#registryPath, { bigint: true }); } catch { stat = undefined; }
+      if (stat && cached.generation === `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
+        registryReadCache.delete(this.#registryPath);
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
+    }
     let fd: number;
     try { fd = fs.openSync(this.#registryPath, "r"); }
     catch (error) { this.releaseReadCache(); throw error; }

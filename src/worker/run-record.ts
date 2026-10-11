@@ -97,7 +97,8 @@ export const createRunningRecord = (
 });
 
 export const writeRunRecord = (filePath: string, record: AgentRunRecord): void => {
-  mkdirPrivate(path.dirname(filePath)); // smarty-dev#9016: 0700 under any umask
+  // smarty-dev#9016: 0700 under any umask; the run root (the record's run directory's parent) is the Fabric anchor.
+  mkdirPrivate(path.dirname(filePath), path.dirname(path.dirname(filePath)));
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify(record, null, 2), {
     encoding: "utf8",

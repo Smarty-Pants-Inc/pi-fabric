@@ -334,7 +334,9 @@ const main = async (): Promise<void> => {
   const taskProvenance = fs.existsSync(options.taskFile + ".provenance.json")
     ? copyFabricProvenance(JSON.parse(fs.readFileSync(options.taskFile + ".provenance.json", "utf8"))) : undefined;
   const deliveryDirectory = path.join(path.dirname(options.taskFile), "deliveries");
-  mkdirPrivate(deliveryDirectory);
+  // The run root (the run directory's parent) is the Fabric-owned anchor (pi-fabric#875 round 3).
+  const runRoot = path.dirname(path.dirname(options.taskFile));
+  mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
   if (options.runner === "pi") {
@@ -357,7 +359,7 @@ const main = async (): Promise<void> => {
     data?: Record<string, unknown>,
   ): void => {
     try {
-      mkdirPrivate(path.dirname(options.lifecycleFile)); // smarty-dev#9016: 0700 under any umask
+      mkdirPrivate(path.dirname(options.lifecycleFile), runRoot); // smarty-dev#9016: 0700 under any umask
       fs.appendFileSync(
         options.lifecycleFile,
         JSON.stringify({ version: 1, event, occurredAt: Date.now(), ...(data ? { data } : {}) }) + "\n",
@@ -369,7 +371,7 @@ const main = async (): Promise<void> => {
   };
   crashContext = { statusFile: options.statusFile, record };
   process.stdout.write(`[pi-fabric] ${options.name}\n${task}\n\n`);
-  mkdirPrivate(path.dirname(options.logFile)); // smarty-dev#9016: 0700 under any umask
+  mkdirPrivate(path.dirname(options.logFile), runRoot); // smarty-dev#9016: 0700 under any umask
   // Other processes tail this file while the run is live (transcript reader,
   // dashboards, preview trees). The previous buffered createWriteStream visibly
   // stalled mid-run — append synchronously so events are durable immediately.

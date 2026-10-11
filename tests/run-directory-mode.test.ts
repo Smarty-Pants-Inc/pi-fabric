@@ -107,9 +107,10 @@ it.skipIf(process.platform === "win32")("does not follow a symlink swapped in at
 });
 
 // pi-fabric#875 round 2 P1-b: the destination chain is validated BEFORE any copy. An unsafe chain refuses the archive.
-it.skipIf(process.platform === "win32")("does not archive below a group-writable ancestor, and warns", async () => {
+it.skipIf(process.platform === "win32")("does not archive below a group-writable ancestor above the anchor, and warns", async () => {
   const { root, source, sessionFile, store } = archiveFixture();
-  fs.chmodSync(path.dirname(sessionFile), 0o775);
+  // The fixture has no actors/ directory: the anchor is the actor's own directory, so `root` is above it.
+  fs.chmodSync(root, 0o775);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   await store.retainRun({ sessionFile }, "run-1", source);
   expect(fs.existsSync(path.join(root, "actor", "runs"))).toBe(false);
@@ -127,6 +128,43 @@ it.skipIf(process.platform === "win32")("does not archive through a symlinked de
   await store.retainRun({ sessionFile }, "run-1", source);
   expect(fs.readdirSync(outside)).toEqual([]);
   expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*symbolic link/));
+});
+
+// pi-fabric#875 round 3: our own group-writable containers at or below the caller's Fabric root (the anchor) are
+// tightened on first use; above it, and for a foreign owner, the refusal holds.
+it.skipIf(process.platform === "win32")("tightens our own 0775 container below the anchor to 0755 and creates the run 0700", async () => {
+  const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+  const anchor = tmp("fabric-private-anchor-");
+  const runs = path.join(anchor, "residency", "host", "runs");
+  fs.mkdirSync(runs, { recursive: true });
+  for (const directory of [path.join(anchor, "residency"), path.join(anchor, "residency", "host"), runs]) fs.chmodSync(directory, 0o775);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  mkdirPrivate(path.join(runs, "run-1"), anchor);
+  for (const directory of [path.join(anchor, "residency"), path.join(anchor, "residency", "host"), runs]) expect(mode(directory), directory).toBe(0o755);
+  expect(mode(path.join(runs, "run-1"))).toBe(0o700);
+  expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`tightened ${runs.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} from 775 to 755`)));
+});
+
+it.skipIf(process.platform === "win32")("refuses the same 0775 container above the anchor", async () => {
+  const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-above-");
+  const shared = path.join(root, "shared");
+  fs.mkdirSync(path.join(shared, "anchor"), { recursive: true });
+  fs.chmodSync(shared, 0o775);
+  expect(() => mkdirPrivate(path.join(shared, "anchor", "run"), path.join(shared, "anchor"))).toThrow(/writable by group or others/);
+  expect(mode(shared)).toBe(0o775);
+});
+
+it.skipIf(process.platform === "win32")("refuses a foreign-owned group-writable container below the anchor (injected fstat)", async () => {
+  const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
+  const anchor = tmp("fabric-private-foreign-");
+  const runs = path.join(anchor, "runs");
+  fs.mkdirSync(runs); fs.chmodSync(runs, 0o775);
+  privateDirTestHooks.stat = (directory, stat) => directory === runs ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: 4242 }) : stat;
+  try { expect(() => mkdirPrivate(path.join(runs, "run-1"), anchor)).toThrow(/owned by uid 4242/); }
+  finally { delete privateDirTestHooks.stat; }
+  expect(mode(runs)).toBe(0o775);
+  expect(fs.readdirSync(runs)).toEqual([]);
 });
 
 // pi-fabric#875 round 2 P1-a: existing ancestors and a competing creator are validated, never skipped.

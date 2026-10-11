@@ -99,7 +99,12 @@ export class ActorLogStore {
     // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
     // source is untouched) and one line says why.
     let held: PrivateDirectory;
-    try { held = openPrivateDir(dest); }
+    // The anchor is the mesh root (the parent of the `actors` directory the session file lies in), else the actor's own
+    // directory: our own group-writable containers below it are tightened on first use (pi-fabric#875 round 3).
+    const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
+    const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
+    const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
+    try { held = openPrivateDir(dest, anchor); }
     catch (error) {
       console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
       return;

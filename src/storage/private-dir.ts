@@ -29,8 +29,32 @@ const FOLLOW_DIRECTORY = fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)
 const at = (fd: number, name: string): string => `/proc/self/fd/${fd}/${name}`;
 const code = (error: unknown): string | undefined => (error as NodeJS.ErrnoException)?.code;
 
-/** Test seam: runs right before a missing component is created (a competing creator wins the race here). */
-export const privateDirTestHooks: { beforeCreate?: (directory: string) => void } = {};
+/** Test seams: `beforeCreate` runs right before a missing component is created (a competing creator wins the race
+ * here); `stat` may replace an existing component's fstat (a foreign owner cannot be staged without root). */
+export const privateDirTestHooks: { beforeCreate?: (directory: string) => void; stat?: (directory: string, stat: fs.Stats) => fs.Stats } = {};
+
+/**
+ * Self-heal inside Fabric's own root (pi-fabric#875 round 3): an EXISTING directory at or below `anchor` (the
+ * Fabric-owned root the caller passes: the mesh root, or the agent run root) that is a real directory, owned by our
+ * uid and group- or other-writable is tightened through its held fd (mode & ~022), with one log line per directory per
+ * process. A Main under umask 002 left such containers (35 on Ryzen 1, e.g. residency/<hash>/runs at 0775).
+ * ponytail: tightening our own directory is monotonic and only removes access. Entries already inside are not
+ * trusted by it: the next name is still created through the fd, and an EEXIST is still validated. Above the anchor,
+ * and for a root-owned or foreign-owned directory anywhere, the refusal rules hold unchanged.
+ */
+const tightened = new Set<string>();
+const underAnchor = (walked: string, anchor: string | undefined): boolean =>
+  anchor !== undefined && (walked === anchor || walked.startsWith(anchor.endsWith(path.sep) ? anchor : anchor + path.sep));
+const tighten = (fd: number, stat: fs.Stats, walked: string, anchor: string | undefined): fs.Stats => {
+  if (!underAnchor(walked, anchor) || !stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) === 0) return stat;
+  const mode = stat.mode & 0o7777 & ~0o022;
+  fs.fchmodSync(fd, mode);
+  if (!tightened.has(walked)) {
+    tightened.add(walked);
+    console.warn(`[pi-fabric] tightened ${walked} from ${(stat.mode & 0o7777).toString(8)} to ${mode.toString(8)}`);
+  }
+  return fs.fstatSync(fd);
+};
 
 class UnsafeDirectory extends Error {}
 /** A directory we may pass or use: ours or root's; not group/other-writable unless root-owned and sticky. */
@@ -62,7 +86,7 @@ export const closeDirectory = (directory: string): boolean => {
  * is `/proc/self/fd/<fd>`, so a later rename or symlink of any ancestor cannot redirect writes made through it. */
 export interface PrivateDirectory { path: string; close(): void }
 
-const openLinux = (target: string): PrivateDirectory => {
+const openLinux = (target: string, anchor: string | undefined): PrivateDirectory => {
   let fd = fs.openSync("/", NOFOLLOW_DIRECTORY);
   try {
     safeDirectory(fs.fstatSync(fd), "/");
@@ -89,7 +113,10 @@ const openLinux = (target: string): PrivateDirectory => {
       try {
         const stat = fs.fstatSync(child);
         if (created && stat.isDirectory() && stat.uid === process.getuid?.()) fs.fchmodSync(child, 0o700);
-        else safeDirectory(stat, walked);
+        else {
+          const seen = privateDirTestHooks.stat?.(walked, stat) ?? stat;
+          safeDirectory(created ? seen : tighten(child, seen, walked, anchor), walked);
+        }
       } catch (error) { fs.closeSync(child); throw error; }
       fs.closeSync(fd);
       fd = child;
@@ -99,7 +126,7 @@ const openLinux = (target: string): PrivateDirectory => {
   return { path: `/proc/self/fd/${held}`, close: () => fs.closeSync(held) };
 };
 
-const openPortable = (target: string): PrivateDirectory => {
+const openPortable = (target: string, anchor: string | undefined): PrivateDirectory => {
   const missing: string[] = [];
   let current = target;
   for (; !fs.lstatSync(current, { throwIfNoEntry: false }); current = path.dirname(current)) {
@@ -108,7 +135,15 @@ const openPortable = (target: string): PrivateDirectory => {
   }
   if (process.platform !== "win32") {
     for (let ancestor = current; ; ancestor = path.dirname(ancestor)) {
-      if (!missing.includes(ancestor)) safeDirectory(fs.lstatSync(ancestor), ancestor);
+      if (!missing.includes(ancestor)) {
+        let stat = fs.lstatSync(ancestor);
+        stat = privateDirTestHooks.stat?.(ancestor, stat) ?? stat;
+        if (stat.isDirectory() && underAnchor(ancestor, anchor)) {
+          const fd = fs.openSync(ancestor, NOFOLLOW_DIRECTORY);
+          try { stat = tighten(fd, stat, ancestor, anchor); } finally { fs.closeSync(fd); }
+        }
+        safeDirectory(stat, ancestor);
+      }
       if (path.dirname(ancestor) === ancestor) break;
     }
   }
@@ -125,11 +160,13 @@ const openPortable = (target: string): PrivateDirectory => {
   return { path: target, close: () => undefined };
 };
 
-/** Create or validate `directory` (see the module comment) and hold it open. Throws on any unsafe directory. */
-export const openPrivateDir = (directory: string): PrivateDirectory => {
+/** Create or validate `directory` (see the module comment) and hold it open. `anchor`: the caller's own Fabric root,
+ * at or below which our own group/other-writable directories are tightened. Throws on any unsafe directory. */
+export const openPrivateDir = (directory: string, anchor?: string): PrivateDirectory => {
   const target = path.resolve(directory);
-  return process.platform === "linux" && fs.existsSync("/proc/self/fd") ? openLinux(target) : openPortable(target);
+  const root = anchor === undefined ? undefined : path.resolve(anchor);
+  return process.platform === "linux" && fs.existsSync("/proc/self/fd") ? openLinux(target, root) : openPortable(target, root);
 };
 
 /** `mkdir -p` whose created directories are exactly 0700, through trusted directories only. Throws on any unsafe one. */
-export const mkdirPrivate = (directory: string): void => { openPrivateDir(directory).close(); };
+export const mkdirPrivate = (directory: string, anchor?: string): void => { openPrivateDir(directory, anchor).close(); };

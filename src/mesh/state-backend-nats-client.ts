@@ -5,7 +5,9 @@ import { connect } from "@nats-io/transport-node";
 import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
-import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles } from "./state-backend-nats.js";
+import {
+  NatsWrongLastSequenceError, redactNatsUrls, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
+} from "./state-backend-nats.js";
 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
@@ -25,15 +27,25 @@ export interface ConnectJetStreamOptions {
 
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
-  const nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) });
+  // smarty-dev#9663 item 2: a client or fetch error may quote a server URL; never pass its credentials on.
+  const redacted = (error: unknown): Error => {
+    const message = error instanceof Error ? error.message : String(error);
+    return Object.assign(new Error(redactNatsUrls(message)), { name: error instanceof Error ? error.name : "Error" });
+  };
+  let nc: Awaited<ReturnType<typeof connect>>;
+  try { nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) }); }
+  catch (error) { throw redacted(error); }
   const js = jetstream(nc);
   const jsm = await jetstreamManager(nc);
   return {
     server: async () => {
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
-        const response = await fetch(new URL("/varz", options.monitoringUrl), { signal: AbortSignal.timeout(5_000) });
-        const varz = await response.json() as { jetstream?: { config?: { sync_always?: unknown } } };
+        let varz: { jetstream?: { config?: { sync_always?: unknown } } };
+        try {
+          const response = await fetch(new URL("/varz", options.monitoringUrl), { signal: AbortSignal.timeout(5_000) });
+          varz = await response.json() as typeof varz;
+        } catch (error) { throw redacted(error); }
         syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
       }
       return { version: nc.info?.version ?? "0.0.0", syncAlways,
@@ -52,6 +64,10 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
       if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
       return { lastSeq: info.state.last_seq, maxMsgSize: info.config.max_msg_size };
+    },
+    streamExists: async (stream) => {
+      try { await jsm.streams.info(stream); return true; }
+      catch (error) { if (apiCode(error) === STREAM_NOT_FOUND) return false; throw error; }
     },
     lastSequence: async (stream) => (await jsm.streams.info(stream)).state.last_seq,
     firstSequence: async (stream) => (await jsm.streams.info(stream)).state.first_seq,

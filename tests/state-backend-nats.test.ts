@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
-  NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
+  NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -19,8 +19,14 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) closeNatsStateBackend(root); });
 const root = () => { const value = path.join(os.tmpdir(), `nats-state-${Math.random().toString(36).slice(2)}`); roots.push(value); return value; };
 const open = (server: FakeJetStreamServer, extra: Partial<Parameters<typeof openNatsStateBackend>[0]> = {}) =>
-  openNatsStateBackend({ root: root(), port: server.port(), stream: "S", lockTimeoutMs: 2_000, ...extra });
+  openNatsStateBackend({ root: root(), port: server.port(), lockTimeoutMs: 2_000, ...extra });
 const encode = (record: unknown) => Buffer.from(JSON.stringify(record));
+/** A stub resolver (no network): `localhost` is loopback, `nats.example.com` is not, anything else does not resolve. */
+const resolver = async (host: string) => {
+  if (host === "localhost") return [{ address: "127.0.0.1", family: 4 }, { address: "::1", family: 6 }];
+  if (host === "nats.example.com") return [{ address: "10.1.1.1", family: 4 }];
+  throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" });
+};
 const settle = () => new Promise<void>(resolve => setImmediate(resolve));
 
 describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
@@ -236,7 +242,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
 
   describe("refusals (never a fallback to file)", () => {
     it.each([
-      ["a server older than 2.11", { version: "2.10.22", syncAlways: true }, /older than 2\.11/],
+      ["a server older than 2.14.7", { version: "2.10.22", syncAlways: true }, /older than 2\.14\.7/],
       ["a server that does not fsync every write", { version: "2.14.7", syncAlways: false }, /sync_always/],
       ["a server that does not report its sync policy", { version: "2.14.7", syncAlways: undefined }, /sync_always/],
     ])("refuses %s", async (_name, facts, reason) => {
@@ -299,20 +305,20 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     });
 
     it("refuses plaintext to a non-loopback server or monitoring URL, before connecting; loopback stays plaintext", async () => {
-      // No port: these would load the client and connect; the refusal comes first.
+      // No port: these would load the client and connect; the refusal comes first. A stub resolver: no network.
       for (const servers of [["nats://10.0.0.5:4222"], ["nats.example.com:4222"], ["127.0.0.1:4222", "nats://192.168.1.2:4222"]]) {
-        await expect(openNatsStateBackend({ root: root(), servers })).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+        await expect(openNatsStateBackend({ root: root(), servers, lookup: resolver })).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
       }
-      await expect(openNatsStateBackend({ root: root(), servers: ["tls://127.0.0.1:4222"], monitoringUrl: "http://10.0.0.5:8222" }))
+      await expect(openNatsStateBackend({ root: root(), servers: ["tls://127.0.0.1:4222"], monitoringUrl: "http://10.0.0.5:8222", lookup: resolver }))
         .rejects.toBeInstanceOf(MeshStateNatsInsecureError);
-      expect(() => assertNatsTransportSecure("tls://nats.example.com:4222", "tls:")).not.toThrow();
-      expect(() => assertNatsTransportSecure("https://nats.example.com:8222", "https:")).not.toThrow();
+      expect(await assertNatsTransportSecure("tls://nats.example.com:4222", "tls:", resolver)).toBe("tls://nats.example.com:4222");
+      expect(await assertNatsTransportSecure("https://nats.example.com:8222", "https:", resolver)).toBe("https://nats.example.com:8222");
       for (const loopback of ["nats://127.0.0.1:4222", "127.9.8.7:4222", "nats://localhost:4222", "nats://[::1]:4222"]) {
-        expect(() => assertNatsTransportSecure(loopback, "tls:")).not.toThrow();
+        await expect(assertNatsTransportSecure(loopback, "tls:", resolver)).resolves.toBeTypeOf("string");
       }
-      expect(() => assertNatsTransportSecure("http://127.0.0.1:8222", "https:")).not.toThrow();
-      // Not loopback: a name that only starts like one.
-      expect(() => assertNatsTransportSecure("nats://127.0.0.1.example.com:4222", "tls:")).toThrow(MeshStateNatsInsecureError);
+      expect(await assertNatsTransportSecure("http://127.0.0.1:8222", "https:", resolver)).toBe("http://127.0.0.1:8222");
+      // Not loopback: a name that only starts like one (it resolves elsewhere, or not at all).
+      await expect(assertNatsTransportSecure("nats://127.0.0.1.example.com:4222", "tls:", resolver)).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
     });
 
     it("derives distinct streams for roots whose old truncated names collided", () => {
@@ -365,7 +371,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const fs = await import("node:fs");
     const meshRoot = root();
     fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
-    await openNatsStateBackend({ root: meshRoot, port: fakeJetStream().port(), stream: "M" });
+    await openNatsStateBackend({ root: meshRoot, port: fakeJetStream().port() });
     const store = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
     try {
       const written = await store.put({ key: "shared/a", value: { n: 1 }, identity });
@@ -830,11 +836,75 @@ describe("NATS state snapshots: review round 2 (pi-fabric#907)", () => {
   });
 
   it("refuses a non-loopback server that does not require authentication; loopback, or auth required, opens", async () => {
-    const open_ = (server: FakeJetStreamServer, servers: string[]) => openNatsStateBackend({ root: root(), port: server.port(), servers, stream: "S" });
+    const open_ = (server: FakeJetStreamServer, servers: string[]) => openNatsStateBackend({ root: root(), port: server.port(), servers, lookup: resolver });
     await expect(open_(fakeJetStream(), ["tls://nats.example.com:4222"])).rejects.toThrow(/does not require authentication/);
     const authed = fakeJetStream();
     authed.authRequired = true;
     await expect(open_(authed, ["tls://nats.example.com:4222"])).resolves.toBeInstanceOf(NatsStateBackend);
     await expect(open_(fakeJetStream(), ["nats://127.0.0.1:4222"])).resolves.toBeInstanceOf(NatsStateBackend);
+  });
+});
+
+describe("JetStream backend P2s (smarty-dev#9663)", () => {
+  it("item 1: exempts plaintext only when every resolved address is loopback, and pins the connection to it", async () => {
+    const offHost = async () => [{ address: "10.0.0.5", family: 4 }];
+    const mixed = async () => [{ address: "127.0.0.1", family: 4 }, { address: "10.0.0.5", family: 4 }];
+    const failing = async (): Promise<{ address: string; family: number }[]> => { throw new Error("ENOTFOUND"); };
+    for (const lookup of [offHost, mixed, failing]) {
+      await expect(assertNatsTransportSecure("nats://localhost:4222", "tls:", lookup)).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+      await expect(openNatsStateBackend({ root: root(), servers: ["nats://localhost:4222"], lookup })).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+    }
+    // The name is never trusted for itself: what it resolves to is, and the URL then names that address.
+    expect(await assertNatsTransportSecure("nats://localhost:4222", "tls:", async () => [{ address: "127.0.0.1", family: 4 }]))
+      .toBe("nats://127.0.0.1:4222");
+    expect(await assertNatsTransportSecure("http://localhost:8222", "https:", async () => [{ address: "::1", family: 6 }]))
+      .toBe("http://[::1]:8222/");
+  });
+
+  it("item 2: an error never carries URL userinfo or query tokens", async () => {
+    const url = "nats://alice:s3cret@10.0.0.5:4222/?token=abc123";
+    const error = await openNatsStateBackend({ root: root(), servers: [url], lookup: resolver }).catch(caught => caught as Error);
+    expect(error).toBeInstanceOf(MeshStateNatsInsecureError);
+    for (const secret of ["alice", "s3cret", "abc123"]) {
+      expect(String(error)).not.toContain(secret);
+      expect((error as MeshStateNatsInsecureError).url).not.toContain(secret);
+    }
+    // The client's connect and /varz errors go through the same redaction.
+    const clientMessage = redactNatsUrls("connect ECONNREFUSED nats://bob:pw9@127.0.0.1:4222 (https://mon:pw8@10.0.0.6:8222/varz?auth=t0k)");
+    for (const secret of ["bob", "pw9", "mon", "pw8", "t0k"]) expect(clientMessage).not.toContain(secret);
+    expect(redactNatsUrl("tls://user:pass@nats.example.com:4222")).toBe("tls://***@nats.example.com:4222");
+  });
+
+  it("item 3: the stream is always the root's hashed one; no override can make two roots share it", async () => {
+    const server = fakeJetStream();
+    const first = root();
+    const second = root();
+    const override = { stream: "SHARED" } as unknown as Partial<Parameters<typeof openNatsStateBackend>[0]>;
+    await openNatsStateBackend({ ...override, root: first, port: server.port() });
+    await openNatsStateBackend({ ...override, root: second, port: server.port() });
+    expect([...server.streams].sort()).toEqual([natsStreamName(first), natsStreamName(second)].sort());
+    expect(server.streams.has("SHARED")).toBe(false);
+  });
+
+  it("item 4: refuses a root whose state is in a stream under the old (c03c829f) name, never replaces it", async () => {
+    const server = fakeJetStream();
+    const at = root();
+    const legacy = `FABRIC_MESH_${Buffer.from(path.resolve(at)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
+    server.streams.add(legacy);
+    const port = server.port();
+    await expect(openNatsStateBackend({ root: at, port })).rejects.toThrow(new RegExp(`${legacy}.*old \\(c03c829f\\) name`));
+    expect(port.calls).not.toContain("ensureStream"); // the hashed stream is never created beside it
+    expect(server.streams.has(natsStreamName(at))).toBe(false);
+  });
+
+  it("item 5: refuses a server older than 2.14.7, accepts 2.14.7", async () => {
+    for (const version of ["2.14.6", "v2.11.0", "2.13.99"]) {
+      const server = fakeJetStream();
+      server.version = version;
+      await expect(open(server)).rejects.toThrow(/older than 2\.14\.7/);
+    }
+    const server = fakeJetStream();
+    server.version = "2.14.7";
+    await expect(open(server)).resolves.toBeInstanceOf(NatsStateBackend);
   });
 });

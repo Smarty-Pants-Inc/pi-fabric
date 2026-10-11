@@ -13,6 +13,8 @@ export interface FakeJetStreamServer {
   beforeConsume?: (afterSeq: number) => Promise<void> | void;
   /** Hides stored messages from getMessage (a dropped chunk). */
   readonly hidden: Set<number>;
+  /** Stream names that exist on this server (ensureStream adds one; tests add an old-named stream). */
+  readonly streams: Set<string>;
   /** Ports opened on this server (one per backend, like separate connections). */
   port(): FakePort;
   version: string;
@@ -60,7 +62,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
   };
   const server: FakeJetStreamServer = {
     messages, version: "2.14.7", syncAlways: true, hidden: new Set<number>(), maxPayload: 1024 * 1024, authRequired: false,
-    streamMaxMsgSize: undefined,
+    streamMaxMsgSize: undefined, streams: new Set<string>(),
     get firstSeq() { return firstSeq; },
     append: (data, subject) => store(data, subject),
     pause: () => { paused ??= []; },
@@ -80,11 +82,13 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           return { version: server.version, syncAlways: server.syncAlways, authRequired: server.authRequired,
             ...(server.maxPayload === undefined ? {} : { maxPayload: server.maxPayload }) };
         },
-        ensureStream: async (_stream, _subjects, { maxMsgSize }) => {
+        ensureStream: async (stream, _subjects, { maxMsgSize }) => {
           calls.push("ensureStream");
+          server.streams.add(stream);
           server.streamMaxMsgSize ??= maxMsgSize;
           return { lastSeq: messages.length, maxMsgSize: server.streamMaxMsgSize };
         },
+        streamExists: async (stream) => { calls.push("streamExists"); return server.streams.has(stream); },
         lastSequence: async () => { calls.push("lastSequence"); return messages.length; },
         firstSequence: async () => { calls.push("firstSequence"); return firstSeq; },
         getMessage: async (_stream, seq) => {
@@ -97,7 +101,9 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           calls.push("lastBySubject");
           for (let seq = messages.length; seq >= Math.max(1, firstSeq); seq--) {
             const message = messages[seq - 1]!;
-            if (message.subject === subject) return { seq, data: message.data };
+            // One stream (stream names are ignored), so subjects compare by their last segment (state, snapshot): a
+            // backend on a root's hashed stream and a test replica opened as "S" read the same stream (smarty-dev#9663).
+            if (message.subject.split(".").at(-1) === subject.split(".").at(-1)) return { seq, data: message.data };
           }
           return undefined;
         },

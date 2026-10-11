@@ -8,7 +8,9 @@
 // host prepares the backend first (`openNatsStateBackend`, async: connect, refuse, replay) and the factory then
 // returns the prepared backend for that root, or refuses. `nats` never falls back to `file`.
 import { createHash, randomUUID } from "node:crypto";
+import dns from "node:dns";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { captureStorageDelete, captureStoragePut, storageRevision } from "../verified/storage.js";
 import type { MeshIdentity } from "./event-log.js";
@@ -52,6 +54,8 @@ export interface JetStreamPort {
   lastSequence(stream: string): Promise<number>;
   /** The stream's first stored sequence now (above 1 after a purge). */
   firstSequence(stream: string): Promise<number>;
+  /** Whether a stream of this name exists (never creates it). */
+  streamExists(stream: string): Promise<boolean>;
   /** One stored message by sequence, or undefined when it is gone (purged) or never existed. */
   getMessage(stream: string, seq: number): Promise<NatsStreamMessage | undefined>;
   /** The last stored message on one subject, or undefined. */
@@ -932,8 +936,8 @@ const prepared = new Map<string, NatsStateBackend>();
 /** The prepared backend for a mesh root, or undefined. Read by the selector's synchronous `nats` factory. */
 export const preparedNatsStateBackend = (root: string): NatsStateBackend | undefined => prepared.get(path.resolve(root));
 
-/** Minimum server: per-message TTL and delete markers (2.11), used by the KV leases of phase 2. */
-const MIN_SERVER = [2, 11, 0];
+/** Minimum server: 2.14.7, as smarty-dev#7504 requires (per-message TTL and delete markers since 2.11; the KV leases of phase 2). */
+export const MIN_SERVER = [2, 14, 7];
 const versionAtLeast = (version: string, minimum: number[]): boolean => {
   const parts = version.replace(/^v/, "").split(/[.-]/).slice(0, 3).map(part => Number.parseInt(part, 10));
   for (let index = 0; index < 3; index++) {
@@ -945,14 +949,16 @@ const versionAtLeast = (version: string, minimum: number[]): boolean => {
 };
 
 export interface OpenNatsStateBackendOptions {
-  /** The mesh root this backend serves (its stream is derived from it unless `stream` is given). */
+  /** The mesh root this backend serves. Its stream is always derived from it (natsStreamName): no override, so two
+   * roots never share one stream (smarty-dev#9663 item 3). */
   root: string;
   /** NATS server URLs (the real client); ignored when `port` is given (tests). */
   servers?: string[];
   /** Host-only: the server's monitoring endpoint (`http://host:8222`), read for `/varz` sync_always. */
   monitoringUrl?: string;
   port?: JetStreamPort;
-  stream?: string;
+  /** Tests: the resolver for the loopback check (default dns.promises.lookup). */
+  lookup?: NatsLookup;
   maxEventBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
@@ -973,26 +979,81 @@ export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: st
 /** A non-loopback server or monitoring URL without TLS: state (and the sync-policy check) would cross the network in clear. */
 export class MeshStateNatsInsecureError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_INSECURE";
-  constructor(readonly url: string) {
-    super(`FABRIC_MESH_STATE_NATS_INSECURE: ${url} is not loopback and not TLS; use tls:// (servers) or https:// (monitoring)`);
+  constructor(url: string, detail = "is not loopback and not TLS") {
+    const shown = redactNatsUrl(url);
+    super(`FABRIC_MESH_STATE_NATS_INSECURE: ${shown} ${detail}; use tls:// (servers) or https:// (monitoring)`);
+    this.url = shown;
     this.name = "MeshStateNatsInsecureError";
   }
+  readonly url: string;
 }
 
-const isLoopback = (host: string): boolean => {
-  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
-  return bare === "localhost" || bare === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare);
-};
+const withScheme = (url: string): string => /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `nats://${url}`;
+
 /**
- * Refuses a plaintext URL to a non-loopback host, before any connection. Loopback (127.0.0.0/8, ::1, localhost)
- * stays plaintext: tests and single-host use. A server without a scheme is `nats://` (plaintext), as the client reads it.
+ * A URL fit for an error or a log line (smarty-dev#9663 item 2): its userinfo and every query value become `***`.
+ * Unparseable input keeps only what a credential cannot hide in.
  */
-export const assertNatsTransportSecure = (url: string, secureScheme: "tls:" | "https:"): void => {
-  let parsed: URL;
-  try { parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `nats://${url}`); }
-  catch { throw new MeshStateNatsInsecureError(url); }
-  if (parsed.protocol !== secureScheme && !isLoopback(parsed.hostname)) throw new MeshStateNatsInsecureError(url);
+export const redactNatsUrl = (url: string): string => {
+  try {
+    const parsed = new URL(withScheme(url));
+    if (parsed.username || parsed.password) { parsed.username = "***"; parsed.password = ""; }
+    for (const key of [...parsed.searchParams.keys()]) parsed.searchParams.set(key, "***");
+    const shown = parsed.toString();
+    return withScheme(url) === url ? shown : shown.replace(/^nats:\/\//, "");
+  } catch {
+    return url.replace(/\/\/[^/@\s]*@/g, "//***@").replace(/([?&][^=&\s]*=)[^&\s]*/g, "$1***");
+  }
 };
+
+/** Every URL inside a message (a client or fetch error), redacted as redactNatsUrl does. */
+export const redactNatsUrls = (text: string): string =>
+  text.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, url => redactNatsUrl(url)).replace(/\b[^\s/@:'"]+:[^\s/@'"]+@/g, "***@");
+
+export type NatsLookup = (host: string) => Promise<{ address: string; family: number }[]>;
+const systemLookup: NatsLookup = host => dns.promises.lookup(host, { all: true, verbatim: true });
+
+const loopbackAddress = (address: string): boolean => {
+  const bare = address.replace(/^\[|\]$/g, "").toLowerCase();
+  if (net.isIPv4(bare)) return bare.split(".")[0] === "127";
+  if (!net.isIPv6(bare)) return false;
+  if (bare === "::1") return true;
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(bare);
+  return mapped !== null && mapped[1]!.split(".")[0] === "127";
+};
+
+/**
+ * Refuses a plaintext URL to a non-loopback host, before any connection, and returns the URL to connect to. A TLS URL
+ * is returned as given (its name is checked by the certificate). A plaintext URL passes only when its host is a
+ * loopback address (127.0.0.0/8, ::1) or a name whose EVERY resolved address is one (smarty-dev#9663 item 1: never
+ * by the name `localhost`; an unresolvable name refuses). The returned plaintext URL names the resolved address, so
+ * a later re-resolution cannot move the connection off the host. A server without a scheme is `nats://`.
+ */
+export const assertNatsTransportSecure = async (url: string, secureScheme: "tls:" | "https:",
+  lookup: NatsLookup = systemLookup): Promise<string> => {
+  let parsed: URL;
+  try { parsed = new URL(withScheme(url)); }
+  catch { throw new MeshStateNatsInsecureError(url); }
+  if (parsed.protocol === secureScheme) return url;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (net.isIP(host)) {
+    if (!loopbackAddress(host)) throw new MeshStateNatsInsecureError(url);
+    return url;
+  }
+  let addresses: { address: string }[];
+  try { addresses = await lookup(host); }
+  catch { throw new MeshStateNatsInsecureError(url, "does not resolve, so it cannot be shown to be loopback"); }
+  if (addresses.length === 0 || !addresses.every(entry => loopbackAddress(entry.address))) {
+    throw new MeshStateNatsInsecureError(url, "does not resolve only to loopback addresses and is not TLS");
+  }
+  const pinned = addresses[0]!.address;
+  parsed.hostname = net.isIPv6(pinned) ? `[${pinned}]` : pinned;
+  return parsed.toString();
+};
+
+/** The c03c829f stream name (before the hashed one): an existing stream under it is never replaced silently. */
+const legacyNatsStreamName = (root: string): string =>
+  `FABRIC_MESH_${Buffer.from(path.resolve(root)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
 
 /**
  * The stream name for a mesh root: a fixed prefix and 32 hex characters (128 bits) of the SHA-256 of the full
@@ -1006,18 +1067,21 @@ export const natsStreamName = (root: string): string => {
 
 /**
  * Opens (and registers for the selector) the NATS state backend of a mesh root. Refuses, never falls back:
- * a server older than 2.11; a server that does not fsync every write unless the operator accepts it; a stream that is
- * retired. Loads the official client only here.
+ * a server older than MIN_SERVER (2.14.7); a server that does not fsync every write unless the operator accepts it; a
+ * stream that is retired; a root whose state is still in a stream under the old (c03c829f) name. Loads the official client only here.
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
-  for (const server of options.servers ?? []) assertNatsTransportSecure(server, "tls:");
-  if (options.monitoringUrl !== undefined) assertNatsTransportSecure(options.monitoringUrl, "https:");
+  const lookup = options.lookup ?? systemLookup;
+  const servers: string[] = [];
+  for (const server of options.servers ?? []) servers.push(await assertNatsTransportSecure(server, "tls:", lookup));
+  const monitoringUrl = options.monitoringUrl === undefined ? undefined
+    : await assertNatsTransportSecure(options.monitoringUrl, "https:", lookup);
   // A tls:// server makes the client REQUIRE TLS on every connection (a server not offering it fails the connect),
   // whatever the client does with the scheme itself.
-  const tls = options.tls ?? ((options.servers ?? []).some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
-  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [], {
-    ...(options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl }),
+  const tls = options.tls ?? (servers.some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
+  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(servers, {
+    ...(monitoringUrl === undefined ? {} : { monitoringUrl }),
     ...(tls === undefined ? {} : { tls }) });
   try {
     const server = await port.server();
@@ -1033,11 +1097,22 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     // auth_required). A non-loopback server that does not lets anyone on the network publish to or purge the stream:
     // refuse. Per-user publish/purge permissions are not visible to a client; docs/mesh-backends.md states the
     // required server configuration.
-    const remote = (options.servers ?? []).some(url => { try { assertNatsTransportSecure(url.replace(/^tls:/i, "nats:"), "tls:"); return false; } catch { return true; } });
+    // assertNatsTransportSecure is async (smarty-dev#9663 item 1: resolved addresses): await it, with the same resolver.
+    let remote = false;
+    for (const url of servers) {
+      try { await assertNatsTransportSecure(url.replace(/^tls:/i, "nats:"), "tls:", lookup); } catch { remote = true; }
+    }
     if (remote && server.authRequired !== true) {
       throw new MeshStateNatsRefusedError("a non-loopback nats-server that does not require authentication: anyone who can reach it could write or purge the state stream (docs/mesh-backends.md)");
     }
-    const stream = options.stream ?? natsStreamName(root);
+    const stream = natsStreamName(root);
+    // smarty-dev#9663 item 4: a stream under the c03c829f name holds this root's state; the hashed stream would
+    // silently start empty beside it. Refuse until the operator migrates it.
+    const legacy = legacyNatsStreamName(root);
+    if (legacy !== stream && await port.streamExists(legacy)) {
+      throw new MeshStateNatsRefusedError(`the stream ${legacy} holds this root's state under the old (c03c829f) name; ` +
+        `migrate it to ${stream} (or remove it after an export), then open again: it is never replaced silently`);
+    }
     const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
       maxEventBytes: options.maxEventBytes ?? 1024 * 1024,
       ...(options.snapshotEvery === undefined ? {} : { snapshotEvery: options.snapshotEvery }),

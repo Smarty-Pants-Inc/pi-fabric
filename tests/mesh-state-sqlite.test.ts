@@ -534,8 +534,10 @@ describe("SqliteStateStore", () => {
     const go = path.join(root, "go");
     const stop = path.join(root, "stop");
     // smarty-dev#7651: the window is work, not wall time. Writers keep filling past their 2,400 puts until the
-    // maintainer's TRUNCATE has won once against the constant readers, up to 4x the traffic: a slow runner (Windows,
-    // 2 cores) gets enough of the maintainer's 1 s-backoff attempts, and a starved checkpoint still fails at the cap.
+    // maintainer's TRUNCATE has succeeded WINS times against the constant readers, up to 4x the traffic: a slow
+    // runner (Windows, 2 cores) gets enough of the maintainer's 1 s-backoff attempts, and a starved, stopped or
+    // ineffective checkpoint still fails at the cap.
+    const WINS = 3;
     const truncated = path.join(root, "truncated");
     const writers = Math.ceil(procs / 2);
     const readers = procs - writers;
@@ -574,23 +576,22 @@ describe("SqliteStateStore", () => {
         store.close();`, [root, go, stop, String(index)])),
     ];
     await waitFor(() => fs.readdirSync(root).filter(name => name.startsWith("ready-")).length === writers + readers, 90_000, `${procs} children ready`);
-    // smarty-dev#7651 (pi-fabric#891 review): measure what each of the maintainer's TRUNCATE statements actually
-    // removed, not a count or a size-sample inference. The maintainer runs in this process; its TRUNCATE is one
-    // synchronous statement, so the WAL size right before and right after it bounds exactly what it emptied. An
-    // ineffective win removes 0; a truncate and regrow is counted exactly.
+    // smarty-dev#7651 (pi-fabric#891 review): count the maintainer's own successful TRUNCATEs from their result rows.
+    // The maintainer is the only connection in this process (children are other processes), and by SQLite's
+    // contract a TRUNCATE with busy = 0 and every frame checkpointed resets the WAL to zero bytes. A pass-through
+    // spy on StatementSync.get reads that row; it changes nothing the store runs.
     const { StatementSync } = process.getBuiltinModule("node:sqlite") as { StatementSync: { prototype: { get: (...args: unknown[]) => unknown } } };
     const statementGet = StatementSync.prototype.get;
-    let removed = 0, inLoad = true;
+    let wins = 0, inLoad = true, peakBefore = 0, peakAfter = 0;
     vi.spyOn(StatementSync.prototype, "get").mockImplementation(function (this: { sourceSQL?: string }, ...args: unknown[]) {
-      if (!inLoad || this.sourceSQL !== "PRAGMA wal_checkpoint(TRUNCATE)") return statementGet.apply(this, args);
-      const before = maintainer.walBytes();
-      try { return statementGet.apply(this, args); }
-      finally { removed += Math.max(0, before - maintainer.walBytes()); }
+      const row = statementGet.apply(this, args) as { busy?: number; log?: number; checkpointed?: number } | undefined;
+      if (inLoad && this.sourceSQL === "PRAGMA wal_checkpoint(TRUNCATE)" && row?.busy === 0 && row.log === row.checkpointed) wins++;
+      return row;
     });
-    let maxWal = 0;
     const sampler = setInterval(() => {
-      maxWal = Math.max(maxWal, maintainer.walBytes());
-      if (removed > 0 && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
+      const wal = maintainer.walBytes();
+      if (wins === 0) peakBefore = Math.max(peakBefore, wal); else peakAfter = Math.max(peakAfter, wal);
+      if (wins >= WINS && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
     }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
@@ -603,17 +604,19 @@ describe("SqliteStateStore", () => {
     const reads = readerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { reads: number }).reads, 0);
     const stats = maintainer.stats();
     const walTraffic = writerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { filled: number }).filled, 0) * 3_000;
-    // Evidence for the PR: the WAL peak and what the maintainer's in-load TRUNCATEs removed.
-    const appended = maintainer.walBytes() + removed;
-    console.log(JSON.stringify({ maxWal, removed, appended, walTraffic, reads, checkpoints: stats.checkpoints }));
+    // Evidence for the PR: the WAL peaks before and after the first in-load win, and the wins.
+    console.log(JSON.stringify({ wins, peakBefore, peakAfter, walTraffic, reads, checkpoints: stats.checkpoints }));
     expect(reads).toBeGreaterThan(readers);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). smarty-dev#7651: the
-    // maintainer must win AND that win must actually shrink the WAL while the readers run, within a window bounded
-    // by work (capped at 4x the traffic), not by a 16 MiB peak, which measured how often the busy-backoff TRUNCATE
-    // wins on the runner's CPU (windows-latest: 36-44 MiB with 0-2 wins). A starved checkpoint fails at truncate,
-    // an ineffective one at removed. No peak bound: the writers' own WAL resets run in other processes, unmeasured.
-    expect(stats.checkpoints.truncate).toBeGreaterThan(0);
-    expect(removed).toBeGreaterThan(0);
+    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). smarty-dev#7651: not a
+    // fixed 16 MiB peak, which measured how often the busy-backoff TRUNCATE wins on the runner's CPU (windows-latest:
+    // 36-44 MiB with 0-2 wins in a fixed window). Instead: WINS successful in-load TRUNCATEs within the work-bounded
+    // window, and the WAL peak stays bounded across every cycle: under 96 MiB, the store's 64 MiB emergency threshold
+    // (emergencyCheckpointBytes) plus the writes 16 processes still have in flight on starved cores while the busy-
+    // backoff TRUNCATE waits. Measured peaks: 13-62 MB on 4 cores + 4 burners, one 67.6 MB with 3 wins on 2 cores +
+    // 2 burners, 36-44 MiB on windows-latest. The growth mutations fail on WINS, not on this bound: a disabled
+    // maintainer wins 0 (peak 67-74 MB) and one that wins once then stops wins 2 (peak 67.5-86 MB).
+    expect(wins).toBeGreaterThanOrEqual(WINS);
+    expect(Math.max(peakBefore, peakAfter)).toBeLessThan(96 * 1024 * 1024);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();

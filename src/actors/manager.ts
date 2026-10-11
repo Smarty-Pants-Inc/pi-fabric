@@ -1135,7 +1135,10 @@ export class ActorManager {
   }
 
   #dormantIdleCandidate(actor: ManagedActor, protectedIds: ReadonlySet<string>): boolean {
-    return this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status === "idle" &&
+    // An unexpired transient block stays warm until retryAt: only a live host publishes its expiry.
+    const transientBlockPending = actor.activationBlocked !== undefined &&
+      activationBlockExpiresAt(actor.activationBlocked) !== undefined && !activationBlockExpired(actor.activationBlocked);
+    return this.#canManageCached(actor.id) && actor.residency === "durable" && actor.status === "idle" && !transientBlockPending &&
       !protectedIds.has(actor.id) && !actor.draining && !actor.abortController && !actor.inFlightRun && !actor.preparing &&
       !actor.removal && !this.#inFlight.has(actor.id) && !this.#draining.has(actor.id) && !actor.queue.length &&
       !this.#overflow.get(actor.id)?.length && !this.#parked.get(actor.id)?.length &&

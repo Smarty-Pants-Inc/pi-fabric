@@ -47,6 +47,15 @@ function fakeWatch() {
 }
 const immediate = setImmediate;
 const settled = async () => { for (let i = 0; i < 40; i++) await new Promise<void>(resolve => immediate(resolve)); };
+// Fake timers also own setImmediate, so a drain's scan-slice yield (entry cap or a real
+// 4 ms budget overrun on a loaded host) resumes only when fake time is flushed. Await a
+// drain by flushing due fake work; each flush also grants a real turn for its file IO.
+const drained = async (drain: unknown): Promise<void> => {
+  let done = false;
+  const settledDrain = Promise.resolve(drain).finally(() => { done = true; });
+  while (!done) await vi.advanceTimersByTimeAsync(0);
+  await settledDrain;
+};
 function plane(mesh: MeshStore, id = "owner", platform: NodeJS.Platform = "win32", lease?: () => boolean) {
   const control = new FabricControlPlane(mesh, { ...identity, id }, { platform, enabled: true, hostId: id,
     pollMs: 20, acknowledgementTimeoutMs: 5_000, ...(lease ? { canConsumeMesh: lease } : {}) });
@@ -190,10 +199,10 @@ describe("Windows observation recovery", () => {
       format: 1, id: h.result.id, rootId: h.config.rootId, from: { id: h.result.id, name: "task", kind: "agent" },
       agentCompletionId: h.result.id, message: "done", delivery: "followUp", triggerTurn: true, createdAt: 2 } });
     const drains = vi.spyOn(CompletionJournal.prototype, "drainChanged");
-    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drains.mock.results.at(-1)!.value; await settled();
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drained(drains.mock.results.at(-1)!.value); await settled();
     expect(h.complete).toHaveBeenCalledOnce(); expect(h.mesh.get(key, { fresh: true })).toBeDefined();
     consumeCompletion(h.config.meshRoot, h.result.id, h.config.sessionId); // Intentionally no native callback.
-    await vi.advanceTimersByTimeAsync(5_000); await settled(); await drains.mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(5_000); await settled(); await drained(drains.mock.results.at(-1)!.value);
     expect(h.mesh.get(key, { fresh: true })).toBeUndefined(); expect(h.complete).toHaveBeenCalledOnce();
     await h.client.close(); await settled(); expect(vi.getTimerCount()).toBe(0);
   });

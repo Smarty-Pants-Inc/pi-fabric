@@ -2,7 +2,10 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
-import type { RootInboxBatch, RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
+import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
+import { FileLockTimeoutError } from "./core/file-lock.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
@@ -208,15 +211,12 @@ const settledCompleted = (event: unknown, context: ExtensionContext): boolean =>
   settledOutcome(event, context) === "completed";
 
 // Whether the session already holds an inbox batch: its cursor moves only then (smarty-dev#754).
-const inboxHeldBy = async (context: ExtensionContext) =>
-  (await import("./topology/root-inbox.js")).confirmedRootInboxSession(context.sessionManager);
-const deliverRootInbox = async (...args: Parameters<typeof import("./topology/root-inbox-delivery.js")["deliverRootInbox"]>): Promise<void> =>
-  (await import("./topology/root-inbox-delivery.js")).deliverRootInbox(...args);
+// Static, as on main: the build admits package-local dynamic imports only for stable entries.
+const inboxHeldBy = (context: ExtensionContext) => confirmedRootInboxSession(context.sessionManager);
 
 /** Expiry is observational: one line, never a triggered continuation. */
 const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undefined): Promise<void> => {
   if (!inbox?.skippedStale) return;
-  const { rootInboxSummary } = await import("./topology/root-inbox.js");
   sendFabricMessage(pi, rootInboxSummary(inbox), { deliverAs: "followUp", triggerTurn: false });
 };
 
@@ -650,7 +650,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       }
     } catch (error) {
       if (signal.aborted) return false;
-      if (error instanceof (await import("./core/file-lock.js")).FileLockTimeoutError) {
+      if (error instanceof FileLockTimeoutError) {
         retry = true;
       } else {
         // Advisory evidence cannot gate the normal-form compiler.
@@ -682,7 +682,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           }
         }
       } catch (error) {
-        if (!(error instanceof (await import("./core/file-lock.js")).FileLockTimeoutError)) throw error;
+        if (!(error instanceof FileLockTimeoutError)) throw error;
         // Proof-checked plans are usable now; durable persistence can catch up
         // later without blocking this session on another process's writer.
         if (current()) setActiveCompiledSurface(outcome.artifact);
@@ -1197,7 +1197,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const executionOutcome = pending.executionOutcome;
     const boundarySucceeded = (handoff.completed === true || handoff.continued === true) &&
       executionOutcome?.success !== false && !executionOutcome?.residentOutcomes.length && !outerToolResult.isError;
-    const { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } = await import("./output-budget.js");
     const residentPriority = executionOutcome?.residentOutcomes.length
       ? formatResidentOutcomePriority(executionOutcome.residentOutcomes)
       : undefined;
@@ -1526,7 +1525,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (!events.length) return;
     for (const event of events) queuedRootInboxIds.set(event.id, rootInboxTurn);
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
-    if (!fabricProvenanceSupported(pi)) return { message: (await import("./topology/root-inbox.js")).rootInboxMessage(events) };
+    if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(events) };
     await deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false });
   });
 

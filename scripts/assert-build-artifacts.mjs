@@ -130,8 +130,12 @@ if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(
 }
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
+// Our operator bins ship as checked-in ./bin wrappers (package "files" includes bin/); the
+// upstream pi-fabric CLI ships from ./dist. Every other public entry must be built output.
+const binTargets = new Set(targets([manifest.bin]));
 for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions, manifest.bin])) {
-  if (!target.startsWith("./dist/") || target.split("/").includes("..") || !existsSync(join(root, target))) {
+  const packagedBin = binTargets.has(target) && target.startsWith("./bin/") && manifest.files?.includes("bin/");
+  if ((!target.startsWith("./dist/") && !packagedBin) || target.split("/").includes("..") || !existsSync(join(root, target))) {
     throw new Error(`Missing or unpackaged public entrypoint: ${target}`);
   }
 }
@@ -175,9 +179,17 @@ const staticClosure = (roots) => {
 };
 
 // Bootstrap diagnostics must survive missing runtime dependencies.
-for (const file of staticClosure([join(dist, "worker.js"), join(dist, "durable/worker.js")])) {
-  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
-    if (!match[1].startsWith(".") && !match[1].startsWith("node:")) {
+// Our dist/worker.js is a self-contained standalone bundle (scripts/build.mjs): esbuild hoists the
+// lazily loaded CLI adapters' imports to its top level, so it may import declared dependencies,
+// which Pi installs (peers are bundled; smoke:package-install covers that). The durable worker
+// keeps upstream's strict rule.
+const declaredDependencies = new Set(Object.keys(manifest.dependencies ?? {}));
+const packageOf = (specifier) => specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : specifier.split("/")[0];
+for (const [entry, allowDeclared] of [["worker.js", true], ["durable/worker.js", false]]) {
+  for (const file of staticClosure([join(dist, entry)])) {
+    for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+      if (match[1].startsWith(".") || match[1].startsWith("node:")) continue;
+      if (allowDeclared && file === join(dist, entry) && declaredDependencies.has(packageOf(match[1]))) continue;
       throw new Error(`Worker bootstrap imports an external package: ${match[1]}`);
     }
   }
@@ -192,7 +204,11 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
 // are the same (smarty-dev#2004).
-if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
+// 47 files after the upstream 0.110.1 merge (smarty-dev#5776): the entry is now upstream's
+// extension-bootstrap.js, and esbuild splits tiny shared chunks for modules both the eager graph
+// and new lazy upstream entries import (e.g. core/approval-overrides.ts). Bytes stay within the
+// unchanged 1150 KiB budget. FLAGGED for review in the sync PR; do not raise it further.
+if (startupBytes > 1150 * 1024 || startupFiles.size > 47) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];

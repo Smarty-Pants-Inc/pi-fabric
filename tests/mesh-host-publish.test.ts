@@ -65,7 +65,7 @@ const harness = async (backend: "file" | "sqlite", archived = false, existingRoo
   const publisher = async (id = "fabric-github.forwarder"): Promise<FabricComponentContext> => {
     let context: FabricComponentContext | undefined;
     await supervisor.start({ id, component: "host-publisher" }, {
-      name: "host-publisher", guarantee: "managed", requires: ["mesh.publish", "mesh.publishBatch"],
+      name: "host-publisher", guarantee: "managed", requires: ["mesh.publish", "mesh.publishBatch", "mesh.sync"],
       activate(current) { context = current; },
     });
     expect(supervisor.status(id)).toMatchObject({ state: "active" });
@@ -282,5 +282,70 @@ return { denied, ordinary, batchPresent: "publishBatch" in mesh };
     expect(staticallyRefused.success).toBe(false);
     expect(staticallyRefused.typeErrors?.some(error => error.message.includes("dedupeKey"))).toBe(true);
     expect(h.store.read()).toHaveLength(1);
+  }, 30_000);
+
+  it("gives trusted host components the mesh.sync barrier and refuses forged or public callers (smarty-dev#9313)", async () => {
+    const h = await harness(backend);
+    const host = await h.publisher();
+    const sync = vi.spyOn(h.store, "sync");
+    const event = await host.call("mesh.publish", { topic: "github.delivery", text: "covered" }) as MeshEvent;
+    expect(await host.call("mesh.sync", {})).toEqual({ synced: true, through: event.sequence });
+    expect(await host.call("mesh.sync", { budgetMs: 5_000 })).toEqual({ synced: true, through: event.sequence });
+    expect(sync.mock.calls).toEqual([[undefined], [5_000]]);
+    for (const budgetMs of [-1, 60_001, "5", null, Number.NaN]) {
+      await expect(host.call("mesh.sync", { budgetMs })).rejects.toThrow(/budgetMs|Invalid arguments/);
+    }
+    // A failed barrier reaches the caller, which must then leave its cursor where it was.
+    sync.mockRejectedValueOnce(new Error("EIO: fsync failed"));
+    await expect(host.call("mesh.sync", {})).rejects.toThrow("EIO");
+    expect(sync).toHaveBeenCalledTimes(3);
+
+    expect((await h.provider.list({}, baseContext())).some(action => action.name === "sync")).toBe(false);
+    await expect(h.provider.describe("sync", baseContext())).rejects.toBeInstanceOf(MeshHostPublishError);
+    const trusted = withFabricHostCaller(baseContext(), "github");
+    expect((await h.provider.describe("sync", trusted))!.inputSchema).toMatchObject({
+      properties: { budgetMs: { type: "number", minimum: 0, maximum: 60_000 } }, additionalProperties: false });
+    const forged = { ...invocation(), parentToolCallId: "component:github:1", componentId: "github", hostTrusted: true,
+      [Symbol("fabric.host-caller")]: { componentId: "github" } };
+    await expect(h.registry.invoke("mesh.sync", {}, forged)).rejects.toBeInstanceOf(MeshHostPublishError);
+    await expect(h.provider.invoke("sync", {}, forged)).rejects.toMatchObject({ code: "FABRIC_MESH_HOST_PUBLISH_REQUIRED", retryable: false });
+    await expect(h.provider.invoke("sync", {}, baseContext())).rejects.toBeInstanceOf(MeshHostPublishError);
+    expect(sync).toHaveBeenCalledTimes(3);
+  });
+
+  it("refuses mesh.sync from model-authored fabric_exec code with a typed QuickJS error", async () => {
+    const h = await harness(backend);
+    await h.publisher(); // A live trusted component must not confer trust on later guest calls.
+    const sync = vi.spyOn(h.store, "sync");
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.executor.runtime = "quickjs";
+    config.approvals.agent = "allow";
+    config.approvals.read = "allow";
+    const service = new FabricExecutionService(h.registry, config);
+    const execute = (code: string) => service.execute({
+      code, signal: undefined, parentToolCallId: "component:fabric-github.forwarder:1",
+      context: { cwd: process.cwd(), hasUI: false } as ExtensionContext, onPartial() {},
+    });
+    const result = await execute(`
+const denied = [];
+for (const args of [{}, { budgetMs: 10 }]) {
+  try { await tools.call({ ref: "mesh.sync", args }); denied.push("allowed"); }
+  catch (error) { const e = error as { name: string; code: string; retryable: boolean };
+    denied.push({ name: e.name, code: e.code, retryable: e.retryable }); }
+}
+let described = "visible";
+try { await tools.describe({ ref: "mesh.sync" }); } catch (error) { described = (error as { code: string }).code; }
+return { denied, described, syncPresent: "sync" in mesh };
+`);
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({ denied: Array.from({ length: 2 }, () => ({
+      name: "MeshHostPublishError", code: "FABRIC_MESH_HOST_PUBLISH_REQUIRED", retryable: false,
+    })), syncPresent: false });
+    expect((result.value as { described: string }).described).not.toBe("visible");
+    // The guest proxy has no mesh.sync: the call fails before reaching the provider.
+    const direct = await execute("return await mesh.sync({});");
+    expect(direct.success).toBe(false);
+    expect(direct.error).toContain("not a function");
+    expect(sync).not.toHaveBeenCalled();
   }, 30_000);
 });

@@ -90,6 +90,9 @@ export const processHarness = () => {
     },
     /** The real `fabric-actors` CLI in its own process, paused at `pauseAt` (see the child fixture). */
     remover: (pauseAt: "fence-temp" | "fence-link" | "beforeTreeMove" | "none", cli: string[]) => start(["remover", pauseAt, ...cli]),
+    /** A host writing its generation exit record, paused before or after the publishing link (smarty-dev#7950). */
+    generationExit: (residencyRoot: string, generation: string, pauseAt: "before-link" | "after-link") =>
+      start(["generation-exit", residencyRoot, generation, pauseAt]),
     close: async () => {
       try {
         for (const child of children) child.stdin?.destroy();

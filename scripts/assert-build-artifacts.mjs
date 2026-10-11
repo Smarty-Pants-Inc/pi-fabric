@@ -134,6 +134,8 @@ if (process.platform === "linux") {
   if (!cli.includes(`"fabric-mesh-lease":"${manifest.helpers["fabric-mesh-lease"]}"`)) {
     throw new Error("dist/mesh/mesh-backend-cli.js does not embed the fabric-mesh-lease digest of the build manifest (a lost esbuild define)");
   }
+  // bin/fabric-mesh-backend checks this one bundle before it loads it (pi-fabric#880): it must import no package file.
+  if (/\bfrom\s*["']\.|\bimport\s*\(\s*["']\./.test(cli)) throw new Error("dist/mesh/mesh-backend-cli.js imports a package file: bin/fabric-mesh-backend's pre-load check would not cover it");
 }
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");

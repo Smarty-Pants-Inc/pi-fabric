@@ -545,6 +545,34 @@ for (let i = 0; ; i++) {
     expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
   });
 
+  // pi-fabric#880 review round 3 (SEC P1): a swapped-in bundle drops any check it carries, so the operator's shim checks
+  // the chain BEFORE it imports the bundle. The fake bundle leaves a marker if any of its code runs.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses before loading a bundle under a group-writable parent${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const parent = tempDir("shim");
+    const pkg = path.join(parent, "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const bundle = path.join(pkg, "dist/mesh/mesh-backend-cli.js");
+    const real = fs.readFileSync(bundle);
+    const marker = path.join(parent, "bundle-ran");
+    fs.writeFileSync(bundle, `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const parentReal = fs.realpathSync(parent);
+    fs.chmodSync(parentReal, 0o770);
+    const refused = cli();
+    expect(refused.status, refused.stderr).toBe(3);
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${parentReal} is group/other-writable (mode 770)\n`);
+    expect(fs.existsSync(marker)).toBe(false);                 // no bundle code ran
+    // Under a 0755 parent, with the real bundle back, the real switch passes.
+    fs.chmodSync(parentReal, 0o755);
+    fs.writeFileSync(bundle, real);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
   it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const pkg = tempDir("bundle");
@@ -557,7 +585,8 @@ for (let i = 0; ; i++) {
     fs.chmodSync(mesh, 0o775);
     const refused = cli();
     expect(refused.status, refused.stderr).toBe(3);
-    expect(refused.stderr).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper integrity: ${mesh} is group/other-writable (mode 775)`);
+    // Since round 3 the shim refuses first, before the bundle loads; the bundle's own check stays as defence in depth.
+    expect(refused.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is group/other-writable (mode 775)\n`);
     fs.chmodSync(mesh, 0o700);
     const ready = cli();
     expect(ready.status, ready.stderr).toBe(0);

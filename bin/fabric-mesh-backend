@@ -1,6 +1,49 @@
 #!/usr/bin/env node
 // Import, cutover and rollback of a mesh root's state backend with the R1 fence (smarty-dev#6477 L4b).
-import { main } from "../dist/mesh/mesh-backend-cli.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// pi-fabric#880 / smarty-dev#8145: before ANY package code loads, refuse when another user could have changed
+// this shim, the gate bundle or the lease helper: on each real path, every entry up to the install root (the
+// package directory) must be inside it, no symlink, ours (or root) and not group/other-writable, and so must
+// every ancestor above it up to the first root-owned one only root can change (or a root-owned sticky one, as
+// /tmp, where only an entry's owner can rename it).
+// ponytail: duplicated on purpose from src/mesh/reader-proof.ts (unsafeChain), which stays as defence in depth:
+// this check must not depend on the code it protects. Node builtins only. Without POSIX owners (Windows) there
+// is nothing to check here; the gate itself fails closed there.
+const unsafeChain = (file, root) => {
+  let real, top;
+  try { real = fs.realpathSync(file); top = fs.realpathSync(root); }
+  catch (error) { return `${file} cannot be resolved (${error.code ?? error.message})`; }
+  const inside = path.relative(top, real);
+  if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
+  const euid = process.geteuid();
+  let above = false;
+  for (let at = real; ; at = path.dirname(at)) {
+    const stat = fs.lstatSync(at);
+    if (above && stat.uid === 0 && stat.isDirectory() && ((stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0)) return undefined;
+    if (stat.isSymbolicLink()) return `${at} is a symlink`;
+    if (stat.uid !== 0 && stat.uid !== euid) return `${at} is owned by uid ${stat.uid}, not ${euid}`;
+    if ((stat.mode & 0o022) !== 0) return `${at} is group/other-writable (mode ${(stat.mode & 0o777).toString(8)})`;
+    if (at === top) above = true;
+    if (at === path.dirname(at)) return undefined;
+  }
+};
+if (process.geteuid) {
+  const shim = fileURLToPath(import.meta.url);
+  const root = path.resolve(path.dirname(shim), "..");
+  const helper = path.join(root, "dist/native/fabric-mesh-lease");
+  // The bundle imports node builtins only (no chunk): the shim, the bundle and the helper are the whole chain.
+  for (const file of [shim, path.join(root, "dist/mesh/mesh-backend-cli.js"), ...fs.existsSync(helper) ? [helper] : []]) {
+    const why = unsafeChain(file, root);
+    if (why) {
+      process.stderr.write(`fabric-mesh-backend: refused before loading: helper integrity: ${why}\n`);
+      process.exit(3);
+    }
+  }
+}
+const { main } = await import("../dist/mesh/mesh-backend-cli.js");
 try { process.exitCode = await main(process.argv.slice(2)); }
 catch (error) {
   process.stderr.write(`fabric-mesh-backend: ${error instanceof Error ? error.message : String(error)}\n`);

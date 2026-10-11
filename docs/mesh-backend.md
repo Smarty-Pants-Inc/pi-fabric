@@ -62,7 +62,9 @@ The gate decides from an inventory, never from what readers chose to register:
    (the package directory), must be owned by this user (or root), not group- or other-writable, and
    inside that root (no symlink out of it), checked at each probe. Above the root, every ancestor up to
    the first root-owned one that only root can change (or a root-owned sticky one, such as `/tmp`)
-   must be ours (or root) and not group- or other-writable. Otherwise it is
+   must be ours (or root) and not group- or other-writable. The operator's `bin/fabric-mesh-backend` runs
+   the same check on itself, the gate bundle and the helper BEFORE it loads the bundle, and exits 3
+   (a bundle another user swapped in would drop its own check). Otherwise it is
    `holder@lease-probe` (smarty-dev#8145). The build strips group/other write from `dist/`, and the
    build check refuses any such entry or symlink in `dist/`. A same-user in-place write between the hash and the exec
    remains the accepted smarty-dev#7800 class: Node has no `memfd_create` to exec a sealed copy.

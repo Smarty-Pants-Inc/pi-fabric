@@ -16,7 +16,7 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
@@ -104,6 +104,8 @@ export const runBridge = async (
   const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
   if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
   const cursorPath = required(flags, "cursor");
+  const logLevel = flags.get("log-level") ?? "info";
+  if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
   const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
@@ -135,6 +137,7 @@ export const runBridge = async (
       localName, remoteName, local, remote: linked, cursorPath,
       stopMs: Math.min(callTimeoutMs, 5_000),
       log,
+      ...(logLevel === "debug" ? { debug: (message: string) => log(`debug: ${message}`) } : {}),
     });
     const running = bridge;
     const aborted = new Promise<void>((resolve) => {

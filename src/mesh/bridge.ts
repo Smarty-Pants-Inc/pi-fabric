@@ -23,7 +23,8 @@ import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
  *
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
- * its recipient is native to the hub. Mirrored records never replace a native record.
+ * its recipient is native to the hub, or is the hub factory's role address `factory` on a work
+ * event or owner wake (smarty-dev#9352). Mirrored records never replace a native record.
  */
 
 /** v2 requires change notifications; v1 remains the explicit pre-capability rollout path. */
@@ -89,6 +90,25 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolea
   event.topic === "fabric.control.ack" ||
   event.topic.startsWith("fleet.work.") ||
   (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
+
+/**
+ * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
+ * owner wakes by topic, addressed to this literal name rather than to a participant id, so no hub
+ * record answers to it. Only from the remote to the hub, only this exact name, and only on
+ * `fleet.work.*` and the allow-listed `ops.owner` kinds is it an address across; every other
+ * check (allow-list, sender identity, reserved ids, live sender at commit, frame budget) still holds.
+ */
+export const HUB_FACTORY_RECIPIENT = "factory";
+
+/** Whether a remote event is addressed to the hub factory's role (see HUB_FACTORY_RECIPIENT). */
+export const isHubFactoryEvent = (event: Pick<MeshEvent, "topic" | "kind" | "to">): boolean =>
+  event.to === HUB_FACTORY_RECIPIENT && typeof event.topic === "string" &&
+  (event.topic.startsWith("fleet.work.") || event.topic === "ops.owner") && isBridgedTopic(event);
+
+/** At most one "not addressed across" count line per this interval (smarty-dev#9352). */
+const UNADDRESSED_LOG_MS = 60_000;
+/** The count line names at most this many distinct topics. */
+const UNADDRESSED_TOPICS = 10;
 
 /** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
 export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
@@ -1108,6 +1128,10 @@ export interface MeshBridgeOptions {
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
   log?: (message: string) => void;
+  /** Debug lines (each event not addressed across); off when absent. */
+  debug?: (message: string) => void;
+  /** The clock the once-a-minute "not addressed across" count line reads (Date.now by default; tests inject it). */
+  clock?: () => number;
 }
 
 export interface BridgeStepResult {
@@ -1226,6 +1250,9 @@ export class MeshBridge {
   #expiryAt = Infinity;
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
   #running: Promise<void> = Promise.resolve();
+  /** Events not addressed across since the last count line (smarty-dev#9352). */
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, topics: new Set<string>(), more: false };
+  #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
 
   constructor(readonly options: MeshBridgeOptions) {
     for (const name of [options.localName, options.remoteName]) {
@@ -1236,6 +1263,38 @@ export class MeshBridge {
 
   #log(message: string): void {
     this.options.log?.(message);
+  }
+
+  /**
+   * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
+   * for the INFO line (smarty-dev#9352: these drops were silent).
+   */
+  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent): void {
+    const unaddressed = this.#unaddressed;
+    unaddressed.count += 1;
+    unaddressed[direction] += 1;
+    if (!unaddressed.topics.has(event.topic)) {
+      if (unaddressed.topics.size < UNADDRESSED_TOPICS) unaddressed.topics.add(event.topic);
+      else unaddressed.more = true;
+    }
+    this.options.debug?.(`${direction}: not addressed across: ${event.topic} ${event.id} from ${
+      isObject(event.from) ? String(event.from.id) : "?"} to ${String(event.to ?? "(none)")}`);
+    this.#reportUnaddressed();
+  }
+
+  /**
+   * The INFO count line, at most once a minute. Event-driven: a drop or a forward after the
+   * minute emits it; an idle bridge arms no timer for it.
+   */
+  #reportUnaddressed(): void {
+    const unaddressed = this.#unaddressed;
+    if (unaddressed.count === 0) return;
+    const now = (this.options.clock ?? Date.now)();
+    if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
+    this.#unaddressedLoggedAt = now;
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, topics: new Set<string>(), more: false };
+    this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal})`);
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
@@ -1433,6 +1492,7 @@ export class MeshBridge {
               forwarded += committed.length;
               this.#save(); // Advance only after the destination confirms the prefix durably.
               for (const id of ids) seen.delete(id);
+              this.#reportUnaddressed();
               index += committed.length - 1;
               continue;
             }
@@ -1461,7 +1521,7 @@ export class MeshBridge {
           if (reason !== "not addressed across") {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
-          }
+          } else this.#notAddressed(direction, event);
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
@@ -1512,6 +1572,7 @@ export class MeshBridge {
             this.#save();
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
             seen.delete(event.id);
+            this.#reportUnaddressed();
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;
@@ -1547,7 +1608,11 @@ export class MeshBridge {
 
   #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
-    if (!event.to || !rules.recipients.has(event.to)) return "not addressed across";
+    // The hub (local) side is the factory's: a remote work event or owner wake addressed to its role
+    // crosses to the hub on the same topic, `to` unchanged (smarty-dev#9352). Never hub to remote.
+    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && isHubFactoryEvent(event)))) {
+      return "not addressed across";
+    }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
     const destinationRefusal = this.#destinationRefusal(event, direction);
     if (destinationRefusal) return destinationRefusal;

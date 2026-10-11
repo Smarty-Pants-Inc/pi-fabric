@@ -96,6 +96,8 @@ interface SetupOptions {
   pollMs?: number;
   presenceMs?: number;
   walCapRetryMinMs?: number;
+  /** The clock of the bridge's once-a-minute "not addressed across" count line. */
+  clock?: () => number;
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -123,6 +125,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
   const remote = new RemoteBridgeSide(replies, toGate, options.callTimeoutMs);
   cleanups.push(() => toAgent.end());
   const logs: string[] = [];
+  const debugs: string[] = [];
   const bridge = new MeshBridge({
     localName: "dev1", remoteName,
     local: options.local?.(hub, remoteName) ?? new StoreBridgeSide(hub, remoteName),
@@ -132,9 +135,11 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     ...(options.pollMs ? { pollMs: options.pollMs } : {}),
     ...(options.stopMs ? { stopMs: options.stopMs } : {}),
     log: (message) => logs.push(message),
+    debug: (message) => debugs.push(message),
+    ...(options.clock ? { clock: options.clock } : {}),
     ...(options.walCapRetryMinMs === undefined ? {} : { walCapRetryMinMs: options.walCapRetryMinMs }),
   });
-  return { hub, far, remote, bridge, logs, gate };
+  return { hub, far, remote, bridge, logs, debugs, gate };
 };
 
 const command = (targetId: string, replyTo: string) => ({
@@ -1731,6 +1736,7 @@ describe("mesh bridge", () => {
       [{ ...base, cursor: "" }, /--cursor is required/],
       [{ ...base, remote: "dev1" }, /names must differ/],
       [{ ...base, mesh: path.join(meshFile, "mesh") }, /ENOTDIR|EEXIST|not a directory/i],
+      [{ ...base, "log-level": "trace" }, /--log-level must be info or debug/],
     ];
     for (const [flags, error] of cases) {
       const spawned: Array<number | undefined> = [];
@@ -1784,3 +1790,102 @@ describe("mesh bridge", () => {
     expect(() => transportCommand(new Map([["ssh", "forge"], ["ssh-port", "22 -oX"]]), [])).toThrow(/port number/);
   });
 });
+
+// smarty-dev#9352: work-host Mains address work events to the hub factory's role, `to: "factory"`;
+// the factory on the hub reads them by topic. The bridge dropped them silently.
+describe("work events for the hub factory (smarty-dev#9352)", () => {
+  const countLines = (logs: string[]): string[] => logs.filter((line) => line.includes("not addressed across"));
+
+  it("carries a spoke Main's work event to factory onto the hub's topic, and counts one to nobody", async () => {
+    const { hub, far, bridge, remote, logs, debugs } = setup(undefined, { realPipe: true });
+    await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await remote.hello();
+    await bridge.start();
+    await bridge.step();
+    const wait = await far.publish({ topic: "fleet.work.smarty-dev.1", kind: "wait", from: spoke.identity, to: "factory", text: "WAIT renewal" });
+    const wake = await far.publish({ topic: "ops.owner", kind: "pr.wake", from: spoke.identity, to: "factory", data: { rootId: spoke.identity.id } });
+    const nobody = await far.publish({ topic: "fleet.work.smarty-dev.1", kind: "ask", from: spoke.identity, to: "nobody", text: "stays" });
+    expect(await bridge.step()).toMatchObject({ toLocal: 2, toRemote: 0, dropped: 0 });
+    const work = on(hub, "fleet.work.smarty-dev.1");
+    expect(work).toHaveLength(1);
+    expect(work[0]).toMatchObject({
+      topic: "fleet.work.smarty-dev.1", kind: "wait", to: "factory", text: "WAIT renewal",
+      from: { id: spoke.identity.id, verified: "bridge" }, data: { bridge: { from: "forge", id: wait.id } },
+    });
+    expect(on(hub, "ops.owner")).toEqual([expect.objectContaining({ kind: "pr.wake", to: "factory", data: { rootId: spoke.identity.id, bridge: { from: "forge", id: wake.id } } })]);
+    expect(hub.read({ after: 0, limit: 100 }).some((event) => event.to === "nobody")).toBe(false);
+    expect(debugs).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
+    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev.1; toRemote 0, toLocal 1)"]);
+    // Once across, never again: the cursor and the stamp keep a second pass from repeating it.
+    expect(await bridge.step()).toMatchObject({ toLocal: 0 });
+    expect(on(hub, "fleet.work.smarty-dev.1")).toHaveLength(1);
+  });
+
+  it("admits only the literal factory, only on work topics and owner wakes, only toward the hub", async () => {
+    const { hub, far, bridge, logs, debugs } = setup();
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const stranger: MeshIdentity = { id: sid("stranger"), name: "main", kind: "main" };
+    await hub.publish({ topic: "fleet.work.hub.1", kind: "ask", from: lane.identity, to: "factory", text: "hub to spoke: unchanged" });
+    await far.publish({ topic: "fabric.control.command", kind: "steer", from: spoke.identity, to: "factory", data: command("factory", spoke.hostId) });
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: spoke.identity, to: "factory", data: { version: 1, commandId: "c", targetId: spoke.identity.id, accepted: true } });
+    await far.publish({ topic: "fleet.work.x.1", kind: "ask", from: spoke.identity, to: "Factory", text: "not the literal" });
+    await far.publish({ topic: "fleet.work.x.2", kind: "ask", from: spoke.identity, to: "factory ", text: "not the literal" });
+    await far.publish({ topic: "ops.owner", kind: "drift", from: spoke.identity, to: "factory" });
+    await far.publish({ topic: "fleet.work.x.3", kind: "ask", from: stranger, to: "factory", text: "no live sender" });
+    await far.publish({ topic: "fleet.work.x.4", kind: "ask", from: lane.identity, to: "factory", text: "claims a hub id" });
+    await far.publish({ topic: "fleet.work.x.5", kind: "ask", from: spoke.identity, to: "factory", data: { bridge: { from: "x", id: "y" } } });
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, toLocal: 0, dropped: 2 });
+    expect(far.read({ after: 0, limit: 100 }).filter((event) => event.topic === "fleet.work.hub.1")).toEqual([]);
+    expect(hub.read({ after: 0, limit: 100 }).map((event) => event.topic)).toEqual(["fleet.work.hub.1"]);
+    expect(logs.join("\n")).toMatch(/fleet\.work\.x\.3 .*: sender is not a live participant of the remote/);
+    expect(logs.join("\n")).toMatch(/fleet\.work\.x\.4 .*: sender claims a hub identity/);
+    expect(debugs.map((line) => line.replace(/ \S+ from .* to /, " -> "))).toEqual([
+      "toRemote: not addressed across: fleet.work.hub.1 -> factory",
+      "toLocal: not addressed across: fabric.control.command -> factory",
+      "toLocal: not addressed across: fabric.control.ack -> factory",
+      "toLocal: not addressed across: fleet.work.x.1 -> Factory",
+      "toLocal: not addressed across: fleet.work.x.2 -> factory ",
+    ]);
+  });
+
+  it("logs the count at most once a minute, on the next drop or forward, with no timer", async () => {
+    let now = 1_000_000;
+    const { hub, far, bridge, logs, debugs } = setup(undefined, { clock: () => now });
+    await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const send = (topic: string, to: string) => far.publish({ topic, kind: "ask", from: spoke.identity, to, text: to });
+    await send("fleet.work.a.1", "nobody");
+    await bridge.step();
+    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1)"]);
+    await send("fleet.work.a.2", "nobody");
+    await send("fleet.work.a.3", "nobody");
+    await send("fleet.work.a.2", "nobody");
+    await bridge.step();
+    expect(countLines(logs)).toHaveLength(1); // within the minute: counted, not logged
+    expect(debugs).toHaveLength(4); // every drop at debug
+    now += 60_000;
+    await bridge.step(); // idle past the minute: nothing happens, so nothing is logged
+    expect(countLines(logs)).toHaveLength(1);
+    await send("fleet.work.smarty-dev.1", "factory"); // the next forward reports
+    expect(await bridge.step()).toMatchObject({ toLocal: 1 });
+    expect(countLines(logs)).toEqual([
+      "bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1)",
+      "bridge: 3 events not addressed across (topics: fleet.work.a.2, fleet.work.a.3; toRemote 0, toLocal 3)",
+    ]);
+    for (let index = 0; index < 12; index++) await send(`fleet.work.b.${index}`, "nobody");
+    await bridge.step();
+    expect(countLines(logs)).toHaveLength(2);
+    now += 60_000;
+    await send("fleet.work.b.12", "nobody"); // the next drop reports, topics capped at ten
+    await bridge.step();
+    expect(countLines(logs).at(-1)).toBe(`bridge: 13 events not addressed across (topics: ${
+      Array.from({ length: 10 }, (_, index) => `fleet.work.b.${index}`).join(", ")}, ...; toRemote 0, toLocal 13)`);
+  });
+});
+

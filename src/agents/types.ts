@@ -213,7 +213,12 @@ export interface AgentRunRecord {
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
+  /**
+   * CONTEXT_OVERFLOW (smarty-dev#3238): set by the worker only from a structured overflow signal
+   * (Pi's own window refusal, pi-ai isContextOverflow on the assistant message, or the activation
+   * window's nonce-bound refusal frame), never from free error text.
+   */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW";
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;

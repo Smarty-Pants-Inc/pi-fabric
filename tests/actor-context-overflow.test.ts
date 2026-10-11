@@ -46,9 +46,10 @@ const setup = () => {
   });
   const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
   const alarms: FabricActorDeliveryRequest[] = [];
-  const actors = new ActorManager("overflow-test", { id: "owner", name: "owner", kind: "main", sessionId: "overflow-test" }, mesh,
+  const makeActors = () => new ActorManager("overflow-test", { id: "owner", name: "owner", kind: "main", sessionId: "overflow-test" }, mesh,
     { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (request) => { alarms.push(request); },
     { actorRoot: path.join(dir, "actors"), persistent: true, maxSessionBytes: 0 });
+  const actors = makeActors();
   managers.push(actors, agents);
   const prompts = (): Prompt[] => fs.existsSync(log)
     ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Prompt) : [];
@@ -58,7 +59,7 @@ const setup = () => {
     name, instructions: "Review the event.", model: "test/overflow", tools: [], extensions: false,
     transport: "process", residency: "durable", delivery: "mailbox", ...extra,
   });
-  return { dir, agents, mesh, actors, alarms, prompts, overflowEvents, ownerAlarms, create };
+  return { dir, agents, mesh, actors, alarms, prompts, overflowEvents, ownerAlarms, create, makeActors };
 };
 
 const header = (file: string): string => JSON.parse(fs.readFileSync(file, "utf8").split("\n", 1)[0]!).id as string;
@@ -172,6 +173,73 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
       trigger: "context", overflow: false, contextUsage: { tokens: 244_810, contextWindow: 272_000 },
     })]);
     expect(s.overflowEvents()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  // Round 2 (PR #853 review): overflow is a typed worker code, never matched in error text.
+  it("does not retry or report overflow for a non-overflow error that quotes the window phrase", async () => {
+    const s = setup();
+    const actor = await s.create("quoting");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    const carried = header(actor.sessionFile!);
+    await expect(s.actors.ask(actor.id, "QUOTED_PHRASE", { pr: 9 })).rejects.toThrow(/the log line says "Context exceeds window/);
+    expect(s.prompts().map(({ marker }) => marker)).toEqual(["FIRST_REVIEW", "QUOTED_PHRASE"]);
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(resets(s.actors, actor.id)).toEqual([]);
+    expect(s.actors.messages(actor.id, 50).some((message) =>
+      (message.data as { contextOverflow?: unknown } | undefined)?.contextOverflow)).toBe(false);
+    expect(s.overflowEvents()).toEqual([]);
+    expect(s.ownerAlarms()).toEqual([]);
+    expect(s.actors.status(actor.id).activationBlocked?.code).not.toBe("context-overflow");
+  }, TEST_GUARD_MS);
+
+  it("retries once on a fresh session for a provider overflow typed by Pi's isContextOverflow", async () => {
+    const s = setup();
+    const actor = await s.create("provider");
+    await s.actors.ask(actor.id, "FIRST_REVIEW");
+    const carried = header(actor.sessionFile!);
+    await expect(s.actors.ask(actor.id, "PROVIDER_OVERFLOW_ON_HISTORY")).resolves.toMatchObject({ text: "verdict: ok" });
+    expect(s.prompts()).toEqual([
+      { history: false, overflow: false, session: carried, marker: "FIRST_REVIEW" },
+      { history: true, overflow: true, session: carried, marker: "PROVIDER_OVERFLOW_ON_HISTORY" },
+      { history: false, overflow: false, session: expect.not.stringMatching(carried), marker: "PROVIDER_OVERFLOW_ON_HISTORY" },
+    ]);
+    expect(resets(s.actors, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
+    expect(s.overflowEvents()).toEqual([]);
+  }, TEST_GUARD_MS);
+
+  it("retries on a fresh session after a restart between the retry's queue checkpoint and the archive", async () => {
+    const s = setup();
+    const actor = await s.create("restarted", { topics: ["github.restart"] });
+    const ingress = { id: "ingress", name: "github-ingress", kind: "agent" as const };
+    const publish = (title: string) => s.mesh.publish({ topic: "github.restart", kind: "github.webhook", from: ingress,
+      data: { event: "pull_request", repository: "o/r", payload: { action: "synchronize", title, pull_request: { number: 5 } } } });
+    await publish("FIRST_REVIEW");
+    await waitFor(() => s.prompts().length === 1 && s.actors.inFlightCount() === 0 && s.actors.status(actor.id).status === "idle");
+    const carried = header(actor.sessionFile!);
+    // Stop the drain as the overflowing run returns: the retry is checkpointed, the reset has not run.
+    const run = s.agents.run.bind(s.agents);
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      const result = await run(...args);
+      if (result.errorCode === "CONTEXT_OVERFLOW") s.actors.pauseForRelease();
+      return result;
+    });
+    await publish("OVERFLOW_ON_HISTORY");
+    await waitFor(() => s.prompts().length === 2 && s.actors.inFlightCount() === 0 &&
+      s.actors.messages(actor.id, 50).some((message) => (message.data as { contextOverflow?: unknown } | undefined)?.contextOverflow));
+    expect(header(actor.sessionFile!)).toBe(carried);
+    expect(backups(actor.sessionFile!)).toEqual([]);
+    await s.actors.close();
+    vi.restoreAllMocks();
+    // A restarted host has no in-memory reset marker: the persisted retry alone must reset.
+    const restarted = s.makeActors();
+    managers.push(restarted);
+    await waitFor(() => s.prompts().length === 3 && restarted.inFlightCount() === 0);
+    expect(s.prompts()[2]).toEqual({ history: false, overflow: false, session: expect.not.stringMatching(carried), marker: "OVERFLOW_ON_HISTORY" });
+    expect(header(actor.sessionFile!)).not.toBe(carried);
+    expect(resets(restarted, actor.id)).toEqual([expect.objectContaining({ trigger: "context", overflow: true })]);
+    expect(s.overflowEvents()).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(s.prompts()).toHaveLength(3);
   }, TEST_GUARD_MS);
 
   it("addresses the triggering event by topic, key and PR or issue reference", () => {

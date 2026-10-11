@@ -303,6 +303,7 @@ const main = async (): Promise<void> => {
   const {
     applyUsage,
     assistantContextTokens,
+    piWindowRefusal,
     createRunningRecord,
     emptyUsage,
     extractUsageDelta,
@@ -747,6 +748,8 @@ const main = async (): Promise<void> => {
   let lastUsageMessageTimestamp: number | undefined;
   // smarty-dev#3238: the child's model window, from its own get_state, for an actor's contextUsage.
   let childContextWindow: number | undefined;
+  // smarty-dev#3238 round 2: set only from a structured overflow signal; stamps errorCode on failure.
+  let contextOverflowSignal = false;
   let finalTurnCompleted = false;
   let attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
   let completedToolInTurn = false;
@@ -925,9 +928,12 @@ const main = async (): Promise<void> => {
   let activationWindowReady = false;
   let residentProbeReady = false;
   // Optional worker-only edge: never load native estimation in Main registration.
-  const admissionModule = options.runner === "pi" && options.actorId && !activationWindow
+  const actorPiModule = options.runner === "pi" && options.actorId
     ? await import(import.meta.url.endsWith(".ts") ? "./worker/context-admission.ts" : "./worker/context-admission.js") as typeof import("./worker/context-admission.js")
     : undefined;
+  const admissionModule = activationWindow ? undefined : actorPiModule;
+  // smarty-dev#3238 round 2: Pi's provider-overflow classifier, for an actor run's typed overflow code.
+  const piContextOverflow = actorPiModule ? await actorPiModule.loadPiContextOverflow(options.piBinary) : undefined;
   const estimateActorInput = admissionModule
     ? await admissionModule.loadActorInputEstimator(options.piBinary) : undefined;
   if (admissionModule && !estimateActorInput) appendLog(`${JSON.stringify({ type: "fabric_context_admission", mode: "launcher", reason: "native_estimator_unavailable" })}\n`);
@@ -1568,6 +1574,12 @@ const main = async (): Promise<void> => {
       } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
       return;
     }
+    // smarty-dev#3238 round 2: the activation window's own window refusal, typed by its bound frame.
+    if (activationWindow && event.type === "fabric_activation_window_refusal") {
+      if (event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
+          event.hook === activationHookPath && event.code === "context-overflow") contextOverflowSignal = true;
+      return;
+    }
     if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
       if (event.runId === options.id && event.nonce === residentProbeNonce &&
           event.protocol === 1 && event.extension === options.fabricExtensionPath && !residentProbeReady) {
@@ -1588,18 +1600,17 @@ const main = async (): Promise<void> => {
       }
     }
     // Context refusal is deterministic for an actor's admitted input. Native
-    // retries cannot make it fit; stop at the first structured failure, also
-    // for full-history actors or a preflight extension that reports an error.
+    // retries cannot make it fit; stop at Pi's own structured refusal (smarty-dev#3238
+    // round 2: the whole refusal message on its assistant message, never free text).
     const eventMessage = event.type === "message_end" && typeof event.message === "object" && event.message !== null
       ? event.message as Record<string, unknown> : undefined;
-    const contextError = eventMessage?.stopReason === "error" ? stringField(eventMessage.errorMessage)
-      : event.type === "extension_error" || (event.type === "response" && event.success === false) ? stringField(event.error)
-      : event.type === "auto_retry_start" ? stringField(event.errorMessage) : undefined;
-    if (options.actorId && !terminalStatus && contextError && /Context exceeds window:/i.test(contextError)) {
+    if (options.actorId && !terminalStatus && eventMessage && piWindowRefusal(eventMessage)) {
+      const contextError = stringField(eventMessage.errorMessage) ?? "Context exceeds window";
       terminalStatus = "failed";
       terminalError = contextError;
       record.error = contextError;
       sawAgentError = true;
+      contextOverflowSignal = true;
       update();
       killChild();
       return;
@@ -1793,6 +1804,11 @@ const main = async (): Promise<void> => {
       if (options.actorId && childContextWindow && contextTokens > 0) {
         record.contextUsage = { tokens: contextTokens, contextWindow: childContextWindow };
       }
+      // smarty-dev#3238 round 2: the run's latest model turn, judged by Pi's own classifier. A
+      // provider overflow that Pi's recovery later fixes is superseded by the next assistant turn.
+      if (piContextOverflow && (messageRecord.stopReason === "error" || messageRecord.stopReason === "length")) {
+        contextOverflowSignal = piContextOverflow(messageRecord, childContextWindow ?? 0);
+      } else if (options.actorId) contextOverflowSignal = false;
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
@@ -2424,6 +2440,8 @@ const main = async (): Promise<void> => {
       (options.runner === "veda" && vedaParsed !== undefined));
   record.status = terminalStatus ?? (childCompleted ? "completed" : "failed");
   if (terminalError) record.error = terminalError;
+  // smarty-dev#3238 round 2: the manager retries and reports overflow only on this typed code.
+  if (record.status === "failed" && contextOverflowSignal && !record.errorCode) record.errorCode = "CONTEXT_OVERFLOW";
   if (record.status === "failed" && !record.error) {
     record.error =
       stderr.trim() ||

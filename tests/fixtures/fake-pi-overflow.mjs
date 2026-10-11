@@ -4,12 +4,16 @@
 // The task text selects the run: OVERFLOW_ALWAYS refuses every run with the window error
 // text the worker reports, OVERFLOW_ON_HISTORY refuses only a run whose session already
 // holds a conversation, FILL_CONTEXT succeeds with 90% of the window used.
+// Round 2: PROVIDER_OVERFLOW_ON_HISTORY refuses a carried run in a provider's own wording (typed by
+// pi-ai isContextOverflow), QUOTED_PHRASE fails with a non-overflow error that quotes the phrase.
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 
 const WINDOW = 272_000;
 const OVERFLOW = "Context exceeds window: estimated 272511 input tokens, window 272000";
+const PROVIDER_OVERFLOW = "prompt is too long: 280000 tokens > 272000 maximum";
+const QUOTED = 'Tool "read" failed: the log line says "Context exceeds window: estimated 272511 input tokens, window 272000"';
 const args = process.argv.slice(2);
 const arg = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
 const sessionFile = arg("--session");
@@ -47,21 +51,26 @@ process.stdin.on("data", (chunk) => {
       const task = String(frame.message ?? "");
       const journal = entries();
       const history = journal.some((entry) => entry.type === "message");
+      const providerOverflow = task.includes("PROVIDER_OVERFLOW_ON_HISTORY") && history;
+      const quoted = task.includes("QUOTED_PHRASE");
       const overflow = task.includes("OVERFLOW_ALWAYS") || (task.includes("OVERFLOW_ON_HISTORY") && history);
       if (process.env.FAKE_PI_LOG) {
         fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({
           history, overflow, session: journal.find((entry) => entry.type === "session")?.id,
-          marker: (task.match(/\b(?:OVERFLOW_ALWAYS|OVERFLOW_ON_HISTORY|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
+          marker: (task.match(/\b(?:OVERFLOW_ALWAYS|PROVIDER_OVERFLOW_ON_HISTORY|OVERFLOW_ON_HISTORY|QUOTED_PHRASE|FILL_CONTEXT|[A-Z]+_REVIEW)\b/g) ?? []).join(","),
         }) + "\n");
       }
       append({ role: "user", content: task, timestamp: Date.now() });
       emit({ type: "agent_start" });
-      if (overflow) {
-        const message = { role: "assistant", provider, model: model.id, content: [], stopReason: "error", errorMessage: OVERFLOW,
+      if (overflow || quoted) {
+        const message = { role: "assistant", provider, model: model.id, content: [], stopReason: "error",
+          errorMessage: quoted ? QUOTED : providerOverflow ? PROVIDER_OVERFLOW : OVERFLOW,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }, timestamp: Date.now() };
         append(message);
         emit({ type: "message_end", message });
         emit({ type: "agent_end" });
+        // Pi's own window refusal is killed at message_end; other errors settle as Pi does.
+        if (quoted || providerOverflow) emit({ type: "agent_settled", outcome: "error" });
         continue;
       }
       const input = task.includes("FILL_CONTEXT") ? Math.floor(WINDOW * 0.9) : 1000;

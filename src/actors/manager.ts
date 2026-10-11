@@ -426,10 +426,10 @@ export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
 /** smarty-dev#3238: a carried session at or past this share of its model window resets at the next run boundary. */
 export const ACTOR_CONTEXT_RESET_RATIO = 0.8;
-/** An actor run's deterministic window refusal, as the worker reports it. */
-const ACTOR_CONTEXT_OVERFLOW = /Context exceeds window:/i;
 /** One explicit notice per event that overflowed a fresh session, on the actor's own output path. */
 export const ACTOR_ACTIVATION_OVERFLOW_KIND = "actor.activation.overflow";
+/** A failed run the worker typed CONTEXT_OVERFLOW, carried to the drain's failure notice (smarty-dev#3238). */
+class ActorContextOverflowError extends Error {}
 export const ACTOR_ACTIVATION_OVERFLOW_REASON = "no verdict (context overflow)";
 const refRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -498,9 +498,9 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
-  // smarty-dev#3238: each actor's last run context use, and actors whose overflow retry needs a fresh session.
+  // smarty-dev#3238: each actor's last run context use. An overflow retry's fresh session is derived
+  // from its durable queue item (overflowRetried), so a restart before the reset still resets.
   readonly #lastContextUsage = new Map<string, { tokens: number; contextWindow: number }>();
-  readonly #contextResets = new Set<string>();
   // smarty-dev#6144 review round 3: read at every drain, never captured, so a live config reload that
   // enables or removes agents.wakeText applies to the next activation (removal revokes at once).
   readonly #wakeTextPolicy: () => FabricWakeTextConfig | undefined;
@@ -1496,14 +1496,18 @@ export class ActorManager {
         if (fs.statSync(live.sessionFile).size > this.#maxSessionBytes) trigger = "size";
       } catch { /* no session file yet */ }
     }
-    // smarty-dev#3238: a carried session that the last run left (nearly) full, or that just
-    // overflowed an event now being retried, starts the next run fresh.
+    // smarty-dev#3238: a carried session that the last run left (nearly) full, or that holds history
+    // while the next event is an overflow retry, starts the next run fresh. The retry is read from the
+    // persisted queue item, never an in-memory marker, so a restart between the queue checkpoint and
+    // this archive still retries on a fresh session; a session already fresh is not archived again.
     const usage = this.#lastContextUsage.get(live.id);
-    if (!trigger && (this.#contextResets.has(live.id) || (usage !== undefined && this.#carriesSession(live) &&
+    const overflowRetry = !trigger && actor.queue[0]?.overflowRetried === true &&
+      this.#sessionCarriedHistory(live, this.#sessionBytes(live.sessionFile));
+    if (!trigger && (overflowRetry || (usage !== undefined && this.#carriesSession(live) &&
       usage.tokens >= usage.contextWindow * ACTOR_CONTEXT_RESET_RATIO))) trigger = "context";
     if (!trigger) return undefined;
     try {
-      this.#archiveSession(live, trigger);
+      this.#archiveSession(live, trigger, overflowRetry);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       waiters?.forEach((waiter) => waiter.reject(failure));
@@ -1519,7 +1523,7 @@ export class ActorManager {
   }
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
-  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context"): void {
+  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
       throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
@@ -1556,7 +1560,6 @@ export class ActorManager {
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
     const usage = this.#lastContextUsage.get(actor.id);
-    const overflow = this.#contextResets.delete(actor.id);
     this.#lastContextUsage.delete(actor.id);
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
@@ -3478,7 +3481,9 @@ export class ActorManager {
             await this.#saveActors();
           }
           if (result.status !== "completed") {
-            const contextOverflow = ACTOR_CONTEXT_OVERFLOW.test(result.error ?? "") && !abortController.signal.aborted && !runStopped;
+            // smarty-dev#3238 round 2: only the worker's typed code, set from a structured overflow
+            // signal, retries or reports an overflow; error text that quotes the phrase never does.
+            const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !abortController.signal.aborted && !runStopped;
             if (contextOverflow && !item.overflowRetried && !this.#closing && (actor.status as string) !== "stopped" &&
                 this.#sessionCarriedHistory(actor, sessionBytesBefore)) {
               // smarty-dev#3238: carried history left this event no room. Reset the session at this
@@ -3486,7 +3491,6 @@ export class ActorManager {
               item.overflowRetried = true;
               item.executionStarted = false;
               handoffConsumed = false;
-              this.#contextResets.add(actor.id);
               // Transfer ownership before cleanup can yield: never both in flight and queued (#3167).
               this.#inFlight.delete(actor.id);
               actor.queue.unshift(item);
@@ -3520,9 +3524,10 @@ export class ActorManager {
               };
               this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false, contextOverflow);
               continue;
             }
+            if (contextOverflow) throw new ActorContextOverflowError(result.error || `Actor run ${result.status}`);
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
@@ -3648,7 +3653,8 @@ export class ActorManager {
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
-            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0);
+            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
+            false, error instanceof ActorContextOverflowError);
         } finally {
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
@@ -3775,13 +3781,13 @@ export class ActorManager {
       from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
       text: `${actor.name}: ${ACTOR_ACTIVATION_OVERFLOW_REASON}${where}.`,
       data: { actorId: actor.id, actorName: actor.name, eventRef, reason: ACTOR_ACTIVATION_OVERFLOW_REASON,
-        ...(runId ? { runId } : {}), error: error.split("\n").find((line) => ACTOR_CONTEXT_OVERFLOW.test(line))?.trim().slice(0, 300) ?? error.slice(0, 300) },
+        ...(runId ? { runId } : {}), error: (error.split("\n").map((line) => line.trim()).find(Boolean) ?? error).slice(0, 300) },
     }).catch(() => undefined);
   }
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false, contextOverflowCode = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3798,9 +3804,10 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
+    // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     const code = preparation ? "failing-preparation"
+      : contextOverflowCode ? "context-overflow"
       : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
-      : /Context exceeds window/i.test(lastError) ? "context-overflow"
       : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
       : "unknown";
     const reason = lastError.slice(0, 300);

@@ -3117,7 +3117,8 @@ export class AgentManager {
       record.status !== "failed" ||
       // Window admission is terminal even when stderr also contains an auth
       // miss or transport-death diagnostic. Never launch a second Pi for it.
-      /Context exceeds window:/i.test(record.error ?? "") ||
+      // (Text here only suppresses a relaunch: a false match fails safe.)
+      record.errorCode === "CONTEXT_OVERFLOW" || /Context exceeds window:/i.test(record.error ?? "") ||
       !(
         (managed.runner === "pi" && retryablePiStartupError(record.error)) ||
         transportExitedWithoutResult(record.error)
@@ -3163,7 +3164,7 @@ export class AgentManager {
       managed.abandoned ||
       managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
       !this.#observedWork(managed) ||
-      /Context exceeds window:/i.test(record.error ?? "") ||
+      record.errorCode === "CONTEXT_OVERFLOW" || /Context exceeds window:/i.test(record.error ?? "") ||
       !recoverableStop(record)
     ) {
       return false;

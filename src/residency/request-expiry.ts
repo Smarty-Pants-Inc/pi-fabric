@@ -22,7 +22,7 @@ export class ResidentRequestExpiredError extends Error {
   constructor(readonly requestId: string, receipt?: FabricResidentOutcomeReceipt, signal?: AbortSignal) {
     super(`ResidentRequestExpiredError: Fabric residency request ${requestId} expired; do not replay or reassign its work. ` +
       `Reconcile the original entity through agents.status / agents.actorStatus / agents.list.` +
-      (receipt ? ` ${receipt.entityKind}Id=${receipt.id ?? "not yet known"}, ownerHostId=${receipt.ownerHostId ?? "not yet known"}, state=${receipt.state}.` : ""));
+      (receipt ? ` ${receipt.entityKind}Id=${receipt.id ?? "not yet known"}, ownerHostId=${receipt.ownerHostId ?? "not yet known"}, state=${receipt.state === "committed" ? `committed (accepted; ${receipt.entityKind === "actor" ? "registry save" : "publication"} pending)` : receipt.state}.` : ""));
     this.name = "ResidentRequestExpiredError";
     this.residentOutcome = receipt ? Object.freeze({ ...receipt }) : undefined;
     if (this.residentOutcome) recordResidentOutcome(signal, this.residentOutcome);

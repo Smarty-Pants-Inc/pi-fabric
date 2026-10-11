@@ -6,6 +6,8 @@ import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js
 export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
   halted(): boolean;
   report(message: string, context: ExtensionContext): Promise<unknown>;
+  /** Main's drain owns a non-retryable error: compaction once, then alarm (smarty-dev#8742). */
+  ownsNonRetryable?(): boolean;
 }): void => {
   let retried = false;
   let reported = false;
@@ -40,6 +42,12 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (!last || last.stopReason === "aborted") return;
     if (last.stopReason !== "error") { reset(); return; }
     const current = generation;
+    // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
+    // would otherwise split into its own eager startup chunk.
+    const { classifyProviderError } = await import("./provider-error-class.js");
+    if (generation !== current) return;
+    // A blind retry of a request the provider rejects as non-retryable fails the same way.
+    if (classifyProviderError(last)?.retryable === false && options.ownsNonRetryable?.() === true) { reset(); return; }
     // Optional provider utilities must not enter registration's eager graph.
     const { isContextOverflow } = await import("@earendil-works/pi-ai/compat");
     if (generation !== current || context.signal?.aborted || options.halted() ||
@@ -47,13 +55,18 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (retried) {
       if (reported) return;
       reported = true;
-      const message = `BLOCKED: provider error: ${last.errorMessage?.split(/\r?\n/, 1)[0] || "Unknown provider error"}`;
+      // smarty-dev#8742: only the classifier's allowlisted short form (HTTP status, a known error type,
+      // a fixed code) leaves this Main. A provider can echo prompt or secret text in errorMessage; that
+      // text stays in the failed assistant message in the local session log.
+      const message = `BLOCKED: provider error: ${classifyProviderError(last)?.short ?? "unknown provider error"}`;
       // Persist/display without waking the failed lane for a third attempt.
       sendFabricMessage(pi, { customType: "pi-fabric-provider-blocked", content: message, display: true },
         { deliverAs: "followUp", triggerTurn: false });
       context.ui.notify(message, "error");
       try { await options.report(message, context); }
-      catch (error) { context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error"); }
+      catch (error) {
+        if (generation === current) context.ui.notify(`Provider error report delivery failed: ${String(error)}`, "error");
+      }
       return;
     }
     // An owner input, another turn, session replacement, or Escape cancels this wake.

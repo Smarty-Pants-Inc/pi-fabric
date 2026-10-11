@@ -165,7 +165,7 @@ describe("round-1 admission invariance", () => {
       sender.start(() => ({ accepted: false }));
       owner.start((command, from, signal) => router.acceptControl(command, from, signal));
       const participant = { id: after.main.id, kind: "root", local: false, capabilities: ["followUp"],
-        ownerHostId: "owner-host", ownerIdentityId: ownerIdentity.id, controlProtocol: "v1" };
+        ownerHostId: "owner-host", ownerIdentityId: ownerIdentity.id, ownerIncarnation: owner.incarnation, controlProtocol: "v1" };
       const provider = new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2],
         { matches: () => false } as unknown as Ports[3], { get: () => participant } as unknown as Ports[4], sender, {} as Ports[6]);
       expect(await provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))

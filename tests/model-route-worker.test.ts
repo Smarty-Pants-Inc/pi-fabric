@@ -81,7 +81,9 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
     vi.stubEnv("PI_FABRIC_EXTENSION_PATH", path.resolve("tests/fixtures/route-cwd-extension.ts"));
     const pin = { model: "route-cwd-probe/pinned", effort: "high" as const };
     const decision = await decideModelRoute({ routeClass: "bounded-lookup", protected: true, pin, candidates: [], parentSessionId: "parent" }, async () => { throw new Error("excluded"); });
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, timeoutMs: 30000 }, {
+    // smarty-dev#7651: timeoutMs covers a cold real-Pi boot plus model admission, which a loaded 2-core
+    // runner can stretch past 30 s; it is a harness budget, not the cwd/content contract under test.
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, timeoutMs: 90000 }, {
       workerPath, piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
       fabricExtensionPath: path.resolve("tests/fixtures/route-cwd-extension.ts"), fullCodeMode: false, runRoot: path.join(root, "runs"),
     }); managers.push(manager);
@@ -99,7 +101,7 @@ describe.skipIf(!fs.existsSync(workerPath))("shadow routing in real built worker
       expect(rows[0].childSessionId).toBe(handle.id);
       expect(rows[1]).toMatchObject({ status: "completed", admittedModel: pin.model, admittedEffort: pin.effort });
     } finally { if (id) await manager.cleanup(id, true); }
-  }, 45000);
+  }, 120000);
   it.each(["native", "win32"])("loads attribution hook even when extensions are disabled and records verified admission (%s paths)", async pathStyle => {
     const { result, rows, launch, pin } = await run("success");
     // Exercise Windows argv separators on every host, using the real worker's hook path.

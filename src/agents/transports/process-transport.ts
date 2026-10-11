@@ -14,7 +14,9 @@ import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
-import { agentPlacementProbe } from "../placement-config.js";
+import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
+import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
+import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 
 const regularFile = (file: string): boolean => {
   try { return fs.statSync(file).isFile(); } catch { return false; }
@@ -52,7 +54,11 @@ export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
-  constructor(private readonly processSlice?: string, private readonly placement?: AgentPlacementConfig) {}
+  readonly #placement: () => AgentPlacementConfig | undefined;
+
+  constructor(private readonly processSlice?: string, placement?: AgentPlacementConfig, placementConfigPath?: string) {
+    this.#placement = placementConfigPath ? liveAgentPlacement(placementConfigPath, placement) : () => placement;
+  }
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
@@ -65,20 +71,27 @@ export class ProcessTransport implements AgentTransportAdapter {
   }
 
   async launch(request: AgentTransportLaunch): Promise<AgentTransportHandle> {
-    if (this.placement) {
-      const unmet = (request.needs ?? []).filter(need => !this.placement!.capabilities.includes(need));
-      let reason = this.placement.default === "local" ? "placement default is local"
+    // Snapshot once before any await: existing handles retain their original policy.
+    const requires = normalizeAgentRequires(request.requires);
+    const needs = normalizeAgentCapabilityTokens(request.needs);
+    request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
+    const placement = this.#placement();
+    if (placement) {
+      const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
+      const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
+      let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
+        : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
-      if (!reason) reason = agentPlacementProbe(this.placement, request.cwd).reason;
+      if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
       // --src ships the Main's workspace, unlike --cwd which names a target-local
       // lane. Require the launcher's tracked/unignored manifest branch; home,
       // non-Git and ignored roots must never enter its recursive-copy branch.
-      if (!reason && this.placement.command.some((entry, index) => entry === "--src" && this.placement!.command[index + 1] === "{cwd}")) {
+      if (!reason && placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}")) {
         try {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
           const git = await executeFile("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
-            timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+            timeoutMs: Math.min(placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
           });
           if (git.stdout.trim() !== "true") throw new Error("not a Git work tree");
           // check-ignore -q exits 0 for ignored, 1 for definitely unignored,
@@ -86,7 +99,7 @@ export class ProcessTransport implements AgentTransportAdapter {
           let unignored = false;
           try {
             await executeFile("git", ["-C", cwd, "check-ignore", "-q", "--", cwd], {
-              timeoutMs: Math.min(this.placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
+              timeoutMs: Math.min(placement.commandTimeoutMs, 5_000), killSignal: "SIGKILL",
             });
           } catch (error) {
             const exit = error as { code?: unknown; signal?: unknown; killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
@@ -98,7 +111,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       if (!reason) {
         const { launchPlacedTask } = await import("./placement.js");
-        return launchPlacedTask(request, this.placement);
+        return launchPlacedTask(request, placement);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -106,6 +119,8 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!log) throw new Error("Placement audit requires a run event log");
       fs.appendFileSync(log, JSON.stringify({ type: "placement.local", ts: Date.now(), id: request.id, reason, needs: request.needs ?? [] }) + "\n", { mode: 0o600 });
     }
+    // Check on Main only after the remote decision; required paths may exist solely on the target.
+    assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
     const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
     const selected = selectWorkerRelease(request.workerPath);
@@ -150,11 +165,13 @@ export class ProcessTransport implements AgentTransportAdapter {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
       sessionId: String(processHandle.pid),
+      ...(processHandle.treeClosed ? { liveness: "events" as const } : {}),
       isAlive: processHandle.isAlive,
       lostContact: processHandle.lostContact,
       ...(processHandle.stopDebt ? { stopDebt: processHandle.stopDebt } : {}),
       waitForClose: processHandle.waitForClose,
       closed: processHandle.closed,
+      ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
       stop: processHandle.stop,
     };
   }

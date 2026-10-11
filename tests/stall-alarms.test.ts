@@ -9,7 +9,8 @@ import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive,
-  rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "../src/topology/stall-alarms.js";
+  rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms } from "../src/topology/stall-alarms.js";
+import { isBridgedTopic } from "../src/mesh/bridge.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig } from "../src/config.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -242,10 +243,10 @@ it("TTL source claim rechecks succession when native C confirms before custody l
   await recovery.run(firstAbsent);
   expect(fs.existsSync(routeFile)).toBe(false);
   const now = firstAbsent + options.rootGoneTtlMs + 1;
-  const exclusive = recoveryMesh.exclusive.bind(recoveryMesh);
+  const custody = recoveryMesh.custody.bind(recoveryMesh);
   let next!: ReturnType<typeof main>;
   let injected = false;
-  vi.spyOn(recoveryMesh, "exclusive").mockImplementationOnce(async (operation, timeout) => {
+  vi.spyOn(recoveryMesh, "custody").mockImplementationOnce(async (operation, timeout) => {
     // Pause A's source claim immediately BEFORE lock acquisition. On the old
     // implementation A has already captured no successor here. C wins the real
     // lock, registers, and confirms B -> C without changing B's retired owner.
@@ -256,7 +257,7 @@ it("TTL source claim rechecks succession when native C confirms before custody l
     next = await mesh.exclusive(() => main(mesh, C, true, targetFile));
     expect(await confirmMainSuccessor(mesh, C.id, targetFile)).toBe(true);
     expect(fs.readFileSync(ownerFile, "utf8")).toBe(retiredOwner);
-    return exclusive(operation, timeout); // Resume A only after confirmation committed.
+    return custody(operation, timeout); // Resume A only after confirmation committed.
   });
   await recovery.run(now);
   expect(injected).toBe(true);
@@ -403,4 +404,90 @@ it.skipIf(process.platform === "win32")("SIGKILL between successor admission and
   expect(recovered.sent).toHaveLength(1); expect(recovered.sent[0].message.details.id).toBe(packet.messageId);
   await new MainInboxMaintenance(mesh, C, source([]), recovered.controller, options).run();
   expect(recovered.sent).toHaveLength(1); expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toHaveLength(1);
+});
+
+// smarty-dev#8742: a provider-dead Main reaches ops at once, on the inbox-age alarm's addressing and bridge.
+it("publishes provider-dead alarms on ops.owner, firing each held message's inbox-age alarm early under its own dedupe key", async () => {
+  const { mesh } = setup();
+  const event = { error: "409 invalid_request_error: compaction_affinity_missing", since: "2026-10-11T08:00:00.000Z",
+    cause: "compaction-failed", held: [{ id: "m1", from: "session:lead", sentAt: 1 }] };
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");     // deduplicated per address
+  const alarms = mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
+  expect(alarms.map(alarm => `${alarm.kind}>${alarm.to}`).sort()).toEqual([
+    "fabric.main.provider-dead>session:A", "fabric.main.provider-dead>session:owner",
+    "inbox.age.alarm>session:A", "inbox.age.alarm>session:lead", "inbox.age.alarm>session:owner",
+  ]);
+  const age = alarms.find(alarm => alarm.kind === "inbox.age.alarm" && alarm.to === "session:lead")!;
+  expect(age).toMatchObject({ dedupeKey: "inbox-age:m1:session:lead",
+    data: { messageId: "m1", rootId: A.id, reason: "provider-dead", error: event.error } });
+  expect(age.text).toContain("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing)");
+  expect(isBridgedTopic(age)).toBe(true);
+  // The later age pass reuses the key, so it never repeats this alarm.
+  await mesh.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: A, to: "session:lead", dedupeKey: "inbox-age:m1:session:lead", data: {} });
+  expect(mesh.read({ topic: "ops.owner", after: 0, limit: 100 })).toHaveLength(5);
+});
+
+// PR #841 code review P1 (round 6): Main holds up to 200 messages; every held message's sender is
+// alarmed at once, once per address, in publish batches of at most 50 alarms.
+it("alarms every held message's sender exactly once, in bounded batches, beyond the first 50 held", async () => {
+  const { mesh } = setup();
+  const batches: number[] = [];
+  const publishBatch = mesh.publishBatch.bind(mesh);
+  vi.spyOn(mesh, "publishBatch").mockImplementation(async inputs => { batches.push(inputs.length); return publishBatch(inputs); });
+  const held = Array.from({ length: 120 }, (_, index) => ({ id: `m${index}`, from: `session:sender${index}`, sentAt: index }));
+  const event = { error: "400 invalid_request_error", since: "2026-10-11T10:00:00.000Z", cause: "compaction-failed", held };
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");     // deduplicated per address
+  const age = mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm");
+  const senders = age.filter(alarm => alarm.to!.startsWith("session:sender"));
+  expect(senders.map(alarm => alarm.to).sort()).toEqual(held.map(item => item.from).sort());   // all 120, once each
+  expect(senders.find(alarm => alarm.to === "session:sender119")).toMatchObject({ dedupeKey: "inbox-age:m119:session:sender119",
+    text: `Undelivered Main message m119 to ${A.id}: provider-dead (non-retryable: 400 invalid_request_error)`,
+    data: { messageId: "m119", messageIds: ["m119"], heldCount: 1, sentAt: 119, rootId: A.id, reason: "provider-dead", error: event.error } });
+  // Owners: one alarm each, counting all 120 and listing the first 50.
+  for (const owner of [A.id, "session:owner"]) {
+    const alarm = age.filter(entry => entry.to === owner);
+    expect(alarm).toHaveLength(1);
+    expect(alarm[0]!.data).toMatchObject({ messageId: "m0", heldCount: 120 });
+    expect((alarm[0]!.data as { messageIds: string[] }).messageIds).toEqual(held.slice(0, 50).map(item => item.id));
+  }
+  expect(age).toHaveLength(122);
+  expect(Math.max(...batches)).toBeLessThanOrEqual(50);
+  expect(batches[0]).toBe(50);   // a batch may commit a prefix; the next one resumes after it
+  expect(Object.keys(senders[0]!.data as object).sort()).toEqual(["error", "heldCount", "messageId", "messageIds", "reason", "rootId", "sentAt"]);
+});
+
+it("alarms each sender once for all its held messages: 120 held from 3 senders is 3 sender alarms", async () => {
+  const { mesh } = setup();
+  const held = Array.from({ length: 120 }, (_, index) => ({ id: `m${index}`, from: `session:sender${index % 3}`, sentAt: index }));
+  await providerDeadAlarms(mesh, A, A.id, { error: "unclassified", kind: "unclassified", failures: 3,
+    since: "2026-10-11T11:00:00.000Z", cause: "unclassified-repeated", held });
+  const age = mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm");
+  const senders = age.filter(alarm => alarm.to !== A.id);
+  expect(senders.map(alarm => alarm.to).sort()).toEqual(["session:sender0", "session:sender1", "session:sender2"]);
+  const second = senders.find(alarm => alarm.to === "session:sender1")!;
+  expect(second).toMatchObject({ dedupeKey: "inbox-age:m1:session:sender1",
+    text: `40 undelivered Main messages to ${A.id}, first m1: provider-dead (unclassified)`, data: { messageId: "m1", heldCount: 40 } });
+  expect((second.data as { messageIds: string[] }).messageIds).toEqual(held.filter(item => item.from === "session:sender1").map(item => item.id));
+  expect(age.filter(alarm => alarm.to === A.id)).toHaveLength(1);   // the Main's own owner address, once
+  // The later age pass reuses the first held message's key, so it never repeats this alarm.
+  await mesh.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: A, to: "session:sender1", dedupeKey: "inbox-age:m1:session:sender1", data: {} });
+  expect(mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm")).toHaveLength(4);
+});
+
+// PR #841 security review P1: alarm data is an allowlist; provider text never rides along.
+it("publishes only allowlisted provider-dead fields, and labels an unclassified incident", async () => {
+  const { mesh } = setup();
+  const leaky = { kind: "unclassified" as const, error: "unclassified", failures: 3, since: "2026-10-11T09:00:00.000Z",
+    cause: "unclassified-repeated", held: [{ id: "m2", from: "session:lead", sentAt: 2 }],
+    message: "SECRET provider echo", detail: "SECRET compaction text", errorMessage: "SECRET raw" };
+  await providerDeadAlarms(mesh, A, A.id, leaky);
+  const alarms = mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
+  expect(JSON.stringify(alarms)).not.toContain("SECRET");
+  const dead = alarms.find(alarm => alarm.kind === "fabric.main.provider-dead")!;
+  expect(dead.text).toBe(`Main ${A.id} provider-dead (unclassified): unclassified-repeated; 1 held message(s) unread`);
+  expect(Object.keys(dead.data as object).sort()).toEqual(["cause", "error", "failures", "held", "heldCount", "kind", "rootId", "since"]);
+  expect(alarms.find(alarm => alarm.kind === "inbox.age.alarm" && alarm.to === "session:lead")!.text)
+    .toBe(`Undelivered Main message m2 to ${A.id}: provider-dead (unclassified)`);
 });

@@ -34,6 +34,8 @@ export interface SessionReceiptManager {
 }
 
 type ReceiptMatcher = (line: string) => boolean;
+type ReceiptProjector = (entry: unknown) => unknown;
+const identityReceipt: ReceiptProjector = (entry) => entry;
 export interface SessionReceiptSnapshot {
   count: number;
   entries: ReadonlyMap<number, unknown>;
@@ -41,6 +43,7 @@ export interface SessionReceiptSnapshot {
 interface ReceiptCache extends SessionReceiptSnapshot {
   file: string;
   matches: ReceiptMatcher;
+  project: ReceiptProjector;
   stat: fs.Stats;
   /** Confirmed complete-line offset; stat.size also includes the unconfirmed carry. */
   offset: number;
@@ -74,10 +77,11 @@ const tailMatches = (fd: number, offset: number, tail: Buffer): boolean => {
 export const confirmedSessionReceiptSnapshot = (
   manager: SessionReceiptManager,
   matches: ReceiptMatcher,
+  project: ReceiptProjector = identityReceipt,
 ): SessionReceiptSnapshot => {
   const memory = (): SessionReceiptSnapshot => {
     const entries = manager.getEntries();
-    return { count: entries.length, entries: new Map(entries.map((entry, index) => [index, entry])) };
+    return { count: entries.length, entries: new Map(entries.map((entry, index) => [index, project(entry)])) };
   };
   const empty = (): SessionReceiptSnapshot => ({ count: 0, entries: new Map() });
   if (manager.isPersisted?.() === false) return memory();
@@ -87,7 +91,7 @@ export const confirmedSessionReceiptSnapshot = (
   try {
     const found = withConfirmedSessionFile(file, (fd, stat) => {
       let previous = receiptCaches.get(manager);
-      if (previous?.file !== file || previous.matches !== matches ||
+      if (previous?.file !== file || previous.matches !== matches || previous.project !== project ||
           previous.stat.dev !== stat.dev || previous.stat.ino !== stat.ino || stat.size < previous.stat.size) {
         previous = undefined;
       }
@@ -124,7 +128,11 @@ export const confirmedSessionReceiptSnapshot = (
           // Count every complete line, including malformed and unrelated entries.
           const index = count++;
           if (matches(line)) {
-            try { entries.set(index, JSON.parse(line)); } catch { /* Malformed entries are not receipts. */ }
+            let entry: unknown, parsed = false;
+            try { entry = JSON.parse(line); parsed = true; } catch { /* Malformed entries are not receipts. */ }
+            // Keep only the consumer's receipt fields, not another complete
+            // copy of every delivered body. Projection errors fail confirmation.
+            if (parsed) entries.set(index, project(entry));
           }
           offset = position + start;
         }
@@ -135,7 +143,7 @@ export const confirmedSessionReceiptSnapshot = (
         if (start < length) carry.push(Buffer.from(view.subarray(start)));
       }
       snapshot = { count, entries };
-      receiptCaches.set(manager, { file, matches, stat, offset, count, entries, carry, tail,
+      receiptCaches.set(manager, { file, matches, project, stat, offset, count, entries, carry, tail,
         partialTail: endTail });
     });
     if (!found) receiptCaches.delete(manager);

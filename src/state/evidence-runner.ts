@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { terminateWindowsTree } from "../child-process-tree.js";
@@ -129,6 +130,7 @@ export const runCommand = (
     try {
       child = spawn(command, {
         shell: true,
+        env: childProcessEnvironment(),
         cwd: options.cwd,
         detached: process.platform !== "win32",
         windowsHide: true,

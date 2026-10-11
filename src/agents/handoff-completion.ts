@@ -24,7 +24,11 @@ export const queueHandoffCompletion = (
     const implementation = typeof result.implementation === "string"
       ? result.implementation
       : JSON.stringify(result.implementation) ?? "";
-    const report = [implementation, typeof result.error === "string" ? `Error: ${result.error}` : ""]
+    const output = status !== "completed" && typeof result.partialText === "string"
+      ? `Partial output (not a completed report):\n${result.partialText}` : implementation;
+    const warnings = Array.isArray(result.warnings)
+      ? result.warnings.filter((warning): warning is string => typeof warning === "string").map(warning => `[pi-fabric warning] ${warning}`) : [];
+    const report = [output, typeof result.error === "string" ? `Error: ${result.error}` : "", ...warnings]
       .filter(Boolean).join("\n\n") || "No conclusion returned by the executor.";
     const heading = truncateMiddle(`Fabric handoff: ${name}${agent?.id ? ` (${agent.id})` : ""} · ${model} · ${status}`, 1000);
     const summary = report.length > 8000

@@ -4,10 +4,78 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { canRemoveTerminalRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
+
+export const RESIDENT_RUN_RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** Called under the host fence: by the mesh-wide sweep (storage/retention-cli.ts) for a resident root whose
+ * host is proven dead and flock-fenced. Every existing run is then untracked. The reference snapshot
+ * only skips early; each delete and compaction re-reads every registry uncached (pi-fabric#645 review
+ * round 2). `requireRegistries`: a vanished root or actors.json is a veto, not an empty registry.
+ * `dryRun`: the same selection and fences, with no removal or compaction; the returned runs are the
+ * ones an apply would delete (pi-fabric#645 review round 3). `measure` sizes a candidate before its final
+ * check, `isRetained` is a further veto of that check, and the check and delete run back to back through
+ * `removeUnreferencedRun`; `onRemove` is called after a run is removed (or, in a dry run, would be) with its
+ * measured bytes (pi-fabric#645 review round 4). */
+export const sweepResidentRuns = (
+  runsRoot: string, now = Date.now(), budgetMs = 100,
+  options: TerminalRunEventsRetention & { actorRoots?: readonly string[]; retainRuns?: boolean; retentionMs?: number; requireRegistries?: boolean;
+    dryRun?: boolean; measure?: (run: string) => number; isRetained?: (runId: string) => boolean;
+    /** Mesh-wide sweep only (smarty-dev#3252): accept a checked PID-reuse proof; default keeps the strict live-PID veto. */
+    acceptPidReuse?: boolean;
+    /** The mesh sweep's registry snapshot, parsed once per sweep (smarty-dev#7916); replaces the per-run re-parse. */
+    references?: RegistryReferences;
+    onRemove?: (run: string, bytes: number) => void;
+    onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
+): string[] => {
+  const removed: string[] = [];
+  if (!ownedStat(runsRoot)?.isDirectory()) return removed;
+  const started = performance.now();
+  const expired = () => performance.now() - started >= budgetMs;
+  const actorRoots = options.actorRoots ?? [];
+  const registryOptions = options.requireRegistries ? { requireRegistries: true } : {};
+  const references = options.references;
+  const retained = references ? references.snapshot() : retainedActorRunIds(actorRoots, registryOptions);
+  if (retained.has("*")) return removed;
+  const referencedNow = (id: string): boolean => {
+    if (!references) return actorRunReferencedNow(actorRoots, id, registryOptions) || !!options.isRetained?.(id);
+    // The caller's veto first: it may add registry roots that references.fresh() must then read.
+    if (options.isRetained?.(id)) return true;
+    const current = references.fresh();
+    return current.has("*") || current.has(id);
+  };
+  let directory: fs.Dir;
+  try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
+  try {
+    let entry: fs.Dirent | null;
+    while (!expired() && (entry = directory.readSync())) {
+      if (!entry.isDirectory() || retained.has(entry.name)) continue;
+      const run = path.join(runsRoot, entry.name);
+      const stat = ownedStat(run);
+      if (!stat?.isDirectory()) continue;
+      if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
+          !runTreeExitVeto(run, 0, expired, true, options.acceptPidReuse === true) &&
+          canRemoveTerminalRun(run, expired, options.acceptPidReuse === true) &&
+          hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
+        // A referenced candidate is kept as is; compaction would veto it on the same reference.
+        const name = entry.name, bytes = options.measure?.(run) ?? 0;
+        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes)) { removed.push(run); options.onRemove?.(run, bytes); }
+      } else {
+        compactTerminalRunEvents(run, {
+          ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
+          ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
+          ...(options.dryRun ? { dryRun: true } : {}), ...(options.onCompact ? { onCompact: options.onCompact } : {}),
+          now, expired, isRetained: () => referencedNow(path.basename(run)) });
+      }
+    }
+  } finally { directory.closeSync(); }
+  return removed;
+};
+
 
 const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
@@ -21,6 +89,23 @@ const readOwned = <T>(file: string): T | undefined => {
   const stat = ownedStat(file);
   if (!stat?.isFile() || stat.size > 1024 * 1024) throw new Error("Unsafe residency retention entry");
   return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+};
+/** readOwned through ONE descriptor, with that descriptor's fstat: the value judged and the stat later handed to
+ * verifiedRemove describe the same inode (pi-fabric#850 round 1 SEC P1). Absent: undefined; unsafe: throws. */
+const readJudged = <T>(file: string): { value: T; stat: fs.Stats } | undefined => {
+  let fd: number;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error("Unsafe residency retention entry");
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1 || (process.getuid && stat.uid !== process.getuid()) || stat.size > 1024 * 1024) {
+      throw new Error("Unsafe residency retention entry");
+    }
+    return { value: JSON.parse(fs.readFileSync(fd, "utf8")) as T, stat };
+  } finally { fs.closeSync(fd); }
 };
 // Cache only a stable, owned registry generation. Include roots and missing files
 // so creation, removal, atomic replacement and in-place writes invalidate it.
@@ -175,7 +260,8 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
+            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
+            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -277,7 +363,8 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
+            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
+            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,
@@ -319,6 +406,12 @@ export class ResidentRequestRetention {
 
   #collect(id: string, ack: ResidentResponseAcknowledgement, liveIds: ReadonlySet<string>, stoppedWritersGone: ReadonlySet<string>): boolean {
     const generation = residentRequestGeneration(id)!;
+    // pi-fabric#850 round 1 SEC P1: the acknowledgement removed is the one judged. One descriptor gives both its stat
+    // and its bytes, and those bytes must equal the judged acknowledgement; a swapped-in newer one keeps everything.
+    const ackPath = path.join(this.root, "acknowledgements", `${id}.json`);
+    const ackRead = readJudged<ResidentResponseAcknowledgement>(ackPath);
+    if (ackRead && JSON.stringify(ackRead.value) !== JSON.stringify(ack)) return false;
+    const ackStat = ackRead?.stat;
     if (generation >= this.#expiredBefore || this.#now - Math.max(ack.completedAt, ack.acknowledgedAt) <= RESIDENT_REQUEST_RETENTION_MS) return false;
     // An unreadable/symlinked exchange directory is a possible pending reference.
     for (const kind of ["requests", "processing"]) {
@@ -330,7 +423,8 @@ export class ResidentRequestRetention {
       if (!absent(dir) && !ownedStat(dir)?.isDirectory()) throw new Error("Unsafe residency reference directory");
     }
     const decisionPath = path.join(this.root, "decisions", `${id}.json`);
-    const decisionValue = readOwned<unknown>(decisionPath);
+    const decisionRead = readJudged<unknown>(decisionPath);
+    const decisionStat = decisionRead?.stat, decisionValue = decisionRead?.value;
     const decision = decisionValue === undefined ? undefined : readResidentRequestDecision(this.root, id);
     if (decision && decision.requestFormat !== 3) throw new Error("Legacy decision is not collectable");
     if (decision?.state === "committed" && !/^[A-Za-z0-9_-]+$/.test(decision.id!)) throw new Error("Invalid resident entity ID");
@@ -372,13 +466,17 @@ export class ResidentRequestRetention {
       }
     }
     const responsePath = path.join(this.root, "responses", `${id}.json`);
-    const response = readOwned<ResidentCommandResponse>(responsePath);
+    const responseRead = readJudged<ResidentCommandResponse>(responsePath);
+    const responseStat = responseRead?.stat, response = responseRead?.value;
     if (response !== undefined && (!validResponse(response, id) || response.completedAt !== ack.completedAt || response.pending !== ack.pending)) throw new Error("Unacknowledged or invalid response");
     // The durable watermark was published first. Partial deletion or a crash is
     // safe: any replay is now expired, even if its createdAt is rewritten.
-    fs.rmSync(responsePath, { force: true });
-    fs.rmSync(decisionPath, { force: true });
-    fs.rmSync(path.join(this.root, "acknowledgements", `${id}.json`), { force: true });
+    // smarty-dev#7916: each file judged above (its owned stat) is the only inode removed; off Linux main's
+    // removal. Absent at judgment: nothing to remove. A refusal stops here; the next scan retries.
+    for (const [file, stat] of [[responsePath, responseStat], [decisionPath, decisionStat], [ackPath, ackStat]] as const) {
+      if (!stat && absent(file)) continue; // no owned stat but present: refused on Linux, main's removal elsewhere
+      if (!verifiedRemove(file, stat, { deleter: "residentRequestCollect", fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) return false;
+    }
     return true;
   }
 }

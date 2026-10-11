@@ -242,10 +242,14 @@ for (const durable of [false, true]) describe.skipIf(process.platform !== "linux
         let outsideOpened = false;
         const outsideStat = realStat(path.join(outside, "role.md"));
         const opened: number[] = [];
+        const resolverHandles = new Set<number>();
         const realClose = fs.closeSync;
         const closed: number[] = [];
         const closeSpy = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
-          closed.push(fd); return realClose(fd);
+          // Lease-gate identity reads may open and close unrelated files while the
+          // provider awaits admission. Only the resolver's pinned walk is LIFO.
+          if (resolverHandles.delete(fd)) closed.push(fd);
+          return realClose(fd);
         });
         // Inject after realpath/containment, before the expected stat and open.
         // Both pathname operations in the old resolver see the outside inode.
@@ -258,7 +262,9 @@ for (const durable of [false, true]) describe.skipIf(process.platform !== "linux
         }) as typeof fs.statSync);
         openSpy = vi.spyOn(fs, "openSync").mockImplementation((target, flags, mode) => {
           const fd = realOpen(target, flags, mode);
-          opened.push(fd);
+          if (String(target) === state.allowed || String(target) === file || String(target).startsWith("/proc/self/fd/")) {
+            opened.push(fd); resolverHandles.add(fd);
+          }
           const openedStat = fs.fstatSync(fd);
           if (openedStat.dev === outsideStat.dev && openedStat.ino === outsideStat.ino) {
             outsideOpened = true;
@@ -279,6 +285,7 @@ for (const durable of [false, true]) describe.skipIf(process.platform !== "linux
           expect(outsideOpened, operation).toBe(false);
           expect(opened.length, operation).toBeGreaterThan(0);
           expect(closed, operation).toEqual([...opened].reverse());
+          expect(resolverHandles.size, operation).toBe(0);
           closeSpy.mockRestore();
           expect(state.owner.status(actor.id), operation).toEqual(before);
           expect(state.owner.instructions(actor.id), operation).toBe(text);

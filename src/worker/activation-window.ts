@@ -3,7 +3,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import * as nodeModule from "node:module";
 import { getCurrentSystemMessage, type Provider, type ProviderRequestOptions } from "@earendil-works/pi-ai";
-import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm, getPackageDir, sessionEntryToContextMessages, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 type AgentMessage = ReturnType<typeof buildSessionContext>["messages"][number];
 
 const isSystem = (message: AgentMessage): boolean => (message as { role?: string }).role === "system";
@@ -166,7 +166,17 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     // a later provider registration cannot replace the dispatch being admitted.
     // Reinstall per request so refresh/registration during a transform is covered.
     // No private host fields, alternate AI runtime, auth or provider composition.
-    const guarded = new WeakSet<Provider>();
+    const guarded = new Map<Provider, () => void>();
+    let contextNow: ExtensionContext | undefined;
+    const lifetime = new AbortController();
+    pi.on("session_shutdown", () => {
+      // ModelRuntime survives native reload; its providers must not retain this
+      // generation's stream closures or guarded ctx (#5962).
+      lifetime.abort(new Error("Fabric activation window session closed"));
+      contextNow = undefined;
+      for (const restore of guarded.values()) restore();
+      guarded.clear();
+    });
     let lastPayload: { tokens: number; contextWindow: number; overheadTokens: number } | undefined;
     pi.on("turn_end", async event => {
       try {
@@ -196,6 +206,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
       }
     });
     pi.on("before_provider_headers", (_event, ctx) => {
+      contextNow = ctx;
       try {
         if (!window || !ctx.model) throw new Error("Activation window is not initialized");
         // A context transform may select a different session model after Pi
@@ -205,10 +216,11 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         const providers = new Set(ctx.modelRegistry.getAll().map(model => model.provider));
         providers.add(ctx.model.provider);
         const verify = (context: Parameters<Provider["streamSimple"]>[1]): void => {
+          lifetime.signal.throwIfAborted();
           try {
             // Compaction checkpoints replay a single system head; audit the raw
             // append-only system records, not that compacted projection.
-            window!.verifySystem(ctx.sessionManager.getBranch().flatMap(entry =>
+            window!.verifySystem(contextNow!.sessionManager.getBranch().flatMap(entry =>
               entry.type === "message" ? sessionEntryToContextMessages(entry) : []), context.messages);
           } catch (error) {
             failClosed(error);
@@ -219,7 +231,9 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
           context: Parameters<Provider["streamSimple"]>[1],
         ): NonNullable<ProviderRequestOptions["onPayload"]> => async (payload, requestModel) => {
           try {
+            lifetime.signal.throwIfAborted();
             const replacement = await options?.onPayload?.(payload, requestModel);
+            lifetime.signal.throwIfAborted();
             // Undefined retains the input, including any in-place mutations.
             const final = replacement === undefined ? payload : replacement;
             if (!final || typeof final !== "object" || Array.isArray(final)) {
@@ -295,6 +309,9 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             }
             return admitted;
           } catch (error) {
+            // A late request callback belongs to the canceled generation, not
+            // an invalid activation in the replacement worker. Do not exit it.
+            if (lifetime.signal.aborted) throw lifetime.signal.reason;
             return failClosed(error);
           }
         };
@@ -306,18 +323,24 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
           if (guarded.has(provider)) continue;
           const stream = provider.stream;
           const streamSimple = provider.streamSimple;
-          provider.stream = (model, context, options) => {
+          const wrappedStream: Provider["stream"] = (model, context, options) => {
             verify(context);
             // Preserve the API-specific conditional options type while copying it.
             const guardedOptions = { ...options } as NonNullable<typeof options>;
             guardedOptions.onPayload = guardPayload(model, options, context);
             return stream.call(provider, model, context, guardedOptions);
           };
-          provider.streamSimple = (model, context, options) => {
+          const wrappedStreamSimple: Provider["streamSimple"] = (model, context, options) => {
             verify(context);
             return streamSimple.call(provider, model, context, { ...options, onPayload: guardPayload(model, options, context) });
           };
-          guarded.add(provider);
+          provider.stream = wrappedStream;
+          provider.streamSimple = wrappedStreamSimple;
+          guarded.set(provider, () => {
+            // Do not undo a later extension's replacement of the provider.
+            if (provider.stream === wrappedStream) provider.stream = stream;
+            if (provider.streamSimple === wrappedStreamSimple) provider.streamSimple = streamSimple;
+          });
         }
       } catch (error) {
         failClosed(error);

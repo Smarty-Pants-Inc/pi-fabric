@@ -1,6 +1,10 @@
 import fs from "node:fs";
+import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
+export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
+import { normalizeWakeTextConfig, type FabricWakeTextConfig } from "./actors/wake-text.js";
 import type { LandlockSettings } from "./core/landlock.js";
 import { DEFAULT_JEV_CONFIG, normalizeJevConfig, type FabricJevConfig } from "./jev/config.js";
 import { DEFAULT_RECORDS_CONFIG, normalizeRecordsConfig, type FabricRecordsConfig } from "./records/config.js";
@@ -21,6 +25,7 @@ import type { FabricComponentEntry } from "./components/types.js";
 import type { FabricRisk } from "./protocol.js";
 import type { FabricKernel } from "./runtime/kernel.js";
 import { DEFAULT_FABRIC_THINKING, isFabricThinking, type FabricThinking } from "./thinking.js";
+import { MESH_STATE_BACKEND_KIND_LIST, MESH_STATE_BACKEND_KINDS, type MeshStateBackendKind } from "./mesh/state-backend-kinds.js";
 import {
   defaultCodePreviewSettings,
   normalizeCodePreviewSettings,
@@ -169,19 +174,22 @@ interface FabricPrewalkConfig {
 }
 
 export interface FabricAgentConfig {
+  /** Optional host-only external spawn/actor model router; off unless enabled. */
+  router?: FabricAgentRouterConfig;
   /** Opt-in shadow routing pins and finite candidates, never live routing. */
   modelRouting?: ModelRoutingConfig;
   enabled: boolean;
   runner: FabricAgentRunner;
   transport: FabricAgentTransport;
-  /** Host-only Linux user scope slice; unset launches workers directly. */
+  /** Root-policy Linux user scope slice; agent-dir values cannot relax this. */
   processSlice?: string;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
-  /** Host-only fleet policy; workspace configuration cannot override these keys. */
+  /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
-  /** Host-only explicit-selection exception policy; [] disables the reason gate. */
+  /** Root/default reason baseline unioned with agent-dir additions; only root may relax. */
   modelPolicy: { requireReason: string[] };
   deniedModelReplacement?: string;
   /** Host-only file instructions root. Unset = ~/.local/share/smarty-dev/factory/current/. */
@@ -189,6 +197,8 @@ export interface FabricAgentConfig {
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
+  /** Configured effort only; excludes the built-in thinking fallback. */
+  configuredThinking?: FabricThinking | undefined;
   maxConcurrent: number;
   maxPerExecution: number;
   maxDepth: number;
@@ -205,6 +215,8 @@ export interface FabricAgentConfig {
   sessionExportDir: string;
   /** Unix niceness 0-19 for every child agent; 0 leaves priority unchanged. */
   nice: number;
+  /** Host-only, default off: hydrate projected GitHub webhook text from the local ingress receipt (smarty-dev#6144). */
+  wakeText?: FabricWakeTextConfig;
   /** Host-only: skip durable-actor activations whose owning root is dead (smarty-dev#6062). */
   deadRootFilter: FabricDeadRootFilterConfig;
 }
@@ -341,6 +353,11 @@ export interface FabricRetentionConfig {
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
   maxSessionBytes: number;
+  /** How long a transient activation block (provider stream error, timeout, preparation or lock
+   * timeout) gates routing before the actor gets a probe run (default 10 min; smarty-dev#6509). */
+  transientBlockCooldownMs?: number;
+  /** Cap of the doubling backoff after failed probes (default 60 min). */
+  transientBlockMaxMs?: number;
 }
 
 export type MeshLockProtocol = 1 | 2;
@@ -351,9 +368,39 @@ const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   throw new Error("mesh.lockProtocol must be 1 or 2");
 };
 
+/** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
+export type MeshStateBackend = MeshStateBackendKind;
+
+// The import-free kinds leaf on purpose: importing state-backend.ts here would put SQLite in the config graph.
+const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = MESH_STATE_BACKEND_KINDS;
+const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
+  // The environment overrides the file setting. An unknown non-empty value is refused, never ignored:
+  // a typo would silently open a different store than its peers and split the mesh (pi-fabric#796).
+  const override = env?.trim().toLowerCase();
+  if (override) {
+    if ((MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+    throw new Error(`PI_FABRIC_MESH_STATE_BACKEND must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
+  }
+  if (value === undefined) return "file";
+  if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
+  throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
+};
+
+/** Host rollout policy for controls whose sender omits the destination epoch. */
+export type MeshControlIncarnationFence = "warn" | "enforce";
+const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFence => {
+  if (value === undefined) return "warn";
+  if (value === "warn" || value === "enforce") return value;
+  throw new Error("mesh.controlIncarnationFence must be warn or enforce");
+};
+
 export interface FabricMeshConfig {
+  /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
+  controlIncarnationFence: MeshControlIncarnationFence;
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
+  /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
+  stateBackend: MeshStateBackend;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -617,9 +664,13 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
+    transientBlockCooldownMs: 10 * 60_000,
+    transientBlockMaxMs: 60 * 60_000,
   },
   mesh: {
+    controlIncarnationFence: "warn",
     lockProtocol: 1,
+    stateBackend: "file",
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -847,7 +898,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const cpython = objectValue(executor.cpython);
   const landlock = objectValue(executor.landlock);
   if (landlock.mode !== undefined && landlock.mode !== "off" && landlock.mode !== "enforce") {
-    throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
+    throw new Error("executor.landlock.mode must be off or enforce. Landlock has no honest warn/audit mode on kernel 6.8; use a one-lane enforce trial with root-granted, logged PI_FABRIC_LANDLOCK_ESCAPE=1 commands.");
   }
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
   const executorMaxTimeoutMs = boundedInteger(
@@ -921,6 +972,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const prewalkModel = stringValue(prewalk.model);
   const prewalkThinking = isFabricThinking(prewalk.thinking) ? prewalk.thinking : undefined;
   const agentModel = stringValue(agents.model);
+  const wakeText = normalizeWakeTextConfig(agents.wakeText);
+  const router = normalizeAgentRouterConfig(agents.router);
   const deniedModelReplacement = stringValue(agents.deniedModelReplacement)?.trim();
   const claudeBinary = stringValue(claude.binary);
   const claudeModel = stringValue(claude.model);
@@ -1031,6 +1084,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       landlock: {
         mode: landlock.mode === "enforce" ? "enforce" : "off",
         disabled: landlock.disabled === true,
+        ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
@@ -1148,6 +1202,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(typeof agents.processSlice === "string" && /^[a-zA-Z0-9_.-]+\.slice$/.test(agents.processSlice)
         ? { processSlice: agents.processSlice } : {}),
       ...(placement ? { placement } : {}),
+      ...(router ? { router } : {}),
       ...(agentModel ? { model: agentModel } : {}),
       ...(typeof agents.modelRouting === "object" && agents.modelRouting !== null && !Array.isArray(agents.modelRouting)
         ? { modelRouting: (() => {
@@ -1206,6 +1261,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         persona: vedaPersona ?? DEFAULT_FABRIC_CONFIG.agents.veda.persona,
       },
       thinking: agentThinking,
+      // Idempotent: a normalized config carries the key (possibly undefined), so re-normalizing keeps it
+      // instead of promoting the filled-in thinking fallback to a configured value.
+      configuredThinking: Object.hasOwn(agents, "configuredThinking")
+        ? (isFabricThinking(agents.configuredThinking) ? agents.configuredThinking : undefined)
+        : (isFabricThinking(agents.thinking) ? agents.thinking : undefined),
       maxConcurrent: boundedInteger(
         agents.maxConcurrent,
         DEFAULT_FABRIC_CONFIG.agents.maxConcurrent,
@@ -1260,6 +1320,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       nice: boundedInteger(agents.nice, DEFAULT_FABRIC_CONFIG.agents.nice, 0, 19),
       deadRootFilter: normalizeDeadRootFilterConfig(agents.deadRootFilter),
       ...(stringValue(agents.instructionsRoot)?.trim() ? { instructionsRoot: stringValue(agents.instructionsRoot)!.trim() } : {}),
+      ...(wakeText ? { wakeText } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     records: normalizeRecordsConfig(input.records),
@@ -1362,9 +1423,23 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         Number.MAX_SAFE_INTEGER,
       ),
+      transientBlockCooldownMs: boundedInteger(
+        actors.transientBlockCooldownMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockCooldownMs!,
+        1_000,
+        24 * 60 * 60_000,
+      ),
+      transientBlockMaxMs: boundedInteger(
+        actors.transientBlockMaxMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockMaxMs!,
+        1_000,
+        7 * 24 * 60 * 60_000,
+      ),
     },
     mesh: {
+      controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
+      stateBackend: meshStateBackend(mesh.stateBackend),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),
@@ -1698,6 +1773,19 @@ export const writeJsonAtomic = (
   }
 };
 
+// Missing policy preserves rollout defaults; damaged/unprovable policy must fail closed.
+const hostLandlockBaseline = (policy: HostPolicy): LandlockSettings => {
+  const defaults = DEFAULT_FABRIC_CONFIG.executor.landlock;
+  if (policy.status === "missing") return { ...defaults };
+  if (policy.status === "invalid") return { mode: "enforce", disabled: false };
+  const landlock = objectValue(objectValue(policy.document.executor).landlock);
+  return {
+    mode: landlock.mode === "off" || landlock.mode === "enforce" ? landlock.mode : defaults.mode,
+    disabled: typeof landlock.disabled === "boolean" ? landlock.disabled : defaults.disabled,
+    ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
+  };
+};
+
 const resolveFabricConfig = (
   options: {
     cwd: string;
@@ -1707,6 +1795,24 @@ const resolveFabricConfig = (
   applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
+  // Normalize supplies the fallback; retain whether a persisted layer sets effort.
+  delete objectValue(merged.agents).thinking;
+  const policy = readHostPolicy();
+  const rootPolicyValid = policy.status === "valid";
+  // Invalid/unprovable policy must tighten even when there is no writable config.
+  merged = mergeObjects(merged, { executor: { landlock: hostLandlockBaseline(policy) } });
+  if (rootPolicyValid) {
+    // Whitelist authority keys: root policy is not a third general settings layer.
+    const agents = objectValue(policy.document.agents);
+    const requireReason = objectValue(agents.modelPolicy).requireReason;
+    merged = mergeObjects(merged, {
+      agents: {
+        ...(Object.hasOwn(agents, "processSlice") ? { processSlice: agents.processSlice } : {}),
+        ...(Array.isArray(agents.deniedModels) ? { deniedModels: agents.deniedModels } : {}),
+        ...(Array.isArray(requireReason) ? { modelPolicy: { requireReason } } : {}),
+      },
+    });
+  }
   const hostPlan = planConfigFile(path.join(options.agentDir, "fabric.json"));
   const projectPlan = includeProject ? planConfigFile(path.join(options.cwd, ".pi", "fabric.json")) : undefined;
   for (const plan of [hostPlan, projectPlan]) {
@@ -1719,19 +1825,52 @@ const resolveFabricConfig = (
     if (ui.principalView === undefined && ui.incomingMessages !== undefined) {
       document.ui = { ...ui, principalView: principalViewModeValue(ui) };
     }
+    if (plan === hostPlan) {
+      const executor = { ...objectValue(document.executor) };
+      const landlock = { ...objectValue(executor.landlock) };
+      if (landlock.disabled === true && rootPolicyValid) warnAgentLandlockDisabled();
+      // Agent settings may only tighten the root/default baseline. Ignore
+      // off/unknown modes even when no root policy is provisioned.
+      if (landlock.mode !== "enforce") delete landlock.mode;
+      delete landlock.disabled;
+      delete landlock.allowEscape;
+      executor.landlock = landlock;
+      document.executor = executor;
+      const agents = { ...objectValue(document.agents) };
+      delete agents.processSlice;
+      const inheritedAgents = objectValue(merged.agents);
+      // Agent-writable lists can add restrictions, never remove a root/default gate.
+      const union = (base: unknown, extra: unknown): unknown[] => [
+        ...(Array.isArray(base) ? base : []), ...(Array.isArray(extra) ? extra : []),
+      ];
+      agents.deniedModels = union(inheritedAgents.deniedModels, agents.deniedModels);
+      agents.modelPolicy = {
+        ...objectValue(agents.modelPolicy),
+        requireReason: union(objectValue(inheritedAgents.modelPolicy).requireReason,
+          objectValue(agents.modelPolicy).requireReason),
+      };
+      document.agents = agents;
+    }
     if (plan === projectPlan) {
       const agents = { ...objectValue(document.agents) };
+      delete agents.router; // Host-only argv execution and task disclosure policy.
       delete agents.modelPolicy;
       delete agents.deniedModels;
       delete agents.deniedModelReplacement;
       delete agents.instructionsRoot;
+      delete agents.wakeText;
       delete agents.processSlice;
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
+      const mesh = { ...objectValue(document.mesh) };
+      delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
+      document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
       delete landlock.disabled; // Host-only fleet kill switch wins over lane config.
+      delete landlock.allowEscape; // Only root policy can grant a per-command escape.
+      if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
       document.executor = executor;
     }
@@ -1793,26 +1932,20 @@ export const loadFabricConfig = (options: {
 // The global configuration plus environment overrides, readable at extension load before a
 // session context exists (smarty-dev#459). Project configuration needs the trust decision
 // that only bootstrap has, so it is left out here.
-/**
- * Host-only Landlock kill switch, read from the global fabric.json on every
- * call so already-running lanes observe a fleet-wide flip without a reload.
- * Unreadable/malformed host files keep the session's loaded value.
- */
-export const readHostLandlockDisabled = (agentDir: string): boolean | undefined => {
-  try {
-    const document: unknown = JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"));
-    const disabled = objectValue(objectValue(objectValue(document).executor).landlock).disabled;
-    return typeof disabled === "boolean" ? disabled : false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : undefined;
-  }
-};
+/** Live root-owned kill switch. No valid policy fails closed. */
+export const readHostLandlockDisabled = (_agentDir: string): boolean =>
+  hostLandlockBaseline(readHostPolicy()).disabled;
 
-/** Session settings with the live host kill switch applied (F2: no cached value). */
-export const liveLandlockSettings = (settings: LandlockSettings, agentDir: string): LandlockSettings => {
-  if (settings.mode !== "enforce") return settings;
-  const disabled = readHostLandlockDisabled(agentDir);
-  return disabled === undefined ? settings : { mode: settings.mode, disabled };
+/** Session settings with live root-only grants applied (F2: no cached value). */
+export const liveLandlockSettings = (settings: LandlockSettings, _agentDir: string): LandlockSettings => {
+  const baseline = hostLandlockBaseline(readHostPolicy());
+  return {
+    // Preserve session tightening and honor live enforcement. Only genuinely
+    // missing policy uses the product default; unprovable policy enforces.
+    mode: settings.mode === "enforce" ? "enforce" : baseline.mode,
+    disabled: baseline.disabled,
+    ...(baseline.allowEscape === true ? { allowEscape: true } : {}),
+  };
 };
 
 export const loadGlobalFabricConfig = (agentDir: string): FabricConfig =>

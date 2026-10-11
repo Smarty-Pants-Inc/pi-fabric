@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
+import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
@@ -45,6 +46,14 @@ catch (error) {
       expect(result.error).toBeUndefined();
       expect(result.value).toEqual({ name: error.name, code: error.code, extra: "undefined" });
     });
+
+  it("preserves the vetted stale owner-incarnation refusal from a fenced control command", async () => {
+    const error = Object.assign(new FabricControlStaleIncarnationError("session:target"), { secret: "host-only" });
+    const result = await new QuickJsRuntime().execute('try { await agents.followUp({ id: "session:target", message: "hello" }); } catch (error) { return { name: error.name, code: error.code, message: error.message, extra: typeof error.secret, targetId: typeof error.targetId }; }', async () => { throw error; }, options);
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricControlStaleIncarnationError", code: "FABRIC_CONTROL_STALE_INCARNATION",
+      message: STALE_INCARNATION_ERROR, extra: "undefined", targetId: "undefined" });
+  });
 
   it("preserves a non-lock host Error name without transferring its arbitrary code", async () => {
     const error = Object.assign(new RangeError("bounded"), { code: "PROVIDER_CODE", secret: "not-guest-data" });
@@ -273,6 +282,8 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   });
 
   it.each([
+    ["FABRIC_CONTROL_INCARNATION_REQUIRED", "FabricControlIncarnationRequiredError"],
+    ["FABRIC_CONTROL_STALE_INCARNATION", "FabricControlStaleIncarnationError"],
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],

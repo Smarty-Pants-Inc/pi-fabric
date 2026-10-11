@@ -367,6 +367,11 @@ export class FabricState {
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#current()?.mainOwnsProviderRecovery() ?? false;
+  }
+
   reportMainProviderError(message: string): Promise<unknown> {
     return this.#required().reportMainProviderError(message);
   }

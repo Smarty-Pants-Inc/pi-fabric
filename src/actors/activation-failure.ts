@@ -1,11 +1,12 @@
 /**
- * smarty-dev#8487: which activation failures may stop gating routing on their own.
+ * smarty-dev#8487, smarty-dev#6509: which activation failures may stop gating routing on their own.
  *
  * A block only expires for a clearly transient cause: a provider 5xx or throttling 429,
- * a stream or network disconnect, a timeout, a lost activation window, a child that exited
- * before model admission, or a missing directive reply after one of those. Credential,
- * permission, security-policy, quota, rejected-request (4xx other than 429), context and
- * preparation failures stay blocked, and so does anything not recognised: fail closed.
+ * a stream error or network disconnect, a timeout, a preparation or lock timeout, a lost
+ * activation window, a child that exited before model admission, or a missing directive reply
+ * after one of those. Credential, permission, security-policy, quota, rejected-request (4xx
+ * other than 429), context and other preparation failures (a model not allowed, invalid
+ * instructions) stay blocked, and so does anything not recognised: fail closed.
  * A permanent cause found anywhere wins: every line of the failure text and every recorded
  * worker warning is scanned for one before any transient evidence is considered, so a
  * multiline failure whose last line is a 502 but whose earlier line is a 401 stays blocked.
@@ -17,10 +18,22 @@ export interface ActivationFailureClass {
   classification: string;
 }
 
-/** Codes whose block expires after the bounded backoff; every other code needs a completed run. */
+/** Codes whose block expires after the bounded backoff; every other code needs a completed run.
+ * smarty-dev#6509: a preparation or lock timeout is transient too ("preparation-timeout"). */
 export const TRANSIENT_ACTIVATION_BLOCK_CODES: ReadonlySet<string> = new Set([
-  "provider-transient", "activation-window-lost", "child-exit-before-admission",
+  "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout",
 ]);
+
+/** smarty-dev#6509: a block's class. Derived from its code, never trusted from a stored record:
+ * a transient block expires after its cooldown and gets a probe; a hard block (auth, config, a
+ * model not allowed, invalid instructions, anything unrecognised) stays until a run completes,
+ * the cause is fixed, or the actor is re-created. */
+export type ActivationBlockClass = "transient" | "hard";
+export const activationBlockClass = (code: string): ActivationBlockClass =>
+  TRANSIENT_ACTIVATION_BLOCK_CODES.has(code) ? "transient" : "hard";
+
+/** A deadline that ran out: a preparation, lock or provider timeout. */
+const TIMEOUT = /\btimed out\b|\btimeout\b|\bETIMEDOUT\b|deadline exceeded/i;
 
 type Rule = readonly [code: string, why: string, pattern: RegExp];
 
@@ -47,10 +60,10 @@ const PROVIDER_TRANSIENT: readonly (readonly [why: string, pattern: RegExp])[] =
     String.raw`|currently experiencing high demand|upstream connect error|reset before headers`, "im")],
   ["provider throttling (429)", /\b429\b|too many requests|rate[ _-]?limit(?:ed|_error|_exceeded)?\b|\bthrottl/i],
   ["model stream disconnect",
-    /premature(?:ly)? clos(?:e|ed)|stream[^\n]{0,80}(?:disconnect|clos(?:e|ed)|ended before|ended without|interrupted)|other side closed|socket hang up|socket connection was closed|websocket (?:error|closed)|http2 request did not get a response|(?:^|[:·]\s*)terminated\b/im],
+    /premature(?:ly)? clos(?:e|ed)|stream[^\n]{0,80}(?:disconnect|clos(?:e|ed)|ended before|ended without|interrupted)|\bstream(?:ing)?[ _-]?error\b|other side closed|socket hang up|socket connection was closed|websocket (?:error|closed)|http2 request did not get a response|(?:^|[:·]\s*)terminated\b/im],
   ["network failure",
     /fetch failed|network[ _]?error|connection (?:reset|closed|lost|error|refused)|\bECONNRESET\b|\bECONNREFUSED\b|\bEPIPE\b|\bENETUNREACH\b|\bEHOSTUNREACH\b|\bENOTFOUND\b|\bEAI_AGAIN\b|getaddrinfo/i],
-  ["timeout", /\btimed out\b|\btimeout\b|\bETIMEDOUT\b|deadline exceeded/i],
+  ["timeout", TIMEOUT],
 ];
 
 /** Worker evidence that the run hit a provider or stream error before it ended. */
@@ -107,10 +120,25 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  */
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
+  /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
+  preparationTimeout?: boolean | undefined;
 }): ActivationFailureClass => {
-  if (input.preparation) {
-    return { code: "failing-preparation", transient: false,
-      classification: "permanent: activation preparation kept failing past its retry budget" };
+  if (input.preparation || input.preparationTimeout) {
+    // smarty-dev#6509: a preparation that only ran out of time (its own deadline, a model/auth
+    // launch deadline, a mesh or registry lock wait) is transient; any other preparation failure,
+    // and a timeout with a permanent cause anywhere in its text, stays a hard block.
+    const permanent = permanentAnywhere(input);
+    const timeout = permanent ? undefined
+      : input.preparationTimeout ? "a preparation deadline" : TIMEOUT.exec(withoutModelText(input.lastError))?.[0];
+    if (timeout) {
+      return { code: "preparation-timeout", transient: true,
+        classification: `transient: activation preparation timed out (${input.preparationTimeout ? timeout : `matched ${quote(timeout)}`})` };
+    }
+    if (input.preparation || !permanent) {
+      return { code: "failing-preparation", transient: false,
+        classification: "permanent: activation preparation kept failing past its retry budget" };
+    }
+    return permanent;
   }
   // Permanent causes first, across the whole failure; only then any transient evidence.
   const permanent = permanentAnywhere(input);

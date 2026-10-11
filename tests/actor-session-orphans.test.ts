@@ -361,4 +361,20 @@ describe("foreign session actor registry truth", () => {
     expect(sessionActorRootGone(mesh, lease.id)).toBeUndefined();
     expect(reads).toBe(2);
   });
+
+  it("retires a planted dormant row with a dormant presence after the restart grace instead of discarding it", async () => {
+    const { mesh, identity, store, actor, repair, id } = fixture();
+    store.write([{ ...actor, status: "dormant" }]);
+    await mesh.put({ identity, key: `actors/old/${id}`, value: { id, name: actor.name, rootId: "session:old", status: "dormant" } });
+    // A recent dormant advertisement keeps the restart grace; the row stays as it was.
+    expect(await repair.reconcile()).toBe(0);
+    expect(store.records()[0]).toMatchObject({ id, status: "dormant" });
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now + SESSION_ACTOR_ORPHAN_GRACE_MS + 1_000);
+    expect(await repair.reconcile()).toBe(1);
+    expect(store.records()).toHaveLength(1);
+    expect(store.records()[0]).toMatchObject({ id, status: "stopped", stopReason: "host-exit",
+      lastError: expect.stringContaining("root-gone:"), sessionOrphan: { oldRoot: "session:old" } });
+    expect(alarms(mesh)).toHaveLength(1);
+  });
 });

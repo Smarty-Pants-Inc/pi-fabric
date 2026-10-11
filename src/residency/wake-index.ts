@@ -30,7 +30,9 @@ export const residentOwnerSleeping = (root: string): boolean => {
 export const residentDirectories = (meshRoot: string): string[] => {
   const directory = path.join(meshRoot, "residency");
   try { return fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory())
-    .map(entry => path.join(directory, entry.name)); } catch { return []; }
+    .map(entry => path.join(directory, entry.name)); }
+  // Only a missing directory is empty; EACCES/EIO must fail the commit, never skip its wake record.
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 };
 /** JSON semantics (including omitted undefined fields), with recursively sorted object keys. */
 export const canonicalResidentWakeConfig = (value: unknown): string => {

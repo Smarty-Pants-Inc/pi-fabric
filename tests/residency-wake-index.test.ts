@@ -223,4 +223,24 @@ describe("archive-coupled resident wake retry index", () => {
       expect(read).not.toHaveBeenCalled();
     } finally { vi.restoreAllMocks(); f.mesh.closeState(); fs.rmSync(f.root, { recursive: true, force: true }); }
   });
+
+  it("propagates a non-ENOENT residency directory error so the event is not committed without its wake record", async () => {
+    const f = fixture();
+    const directory = path.join(f.mesh.root, "residency");
+    const readdir = fs.readdirSync;
+    try {
+      await wake.ensureResidentWakeArchive(f.mesh);
+      vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+        if (file === directory) throw Object.assign(new Error(`EACCES: permission denied, scandir '${directory}'`), { code: "EACCES" });
+        return (readdir as (...values: unknown[]) => unknown)(file, ...args);
+      }) as typeof fs.readdirSync);
+      expect(() => index.residentDirectories(f.mesh.root)).toThrow(expect.objectContaining({ code: "EACCES" }));
+      await expect(f.mesh.publish({ topic: "indexed.delivery", from: f.from })).rejects.toMatchObject({ code: "EACCES" });
+      vi.restoreAllMocks();
+      expect(f.mesh.read({ topic: "indexed.delivery", after: 0, limit: 10 })).toHaveLength(0);
+      expect(index.residentUnacknowledgedDeliveries(f.mesh.root).size).toBe(0);
+      // Only a missing residency directory reads as empty.
+      expect(index.residentDirectories(path.join(f.root, "absent-mesh"))).toEqual([]);
+    } finally { vi.restoreAllMocks(); f.mesh.closeState(); fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
 });

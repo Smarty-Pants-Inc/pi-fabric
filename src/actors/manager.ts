@@ -1135,6 +1135,8 @@ export class ActorManager {
   }
 
   #dormantIdleCandidate(actor: ManagedActor, protectedIds: ReadonlySet<string>): boolean {
+    // Session-scoped actors stay idle (pre-#774): their session's orphan scan retires them, never a wake.
+    if (this.#actorScope === "session") return false;
     // An unexpired transient block stays warm until retryAt: only a live host publishes its expiry.
     const transientBlockPending = actor.activationBlocked !== undefined &&
       activationBlockExpiresAt(actor.activationBlocked) !== undefined && !activationBlockExpired(actor.activationBlocked);

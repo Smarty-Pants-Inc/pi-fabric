@@ -405,6 +405,19 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("never makes a session-scoped durable actor dormant; it stays idle as before #774", async () => {
+    const { root, host } = fixture();
+    try {
+      await host.start();
+      const session = await host.actors.create({ name: "session-listener", instructions: "wait", residency: "durable", scope: "session", topics: ["test.session"] });
+      expect(session.scope).toBe("session");
+      const project = await host.actors.create({ name: "project-listener", instructions: "wait", residency: "durable", topics: ["test.project"] });
+      await until(() => host.actors.status(project.id).status === "dormant");
+      expect(await host.actors.dormantIdleActors()).toBe(0);
+      expect(host.actors.status(session.id).status).toBe("idle");
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("does no probe and arms no dormancy timer for 30 seconds with only ineligible actors, then probes once on eligibility", async () => {
     const { root, config, host } = fixture();
     const wake = await import("../src/residency/wake.js");

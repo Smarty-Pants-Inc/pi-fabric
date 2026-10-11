@@ -118,6 +118,8 @@ const lazyEntryPoints = [
   "src/ui/conversation-chrome.ts",
   "src/ui/conversation-native-reader.ts",
   "src/ui/model-picker.ts",
+  // First-use prewalk picker (/fabric prewalk); stable path keeps it out of startup.
+  "src/ui/fabric-model-selector.ts",
   "src/ui/settings.ts",
   "src/worker/event-projection.ts",
   "src/worker/activation-window.ts",

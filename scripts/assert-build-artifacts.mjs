@@ -84,6 +84,7 @@ const lazy = [
   "ui/conversation-chrome.js",
   "ui/conversation-native-reader.js",
   "ui/model-picker.js",
+  "ui/fabric-model-selector.js",
   "ui/settings.js",
   "worker/event-projection.js",
   "worker/activation-window.js",
@@ -204,11 +205,9 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
 // are the same (smarty-dev#2004).
-// 47 files after the upstream 0.110.1 merge (smarty-dev#5776): the entry is now upstream's
-// extension-bootstrap.js, and esbuild splits tiny shared chunks for modules both the eager graph
-// and new lazy upstream entries import (e.g. core/approval-overrides.ts). Bytes stay within the
-// unchanged 1150 KiB budget. FLAGGED for review in the sync PR; do not raise it further.
-if (startupBytes > 1150 * 1024 || startupFiles.size > 47) {
+// Still 45 after the upstream 0.110.1 merge (smarty-dev#5776): the entry is upstream's
+// extension-bootstrap.js, and the prewalk model picker loads on first use instead of eagerly.
+if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];

@@ -11,8 +11,6 @@ import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
 import { FABRIC_CONVERSATION_SHORTCUT } from "../ui/conversation-shortcut.js";
 import { safeText } from "../ui/format.js";
-import { FabricModelSelector } from "../ui/fabric-model-selector.js";
-import { buildModelSource } from "../ui/model-picker.js";
 import {
   FABRIC_PEER_AWAIT_SETTLE_EVENT,
   FABRIC_PEER_CARDS_EVENT,
@@ -121,6 +119,10 @@ const resolvePrewalkModel = async (
   }
   if (typeof context.ui.custom === "function") {
     try {
+      // First use only: the picker UI stays out of the startup graph (45-file budget).
+      const [{ FabricModelSelector }, { buildModelSource }] = await Promise.all([
+        import("../ui/fabric-model-selector.js"), import("../ui/model-picker.js"),
+      ]);
       // undefined = host can't show the dialog; { model: undefined } = user cancelled.
       const picked = await context.ui.custom<{ model?: string | undefined } | undefined>(
         (_tui, theme, _keybindings, done) =>

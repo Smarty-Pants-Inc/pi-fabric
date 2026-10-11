@@ -573,6 +573,47 @@ for (let i = 0; ; i++) {
     expect(await backendOf(root)).toBe("sqlite");
   });
 
+  // pi-fabric#880 review round 4 (CODE P1): a symlink at or below the package root could be swapped after the check.
+  it.skipIf(binSkip !== "")(`the operator's bin refuses a symlinked bundle or bundle directory inside the package${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = path.join(tempDir("links"), "pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const cli = () => spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+      "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+    const pkgReal = fs.realpathSync(pkg);
+    // (1) The bundle is a symlink, in a group-writable dist/mesh, to an in-root copy (here a fake that leaves a marker).
+    const mesh = path.join(pkgReal, "dist/mesh");
+    const bundle = path.join(mesh, "mesh-backend-cli.js");
+    const copy = path.join(pkgReal, "dist/copy");
+    fs.mkdirSync(copy, { mode: 0o700 });
+    const marker = path.join(pkgReal, "..", "bundle-ran");
+    fs.writeFileSync(path.join(copy, "cli.js"), `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(marker)}, "ran");\nexport const main = async () => 0;\n`, { mode: 0o600 });
+    const real = fs.readFileSync(bundle);
+    fs.unlinkSync(bundle);
+    fs.symlinkSync(path.join(copy, "cli.js"), bundle);
+    fs.chmodSync(mesh, 0o770);
+    const linked = cli();
+    expect(linked.status, linked.stderr).toBe(3);
+    expect(linked.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${bundle} is a symlink inside the install root\n`);
+    expect(fs.existsSync(marker)).toBe(false);
+    fs.chmodSync(mesh, 0o700);
+    fs.unlinkSync(bundle);
+    fs.writeFileSync(bundle, real, { mode: 0o600 });
+    // (2) dist/mesh itself is an in-root symlink to the real directory.
+    fs.renameSync(mesh, path.join(pkgReal, "dist/mesh-real"));
+    fs.symlinkSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    const dir = cli();
+    expect(dir.status, dir.stderr).toBe(3);
+    expect(dir.stderr).toBe(`fabric-mesh-backend: refused before loading: helper integrity: ${mesh} is a symlink inside the install root\n`);
+    // (3) The normal layout passes.
+    fs.unlinkSync(mesh);
+    fs.renameSync(path.join(pkgReal, "dist/mesh-real"), mesh);
+    const ready = cli();
+    expect(ready.status, ready.stderr).toBe(0);
+    expect(await backendOf(root)).toBe("sqlite");
+  });
+
   it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const pkg = tempDir("bundle");

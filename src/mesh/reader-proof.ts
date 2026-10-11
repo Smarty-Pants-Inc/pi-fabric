@@ -279,6 +279,16 @@ const unsafeChain = (file: string, root: string, fd?: number): string | undefine
   catch (error) { return `${file} cannot be resolved (${errno(error)})`; }
   const inside = path.relative(top, real);
   if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
+  // pi-fabric#880 review round 4: no symlink at or below the root on the LEXICAL path either: whoever writes a
+  // link's parent could swap it after the realpath (bin/fabric-mesh-backend checks the same before loading).
+  const lexical = path.relative(root, file);
+  if (!lexical.startsWith("..") && !path.isAbsolute(lexical)) {
+    let at = root;
+    for (const part of lexical.split(path.sep)) {
+      at = path.join(at, part);
+      if (fs.lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) return `${at} is a symlink inside the install root`;
+    }
+  }
   const euid = process.geteuid?.();
   let above = false;
   for (let at = real; ; at = path.dirname(at)) {

@@ -2,7 +2,7 @@
 // Import, cutover and rollback of a mesh root's state backend with the R1 fence (smarty-dev#6477 L4b).
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // pi-fabric#880 / smarty-dev#8145: before ANY package code loads, refuse when another user could have changed
 // this shim, the gate bundle or the lease helper: on each real path, every entry up to the install root (the
@@ -30,20 +30,43 @@ const unsafeChain = (file, root) => {
     if (at === path.dirname(at)) return undefined;
   }
 };
+// pi-fabric#880 review round 4: a symlink AT or BELOW the package root can be swapped after realpath by
+// whoever writes its lexical parent, so none is allowed there (lstat of each lexical component). ponytail:
+// above the package root only the real-path chain counts: npm's node_modules/.bin link points INTO the package
+// and lies outside it, and a symlinked ancestor is resolved by realpath and checked as its target.
+const lexicalSymlink = (root, file) => {
+  const inside = path.relative(root, file);
+  if (inside.startsWith("..") || path.isAbsolute(inside)) return undefined;
+  let at = root;
+  for (const part of inside.split(path.sep)) {
+    at = path.join(at, part);
+    if (fs.lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) return `${at} is a symlink inside the install root`;
+  }
+  return undefined;
+};
+const shim = fileURLToPath(import.meta.url);
+const root = path.resolve(path.dirname(shim), "..");
+const bundle = path.join(root, "dist/mesh/mesh-backend-cli.js");
 if (process.geteuid) {
-  const shim = fileURLToPath(import.meta.url);
-  const root = path.resolve(path.dirname(shim), "..");
+  const refuse = (why) => {
+    process.stderr.write(`fabric-mesh-backend: refused before loading: helper integrity: ${why}\n`);
+    process.exit(3);
+  };
   const helper = path.join(root, "dist/native/fabric-mesh-lease");
+  // How the shim was invoked: a path that names this package's own bin must not pass through a symlink in it.
+  const invoked = path.resolve(process.argv[1] ?? shim);
+  const invokedRoot = path.resolve(path.dirname(invoked), "..");
+  const lexical = (() => { try { return fs.realpathSync(invokedRoot) === fs.realpathSync(root); } catch { return false; } })();
+  if (lexical) { const why = lexicalSymlink(invokedRoot, invoked); if (why) refuse(why); }
   // The bundle imports node builtins only (no chunk): the shim, the bundle and the helper are the whole chain.
-  for (const file of [shim, path.join(root, "dist/mesh/mesh-backend-cli.js"), ...fs.existsSync(helper) ? [helper] : []]) {
-    const why = unsafeChain(file, root);
-    if (why) {
-      process.stderr.write(`fabric-mesh-backend: refused before loading: helper integrity: ${why}\n`);
-      process.exit(3);
-    }
+  for (const file of [shim, bundle, ...fs.existsSync(helper) ? [helper] : []]) {
+    const why = lexicalSymlink(root, file) ?? unsafeChain(file, root);
+    if (why) refuse(why);
   }
 }
-const { main } = await import("../dist/mesh/mesh-backend-cli.js");
+// Load exactly the checked file (root is the shim's real directory and no symlink is below it, so `bundle`
+// is canonical), never a relative specifier resolved again later.
+const { main } = await import(pathToFileURL(bundle).href);
 try { process.exitCode = await main(process.argv.slice(2)); }
 catch (error) {
   process.stderr.write(`fabric-mesh-backend: ${error instanceof Error ? error.message : String(error)}\n`);

@@ -332,6 +332,10 @@ export class FabricState {
   async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle, options);
   }
+  /** Mark injected inbox events consumed, so no later turn injects them again (R-token-waste). */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    await this.#current()?.consumeRootInbox(ids, receipts);
+  }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
     this.#recordsWake = wake;
@@ -358,6 +362,11 @@ export class FabricState {
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#current()?.mainOwnsProviderRecovery() ?? false;
+  }
+
   reportMainProviderError(message: string): Promise<unknown> {
     return this.#required().reportMainProviderError(message);
   }

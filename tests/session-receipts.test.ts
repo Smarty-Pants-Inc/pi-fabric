@@ -30,9 +30,9 @@ describe("incremental confirmed session receipts", () => {
     const entry = { type: "custom_message", id: "native", timestamp: "2026-01-01T00:00:00.000Z",
       customType: "pi-fabric-agent-message", content: body, display: true,
       details: { text: body, id: "delivery", chain: "chain", from: { id: "sender", name: body },
-        data: { key: " work ", ref: "ref", deliveryId: "data-delivery", messageId: "message", body },
+        data: { key: " work ", ref: "ref", topic: "fleet.work.receipts", deliveryId: "data-delivery", messageId: "message", body },
         items: [{ id: "item", chain: "item-chain", deliveryId: "item-delivery", text: body,
-          from: { id: "other", name: body }, data: { ref: " item-ref ", body } }] } };
+          from: { id: "other", name: body }, data: { ref: " item-ref ", key: "item-key", topic: "fleet.work.receipts", body } }] } };
     const { manager, file } = fixture(JSON.stringify({ type: "session", id: "session" }) + "\n" + JSON.stringify(entry) + "\n");
     const project = projectRootInboxReceipt;
     const snapshot = confirmedSessionReceiptSnapshot(manager, matches, project);
@@ -43,7 +43,10 @@ describe("incremental confirmed session receipts", () => {
     const actual = confirmedRootInboxSession(manager);
     expect([...actual.delivered!]).toEqual([...expected.delivered!]);
     expect([...actual.deliveredAt!]).toEqual([...expected.deliveredAt!]);
-    expect(actual.holdsSteer("other", "item-ref")).toBe(false);
+    expect(actual.holdsSteer("other", "item-ref", "fleet.work.receipts")).toBe(false);
+    // The projection keeps a carrier's topic: its topic-scoped key claim survives the compact cache.
+    expect(actual.holdsSteer("other", "item-key", "fleet.work.receipts")).toBe(true);
+    expect(actual.holdsSteer("other", "item-key", "fleet.work.other")).toBe(false);
     expect(confirmedMainInboxIds(manager, "session")).toEqual(new Set(["delivery", "chain", "item", "item-chain"]));
     expect(() => confirmedMainInboxIds(manager, "wrong")).toThrow("identity mismatch");
     // Changing the projection cannot inherit a compact cache as canonical data.

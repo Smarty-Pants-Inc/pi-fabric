@@ -326,6 +326,7 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "terminalRunEventsMaxBytes": 262144
   },
   "mesh": {
+    "controlIncarnationFence": "warn",
     "lockProtocol": 1,
     "stateBackend": "file",
     "enabled": true,
@@ -344,7 +345,9 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "rootGoneTtlMs": 7200000
   },
   "actors": {
-    "maxSessionBytes": 20971520
+    "maxSessionBytes": 20971520,
+    "transientBlockCooldownMs": 600000,
+    "transientBlockMaxMs": 3600000
   }
 }
 ```
@@ -761,6 +764,8 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 call override → session binding → project default → Fabric default
 ```
 
+`mesh.controlIncarnationFence` is a **host-only** setting in the host's `fabric.json`: `"warn"` (default) or `"enforce"`. Project configuration cannot override it. In `"warn"`, an older sender that omits an upgraded destination's advertised `ownerIncarnation` can still deliver controls and messages, subject to the existing identity, target, bridge-link, lease, deadline and deduplication checks. The receiving owner emits a counted warning naming the sender at most once per sender per hour. An explicit wrong or stale incarnation is refused in **both** modes. In `"enforce"`, omission is also refused with `FABRIC_CONTROL_STALE_INCARNATION`. Keep `"warn"` while installs roll host by host: advertising an epoch alone does not make an old sender epoch-aware. **Flip to `"enforce"` only after every host runs a release containing this PR**, including Main and resident senders; see [the rollout cutover rule (smarty-dev#7514)](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7514). Reload the Main or restart the resident after changing this captured setting.
+
 `mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. ASK, bridge and explicitly bounded requests retain their timeout policy. Native steer/followUp commands with a validated fresh owner lease have a 60-second admission/ACK window plus the existing (up to 15-second) return-leg grace. While a message is pending, the sender polls only the captured owner's lease file; an owner more than the routing grace overdue produces retryable `FABRIC_PARTICIPANT_STALE`, not an acknowledgement timeout.
 
 `PI_FABRIC_PARTICIPANT_LEASE_GRACE_MS` configures resolution-only lease grace (default 45000 ms, range 0–300000; invalid values use the default). It does not lengthen heartbeat TTLs, discovery liveness, or residency consumption fences. When an exact native participant's lease is recently late and the mesh is write-stalled/lock-contended, or its matching lease file advanced beyond stored state, resolution waits at most 10 seconds, polling that file every 100 ms. A renewal restores ordinary resolution; no renewal gives `FABRIC_PARTICIPANT_STALE` (`retryable: true`, “lease late by Ns; retry”). A lease older than the grace or an explicit terminal session receipt remains Unknown. Same-name presence stays ambiguous even if one owner's lease is unavailable; there is no replacement-participant fallback.
@@ -818,6 +823,8 @@ credential: this process then publishes nudges and raises alarms), `alarmTo`,
 configuration, never a caller's. It needs the mesh. See [records](records.md).
 
 ## Actors
+
+`actors.transientBlockCooldownMs` (default `600000`, 10 minutes; from 1000 to 86400000) is how long a transient activation block gates routing. Transient blocks come from provider stream errors, timeouts, and preparation or lock timeouts. After the cooldown, the actor is routable again and its next activation is a probe. Each transient failure of a probe doubles the backoff, up to `actors.transientBlockMaxMs` (default `3600000`, 60 minutes). Hard blocks, such as credentials, configuration or a model that is not allowed, never expire. See [actor activation blocks](agents.md) (smarty-dev#6509).
 
 `actors.maxSessionBytes` limits the size of a persistent actor's Pi session file, in bytes. The default is `20971520` (20 MiB). Set it to `0` to disable the limit. Before a run starts, Fabric checks the session file. A larger file gets the same reset as `agents.resetSession()`, with trigger `size`: Fabric archives the file and the run starts a fresh session. So Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [fresh actor sessions](agents.md#fresh-actor-sessions).
 

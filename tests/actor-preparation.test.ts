@@ -279,7 +279,9 @@ describe("round-four launch-preparation recovery (#3167)", () => {
     const actor = await before.create({ name: "pending-recreation", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
     const accepted = before.tell(actor.id, "preserve accepted work beyond preparation budget");
     await waitFor(() => calls >= 4 && before.inFlightCount() === 0);
-    expect(before.status(actor.id)).toMatchObject({ status: "failing-preparation", queued: 1, activationBlocked: { code: "failing-preparation" } });
+    // smarty-dev#6509: a preparation that only timed out is a transient block: it expires and gets a probe.
+    expect(before.status(actor.id)).toMatchObject({ status: "failing-preparation", queued: 1,
+      activationBlocked: { code: "preparation-timeout", class: "transient", classification: "transient: activation preparation timed out (a preparation deadline)" } });
     expect(beforeNotices).toHaveLength(1);
     const directory = path.dirname(actor.sessionFile!);
     const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);

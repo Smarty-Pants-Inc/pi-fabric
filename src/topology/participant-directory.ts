@@ -331,6 +331,8 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     typeof value.ownerHostId !== "string" ||
     typeof value.ownerIdentityId !== "string" ||
     entry.updatedBy.id !== value.ownerIdentityId ||
+    (value.ownerIncarnation !== undefined &&
+      (typeof value.ownerIncarnation !== "string" || !value.ownerIncarnation.length || value.ownerIncarnation.length > 128)) ||
     typeof value.name !== "string" ||
     typeof value.status !== "string" ||
     (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
@@ -593,6 +595,8 @@ export const LIFECYCLE_LOST_TICKS = 2;
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
+  /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
+  readonly ownerIncarnation = randomUUID();
   readonly #backgroundRefresh: MeshBackgroundRetry;
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
@@ -1696,6 +1700,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: this.options.rootId,
       ownerHostId: this.options.selfOwnerHostId ?? this.options.hostId,
       ownerIdentityId: this.options.selfOwnerIdentityId ?? this.options.identity.id,
+      // A worker's self address belongs to its parent owner, not this runtime.
+      ...(!this.options.selfOwnerHostId ? { ownerIncarnation: this.ownerIncarnation } : {}),
       ...(kind === "root" ? {} : { parentId: this.options.rootId }),
       name: this.options.identity.name,
       status: "running",
@@ -1736,6 +1742,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       rootId: main.id,
       ownerHostId: this.options.hostId,
       ownerIdentityId: this.options.identity.id,
+      ownerIncarnation: this.ownerIncarnation,
       name: rootParticipantName(sessionName),
       status: main.status === "running" ? "running" : "idle",
       runner: "pi",
@@ -1944,6 +1951,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           format: 1,
           ownerHostId: this.options.hostId,
           ownerIdentityId: this.options.identity.id,
+          ownerIncarnation: this.ownerIncarnation, // override untrusted/cached source epochs
           // A root that is shutting down takes no new steer, and says why (smarty-dev#1113).
           ...(this.#quiescing
             ? this.#reloadUntil !== undefined && candidate.kind === "root" && candidate.id === this.options.rootId

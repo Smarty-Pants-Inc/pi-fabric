@@ -61,6 +61,28 @@ describe("classifyProviderError (smarty-dev#8742)", () => {
 
   it("keeps CLIProxyAPI's restart-time 400 retryable, as Pi does (smarty-dev#1856)", () => {
     expect(classifyProviderError(failed("400 unknown provider for model claude-opus-5"))).toMatchObject({ retryable: true, status: 400, basis: "text" });
+    expect(classifyProviderError(failed("openai API error (400): unknown provider for model gpt-6"))).toMatchObject({ retryable: true, status: 400, basis: "text" });
+    const gateway = `400 ${JSON.stringify({ error: { message: "unknown provider for model claude-opus-5", type: "invalid_request_error" } })}`;
+    expect(classifyProviderError(failed(gateway))).toMatchObject({ retryable: true, status: 400, type: "invalid_request_error", basis: "body" });
+    expect(classifyProviderError(failed(anthropic(400, "invalid_request_error", "unknown provider for model claude-opus-5")))).toMatchObject({ retryable: true, basis: "body" });
+  });
+
+  // PR #841 code review P1: the routing-miss text must never override an explicit status, type or code.
+  it.each([
+    ["401 unknown provider for model claude-opus-5", 401],
+    ["403 unknown provider for model claude-opus-5", 403],
+    ["404 unknown provider for model claude-opus-5", 404],
+    [anthropic(401, "authentication_error", "unknown provider for model claude-opus-5"), 401],
+    [anthropic(403, "permission_error", "unknown provider for model claude-opus-5"), 403],
+    [anthropic(400, "authentication_error", "unknown provider for model claude-opus-5"), 400],
+    [anthropic(400, "permission_error", "unknown provider for model claude-opus-5"), 400],
+    [anthropic(400, "not_found_error", "unknown provider for model claude-opus-5"), 400],
+    [anthropic(400, "invalid_request_error", "model claude-nope is not allowed: unknown provider for model claude-nope"), 400],
+    [`openai API error (401): ${JSON.stringify({ type: "authentication_error", message: "unknown provider for model gpt-6" })}`, 401],
+    [`400: ${JSON.stringify({ error: { message: "unknown provider for model x", type: "invalid_request_error", code: "model_not_found" } })}`, 400],
+    ["400 invalid x-api-key; unknown provider for model claude-opus-5", 400],
+  ])("keeps %s non-retryable despite the routing-miss text", (errorMessage, status) => {
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: false, status });
   });
 
   it("reads the type of a truncated body", () => {

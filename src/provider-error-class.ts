@@ -82,10 +82,32 @@ const bodyOf = (message: string): ErrorBody | undefined => {
   }
 };
 
+// CLIProxyAPI's routing miss while it reloads after a restart (smarty-dev#1856): the whole reason is
+// `unknown provider for model <model>` (Go: fmt.Errorf("unknown provider for model %s", model)).
+const ROUTING_MISS = /^unknown provider for model(?: \S+)?$/i;
+
+/** The text after a pi-ai status head: `400 x`, `400: x`, or `<provider> API error (400): x`. */
+const reasonOf = (message: string): string =>
+  message.replace(/^\s*(?:\d{3}(?::\s*|\s+)|[^(\n]*\(\d{3}\):\s*)/, "").trim();
+
+/**
+ * PR #841 review P1: only the gateway's own routing-miss 400 is retryable, never an error that merely
+ * mentions it. Any other status, any error code, and any body type other than the gateway's own
+ * invalid_request_error (auth, permission, not found...) win over the text, and the reason must be
+ * exactly the routing message, not an invalid request that quotes it.
+ */
+const routingMiss = (status: number, body: ErrorBody | undefined, message: string): boolean => {
+  if (status !== 400) return false;
+  if (!body) return ROUTING_MISS.test(reasonOf(message));
+  if (body.code !== undefined || (body.type !== undefined && body.type !== "invalid_request_error")) return false;
+  return body.message !== undefined && ROUTING_MISS.test(body.message.trim());
+};
+
 /**
  * Classify a failed turn's assistant message; undefined when the turn did not fail. Non-retryable:
  * an HTTP 4xx other than 408, 429 and a throttling 409 (a 409 needs a non-retryable body type),
- * or the gateway's `compaction_affinity_missing`. Everything else, including 5xx, 429, network
+ * or the gateway's `compaction_affinity_missing`, except the gateway's exact 400 routing miss while
+ * it restarts (see routingMiss). Everything else, including 5xx, 429, network
  * failures and errors with no status, stays retryable; an error with no status, body or known token
  * is basis "default" (unclassified), which Main counts toward its unclassified-failure alarm.
  */
@@ -116,7 +138,7 @@ export const classifyProviderError = (turn: FailedTurn | undefined): ProviderErr
     if (bodyType !== undefined && RETRYABLE_TYPES.has(bodyType)) return verdict(true, "body");
     // ponytail: CLIProxyAPI answers 400 "unknown provider for model" while it reloads after a
     // restart (smarty-dev#1856); Pi retries it too. A real unknown model then keeps backing off.
-    if (/unknown provider for model/i.test(message)) return verdict(true, "text");
+    if (routingMiss(status, body, message)) return verdict(true, body ? "body" : "text");
     return verdict(false, bodyType === undefined ? "status" : "body");
   }
   // ponytail: last resort, raw text. A message with no status or body (a gateway that drops both,

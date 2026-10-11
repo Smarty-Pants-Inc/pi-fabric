@@ -271,11 +271,7 @@ describe("mesh backend rollback fence (R1)", () => {
       await seedFileRoot(root);
       await importMeshState(root);
       const marker = fs.readFileSync(path.join(root, "state.json"));
-      const exporter = await openSqlite(root);
-      const before = meshSnapshotDigest(exporter.exportState());
-      // Closed per round: a store left open on round 1's root keeps descriptors SQLite parked there, and the gate's
-      // reuse proof (state-gate.ts openPinned) then fails closed for round 2's root (one process, two roots).
-      exporter.close();
+      const before = meshSnapshotDigest((await openSqlite(root)).exportState());
       await expect(rollbackMeshState(root, { onStep: (at) => { if (at === "rollback-switch") throw new Error(at); } }))
         .rejects.toThrow("rollback-switch");
       const meta = rawMeta(root);

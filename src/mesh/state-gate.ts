@@ -155,12 +155,18 @@ const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): Sqli
       // the validated inode is the ONLY inode with a parked descriptor (descriptors on it beyond this module's live
       // connections): then the reused one can only be that. Residual on #7784: a SQLite connection in this process
       // that bypasses this module.
+      // smarty-dev#7548: "only" is scoped to this state root's directory. A process may hold another root (the
+      // shadow-mode resident host: state-shadow/ and state-projector/), and its parked descriptor must not fail this
+      // root closed. Residual: a swap of this root's state.db to another root this process holds, while both have a
+      // parked descriptor; that needs write access to this private root (same uid or root, #7548's accepted class).
       if (mains.length === 0) {
         const fds = new Map<string, number>();
         for (const [, identity] of before) fds.set(identity, (fds.get(identity) ?? 0) + 1);
         const parked = (identity: string) => (fds.get(identity) ?? 0) - (liveConnections.get(identity) ?? 0);
-        const elsewhere = [...liveConnections.keys()].some(identity => identity !== target && parked(identity) > 0);
-        if (added.length > 0 || parked(target) < 1 || elsewhere) {
+        const parkedOther = (sameRoot: boolean) => [...liveConnections.keys()].some(identity =>
+          identity !== target && parked(identity) > 0 && (liveRoots.get(identity) === path.dirname(name)) === sameRoot);
+        const elsewhere = parkedOther(true) || parkedOther(false);
+        if (added.length > 0 || parked(target) < 1 || parkedOther(true)) {
           throw refuse(`the connection's own descriptor on it is not proven (0 new, ${added.length} other, ` +
             `${Math.max(0, parked(target))} parked here${elsewhere ? ", parked elsewhere" : ""})`);
         }
@@ -168,7 +174,7 @@ const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): Sqli
     }
     const now = fs.lstatSync(file, { throwIfNoEntry: false });
     if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
-    return tracked(db, `${validated.dev}:${validated.ino}`);
+    return tracked(db, `${validated.dev}:${validated.ino}`, path.dirname(name));
   } catch (error) {
     try { db.close(); } catch { /* best effort */ }
     throw error;
@@ -177,15 +183,19 @@ const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): Sqli
 
 // This module's live connections per "dev:ino" (openPinned's reuse proof). Closing a connection releases its count.
 const liveConnections = new Map<string, number>();
-const tracked = (db: SqliteConnection, identity: string): SqliteConnection => {
+// The real root directory of each live "dev:ino" (the reuse proof's scope, smarty-dev#7548).
+const liveRoots = new Map<string, string>();
+const tracked = (db: SqliteConnection, identity: string, root: string): SqliteConnection => {
   liveConnections.set(identity, (liveConnections.get(identity) ?? 0) + 1);
+  liveRoots.set(identity, root);
   const close = db.close.bind(db);
   let open = true;
   db.close = () => {
     if (open) {
       open = false;
       const left = (liveConnections.get(identity) ?? 1) - 1;
-      if (left > 0) liveConnections.set(identity, left); else liveConnections.delete(identity);
+      if (left > 0) liveConnections.set(identity, left);
+      else { liveConnections.delete(identity); liveRoots.delete(identity); }
     }
     close();
   };

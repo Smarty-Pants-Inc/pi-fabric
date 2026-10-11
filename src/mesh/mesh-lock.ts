@@ -1,4 +1,4 @@
-import { createLockStats, type MeshLockClass } from "./commit-stats.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
 import { MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -22,6 +22,18 @@ import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, Mes
 // Mesh-lock wait/hold by caller class under <root>/lock-stats (smarty-dev#6477 L8). On unless
 // PI_FABRIC_LOCK_STATS=0; no extra lock, no fsync, and no timer or file before an acquisition.
 export const lockStats = createLockStats();
+// Held-time and wait-timeout events under <root>/lock-stats/events.jsonl (smarty-dev#9290), with the
+// recorder: rare appends only, nothing on an ordinary acquisition.
+export const lockEvents = createLockEvents();
+const timed = lockStats !== undefined || lockEvents !== undefined;
+
+/** The pid a `.lock` owner record names (its second line), when readable. */
+export const lockOwnerPid = (ownerPath: string): number | undefined => {
+  try {
+    const pid = Number(fs.readFileSync(ownerPath, "utf8").split("\n")[1]);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+  } catch { return undefined; }
+};
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
@@ -108,6 +120,8 @@ export interface MeshLockOptions {
   lockTimeoutMs?: number;
   writeSignal?: AbortSignal;
   staleLockMs?: number;
+  /** A hold longer than this emits a `held` lock event (smarty-dev#9290). Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
 }
 
 export class MeshLock {
@@ -120,6 +134,7 @@ export class MeshLock {
   readonly #lockTimeoutMs: number;
   readonly #writeAbortSignal: AbortSignal | undefined;
   readonly #staleLockMs: number;
+  readonly #lockHeldEventMs: number;
   readonly #onOperationError: () => void;
 
   constructor(readonly root: string, options: MeshLockOptions, onOperationError: () => void) {
@@ -143,6 +158,7 @@ export class MeshLock {
     this.#lockPath = path.join(root, ".lock");
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
+    this.#lockHeldEventMs = lockHeldEventThreshold(options.lockHeldEventMs);
   }
 
   get lockPath(): string { return this.#lockPath; }
@@ -191,7 +207,7 @@ export class MeshLock {
 
   async #withLock<T>(operation: () => T | Promise<T>, lockTimeoutMs: number, lockClass: MeshLockClass,
     bounded: boolean, acrossAwait: boolean): Promise<T> {
-    const lockWaitStart = lockStats ? performance.now() : 0;
+    const lockWaitStart = timed ? performance.now() : 0;
     let lockHeldAt = -1;
     let holdMs = -1;
     let failedWaitMs = -1;
@@ -204,8 +220,11 @@ export class MeshLock {
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
       (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // Fails closed before the common accounting below: count it once here.
-      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
+      // Fails closed before the common accounting below: count it (and any event) once here.
+      const tried = Boolean(scope?.active) || bounded;
+      const waitedMs = performance.now() - lockWaitStart;
+      lockStats?.failed(this.root, lockClass, waitedMs, tried);
+      if (!tried) lockEvents?.waitTimeout(this.root, "mesh-lock", lockClass, waitedMs, lockOwnerPid(ownerPath));
       throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
     }
     const startTime = this.#lockProtocol === 2
@@ -312,7 +331,7 @@ export class MeshLock {
           else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }
-      if (lockStats) lockHeldAt = performance.now();
+      if (timed) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();
         return acrossAwait ? await operation() : operation();
@@ -323,16 +342,23 @@ export class MeshLock {
         throw error;
       } finally {
         releaseOwned();
-        if (lockStats) holdMs = performance.now() - lockHeldAt;
+        if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (lockStats && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
       throw error;
     } finally {
       ticket.close();
       // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
-      if (holdMs >= 0) lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
-      else if (failedWaitMs >= 0) lockStats?.failed(this.root, lockClass, failedWaitMs, Boolean(scope?.active) || bounded);
+      if (holdMs >= 0) {
+        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
+        if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);
+      } else if (failedWaitMs >= 0) {
+        const tried = Boolean(scope?.active) || bounded;
+        lockStats?.failed(this.root, lockClass, failedWaitMs, tried);
+        // The holder as its owner record names it now (it may have released since the timeout).
+        if (!tried) lockEvents?.waitTimeout(this.root, "mesh-lock", lockClass, failedWaitMs, lockOwnerPid(ownerPath));
+      }
     }
   }
 

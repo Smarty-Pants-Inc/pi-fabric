@@ -245,6 +245,11 @@ export interface MeshStoreOptions {
   /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
+   * A `.lock` or SQLite writer-lock hold longer than this emits a `held` event to
+   * `<root>/lock-stats/events.jsonl` (smarty-dev#9290). Default 1,000 ms; 0 disables them.
+   */
+  lockHeldEventMs?: number;
+  /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
    * another process has rewritten the file since. Every write still reads the file fresh
    * against an identity revalidated under the lock and checks versions, and a store sees its own writes at once. 0 (the

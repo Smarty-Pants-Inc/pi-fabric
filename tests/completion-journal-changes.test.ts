@@ -46,7 +46,9 @@ describe("completion journal changed-path drains", () => {
     await h.journal.drainChanged();
     if (kind === "consumed") consumeCompletion(h.meshRoot, value.id, h.recipient.sessionId);
     h.enqueue.mockClear();
-    fs.rmSync(target);
+    // A durable receipt archives the consumed envelope itself (#721); delete only the foreign one.
+    if (kind === "consumed") expect(fs.existsSync(target)).toBe(false);
+    else fs.rmSync(target);
     await h.journal.drainChanged(true, { safety: true });
     const stat = vi.spyOn(fs.promises, "stat"), open = vi.spyOn(fs.promises, "open"), read = vi.spyOn(fs.promises, "readFile"), readdir = vi.spyOn(fs.promises, "readdir");
     for (let i = 0; i < 3; i++) await h.journal.drainChanged(true, { safety: true });

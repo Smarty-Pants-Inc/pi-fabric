@@ -483,7 +483,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       id: this.id,
       name: "Main",
       kind: "main",
-      status: this.local ? (context?.isIdle() === false ? "running" : "idle") : "remote",
+      // Minimal host contexts (bootstrap probes, fixtures) may omit isIdle.
+      status: this.local ? (typeof context?.isIdle === "function" && context.isIdle() === false ? "running" : "idle") : "remote",
       runner: "pi",
       transport: "host",
       ...(this.local ? { cwd: this.cwd, startedAt: this.startedAt } : {}),
@@ -491,7 +492,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
       updatedAt: Date.now(),
-      pendingMessages: this.local ? (context?.hasPendingMessages() ?? false) : false,
+      pendingMessages: this.local && typeof context?.hasPendingMessages === "function" ? context.hasPendingMessages() : false,
       local: this.local,
     };
   }

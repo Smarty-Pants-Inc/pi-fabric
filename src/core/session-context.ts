@@ -1,6 +1,6 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
-// Local mirror of the context-projection helpers in pi 0.84.2
+// Local mirror of the context-projection helpers in pi 1.1.0
 // core/session-manager.js and core/messages.js. Kept identical so Fabric's
 // compaction projections match the host's without importing the host package
 // during extension load.
@@ -104,6 +104,7 @@ const createCustomMessage = (
 export const sessionEntryToContextMessages = (entry: SessionEntry): ContextMessage[] => {
   if (entry.type === "message") {
     const message = entry.message;
+    if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
     if (
       (message.role === "user" || message.role === "assistant" || message.role === "toolResult")
       && message.content == null
@@ -121,7 +122,8 @@ export const sessionEntryToContextMessages = (entry: SessionEntry): ContextMessa
     return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
   }
   if (entry.type === "compaction") {
-    return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
+    const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+    return entry.systemMessage ? [entry.systemMessage as unknown as ContextMessage, summary] : [summary];
   }
   return [];
 };
@@ -155,12 +157,37 @@ const buildContextEntries = (
     if (entry.id === compaction.firstKeptEntryId) {
       foundFirstKept = true;
     }
-    if (foundFirstKept) {
+    if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
       contextEntries.push(entry);
     }
   }
   contextEntries.push(...path.slice(compactionIdx + 1));
   return contextEntries;
+};
+
+/** Content-only view; preserve IDs/parent links even for omissions so cuts and
+ * tree traversal still address the original branch. Never mutate raw history.
+ * Also used over cumulative raw history by deterministic compaction: an omitted
+ * recovery attempt must not be resurrected by a later summary. */
+export const applyContextEdits = (entries: readonly SessionEntry[]): SessionEntry[] => {
+  const edits = new Map<string, Extract<SessionEntry, { type: "context_edit" }>>();
+  for (const entry of entries) if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+  return entries.map((entry) => {
+    const edit = edits.get(entry.id);
+    if (!edit) return entry;
+    const replacement = edit.replacement;
+    if (replacement === null) return {
+      type: "custom", id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp,
+      customType: "fabric.context-omission",
+    };
+    if (entry.type === "custom_message") return { ...entry, content: replacement.content as typeof entry.content };
+    if (entry.type !== "message") return entry;
+    const message = entry.message;
+    if (!["user", "assistant", "toolResult", "custom"].includes(message.role)) return entry;
+    const content = (message.role === "assistant" || message.role === "toolResult") && typeof replacement.content === "string"
+      ? [{ type: "text" as const, text: replacement.content }] : replacement.content;
+    return { ...entry, message: { ...message, content } } as SessionEntry;
+  });
 };
 
 export const buildSessionContext = (
@@ -174,6 +201,7 @@ export const buildSessionContext = (
 } => {
   const path = buildSessionPath(entries, leafId, byId);
   const { thinkingLevel, model } = getSessionContextSettings(path);
-  const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
+  const messages = applyContextEdits(buildContextEntries(entries, leafId, byId))
+    .flatMap((entry, index) => entry.type === "compaction" && index > 0 ? [] : sessionEntryToContextMessages(entry));
   return { messages, thinkingLevel, model };
 };

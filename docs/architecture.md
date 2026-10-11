@@ -20,6 +20,9 @@ ActionRegistry ◀── staged commit ── ComponentSupervisor
     ├── memory.*
     ├── compact.*
     ├── cache.* local observations + optional native warming leases
+    ├── thinking.* bounded host-session reasoning effort
+    ├── decisions.* durable approvals and questions over the mesh
+    ├── programs.* content-addressed saved programs, run nested
     ├── components.* kernel diagnostics and reload
     └── external providers
 
@@ -101,6 +104,10 @@ preflight, and callers requiring all final errors to throw should omit `settle`.
 ## Model-context economy
 
 Fabric caps final `fabric_exec` output at 50,000 characters by default, which matches Pi's built-in 50KB tool ceiling. Failed executions get a tighter 20,000-character visible ceiling, and the complete output stays in the same private artifact. An oversized structured return shares that budget across every multiline section and preserves both ends with explicit omission markers. Unstructured output keeps its global beginning and end. Fabric writes the complete output to a mode-`0600` temporary artifact and includes the artifact path inside the visible ceiling. The model can then retrieve a targeted range without carrying the entire result. Type-check diagnostics use the same ceiling. Models should still filter noisy commands and return only useful evidence, because source-side projection preserves more relevant information than post-format truncation. When a later nested call fails after earlier calls completed, the error adds a bounded list of completed refs and paths. The model can inspect that list before repeating side effects. Nested outputs the guest did not return are never exposed. Raw media never enters those text channels: image payloads in `fabric_exec` logs, results, and error text, in worker event lines, and in actor host events are replaced by a `{type: "image", mediaIndex, mimeType, redacted: true}` descriptor and hoisted out of band, so a nested `pi.read` image stays available to a multimodal model without pushing hundreds of KB of base64 into one serialized line. A child event line that only exceeds the 4 MB cap because it embeds raw base64 is sanitized to avoid failing the run.
+
+### Foreground tools
+
+Full code mode keeps `fabric_exec` as the single model tool so that every effect passes one typed, budgeted, audited path. A few extension tools only make sense as a direct model turn, such as a question to the human. The `foreground` policy declares a capped, explicit list of such registered tools beside `fabric_exec`. It changes declaration only. It grants no new authority: a direct call takes the same `tool_call` hooks, the same `extensions.<name>` approval ref and risk class as the program path, and the tool stays callable from programs. Pi core tools, Pi built-ins, and Schema enforce mode are excluded. See [foreground tools](configuration.md#foreground-tools).
 
 ## Federated participant topology
 

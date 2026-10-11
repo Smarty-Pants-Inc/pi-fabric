@@ -1,9 +1,10 @@
 import path from "node:path";
+import { nativeToolResult } from "../core/native-tool-result.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
 import type {
   FabricActionDescriptor,
@@ -17,6 +18,7 @@ export interface CapturedToolInvocationResult {
   text: string;
   details?: unknown;
   isError: boolean;
+  structuredContent?: unknown;
   terminate?: boolean;
   source: SourceInfo;
 }
@@ -57,6 +59,7 @@ const asInvocationResult = (
   text: textFromContent(result.content),
   ...(result.details !== undefined ? { details: result.details } : {}),
   isError,
+  ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
   ...(result.terminate !== undefined ? { terminate: result.terminate } : {}),
   source: entry.sourceInfo,
 });
@@ -97,7 +100,10 @@ export class CapturedToolsProvider implements FabricProvider {
   readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
-  constructor(readonly catalog: CapturedToolCatalog) {}
+  constructor(
+    readonly catalog: CapturedToolCatalog,
+    private readonly omitFromDiscovery: (entry: CapturedToolEntry) => boolean = () => false,
+  ) {}
 
   async close(): Promise<void> {
     this.#lifetime.abort(new Error("Captured extension tool session closed"));
@@ -108,7 +114,9 @@ export class CapturedToolsProvider implements FabricProvider {
     _context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor[]> {
     const query = request.query?.trim().toLowerCase();
-    const descriptors = this.catalog.list().filter((entry) => !this.#allowedTools || this.#allowedTools.has(entry.name)).map(descriptorFrom);
+    const descriptors = this.catalog.list().filter((entry) =>
+      (!this.#allowedTools || this.#allowedTools.has(entry.name)) && !this.omitFromDiscovery(entry),
+    ).map(descriptorFrom);
     if (!query) return descriptors;
     return descriptors.filter((descriptor) =>
       `${descriptor.name} ${descriptor.description} ${descriptor.namespace ?? ""}`
@@ -141,7 +149,7 @@ export class CapturedToolsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
-  ): Promise<CapturedToolInvocationResult> {
+  ): Promise<unknown> {
     this.#assertAllowed(actionName);
     // Include provider custody even for host-direct calls without a turn signal.
     // Queued work and non-cooperative late results cannot use a retired runner.
@@ -150,9 +158,10 @@ export class CapturedToolsProvider implements FabricProvider {
     ]), context.signal) };
     throwIfAborted(context.signal);
     const entry = this.catalog.require(actionName);
-    return this.#scheduler.run(entry.definition.executionMode, () =>
+    const result = await this.#scheduler.run(entry.definition.executionMode, () =>
       runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
     );
+    return context.nativeToolResult ? nativeToolResult(entry.definition, result, result.isError) : result;
   }
 
   #assertAllowed(name: string): void {
@@ -167,6 +176,30 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<CapturedToolInvocationResult> {
     const { runner, wrappedTool } = entry;
+    const native = context.extensionContext as Partial<import("@earendil-works/pi-coding-agent").ExtensionToolContext>;
+    // Native calls own validation, middleware, child IDs, execution events and
+    // usage accounting. Shells retain the adapted boundary so native exit status
+    // is captured BEFORE tool_result redaction/recovery (and cwd stays scoped).
+    // Tools with prepareArguments use Fabric's wrapper: the registry already
+    // prepared the authorized arguments; native dispatch would prepare twice.
+    if (native.executeTool && native.tools?.some((tool) => tool.name === entry.name) &&
+        !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
+      const activeBefore = runner.getActiveTools();
+      const outcome = await native.executeTool(entry.name, args, {
+        ...(context.signal ? { signal: context.signal } : {}),
+        onUpdate: (partial) => {
+          const progress = textFromContent(partial.content).trim();
+          if (progress) context.update(`${entry.name}: ${progress.slice(0, 500)}`);
+        },
+      });
+      const activeAfter = new Set(runner.getActiveTools());
+      this.catalog.remove(activeBefore.filter((name) => !activeAfter.has(name)));
+      context.updateArguments?.(outcome.toolCall.arguments);
+      const images = outcome.result.content.filter((part) => part.type === "image");
+      if (images.length && !context.nativeToolResult) context.attachMedia?.(images);
+      if (outcome.isError && !(context.nativeToolResult && entry.definition.outputSchema && outcome.result.structuredContent !== undefined)) throw new Error(textFromContent(outcome.result.content) || `Captured tool ${entry.name} failed`);
+      return asInvocationResult(entry, outcome.result, outcome.isError);
+    }
     const toolCallId = context.nestedToolCallId;
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_start",
@@ -199,7 +232,9 @@ export class CapturedToolsProvider implements FabricProvider {
       executionStarted = true;
       const requestedCwd = args.cwd;
       const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? { ...runner.createContext(), cwd: requestedCwd }
+        ? Object.defineProperty(Object.create(runner.createToolContext
+            ? runner.createToolContext(toolCallId, context.signal)
+            : runner.createContext()), "cwd", { value: requestedCwd, enumerable: true })
         : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
@@ -221,6 +256,8 @@ export class CapturedToolsProvider implements FabricProvider {
           .catch(() => undefined);
         }, executionContext),
       );
+      isError = result.isError === true;
+      if (isError && isPiShellToolName(entry.name)) thrown = classifyPiBashResult(result);
     } catch (error) {
       thrown = isPiShellToolName(entry.name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -245,6 +282,7 @@ export class CapturedToolsProvider implements FabricProvider {
       input: args,
       content: result.content,
       details: result.details,
+      ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
       isError,
     }));
     if (patch) {
@@ -252,6 +290,8 @@ export class CapturedToolsProvider implements FabricProvider {
         ...result,
         content: patch.content ?? result.content,
         ...(patch.details !== undefined ? { details: patch.details } : {}),
+        ...((patch.content !== undefined || patch.structuredContent !== undefined)
+          ? { structuredContent: patch.structuredContent } : {}),
       };
       isError = patch.isError ?? isError;
     }
@@ -267,8 +307,8 @@ export class CapturedToolsProvider implements FabricProvider {
     // Keep observations emitted before a failed batch as well as successful
     // results. Hooks have already produced the final model-facing content.
     const images = result.content.filter((part) => part.type === "image");
-    if (images.length > 0) context.attachMedia?.(images);
-    if (isError) {
+    if (images.length > 0 && !context.nativeToolResult) context.attachMedia?.(images);
+    if (isError && !(context.nativeToolResult && entry.definition.outputSchema && result.structuredContent !== undefined)) {
       if (isPiShellToolName(entry.name)) {
         throw piBashResultError(thrown, textFromContent(result.content));
       }
@@ -277,6 +317,6 @@ export class CapturedToolsProvider implements FabricProvider {
         text || (thrown instanceof Error ? thrown.message : `Captured tool ${entry.name} failed`),
       );
     }
-    return asInvocationResult(entry, result, false);
+    return asInvocationResult(entry, result, isError);
   }
 }

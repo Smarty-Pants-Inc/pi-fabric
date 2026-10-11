@@ -169,7 +169,8 @@ export class WorkerMemoryProvider extends MemoryProvider {
       request.branch = this.snapshot(request);
       const worker = this.worker ?? this.start();
       worker.ref();
-      worker.postMessage({ id: request.id, action: request.action, args: request.args, branch: request.branch });
+      worker.postMessage({ id: request.id, action: request.action, args: request.args, branch: request.branch,
+        ...(request.invocation.scope ? { scope: request.invocation.scope } : {}) });
     } catch (error) {
       this.active = undefined;
       void this.retire();

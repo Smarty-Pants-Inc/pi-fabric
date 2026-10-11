@@ -1,11 +1,12 @@
 import ts from "typescript";
 import { stableJsonHash } from "../core/stable-hash.js";
+import { speculativeNativeRef } from "../core/native-tool-names.js";
 import type { FabricSpeculationCandidate } from "./types.js";
 
 // Root namespaces the model can call from a fabric program. Calls are emitted
 // as candidates regardless of action so the tap can apply its eligibility
 // policy in one place; args must still be fully literal.
-const ROOTS = new Set(["pi", "memory", "state", "schema", "compact", "components", "mcp"]);
+const ROOTS = new Set(["pi", "memory", "state", "schema", "compact", "thinking", "decisions", "programs", "components", "mesh", "mcp", "tools", "nativeTools"]);
 
 const LITERAL_FAIL = Symbol("literal-fail");
 
@@ -105,9 +106,10 @@ const accessChain = (node: ts.Expression): string[] | undefined => {
   return segments;
 };
 
-const refFromChain = (segments: string[], tainted: Set<string>): string | undefined => {
+const refFromChain = (segments: string[], tainted: Set<string>, nativeRef: (name: string, root: string) => string | undefined): string | undefined => {
   const root = segments[0]!;
   if (!ROOTS.has(root) || tainted.has(root)) return undefined;
+  if (segments.length === 2 && (root === "tools" || root === "nativeTools")) return nativeRef(segments[1]!, root);
   if (segments.length === 2) return `${segments[0]}.${segments[1]}`;
   if (segments.length === 3 && root === "mcp") return segments.join(".");
   return undefined;
@@ -121,6 +123,7 @@ const refFromChain = (segments: string[], tainted: Set<string>): string | undefi
  * substring scan, not an AST build.
  */
 export class LiteralCallScanner {
+  constructor(readonly nativeRef: (name: string, root: string) => string | undefined = name => speculativeNativeRef(name)) {}
   #scannedLength = 0;
   readonly #tainted = new Set<string>();
   readonly #emitted = new Set<string>();
@@ -151,14 +154,15 @@ export class LiteralCallScanner {
       if (ts.isCallExpression(node)) {
         const segments = accessChain(node.expression);
         if (segments) {
-          const ref = refFromChain(segments, this.#tainted);
+          const ref = refFromChain(segments, this.#tainted, this.nativeRef);
           if (ref) {
             const args = this.#literalArgs(node);
             if (args !== undefined) {
-              const key = `${ref}\n${stableJsonHash(args)}`;
+              const nativeToolResult = segments[0] === "tools" || segments[0] === "nativeTools";
+              const key = `${ref}\n${nativeToolResult}\n${stableJsonHash(args)}`;
               if (!this.#emitted.has(key)) {
                 this.#emitted.add(key);
-                candidates.push({ ref, args });
+                candidates.push({ ref, args, ...(nativeToolResult ? {nativeToolResult: true} : {}) });
               }
             }
           }
@@ -216,6 +220,12 @@ export class LiteralCallScanner {
             for (const element of clause.namedBindings.elements) into.add(element.name.text);
           }
         }
+      }
+      // Aliases/mutations of the native facade can change what a dotted call means.
+      if (ts.isIdentifier(current) && ["tools", "nativeTools"].includes(current.text)) {
+        let access: ts.Node = current;
+        while (ts.isPropertyAccessExpression(access.parent) && access.parent.expression === access) access = access.parent;
+        if (!(ts.isCallExpression(access.parent) && access.parent.expression === access)) into.add(current.text);
       }
       ts.forEachChild(current, visit);
     };

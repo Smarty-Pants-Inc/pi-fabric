@@ -24,6 +24,8 @@ export interface FabricResidentOutcomeReceipt {
 export interface FabricSandboxResult {
   value: unknown;
   logs: string[];
+  /** Explicit image() output, including partial output on errors. */
+  emitted?: unknown[];
   terminationReason: FabricSandboxTerminationReason;
   error?: string;
   /** Host-side reconciliation data, independent of verbose guest error prose. */
@@ -40,6 +42,9 @@ export interface FabricSandboxOptions {
   maximumDeadlineAt?: number;
   /** Opaque host-issued cause, used only when this runtime is clamped to that ceiling. */
   maximumDeadlineReason?: Error;
+  nativeStoreEnabled?: boolean;
+  nativeToolsEnabled?: boolean;
+  codemodeProfile?: "additive" | "native";
   memoryLimitBytes: number;
   /** Optional uninterrupted guest CPU limit. Await host work/timers to yield. */
   maxCpuSliceMs?: number;
@@ -55,6 +60,9 @@ export interface FabricSandboxOptions {
     ref: string,
     args: Record<string, unknown>,
   ): number | undefined;
+  /** True for a host call that waits for a person (executor.humanWaitRefs).
+   * The program deadline is paused while any such call is in flight. */
+  isHumanWaitHostCall?(ref: string, args: Record<string, unknown>): boolean;
   /** Declared core override fields must not be consumed as built-in aliases. */
   piToolCanonicalFields?: Record<string, string[]>;
   /** False in orchestration-only mode, where the guest has no usable `pi`; guides runtime hints. */

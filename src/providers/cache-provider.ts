@@ -40,9 +40,10 @@ export class CacheProvider implements FabricProvider {
   readonly description = "Observed prompt-cache usage and optional native scoped warming; not a key/value or tool-result cache";
   readonly #leases: CacheLeases;
   readonly #sessionId: string;
-  constructor(pi: ExtensionAPI, context: ExtensionContext, private readonly isMain: boolean) {
+  constructor(pi: ExtensionAPI, context: ExtensionContext, private readonly isMain: boolean,
+    foregroundTools?: () => readonly string[]) {
     this.#sessionId = context.sessionManager.getSessionId();
-    this.#leases = new CacheLeases(pi, this.#sessionId);
+    this.#leases = new CacheLeases(pi, this.#sessionId, foregroundTools);
   }
   async list(request: FabricProviderListRequest): Promise<FabricActionDescriptor[]> {
     const query = request.query?.toLowerCase();

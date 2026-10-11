@@ -1,6 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 /**
  * The one removal path of every retention and scratch deleter (smarty-dev#7916). A deleter judges a target by
@@ -40,6 +43,13 @@ export interface DeleterTally {
 let tally: Record<string, DeleterTally> | undefined;
 export const startRemovalTally = (): Record<string, DeleterTally> => (tally = {});
 export const stopRemovalTally = (): void => { tally = undefined; };
+
+/** smarty-dev#7858: Windows verified removal (the native helper) is on only where it is switched on: the operator's
+ * `retention --apply` sweep. In-process sweeps keep main's path-based fallback.
+ * ponytail: one helper process per removal costs tens of ms on Windows; resident sweeps of thousands of runs, and
+ * their per-run metadata budget (actor-manager-startup #4250), cannot carry that (pi-fabric#913 Windows CI). */
+let windowsVerified = false;
+export const setWindowsVerifiedRemoval = (on: boolean): void => { windowsVerified = on; };
 /** Whether a report is being collected: deleters compute detailed refusal reasons and sizes only then. */
 export const removalTallyOn = (): boolean => tally !== undefined;
 const entry = (deleter: string): DeleterTally => (tally![deleter] ??= { removed: 0, bytes: 0, refused: {}, refusedBytes: {}, examples: {} });
@@ -57,7 +67,9 @@ export const countRefusal = (deleter: string, reason: string, target?: string, b
 };
 
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */
-export const verifiedRemoveTestHooks: { beforeOpen?: (target: string) => void } = {};
+export const verifiedRemoveTestHooks: { beforeOpen?: (target: string) => void;
+  /** Windows: runs after the tree walk, right before the helper opens the entries (the ancestor-swap test). */
+  beforeHelper?: (target: string) => void } = {};
 
 // O_PATH (Linux): an fd for fstat and /proc traversal only; never reads a file, never blocks on a FIFO.
 const O_PATH = 0o10000000;
@@ -147,6 +159,78 @@ const pathBytes = (file: string, depth = 0): number => {
   } catch { return 0; }
 };
 
+// smarty-dev#7858: Windows verified removal through the native helper (native/fabric-win-remove.c). It opens every
+// entry without following a reparse point, verifies ALL on their handles (owner SID = this token's user or default
+// owner, the judged volume serial and file index, the kind) and only then deletes each BY HANDLE, children first.
+// Replaced at build time (scripts/build.mjs define); tests set the global from dist/native/manifest.json.
+declare const __FABRIC_NATIVE_DIGESTS__: string | undefined;
+const WIN_HELPER = "fabric-win-remove.exe";
+const MAX_WIN_ENTRIES = 4096;
+/** The helper, when present and its bytes equal the digest embedded at build time; else undefined (fail closed).
+ * ponytail: hash, then exec by path (Windows has no fd exec): a same-user rewrite in between is the accepted
+ * smarty-dev#7800 class, as for the lease helper. Located beside the bundle (dist/<dir>/ or dist/) or from src/. */
+let helperFound: { file: string | undefined } | undefined;
+export const windowsRemoveHelper = (): string | undefined => {
+  // os.type() names the real OS: tests that force process.platform to win32 on Linux keep main's Windows paths.
+  if (process.platform !== "win32" || os.type() !== "Windows_NT") return undefined;
+  // Looked up and hashed once per process (pi-fabric#913 Windows CI): not once per removal.
+  return (helperFound ??= { file: findWindowsRemoveHelper() }).file;
+};
+const findWindowsRemoveHelper = (): string | undefined => {
+  let expected: string | undefined;
+  try { expected = (JSON.parse(__FABRIC_NATIVE_DIGESTS__ as string) as Record<string, string>)[WIN_HELPER]; } catch { return undefined; }
+  if (typeof expected !== "string" || !/^[0-9a-f]{64}$/.test(expected)) return undefined;
+  for (const relative of ["../../dist/native/", "../dist/native/"]) {
+    const file = fileURLToPath(new URL(`${relative}${WIN_HELPER}`, import.meta.url));
+    try {
+      if (!fs.lstatSync(file).isFile()) continue;
+      if (createHash("sha256").update(fs.readFileSync(file)).digest("hex") === expected) return file;
+    } catch { /* next candidate */ }
+  }
+  return undefined;
+};
+/** The tree below a judged target, children first, by lstat with exact (bigint) ids; no reparse point is entered. */
+const windowsEntries = (target: string, judged: fs.Stats): Array<{ file: string; stat: fs.BigIntStats }> => {
+  const entries: Array<{ file: string; stat: fs.BigIntStats }> = [];
+  const walk = (file: string, depth: number): void => {
+    if (depth > MAX_DEPTH) refuse("tree is too deep");
+    const stat = fs.lstatSync(file, { bigint: true });
+    if (stat.isSymbolicLink()) refuse("a reparse point in the tree");
+    if (!stat.isFile() && !stat.isDirectory()) refuse("an entry in the tree is not a regular file or directory");
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file)) walk(path.join(file, name), depth + 1);
+    if (entries.length >= MAX_WIN_ENTRIES) refuse("tree is too large");
+    entries.push({ file, stat });
+  };
+  walk(target, 0);
+  const top = entries.at(-1)!.stat;
+  // The judged stat's ino is a double (a 64-bit NTFS index may round): the exact id goes to the helper from here.
+  if (Number(top.dev) !== judged.dev || Number(top.ino) !== judged.ino) refuse("target inode was replaced since judgment");
+  if (kind(judged) !== (top.isDirectory() ? "directory" : "file")) refuse("type changed since judgment");
+  // A bigint stat's mtimeMs is whole milliseconds; NTFS keeps 100 ns: compare the judged double with a plain lstat.
+  if (fs.lstatSync(target).mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
+  return entries;
+};
+const windowsRemove = (helper: string, entries: Array<{ file: string; stat: fs.BigIntStats }>, dryRun: boolean): void => {
+  const args = entries.flatMap(({ file, stat }) => [stat.isDirectory() ? "d" : "f", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)]);
+  const result = spawnSync(helper, dryRun ? ["--dry-run", ...args] : args, { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  const line = (result.stdout ?? "").split(/\r?\n/)[0] ?? "";
+  if (result.status === 0 && /^ok \d+/.test(line)) return;
+  const match = /^(refused|failed) (-?\d+) (.+)$/.exec(line);
+  if (!match) refuse(`the Windows removal helper failed (${result.error?.message ?? `exit ${String(result.status)}`})`);
+  const entry = entries[Number(match![2])]?.file ?? "the helper";
+  refuse(match![1] === "refused" ? `${match![3]} (${entry}); nothing is deleted` : `removal failed at ${entry} (${match![3]})`);
+};
+
+/** Windows: `file` (its exact id from a bigint stat) is a private record, proven on a handle by the verified helper:
+ * ours, not a reparse point, and no SID but ours, SYSTEM or Administrators may write it (pi-fabric#913 P1). */
+export const windowsPrivate = (file: string, stat: fs.BigIntStats): boolean => {
+  const helper = windowsRemoveHelper();
+  if (!helper || !stat.isFile()) return false;
+  const result = spawnSync(helper, ["--private", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)],
+    { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  return result.status === 0 && /^ok 1 private/.test(result.stdout ?? "");
+};
+
 export const verifiedRemove = (target: string, judged: fs.Stats | undefined, options: {
   /** The deleter's name, for the report. */
   deleter: string;
@@ -164,6 +248,43 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     countRefusal(deleter, reason, target);
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
+  // smarty-dev#7858: on Windows with the verified helper, it takes the place of main's path-based fallback.
+  const windowsHelper = windowsVerified ? windowsRemoveHelper() : undefined;
+  if (windowsHelper) {
+    if (!judged) return no("no judged stat");
+    try {
+      verifiedRemoveTestHooks.beforeOpen?.(target);
+      const entries = windowsEntries(target, judged);
+      verifiedRemoveTestHooks.beforeHelper?.(target);
+      const bytes = options.freed ?? entries.reduce((sum, { stat }) => sum + (stat.isFile() ? Number(stat.size) : 0), 0);
+      if (options.dryRun) { windowsRemove(windowsHelper, entries, true); countRemoval(deleter, bytes); return { removed: true, bytes }; }
+      if (!options.proceed) { windowsRemove(windowsHelper, entries, false); countRemoval(deleter, bytes); return { removed: true, bytes }; }
+      // The caller's final check runs with the target off its name, as on Linux (step 4): a compaction publishes its
+      // new tail at the free name (pi-fabric#913 Windows CI). The move is by path; the helper then verifies every
+      // moved entry by its judged id, so a swapped entry is refused and stays at the grave name, reported.
+      const grave = path.join(path.dirname(target), `.retention-graveyard-${process.pid}-${randomUUID()}`);
+      fs.renameSync(target, grave);
+      const moved = entries.map(({ file, stat }) => ({ file: grave + file.slice(target.length), stat }));
+      try { windowsRemove(windowsHelper, moved, true); }
+      catch (error) { return no(`${error instanceof Refusal ? error.message : code(error)} (swapped during removal; left at ${grave})`, grave); }
+      let keep: boolean;
+      try { keep = !options.proceed(); } catch { keep = true; }
+      if (keep) {
+        // ponytail: lstat, then rename back (Windows rename replaces): a same-user create in between is the
+        // smarty-dev#7800 class; the Linux path has the same check-then-move.
+        try { fs.lstatSync(target); return no("kept by the final check; name is taken, left in the graveyard", grave); }
+        catch { /* the name is free */ }
+        try { fs.renameSync(grave, target); } catch (error) { return no(`kept by the final check; move back failed (${code(error)}), left in the graveyard`, grave); }
+        return no("kept by the final check");
+      }
+      try { windowsRemove(windowsHelper, moved, false); }
+      catch (error) { return no(`${error instanceof Refusal ? error.message : code(error)}; the rest is left in the graveyard`, grave); }
+      countRemoval(deleter, bytes);
+      return { removed: true, bytes };
+    } catch (error) {
+      return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
+    }
+  }
   if (process.platform !== "linux" && options.fallback) {
     // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2). The size
     // walk runs only for a report: in-process sweeps keep main's filesystem cost (actor-manager-startup #4250 guard).

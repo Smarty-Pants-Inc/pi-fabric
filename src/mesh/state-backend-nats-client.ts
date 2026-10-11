@@ -36,19 +36,34 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         const varz = await response.json() as { jetstream?: { config?: { sync_always?: unknown } } };
         syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
       }
-      return { version: nc.info?.version ?? "0.0.0", syncAlways };
+      return { version: nc.info?.version ?? "0.0.0", syncAlways,
+        ...(typeof nc.info?.max_payload === "number" ? { maxPayload: nc.info.max_payload } : {}),
+        authRequired: nc.info?.auth_required === true };
     },
-    ensureStream: async (stream, subject) => {
-      try { return { lastSeq: (await jsm.streams.info(stream)).state.last_seq }; }
+    ensureStream: async (stream, subjects, { maxMsgSize }) => {
+      let info;
+      try { info = await jsm.streams.info(stream); }
       catch (error) { if (apiCode(error) !== STREAM_NOT_FOUND) throw error; }
-      const created = await jsm.streams.add({ name: stream, subjects: [subject], storage: StorageType.File, num_replicas: 1 });
-      return { lastSeq: created.state.last_seq };
+      if (!info) {
+        // The stream itself refuses a larger message (pi-fabric#907): the server enforces the cap, not only the client.
+        const created = await jsm.streams.add({ name: stream, subjects, storage: StorageType.File, num_replicas: 1, max_msg_size: maxMsgSize });
+        return { lastSeq: created.state.last_seq, maxMsgSize: created.config.max_msg_size };
+      }
+      const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
+      if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
+      return { lastSeq: info.state.last_seq, maxMsgSize: info.config.max_msg_size };
     },
     lastSequence: async (stream) => (await jsm.streams.info(stream)).state.last_seq,
+    firstSequence: async (stream) => (await jsm.streams.info(stream)).state.first_seq,
     getMessage: async (stream, seq) => {
       const message = await jsm.streams.getMessage(stream, { seq });
       return message ? { seq: message.seq, data: message.data } : undefined;
     },
+    lastBySubject: async (stream, subject) => {
+      const message = await jsm.streams.getMessage(stream, { last_by_subj: subject });
+      return message ? { seq: message.seq, data: message.data } : undefined;
+    },
+    purge: async (stream, beforeSeq) => { await jsm.streams.purge(stream, { seq: beforeSeq }); },
     publish: async (subject, data, { expectLastSequence, msgID }) => {
       try {
         const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });

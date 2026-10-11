@@ -6,9 +6,11 @@ import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { MESH_STATE_BUSY_CODE, MeshShadowNotReconciledError, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
   ShadowStateBackend, SqliteStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
+import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
   type MeshStoreOptions } from "../src/mesh/store.js";
+import { itFor, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const other: MeshIdentity = { id: "other", name: "other", kind: "actor" };
@@ -27,6 +29,12 @@ const open = (root: string, options: MeshStoreOptions = {}): MeshStore => {
   return store;
 };
 
+// The contract cases run on every backend kind; `nats` needs its root prepared on a real server first (smarty-dev#7504).
+const openAs = async (root: string, kind: "file" | "sqlite" | "nats", options: MeshStoreOptions = {}): Promise<MeshStore> => {
+  if (kind === "nats") await prepareNatsRoot(root, options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs });
+  return open(root, { ...options, stateBackend: kind });
+};
+
 const shadowOf = (store: MeshStore): ShadowStateBackend => {
   const backend = store.stateBackendHandle;
   if (!(backend instanceof ShadowStateBackend)) throw new Error(`not a shadow backend: ${backend.kind}`);
@@ -38,7 +46,10 @@ beforeEach(() => { vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", ""); });
 afterEach(() => {
   vi.unstubAllEnvs();
   for (const store of stores.splice(0)) try { store.closeState(); } catch { /* closed by the test */ }
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) {
+    closeNatsStateBackend(root);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // Reads without the wall clock: updatedAt differs between two runs by construction.
@@ -94,7 +105,8 @@ describe("state backend selection", () => {
   });
 });
 
-describe("file and sqlite give identical reads for the same operation sequence", () => {
+describe("file, sqlite and nats give identical reads for the same operation sequence", () => {
+  reportNatsSkip();
   const script = async (store: MeshStore, random: () => number): Promise<unknown[]> => {
     const trace: unknown[] = [];
     const keys = ["a", "b", "c", "ns/x", "ns/y", "ns:z"];
@@ -138,18 +150,18 @@ describe("file and sqlite give identical reads for the same operation sequence",
     return trace;
   };
 
-  it("in a scripted and a seeded random sequence", async () => {
+  for (const kind of ["sqlite", "nats"] as const) itFor(kind)(`${kind} matches file in a scripted and a seeded random sequence`, async () => {
     const file = open(tempRoot("diff-file"), { stateBackend: "file" });
-    const sqlite = open(tempRoot("diff-sqlite"), { stateBackend: "sqlite" });
-    expect(sqlite.stateBackend).toBe("sqlite");
+    const other = await openAs(tempRoot(`diff-${kind}`), kind);
+    expect(other.stateBackend).toBe(kind);
     const fileTrace = await script(file, prng(7));
-    const sqliteTrace = await script(sqlite, prng(7));
-    expect(sqliteTrace).toEqual(fileTrace);
+    const otherTrace = await script(other, prng(7));
+    expect(otherTrace).toEqual(fileTrace);
     expect(fileTrace.some(step => JSON.stringify(step).includes("MeshBatchConflictError"))).toBe(true);
-  });
+  }, 60_000);
 
-  it("snapshot tokens pin reads in sqlite", async () => {
-    const store = open(tempRoot("token"), { stateBackend: "sqlite" });
+  for (const kind of ["sqlite", "nats"] as const) itFor(kind)(`snapshot tokens pin reads in ${kind}`, async () => {
+    const store = await openAs(tempRoot("token"), kind);
     await store.put({ key: "a", value: 1, identity });
     const token = store.stateToken();
     expect(store.stateToken()).toBe(token);
@@ -161,9 +173,11 @@ describe("file and sqlite give identical reads for the same operation sequence",
   });
 });
 
-describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (kind) => {
+describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s backend", (kind) => {
+  const it = itFor(kind);
+  if (kind === "nats") reportNatsSkip();
   it("re-reads when the fileRead stamp changes before the transaction and gives prepare the fresh read", async () => {
-    const store = open(tempRoot(`fileread-${kind}`), { stateBackend: kind });
+    const store = await openAs(tempRoot(`fileread-${kind}`), kind);
     let stamps = 0;
     let reads = 0;
     const seen: unknown[] = [];
@@ -189,7 +203,7 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
     fs.writeFileSync(source, "v1");
     let reads = 0;
     const seen: unknown[] = [];
-    const store = open(root, { stateBackend: kind });
+    const store = await openAs(root, kind);
     const results = await store.writeBatch({
       identity, ops: [],
       fileRead: {
@@ -211,7 +225,7 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
   });
 
   it("gives up with MeshStateFileReadChangedError and writes nothing when the stamp never holds", async () => {
-    const store = open(tempRoot(`fileread-fail-${kind}`), { stateBackend: kind });
+    const store = await openAs(tempRoot(`fileread-fail-${kind}`), kind);
     let tick = 0;
     await expect(store.writeBatch({
       identity, ops: [{ kind: "put", key: "k", value: 1 }],
@@ -222,7 +236,7 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
 
   it("runs commitOutbox once after COMMIT, outside the state lock, with the committed effects", async () => {
     const root = tempRoot(`outbox-${kind}`);
-    const store = open(root, { stateBackend: kind });
+    const store = await openAs(root, kind);
     await store.put({ key: "keep", value: 0, identity });
     const effects: MeshCommitEffects[] = [];
     const lockHeld: boolean[] = [];
@@ -245,7 +259,7 @@ describe.each(["file", "sqlite"] as const)("R11 callbacks on the %s backend", (k
   });
 
   it("a throwing commitOutbox rejects the call but the commit stands; a conflict never reaches it", async () => {
-    const store = open(tempRoot(`outbox-throw-${kind}`), { stateBackend: kind });
+    const store = await openAs(tempRoot(`outbox-throw-${kind}`), kind);
     await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "k", value: 1 }],
       commitOutbox: () => { throw new Error("outbox down"); } })).rejects.toThrow("outbox down");
     expect(store.get("k")?.value).toBe(1);

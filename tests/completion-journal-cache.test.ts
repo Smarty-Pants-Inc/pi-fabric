@@ -39,7 +39,7 @@ describe("completion journal unchanged routing metadata", () => {
     for (let i = 1; i <= 300; i++) { const result = h.seed(i); files.add(h.file(result.id)); consumeCompletion(h.meshRoot, result.id, "away"); }
     const open = vi.spyOn(fs.promises, "open"); const read = vi.spyOn(fs.promises, "readFile");
     await h.journal.drain();
-    expect(open.mock.calls.filter(([file]) => files.has(String(file)))).toHaveLength(300); // Not twice in one pass.
+    expect(open.mock.calls.filter(([file]) => files.has(String(file)))).toHaveLength(0); // Already archived on receipt.
     open.mockClear(); read.mockClear();
     for (let i = 0; i < 3; i++) await h.journal.drain();
     expect(open.mock.calls.filter(([file]) => files.has(String(file)))).toHaveLength(0);
@@ -99,12 +99,12 @@ describe("completion journal unchanged routing metadata", () => {
     expect(h.enqueue).not.toHaveBeenCalled(); expect(fs.existsSync(h.file(result.id))).toBe(true);
   });
 
-  it("reopens an eligible cleanup address and confirms its receipt even after cache warmup", async () => {
+  it("does not reopen an archived address or receipt after cache warmup", async () => {
     const h = setup(); const result = h.seed(1); await h.journal.drain(); Object.assign(h.recipient, h.foreign);
     consumeCompletion(h.meshRoot, result.id, "away");
     const open = vi.spyOn(fs.promises, "open"); await h.journal.drain();
-    expect(open.mock.calls.some(([target]) => String(target) === h.file(result.id))).toBe(true);
-    expect(open.mock.calls.some(([target]) => String(target) === h.receipt(result.id))).toBe(true);
+    expect(open.mock.calls.some(([target]) => String(target) === h.file(result.id))).toBe(false);
+    expect(open.mock.calls.some(([target]) => String(target) === h.receipt(result.id))).toBe(false);
     expect(fs.existsSync(h.file(result.id))).toBe(false); expect(fs.existsSync(h.receipt(result.id))).toBe(true);
     expect(h.enqueue).not.toHaveBeenCalled();
   });

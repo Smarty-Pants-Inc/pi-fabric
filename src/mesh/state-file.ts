@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
@@ -5,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
@@ -254,6 +255,8 @@ interface PreparedStateCommit {
   namespaces: Record<string, string> | undefined;
   serializedText: string;
   temporary?: string;
+  /** Unregisters the staged temp from the process-exit cleanup hook. */
+  releaseTemporary?: () => void;
 }
 const WRITE_SNAPSHOT_CHANGED = Symbol("mesh write snapshot changed");
 
@@ -551,7 +554,7 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
     } else return false;
     const start = childProcess.execFileSync(executable, args, { encoding: "utf8", timeout: 2_000,
       maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+      env: childProcessEnvironment({ ...process.env, LC_ALL: "C", TZ: "UTC" }) }).trim();
     return Date.parse(process.platform === "win32" ? start : `${start} UTC`) > modifiedAt;
   } catch { return false; }
 };
@@ -912,8 +915,18 @@ export class StateFile implements StateBackend {
         // State remains a soft-state atomic replacement (no durability policy change).
         // Stage the large write off-lock too; custody only compares identity and renames.
         const temporary = `${this.#statePath}.${process.pid}.${randomUUID()}.prepared.tmp`;
-        writeFileAtomic(temporary, prepared.encoded.serialized);
+        // Registered before staging: an exit while this write awaits the mesh lock (a Main
+        // /quit, a worker/resident exit or SIGTERM) removes it (smarty-dev#6622). A kill -9
+        // leaves it to the existing prepared-state sweep or the host reaper's janitor.
+        const release = trackTemporary(temporary);
+        try { writeFileAtomic(temporary, prepared.encoded.serialized); }
+        catch (error) {
+          try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+          release();
+          throw error;
+        }
         prepared.temporary = temporary;
+        prepared.releaseTemporary = release;
       }
       return { state, ...outcome, prepared };
     }, ({ state, result, keys, prepared }) => {
@@ -923,6 +936,7 @@ export class StateFile implements StateBackend {
     }, ({ prepared }) => {
       if (prepared?.temporary) {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+        prepared.releaseTemporary?.();
       }
     }, "put/delete");
   }

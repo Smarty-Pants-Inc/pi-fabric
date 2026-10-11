@@ -352,7 +352,7 @@ The profile is `PI_CODING_AGENT_DIR`, or `~/.pi/agent`; relative settings paths
 resolve from that profile directory. Fabric does not install missing packages or
 replay project resources, and its pinned Fabric extension loads separately. An
 installed npm package whose version does not satisfy the configured spec is
-skipped with a warning, because Pi would reinstall it rather than load it.
+skipped with a warning, because Pi would reinstall it instead of loading it.
 Explicitly disabled extensions and resident startup probes do not replay profile
 hooks.
 

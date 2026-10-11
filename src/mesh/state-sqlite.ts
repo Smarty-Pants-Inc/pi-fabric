@@ -549,7 +549,7 @@ const writeCheckpointLog = (line: string): void => {
 const round1 = (ms: number): number => Math.round(ms * 10) / 10;
 // ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
 // within minutes (~6-7 min at 2.5 commits/s); normal peaks are ~6-11 MiB (smarty-dev#6477).
-const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
+export const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
 /** `walHardCapBytes`, validated: a finite number greater than 0 (pi-fabric#694: 0 no longer disables the cap). */
 const walHardCapOf = (options: SqliteStateStoreOptions): number => {
   const cap = options.walHardCapBytes ?? DEFAULT_WAL_HARD_CAP_BYTES;

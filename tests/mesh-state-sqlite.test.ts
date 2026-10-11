@@ -2,10 +2,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import {
-  filesystemRefusal, MeshStateRetiredError, openNodeSqlite, SqliteStateStore, type SqliteConnection, type SqliteStateStoreOptions,
+  DEFAULT_WAL_HARD_CAP_BYTES, filesystemRefusal, MeshStateRetiredError, openNodeSqlite, SqliteStateStore, type SqliteConnection, type SqliteStateStoreOptions,
 } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -524,6 +524,10 @@ describe("SqliteStateStore", () => {
     expect(reconciled).toBe(true);
   }, 60_000);
 
+  // pi-fabric#891: the store's write-refusing WAL hard cap (walHardCapBytes default), the last resort.
+  const STORE_WAL_CEILING = DEFAULT_WAL_HARD_CAP_BYTES;
+  const capRefusalsOf = (results: ChildResult[]): number =>
+    results.reduce((sum, result) => sum + ((JSON.parse(result.stdout.trim().split("\n").at(-1)!) as { capRefusals?: number }).capRefusals ?? 0), 0);
   // 16 processes by default (host memory budget); PI_FABRIC_STATE_SQLITE_PROCS=40 reruns the design's 40.
   // The fill traffic is fixed (2,400 puts of 3 KB), so the WAL bound below discriminates at any count.
   const procs = Math.max(4, Number(process.env.PI_FABRIC_STATE_SQLITE_PROCS ?? 16));
@@ -533,13 +537,19 @@ describe("SqliteStateStore", () => {
     await maintainer.put({ key: "ctr/shared", value: 0, identity });
     const go = path.join(root, "go");
     const stop = path.join(root, "stop");
+    // smarty-dev#7651: the window is work, not wall time. Writers keep filling past their 2,400 puts until the
+    // maintainer's TRUNCATE has succeeded WINS times against the constant readers, up to 4x the traffic: a slow
+    // runner (Windows, 2 cores) gets enough of the maintainer's 1 s-backoff attempts, and a starved, stopped or
+    // ineffective checkpoint still fails at the cap.
+    const WINS = 3;
+    const truncated = path.join(root, "truncated");
     const writers = Math.ceil(procs / 2);
     const readers = procs - writers;
     const increments = 25;
     const fills = Math.ceil(2_400 / writers);
     const children = [
       ...Array.from({ length: writers }, (_, index) => child(`
-        const [root, go, index, increments, fills] = process.argv.slice(1);
+        const [root, go, index, increments, fills, truncated] = process.argv.slice(1);
         const store = await SqliteStateStore.open(root, 65536, 1000);
         fs.writeFileSync(path.join(root, "ready-w" + index), "");
         while (!fs.existsSync(go)) await new Promise(r => setTimeout(r, 5));
@@ -552,9 +562,14 @@ describe("SqliteStateStore", () => {
           }
         }
         const filler = "f".repeat(3000);
-        for (let i = 0; i < Number(fills); i++) await store.put({ key: "fill/" + index + "/" + (i % 8), value: { i, filler }, identity });
-        console.log(JSON.stringify({ conflicts, stats: store.stats() }));
-        store.close();`, [root, go, String(index), String(increments), String(fills)])),
+        let filled = 0;
+        let capRefusals = 0;
+        for (; filled < Number(fills) * 4 && (filled < Number(fills) || !fs.existsSync(truncated)); filled++) {
+          try { await store.put({ key: "fill/" + index + "/" + (filled % 8), value: { i: filled, filler }, identity }); }
+          catch (error) { if (error.code !== "FABRIC_MESH_STATE_WAL_CAP") throw error; capRefusals++; }
+        }
+        console.log(JSON.stringify({ conflicts, filled, capRefusals, stats: store.stats() }));
+        store.close();`, [root, go, String(index), String(increments), String(fills), truncated])),
       ...Array.from({ length: readers }, (_, index) => child(`
         const [root, go, stop, index] = process.argv.slice(1);
         const store = await SqliteStateStore.open(root, 65536, 1000);
@@ -567,10 +582,26 @@ describe("SqliteStateStore", () => {
         store.close();`, [root, go, stop, String(index)])),
     ];
     await waitFor(() => fs.readdirSync(root).filter(name => name.startsWith("ready-")).length === writers + readers, 90_000, `${procs} children ready`);
-    let maxWal = 0;
-    const sampler = setInterval(() => { maxWal = Math.max(maxWal, maintainer.walBytes()); }, 10);
+    // smarty-dev#7651 (pi-fabric#891 review): count the maintainer's own successful TRUNCATEs from their result rows.
+    // The maintainer is the only connection in this process (children are other processes), and by SQLite's
+    // contract a TRUNCATE with busy = 0 and every frame checkpointed resets the WAL to zero bytes. A pass-through
+    // spy on StatementSync.get reads that row; it changes nothing the store runs.
+    const { StatementSync } = process.getBuiltinModule("node:sqlite") as { StatementSync: { prototype: { get: (...args: unknown[]) => unknown } } };
+    const statementGet = StatementSync.prototype.get;
+    let wins = 0, inLoad = true, peakBefore = 0, peakAfter = 0;
+    vi.spyOn(StatementSync.prototype, "get").mockImplementation(function (this: { sourceSQL?: string }, ...args: unknown[]) {
+      const row = statementGet.apply(this, args) as { busy?: number; log?: number; checkpointed?: number } | undefined;
+      if (inLoad && this.sourceSQL === "PRAGMA wal_checkpoint(TRUNCATE)" && row?.busy === 0 && row.log === row.checkpointed) wins++;
+      return row;
+    });
+    const sampler = setInterval(() => {
+      const wal = maintainer.walBytes();
+      if (wins === 0) peakBefore = Math.max(peakBefore, wal); else peakAfter = Math.max(peakAfter, wal);
+      if (wins >= WINS && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
+    }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
+    inLoad = false;
     fs.writeFileSync(stop, "");
     const readerResults = await Promise.all(children.slice(writers).map(entry => entry.done));
     clearInterval(sampler);
@@ -578,16 +609,78 @@ describe("SqliteStateStore", () => {
     expect(maintainer.get("ctr/shared")?.value).toBe(writers * increments);
     const reads = readerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { reads: number }).reads, 0);
     const stats = maintainer.stats();
-    const walTraffic = writers * fills * 3_000;
-    // Evidence for the PR: WAL bound versus the bytes written through it.
-    console.log(JSON.stringify({ maxWal, walTraffic, reads, checkpoints: stats.checkpoints }));
+    const walTraffic = writerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { filled: number }).filled, 0) * 3_000;
+    // Evidence for the PR: the WAL peaks before and after the first in-load win, and the wins.
+    console.log(JSON.stringify({ wins, peakBefore, peakAfter, walTraffic, reads, checkpoints: stats.checkpoints }));
     expect(reads).toBeGreaterThan(readers);
-    expect(stats.checkpoints.truncate).toBeGreaterThan(0);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe).
-    expect(maxWal).toBeLessThan(Math.max(16 * 1024 * 1024, walTraffic / 2));
+    // smarty-dev#7651: the maintainer is guarded by its wins (WINS successful in-load TRUNCATEs against the constant
+    // readers, within a window bounded by work); the emergency checkpoint (64 MiB, emergencyCheckpointBytes) by
+    // this ceiling: the WAL stays under the store's write-refusing hard cap (walHardCapBytes, 96 MiB), and no write
+    // is ever refused. The hard cap is the last resort and must not be reached. Measured on 2 cores + 2 burners: at
+    // most 76.1 MB over 40 runs (20 maintained, 20 maintainer-less). The test below shows the ceiling guards something.
+    expect(wins).toBeGreaterThanOrEqual(WINS);
+    expect(Math.max(peakBefore, peakAfter)).toBeLessThan(STORE_WAL_CEILING);
+    expect(capRefusalsOf(writerResults)).toBe(0);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();
+  }, 180_000);
+
+  // The ceiling above guards something: with the maintainer AND the emergency checkpoint (1 GiB) disabled, the WAL
+  // reaches the hard cap (kept at its default) and writes are refused. The WAL reset is off too (existing option),
+  // and SQLite's autocheckpoint off through a test-only wrap of DatabaseSync.exec in the writer processes (test code
+  // only; there is no option for it, and with it on SQLite restarts the WAL in place between readers).
+  it(`${procs} processes without the maintainer and the emergency checkpoint reach the WAL hard cap`, async () => {
+    const root = tempRoot("ceiling");
+    const off = { emergencyCheckpointBytes: 1024 * 1024 * 1024, walResetBytes: 0 };
+    const store = await open(root, off);
+    await store.put({ key: "ctr/shared", value: 0, identity });
+    const go = path.join(root, "go");
+    const stop = path.join(root, "stop");
+    const writers = Math.ceil(procs / 2);
+    const readers = procs - writers;
+    // ~16.9 KB of WAL frames per 3 KB put (measured: 11,000 puts -> 186 MB): 7,000 puts (~118 MB of frames) are
+    // enough to reach the 96 MiB (100.7 MB) cap.
+    const fills = Math.ceil(7_000 / writers);
+    const noAutocheckpoint = `
+      const { DatabaseSync } = process.getBuiltinModule("node:sqlite");
+      const exec = DatabaseSync.prototype.exec;
+      DatabaseSync.prototype.exec = function (sql) { return exec.call(this, /^PRAGMA wal_autocheckpoint/.test(sql) ? "PRAGMA wal_autocheckpoint = 0" : sql); };`;
+    const children = [
+      ...Array.from({ length: writers }, (_, index) => child(`${noAutocheckpoint}
+        const [root, go, index, fills] = process.argv.slice(1);
+        const store = await SqliteStateStore.open(root, 65536, 1000, ${JSON.stringify(off)});
+        fs.writeFileSync(path.join(root, "ready-w" + index), "");
+        while (!fs.existsSync(go)) await new Promise(r => setTimeout(r, 5));
+        const filler = "f".repeat(3000);
+        let capRefusals = 0;
+        for (let i = 0; i < Number(fills); i++) {
+          try { await store.put({ key: "fill/" + index + "/" + (i % 8), value: { i, filler }, identity }); }
+          catch (error) { if (error.code !== "FABRIC_MESH_STATE_WAL_CAP") throw error; capRefusals++; }
+        }
+        console.log(JSON.stringify({ capRefusals }));
+        store.close();`, [root, go, String(index), String(fills)])),
+      ...Array.from({ length: readers }, (_, index) => child(`
+        const [root, go, stop, index] = process.argv.slice(1);
+        const store = await SqliteStateStore.open(root, 65536, 1000, ${JSON.stringify(off)});
+        fs.writeFileSync(path.join(root, "ready-r" + index), "");
+        while (!fs.existsSync(go)) await new Promise(r => setTimeout(r, 5));
+        while (!fs.existsSync(stop)) { store.listAll("fill/"); store.get("ctr/shared"); }
+        store.close();`, [root, go, stop, String(index)])),
+    ];
+    await waitFor(() => fs.readdirSync(root).filter(name => name.startsWith("ready-")).length === writers + readers, 90_000, `${procs} children ready`);
+    let peak = 0;
+    const sampler = setInterval(() => { peak = Math.max(peak, store.walBytes()); }, 10);
+    fs.writeFileSync(go, "");
+    const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
+    fs.writeFileSync(stop, "");
+    const readerResults = await Promise.all(children.slice(writers).map(entry => entry.done));
+    clearInterval(sampler);
+    peak = Math.max(peak, store.walBytes());
+    for (const result of [...writerResults, ...readerResults]) expect(result.code, result.stderr).toBe(0);
+    const capRefusals = capRefusalsOf(writerResults);
+    console.log(JSON.stringify({ ceilingMutation: true, peak, capRefusals, puts: writers * fills }));
+    expect(peak >= STORE_WAL_CEILING || capRefusals > 0).toBe(true); // the ceiling assertion above trips
   }, 180_000);
 
   it("confirms durability with a PASSIVE checkpoint and reports change stamps", async () => {

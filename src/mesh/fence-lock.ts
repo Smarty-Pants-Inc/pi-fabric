@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
@@ -104,7 +104,7 @@ const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undef
  * 343-413, custody-lock.ts:107-134, proven by tests/mesh-fence-lock.test.ts for both trees). Even then it
  * empties our own receipt; it never touches a successor's record.
  *
- * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `owner.released.<token>`, never
+ * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `r.<8 random hex>`, never
  * out of the directory), verified, and either removed with an rmdir or linked back without clobbering; a foreign
  * record that cannot go back stays in `<lock>`, so the directory stays non-empty and nobody else can mkdir,
  * publish into or rmdir it. Residual there: only after a live owner's lock was replaced (the same precondition)
@@ -131,7 +131,9 @@ export const releaseFenceLock = (lock: string, record: string,
   const ownerPath = path.join(lock, "owner");
   try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; }
   hooks.afterCheck?.();
-  const taken = path.join(lock, `owner.released.${record.split("\n")[0] ?? ""}`);
+  // Short: Windows takes this path, and a deep mesh root must stay under MAX_PATH (smarty-dev#8777). Only this
+  // function reads the name back; any taken file still keeps <lock> non-empty, whatever its name.
+  const taken = path.join(lock, `r.${randomBytes(4).toString("hex")}`);
   try { fs.renameSync(ownerPath, taken); } catch { return; }
   hooks.afterTake?.();
   let ours = false;

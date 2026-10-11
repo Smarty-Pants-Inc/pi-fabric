@@ -6,6 +6,7 @@ import { ChildCompletionClaimLostError } from "../result-consumption.js";
 export { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { ARCHIVE_PENDING_FILE, commitRunArchive, readPendingRunArchives } from "../agents/archive-custody.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import type { AgentRunResult, AgentSpawner } from "../agents/types.js";
 
 export type ActorChildResult = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
@@ -349,23 +350,33 @@ export class ActorChildCompletionStore {
 
   /** On the existing retention sweep, bound unread archives and receipt tombstones. */
   prune(retentionMs: number, now = Date.now(), keepIds: ReadonlySet<string> = new Set()): void {
-    const groups = new Map<string, { files: string[]; newest: number }>();
+    // smarty-dev#7916: each file's owned stat is taken at judgment; only that inode is removed.
+    const groups = new Map<string, { files: { file: string; stat: fs.Stats | undefined }[]; newest: number }>();
     try {
       for (const name of fs.readdirSync(this.directory)) {
         const id = STORED_FILE.exec(name)?.[1];
         if (!id || keepIds.has(id)) continue;
         const file = path.join(this.directory, name);
         const group = groups.get(id) ?? { files: [], newest: 0 };
-        group.files.push(file);
-        group.newest = Math.max(group.newest, fs.statSync(file).mtimeMs);
+        // One stat for both the age and the removal (pi-fabric#850 round 1 SEC P1): a second stat could describe a
+        // swapped-in older inode and make a fresh group look expired. Without an owned stat (a link, hard-linked or
+        // not ours) Linux removes nothing; off Linux main's age stat and removal stay (smarty-dev#7858).
+        const stat = ownedStat(file);
+        group.files.push({ file, stat });
+        group.newest = Math.max(group.newest, stat?.mtimeMs ?? (process.platform === "linux" ? Infinity : fs.statSync(file).mtimeMs));
         groups.set(id, group);
       }
     } catch { return; }
     for (const [id, group] of groups) {
       if (now - group.newest < retentionMs) continue;
       try {
-        for (const file of group.files) fs.rmSync(file, { force: true });
-        this.#checked.delete(id);
+        let all = true;
+        for (const { file, stat } of group.files) {
+          // No owned stat: refused on Linux; off Linux main's removal runs unchanged (smarty-dev#7858).
+          if (!verifiedRemove(file, stat, { deleter: "childCompletionsPrune",
+            fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) all = false;
+        }
+        if (all) this.#checked.delete(id);
       } catch { /* Best effort, like actor run retention. */ }
     }
   }

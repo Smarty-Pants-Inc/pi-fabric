@@ -10,6 +10,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { residentProcessAlive } from "../src/residency/process-identity.js";
+import type { WindowsRequestFileReport } from "../src/residency/windows-acl.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -385,6 +386,54 @@ describe("resident channel owner check", () => {
         }
       }
       expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("simulated win32 stop/remove refuse when config.json or owner.json grants another SID write; private metadata passes", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("win32-metadata");
+      const directory = fs.realpathSync(f.config.residencyRoot);
+      const metadata = [path.join(directory, "config.json"), path.join(directory, "owner.json")];
+      const privateReport = (): WindowsRequestFileReport => ({ attributes: 0x20, acl: { user: userSid, owner: userSid, dacl: "present",
+        aces: [userSid, "S-1-5-18", "S-1-5-32-544"].map(sid => ({ type: "Allow" as const, sid, rights: 2032127 })) } });
+      const calls: string[][] = [];
+      const owners = (files: string[]) => ({ owners: files.map(() => userSid), user: userSid });
+      const probe = (foreign?: number) => ({ platform: "win32" as const, windowsOwnerSids: owners,
+        windowsFileAcls: async (files: string[]) => {
+          calls.push(files);
+          return files.map((_, index) => {
+            const report = privateReport();
+            // (W): FILE_WRITE_DATA and friends for another local account.
+            if (index === foreign && "acl" in report) report.acl.aces.push({ type: "Allow", sid: otherSid, rights: 278 });
+            return report;
+          });
+        } });
+      const run = async (action: "stop" | "remove", flags: string[], ownerProbe: Parameters<typeof main>[2]) => {
+        let err = "";
+        const code = await main([action, "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, ...flags],
+          { out: () => {}, err: text => { err += text; } }, ownerProbe);
+        return { code, err };
+      };
+      for (const action of ["stop", "remove"] as const) {
+        for (const foreign of [0, 1]) {
+          for (const flags of [f.confirm, ["--dry-run", ...f.confirm]]) {
+            const refused = await run(action, flags, probe(foreign));
+            expect(refused.code).toBe(1);
+            expect(refused.err).toContain(`Resident metadata is not private to this OS user: ${metadata[foreign]} ` +
+              `(owned or writable by other accounts (${otherSid})); refusing stop/remove`);
+          }
+        }
+        const noQuery = await run(action, f.confirm, { platform: "win32", windowsOwnerSids: owners });
+        expect(noQuery.code).toBe(1);
+        expect(noQuery.err).toContain("Cannot verify that the resident metadata is private to this Windows user (no file ACL query is available); refusing stop/remove");
+      }
+      expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      calls.length = 0;
+      expect(await run("stop", ["--dry-run", ...f.confirm], probe())).toMatchObject({ code: 0, err: "" });
+      expect(calls).toEqual([metadata]);
       expect(f.host.actors.status(actor.id).status).toBe("idle");
     } finally { await f.close(); }
   }, 30_000);

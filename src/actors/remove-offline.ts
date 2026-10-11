@@ -21,6 +21,7 @@ import { acquireMainPublicationFence, deleteRootActorTree } from "../topology/ma
 import { withParticipantFileTryLock } from "../topology/participant-files.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence, type MainToolEvidence } from "../residency/operator-safety.js";
 import { residentActorRoots, residentHostId, residentRoot, type ResidentHostConfig } from "../residency/protocol.js";
+import { assertWindowsResidentMetadataPrivate } from "../residency/windows-acl.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { ActorBindingStore } from "./binding-store.js";
@@ -323,6 +324,8 @@ const readOfflineMarker = (actorRoot: string, id: string, rootId: string): Offli
 export const removeActorOffline = async (directory: string, config: ResidentHostConfig, selector: string,
   options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: MainStoppedAudit } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
+  // Windows: config.json and owner.json are trusted below only when no other account may write them (smarty-dev#6001).
+  await assertWindowsResidentMetadataPrivate([path.join(directory, "config.json"), path.join(directory, "owner.json")], "offline removal");
   assertOwnershipProvable(); // before the fence, any record or any mutation
   // The root's existing resident startup claim, held for the whole removal, in the host's own order
   // (startup claim, then host.lock): no resident host can start on this root meanwhile; it gets

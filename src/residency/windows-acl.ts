@@ -158,7 +158,8 @@ export type WindowsRequestFileReport = { attributes: number; acl: WindowsDirecto
 
 /**
  * Parse the batch report for `count` files. A malformed batch throws (nothing is
- * judged); a malformed or unreadable single file becomes an `error` entry.
+ * judged); a malformed or unreadable single file becomes an `error` entry, which
+ * the callers treat as a failed batch (nothing is consumed or trusted).
  */
 export function parseWindowsFileAclBatch(output: string, count: number): WindowsRequestFileReport[] {
   const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
@@ -253,6 +254,40 @@ export interface WindowsRequestsAclDeps {
 export const windowsRequestsAclAdapters: Required<WindowsRequestsAclDeps> = {
   readAcl: readWindowsDirectoryAcl, restrict: restrictWindowsDirectory, readFileAcls: readWindowsFileAcls,
 };
+
+/**
+ * Windows: fail closed unless each resident metadata file (config.json, owner.json) is as private as a pending
+ * request file, judged by the same batch report and policy (windowsRequestFileViolations). Whoever can write these
+ * files picks the root, mesh, process and paths an operator tool acts on, so an owner SID check alone is not
+ * enough: a foreign owner, a foreign write-class ACE, a NULL or missing DACL, a reparse point, or an unreadable
+ * report refuses. POSIX: no-op (callers check the uid).
+ */
+export async function assertWindowsResidentMetadataPrivate(files: string[], refusing: string,
+  platform: NodeJS.Platform = process.platform,
+  readFileAcls: (files: string[]) => Promise<WindowsRequestFileReport[]> = windowsRequestsAclAdapters.readFileAcls): Promise<void> {
+  if (platform !== "win32") return;
+  const cannot = (reason: string) =>
+    new Error(`Cannot verify that the resident metadata is private to this Windows user (${reason}); refusing ${refusing}`);
+  const entries = files.map(file => {
+    const stat = fs.lstatSync(file);
+    return { file, regularFile: stat.isFile(), symbolicLink: stat.isSymbolicLink() };
+  });
+  let reports: WindowsRequestFileReport[];
+  try {
+    reports = await readFileAcls(files);
+  } catch (error) {
+    throw cannot(error instanceof Error ? error.message : String(error));
+  }
+  if (reports.length !== files.length) throw cannot(`expected ${files.length} file reports, got ${reports.length}`);
+  entries.forEach(({ file, regularFile, symbolicLink }, index) => {
+    const report = reports[index]!;
+    if ("error" in report) throw cannot(`${file}: ${report.error}`);
+    const violations = windowsRequestFileViolations({ regularFile, symbolicLink, report });
+    if (violations.length > 0) {
+      throw new Error(`Resident metadata is not private to this OS user: ${file} (${violations.join("; ")}); refusing ${refusing}`);
+    }
+  });
+}
 
 /** Fail closed unless only this user, SYSTEM and Administrators own or may write the directory. */
 export async function assertWindowsRequestsDirectoryPrivate(directory: string,
@@ -392,9 +427,11 @@ export class WindowsRequestsGuard {
    * Windows: the pending entries (names in this directory) that may be consumed.
    * The directory DACL says nothing about files planted before it was tightened,
    * so each file is checked (see windowsRequestFileViolations) with one batch ACL
-   * read. A violating or unverifiable file is renamed to a quarantine name (no
-   * `.json` suffix, so it is never enumerated again) with a logged alarm, and is
-   * never returned. If the batch read itself fails nothing is returned this time.
+   * read. A file with a clean report that violates the policy is renamed to a
+   * quarantine name (no `.json` suffix, so it is never enumerated again) with a
+   * logged alarm, and is never returned. If the batch read fails, or any single
+   * file's report is unreadable or malformed, the whole batch is aborted: nothing
+   * is returned or quarantined this time, and each distinct failure alarms once.
    * POSIX returns the entries unchanged.
    */
   async screenPending(entries: string[]): Promise<string[]> {
@@ -413,10 +450,15 @@ export class WindowsRequestsGuard {
       const readFileAcls = this.#deps().readFileAcls ?? windowsRequestsAclAdapters.readFileAcls;
       reports = await readFileAcls(candidates.map(candidate => candidate.file));
       if (reports.length !== candidates.length) throw new Error(`expected ${candidates.length} file reports, got ${reports.length}`);
+      // One unreadable or malformed per-file report aborts the whole batch; valid siblings wait for the next poll.
+      const unreadable = reports.findIndex(report => "error" in report);
+      if (unreadable !== -1) {
+        throw new Error(`${candidates[unreadable]!.file}: ${(reports[unreadable] as { error: string }).error}`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message !== this.#screenFailure) {
-        console.error(`[pi-fabric] Not consuming resident requests in ${this.directory}: cannot verify the request files (${message}); retrying`);
+        console.error(`[pi-fabric] ALARM: not consuming resident requests in ${this.directory}: cannot verify the request files (${message}); retrying`);
       }
       this.#screenFailure = message;
       return [];

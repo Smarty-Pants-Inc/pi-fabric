@@ -3,7 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
-import { windowsPowerShellPath } from "./residency/windows-acl.js";
+import { assertWindowsResidentMetadataPrivate, windowsPowerShellPath, windowsRequestsAclAdapters,
+  type WindowsRequestFileReport } from "./residency/windows-acl.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
 
@@ -55,6 +56,8 @@ export interface ResidentChannelOwnerProbe {
   getuid?: () => number;
   /** win32 only: owner SID of each path followed by the current user's SID. */
   windowsOwnerSids?: (files: string[]) => { owners: string[]; user: string };
+  /** win32 only: the batch ACL report of each resident metadata file (the request-file policy). */
+  windowsFileAcls?: (files: string[]) => Promise<WindowsRequestFileReport[]>;
 }
 
 const windowsSidScript = [
@@ -79,7 +82,8 @@ export function windowsOwnerSids(files: string[]): { owners: string[]; user: str
 }
 
 const defaultOwnerProbe = (): ResidentChannelOwnerProbe => ({ platform: process.platform,
-  ...(process.getuid ? { getuid: () => process.getuid!() } : {}), windowsOwnerSids });
+  ...(process.getuid ? { getuid: () => process.getuid!() } : {}), windowsOwnerSids,
+  windowsFileAcls: files => windowsRequestsAclAdapters.readFileAcls(files) });
 const sidPattern = /^S-1-\d+(-\d+)+$/;
 
 /** Fail closed unless every channel path is a non-symlink owned by the invoking OS user. */
@@ -151,6 +155,9 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     // Local OS user boundary, independent of the invoking Fabric session's root.
     assertResidentChannelOwned([directory, path.join(directory, "config.json"), path.join(directory, "owner.json"),
       path.join(directory, "requests"), path.join(directory, "responses")], ownerProbe);
+    // Windows: an owner SID does not make the metadata private; another SID may hold a write ACE (smarty-dev#6001).
+    await assertWindowsResidentMetadataPrivate([path.join(directory, "config.json"), path.join(directory, "owner.json")],
+      "stop/remove", ownerProbe.platform, ownerProbe.windowsFileAcls ?? (async () => { throw new Error("no file ACL query is available"); }));
     const config = JSON.parse(fs.readFileSync(path.join(directory, "config.json"), "utf8")) as ResidentHostConfig;
     const owner = JSON.parse(fs.readFileSync(path.join(directory, "owner.json"), "utf8")) as ResidentHostOwner;
     if (typeof config.rootId !== "string" || typeof config.meshRoot !== "string" ||

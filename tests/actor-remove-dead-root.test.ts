@@ -22,6 +22,7 @@ import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile, writeParticipantFile } from "../src/topology/participant-files.js";
+import { windowsRequestsAclAdapters, type WindowsRequestFileReport } from "../src/residency/windows-acl.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { deleteRootActorTree, mainPublicationFencePath, mainPublicationFenced, takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
@@ -447,6 +448,38 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
     } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }
+  }, 40_000);
+
+  it("offline: simulated win32 refuses before any change when owner.json grants another SID write; private metadata passes (smarty-dev#6001)", async () => {
+    const f = await fixture();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const userSid = "S-1-5-21-1-2-3-1001", otherSid = "S-1-5-21-1-2-3-1002";
+    const report = (foreign: boolean): WindowsRequestFileReport => ({ attributes: 0x20, acl: { user: userSid, owner: userSid, dacl: "present",
+      aces: [userSid, "S-1-5-18", "S-1-5-32-544", ...(foreign ? [otherSid] : [])].map(sid => ({ type: "Allow" as const, sid, rights: sid === otherSid ? 278 : 2032127 })) } });
+    const calls: string[][] = [];
+    // win32 only for the metadata check: the rest of the offline removal needs Linux flock fences.
+    const answer = (foreignIndex?: number) => async (files: string[]) => {
+      calls.push(files); Object.defineProperty(process, "platform", platform);
+      return files.map((_, index) => report(index === foreignIndex));
+    };
+    const spy = vi.spyOn(windowsRequestsAclAdapters, "readFileAcls");
+    try {
+      const actor = await f.create("win32-metadata");
+      await f.killResident();
+      const metadata = [path.join(f.config.residencyRoot, "config.json"), path.join(f.config.residencyRoot, "owner.json")];
+      const options = { confirmDeadRoot: f.config.rootId, mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) };
+      spy.mockImplementation(answer(1));
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, options)).rejects.toThrow(
+        `Resident metadata is not private to this OS user: ${metadata[1]} (owned or writable by other accounts (${otherSid})); refusing offline removal`);
+      expectUnchanged(f, actor.id);
+      spy.mockImplementation(answer());
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, { ...options, dryRun: true }))
+        .resolves.toMatchObject({ offline: true, dryRun: true, actor: { id: actor.id } });
+      expect(calls).toEqual([metadata, metadata]);
+      expectUnchanged(f, actor.id);
+    } finally { Object.defineProperty(process, "platform", platform); spy.mockRestore(); await f.close(); }
   }, 40_000);
 
   it("offline: a nested dir swapped for a symlink before the rename leaves the outside target untouched", async () => {

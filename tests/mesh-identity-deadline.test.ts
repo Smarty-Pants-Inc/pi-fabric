@@ -119,7 +119,11 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       const begin = performance.now();
       await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent setter" }))));
       const registryBlockedMs = performance.now() - begin;
-      expect(registryBlockedMs).toBeLessThan(150);
+      // smarty-dev#7651: this wall-clock window also spans the successor's own startup work on the
+      // same event loop, so a descheduled CI runner can stretch it. The regression it guards is custody
+      // held across the 1200 ms identity read (also pinned structurally: zero-ms try, no read), so
+      // bound it below that read, not at a host-speed constant.
+      expect(registryBlockedMs).toBeLessThan(1200 / 2);
       expect(read).not.toHaveBeenCalled();
       expect(registry.records()[0]!.rootId).toBe("session:dead");
       intact(mesh, held);

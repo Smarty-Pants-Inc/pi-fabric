@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { processIncarnation } from "../src/core/atomic-write.js";
 import * as currentCustody from "../src/mesh/custody-lock.js";
 import { FOREIGN_LOCK, holdMeshFenceSync, MeshFenceBusyError, pinFenceLock, releaseFenceLock } from "../src/mesh/fence-lock.js";
@@ -60,6 +60,50 @@ const acquireA = (lock: string): number | undefined => {
   expect(pin).not.toBe(FOREIGN_LOCK);
   return pin;
 };
+
+// pi-fabric#889 Windows CI: the unpinned release's rmdir can fail while the unlinked owner is delete-pending or a
+// handle is still open (ENOTEMPTY/EPERM/EBUSY). Windows semantics cannot be produced on Linux: inject the errors.
+describe("the unpinned release removes its lock through transient Windows rmdir failures", () => {
+  const failing = (lock: string, codes: string[]) => {
+    const rmdir = fs.rmdirSync.bind(fs);
+    return vi.spyOn(fs, "rmdirSync").mockImplementation((file: fs.PathLike) => {
+      const code = String(file) === lock ? codes.shift() : undefined;
+      if (code) throw Object.assign(new Error(`${code}: rmdir`), { code });
+      return rmdir(file);
+    });
+  };
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("retries a transient ENOTEMPTY, EPERM or EBUSY and removes the released lock", () => {
+    const lock = lockIn();
+    hold(lock, "A\n");
+    const rmdir = failing(lock, ["ENOTEMPTY", "EPERM", "EBUSY"]);
+    releaseFenceLock(lock, "A\n", {}, undefined);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(4);
+  });
+
+  it("stops at once when a successor's record is in it, and gives up after a bounded ~500 ms", () => {
+    const lock = lockIn();
+    hold(lock, "A\n");
+    let rmdir = failing(lock, ["ENOTEMPTY"]);
+    releaseFenceLock(lock, "A\n", { afterTake: () => fs.writeFileSync(path.join(lock, "owner"), "B\n", { flag: "wx" }) }, undefined);
+    expect(owner(lock)).toBe("B\n"); // the successor's lock stays, with one rmdir attempt
+    expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(1);
+    vi.restoreAllMocks();
+    fs.rmSync(path.join(lock, "owner"));
+    fs.writeFileSync(path.join(lock, "owner"), "C\n");
+    rmdir = failing(lock, Array.from({ length: 20 }, () => "EPERM"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const started = Date.now();
+    releaseFenceLock(lock, "C\n", {}, undefined);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(10);
+    expect(fs.existsSync(lock)).toBe(true); // left empty for the ownerless-lock recovery
+    expect(fs.readdirSync(lock)).toEqual([]);
+    expect(warn.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+});
 
 describe("releaseFenceLock never detaches a successor (pi-fabric#694 P1)", () => {
   it("pins the lock directory on Linux and removes the releaser's own lock", () => {

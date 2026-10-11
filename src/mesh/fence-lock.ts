@@ -140,11 +140,36 @@ export const releaseFenceLock = (lock: string, record: string,
   try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
   if (ours) {
     try { fs.unlinkSync(taken); } catch { /* best effort */ }
-    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
+    removeReleasedLock(lock);
     return;
   }
   try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
   catch { /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }
+};
+
+let releaseLeftWarned = false;
+/**
+ * rmdir the released `<lock>` (unpinned path). On Windows the unlinked owner can stay delete-pending, or another
+ * process can still hold a handle, for a moment: rmdir then fails ENOTEMPTY, EPERM or EBUSY (pi-fabric#889 CI). Retry
+ * a bounded 10 times over ~500 ms, but never once a successor's record is in it: rmdir only ever removes an EMPTY
+ * directory, so it can never remove a recorded successor. Still failing: log once and leave the empty directory
+ * (the earlier behaviour); the ownerless-lock recovery reclaims it after its grace.
+ */
+const removeReleasedLock = (lock: string): void => {
+  for (let attempt = 1; ; attempt++) {
+    try { fs.rmdirSync(lock); return; } catch (error) {
+      const code = codeOf(error);
+      if (!(code === "ENOTEMPTY" || code === "EPERM" || code === "EBUSY") || fs.existsSync(path.join(lock, "owner"))) return;
+      if (attempt >= 10) {
+        if (!releaseLeftWarned) {
+          releaseLeftWarned = true;
+          try { console.warn(`[pi-fabric] mesh lock ${lock} released but its empty directory stays (${code}); stale-lock recovery reclaims it`); } catch { /* never mask a release */ }
+        }
+        return;
+      }
+      sleepSync(50);
+    }
+  }
 };
 
 /**

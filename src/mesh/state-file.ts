@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
@@ -5,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
@@ -89,6 +90,46 @@ export const jsonClone = <T>(value: T): T => {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error("Mesh values must be JSON-serializable");
   return JSON.parse(serialized) as T;
+};
+
+/**
+ * Deep check of a parsed state.json document, for callers that must not act on doubt (retention --apply,
+ * smarty-dev#7916). The tolerant reader below accepts `{"format":1,"entries":{"k":null}}`; this does not: the
+ * envelope has only known fields and every entry is a complete entry under its own key. Returns the first problem.
+ */
+export const meshStateDocumentProblem = (value: unknown): string | undefined => {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item);
+  const count = (item: unknown): boolean => Number.isSafeInteger(item) && (item as number) >= 0;
+  if (!object(value)) return "not an object";
+  const known = new Set(["format", "revisionFormat", "entries", "versions", "tombstoneOrder", "highWater", "readGeneration", "readJournalHash"]);
+  const unknown = Object.keys(value).find(key => !known.has(key));
+  if (unknown !== undefined) return `unknown field ${JSON.stringify(unknown)}`;
+  if (value.format !== 1 && value.format !== 2) return "unknown format";
+  if (value.revisionFormat !== undefined && value.revisionFormat !== 2) return "unknown revisionFormat";
+  if (value.highWater !== undefined && !count(value.highWater)) return "invalid highWater";
+  for (const field of ["readGeneration", "readJournalHash"] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") return `invalid ${field}`;
+  }
+  if (value.versions !== undefined && (!object(value.versions) || !Object.values(value.versions).every(count))) return "invalid versions";
+  if (value.tombstoneOrder !== undefined && (!Array.isArray(value.tombstoneOrder) || !value.tombstoneOrder.every(key => typeof key === "string"))) {
+    return "invalid tombstoneOrder";
+  }
+  if (!object(value.entries)) return "entries is not an object";
+  const entryFields = new Set(["key", "value", "version", "updatedAt", "updatedBy"]);
+  for (const [key, entry] of Object.entries(value.entries)) {
+    const at = `entry ${JSON.stringify(key)}`;
+    if (!object(entry)) return `${at} is not an object`;
+    if (Object.keys(entry).some(field => !entryFields.has(field))) return `${at} has an unknown field`;
+    if (entry.key !== key) return `${at} names another key`;
+    if (!count(entry.version)) return `${at} has an invalid version`;
+    if (typeof entry.updatedAt !== "number" || !Number.isFinite(entry.updatedAt) || entry.updatedAt < 0) return `${at} has an invalid updatedAt`;
+    const by = entry.updatedBy;
+    if (!object(by) || typeof by.id !== "string" || typeof by.name !== "string" || typeof by.kind !== "string" ||
+        (by.sessionId !== undefined && typeof by.sessionId !== "string") || (by.verified !== undefined && typeof by.verified !== "string")) {
+      return `${at} has an invalid updatedBy`;
+    }
+  }
+  return undefined;
 };
 
 const isMeshStateFile = (value: unknown): value is MeshStateFile => {
@@ -254,6 +295,8 @@ interface PreparedStateCommit {
   namespaces: Record<string, string> | undefined;
   serializedText: string;
   temporary?: string;
+  /** Unregisters the staged temp from the process-exit cleanup hook. */
+  releaseTemporary?: () => void;
 }
 const WRITE_SNAPSHOT_CHANGED = Symbol("mesh write snapshot changed");
 
@@ -551,7 +594,7 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
     } else return false;
     const start = childProcess.execFileSync(executable, args, { encoding: "utf8", timeout: 2_000,
       maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" } }).trim();
+      env: childProcessEnvironment({ ...process.env, LC_ALL: "C", TZ: "UTC" }) }).trim();
     return Date.parse(process.platform === "win32" ? start : `${start} UTC`) > modifiedAt;
   } catch { return false; }
 };
@@ -912,8 +955,18 @@ export class StateFile implements StateBackend {
         // State remains a soft-state atomic replacement (no durability policy change).
         // Stage the large write off-lock too; custody only compares identity and renames.
         const temporary = `${this.#statePath}.${process.pid}.${randomUUID()}.prepared.tmp`;
-        writeFileAtomic(temporary, prepared.encoded.serialized);
+        // Registered before staging: an exit while this write awaits the mesh lock (a Main
+        // /quit, a worker/resident exit or SIGTERM) removes it (smarty-dev#6622). A kill -9
+        // leaves it to the existing prepared-state sweep or the host reaper's janitor.
+        const release = trackTemporary(temporary);
+        try { writeFileAtomic(temporary, prepared.encoded.serialized); }
+        catch (error) {
+          try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+          release();
+          throw error;
+        }
         prepared.temporary = temporary;
+        prepared.releaseTemporary = release;
       }
       return { state, ...outcome, prepared };
     }, ({ state, result, keys, prepared }) => {
@@ -923,6 +976,7 @@ export class StateFile implements StateBackend {
     }, ({ prepared }) => {
       if (prepared?.temporary) {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+        prepared.releaseTemporary?.();
       }
     }, "put/delete");
   }
@@ -936,8 +990,8 @@ export class StateFile implements StateBackend {
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
   #commitState(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined, keys: string[], caller: string[] | undefined,
-    namespaces?: Record<string, string>): void {
-    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller);
+    namespaces?: Record<string, string>, beforeCommit?: () => void): void {
+    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller, beforeCommit);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -977,7 +1031,7 @@ export class StateFile implements StateBackend {
     return epoch === undefined ? 0 : storageRevision(epoch);
   };
 
-  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
+  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[], beforeCommit?: () => void): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
@@ -991,8 +1045,9 @@ export class StateFile implements StateBackend {
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;
     try {
-      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
-      else writeFileAtomic(this.#statePath, encoded.serialized);
+      const commitOptions = beforeCommit ? { beforeRename: beforeCommit } : undefined;
+      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath, commitOptions);
+      else writeFileAtomic(this.#statePath, encoded.serialized, commitOptions);
       if (journal) {
         try { witnessStat = staged !== undefined ? fs.fstatSync(staged, { bigint: true }) : fs.statSync(this.#statePath, { bigint: true }); }
         catch { /* no witness: readers hash */ }
@@ -1164,7 +1219,7 @@ export class StateFile implements StateBackend {
   async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
@@ -1267,12 +1322,13 @@ export class StateFile implements StateBackend {
         changed = true;
       }
       if (!changed) {
+        input.beforeCommit?.();
         this.#cacheState(state, undefined);
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
         const changedKeys = results.filter(result => result.applied).map(result => result.key);
-        this.#commitState(state, reuse, changedKeys, caller, namespaces);
+        this.#commitState(state, reuse, changedKeys, caller, namespaces, input.beforeCommit);
         committed?.(changedKeys);
       }
       input.afterCommit?.(view);

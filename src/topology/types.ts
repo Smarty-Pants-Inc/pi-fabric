@@ -22,6 +22,8 @@ export interface FabricParticipantRecord {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  /** Fresh control-owner activation, including same-process extension reloads. */
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   /**
@@ -99,6 +101,8 @@ export interface FabricHostRecord {
   id: string;
   rootId: string;
   identity: MeshIdentity;
+  /** UUID fence for token-capable host incarnations; start time is metadata. */
+  incarnationToken?: string;
   startedAt: number;
   updatedAt: number;
   expiresAt: number;

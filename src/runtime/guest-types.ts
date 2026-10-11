@@ -194,6 +194,7 @@ interface FabricParticipantInfo {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   status: string;
@@ -860,8 +861,16 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * classification says why the block does or does not expire. Only an explicitly transient
+   * code (provider-transient, activation-window-lost, child-exit-before-admission) carries
+   * retryAt: from then on the block no longer gates routing and is reported as
+   * activationBlockExpired instead (smarty-dev#8487). Credential, permission, security-policy,
+   * quota, invalid-request, context-overflow, failing-preparation and unknown stay blocked. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number; retryAt?: number; classification?: string };
+  /** History of a transient block whose backoff ended; the next activation runs normally.
+   * Another failure blocks again with a doubled backoff; a completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; since: number; count: number; expiredAt: number; classification?: string };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
   records?: FabricActorRecordsOptions;
@@ -951,7 +960,10 @@ type FabricMessageArgs = FabricMessageTarget & {
   /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
   idempotencyKey?: string;
 };
-type FabricMessageSteerArgs = FabricMessageArgs;
+type FabricMessageSteerArgs = FabricMessageArgs & {
+  /** Main only: preempt a running tool via native abort, then steer. No tool retry. */
+  priority?: "interrupt";
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -1066,6 +1078,9 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
+  /** Alias of steer; uses the same authority and default delivery. */
+  send(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
+  send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;

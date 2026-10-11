@@ -1,7 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation } from "../core/atomic-write.js";
+import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
 
 /**
  * File custody lock (smarty-dev#6477 L5). `exclusive()` users that only guard files beside the
@@ -19,6 +19,19 @@ import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validP
  */
 export const MESH_CUSTODY_LOCK_NAME = "custody.lock";
 const CUSTODY_LOCK_TIMEOUT_MS = 10_000;
+// Same conservative 30s staleness bound as mesh/exclusive locks; age alone NEVER proves death.
+export const CUSTODY_LOCK_STALE_MS = 30_000;
+
+/** Not a contention timeout: callers must surface this refusal, not silently retry/skip it. */
+export class MeshCustodyUnrecoverableError extends Error {
+  override readonly name = "MeshCustodyUnrecoverableError";
+  readonly code = "FABRIC_MESH_CUSTODY_UNRECOVERABLE";
+  readonly kind = "custody-unrecoverable";
+  readonly retryable = false;
+  constructor(readonly lock: string) {
+    super(`Fabric custody-unrecoverable: ${lock} has no valid owner pid; recovery refused`);
+  }
+}
 
 export type MeshCustodyMode = "dual" | "own";
 
@@ -44,14 +57,22 @@ const processAlive = (pid: number): boolean => {
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Holds the custody lock of a mesh root until the returned release is called. */
-export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS): Promise<() => void> => {
+export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS,
+  options: { hostQualified?: boolean; ownIncarnation?: string | undefined } = {}): Promise<() => void> => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const token = randomUUID();
-  const started = await ownProcessIncarnation().catch(() => undefined);
-  const record = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
+  // Keep full UUID ownership receipts; only transient filesystem names need a short token.
+  const pathToken = randomBytes(4).toString("hex");
+  const started = Object.hasOwn(options, "ownIncarnation") ? options.ownIncarnation
+    : await ownProcessIncarnation().catch(() => undefined);
+  const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
+  const machineId = physical?.machineId ?? (options.hostQualified ? readPhysicalMachineId() : undefined);
+  const record = options.hostQualified
+    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${machineId ?? ""}\n${physical?.bootId ?? ""}\n`
+    : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
   const readOwner = (): string | undefined => {
     try { return fs.readFileSync(ownerPath, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -65,7 +86,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     attempts += 1;
     lastAttemptAt = now;
     // Publish a complete owner by rename: the canonical name is never ownerless.
-    const staging = fs.mkdtempSync(`${lock}.pending.${token}.`);
+    const staging = fs.mkdtempSync(`${lock}.p.${pathToken}.`);
     try {
       fs.writeFileSync(path.join(staging, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 });
       try {
@@ -80,7 +101,14 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
-    if (await clearDeadCustodyLock(lock, readOwner, deadline, started)) continue;
+    try {
+      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified)) continue;
+    } catch (error) {
+      if (error instanceof MeshCustodyUnrecoverableError) {
+        try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
+      }
+      throw error;
+    }
     if (Date.now() >= deadline) {
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
       const pid = owner?.split("\n")[1];
@@ -92,7 +120,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     try {
       if (readOwner() !== record) return;
       // Detach before removal: never recursively delete through the canonical name.
-      const released = `${lock}.released.${token}`;
+      const released = `${lock}.released.${pathToken}`;
       fs.renameSync(lock, released);
       fs.rmSync(released, { recursive: true, force: true });
     } catch {
@@ -105,18 +133,38 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
 // second recoverer cannot rename a successor onto the same nonempty fence.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
-  ownStart: string | undefined): Promise<boolean> => {
+  ownStart: string | undefined, hostQualified = false): Promise<boolean> => {
   try {
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
     const owner = readOwner();
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
-    const fields = owner.split("\n");
+    const fields = owner?.split("\n") ?? [];
     const [token, pidText, createdText, recordedStart] = fields;
     const pid = Number(pidText);
+    if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {
+      // A concurrent release/replacement is not a corrupt receipt. Alarm only the same
+      // canonical lock we actually observed, just as recovery fences the same inode/bytes.
+      const current = fs.lstatSync(lock);
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+      throw new MeshCustodyUnrecoverableError(lock);
+    }
+    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
+    // machine evidence is still mandatory when boot/process identity is unavailable.
+    const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
+    const machineId = physical?.machineId ?? (hostQualified ? readPhysicalMachineId() : undefined);
+    if (hostQualified && (!machineId || fields.length !== 7 || fields[4] !== machineId)) return false;
+    const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
+    const previousBoot = bootKnown && fields[5] !== physical!.bootId;
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
-      (fields.length !== 4 && fields.length !== 5)) return false;
-    if (processAlive(pid)) {
+      (fields.length !== 4 && fields.length !== 5 && !(hostQualified && fields.length === 7))) return false;
+    if (hostQualified && !bootKnown) {
+      // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE
+      // holder. Do not compare incarnations or infer a reboot from missing evidence.
+      const ownerStat = fs.lstatSync(path.join(lock, "owner"));
+      if (!ownerStat.isFile() || Date.now() - Math.max(stat.mtimeMs, ownerStat.mtimeMs) <= CUSTODY_LOCK_STALE_MS ||
+        processAlive(pid)) return false;
+    } else if (!previousBoot && processAlive(pid)) {
       if (!validProcessIncarnation(recordedStart)) return false;
       // Our own pid with another incarnation is a dead predecessor; with ours, a live caller.
       const remaining = deadline - Date.now();
@@ -128,7 +176,8 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
     fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
     return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof MeshCustodyUnrecoverableError) throw error;
     return false;
   }
 };

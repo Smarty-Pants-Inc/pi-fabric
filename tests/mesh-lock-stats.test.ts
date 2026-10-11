@@ -266,6 +266,75 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(stale)).toBe(false);
   });
 
+  it("keeps a stats file its writer refreshes between the age check and the delete (smarty-dev#7879)", () => {
+    const root = path.join(temp(), "mesh");
+    const directory = path.join(root, "lock-stats");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // `once`: the writer's refresh lands right before the pruner moves or deletes the file.
+    // `twice`: and a second refresh lands just after the pruner moved the first one aside.
+    const once = path.join(directory, "once-3.json");
+    const twice = path.join(directory, "twice-4.json");
+    const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+    for (const file of [once, twice]) {
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+    }
+    const refresh = (file: string, body: string): void => {
+      fs.writeFileSync(`${file}.next`, body);
+      renameSync(`${file}.next`, file);
+    };
+    const renameSync = fs.renameSync, unlinkSync = fs.unlinkSync;
+    const refreshed = new Set<string>();
+    const before = (file: string): void => {
+      if (refreshed.has(file) || (file !== once && file !== twice)) return;
+      refreshed.add(file);
+      refresh(file, `{"fresh":"${path.basename(file)}"}`);
+    };
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      before(String(from));
+      renameSync(from, to);
+      if (String(from) === twice && String(to) !== twice) refresh(twice, "{\"fresh\":2}");
+    });
+    vi.spyOn(fs, "unlinkSync").mockImplementation((file) => { before(String(file)); unlinkSync(file); });
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect([...refreshed].sort()).toEqual([once, twice]);
+    expect(fs.readFileSync(once, "utf8")).toBe("{\"fresh\":\"once-3.json\"}");
+    expect(fs.readFileSync(twice, "utf8")).toBe("{\"fresh\":2}");
+    expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost())).sort()).toEqual(["once-3.json", "twice-4.json"]);
+  });
+
+  it("never replaces a newer stats file that lands just before the pruner restores a moved one (smarty-dev#7879)", () => {
+    const root = path.join(temp(), "mesh");
+    const directory = path.join(root, "lock-stats");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const file = path.join(directory, "racer-5.json");
+    const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+    fs.writeFileSync(file, "{}");
+    fs.utimesSync(file, old, old);
+    const renameSync = fs.renameSync, linkSync = fs.linkSync;
+    const refresh = (body: string): void => {
+      fs.writeFileSync(`${file}.next`, body);
+      renameSync(`${file}.next`, file);
+    };
+    let landed = 0;
+    // The pruner moves the writer's first refresh aside; the second lands after that move and
+    // right before the pruner puts the moved file back at the name.
+    const restoring = (from: fs.PathLike, to: fs.PathLike): void => {
+      if (String(from) === file && landed === 0) { landed++; refresh("{\"fresh\":1}"); }
+      else if (String(to) === file && String(from).startsWith(`${file}.prune-`) && landed === 1) { landed++; refresh("{\"fresh\":2}"); }
+    };
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { restoring(from, to); renameSync(from, to); });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => { restoring(from, to); linkSync(from, to); });
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect(landed).toBe(2);
+    expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
+    expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost()))).toEqual(["racer-5.json"]);
+  });
+
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -612,7 +681,7 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     fs.unlinkSync(path.join(directory, "edge-before-8.json"));
     fs.unlinkSync(path.join(directory, "edge-at-9.json"));
     // Still over the cap inside the window: the newest are read and the cut is reported.
-    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, []);
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, [{ minute: MINUTE0 + 1, classes: {} }]);
     const newer = Date.now() / 1000 + 3_600;
     fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), newer, newer);
     const capped: string[] = [];
@@ -620,5 +689,21 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(files).toHaveLength(LOCK_STATS_MAX_FILES);
     expect(files[0]!.host).toBe("zzz-bridge");
     expect(capped).toEqual([`${directory}: ${LOCK_STATS_MAX_FILES + 1} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`]);
+  });
+
+  it("gives no cap slot to files that hold only the current, incomplete minute (smarty-dev#7894)", () => {
+    const root = temp();
+    const directory = path.join(root, "lock-stats");
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    // Newer than the in-window file, so they sort first; each holds only the current minute.
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES + 1; pid++) {
+      fixture(root, "aaa-current", pid, [{ minute: MINUTE0 + 2, classes: { publish: bucket({ n: 1 }) } }]);
+    }
+    fixture(root, "zzz-bridge", 7, [{ minute: MINUTE0 + 1, classes: { publish: bucket({ n: 3, holdMs: 30 }) } },
+      { minute: MINUTE0 + 2, classes: { publish: bucket({ n: 1 }) } }]);
+    fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), now / 1000, now / 1000);
+    const problems: string[] = [];
+    expect(readLockStats(root, problems, { minutes: 2, now }).map(file => file.host)).toEqual(["zzz-bridge"]);
+    expect(problems).toEqual([]);
   });
 });

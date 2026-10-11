@@ -274,6 +274,9 @@ describe("spawnDetached", () => {
   });
 
   it.each(["tree-first", "worker-first"])("Windows stop joins both the owned tree helper and worker close (%s)", async order => {
+    vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE", "1");
+    // #738 changes the helper environment, not its owned-tree argv or close join.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_FABRIC_LANDLOCK_")));
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const child = Object.assign(new EventEmitter(), { pid: 1234, unref: vi.fn(), kill: vi.fn() });
     const killer = Object.assign(new EventEmitter(), { pid: 5678, kill: vi.fn() });
@@ -286,7 +289,7 @@ describe("spawnDetached", () => {
       const first = handle.stop();
       expect(handle.stop()).toBe(first); // one owned tree helper, not two
       const stopping = first.then(() => { stopped = true; });
-      expect(spawn).toHaveBeenLastCalledWith("taskkill", ["/pid", "1234", "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      expect(spawn).toHaveBeenLastCalledWith("taskkill", ["/pid", "1234", "/T", "/F"], { env, windowsHide: true, stdio: "ignore" });
       expect(kill).not.toHaveBeenCalled(); // never force-kill only the parent first
       if (order === "tree-first") killer.emit("close", 0);
       else { child.emit("exit", null); child.emit("close", null); }

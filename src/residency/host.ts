@@ -45,8 +45,8 @@ import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycl
 import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
-import { FabricControlPlane, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
+import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
@@ -362,6 +362,8 @@ export class ResidentHost {
       },
     });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
+      ownerIncarnation: this.participants.ownerIncarnation,
+      controlIncarnationFence: config.mesh.controlIncarnationFence,
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
@@ -1007,7 +1009,7 @@ export class ResidentHost {
       target.ownerHostId,
       target.id,
       subscription.delivery,
-      { message, data: event, triggerTurn: subscription.triggerTurn, wakeCause },
+      { message, data: event, triggerTurn: subscription.triggerTurn, ownerIncarnation: controlOwnerIncarnation(target), wakeCause },
       target.ownerIdentityId,
       { routedRemoteHost: target.remoteHost ?? null },
     );
@@ -1112,7 +1114,7 @@ export class ResidentHost {
         // A restart after put but before unlink replays the SAME private UUID. A CAS
         // conflict (including a consumed tombstone) means it was handed off already.
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
-          if (isMeshLockTimeout(error)) throw error;
+          if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write
           await this.mesh.put({
             key, value: { ...publish, message: publish.message.slice(0, Math.max(1, this.config.mesh.eventContextChars)), data: { fabricTruncated: true } },
             identity: this.identity, ifVersion: 0,
@@ -1474,6 +1476,7 @@ export class ResidentHost {
         caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
     }
     this.#pruneCreations();
+    if (command.operation === "createActor" && command.caller) this.#authorizeResidentSetter(command.caller);
     // Operation-scoped; this host already validates its one root before dispatch.
     const key = JSON.stringify([command.operation, command.idempotencyKey]);
     let entry = this.#creations.get(key);
@@ -1595,7 +1598,14 @@ export class ResidentHost {
         // self-transfer window that blocked the next recruitment request.
         const { instructionsFile: _file, sha256: _digest, ...base } = command.request;
         const instructions = resolveActorInstructions(command.request, this.config.agents.instructionsRoot);
-        const actor = await this.actors.create({ ...base, instructions }, { asRegistryOwner: true, beforeCommit: commit });
+        const actor = await this.actors.create({ ...base, instructions }, {
+          asRegistryOwner: true,
+          ...(command.caller ? { supervisorOwner: command.caller.identity } : {}),
+          beforeCommit: id => {
+            if (command.caller) this.#authorizeResidentSetter(command.caller);
+            commit(id);
+          },
+        });
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

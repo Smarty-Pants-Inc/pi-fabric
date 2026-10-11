@@ -240,6 +240,39 @@ describe("resident activation filter telemetry", () => {
   });
 });
 
+describe("verified resident supervisor creation (#7452)", () => {
+  it("mints a durable binding only for a freshly verified owning Main creator", async () => {
+    const { root, config, host } = fixture({}, true);
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    const mesh = new MeshStore(config.meshRoot, 65536, 1000);
+    const participants = new ParticipantDirectory(mesh, {
+      enabled: true, hostId: config.rootId, rootId: config.rootId, identity,
+    });
+    participants.registerSource(() => [{
+      format: 1, id: config.rootId, kind: "root", rootId: config.rootId, ownerHostId: config.rootId, ownerIdentityId: config.rootId,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: config.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const client = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: true } as FabricMainAgentTarget });
+    const legacy = new ResidencyClient({ config, mesh, participants, commandTimeoutMs: 5_000,
+      mainAgent: { id: config.rootId, local: false } as FabricMainAgentTarget });
+    const request = { name: "supervisor", instructions: "Watch Main.", residency: "durable" as const,
+      events: ["agent_settled" as const], responseMode: "directive" as const, delivery: "steer" as const, triggerTurn: true };
+    try {
+      await participants.start(); await host.start();
+      const own = await client.createActor(request);
+      expect(own.supervisorFor).toBe(config.rootId);
+      expect(host.actors.status(own.id).supervisorFor).toBe(config.rootId);
+      const unbound = await legacy.createActor({ ...request, name: "legacy-supervisor", supervisorFor: config.rootId } as any);
+      expect(unbound.supervisorFor).toBeUndefined();
+    } finally {
+      await client.close(); await legacy.close(); await host.close(); await participants.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("resident maintenance readiness attachment", () => {
   it("waits for the published live generation before one accepted create, without another launcher", async () => {
     const { root, config, host } = fixture();
@@ -303,7 +336,7 @@ describe("Astra resident lease delivery fence", () => {
       const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
       sender = new FabricControlPlane(new MeshStore(config.meshRoot, 65536, 1000), identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5000 });
       sender.start(() => ({ accepted: false }));
-      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work" }).catch(error => error);
+      result = sender.request(host.hostId, "actor", "followUp", { message: "accepted work", ownerIncarnation: host.participants.ownerIncarnation }).catch(error => error);
       await preparing; healthy = false; release(); await delay(150);
       expect(tell).not.toHaveBeenCalled();
       const seenRoot = path.join(config.meshRoot, "control-seen", createHash("sha256").update(host.hostId).digest("hex").slice(0, 32));
@@ -1036,7 +1069,9 @@ describe("resident host ownership", () => {
       sender.start(() => ({ accepted: false }));
       const child = await host.agents.spawn({ task: "HANG", transport: "process" });
       await vi.waitFor(() => expect(fs.existsSync(path.join(host.agents.runDirectory(child.id)!, "status.json"))).toBe(true));
-      const receipt = await sender.request(host.hostId, child.id, "followUp", { message: "later" }, host.identity.id);
+      await host.participants.refresh();
+      const receipt = await sender.request(host.hostId, child.id, "followUp",
+        { message: "later", ownerIncarnation: host.participants.get(child.id, undefined, { fresh: true })!.ownerIncarnation }, host.identity.id);
       const warning = { code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId: child.id, kind: "agent", status: "running",
         message: "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion." };
       const command = host.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;

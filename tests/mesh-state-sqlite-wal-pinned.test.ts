@@ -444,7 +444,9 @@ describe("SQLite WAL bound under pinned and constant readers (smarty-dev#6477 P1
     // Reported, not asserted: under constant readers the one-shot reset is mostly busy; the bound comes from
     // SQLite restarting the WAL from its start once PASSIVE backfill completes (the file stops growing).
     expect(stats.checkpoints.emergency).toBe(0);
-    expect(stats.checkpoints.walResets + stats.checkpoints.walResetBusy).toBeGreaterThan(0);
+    // The reset runs after a commit that leaves the WAL above walResetBytes (8 MiB). A slow (loaded) writer can stay
+    // below it for the whole 20 s while SQLite keeps restarting the WAL; then the reset has nothing to do (smarty-dev#7651).
+    if (maxWal > 8 * MiB) expect(stats.checkpoints.walResets + stats.checkpoints.walResetBusy).toBeGreaterThan(0);
     expect(maxMs).toBeLessThan(2_000);
   }, 90_000);
 });

@@ -432,6 +432,10 @@ const testPidDelay = (tool: PiShellToolName): string => {
   return tool === "powershell" ? `Start-Sleep -Milliseconds ${ms}\n` : `sleep ${ms / 1000}\n`;
 };
 
+/** Exact trusted decoration, also supplied to sandbox command inspection. */
+export const shellTrackingPrefix = (pidPath: string, tool: PiShellToolName): string =>
+  testPidDelay(tool) + wrapShellCommandForPid("", pidPath, tool);
+
 export const trackShellOperations = (
   inner: BashOperations,
   job: FabricShellJobHandle,
@@ -439,7 +443,7 @@ export const trackShellOperations = (
 ): BashOperations => ({
   exec: async (command, cwd, options) => {
     job.operationStarted();
-    const result = await inner.exec(testPidDelay(tool) + wrapShellCommandForPid(command, job.pidPath, tool), cwd, {
+    const result = await inner.exec(shellTrackingPrefix(job.pidPath, tool) + command, cwd, {
       ...options,
       onData: (data) => {
         job.append(data);

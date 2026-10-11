@@ -695,8 +695,30 @@ export const meshRetryWarningWindowMs = (): number => {
   return raw?.trim() && Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MESH_RETRY_WARNING_WINDOW_MS;
 };
 
+/** A deferred-write outage (lock timeout or WAL-cap refusal) this long on one background path raises one alarm
+ * (smarty-dev#8825). */
+export const MESH_OUTAGE_ALARM_AFTER_MS = 5 * 60 * 1_000;
+export interface MeshOutageAlarm { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs: number; reason?: string }
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
+  #outageSince: number | undefined;
+  #outageLogged = false;
+  #outageAlarmed = false;
+  #alarm: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
+  /** Where this path's outage alarm goes (the owner's mesh publish); without it the warn line is the only signal. */
+  alarmsTo(sink: (alarm: MeshOutageAlarm) => Promise<unknown> | void): this { this.#alarm = sink; return this; }
+  // One alarm per outage. Under a lock timeout the publish itself can fail: a later retry tries it again (one log line).
+  #raise(alarm: MeshOutageAlarm): void {
+    if (alarm.state === "recovered" || !this.#outageLogged) {
+      console.warn(`[pi-fabric] ${this.label}: mesh writes ${alarm.state === "outage" ? "deferred for" : "recovered after"} ${Math.floor(alarm.durationMs / 1_000)}s${alarm.reason ? `: ${alarm.reason}` : ""}`);
+      this.#outageLogged = true;
+    }
+    try {
+      const sent = this.#alarm?.(alarm);
+      if (alarm.state === "outage" && sent) void Promise.resolve(sent).catch(() => { if (this.#outageSince === alarm.sinceMs) this.#outageAlarmed = false; });
+    } catch { if (alarm.state === "outage") this.#outageAlarmed = false; }
+  }
   #delay = 0;
   #retryAt = 0;
   #lastReportedAt: number | undefined;
@@ -710,6 +732,13 @@ export class MeshBackgroundRetry {
   /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). */
   success(): void {
     this.#resetBackoff();
+    if (this.#outageLogged && this.#outageSince !== undefined) {
+      const now = Date.now();
+      this.#raise({ label: this.label, state: "recovered", sinceMs: this.#outageSince, durationMs: now - this.#outageSince });
+    }
+    this.#outageSince = undefined;
+    this.#outageAlarmed = false;
+    this.#outageLogged = false;
     if (!this.#suppressed || this.#lastReportedAt === undefined) return;
     const now = Date.now();
     const elapsedMs = now - this.#lastReportedAt;
@@ -737,6 +766,12 @@ export class MeshBackgroundRetry {
     const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
     const now = Date.now();
     this.#retryAt = now + delayMs;
+    this.#outageSince ??= now;
+    if (!this.#outageAlarmed && now - this.#outageSince >= MESH_OUTAGE_ALARM_AFTER_MS) {
+      this.#outageAlarmed = true;
+      this.#raise({ label: this.label, state: "outage", sinceMs: this.#outageSince, durationMs: now - this.#outageSince,
+        reason: isMeshLockTimeout(error) ? "mesh lock timeout" : "SQLite WAL cap" });
+    }
     const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
     // At most one lock-retry line per instance per window (default 60 s), even across
     // successful acquisitions: a flapping lock must not print one warning per short outage.

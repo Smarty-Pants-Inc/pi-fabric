@@ -1,4 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
+import type { MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -263,6 +264,18 @@ export interface MeshStoreOptions {
 
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
 let unreadableStateRevisions = 0;
+
+/** A background mesh path whose writes stay deferred past MESH_OUTAGE_ALARM_AFTER_MS, and its recovery (smarty-dev#8825). */
+export const FABRIC_MESH_OUTAGE_ALARM_TOPIC = "fabric.alarm.mesh-outage";
+/** The MeshBackgroundRetry.alarmsTo sink of an owner: resolved at alarm time (owners assign their mesh after field init). */
+export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }) =>
+  (alarm: MeshOutageAlarm): Promise<unknown> | void => {
+    const { mesh, from } = owner();
+    if (!mesh || !from) return;
+    return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: `mesh-${alarm.state}`, from,
+      text: `${alarm.label}: mesh writes ${alarm.state === "outage" ? "deferred" : "recovered"} after ${Math.floor(alarm.durationMs / 1_000)}s`,
+      data: { ...alarm } });
+  };
 
 export class MeshStore {
   readonly #lock: MeshLock;

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../src/core/atomic-write.js";
+import { MESH_OUTAGE_ALARM_AFTER_MS, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshOutageAlarmSink } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
@@ -124,5 +125,52 @@ describe("background mesh retry boundary", () => {
     await Promise.resolve(); expect(closed).toBe(false);
     release(); await admitted; await closing;
     expect(closed).toBe(true);
+  });
+});
+
+// smarty-dev#8825: a deferred-write outage that outlasts MESH_OUTAGE_ALARM_AFTER_MS raises ONE mesh alarm per path,
+// and a confirmed write clears it (with one recovery event).
+describe("background outage alarm (smarty-dev#8825)", () => {
+  const capped = () => Object.assign(new Error("Fabric mesh state write refused: WAL cap"), { code: "FABRIC_MESH_STATE_WAL_CAP" });
+  it("alarms once when a lock-timeout or WAL-cap outage outlasts the bound, and clears on success", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const alarms: MeshOutageAlarm[] = [];
+    const retry = new MeshBackgroundRetry("poll", 100, 400).alarmsTo((alarm) => { alarms.push(alarm); });
+    for (let elapsed = 0; elapsed <= MESH_OUTAGE_ALARM_AFTER_MS * 2; elapsed += 30_000) {
+      retry.failure(elapsed % 60_000 ? capped() : busy());
+      await vi.advanceTimersByTimeAsync(30_000);
+    }
+    expect(alarms).toEqual([expect.objectContaining({ label: "poll", state: "outage", durationMs: MESH_OUTAGE_ALARM_AFTER_MS })]);
+    retry.success();
+    expect(alarms.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    // A new outage shorter than the bound raises nothing; a non-deferred failure never counts as one.
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS - 1);
+    retry.failure(new Error("bug"));
+    retry.success();
+    expect(alarms).toHaveLength(2);
+  });
+
+  it("retries the alarm publish when it fails, and publishes a fabric.alarm.mesh-outage event through the owner's mesh", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const published: unknown[] = [];
+    let fail = true;
+    const mesh = { publish: async (input: unknown) => { if (fail) throw busy(); published.push(input); return input; } };
+    const from = { id: "session:outage", name: "main", kind: "main" as const };
+    const retry = new MeshBackgroundRetry("inbox", 100, 400)
+      .alarmsTo(meshOutageAlarmSink(() => ({ mesh: mesh as never, from })));
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy()); // past the bound: the publish fails under the same outage
+    await vi.advanceTimersByTimeAsync(1_000);
+    fail = false;
+    retry.failure(busy()); // tried again
+    await vi.advanceTimersByTimeAsync(1_000);
+    retry.failure(busy()); // already sent: not again
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(published).toEqual([expect.objectContaining({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: "mesh-outage", from,
+      data: expect.objectContaining({ label: "inbox", state: "outage", reason: "mesh lock timeout" }) })]);
   });
 });

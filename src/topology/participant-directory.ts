@@ -7,7 +7,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.j
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, meshOutageAlarmSink, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -594,7 +594,8 @@ export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
   readonly ownerIncarnation = randomUUID();
-  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   #startedAt = Date.now();

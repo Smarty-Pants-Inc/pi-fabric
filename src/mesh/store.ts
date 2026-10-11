@@ -268,11 +268,26 @@ let unreadableStateRevisions = 0;
 /** A background mesh path whose writes stay deferred past MESH_OUTAGE_ALARM_AFTER_MS, and its recovery (smarty-dev#8825). */
 export const FABRIC_MESH_OUTAGE_ALARM_TOPIC = "fabric.alarm.mesh-outage";
 /** The MeshBackgroundRetry.alarmsTo sink of an owner: resolved at alarm time (owners assign their mesh after field init). */
+/**
+ * Who a mesh-health alarm goes to (pi-fabric#893 round 3, R-org-delegate): never the whole shared mesh.
+ * `PI_FABRIC_MESH_ALARM_TO` (the deployment's chief-of-staff or org id), else this process's owning lead as its
+ * launcher exports it (SMARTY_LEAD_SESSION, a `session:<uuid>`). Neither: undefined, and the alarm stays on stderr
+ * only (fail closed). ponytail: the env only, not the `.local/lead` marker walk, which would pull
+ * topology/project-identity into the store's eager startup graph.
+ */
+export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string | undefined => {
+  const configured = env.PI_FABRIC_MESH_ALARM_TO?.trim();
+  if (configured) return configured;
+  const lead = env.SMARTY_LEAD_SESSION?.trim();
+  return lead && /^session:[0-9a-fA-F-]{36}$/.test(lead) ? lead : undefined;
+};
+
 export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }) =>
   (alarm: MeshOutageAlarm): Promise<unknown> | void => {
     const { mesh, from } = owner();
-    if (!mesh || !from) return;
-    return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: `mesh-${alarm.state}`, from,
+    const to = meshAlarmRecipient();
+    if (!mesh || !from || !to) return; // no recipient: the stderr line is the only sink, never a broadcast
+    return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: `mesh-${alarm.state}`, from, to,
       text: `${alarm.label}: mesh writes ${alarm.state === "outage" ? "deferred" : "recovered"} after ${Math.floor(alarm.durationMs / 1_000)}s`,
       data: { ...alarm } });
   };
@@ -436,8 +451,9 @@ export class MeshStore {
         console.warn(`[pi-fabric] ${text} at ${this.root}`);
         const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.
+        const to = meshAlarmRecipient(); // no recipient: the log line only, never a broadcast
         try {
-          void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
+          if (to) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, to, text,
             data: { root: this.root, walBytes, capBytes, readerCount: readerCount ?? 0, writer: identity ? identity.id : null } })
             .catch(() => undefined);
         } catch { /* the alarm is best effort */ }

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { STATE_BACKEND_FACTORIES } from "../src/mesh/state-backend.js";
 import { StateFile } from "../src/mesh/state-file.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
@@ -9,7 +9,10 @@ import { MESH_WAL_CAP_ALARM_TOPIC, MeshStore, type MeshIdentity } from "../src/m
 
 // smarty-dev#7451 item 6: a write the SQLite WAL cap refuses raises an in-product alarm, not only a bridge log line.
 const roots: string[] = [];
+// pi-fabric#893 round 3: an alarm needs an explicit recipient (here a configured one).
+beforeEach(() => { vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:chief-of-staff"); });
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.useRealTimers();
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -73,6 +76,22 @@ describe("mesh WAL-cap alarm (smarty-dev#7451 item 6)", () => {
     await vi.waitFor(() => expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(2));
     expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })[1]).toMatchObject({
       from: { id: `mesh-store:${process.pid}`, kind: "agent" }, data: { writer: null, readerCount: 1 } });
+  });
+
+  it("addresses the alarm to its recipient, and publishes nothing without one (the log line only)", async () => {
+    const { store } = cappedStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(store.put({ key: "a/b", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_WAL_CAP" });
+    await vi.waitFor(() => expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(1));
+    expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })[0]!.to).toBe("session:chief-of-staff");
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    vi.spyOn(process, "cwd").mockReturnValue(os.tmpdir()); // no .local/lead above it
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10 * 60 * 1_000);
+    await expect(store.put({ key: "a/b", value: 2, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_WAL_CAP" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("WAL cap"))).toHaveLength(2);
   });
 
   it("an alarm publish that throws synchronously never replaces the WAL-cap error", async () => {

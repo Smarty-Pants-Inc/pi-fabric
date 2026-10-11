@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE } from "../core/atomic-write.js";
+import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -2089,7 +2089,7 @@ export class MeshBridge {
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);
+              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

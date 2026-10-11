@@ -1,3 +1,4 @@
+import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshOutageAlarmSink } from "../src/mesh/store.js";
@@ -196,6 +197,7 @@ describe("background outage alarm (smarty-dev#8825)", () => {
 
   it("retries the alarm publish when it fails, and publishes a fabric.alarm.mesh-outage event through the owner's mesh", async () => {
     vi.useFakeTimers();
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:chief-of-staff");
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const published: unknown[] = [];
     let fail = true;
@@ -213,6 +215,57 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     retry.failure(busy()); // already sent: not again
     await vi.advanceTimersByTimeAsync(1_000);
     expect(published).toEqual([expect.objectContaining({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: "mesh-outage", from,
-      data: expect.objectContaining({ label: "inbox", state: "outage", reason: "mesh lock timeout" }) })]);
+      to: "session:chief-of-staff", data: expect.objectContaining({ label: "inbox", state: "outage", reason: "mesh lock timeout" }) })]);
+    vi.unstubAllEnvs();
+  });
+
+  // pi-fabric#893 round 3 (R-org-delegate): an alarm goes to one recipient, never to the whole shared mesh.
+  it("never publishes an outage alarm without a recipient: stderr only", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    vi.spyOn(process, "cwd").mockReturnValue(os.tmpdir()); // no .local/lead above it
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const publish = vi.fn(async (input: unknown) => input);
+    const retry = new MeshBackgroundRetry("inbox", 100, 400)
+      .alarmsTo(meshOutageAlarmSink(() => ({ mesh: { publish } as never, from: { id: "session:x", name: "main", kind: "main" } })));
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(publish).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some(([line]) => String(line).startsWith(`${MESH_OUTAGE_ALARM_TAG} {`))).toBe(true);
+    vi.unstubAllEnvs();
+  });
+
+  // pi-fabric#893 round 3: a WAL-cap refusal's message carries reader pids and command lines; the retry line never does.
+  it("logs a WAL-cap retry without the readers' pids or command lines", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const refused = Object.assign(new Error("Fabric mesh state write refused ... (WAL readers: pid 4242 (S, 3m, node --token=hunter2) slot 0)"),
+      { code: "FABRIC_MESH_STATE_WAL_CAP", walBytes: 120, capBytes: 96, readerCount: 1 });
+    new MeshBackgroundRetry("poll", 100, 400).failure(refused);
+    const lines = warn.mock.calls.map(([line]) => String(line)).join("\n");
+    expect(lines).toContain("120 bytes, above the 96-byte cap; 1 WAL reader(s)");
+    expect(lines).not.toMatch(/4242|hunter2|--token/);
+  });
+
+  // pi-fabric#893 CODE P2: any failure, deferred or not, breaks the recovery streak.
+  it("success, success, a non-deferred failure, then success emits no recovery", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const alarms: MeshOutageAlarm[] = [];
+    const retry = new MeshBackgroundRetry("poll", 100, 400).alarmsTo((alarm) => { alarms.push(alarm); });
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy());
+    retry.success(); retry.success();
+    retry.failure(new Error("bug"));
+    retry.success();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(alarms.map((alarm) => alarm.state)).toEqual(["outage"]);
+    retry.success(true); // a path's final write ends the outage at once
+    await vi.advanceTimersByTimeAsync(0);
+    expect(alarms.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
+    expect(retry.idle).toBe(true);
   });
 });

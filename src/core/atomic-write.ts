@@ -704,6 +704,15 @@ export const MESH_OUTAGE_RECOVERY_SUCCESSES = 3;
 export const MESH_OUTAGE_ALARM_TAG = "fabric.alarm.mesh-outage";
 export interface MeshOutageAlarm { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs: number; reason?: string }
 
+/** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
+ * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
+export const meshDeferredSummary = (error: unknown): string => {
+  if (isMeshLockTimeout(error)) return error.message;
+  const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
+  return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
+    + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
+};
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
   // smarty-dev#8825 outage alarm. Per instance by design: a restarted process starts a new 5-min window and
@@ -717,8 +726,18 @@ export class MeshBackgroundRetry {
   readonly #pendingAlarms: MeshOutageAlarm[] = [];
   #flushing = false;
   #alarm: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
-  /** Where this path's outage alarm goes (the owner's mesh publish). The stderr line is written regardless. */
-  alarmsTo(sink: (alarm: MeshOutageAlarm) => Promise<unknown> | void): this { this.#alarm = sink; return this; }
+  #alarmAfterMs = MESH_OUTAGE_ALARM_AFTER_MS;
+  /** Where this path's outage alarm goes (the owner's mesh publish). The stderr line is written regardless.
+   * `afterMs`: the outage bound (tests shorten it). */
+  alarmsTo(sink: (alarm: MeshOutageAlarm) => Promise<unknown> | void, afterMs = MESH_OUTAGE_ALARM_AFTER_MS): this {
+    this.#alarm = sink;
+    this.#alarmAfterMs = afterMs;
+    return this;
+  }
+  /** No outage being tracked and every alarm event accepted: an owner may drop this retry (pi-fabric#893 round 3). */
+  get idle(): boolean { return this.#outageSince === undefined && this.#pendingAlarms.length === 0 && !this.#flushing; }
+  /** Retry the pending alarm events now (an owner whose path has no further writes). */
+  flushAlarms(): Promise<void> { return this.#flushAlarms(); }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
     console.warn(`${MESH_OUTAGE_ALARM_TAG} ${JSON.stringify(alarm)}`);
@@ -745,10 +764,11 @@ export class MeshBackgroundRetry {
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
   #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
-  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). */
-  success(): void {
+  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). `final`: the path's work is
+   * done (a one-shot write such as one actor's presence), so its outage ends now, with no further writes to wait for. */
+  success(final = false): void {
     this.#resetBackoff();
-    if (this.#outageSince !== undefined && ++this.#outageSuccesses >= MESH_OUTAGE_RECOVERY_SUCCESSES) {
+    if (this.#outageSince !== undefined && (++this.#outageSuccesses >= MESH_OUTAGE_RECOVERY_SUCCESSES || final)) {
       if (this.#outageRaised) this.#raise({ label: this.label, state: "recovered", sinceMs: this.#outageSinceWall,
         durationMs: Math.round(performance.now() - this.#outageSince) });
       this.#outageSince = undefined;
@@ -769,6 +789,7 @@ export class MeshBackgroundRetry {
   }
   failure(error: unknown): boolean {
     const transient = isMeshWriteDeferred(error);
+    this.#outageSuccesses = 0; // any failure breaks the recovery streak (pi-fabric#893 CODE P2)
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
@@ -786,7 +807,7 @@ export class MeshBackgroundRetry {
     const clock = performance.now();
     if (this.#outageSince === undefined) { this.#outageSince = clock; this.#outageSinceWall = now; }
     this.#outageSuccesses = 0;
-    if (!this.#outageRaised && clock - this.#outageSince >= MESH_OUTAGE_ALARM_AFTER_MS) {
+    if (!this.#outageRaised && clock - this.#outageSince >= this.#alarmAfterMs) {
       this.#outageRaised = true;
       this.#raise({ label: this.label, state: "outage", sinceMs: this.#outageSinceWall, durationMs: Math.round(clock - this.#outageSince),
         reason: isMeshLockTimeout(error) ? "mesh lock timeout" : "SQLite WAL cap" });
@@ -798,7 +819,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`);
+      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {

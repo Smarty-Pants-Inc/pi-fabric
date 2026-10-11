@@ -702,6 +702,7 @@ export class ActorManager {
   #presenceTimer: NodeJS.Timeout | undefined;
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
+  #meshOutageAlarmMs: number | undefined;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   // Independent of registry objects: ownership/reload may replace them during a drain.
@@ -790,6 +791,8 @@ export class ActorManager {
       presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** Outage-alarm bound of this manager's background paths (tests shorten it); default MESH_OUTAGE_ALARM_AFTER_MS. */
+      meshOutageAlarmMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
       preparationTimeoutMs?: number;
       preparationRetryMs?: number;
@@ -917,6 +920,7 @@ export class ActorManager {
     });
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
     this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
@@ -5027,10 +5031,16 @@ export class ActorManager {
       }
       return;
     }
+    // pi-fabric#893 round 3: a settled id's retry is kept until its alarm and recovery were accepted; retry those now.
+    for (const [other, kept] of this.#presenceRetries) {
+      if (other === id || this.#pendingPresence.has(other)) continue;
+      if (kept.idle) this.#presenceRetries.delete(other);
+      else void kept.flushAlarms();
+    }
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
       retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs)
-        .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
+        .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })), this.#meshOutageAlarmMs);
       this.#presenceRetries.set(id, retry);
     }
     if (retry.waitMs > 0) {
@@ -5054,7 +5064,10 @@ export class ActorManager {
       }
       this.#pendingPresence.delete(id);
       this.#orphanPresence.delete(id);
-      this.#presenceRetries.delete(id);
+      // The write is this path's last: its outage (if any) ends now, alarm first, then recovery. The retry is dropped
+      // only once both were accepted; until then later presence passes retry them (above).
+      retry.success(true);
+      if (retry.idle) this.#presenceRetries.delete(id);
     } catch (error) {
       if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
         // Someone wrote this entry since it was found orphaned: it is not ours to delete.

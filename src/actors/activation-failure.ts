@@ -6,7 +6,9 @@
  * before model admission, or a missing directive reply after one of those. Credential,
  * permission, security-policy, quota, rejected-request (4xx other than 429), context and
  * preparation failures stay blocked, and so does anything not recognised: fail closed.
- * A permanent cause wins over a transient one found in the same text.
+ * A permanent cause found anywhere wins: every line of the failure text and every recorded
+ * worker warning is scanned for one before any transient evidence is considered, so a
+ * multiline failure whose last line is a 502 but whose earlier line is a 401 stays blocked.
  */
 export interface ActivationFailureClass {
   code: string;
@@ -56,16 +58,39 @@ const PROVIDER_RECOVERY_EVIDENCE = /Pi provider recovery|interrupted by a model 
 
 const quote = (match: string): string => JSON.stringify(match.trim().slice(0, 80));
 
-/** Model prose quoted into an error (a final-text or output snippet) is not evidence of a cause. */
+/** A V8 stack frame is context for the error above it; its path or line number is not a cause. */
+const STACK_FRAME = /^at\s/;
+
+/** The worker quotes at most 200 characters of model prose, then "…" and ")", as a final-text or
+ * output snippet (src/worker.ts). That prose is not evidence of a cause. For the permanent scan
+ * only the quote is cut (up to the first ")" that ends a line, else the rest of its line), so a
+ * real error line after it is still scanned; any prose left over can only keep a block. */
+const MODEL_TEXT_QUOTE = /\s*\((?:final text|output): (?:[\s\S]{0,201}?\)(?=[ \t]*(?:\r?\n|$))|[^\n]*)/gi;
+/** For transient evidence everything from the first quote on is cut: fail closed. */
 const withoutModelText = (text: string): string =>
   text.replace(/\s*\((?:final text|output): [\s\S]*$/i, "");
 
-const permanentIn = (text: string): ActivationFailureClass | undefined => {
+/** The non-empty, non-stack-frame lines of a failure text. */
+const lines = (text: string): string[] =>
+  text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !STACK_FRAME.test(line));
+
+const permanentIn = (text: string, where = ""): ActivationFailureClass | undefined => {
   for (const [code, why, pattern] of PERMANENT) {
     const match = pattern.exec(text);
-    if (match) return { code, transient: false, classification: `permanent: ${why} (matched ${quote(match[0])})` };
+    if (match) return { code, transient: false, classification: `permanent: ${why} (matched ${quote(match[0])}${where})` };
   }
   return undefined;
+};
+
+/** smarty-dev#8487 review: a permanent cause anywhere in the failure wins. The terminal line is
+ * scanned first, then every other line of the full failure text, then the worker warnings. */
+const permanentAnywhere = (input: { lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined }):
+  ActivationFailureClass | undefined => {
+  const scan = (texts: readonly string[]): string =>
+    texts.flatMap(text => lines(text.replace(MODEL_TEXT_QUOTE, ""))).join("\n");
+  return permanentIn(scan([input.lastError]))
+    ?? permanentIn(scan([input.error ?? ""]), " in another failure line")
+    ?? permanentIn(scan(input.evidence ?? []), " in a worker warning");
 };
 
 const providerTransientIn = (text: string): { why: string; match: string } | undefined => {
@@ -87,9 +112,10 @@ export const classifyActivationFailure = (input: {
     return { code: "failing-preparation", transient: false,
       classification: "permanent: activation preparation kept failing past its retry budget" };
   }
-  const line = withoutModelText(input.lastError);
-  const permanent = permanentIn(line);
+  // Permanent causes first, across the whole failure; only then any transient evidence.
+  const permanent = permanentAnywhere(input);
   if (permanent) return permanent;
+  const line = withoutModelText(input.lastError);
   if (/Activation window lost current activation messages/i.test(line)) {
     return { code: "activation-window-lost", transient: true,
       classification: "transient: activation window lost its current messages" };
@@ -100,14 +126,11 @@ export const classifyActivationFailure = (input: {
   }
   if (/Directive reply missing/i.test(line)) {
     // Transient only after a provider or stream error in the same run; a model that
-    // simply did not reply stays blocked.
-    const earlier = withoutModelText((input.error ?? "").split(input.lastError).join("\n"));
-    const evidence = [earlier, ...(input.evidence ?? [])].join("\n");
-    const blocking = permanentIn(evidence);
-    if (blocking) {
-      return { code: "unknown", transient: false,
-        classification: `fail-closed: directive reply missing after a non-transient error (${blocking.classification})` };
-    }
+    // simply did not reply stays blocked. No permanent cause is anywhere in the failure here.
+    // Cut the model quote from the whole text before removing the terminal line, so prose on a
+    // quote's later lines is never left behind as transient evidence.
+    const earlier = withoutModelText(input.error ?? "").split(line).join("\n");
+    const evidence = lines([earlier, ...(input.evidence ?? []).map(withoutModelText)].join("\n")).join("\n");
     const recovery = PROVIDER_RECOVERY_EVIDENCE.exec(evidence);
     const cause = providerTransientIn(evidence) ?? (recovery ? { why: "provider recovery", match: recovery[0] } : undefined);
     return cause

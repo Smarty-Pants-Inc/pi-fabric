@@ -3707,6 +3707,11 @@ describe("ActorManager", () => {
       ["Error: 503 Service Unavailable but the API key is unauthorized", "auth", /^permanent: credential/],
       ["Error: Structured agent output was invalid: must have required property 'action' (output: upstream 502 timeout)", "unknown", /^fail-closed: no transient cause recognised$/],
       ["Error: something nobody has classified", "unknown", /^fail-closed: no transient cause recognised$/],
+      // #842 review P1: a permanent cause on an earlier line wins over a transient last line.
+      ["Error: 401 Unauthorized: invalid x-api-key\nError: provider stream failed: 502 Bad Gateway", "auth",
+        /^permanent: credential or authentication failure \(matched "401" in another failure line\)$/],
+      ["Error: 403 Forbidden: organization has no access\nError: stream disconnected before completion", "permission",
+        /^permanent: permission denied \(matched "403" in another failure line\)$/],
     ])("keeps %s blocked (fail closed)", async (error, code, classification) => {
       const s = setup(true);
       const time = clock();
@@ -3762,8 +3767,35 @@ describe("ActorManager", () => {
       [{ lastError: "Directive reply missing: the run ended without a fabric_reply call (final text: the upstream returned 502 Bad Gateway)" }, "unknown",
         /^fail-closed: directive reply missing without a provider or stream error$/],
       [{ lastError: "Directive reply missing: the run ended without a fabric_reply call",
-        evidence: ["Pi provider recovery: same-session resume 1/3", "Error: 403 Forbidden"] }, "unknown",
-        /^fail-closed: directive reply missing after a non-transient error \(permanent: permission denied/],
+        evidence: ["Pi provider recovery: same-session resume 1/3", "Error: 403 Forbidden"] }, "permission",
+        /^permanent: permission denied \(matched "403" in a worker warning\)$/],
+      // #842 review P1: the full failure text and the worker warnings are scanned for a permanent
+      // cause first; any match anywhere wins over a transient last line.
+      [{ lastError: "Error: 502 Bad Gateway", error: "Error: 401 Unauthorized: invalid x-api-key\nError: 502 Bad Gateway" }, "auth",
+        /^permanent: credential or authentication failure \(matched "401" in another failure line\)$/],
+      [{ lastError: "Error: stream disconnected before completion",
+        error: "Error: 403 Forbidden: organization has no access\nError: stream disconnected before completion" }, "permission",
+        /^permanent: permission denied \(matched "403" in another failure line\)$/],
+      [{ lastError: "Error: 502 Bad Gateway", error: "Error: 502 Bad Gateway",
+        evidence: ["Error: 401 Unauthorized; aborting turn for one same-model retry"] }, "auth",
+        /^permanent: credential or authentication failure \(matched "401" in a worker warning\)$/],
+      [{ lastError: "Error: 502 Bad Gateway", error: "Error: Structured agent output was invalid: must have required property 'action' " +
+        "(output: upstream said\nall good)\nError: 401 Unauthorized\nError: 502 Bad Gateway" }, "auth",
+        /^permanent: credential or authentication failure \(matched "401" in another failure line\)$/],
+      // All-transient multiline failures still expire; a stack frame's line number (":401:") is not a cause.
+      [{ lastError: "Error: stream disconnected before completion", error: "Error: 503 Service Unavailable\n" +
+        "    at fetch (/app/node_modules/undici/index.js:401:15)\nError: stream disconnected before completion" }, "provider-transient",
+        /^transient: model stream disconnect/],
+      [{ lastError: "Error: 502 Bad Gateway", error: "Error: 429 Too Many Requests\nError: read ECONNRESET\nError: 502 Bad Gateway",
+        evidence: ["Pi provider recovery: same-session resume 1/3 scheduled after 5000ms"] }, "provider-transient",
+        /^transient: provider 5xx or overload/],
+      // Model prose quoted over several lines is evidence of neither class.
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call (final text: Summary:",
+        error: "Directive reply missing: the run ended without a fabric_reply call (final text: Summary:\nthe upstream returned 502 Bad Gateway)" },
+        "unknown", /^fail-closed: directive reply missing without a provider or stream error$/],
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call (final text: Summary:",
+        error: "Error: 503 Service Unavailable\nDirective reply missing: the run ended without a fabric_reply call (final text: Summary:\nfixed the 403 page)" },
+        "provider-transient", /^transient: directive reply missing after a provider 5xx or overload/],
       [{ lastError: "Error: worker retried after 500 ms and gave up" }, "unknown", /^fail-closed: no transient cause recognised$/],
       [{ lastError: "Unknown activation failure" }, "unknown", /^fail-closed: no transient cause recognised$/],
       [{ lastError: "Error: 502 Bad Gateway", preparation: true }, "failing-preparation", /^permanent: activation preparation/],

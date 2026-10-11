@@ -52,7 +52,7 @@ describe("native jump-to-latest parity", () => {
     const latest = new ConversationLatest();
     const lines = ["history", "history"];
     latest.paint(lines, 80, 3, true, true, theme);
-    const label = " ↓ Jump to latest message · End ";
+    const label = " ↓ Jump to latest message · Ctrl+End ";
     const column = Math.floor((80 - label.length) / 2);
     expect(latest.hit(mouse("press", column, 4))).toBe(true);
     expect(latest.hit(mouse("press", column + label.length - 1, 4))).toBe(true);
@@ -102,7 +102,7 @@ describe("participant latest-history action", () => {
       f.append(); f.newer();
       const frame = f.frame();
       expect(f.state.view("child").scroll).toBe(pinned);
-      const row = frame.findIndex((line) => line.includes("Jump to latest message · End"));
+      const row = frame.findIndex((line) => line.includes("Jump to latest message · Ctrl+End"));
       const x = frame[row]!.indexOf("↓");
       expect(row).toBeGreaterThan(0);
       expect(f.view.focused).toBe(true);
@@ -117,7 +117,7 @@ describe("participant latest-history action", () => {
       expect(f.state.view("child").draft).toBe("draft stays here!");
       f.view.handleInput("\x1b[5~");
       f.frame();
-      f.view.handleInput("\x1b[F");
+      f.view.handleInput("\x1b[1;5F");
       expect(f.loadLatest).toHaveBeenCalledTimes(2);
       expect(f.frame().join("\n")).not.toContain("Jump to latest");
     } finally { f.view.dispose(); f.state.clear(); }
@@ -128,8 +128,8 @@ describe("participant latest-history action", () => {
     try {
       f.newer();
       expect(f.state.view("child").following).toBe(true);
-      expect(f.frame().join("\n")).toContain("Jump to latest message · End");
-      f.view.handleInput("\x1b[F");
+      expect(f.frame().join("\n")).toContain("Jump to latest message · Ctrl+End");
+      f.view.handleInput("\x1b[1;5F");
       expect(f.loadLatest).toHaveBeenCalledTimes(1);
       expect(f.frame().join("\n")).not.toContain("Jump to latest");
     } finally { f.view.dispose(); f.state.clear(); }

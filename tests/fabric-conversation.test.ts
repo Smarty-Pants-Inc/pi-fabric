@@ -18,6 +18,8 @@ import {
 import { FabricConversationTranscriptRenderer } from "../src/ui/conversation-render.js";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { nativeTranscript, userMessage, assistantMessage } from "./fixtures/native-conversation.js";
+// Pi 1.1 binds tui.altScreen.bottom (jump to latest) to Ctrl+End, not End.
+const CTRL_END = "\x1b[1;5F";
 initTheme("dark", false);
 
 const theme = {
@@ -206,7 +208,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
       expect(h.state.view("a").following).toBe(false);
       appendFileSync(eventsFile, JSON.stringify({ type: "message_end", message: assistantMessage("while pinned", 99) }) + "\n");
       expect(renderText(h.view)).toContain("newer activity available");
-      h.view.handleInput("\x1b[F");
+      h.view.handleInput(CTRL_END);
       const latest = renderText(h.view);
       expect(latest).toContain("while pinned");
       expect(latest).toContain("Working");
@@ -230,7 +232,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     expect(h.state.view("b").following).toBe(false);
     expect(lines.slice(0, border - 1).map(historyText)).toEqual(history.slice(scroll, scroll + border - 1));
     expect(lines[border - 1]).toContain("Jump to latest message");
-    h.view.handleInput("\x1b[F");
+    h.view.handleInput(CTRL_END);
     const latest = h.view.render(100);
     expect(latest.slice(border - 2, border).map(historyText)).toEqual(["history 99", ""]);
     expect(history).toHaveLength(100);
@@ -254,7 +256,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     expect(historyText(lines[editorTop - 2]!)).toMatch(/^history \d+$/);
     expect(lines[editorTop - 1]).toContain("Jump to latest message");
     expect(lines[editorTop - 1]).not.toContain("history 99");
-    h.view.handleInput("\x1b[F");
+    h.view.handleInput(CTRL_END);
     lines = h.view.render(100);
     editorTop = editorStatusRow(lines);
     expect(historyText(lines[editorTop - 2]!)).toBe("history 99");
@@ -768,7 +770,7 @@ describe("FabricConversationView", () => {
     renderText(h.view);
     h.view.handleInput("\x1b[1;5B");
     expect(h.loadNewer).toHaveBeenCalledWith("a");
-    h.view.handleInput("\x1b[F");
+    h.view.handleInput(CTRL_END);
     expect(h.loadLatest).toHaveBeenCalledWith("a");
     h.view.handleInput("\x1b[5~");
     renderText(h.view);

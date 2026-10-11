@@ -305,6 +305,36 @@ describe("mesh lock stats recorder", () => {
     expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost())).sort()).toEqual(["once-3.json", "twice-4.json"]);
   });
 
+  it("never replaces a newer stats file that lands just before the pruner restores a moved one (smarty-dev#7879)", () => {
+    const root = path.join(temp(), "mesh");
+    const directory = path.join(root, "lock-stats");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const file = path.join(directory, "racer-5.json");
+    const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+    fs.writeFileSync(file, "{}");
+    fs.utimesSync(file, old, old);
+    const renameSync = fs.renameSync, linkSync = fs.linkSync;
+    const refresh = (body: string): void => {
+      fs.writeFileSync(`${file}.next`, body);
+      renameSync(`${file}.next`, file);
+    };
+    let landed = 0;
+    // The pruner moves the writer's first refresh aside; the second lands after that move and
+    // right before the pruner puts the moved file back at the name.
+    const restoring = (from: fs.PathLike, to: fs.PathLike): void => {
+      if (String(from) === file && landed === 0) { landed++; refresh("{\"fresh\":1}"); }
+      else if (String(to) === file && String(from).startsWith(`${file}.prune-`) && landed === 1) { landed++; refresh("{\"fresh\":2}"); }
+    };
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { restoring(from, to); renameSync(from, to); });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => { restoring(from, to); linkSync(from, to); });
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect(landed).toBe(2);
+    expect(fs.readFileSync(file, "utf8")).toBe("{\"fresh\":2}");
+    expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost()))).toEqual(["racer-5.json"]);
+  });
+
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);

@@ -284,15 +284,16 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
         if (!name.endsWith(".json")) { fs.unlinkSync(file); continue; }
         // Never unlink a stats file by name (smarty-dev#7879): its writer may refresh it by rename
         // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
-        // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back,
-        // unless an even newer one now holds the name. ponytail: a refresh inside that last
-        // lstat-to-rename gap is replaced by the one just before it, never lost to an unlink.
+        // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
+        // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
+        // works on NTFS too), then drop the graveyard name either way.
         const grave = `${file}.prune-${process.pid}`;
         fs.renameSync(file, grave);
         const moved = fs.lstatSync(grave);
-        if (moved.dev === seen.dev && moved.ino === seen.ino && moved.mtimeMs === seen.mtimeMs) fs.unlinkSync(grave);
-        else if (fs.lstatSync(file, { throwIfNoEntry: false })) fs.unlinkSync(grave);
-        else fs.renameSync(grave, file);
+        if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {
+          try { fs.linkSync(grave, file); } catch { /* A newer file holds the name. */ }
+        }
+        fs.unlinkSync(grave);
       } catch { /* Raced with its owner or another pruner. */ }
     }
   };

@@ -686,7 +686,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   agents: {
     enabled: true,
-    runner: "pi-durable",
+    // Fork policy (smarty-dev#5776): our route pins, release pinning, placement and residency
+    // behaviour key on the "pi" runner; upstream's pi-durable default stays opt-in here.
+    runner: "pi",
     transport: "process",
     deniedModels: [],
     modelPolicy: { requireReason: ["gpt-6-astra"] },

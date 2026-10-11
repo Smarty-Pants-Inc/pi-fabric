@@ -3382,7 +3382,8 @@ export class AgentManager {
     // other handle (including custom process handles on Windows) stays strict.
     if (transports.some((transport, index) => alive[index] &&
           !all.some(managed => managed.transport === transport && this.#hasNativeStopDebt(managed))) ||
-        all.some((managed) => !managed.executionExited && !this.#hasNativeStopDebt(managed)) ||
+        // Hosted runs have no local execution: their adapter owns stop/detach (upstream runner contract).
+        all.some((managed) => !managed.executionExited && !managed.hosted && !this.#hasNativeStopDebt(managed)) ||
         [...this.#queued.values()].some(queued => queued.cleanupPending)) {
       throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
     }

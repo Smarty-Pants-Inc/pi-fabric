@@ -482,6 +482,11 @@ describe("agent scope narrowing", () => {
       resolveCwd: (cwd: string) => cwd,
       childThinkingBounds: () => ({}),
       detachSignal() {},
+      // Our model-policy hooks (requireReason, denied models): no policy in this fixture.
+      assertExplicitModelReason() {},
+      assertModelAllowed() {},
+      prepareModelForAdmission: async (model: string | undefined) => model,
+      defaultModel: () => undefined,
       spawn: async (request: unknown) => {
         requests.push(request);
         return handle;
@@ -493,7 +498,12 @@ describe("agent scope narrowing", () => {
       { scheduleRefresh() {} } as unknown as FabricParticipantSource, undefined, {} as LifecycleBroker,
       () => true, residency as unknown as ConstructorParameters<typeof AgentsProvider>[8],
     );
-    const context = { ...invocation(), extensionContext: { model: { provider: "p", id: "m" } } as unknown as ExtensionContext };
+    // Our Pi model admission resolves the inherited model against the session registry.
+    const piModel = { provider: "p", id: "m", name: "m" };
+    const context = { ...invocation(), extensionContext: {
+      model: piModel,
+      modelRegistry: { getAvailable: () => [piModel], getAll: () => [piModel], find: (provider: string, id: string) => provider === "p" && id === "m" ? piModel : undefined },
+    } as unknown as ExtensionContext };
     const parent = root();
     scoped(parent);
     const forged = normalizeScope({ principal: { id: "user:mallory" }, grants: [{ resource: "fs:*", actions: ["write"] }] });

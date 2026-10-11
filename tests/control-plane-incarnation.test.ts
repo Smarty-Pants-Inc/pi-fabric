@@ -106,6 +106,8 @@ describe("FabricControlPlane owner incarnation", () => {
       expect.objectContaining({ ownerIncarnation: owner.incarnation }),
       expect.anything(),
       expect.anything(),
+      // Our control plane also passes the admitted verification (mesh or bridge).
+      expect.anything(),
     );
     expect(store(meshRoot).read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
       expect.objectContaining({

@@ -31,6 +31,10 @@ describe("CI Node runtime prerequisites", () => {
     expect(prerequisites.run).toContain("mkdir -p /tmp");
   });
 
+  // Our deliberately pinned jobs keep their own Node version (fork CI policy: our jobs stay as
+  // they are). mesh-lock-bench measures dist/ built for node24 against a fixed baseline.
+  const pinnedNodeJobs = new Set(["test.yml:mesh-lock-bench"]);
+
   it.each(workflows)("%s configures the declared Node runtime before install and execution", (file) => {
     const workflow = parse(fs.readFileSync(new URL(`.github/workflows/${file}`, root), "utf8")) as {
       jobs: Record<string, { steps?: Step[] }>;
@@ -44,8 +48,12 @@ describe("CI Node runtime prerequisites", () => {
       expect(checkout).toBeGreaterThanOrEqual(0);
       expect(checkout).toBeLessThan(setup);
       expect(manifest.engines.node).toBeTruthy();
-      expect(steps[setup]!.with?.["node-version-file"]).toBe("package.json");
-      expect(steps[setup]!.with?.["node-version"]).toBeUndefined();
+      if (pinnedNodeJobs.has(`${file}:${job}`)) {
+        expect(steps[setup]!.with?.["node-version"]).toBeTruthy();
+      } else {
+        expect(steps[setup]!.with?.["node-version-file"]).toBe("package.json");
+        expect(steps[setup]!.with?.["node-version"]).toBeUndefined();
+      }
       expect(steps[setup]!.if).toBeUndefined();
       for (const index of executions) {
         expect(setup, `${file}:${job} must set up Node before ${steps[index]!.run}`).toBeLessThan(index);

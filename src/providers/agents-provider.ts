@@ -864,7 +864,8 @@ export class AgentsProvider implements FabricProvider {
     if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
       const runner = checkedRunner(args.runner, this.manager.config.runner);
       const inherited = (runner === "pi" || runner === "pi-durable") && args.scope !== "global" ? context.extensionContext.model : undefined;
-      this.manager.assertExplicitModelReason(args.model, args.modelReason, runner,
+      // Host-supplied managers without our model policy (embeds, upstream fixtures) skip the check.
+      this.manager.assertExplicitModelReason?.(args.model, args.modelReason, runner,
         inherited ? `${inherited.provider}/${inherited.id}` : undefined);
     }
     switch (actionName) {

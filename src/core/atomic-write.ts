@@ -675,6 +675,11 @@ export class MeshLockTimeoutError extends Error {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** A write that wrote nothing and may succeed later: a lock timeout, or a SQLite WAL-cap refusal
+ * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+export const isMeshWriteDeferred = (error: unknown): error is Error =>
+  isMeshLockTimeout(error) || (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+
 /** Best-effort protocol writes may swallow conflicts, but not a retryable lock wait. */
 export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   if (isMeshLockTimeout(error)) throw error;
@@ -717,7 +722,7 @@ export class MeshBackgroundRetry {
     this.#suppressed = 0;
   }
   failure(error: unknown): boolean {
-    const transient = isMeshLockTimeout(error);
+    const transient = isMeshWriteDeferred(error);
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
@@ -739,7 +744,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`);
+      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {

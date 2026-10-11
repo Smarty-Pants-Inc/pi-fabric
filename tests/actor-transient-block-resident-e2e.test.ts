@@ -73,7 +73,8 @@ const fixture = (cooldownMs = COOLDOWN_MS) => {
     // Factory review routing: skip an actor whose published record is blocked or not live.
     routable: (id: string): boolean => {
       const value = router.get(`actors/${config.sessionId}/${id}`)?.value as Presence;
-      return value !== undefined && value.activationBlocked === undefined && ["idle", "running", "queued"].includes(String(value.status));
+      // A dormant actor still accepts deliveries: delivery wakes it, so it is routable.
+      return value !== undefined && value.activationBlocked === undefined && ["idle", "running", "queued", "dormant"].includes(String(value.status));
     },
     route: (text: string) => router.publish({ topic: TOPIC, from, text }),
   };

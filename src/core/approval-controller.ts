@@ -205,7 +205,11 @@ export class ApprovalController {
     this.#assertCurrent();
     if (!this.context.hasUI) {
       if (this.config.headless === "decision" && this.headless) {
-        if (await this.headless(action, escalationReason)) return;
+        const approved = await this.headless(action, escalationReason);
+        // A session reset while the decision was pending retires it: a late
+        // answer must not authorize the old action (same fence as the UI path).
+        this.#assertCurrent();
+        if (approved) return;
         throw new FabricTraceSafeError(`${action.ref} approval was denied, cancelled, or expired`);
       }
       throw new FabricTraceSafeError(`${action.ref} requires approval, but no interactive UI is available`);

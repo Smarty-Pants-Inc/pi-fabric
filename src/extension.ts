@@ -640,14 +640,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           return merged;
         }
       }();
-      // Avoid a write/lock attempt for unchanged evidence as in the fork, but
-      // rebase every actual update under upstream's cross-process pool lock.
-      const pooled = await entropy.loadObservationPoolAsync(agentDir);
-      if (pooled.error) throw new Error(pooled.error);
-      const planned = await observations.merge(pooled.file, evidence.observationWindows, signal);
-      if (planned.mergedSessions > 0 || !pooled.file) {
-        await updateObservationPoolAsync(agentDir, evidence.observationWindows, observations);
-      }
+      // Upstream's update rebases under the cross-process pool lock and skips
+      // the write for unchanged evidence (written: false), as the fork did.
+      await updateObservationPoolAsync(agentDir, evidence.observationWindows, observations);
     } catch (error) {
       if (signal.aborted) return false;
       if (error instanceof FileLockTimeoutError) {

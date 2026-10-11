@@ -189,14 +189,17 @@ describe("extractive extension integration", () => {
       const f = await fixture(enabled, true, true);
       await f.emit("session_start");
       for (const query of ["first query", "different second query"]) {
-        const options = Object.freeze({ skills: Object.freeze([]) });
+        // Fork: Fabric writes journaled prompt sections (systemPromptOptions.sections)
+        // instead of forcing a systemPrompt projection; both must stay byte-stable.
+        const options = { skills: Object.freeze([]), sections: {} as Record<string, string> };
         const event = Object.freeze({ prompt: query, systemPrompt: "STATIC SYSTEM", systemPromptOptions: options });
         const results = await f.emit("before_agent_start", event);
-        const forced = results.filter((r) => r?.systemPrompt !== undefined);
-        expect(forced).toHaveLength(1);
-        prompts.push(forced[0].systemPrompt);
-        expect(event.systemPromptOptions).toEqual({ skills: [] });
-        const system = { role: "system", content: forced[0].systemPrompt, toolsAdded: [{ name: "fabric_exec", parameters: { type: "object" } }], timestamp: 0 };
+        expect(results.filter((r) => r?.systemPrompt !== undefined)).toHaveLength(0);
+        expect(options.sections.fabric_execution).toEqual(expect.any(String));
+        const systemPrompt = `STATIC SYSTEM\n\n${JSON.stringify(options.sections)}`;
+        prompts.push(systemPrompt);
+        expect(options.skills).toEqual([]);
+        const system = { role: "system", content: systemPrompt, toolsAdded: [{ name: "fabric_exec", parameters: { type: "object" } }], timestamp: 0 };
         const request = await f.request([system, { role: "user", content: query, timestamp: 1 }]);
         expect(request[0].content).toBe(system.content);
         systems.push(JSON.stringify(convertToLlm(request).filter((m) => m.role === "system")));

@@ -33,13 +33,23 @@ describe("Fabric compaction extension hooks", () => {
 
   it("repairs orphaned tool results in the outgoing context and keeps clean lists untouched", async () => {
     const handlers = await loadExtension();
-    const [context] = handlers.get("context")!;
+    // The fork registers cheap observers (principal capture, wake causes) before
+    // the projection hook, so chain every context handler as Pi does.
+    const context = async (event: { type: string; messages: unknown[] }, host: ReturnType<typeof hostContext>) => {
+      let messages = event.messages;
+      let changed = false;
+      for (const handler of handlers.get("context")!) {
+        const result = await handler({ ...event, messages }, host) as { messages?: unknown[] } | undefined;
+        if (result?.messages) { messages = result.messages; changed = true; }
+      }
+      return changed ? { messages } : undefined;
+    };
     const clean = [
       { role: "user", content: "go", timestamp: 1 },
       { role: "assistant", content: [{ type: "toolCall", id: "a", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
       { role: "toolResult", toolCallId: "a", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 1 },
     ];
-    expect(await context!({ type: "context", messages: clean }, hostContext())).toBeUndefined();
+    expect(await context({ type: "context", messages: clean }, hostContext())).toBeUndefined();
 
     const broken = [
       { role: "user", content: "go", timestamp: 1 },
@@ -47,7 +57,7 @@ describe("Fabric compaction extension hooks", () => {
       { role: "assistant", content: [{ type: "toolCall", id: "b", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
       { role: "user", content: "again", timestamp: 1 },
     ];
-    const repaired = await context!({ type: "context", messages: broken }, hostContext()) as {
+    const repaired = await context({ type: "context", messages: broken }, hostContext()) as {
       messages: Array<{ role: string; toolCallId?: string; content?: unknown }>;
     };
     expect(repaired.messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "user"]);

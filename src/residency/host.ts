@@ -222,7 +222,7 @@ export class ResidentHost {
   #deliveryCommits!: CommitOutbox;
   #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
-  readonly #token = randomUUID();
+  readonly #token = residentGenerationToken();
   /** The owner token this host publishes in owner.json: its generation (smarty-dev#7950). */
   get generation(): string { return this.#token; }
   #requestTimer: NodeJS.Timeout | undefined;
@@ -1922,6 +1922,22 @@ function residentHostLaunchContext(config: ResidentHostConfig): ResidentHostLaun
   }
   return { launcher, spec, ...(attempt ? { attempt } : {}) };
 }
+
+/**
+ * This host's generation (owner token). A launcher chooses it before the spawn and passes it in
+ * PI_FABRIC_RESIDENT_GENERATION, so the launcher knows the generation of an exit it did not see the host publish
+ * (smarty-dev#7950); a malformed one refuses the start. Consumed once (removed from the environment), so no child
+ * inherits it. Absent (an in-process host, or a launcher from before this change during a handover): a random one.
+ */
+const residentGenerationToken = (): string => {
+  const chosen = process.env.PI_FABRIC_RESIDENT_GENERATION;
+  delete process.env.PI_FABRIC_RESIDENT_GENERATION;
+  if (!chosen) return randomUUID();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(chosen)) {
+    throw new Error("Resident generation from the launcher is malformed; refusing to start");
+  }
+  return chosen;
+};
 
 /** Why a resident host exits (smarty-dev#7770). */
 export type ResidentExitReason = "idle-exit" | "handover-release" | "stopped" | "error";

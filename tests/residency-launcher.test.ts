@@ -172,22 +172,27 @@ describe.skipIf(!hasLauncher || process.platform !== "linux")("resident launcher
   const tree = (dir: string): Record<string, string> => Object.fromEntries(fs.readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name))
     .map(file => [path.relative(dir, file), fs.readFileSync(file, "utf8")]));
-  const setup = (report: "none" | "complete" | "partial") => {
+  const setup = (report: "none" | "complete" | "partial" | "die-after-publish") => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-generation-"));
     const root = path.join(base, "root");
     fs.mkdirSync(root);
-    const generation = randomUUID();
     const hostBinary = path.join(base, "fake-host.mjs");
-    // Like the real host: make generations/ while it owns the root, then publish owner.json with its token.
+    // Like the real host: publish owner.json with the generation its launcher chose (PI_FABRIC_RESIDENT_GENERATION),
+    // after making generations/. die-after-publish waits for the test's go file, publishes, and SIGKILLs itself.
     fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path';
-const root = ${JSON.stringify(root)};
+const root = ${JSON.stringify(root)}, base = ${JSON.stringify(base)};
+const generation = process.env.PI_FABRIC_RESIDENT_GENERATION;
+fs.writeFileSync(path.join(base, 'generation'), generation);
 const stat = fs.readFileSync('/proc/self/stat', 'utf8');
 const processStartTime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+${report === "die-after-publish" ? `fs.writeFileSync(path.join(base, 'ready'), String(process.pid));
+while (!fs.existsSync(path.join(base, 'go'))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);` : ""}
 fs.mkdirSync(path.join(root, 'generations'), { mode: 0o700 });
-fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, processStartTime, token: ${JSON.stringify(generation)} }));
-${report === "none" ? "" : `fs.writeFileSync(path.join(root, 'generations', ${JSON.stringify(generation + ".exit.json")}), ${report === "complete"
-    ? `JSON.stringify({ format: 1, generation: ${JSON.stringify(generation)}, writer: 'host', reason: 'idle-exit', pid: process.pid, at: Date.now() })`
-    : `'{"format":1,"gen'`}, { flag: 'wx', mode: 0o600 });`}
+fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, processStartTime, token: generation }));
+${report === "die-after-publish" ? "process.kill(process.pid, 'SIGKILL');" : ""}
+${report === "complete" || report === "partial" ? `fs.writeFileSync(path.join(root, 'generations', generation + '.exit.json'), ${report === "complete"
+    ? "JSON.stringify({ format: 1, generation, writer: 'host', reason: 'idle-exit', pid: process.pid, at: Date.now() })"
+    : `'{"format":1,"gen'`}, { flag: 'wx', mode: 0o600 });` : ""}
 setInterval(() => {}, 1000);
 `);
     const configPath = path.join(root, "config.json");
@@ -195,7 +200,9 @@ setInterval(() => {}, 1000);
     const launcher = spawn(process.execPath, [launcherPath, "--config", configPath], { cwd: root, stdio: "ignore" });
     const exited = new Promise(resolve => launcher.once("exit", resolve));
     const owner = () => { try { return JSON.parse(fs.readFileSync(path.join(root, "owner.json"), "utf8")) as { pid: number }; } catch { return undefined; } };
-    return { base, root, generation, launcher, exited, owner,
+    return { base, root, launcher, exited, owner,
+      get generation() { return fs.readFileSync(path.join(base, "generation"), "utf8"); },
+      ready: () => { try { return Number(fs.readFileSync(path.join(base, "ready"), "utf8")) || undefined; } catch { return undefined; } },
       records: () => fs.existsSync(path.join(root, "generations")) ? fs.readdirSync(path.join(root, "generations")) : [],
       close: () => { if (launcher.exitCode === null && launcher.signalCode === null) launcher.kill("SIGKILL"); fs.rmSync(base, { recursive: true, force: true }); } };
   };
@@ -225,6 +232,30 @@ setInterval(() => {}, 1000);
       expect(JSON.parse(after[name]!)).toMatchObject({ format: 1, generation: f.generation, writer: "launcher", reason: "unreported",
         pid: child, code: null, signal: "SIGKILL" });
       expect(fs.statSync(path.join(f.root, name)).mode & 0o777).toBe(0o600);
+    } finally { f.close(); }
+  });
+
+  it("a child SIGKILLed right after it publishes owner.json, before any launcher sample: the launcher writes the generation record; a successor's files are byte-identical", { timeout: 30_000 }, async () => {
+    const f = setup("die-after-publish");
+    try {
+      await waitFor(() => f.ready() !== undefined);
+      const child = f.ready()!;
+      // The launcher is stopped for the whole first sampling window: it never sees owner.json.
+      process.kill(f.launcher.pid!, "SIGSTOP");
+      fs.writeFileSync(path.join(f.base, "go"), "");
+      await waitFor(() => state(child) === "Z");
+      const successor = randomUUID();
+      fs.writeFileSync(path.join(f.root, "owner.json"), JSON.stringify({ pid: process.pid, processStartTime: startTime(process.pid), token: successor }));
+      fs.appendFileSync(path.join(f.root, "launcher.log"), JSON.stringify({ event: "successor-line" }) + "\n");
+      fs.writeFileSync(path.join(f.root, "error.json"), "successor");
+      const before = tree(f.root);
+      process.kill(f.launcher.pid!, "SIGCONT");
+      await f.exited;
+      const after = tree(f.root);
+      const name = path.join("generations", `${f.generation}.exit.json`);
+      expect(Object.keys(after).filter(file => !(file in before))).toEqual([name]);
+      for (const [file, bytes] of Object.entries(before)) expect(after[file], file).toBe(bytes);
+      expect(JSON.parse(after[name]!)).toMatchObject({ generation: f.generation, writer: "launcher", reason: "unreported", pid: child, signal: "SIGKILL" });
     } finally { f.close(); }
   });
 

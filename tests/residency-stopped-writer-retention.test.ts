@@ -19,6 +19,17 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
+
+// On Linux the collector removes through verifiedRemove (smarty-dev#7916), not rmSync: record each verified removal
+// in the test's rmSync spy, so its "collected once" counts hold on every platform.
+// ponytail: appends to the spy's call log instead of rewriting four identical assertions.
+beforeEach(() => {
+  verifiedRemoveTestHooks.beforeOpen = (target) => {
+    const calls = (fs.rmSync as unknown as { mock?: { calls: unknown[][] } }).mock?.calls;
+    calls?.push([target]);
+  };
+});
 
 // A native session Main owns the caller binding independently of the resident executor.
 const mainParticipants = (config: ResidentHostConfig) => {

@@ -1,0 +1,238 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  claimMeshRetentionSweep, compactTerminalRunEvents, FABRIC_RUN_ROOT_PREFIX, pruneActorRunArchives, pruneActorSessionBackups,
+  removeEmptyRunRoot, sweepTempRunRoots,
+} from "../src/storage/retention.js";
+import { sweepResidentRuns } from "../src/residency/retention.js";
+import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
+import { sweepMeshRetention } from "../src/storage/retention-cli.js";
+
+// smarty-dev#7916 acceptance: for each routed deleter, a swap between the judgment and the delete (file to symlink,
+// a replaced inode, a foreign owner, a refreshed mtime) deletes nothing; no getuid deletes nothing; a future-dated
+// backup name never costs the newest backup. The file runs unchanged on main for the RED evidence: there the swap is
+// triggered by main's own removal call (rmSync/unlinkSync/renameSync/promises.rm on the target), on the head by the
+// helper's seam right before its first open. Either way the swap lands after the judgment and before the delete.
+const DAY = 24 * 60 * 60 * 1_000;
+const NOW = Date.now();
+const DEAD = "2147483647";
+const roots: string[] = [];
+const restores: (() => void)[] = [];
+afterEach(() => {
+  for (const restore of restores.splice(0).reverse()) restore();
+  vi.restoreAllMocks();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
+const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
+const LOG = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
+const run = (directory: string, status: Record<string, unknown> = { status: "completed", finishedAt: 1 }) => {
+  write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: DEAD, ...status }));
+  write(path.join(directory, "events.jsonl"), LOG);
+  write(path.join(directory, "reply.json"), '{"text":"done"}');
+  return directory;
+};
+const old = (file: string) => { const at = (NOW - 30 * DAY) / 1000; fs.utimesSync(file, at, at); return file; };
+/** The whole observable tree below a path (lstat, no following), for "nothing deleted" checks. */
+const shape = (file: string): unknown => {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return null;
+  if (stat.isSymbolicLink()) return ["link", fs.readlinkSync(file)];
+  if (stat.isDirectory()) return Object.fromEntries(fs.readdirSync(file).sort().map(name => [name, shape(path.join(file, name))]));
+  return fs.readFileSync(file, "utf8");
+};
+
+type Swap = "symlink" | "replaced inode" | "foreign owner" | "refreshed mtime";
+const SWAPS: Swap[] = ["symlink", "replaced inode", "foreign owner", "refreshed mtime"];
+/** Apply `swap` to `target` once, right before the removal; returns what must still exist afterwards. */
+const armSwap = async (target: string, swap: Swap): Promise<() => Record<string, unknown>> => {
+  const outside = tmp("fabric-swap-outside-");
+  const moved = path.join(outside, "moved");
+  let fired = false;
+  const doSwap = () => {
+    if (fired) return;
+    fired = true;
+    if (swap === "symlink") { fs.renameSync(target, moved); fs.symlinkSync(moved, target); }
+    else if (swap === "replaced inode") { fs.cpSync(target, moved, { recursive: true }); fs.renameSync(target, path.join(outside, "original")); fs.renameSync(moved, target); }
+    else if (swap === "refreshed mtime") { const at = Date.now() / 1000 + 5; fs.utimesSync(target, at, at); }
+    else {
+      // Another user's file: the process now runs as another uid than the target's owner.
+      const real = process.geteuid!.bind(process); const uid = real() + 1;
+      Object.defineProperty(process, "geteuid", { value: () => uid, configurable: true, writable: true });
+      restores.push(() => Object.defineProperty(process, "geteuid", { value: real, configurable: true, writable: true }));
+    }
+  };
+  const hooks = await import("../src/storage/verified-remove.js").then(module => module.verifiedRemoveTestHooks).catch(() => undefined);
+  if (hooks) {
+    hooks.beforeOpen = (file) => { if (file === target) doSwap(); };
+    restores.push(() => { delete hooks.beforeOpen; });
+  } else {
+    // main: swap inside main's own removal call on the target, before it runs.
+    const intercept = <K extends "rmSync" | "unlinkSync" | "renameSync">(name: K) => {
+      const original = fs[name] as (...args: unknown[]) => unknown;
+      vi.spyOn(fs, name).mockImplementation(((...args: unknown[]) => {
+        if (args[0] === target || (name === "renameSync" && args[1] === target)) doSwap();
+        return original(...args);
+      }) as never);
+    };
+    intercept("rmSync"); intercept("unlinkSync"); intercept("renameSync");
+    const rm = fs.promises.rm;
+    vi.spyOn(fs.promises, "rm").mockImplementation(((file: fs.PathLike, options?: fs.RmOptions) => { if (file === target) doSwap(); return rm(file, options); }) as never);
+  }
+  return () => ({ target: shape(target), outside: shape(outside) });
+};
+
+interface Fixture { target: string; act: () => unknown }
+const FIXTURES: Record<string, () => Fixture> = {
+  pruneActorRunArchives: () => {
+    const runs = tmp("fabric-vr-archives-");
+    const target = run(path.join(runs, "old"));
+    return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
+  },
+  sweepResidentRuns: () => {
+    const residency = tmp("fabric-vr-resident-");
+    const target = old(run(path.join(residency, "runs", "old")));
+    return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
+  },
+  "pruneClosedRunRoot (sweepTempRunRoots)": () => {
+    const tempRoot = tmp("fabric-vr-closed-");
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
+    const target = run(path.join(root, "old"));
+    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
+    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+  },
+  "sweepTempRunRoots (orphaned root)": () => {
+    const tempRoot = tmp("fabric-vr-orphan-");
+    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
+    const target = run(path.join(root, "old"));
+    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+  },
+  removeEmptyRunRoot: () => {
+    const tempRoot = tmp("fabric-vr-empty-");
+    const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "empty");
+    write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1 }));
+    return { target, act: () => removeEmptyRunRoot(target) };
+  },
+  compactTerminalRunEvents: () => {
+    const directory = run(path.join(tmp("fabric-vr-compact-"), "old"));
+    const target = path.join(directory, "events.jsonl");
+    return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
+  },
+  pruneActorSessionBackups: () => {
+    const directory = tmp("fabric-vr-backups-");
+    const session = path.join(directory, "session.jsonl");
+    write(session, "live");
+    const names = ["20260920T150000000Z", "20260921T150000000Z", "20260922T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
+    names.forEach((name, index) => { write(name, name); const at = 1_000 + index; fs.utimesSync(name, at, at); });
+    return { target: names[0]!, act: () => pruneActorSessionBackups(session) };
+  },
+  sweepScratch: () => {
+    const tempRoot = tmp("fabric-vr-scratch-");
+    const target = createScratch("output", tempRoot);
+    write(path.join(target, "output.txt"), "x");
+    closeScratch(target);
+    return { target, act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
+  },
+  claimMeshRetentionSweep: () => {
+    const meshRoot = tmp("fabric-vr-claim-");
+    const hour = 3600_000;
+    claimMeshRetentionSweep(meshRoot, hour, 10 * hour);
+    const target = path.join(meshRoot, ".mesh-retention-sweep-10.json");
+    return { target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
+  },
+  "mesh --runs-older-than pass (sweepMeshRetention --apply)": () => {
+    const root = tmp("fabric-vr-mesh-");
+    const registry = path.join(root, "actors", "project");
+    const actor = path.join(registry, "actor");
+    write(path.join(registry, "actors.json"), JSON.stringify({ actors: [{ id: "actor", rootId: "session:dead", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest" }] }));
+    write(path.join(actor, "session.jsonl"), "live");
+    run(path.join(actor, "runs", "latest"));
+    const target = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 9 * DAY });
+    write(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    return { target, act: () => sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }) };
+  },
+};
+
+describe.skipIf(process.platform !== "linux")("verified removal: every routed retention deleter (smarty-dev#7916)", () => {
+  it.each(Object.keys(FIXTURES))("%s removes its expired target when nothing changes (control)", async name => {
+    const { target, act } = FIXTURES[name]!();
+    await act();
+    expect(fs.existsSync(target) && name !== "compactTerminalRunEvents").toBe(false);
+    if (name === "compactTerminalRunEvents") expect(fs.statSync(target).size).toBeLessThan(LOG.length);
+  });
+
+  const cases = Object.keys(FIXTURES).flatMap(name => SWAPS.map(swap => [name, swap] as const));
+  it.each(cases)("%s deletes nothing after a swap to a %s between judgment and delete", async (name, swap) => {
+    const { target, act } = FIXTURES[name]!();
+    const observe = await armSwap(target, swap);
+    await act();
+    const after = observe();
+    for (const restore of restores.splice(0).reverse()) restore();
+    // The swapped-in object is still at the path, and the judged original (if moved away by the swap) is intact.
+    expect(after.target, `${name} / ${swap}: target path`).not.toBeNull();
+    if (swap === "symlink") expect(after.target).toEqual(["link", path.join(path.dirname(String((after.target as string[])[1])), "moved")]);
+    if (swap === "symlink" || swap === "replaced inode") {
+      const outside = after.outside as Record<string, unknown>;
+      expect(Object.values(outside).every(value => value !== null), `${name} / ${swap}: moved original`).toBe(true);
+    }
+    if (name === "compactTerminalRunEvents" && swap !== "symlink") expect(fs.readFileSync(target, "utf8")).toBe(LOG);
+  });
+
+  it.each(Object.keys(FIXTURES))("%s deletes nothing without getuid", async name => {
+    const { target, act } = FIXTURES[name]!();
+    const before = shape(target);
+    const getuid = process.getuid;
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
+    restores.push(() => Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }));
+    try { await act(); } catch { /* a refusal may throw; it must not delete */ }
+    expect(shape(target)).toEqual(before);
+  });
+
+  it("a swap between the verify and the graveyard move is caught after the move: left in the graveyard, reported, nothing deleted", async () => {
+    const { verifiedRemove } = await import("../src/storage/verified-remove.js");
+    const parent = tmp("fabric-vr-grave-");
+    const outside = tmp("fabric-vr-grave-outside-");
+    const target = run(path.join(parent, "old"));
+    const judged = fs.lstatSync(target);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      // The helper's move into the graveyard (directory-relative through /proc/self/fd).
+      if (String(from).startsWith("/proc/self/fd/") && path.basename(String(from)) === "old") {
+        fs.cpSync(target, path.join(outside, "copy"), { recursive: true });
+        rename(target, path.join(outside, "original"));
+        rename(path.join(outside, "copy"), target);
+      }
+      return rename(from, to);
+    }) as never);
+    const result = verifiedRemove(target, judged, { deleter: "test" });
+    vi.restoreAllMocks();
+    expect(result).toMatchObject({ removed: false, reason: expect.stringMatching(/replaced.*graveyard/) });
+    const graveyard = (result as { graveyard: string }).graveyard;
+    expect(shape(graveyard)).toEqual(shape(path.join(outside, "original")));
+    expect(shape(path.join(outside, "original"))).toMatchObject({ "reply.json": '{"text":"done"}' });
+  });
+
+  it("a dry run verifies the whole tree and reports its bytes, and changes nothing", async () => {
+    const { verifiedRemove } = await import("../src/storage/verified-remove.js");
+    const target = run(path.join(tmp("fabric-vr-dry-"), "old"));
+    const before = shape(path.dirname(target));
+    const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", dryRun: true });
+    expect(result).toEqual({ removed: true, bytes: LOG.length + 15 + fs.statSync(path.join(target, "status.json")).size });
+    expect(shape(path.dirname(target))).toEqual(before);
+  });
+
+  it("a future-dated backup name never costs the newest backup (design 3)", () => {
+    const directory = tmp("fabric-vr-future-");
+    const session = path.join(directory, "session.jsonl");
+    write(session, "live");
+    // Rotation order by mtime: oldest, then a forged far-future name, then the real newest.
+    const order = ["20260920T150000000Z", "20991231T235959999Z", "20260925T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
+    order.forEach((name, index) => { write(name, name); const at = 1_000 + index; fs.utimesSync(name, at, at); });
+    pruneActorSessionBackups(session);
+    expect(fs.existsSync(order[2]!)).toBe(true);
+    expect(fs.existsSync(order[0]!)).toBe(false);
+  });
+});

@@ -3,9 +3,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
-import { readMeshStateMovedMarker } from "../mesh/backend-fence.js";
+import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backend-fence.js";
+import { meshStateDocumentProblem } from "../mesh/state-file.js";
+import { startRemovalTally, stopRemovalTally, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
-import { actorRunReferencedNow, compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, retainedActorRunIds } from "./retention.js";
+import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 
 const read = (file: string, maxBytes = 1024 * 1024): Record<string, unknown> => {
@@ -49,13 +51,40 @@ const applyRefusal = (meshRoot: string): string | undefined => {
   // Ownership of the mesh's files cannot be proven without a uid (Windows): --apply never deletes there (a dry run
   // still previews), whatever the marker says.
   if (typeof process.getuid !== "function") return "file ownership cannot be proven on this platform; --apply deletes nothing";
+  // Verified removal is directory-relative through /proc/self/fd (smarty-dev#7916); elsewhere --apply stays off,
+  // as on main (smarty-dev#7858).
+  if (process.platform !== "linux") return "retention --apply needs Linux verified removal (smarty-dev#7858); --apply deletes nothing";
   if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
+  const doubt = meshStateDoubt(meshRoot);
+  if (doubt !== undefined) return `the mesh state is unknown (${doubt}); --apply deletes nothing`;
   const moved = readMeshStateMovedMarker(meshRoot);
   if (moved === undefined) return undefined;
   let approved: unknown;
   try { approved = readPrivate(path.join(meshRoot, MESH_RETENTION_APPROVAL)).epoch; } catch { /* absent, unsafe or unreadable: not approved */ }
   return approved === moved.epoch ? undefined
     : `the mesh switched to ${moved.backend} at epoch ${moved.epoch}; deletions need a ruling in ${MESH_RETENTION_APPROVAL}`;
+};
+/** smarty-dev#7916 design 2: before any deletion state.json must be, in full, either the moved marker with our own
+ * private state.db beside it, or a state document whose envelope and every entry validate. Absent, linked, foreign,
+ * oversized, damaged or partly valid: doubt, and --apply refuses. */
+// The gate runs before every deletion: a full parse is reused only while state.json keeps the same identity.
+let validatedState: string | undefined;
+const meshStateDoubt = (meshRoot: string): string | undefined => {
+  const file = path.join(meshRoot, "state.json");
+  const stamp = (stat: fs.Stats | undefined) => stat && `${file}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  const before = stamp(ownedStat(file));
+  if (before !== undefined && before === validatedState) return undefined;
+  let value: unknown;
+  try { value = readPrivate(file, 256 * 1024 * 1024); }
+  catch (error) { return `state.json is absent, unsafe or not JSON: ${(error as Error).message}`; }
+  if (isMeshStateMovedMarker(value)) {
+    const db = ownedStat(path.join(meshRoot, "state.db"));
+    return db?.isFile() && (db.mode & 0o022) === 0 ? undefined : "state.json is the moved marker but state.db is not our private file";
+  }
+  const problem = meshStateDocumentProblem(value);
+  if (problem !== undefined) return `state.json: ${problem}`;
+  if (before !== undefined && stamp(ownedStat(file)) === before) validatedState = before;
+  return undefined;
 };
 const readPrivate = (file: string, maxBytes = 64 * 1024): Record<string, unknown> => {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
@@ -83,8 +112,19 @@ const lockWaiter = (fd: number): boolean => {
  * exist and be claimable, diagnostic holders must be proven dead, and actor roots
  * must belong to those fenced resident roots. Live/legacy/unknown custody is skipped.
  * Dry-run never creates locks, markers or files (flock on an existing inode only). */
-/** Why every apply is refused (smarty-dev#7916). */
-export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled until smarty-dev#7916 (verified-inode deletion); run --dry-run";
+/** The deleters --apply reaches; every one removes through verifiedRemove (smarty-dev#7916). A deleter added to this
+ * sweep without it must stay dry-run, with the message below. */
+export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled for this deleter until smarty-dev#7916 (verified-inode deletion); run --dry-run";
+export interface MeshRetentionSummary {
+  /** Per deleter: removed (dry run: would remove), bytes, refusals by reason (with up to 3 example paths). */
+  deleters: Record<string, DeleterTally>;
+  /** Why --apply would refuse now (hold, epoch, state.json doubt, platform), or undefined. */
+  applyRefusal?: string;
+  /** Actor registries read by this sweep: count, total parses, the most parses of one registry (1 unless it changed). */
+  registries: { count: number; parses: number; maxParsesPerRegistry: number };
+}
+// The last sweep's registry parse counts, for its summary (the sweep has many early returns).
+let registryParses: ReadonlyMap<string, number> = new Map();
 export const sweepMeshRetention = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number;
   /** Remove terminal actor runs older than this, mesh-wide (the actor archive TTL). Unset: compaction only. */
@@ -92,10 +132,36 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   /** Removal age of a proven-dead resident root's runs (default: the live host's 24 h). */
   residentRunRetentionMs?: number;
 } = {}) => {
-  // Deletes nothing by construction (smarty-dev#7916): an apply throws before any fence, discovery or helper call,
-  // so no in-process caller reaches a deleter. The apply branches below stay for #7916 to re-enable.
-  if (options.dryRun === false) throw new Error(MESH_RETENTION_APPLY_DISABLED);
-  const dryRun = true;
+  const tally = startRemovalTally();
+  registryParses = new Map();
+  try {
+    const result = await sweep(meshRoot, options);
+    const parses = [...registryParses.values()];
+    const summary: MeshRetentionSummary = { deleters: tally, registries: {
+      count: parses.length, parses: parses.reduce((sum, count) => sum + count, 0), maxParsesPerRegistry: Math.max(0, ...parses) } };
+    if (ownedStat(meshRoot)?.isDirectory()) { const refusal = applyRefusal(meshRoot); if (refusal !== undefined) summary.applyRefusal = refusal; }
+    return { ...result, summary };
+  } finally { stopRemovalTally(); }
+};
+/** The operator's lines: per deleter, then the one total (GiB) on its own line. */
+export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): string[] => {
+  const lines: string[] = [];
+  let bytes = 0;
+  for (const [name, item] of Object.entries(summary.deleters).sort(([a], [b]) => a.localeCompare(b))) {
+    bytes += item.bytes;
+    const refused = Object.values(item.refused).reduce((sum, count) => sum + count, 0);
+    lines.push(`${name}: ${dryRun ? "would delete" : "deleted"} ${item.removed} (${item.bytes} bytes), refused ${refused}`);
+    for (const [reason, count] of Object.entries(item.refused)) lines.push(`  refused ${count}: ${reason}`);
+  }
+  if (summary.applyRefusal) lines.push(`--apply would refuse now: ${summary.applyRefusal}`);
+  lines.push(`registries: ${summary.registries.count} read, ${summary.registries.parses} parses (at most ${summary.registries.maxParsesPerRegistry} per registry)`);
+  lines.push(`${dryRun ? "WOULD_FREE_GIB" : "FREED_GIB"}=${(bytes / 1024 ** 3).toFixed(3)}`);
+  return lines;
+};
+const sweep = async (meshRoot: string, options: {
+  dryRun?: boolean; now?: number; runRetentionMs?: number; residentRunRetentionMs?: number;
+}) => {
+  const dryRun = options.dryRun !== false;
   const now = options.now ?? Date.now();
   const removedRuns: string[] = [];
   const changes: Array<{ path: string; beforeBytes: number; afterBytes: number }> = [];
@@ -132,12 +198,33 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   // cannot see: every later delete fails closed and the sweep reports it. Sticky once changed.
   const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
   const discovered = rootSet(registries);
+  // ponytail: the per-delete check relies on one invariant: an actor registry lives only at actors/actors.json (the
+  // project registry) or actors/<session>/actors.json (a session registry). Enforced where every registry is created:
+  // fabric-runtime-state.ts `actorRoots` ({ project: <mesh>/actors, session: <mesh>/actors/<session id> }) feeds
+  // ActorManager's registry store, and fabric-state.ts reads exactly those two. So a new root is either a new name in
+  // actors/ or an actors.json appearing in actors/ or in one of its directories that had none. The check lists actors/
+  // (one readdir) and probes actors.json in those directories (one lstat each); it never stats the ~10k actor homes
+  // below, which cost minutes per sweep on Ryzen 1 (smarty-dev#7916). Names, not mtimes: within one coarse clock tick
+  // a directory's mtime need not change. A changed listing re-walks the whole tree, as before (pi-fabric#645 round 4).
+  const names = (): string => { try { return fs.readdirSync(actorsRoot).sort().join("\0"); } catch { return "\0unreadable"; } };
+  const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
+    .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
+  let listing = names();
+  let watch = unregistered();
   let rootsChanged = false;
   const registryRootsChanged = (): boolean => {
     if (rootsChanged) return true;
-    let current: string | undefined;
-    try { const found: string[] = []; discover(actorsRoot, 0, found); current = rootSet(found); } catch { /* uncertain: changed */ }
-    if (current !== discovered) {
+    let changed = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined);
+    if (!changed && names() !== listing) {
+      // A name came or went: re-walk, and accept it only when the registry roots are exactly the discovered ones.
+      // The listing is taken before the walk: a name added during it differs again at the next check.
+      const before = names();
+      let current: string | undefined;
+      try { const found: string[] = []; discover(actorsRoot, 0, found); current = rootSet(found); } catch { /* uncertain: changed */ }
+      if (current !== discovered) changed = true;
+      else { listing = before; watch = unregistered(); }
+    }
+    if (changed) {
       rootsChanged = true;
       skipped.push({ path: actorsRoot, reason: "actor registry roots changed during the sweep; no further run is deleted" });
     }
@@ -200,13 +287,26 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         residents.set(rootId, root);
       } catch (error) { skipped.push({ path: root, reason: String(error) }); }
     }
-    const retained = retainedActorRunIds(registries);
+    // Every registry parsed once for the whole sweep (smarty-dev#7916); a final check re-stats each registry and
+    // re-parses only one whose actors.json changed.
+    const refs = registryReferences(registries, { requireRegistries: true });
+    registryParses = refs.parses;
+    const retained = refs.snapshot();
     if (retained.has("*")) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [...skipped, { path: meshRoot, reason: "unknown actor run references" }] };
+    const referencedNow = (id: string): boolean => {
+      const current = refs.fresh();
+      return current.has("*") || current.has(id) || registryRootsChanged();
+    };
+    const registryRows = (registryRoot: string): Record<string, any>[] => {
+      const rows = refs.actors(registryRoot);
+      if (!rows) throw new Error("unreadable actor registry");
+      return rows;
+    };
     const compactRuns = (runs: string, veto: () => boolean = gate) => {
       if (retained.has("*")) return;
       for (const run of directories(runs)) if (!retained.has(path.basename(run))) {
         compactTerminalRunEvents(run, { ...options, dryRun, onCompact: change => changes.push(change),
-          isRetained: () => { if (veto()) return true; const current = retainedActorRunIds(registries); return current.has("*") || current.has(path.basename(run)); },
+          isRetained: () => veto() || referencedNow(path.basename(run)),
         });
       }
     };
@@ -220,7 +320,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
         // re-discovers the registry roots, and the check and delete run back to back (review round 4).
         removedRuns.push(...sweepResidentRuns(path.join(root, "runs"), now, 10 * 60 * 1_000, {
-          actorRoots: registries, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
+          actorRoots: registries, references: refs, retainRuns: false, requireRegistries: true, dryRun, acceptPidReuse: true,
           isRetained: () => veto() || registryRootsChanged(), measure: treeBytes,
           onRemove: (run, bytes) => changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }),
           onCompact: change => changes.push(change),
@@ -235,9 +335,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
         // Match ActorRegistryStore/retainedActorRunIds: owned registries contain
         // instructions and message history and have no byte-size protocol limit.
         // Diagnostic records keep the bounded reader above.
-        const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
-        if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
-        for (const actor of registry.actors) {
+        for (const actor of registryRows(registryRoot)) {
           if (!actor || actor.rootId !== rootId || actor.removal !== undefined ||
               typeof actor.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(actor.id) || typeof actor.sessionFile !== "string" ||
               path.resolve(actor.sessionFile) !== path.join(path.resolve(registryRoot), actor.id, "session.jsonl")) continue;
@@ -251,9 +349,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
       };
       let rootIds: Set<string>;
       try {
-        const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
-        if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
-        rootIds = new Set(registry.actors.map((actor: Record<string, unknown> | null) => actor?.rootId)
+        rootIds = new Set(registryRows(registryRoot).map((actor: Record<string, unknown> | null) => actor?.rootId)
           .filter((rootId: unknown): rootId is string => typeof rootId === "string" && residents.has(rootId)));
       } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); continue; }
       for (const rootId of rootIds) await fenced(rootId, residents.get(rootId)!, async veto => {
@@ -269,24 +365,12 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
       // plus every registry's latest, in-flight, preparing and pending-removal runs, re-read when a
       // registry changes. The final pre-delete check re-reads every discovered registry uncached;
       // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
-      const fingerprint = () => registries.map(root => {
-        const stat = ownedStat(path.join(root, "actors.json"));
-        return stat ? `${stat.ino}:${stat.size}:${stat.mtimeMs}` : "-";
-      }).join("|");
-      let references = { key: fingerprint(), ids: retained };
-      const referenced = (id: string): boolean => {
-        const key = fingerprint();
-        if (key !== references.key) references = { key, ids: retainedActorRunIds(registries) };
-        return references.ids.has("*") || references.ids.has(id);
-      };
-      const referencedNow = (id: string): boolean =>
-        actorRunReferencedNow(registries, id, { requireRegistries: true }) || registryRootsChanged();
+      // Early skips judge from the sweep's snapshot; the final pre-delete check is referencedNow (smarty-dev#7916).
+      const referenced = (id: string): boolean => { const ids = refs.snapshot(); return ids.has("*") || ids.has(id); };
       for (const registryRoot of registries) {
         try {
-          const registry = read(path.join(registryRoot, "actors.json"), Number.MAX_SAFE_INTEGER);
-          if (!Array.isArray(registry.actors)) throw new Error("unreadable actor registry");
           const rows = new Map<string, Record<string, any>>();
-          for (const actor of registry.actors) if (actor && typeof actor.id === "string") rows.set(actor.id, actor);
+          for (const actor of registryRows(registryRoot)) if (actor && typeof actor.id === "string") rows.set(actor.id, actor);
           for (const actorRoot of directories(registryRoot)) {
             const id = path.basename(actorRoot), row = rows.get(id);
             // Removal (pending or accepted) owns its runs until it finishes.
@@ -335,20 +419,20 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const report = take("--report");
   const value = take("--runs-older-than");
   const [root, mode = "--dry-run"] = args;
-  // --apply is off until deletion verifies each inode it removes (smarty-dev#7916); the dry run and report stay.
+  // --apply is back for the deleters that remove through verifiedRemove (smarty-dev#7916): all of this sweep's.
   const runRetentionMs = value === undefined ? undefined : Number(value);
-  if (mode === "--apply") {
-    console.error(MESH_RETENTION_APPLY_DISABLED);
-    process.exitCode = 2;
-  } else if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
+  if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
       (runRetentionMs !== undefined && (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 60 * 60 * 1_000))) {
     console.error("Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run|--apply] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
   } else {
     try {
-      const text = JSON.stringify(await sweepMeshRetention(path.resolve(root), {
+      const result = await sweepMeshRetention(path.resolve(root), {
         dryRun: mode !== "--apply", ...(runRetentionMs !== undefined ? { runRetentionMs } : {}),
-      }), null, 2);
+      });
+      const text = JSON.stringify(result, null, 2);
       if (report !== undefined) writeReport(path.resolve(report), `${text}\n`); else console.log(text);
+      // The operator's summary, on stderr so stdout stays one JSON document.
+      for (const line of summaryLines(result.dryRun, result.summary)) console.error(line);
     }
     catch (error) { console.error(error); process.exitCode = 1; }
   }

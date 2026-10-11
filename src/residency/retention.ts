@@ -4,8 +4,9 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
 import { isResidentCommandOperation, readResidentRequestDecision, type ResidentCommandResponse, type ResidentResponseAcknowledgement } from "./protocol.js";
 
@@ -26,6 +27,8 @@ export const sweepResidentRuns = (
     dryRun?: boolean; measure?: (run: string) => number; isRetained?: (runId: string) => boolean;
     /** Mesh-wide sweep only (smarty-dev#3252): accept a checked PID-reuse proof; default keeps the strict live-PID veto. */
     acceptPidReuse?: boolean;
+    /** The mesh sweep's registry snapshot, parsed once per sweep (smarty-dev#7916); replaces the per-run re-parse. */
+    references?: RegistryReferences;
     onRemove?: (run: string, bytes: number) => void;
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
 ): string[] => {
@@ -35,9 +38,14 @@ export const sweepResidentRuns = (
   const expired = () => performance.now() - started >= budgetMs;
   const actorRoots = options.actorRoots ?? [];
   const registryOptions = options.requireRegistries ? { requireRegistries: true } : {};
-  const retained = retainedActorRunIds(actorRoots, registryOptions);
+  const references = options.references;
+  const retained = references ? references.snapshot() : retainedActorRunIds(actorRoots, registryOptions);
   if (retained.has("*")) return removed;
-  const referencedNow = (id: string): boolean => actorRunReferencedNow(actorRoots, id, registryOptions) || !!options.isRetained?.(id);
+  const referencedNow = (id: string): boolean => {
+    if (!references) return actorRunReferencedNow(actorRoots, id, registryOptions) || !!options.isRetained?.(id);
+    const current = references.fresh();
+    return current.has("*") || current.has(id) || !!options.isRetained?.(id);
+  };
   let directory: fs.Dir;
   try { directory = fs.opendirSync(runsRoot); } catch { return removed; }
   try {
@@ -53,7 +61,7 @@ export const sweepResidentRuns = (
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
         // A referenced candidate is kept as is; compaction would veto it on the same reference.
         const name = entry.name, bytes = options.measure?.(run) ?? 0;
-        if (removeUnreferencedRun(run, () => referencedNow(name), options.dryRun)) { removed.push(run); options.onRemove?.(run, bytes); }
+        if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns")) { removed.push(run); options.onRemove?.(run, bytes); }
       } else {
         compactTerminalRunEvents(run, {
           ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
@@ -233,7 +241,8 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
+            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
+            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -335,7 +344,8 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            try { fs.rmSync(file, { recursive: true, force: true }); } catch { /* retry next scan */ }
+            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
+            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,
@@ -377,6 +387,7 @@ export class ResidentRequestRetention {
 
   #collect(id: string, ack: ResidentResponseAcknowledgement, liveIds: ReadonlySet<string>, stoppedWritersGone: ReadonlySet<string>): boolean {
     const generation = residentRequestGeneration(id)!;
+    const ackPath = path.join(this.root, "acknowledgements", `${id}.json`), ackStat = ownedStat(ackPath);
     if (generation >= this.#expiredBefore || this.#now - Math.max(ack.completedAt, ack.acknowledgedAt) <= RESIDENT_REQUEST_RETENTION_MS) return false;
     // An unreadable/symlinked exchange directory is a possible pending reference.
     for (const kind of ["requests", "processing"]) {
@@ -388,7 +399,7 @@ export class ResidentRequestRetention {
       if (!absent(dir) && !ownedStat(dir)?.isDirectory()) throw new Error("Unsafe residency reference directory");
     }
     const decisionPath = path.join(this.root, "decisions", `${id}.json`);
-    const decisionValue = readOwned<unknown>(decisionPath);
+    const decisionStat = ownedStat(decisionPath), decisionValue = readOwned<unknown>(decisionPath);
     const decision = decisionValue === undefined ? undefined : readResidentRequestDecision(this.root, id);
     if (decision && decision.requestFormat !== 3) throw new Error("Legacy decision is not collectable");
     if (decision?.state === "committed" && !/^[A-Za-z0-9_-]+$/.test(decision.id!)) throw new Error("Invalid resident entity ID");
@@ -430,13 +441,16 @@ export class ResidentRequestRetention {
       }
     }
     const responsePath = path.join(this.root, "responses", `${id}.json`);
-    const response = readOwned<ResidentCommandResponse>(responsePath);
+    const responseStat = ownedStat(responsePath), response = readOwned<ResidentCommandResponse>(responsePath);
     if (response !== undefined && (!validResponse(response, id) || response.completedAt !== ack.completedAt || response.pending !== ack.pending)) throw new Error("Unacknowledged or invalid response");
     // The durable watermark was published first. Partial deletion or a crash is
     // safe: any replay is now expired, even if its createdAt is rewritten.
-    fs.rmSync(responsePath, { force: true });
-    fs.rmSync(decisionPath, { force: true });
-    fs.rmSync(path.join(this.root, "acknowledgements", `${id}.json`), { force: true });
+    // smarty-dev#7916: each file judged above (its owned stat) is the only inode removed; off Linux main's
+    // removal. Absent at judgment: nothing to remove. A refusal stops here; the next scan retries.
+    for (const [file, stat] of [[responsePath, responseStat], [decisionPath, decisionStat], [ackPath, ackStat]] as const) {
+      if (!stat && absent(file)) continue; // no owned stat but present: refused on Linux, main's removal elsewhere
+      if (!verifiedRemove(file, stat, { deleter: "residentRequestCollect", fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) return false;
+    }
     return true;
   }
 }

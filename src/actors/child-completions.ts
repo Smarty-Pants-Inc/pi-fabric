@@ -6,6 +6,7 @@ import { ChildCompletionClaimLostError } from "../result-consumption.js";
 export { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { ARCHIVE_PENDING_FILE, commitRunArchive, readPendingRunArchives } from "../agents/archive-custody.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import type { AgentRunResult, AgentSpawner } from "../agents/types.js";
 
 export type ActorChildResult = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt">;
@@ -337,14 +338,15 @@ export class ActorChildCompletionStore {
 
   /** On the existing retention sweep, bound unread archives and receipt tombstones. */
   prune(retentionMs: number, now = Date.now(), keepIds: ReadonlySet<string> = new Set()): void {
-    const groups = new Map<string, { files: string[]; newest: number }>();
+    // smarty-dev#7916: each file's owned stat is taken at judgment; only that inode is removed.
+    const groups = new Map<string, { files: { file: string; stat: fs.Stats | undefined }[]; newest: number }>();
     try {
       for (const name of fs.readdirSync(this.directory)) {
         const id = STORED_FILE.exec(name)?.[1];
         if (!id || keepIds.has(id)) continue;
         const file = path.join(this.directory, name);
         const group = groups.get(id) ?? { files: [], newest: 0 };
-        group.files.push(file);
+        group.files.push({ file, stat: ownedStat(file) });
         group.newest = Math.max(group.newest, fs.statSync(file).mtimeMs);
         groups.set(id, group);
       }
@@ -352,8 +354,13 @@ export class ActorChildCompletionStore {
     for (const [id, group] of groups) {
       if (now - group.newest < retentionMs) continue;
       try {
-        for (const file of group.files) fs.rmSync(file, { force: true });
-        this.#checked.delete(id);
+        let all = true;
+        for (const { file, stat } of group.files) {
+          // No owned stat: refused on Linux; off Linux main's removal runs unchanged (smarty-dev#7858).
+          if (!verifiedRemove(file, stat, { deleter: "childCompletionsPrune",
+            fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed) all = false;
+        }
+        if (all) this.#checked.delete(id);
       } catch { /* Best effort, like actor run retention. */ }
     }
   }

@@ -16,10 +16,21 @@ store open. Before this, it was ignored, and a typo silently opened a different 
 |---|---|---|
 | `file` | `StateFile` | none |
 | `sqlite`, `shadow` | `SqliteStateBackend`, `ShadowStateBackend` | non-local filesystem (R16), no `node:sqlite` (R19) |
-| `nats` | throws `MeshStateBackendNotBuiltError` (`FABRIC_MESH_STATE_BACKEND_NOT_BUILT`) | none |
+| `nats` | the backend a host prepared with `openNatsStateBackend` for that root (`src/mesh/state-backend-nats.ts`); otherwise throws `MeshStateBackendNotBuiltError` (`FABRIC_MESH_STATE_BACKEND_NOT_BUILT`) | none |
 
 `nats` never falls back to `file`. A host that wrote local state while its peers wrote the
-shared stream would split the mesh. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
+shared stream would split the mesh.
+
+Phase 1 (smarty-dev#7504, single host) implements option (c) below.
+- **The factory and the client:** the factory is synchronous and the connection is not, so a host first awaits
+`openNatsStateBackend({ root, servers })`. That call loads the official nats.js v3 client
+(`@nats-io/transport-node`, `@nats-io/jetstream`; a lazy entry point, never in the startup graph), refuses and
+replays the stream. The factory then returns that prepared backend.
+- **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
+`acceptPeriodicSync`; a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
+(busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **The read model:** in memory, rebuilt by replaying the stream at open. Persisting it in the `state.db` schema, the
+cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must
 also refuse (throw), never return a reason, for the same reason.
 

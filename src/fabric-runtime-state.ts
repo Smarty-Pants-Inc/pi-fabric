@@ -1141,6 +1141,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
+            transientBlockCooldownMs: this.#config.actors.transientBlockCooldownMs,
+            transientBlockMaxMs: this.#config.actors.transientBlockMaxMs,
             // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
             wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -1165,6 +1167,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
+            transientBlockCooldownMs: this.#config.actors.transientBlockCooldownMs,
+            transientBlockMaxMs: this.#config.actors.transientBlockMaxMs,
             // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
             wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,

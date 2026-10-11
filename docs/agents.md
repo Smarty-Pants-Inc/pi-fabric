@@ -981,6 +981,24 @@ not the execution/restart `attempts` counter. Callerless work (mesh, host, and t
 with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
 its pending activation. After three preparation requeues, further failures report
 `failing-preparation` and raise one owner alarm until a successful activation clears it.
+
+A failed activation records `activationBlocked` on the actor, and routers (factory review
+routing) skip a blocked actor. Its `class` says whether it can recover by itself
+(smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or
+429, a timeout, or a preparation or lock timeout (code `preparation-timeout`). It records
+`blockedAt` and `backoffMs`, and expires at `retryAt`: after `actors.transientBlockCooldownMs`
+(default 10 minutes). After expiry, the actor info and the published actor record show
+`activationBlockExpired` instead, so routers admit the actor again. Its next activation, queued
+or routed, is the probe. A probe that completes clears the block. A probe that fails transiently
+blocks again with the backoff doubled, up to `actors.transientBlockMaxMs` (default 60 minutes).
+A failure inside the cooldown restarts the same cooldown and does not double it. A `hard` block
+has no expiry. This covers credentials, permissions, policy, quota, a rejected request, context
+overflow, a preparation failure other than a timeout, and any cause Fabric does not recognise. A
+hard block stays until a run completes, the cause is fixed, or the actor is re-created. The class,
+times and backoff are stored in the actor registry, so they survive a restart. On load, Fabric
+re-classifies an older `unknown` or `failing-preparation` block from its stored reason with the
+current rules. So an actor that an older host blocked for good on a transient cause recovers
+without being re-created.
 A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
 does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
 the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a

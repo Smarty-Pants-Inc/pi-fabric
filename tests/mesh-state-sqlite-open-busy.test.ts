@@ -535,7 +535,12 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     age(crashed, 5_000);
     age(live, 5_000); // a live holder's stale flag is kept: only a dead holder's flag is removed
     expect(checkpointFlagRaised(root)).toBe(false);
-    expect(fs.readdirSync(path.dirname(live))).toEqual([path.basename(live)]);
+    // Without /proc (Windows, macOS) a token records no start ticks ("-"), so the scan fails closed and keeps the
+    // dead holder's flag too; it is stale, so it never makes writers yield (pi-fabric#834 review).
+    const linux = process.platform === "linux";
+    expect(path.basename(crashed).split(".")[1] === "-").toBe(!linux);
+    const expected = linux ? [live] : [crashed, live];
+    expect(fs.readdirSync(path.dirname(live)).sort()).toEqual(expected.map((flag) => path.basename(flag)).sort());
   });
 
   // pi-fabric#834 review: the flag scan fails closed, and its removal is tryLockFile's claim plus recheck.

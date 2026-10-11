@@ -58,6 +58,7 @@ import type {
   FabricActorResponseMode,
   FabricActorRunBinding,
   FabricActorStatus,
+  FabricActorStopReason,
   FabricActorValidWhileSource,
 } from "./types.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
@@ -212,6 +213,8 @@ interface ManagedActor {
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
   removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
   lastError?: string;
+  /** Why a stopped actor stopped; only host-exit is restarted by its session's next start (smarty-dev#9241). */
+  stopReason?: FabricActorStopReason;
   sessionOrphan?: FabricActorInfo["sessionOrphan"];
   /** Persistent, deduplicated publication diagnostic; does not stop actor execution. */
   presenceError?: string;
@@ -401,6 +404,14 @@ const asDirective = (result: AgentRunResult): FabricActorDirective => {
     throw new Error("Actor message directive is missing message text");
   }
   return directive as FabricActorDirective;
+};
+
+const STOP_REASONS: ReadonlySet<string> = new Set<FabricActorStopReason>(["explicit", "directive", "host-exit"]);
+/** A persisted stop's reason. A legacy root-gone row (its own-root marker, no reason) stopped at host exit. */
+const persistedStopReason = (row: Record<string, unknown>): FabricActorStopReason | undefined => {
+  if (typeof row.stopReason === "string" && STOP_REASONS.has(row.stopReason)) return row.stopReason as FabricActorStopReason;
+  const orphan = row.sessionOrphan;
+  return typeof orphan === "object" && orphan !== null && (orphan as { oldRoot?: unknown }).oldRoot === row.rootId ? "host-exit" : undefined;
 };
 
 export class ActorRegistryOwnershipError extends Error {
@@ -2289,6 +2300,8 @@ export class ActorManager {
   #stopRun(actor: ManagedActor): void {
     this.#clearSettledWindows(actor.id);
     actor.status = "stopped";
+    // agents.stop/remove: an explicit stop is terminal, never restarted at a session start (smarty-dev#9241).
+    actor.stopReason = "explicit";
     actor.updatedAt = Date.now();
     // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
     if (actor.abortController) actor.cancelAbort = actor.abortController;
@@ -3601,6 +3614,7 @@ export class ActorManager {
           if (message.action === "stop") {
             this.#clearSettledWindows(actor.id);
             actor.status = "stopped";
+            actor.stopReason = "directive";
             this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
                 new Error(
@@ -4940,6 +4954,7 @@ export class ActorManager {
       ...(actor.project ? { project: actor.project } : {}),
       instructions: actor.instructions,
       status: actor.status,
+      ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       events: actor.events,
       topics: actor.topics,
       delivery: actor.delivery,
@@ -5303,6 +5318,17 @@ export class ActorManager {
     this.#scheduleRestoreParked();
   }
 
+  /**
+   * smarty-dev#9241: a same-session start (relaunch, resume or reload) restarts this session's own
+   * session-residency actors that stopped only because their host Main exited. An explicit or
+   * directive stop, a pending removal, another root's row and a durable actor stay as they are.
+   */
+  #restartsAfterHostExit(row: Record<string, unknown>): boolean {
+    return this.#persistent && this.#claimResidency === "session" && row.status === "stopped" &&
+      row.residency !== "durable" && row.rootId === this.#rootId && row.removal === undefined &&
+      persistedStopReason(row) === "host-exit";
+  }
+
   #loadActors(onlyMissing = false): void {
     this.#withOwnershipRead(() => this.#loadActorsNow(onlyMissing));
   }
@@ -5311,6 +5337,7 @@ export class ActorManager {
     const loaded: ManagedActor[] = [];
     let added = 0;
     const firstLoads: ManagedActor[] = [];
+    const restartedIds: string[] = [];
     let parsed: unknown;
     try {
       parsed = this.#registry.read();
@@ -5356,9 +5383,13 @@ export class ActorManager {
       // A temporary hole during revocation is not an invitation to resurrect the registry row.
       if (this.#removeCalls.has(record.id) || this.#removals.has(record.id) || this.#finishCalls.has(record.id) || this.#revoked.has(record.id)) continue;
       if (onlyMissing && this.#actors.has(record.id)) continue;
+      // smarty-dev#9241: this session's start revives its session actors stopped only by their host's exit.
+      // A dormant row is not stopped (and is durable), so it is never a host-exit restart.
+      const restarted = this.#restartsAfterHostExit(source);
       // A new runtime is awake. Re-evaluate dormancy under its current work/owner
       // custody instead of carrying a retired host's idle decision through reload.
-      const status = record.status === "stopped" ? "stopped" : "idle";
+      const status = record.status === "stopped" && !restarted ? "stopped" : "idle";
+      const stopReason = status === "stopped" ? persistedStopReason(source) : undefined;
       if (record.status === "dormant") this.#loadedDormant.add(record.id);
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
@@ -5486,9 +5517,10 @@ export class ActorManager {
         draining: false,
         messages: [],
         createdAt: record.createdAt,
-        updatedAt: typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
+        updatedAt: restarted ? Date.now() : typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
-        ...(record.status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
+        ...(stopReason ? { stopReason } : {}),
+        ...(status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
             typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
           ? { sessionOrphan: { ...record.sessionOrphan }, ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}) } : {}),
@@ -5506,6 +5538,7 @@ export class ActorManager {
       this.#installLazyMessages(actor, source);
       this.#installRecords(actor);
       this.#actors.set(actor.id, actor);
+      if (restarted) restartedIds.push(actor.id);
       if (actor.status === "stopped" || actor.removal) this.#clearSettledWindows(actor.id);
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
@@ -5526,6 +5559,9 @@ export class ActorManager {
       if (this.#ownershipDecision(actor.id)) this.#pendingPresence.add(actor.id);
     }
     this.#schedulePresenceRetry();
+    // Persist each restart (running, no orphan marker) so peers and the next load agree. It keeps
+    // the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
+    if (restartedIds.length) this.#scheduleRegistrySave(true, 1);
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
     if (added > 0) this.#emitChange();
@@ -6080,6 +6116,7 @@ export class ActorManager {
         : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
         ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
+      ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
         ...(actor.preparing.runId ? { queuePosition: this.agents.status(actor.preparing.runId).queuePosition } : {}),

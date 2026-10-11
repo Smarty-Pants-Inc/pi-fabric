@@ -879,7 +879,9 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
-  /** Fenced terminal foreign session-root record; never grants adoption/restart. */
+  /** Stopped only: explicit (agents.stop/remove), directive (its own stop) or host-exit (its session Main exited; that session's restart revives it). */
+  stopReason?: "explicit" | "directive" | "host-exit";
+  /** Fenced terminal foreign session-root record; never grants adoption. Its own session's restart revives it. */
   sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;

@@ -393,6 +393,9 @@ export class FabricControlPlane {
   // A proven-notRun request remains close-owned while waiting to resend.
   readonly #resendWaits = new Set<() => void>();
   #closed = false;
+  // close() teardown in flight; a start() meanwhile is queued in #reopen until it ends.
+  #closing = false;
+  #reopen: FabricControlHandler | undefined;
   #paused = false;
   #releasePublicationFailed = false;
   #handler: FabricControlHandler | undefined;
@@ -450,11 +453,21 @@ export class FabricControlPlane {
   }
 
   start(handler: FabricControlHandler): void {
+    if (this.#closing) {
+      // Reopen only after teardown has joined its drain and cleared the old handler.
+      this.#reopen = handler;
+      return;
+    }
     this.#handler = handler;
-    if (!this.options.enabled || this.#started || this.#closed) return;
+    if (!this.options.enabled || this.#started) return;
+    // An explicit owner start reopens a closed plane, as it did before the event-driven
+    // port (a sender that stopped its mesh publishers resumes them). Stale watcher or
+    // timer callbacks and resume() still cannot rearm a closed plane.
+    this.#closed = false;
     this.#started = true;
     this.#paused = false;
     this.#attachWatcher();
+    this.#armSeenExpiry(this.#seenExpiryAt); // close() cleared a pending claim-expiry wake.
     this.#wake();
   }
 
@@ -937,9 +950,23 @@ export class FabricControlPlane {
   }
 
   async close(): Promise<void> {
+    this.#reopen = undefined; // A later close cancels a start queued during teardown.
     if (this.#closed) return;
     // Fence new requests before joining polls: a late notRun ACK must not arm a resend.
     this.#closed = true;
+    this.#started = false;
+    this.#closing = true;
+    try {
+      await this.#teardown();
+    } finally {
+      this.#closing = false;
+      const reopen = this.#reopen;
+      this.#reopen = undefined;
+      if (reopen) this.start(reopen);
+    }
+  }
+
+  async #teardown(): Promise<void> {
     if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
     this.#seenExpiryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();

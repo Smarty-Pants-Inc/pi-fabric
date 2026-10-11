@@ -261,6 +261,28 @@ describe("event-driven mesh observers", () => {
     await vi.advanceTimersByTimeAsync(120_000); expect(tail).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("reopens a closed control plane only on an explicit start, deferring a start made during close", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
+    const command = (commandId: string) => mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
+      data: { version: 1, commandId, targetId: "target", operation: "steer", replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+    const first = vi.fn(() => ({ accepted: true })); const second = vi.fn(() => ({ accepted: true }));
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
+    closers.push(() => control.close()); control.start(first); await vi.advanceTimersByTimeAsync(0);
+    // A start during teardown is queued; a later close cancels it. Stale watches never rearm.
+    const closing = control.close(); control.start(first); await control.close(); await closing;
+    watches[0]!.notify("change", "events.jsonl"); await vi.advanceTimersByTimeAsync(120_000);
+    expect(watches).toHaveLength(1); expect(vi.getTimerCount()).toBe(0);
+    // An explicit start after close reopens the watch and claims a new command.
+    control.start(first); await vi.advanceTimersByTimeAsync(0); expect(watches).toHaveLength(2);
+    await command("after-restart"); watches[1]!.notify("change", "events.jsonl"); await vi.advanceTimersByTimeAsync(0);
+    expect(first).toHaveBeenCalledOnce();
+    // A start queued during teardown applies once that teardown has cleared the old handler.
+    const reopening = control.close(); control.start(second); await reopening; await vi.advanceTimersByTimeAsync(0);
+    expect(watches).toHaveLength(3);
+    await command("after-queued-restart"); watches[2]!.notify("change", "events.jsonl"); await vi.advanceTimersByTimeAsync(0);
+    expect(second).toHaveBeenCalledOnce(); expect(first).toHaveBeenCalledOnce();
+  });
+
   it("retries full actor work without a log change and closes every retry resource", async () => {
     vi.useFakeTimers(); mockWatch(); const mesh = store();
     const event = await mesh.publish({ topic: "fleet.work.test", from: identity });

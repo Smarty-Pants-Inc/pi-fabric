@@ -403,6 +403,15 @@ export class FabricRuntimeState {
     return batch;
   }
 
+  /** Record inbox events that entered a turn as consumed (R-token-waste); never injected again. */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    if (!ids.length || !this.#meshActivationReady()) return;
+    await this.#inboxRetry.run(async () => {
+      if (!this.#meshActivationReady()) return;
+      await this.#rootInbox?.consume(ids, receipts);
+    });
+  }
+
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
   recordsWake: (() => Promise<void>) | undefined;
 

@@ -217,6 +217,15 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     expect(seq(backend.stateStamp()!)).toBeGreaterThan(seq(stamp));
   });
 
+  it("sync is a no-op barrier: an acked commit is already durable at the server (sync_always), no JetStream call", async () => {
+    const port = fakeJetStream().port();
+    const backend = await openNatsStateBackend({ root: root(), port, stream: "S", lockTimeoutMs: 2_000 });
+    await backend.put({ key: "ns/a", value: 1, identity });
+    const calls = port.calls.length;
+    await expect(backend.sync(0)).resolves.toBeUndefined();
+    expect(port.calls.length).toBe(calls);
+  });
+
   it("a fresh read refuses (busy, retryable) while the projector lags the stream", async () => {
     const server = fakeJetStream();
     const backend = await open(server);
@@ -371,6 +380,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       expect(store.get("shared/a")).toMatchObject({ value: { n: 1 }, version: written.version });
       expect(store.listAll("shared/").map(entry => entry.key)).toEqual(["shared/a"]);
       expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
+      await expect(store.sync()).resolves.toEqual({ through: expect.any(Number) });
     } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   });
 

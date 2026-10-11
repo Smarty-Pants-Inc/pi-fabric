@@ -489,6 +489,14 @@ export class NatsStateBackend implements StateBackend {
     return operation();
   }
 
+  /**
+   * Durability barrier (smarty-dev#9313): a no-op. Nothing is buffered client side: every commit, by this process or
+   * any other on the stream, returned only after JetStream acked its publish, and the ack follows the server's fsync
+   * because `openNatsStateBackend` refuses a server without `sync_always`. When the operator accepted periodic sync
+   * (`acceptPeriodicSync`), the client has no flush to request: durability is the server's sync interval by that choice.
+   */
+  async sync(_budgetMs: number): Promise<void> { /* every acked commit is already on the server's disk */ }
+
   dropCache(): void { /* the model is the stream's projection: nothing to drop */ }
 
   diagnostics(): StateBackendDiagnostics {

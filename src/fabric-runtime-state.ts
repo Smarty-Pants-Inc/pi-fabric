@@ -708,6 +708,9 @@ export class FabricRuntimeState {
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );
+    // The managed composition returned above without native managers or a mesh root.
+    // Bind native custody to this execution session once, never to a hosted invocation context.
+    if (this.#config.mesh.enabled) this.#registry.setResidentProcessWorkSession(sessionId);
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
       ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])

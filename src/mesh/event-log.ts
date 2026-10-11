@@ -187,7 +187,8 @@ export class EventLog {
   #oldestLive: { identity: string; sequence: number | undefined } | undefined;
   #preparedLiveCatchUp: PreparedLiveCatchUp | undefined;
 
-  constructor(context: MeshStoreContext, options: EventLogOptions) {
+  constructor(context: MeshStoreContext, options: EventLogOptions,
+    readonly indexDeliveryBeforeAppend?: (event: MeshEvent) => void) {
     const { root, maxEventBytes } = context;
     this.root = root;
     this.maxEventBytes = maxEventBytes;
@@ -614,6 +615,10 @@ export class EventLog {
         if (intentPath && this.#pruneDedupeReceipts(1) >= this.#maxDedupeReceipts) {
           throw new MeshDedupeStoreFullError(this.#maxDedupeReceipts);
         }
+        // Match and bound the wake set before touching the live/archive event. Overflow
+        // remains a durable pending nudge for the next delivery, never a post-append throw.
+        // A failed append can leave only a harmless nudge; actor cursors still own delivery.
+        this.indexDeliveryBeforeAppend?.(event);
         // The counter is a reservation: a crash after it leaves a gap, never a reused sequence.
         // The archive holds the event durably before it goes live (smarty-dev#754); the live
         // append commits it. If either step fails, the event is cut back out of the archive.

@@ -280,6 +280,18 @@ export class ActorChildCompletionStore {
     }
   }
 
+  /** Unsettled child custody is a pending reply, even before a result envelope exists. */
+  hasPendingReply(): boolean {
+    try {
+      return fs.readdirSync(this.directory).some(file => {
+        if (file.endsWith(".source") || file.endsWith(".abandon")) return true;
+        return /^[a-f0-9]{32}\.json$/.test(file) && !this.received(file.slice(0, -5));
+      });
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT"; // unknown custody cannot authorize sleep
+    }
+  }
+
   pending(options: { actorId?: string; inFlightRunId?: string } = {}): ActorChildCompletion[] {
     this.recoverArchives(options);
     try { return this.#withClaim(() => this.#pending(options)); }

@@ -612,7 +612,7 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     fs.unlinkSync(path.join(directory, "edge-before-8.json"));
     fs.unlinkSync(path.join(directory, "edge-at-9.json"));
     // Still over the cap inside the window: the newest are read and the cut is reported.
-    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, []);
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, [{ minute: MINUTE0 + 1, classes: {} }]);
     const newer = Date.now() / 1000 + 3_600;
     fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), newer, newer);
     const capped: string[] = [];
@@ -620,5 +620,21 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(files).toHaveLength(LOCK_STATS_MAX_FILES);
     expect(files[0]!.host).toBe("zzz-bridge");
     expect(capped).toEqual([`${directory}: ${LOCK_STATS_MAX_FILES + 1} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`]);
+  });
+
+  it("gives no cap slot to files that hold only the current, incomplete minute (smarty-dev#7894)", () => {
+    const root = temp();
+    const directory = path.join(root, "lock-stats");
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    // Newer than the in-window file, so they sort first; each holds only the current minute.
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES + 1; pid++) {
+      fixture(root, "aaa-current", pid, [{ minute: MINUTE0 + 2, classes: { publish: bucket({ n: 1 }) } }]);
+    }
+    fixture(root, "zzz-bridge", 7, [{ minute: MINUTE0 + 1, classes: { publish: bucket({ n: 3, holdMs: 30 }) } },
+      { minute: MINUTE0 + 2, classes: { publish: bucket({ n: 1 }) } }]);
+    fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), now / 1000, now / 1000);
+    const problems: string[] = [];
+    expect(readLockStats(root, problems, { minutes: 2, now }).map(file => file.host)).toEqual(["zzz-bridge"]);
+    expect(problems).toEqual([]);
   });
 });

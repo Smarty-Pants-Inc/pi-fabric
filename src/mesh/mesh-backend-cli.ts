@@ -1,12 +1,11 @@
 // fabric-mesh-backend: import, cutover, rollback and status of a mesh root's state backend
 // (smarty-dev#6477 L4b). The fence and the commit order live in backend-migration.ts; see
 // docs/mesh-lock-plan.md section 5.
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { censusSync as writerCensusSync, type CensusWriter } from "./writer-census.js";
-import { verifiedRemove } from "../storage/verified-remove.js";
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
@@ -19,7 +18,7 @@ type Command = typeof COMMANDS[number];
 const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback|abort-rollback> --root DIR [--json]
                           [--lock-protocol 1|2] [--lock-timeout-ms N] [--accept-unready NAME,...]
                           [--require-reader NAME=INSTALL_ROOT]...
-       fabric-mesh-backend import --root SCRATCH --scratch-proof [--json]
+       fabric-mesh-backend import --scratch-proof-from STATE_JSON [--scratch-parent DIR] [--json]
        fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
        fabric-mesh-backend reader-proof --root DIR --name NAME --proof-file FILE [--json]
 
@@ -45,15 +44,13 @@ the built-in installed readers (factory) and each --require-reader. --accept-unr
 only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
 
---scratch-proof (import only, smarty-dev#9404): a reader's proof step imports a COPY of state.json in a
-private scratch directory. There the gate is skipped, but only when the root is provably that copy: a
-real directory owned by this user, mode 0700, holding nothing but a private regular state.json. Anything
-else (readers/, host leases, a writer census, backend-switches.jsonl, actors/, a state.db) refuses, so
-it can never switch a live mesh. The output records "scratchProof": true.
-
-A refused import or cutover (exit 3) removes the state.db, -wal, -shm and -journal it created in this
-run, when state.json is still byte-identical: the root is left as it was, never a state.db beside a
-file-format state.json. A crash or error (exit 1) keeps them, so a rerun converges.
+--scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
+creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its
+ancestors must be ours or root's and not group/other-writable unless root-owned and sticky), copies
+STATE_JSON into it (read through an O_NOFOLLOW fd; a regular file; the live state.json is fine) and
+imports there without the readiness gate: the root is provably a copy this process just made. It prints
+"scratchProof": true and "root"; the caller reads it, then removes it. A refused or failed import
+removes the whole directory. No caller-named root ever skips the gate.
 
 The fence is the mesh .lock plus custody.lock, held for the whole section of import, cutover,
 rollback and abort-rollback. Stop every writer (Pi sessions, actors, mesh-bridge, the projector) first.
@@ -89,7 +86,8 @@ export const meshWriterCensusSync = (root: string): MeshWriterCensusSync => () =
 interface Options {
   command: Command; root: string; json: boolean; lockProtocol: 1 | 2; lockTimeoutMs?: number;
   acceptUnready: string[]; requireReaders: InstalledReader[]; name?: string; backend?: ReaderBackend; readerVersion?: string; proofFile?: string;
-  scratchProof: boolean;
+  /** smarty-dev#9404: import a fresh scratch copy of this state.json, gate skipped; `root` is then unset until made. */
+  scratchProofFrom?: string; scratchParent?: string;
 }
 
 class UsageError extends Error {}
@@ -107,12 +105,12 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let backend: ReaderBackend | undefined;
   let readerVersion: string | undefined;
   let proofFile: string | undefined;
-  let scratchProof = false;
+  let scratchProofFrom: string | undefined;
+  let scratchParent: string | undefined;
   const requireReaders: InstalledReader[] = [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
-    if (flag === "--scratch-proof") { scratchProof = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
@@ -132,6 +130,8 @@ const parseArgs = (argv: string[]): Options | "help" => {
       backend = value;
     } else if (flag === "--reader-version") readerVersion = value;
     else if (flag === "--proof-file") proofFile = value;
+    else if (flag === "--scratch-proof-from") scratchProofFrom = value;
+    else if (flag === "--scratch-parent") scratchParent = value;
     else if (flag === "--require-reader") {
       const [readerName, installRoot] = [value.slice(0, value.indexOf("=")), value.slice(value.indexOf("=") + 1)];
       // Flags only ADD readers: a built-in's trusted root can never be replaced from the command line.
@@ -145,14 +145,19 @@ const parseArgs = (argv: string[]): Options | "help" => {
     }
     else throw new UsageError(`Bad argument: ${flag}`);
   }
-  if (!root) throw new UsageError("--root DIR is required");
-  if (scratchProof && (command !== "import" || acceptUnready.length > 0 || requireReaders.length > 0)) {
-    throw new UsageError("--scratch-proof is for import only, without --accept-unready or --require-reader");
+  if (scratchProofFrom !== undefined || scratchParent !== undefined) {
+    if (command !== "import" || scratchProofFrom === undefined || root !== undefined || acceptUnready.length > 0 || requireReaders.length > 0) {
+      throw new UsageError("--scratch-proof-from STATE_JSON [--scratch-parent DIR] is for import only, without --root, --accept-unready or --require-reader");
+    }
+    return { command: "import", root: "", json, lockProtocol, acceptUnready, requireReaders, scratchProofFrom: path.resolve(scratchProofFrom),
+      ...(scratchParent === undefined ? {} : { scratchParent: path.resolve(scratchParent) }),
+      ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) };
   }
+  if (!root) throw new UsageError("--root DIR is required");
   if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
     throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
   }
-  return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders, scratchProof,
+  return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
     ...(proofFile === undefined ? {} : { proofFile }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
     ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }) };
@@ -196,42 +201,91 @@ const formatResult = (command: Command, result: Record<string, unknown>): string
   return `abort-rollback ${done}: backend=sqlite epoch ${String(result.epoch)}`;
 };
 
-/** Why `root` is not provably a reader's private scratch copy of state.json, or undefined (smarty-dev#9404). */
-export const scratchProofRefusal = (root: string): string | undefined => {
-  if (process.platform === "win32" || typeof process.getuid !== "function") return "a private scratch root cannot be proven on this platform";
-  const uid = process.getuid();
-  const stat = fs.lstatSync(root, { throwIfNoEntry: false });
-  if (!stat?.isDirectory()) return "the root is not a real directory";
-  if (stat.uid !== uid) return "the root is not owned by this user";
-  if ((stat.mode & 0o077) !== 0) return `the root is mode ${(stat.mode & 0o777).toString(8)}, not 700`;
-  const extra = fs.readdirSync(root).filter(name => name !== "state.json");
-  if (extra.length > 0) return `the root holds more than a copied state.json (${extra.slice(0, 5).join(", ")}): it may be a live mesh`;
-  const state = fs.lstatSync(path.join(root, "state.json"), { throwIfNoEntry: false });
-  if (!state?.isFile() || state.uid !== uid || state.nlink !== 1) return "state.json is not a private regular file";
-  return undefined;
+/** A directory other uids cannot change: ours or root's, not a link (unless root's), and not group/other-writable
+ * unless root-owned and sticky (/tmp). The same rule as pi-fabric#875's openPrivateDir. Throws with the reason. */
+const assertSafeChain = (directory: string): void => {
+  const uid = process.getuid?.();
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    const stat = fs.lstatSync(current);
+    const owner = stat.uid === uid || stat.uid === 0;
+    if (stat.isSymbolicLink()) { if (stat.uid !== 0) throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is a symbolic link`); }
+    else if (!stat.isDirectory() || !owner) throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is not a directory owned by us or root`);
+    else if ((stat.mode & 0o022) !== 0 && !(stat.uid === 0 && (stat.mode & 0o1000) !== 0)) {
+      throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is writable by group or others (mode ${(stat.mode & 0o7777).toString(8)})`);
+    }
+    if (path.dirname(current) === current) return;
+  }
 };
 
-const DB_FILES = ["state.db", "state.db-wal", "state.db-shm", "state.db-journal"] as const;
-const fileDigest = (file: string): string | undefined => {
-  try { return createHash("sha256").update(fs.readFileSync(file)).digest("hex"); } catch { return undefined; }
+/**
+ * smarty-dev#9404 (pi-fabric#884 round 1): the scratch copy a reader's proof imports. Created here, so it is provably a
+ * copy and not a live mesh: a fresh mkdtemp (0700) in a parent whose whole chain no other uid can change, held by a
+ * no-follow fd and re-checked (same dev and ino) before it is reported. ponytail: the import itself uses the path;
+ * a fresh 0700 directory inside a chain no other uid can write cannot be replaced by them (sticky /tmp included).
+ */
+const makeScratchCopy = (stateJson: string, parent: string | undefined): { root: string; fd: number } => {
+  if (process.platform === "win32" || typeof process.getuid !== "function") throw new MeshBackendRefusedError("--scratch-proof-from needs POSIX ownership (not on this platform)");
+  const base = parent ?? os.tmpdir();
+  assertSafeChain(base);
+  const source = fs.openSync(stateJson, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  let bytes: Buffer;
+  try {
+    if (!fs.fstatSync(source).isFile()) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is not a regular file`);
+    bytes = fs.readFileSync(source);
+  } finally { fs.closeSync(source); }
+  const root = fs.mkdtempSync(path.join(base, "fabric-scratch-proof-"));
+  const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o700) throw new MeshBackendRefusedError(`scratch directory ${root} is not our private directory`);
+    const copy = fs.openSync(path.join(root, "state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    try { fs.writeFileSync(copy, bytes); fs.fsyncSync(copy); } finally { fs.closeSync(copy); }
+  } catch (error) { fs.closeSync(fd); fs.rmSync(root, { recursive: true, force: true }); throw error; }
+  return { root, fd };
 };
-/** Before an import or cutover: which database files exist, and state.json's digest. */
-const snapshotRoot = (root: string) => ({
-  absent: DB_FILES.filter(name => !fs.lstatSync(path.join(root, name), { throwIfNoEntry: false })),
-  state: fileDigest(path.join(root, "state.json")),
-});
-/** After a refused import or cutover (smarty-dev#9404): remove the database files this run created, only
- * while state.json is byte-identical to before (the switch never got as far as the moved marker). The root then
- * looks exactly as before; a reader never meets a state.db beside a file-format state.json. */
-const rollBackOwnDatabase = (root: string, before: ReturnType<typeof snapshotRoot>): string[] => {
-  if (before.state === undefined || fileDigest(path.join(root, "state.json")) !== before.state) return [];
-  const removed: string[] = [];
-  for (const name of before.absent) {
-    const file = path.join(root, name);
-    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (stat && verifiedRemove(file, stat, { deleter: "meshImportRollback", fallback: () => { fs.unlinkSync(file); return true; } }).removed) removed.push(name);
+/** The scratch path still names the directory this process made and holds. */
+const sameScratch = (root: string, fd: number): boolean => {
+  const named = fs.lstatSync(root, { throwIfNoEntry: false }), held = fs.fstatSync(fd);
+  return !!named?.isDirectory() && named.dev === held.dev && named.ino === held.ino;
+};
+
+/** `import --scratch-proof-from` (smarty-dev#9404): the gate is skipped only on the copy this process made. */
+const scratchProofImport = async (options: Options, io: { census?: MeshWriterCensus; options?: Partial<MeshBackendOptions> },
+  write: (text: string) => void, warn: (text: string) => void): Promise<number> => {
+  const alarms: MeshBackendAlarm[] = [];
+  let scratch: { root: string; fd: number } | undefined;
+  try {
+    scratch = makeScratchCopy(options.scratchProofFrom!, options.scratchParent);
+    const library: MeshBackendOptions = {
+      ...io.options, lockProtocol: options.lockProtocol,
+      onAlarm: (alarm) => { alarms.push(alarm); warn(`fabric-mesh-backend: ALARM ${alarm.code}: ${alarm.message}\n`); },
+      census: io.census ?? meshWriterCensus(scratch.root),
+      onAdvisory: (advisory) => { warn(`fabric-mesh-backend: ${describeCensusAdvisory(advisory)}\n`); io.options?.onAdvisory?.(advisory); },
+      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
+    };
+    const result: Record<string, unknown> = { ...(await importMeshState(scratch.root, library)) };
+    if (!sameScratch(scratch.root, scratch.fd)) throw new MeshBackendRefusedError(`the scratch directory ${scratch.root} changed during the import`);
+    fs.closeSync(scratch.fd);
+    write(`${options.json ? JSON.stringify({ command: "import", ok: true, scratchProof: true, root: scratch.root, ...result, alarms }, null, 2)
+      : `scratch-proof ${formatResult("import", result)}: ${scratch.root}`}\n`);
+    return 0;
+  } catch (error) {
+    const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
+    const message = error instanceof Error ? error.message : String(error);
+    let removed = false;
+    if (scratch) {
+      // Ours and fresh: nothing else is in it. Removed only while the name still holds the directory we made.
+      try { if (sameScratch(scratch.root, scratch.fd)) { fs.rmSync(scratch.root, { recursive: true, force: true }); removed = true; } }
+      catch (cleanupError) { warn(`fabric-mesh-backend: could not remove the scratch directory ${scratch.root}: ${(cleanupError as Error).message}\n`); }
+      finally { fs.closeSync(scratch.fd); }
+    }
+    if (options.json) {
+      write(`${JSON.stringify({ command: "import", ok: false, refused, scratchProof: false, code: (error as { code?: unknown }).code, error: message,
+        ...(scratch ? { root: scratch.root, removed } : {}), alarms }, null, 2)}\n`);
+    }
+    warn(`fabric-mesh-backend: import ${refused ? "refused" : "failed"}: ${message}\n`);
+    return refused ? 3 : 1;
   }
-  return removed;
 };
 
 interface Gate { ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
@@ -362,9 +416,9 @@ export const main = async (argv: string[], io: {
     return 2;
   }
   if (options === "help") { write(`${USAGE}\n`); return 0; }
+  if (options.scratchProofFrom !== undefined) return scratchProofImport(options, io, write, warn);
   const alarms: MeshBackendAlarm[] = [];
   let gate: Gate | undefined;
-  let before: ReturnType<typeof snapshotRoot> | undefined;
   const library: MeshBackendOptions = {
     ...io.options,
     lockProtocol: options.lockProtocol,
@@ -402,45 +456,27 @@ export const main = async (argv: string[], io: {
       write(`${options.json ? JSON.stringify(status, null, 2) : formatStatus(status)}\n`);
       return status.fenceHolds && "source" in status.reader ? 0 : 3;
     }
-    const switching = options.command === "import" || options.command === "cutover";
-    if (switching) before = snapshotRoot(options.root);
-    if (options.scratchProof) {
-      // A reader's proof copy (smarty-dev#9404): no gate, and only on a provably private scratch root.
-      const refusal = scratchProofRefusal(options.root);
-      if (refusal !== undefined) throw new MeshBackendRefusedError(`--scratch-proof: ${refusal}`);
-    } else if (switching) {
-      // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
-      gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
-        io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, io.leaseProbe ?? {}, warn);
-    }
+    // The readiness gate (smarty-dev#7815): every registered reader proved the target backend.
+    if (options.command === "import" || options.command === "cutover") gate = await openGate(options, library, io.builtinReaders ?? BUILTIN_READERS,
+      io.gateCensus ?? meshWriterCensusSync(options.root), io.procScan ?? {}, io.leaseProbe ?? {}, warn);
     const result: Record<string, unknown> = { ...(await (options.command === "import" ? importMeshState(options.root, library)
       : options.command === "cutover" ? cutoverMeshState(options.root, library)
         : options.command === "rollback" ? rollbackMeshState(options.root, library)
           : abortMeshRollback(options.root, library))) };
-    if (options.scratchProof) result.scratchProof = true;
     if (gate) {
       const final = gate.final ?? gate.readiness;
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
         checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
     }
-    write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2)
-      : `${options.scratchProof ? "scratch-proof " : ""}${formatResult(options.command, result)}`}\n`);
+    write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;
   } catch (error) {
     const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
     const message = error instanceof Error ? error.message : String(error);
-    let rolledBack: string[] = [];
-    // Refusals only: a crash or an error after a commit keeps its state for the rerun to converge (importing).
-    if (before && refused) {
-      try { rolledBack = rollBackOwnDatabase(options.root, before); }
-      catch (rollbackError) { warn(`fabric-mesh-backend: could not remove the database files this run created: ${(rollbackError as Error).message}\n`); }
-      if (rolledBack.length > 0) warn(`fabric-mesh-backend: removed the database files this run created: ${rolledBack.join(", ")}\n`);
-    }
-    if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message, ...(rolledBack.length ? { rolledBack } : {}) });
+    if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
     if (options.json) {
-      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message,
-        ...(options.scratchProof ? { scratchProof: false } : {}), rolledBack, alarms }, null, 2)}\n`);
+      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message, alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;

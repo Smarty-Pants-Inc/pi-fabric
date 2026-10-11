@@ -167,16 +167,15 @@ checks the schema and writes it under the fence:
 
 1. `release = basename(realpath(<its release root>/current))` of the running install.
 2. `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
-3. Create an empty private scratch directory (`mkdir -m 700`), copy `<mesh>/state.json` into it and run
-   `fabric-mesh-backend import --root <scratch> --scratch-proof --json` there. Check that the output has
-   `"ok": true` and `"scratchProof": true`. `--scratch-proof` skips the readiness gate, because the reader being
-   proved has no proof yet. It runs only on a provably private copy: a real directory owned by you, mode 0700,
-   holding nothing but the copied `state.json`. Anything else (`readers/`, a writer census,
-   `backend-switches.jsonl`, `actors/`, a `state.db`) is refused (exit 3), so it can never switch a live mesh.
-   No `--accept-unready` is needed. A refused or failed import removes the `state.db` files it created, so the
-   scratch directory is left as it was.
+3. Run `fabric-mesh-backend import --scratch-proof-from <mesh>/state.json --json`. The CLI creates a fresh
+   private (0700) scratch directory itself (`mkdtemp` under the OS temp directory, or under
+   `--scratch-parent DIR`, whose whole chain must be yours or root's and not group/other-writable unless
+   root-owned and sticky). It copies `state.json` into that directory and imports there without the
+   readiness gate: the directory is provably a copy it just made, never a live mesh. Check `"ok": true`
+   and `"scratchProof": true`, and read `"root"`: that is `<scratch>`. On a refusal or error the CLI removes
+   that directory itself. No `--accept-unready` is needed.
 4. Read every entry from `<scratch>` with its own SQLite read path; fail on any error or a count
-   other than the import's `entries`.
+   other than the import's `entries`. Then remove `<scratch>`.
 5. Write the proof JSON (format above) to a private temp file and run
    `fabric-mesh-backend reader-proof --root <mesh> --name <name> --proof-file <temp>`.
    It refuses `fabric*` names and `implementation: "fabric-meshstore"`.

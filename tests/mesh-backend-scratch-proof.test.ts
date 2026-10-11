@@ -6,10 +6,9 @@ import { MeshBackendRefusedError } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
-// smarty-dev#9404: docs/mesh-backend.md "Any other reader" step 3 tells a non-Fabric reader (the factory) to import a
-// copy of state.json in an empty scratch directory. On main the readiness gate refused there (the reader being
-// proved has no proof yet; the import's own new state.db reads as fabric@unknown), and a refused import left state.db
-// beside the unchanged file-format state.json.
+// smarty-dev#9404 (pi-fabric#884 round 1): a non-Fabric reader's proof step imports a scratch COPY of state.json without
+// the readiness gate. The CLI makes that copy itself (`import --scratch-proof-from <state.json>`), so the gate is never
+// skipped on a caller-named root: a private directory is not proof of a copy (CODE P1).
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const dirs: string[] = [];
 const savedRelease = process.env.PI_FABRIC_RELEASE_SHA;
@@ -27,7 +26,6 @@ const fileRoot = async (): Promise<string> => {
   store.closeState();
   return root;
 };
-/** A release root as the installer leaves it, for the factory's trusted install root. */
 const installRoot = (release: string): string => {
   const root = tempDir("install");
   fs.mkdirSync(path.join(root, "releases", release), { recursive: true });
@@ -41,82 +39,95 @@ const cli = async (argv: string[], io: Parameters<typeof main>[1] = {}) => {
     stdout: text => { out += text; }, stderr: text => { err += text; } });
   return { code, out, err };
 };
-/** Step 3 verbatim: copy state.json into an empty scratch directory (created private, 0700). */
-const scratchCopy = (mesh: string): string => {
-  const scratch = tempDir("copy");
-  fs.chmodSync(scratch, 0o700);
-  fs.copyFileSync(path.join(mesh, "state.json"), path.join(scratch, "state.json"));
-  return scratch;
-};
-const dbFiles = (root: string) => fs.readdirSync(root).filter(name => name.startsWith("state.db"));
+const mode = (file: string) => fs.statSync(file).mode & 0o777;
 
 describe.skipIf(process.platform === "win32")("a non-Fabric reader's documented proof steps (smarty-dev#9404)", () => {
   it("the documented steps, run through the real CLI, give a proof the gate accepts", async () => {
     const mesh = await fileRoot();
     const factory = { name: "factory", installRoot: installRoot("factory-rel-1") };
-    // 1. release; 2. provedEpoch from status --json.
     const release = path.basename(fs.realpathSync(path.join(factory.installRoot, "current")));
-    const status = await cli(["status", "--root", mesh, "--json"]);
-    const provedEpoch = JSON.parse(status.out).epoch as number;
-    // 3. the scratch import.
-    const scratch = scratchCopy(mesh);
-    const imported = await cli(["import", "--root", scratch, "--scratch-proof", "--json"], { builtinReaders: [factory] });
+    const provedEpoch = JSON.parse((await cli(["status", "--root", mesh, "--json"])).out).epoch as number;
+    // 3. the CLI makes and imports its own scratch copy of the live state.json.
+    const imported = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--json"], { builtinReaders: [factory] });
     expect(imported.code, imported.err).toBe(0);
     const result = JSON.parse(imported.out);
-    expect(result).toMatchObject({ ok: true, scratchProof: true, entries: 2 });
-    // 4. read every entry from the scratch copy with a SQLite read path; the count must equal the import's entries.
-    const reader = new MeshStore(scratch, 64 * 1024, 1_000, { stateBackend: "sqlite" });
+    expect(result).toMatchObject({ ok: true, scratchProof: true, entries: 2, root: expect.any(String) });
+    dirs.push(result.root);
+    // 4. read every entry with a SQLite read path; then remove the scratch copy.
+    const reader = new MeshStore(result.root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
     expect(reader.listAll("seed/")).toHaveLength(result.entries);
     reader.closeState();
-    // 5. the proof, installed under the fence.
+    fs.rmSync(result.root, { recursive: true, force: true });
+    // 5. the proof, installed under the fence; the gate then accepts the live switch with no override.
     const proofFile = path.join(tempDir("proof"), "factory.json");
     fs.writeFileSync(proofFile, JSON.stringify({ name: "factory", implementation: "python-factory", version: "factory-1", release,
       backends: ["file", "sqlite"], provedAt: new Date().toISOString(), provedEpoch }), { mode: 0o600 });
-    const proved = await cli(["reader-proof", "--root", mesh, "--name", "factory", "--proof-file", proofFile]);
-    expect(proved.code, proved.err).toBe(0);
-    // The gate accepts the factory's proof: the live switch runs with no --accept-unready.
+    expect((await cli(["reader-proof", "--root", mesh, "--name", "factory", "--proof-file", proofFile])).code).toBe(0);
     const switched = await cli(["import", "--root", mesh, "--json"], { builtinReaders: [factory] });
     expect(switched.code, switched.err).toBe(0);
     expect(JSON.parse(switched.out).readers).toMatchObject({ ready: expect.arrayContaining(["factory"]), acceptedUnready: [] });
   });
 
-  it("a refused import leaves no state.db and an unchanged state.json", async () => {
+  it("--scratch-proof-from makes its own 0700 directory in --scratch-parent, holding the imported state.db; the source is unchanged", async () => {
     const mesh = await fileRoot();
-    const scratch = scratchCopy(mesh);
-    const before = fs.readFileSync(path.join(scratch, "state.json"));
-    // The gate refuses under the fence, after the import opened its own state.db (main's fabric@unknown case).
-    const refused = await cli(["import", "--root", scratch, "--accept-unready", "factory", "--json"], {
-      builtinReaders: [{ name: "factory", installRoot: installRoot("factory-rel-1") }],
-      options: { beforeCommit: () => { throw new MeshBackendRefusedError("readers not ready for sqlite (under the fence): fabric@unknown"); } },
-    });
+    const parent = tempDir("parent");
+    const before = fs.readFileSync(path.join(mesh, "state.json"));
+    const imported = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"]);
+    expect(imported.code, imported.err).toBe(0);
+    const { root } = JSON.parse(imported.out);
+    expect(path.dirname(root)).toBe(parent);
+    expect(mode(root)).toBe(0o700);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+    expect(fs.readFileSync(path.join(mesh, "state.json")).equals(before)).toBe(true);
+    expect(fs.readdirSync(mesh).filter(name => name.startsWith("state.db"))).toEqual([]);
+  });
+
+  it("a refused scratch import removes its own directory", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"], {
+      options: { beforeCommit: () => { throw new MeshBackendRefusedError("refused under the fence"); } } });
     expect(refused.code).toBe(3);
-    expect(dbFiles(scratch)).toEqual([]);
-    expect(fs.readFileSync(path.join(scratch, "state.json")).equals(before)).toBe(true);
-    expect(JSON.parse(refused.out).rolledBack).toEqual(expect.arrayContaining(["state.db"]));
+    expect(JSON.parse(refused.out)).toMatchObject({ ok: false, refused: true, scratchProof: false, removed: true });
+    // Only the shared per-user mesh lock helper the fence keeps beside a root remains, not the scratch directory.
+    expect(fs.readdirSync(parent).filter(name => name.startsWith("fabric-scratch-proof-"))).toEqual([]);
+  });
+
+  it("never skips the gate on a caller-named root: a 0700 directory holding only state.json is not accepted as a copy", async () => {
+    const mesh = await fileRoot();
+    const lookalike = tempDir("lookalike");
+    fs.chmodSync(lookalike, 0o700);
+    fs.copyFileSync(path.join(mesh, "state.json"), path.join(lookalike, "state.json"));
+    const factory = { name: "factory", installRoot: installRoot("factory-rel-1") };
+    // The former --root form is gone.
+    expect((await cli(["import", "--root", lookalike, "--scratch-proof", "--json"], { builtinReaders: [factory] })).code).toBe(2);
+    expect((await cli(["import", "--root", lookalike, "--scratch-proof-from", path.join(lookalike, "state.json")], { builtinReaders: [factory] })).code).toBe(2);
+    // A plain import of that root meets the gate: the factory has no proof.
+    const gated = await cli(["import", "--root", lookalike, "--json"], { builtinReaders: [factory] });
+    expect(gated.code).toBe(3);
+    expect(gated.err).toMatch(/readers not ready for sqlite/);
   });
 
   it.each([
-    ["a readers/ directory", (root: string) => fs.mkdirSync(path.join(root, "readers"), { mode: 0o700 })],
-    ["a writer census", (root: string) => fs.writeFileSync(path.join(root, ".writer-census"), "")],
-    ["a switch record", (root: string) => fs.writeFileSync(path.join(root, "backend-switches.jsonl"), "")],
-    ["an actors/ directory", (root: string) => fs.mkdirSync(path.join(root, "actors"))],
-    ["mode 0755", (root: string) => fs.chmodSync(root, 0o755)],
-  ])("--scratch-proof refuses a live-looking root with %s and changes nothing", async (_name, liven) => {
+    ["a group-writable --scratch-parent", async (parent: string) => { fs.chmodSync(parent, 0o775); return parent; }],
+    ["a symlinked --scratch-parent", async (parent: string) => { const link = path.join(tempDir("link"), "parent"); fs.symlinkSync(parent, link); return link; }],
+  ])("refuses %s and creates nothing", async (_name, prepare) => {
     const mesh = await fileRoot();
-    const root = scratchCopy(mesh);
-    liven(root);
-    const listing = fs.readdirSync(root).sort();
-    const refused = await cli(["import", "--root", root, "--scratch-proof", "--json"]);
+    const parent = tempDir("parent");
+    const given = await prepare(parent);
+    const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", given, "--json"]);
     expect(refused.code).toBe(3);
-    expect(JSON.parse(refused.out)).toMatchObject({ ok: false, refused: true, scratchProof: false, error: expect.stringMatching(/--scratch-proof/) });
-    expect(fs.readdirSync(root).sort()).toEqual(listing);
+    expect(JSON.parse(refused.out).error).toMatch(/--scratch-parent chain/);
+    expect(fs.readdirSync(parent)).toEqual([]);
   });
 
-  it("--scratch-proof refuses the live mesh itself", async () => {
+  it("refuses a state.json source that is a symlink", async () => {
     const mesh = await fileRoot();
-    fs.chmodSync(mesh, 0o700);
-    const refused = await cli(["import", "--root", mesh, "--scratch-proof", "--json"]);
-    expect(refused.code).toBe(3);
-    expect(dbFiles(mesh)).toEqual([]);
+    const link = path.join(tempDir("src"), "state.json");
+    fs.symlinkSync(path.join(mesh, "state.json"), link);
+    const parent = tempDir("parent");
+    const refused = await cli(["import", "--scratch-proof-from", link, "--scratch-parent", parent, "--json"]);
+    expect(refused.code).not.toBe(0);
+    expect(fs.readdirSync(parent)).toEqual([]);
   });
 });

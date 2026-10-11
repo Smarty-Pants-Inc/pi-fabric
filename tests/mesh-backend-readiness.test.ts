@@ -279,9 +279,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
       options: { beforeCommit: () => { live = [...live, { pid: 11, release: "fabric-rel-new", mode: "sqlite" }]; } } });
     expect(result.code).toBe(3);
     expect(result.err).toContain("(under the fence, before the importing commit): fabric@fabric-rel-new (no proof from installed reader fabric release fabric-rel-new");
-    // smarty-dev#9404: the refused switch removes the state.db it created; state.json stays the only state.
-    expect(await backendOf(root)).toBe("none");
-    expect(fs.readdirSync(root).filter(name => name.startsWith("state.db"))).toEqual([]);
+    expect(await backendOf(root)).toBe("file");
   });
 
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it

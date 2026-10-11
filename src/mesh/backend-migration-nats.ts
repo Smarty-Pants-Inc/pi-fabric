@@ -32,7 +32,8 @@ import { renameAtomic } from "../core/atomic-write.js";
 import { encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshBackendRefusedError, meshSnapshotDigest, normalizeSnapshot, type MeshBackendStep, type MeshStateSnapshot } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
-import { applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, natsStreamName, NatsWrongLastSequenceError, type JetStreamPort, type NatsTlsFiles } from "./state-backend-nats.js";
+import { applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, MAX_MESSAGE_BYTES, NatsStateBackend, natsSnapshotLimits, natsStreamName,
+  NatsWrongLastSequenceError, type JetStreamPort, type NatsTlsFiles } from "./state-backend-nats.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "./state-file.js";
 
 const STATE_JSON = "state.json";
@@ -91,7 +92,8 @@ export interface MeshNatsMigrationResult {
 }
 
 type Snapshot = Parameters<typeof applyNatsMessage>[0];
-const EMPTY: Snapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 };
+const EMPTY: Snapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0,
+  snapshotEnd: 0, snapshotDigest: "" };
 const record = (value: object): Uint8Array => Buffer.from(JSON.stringify(value), "utf8");
 
 const fsyncDirectory = (directory: string): void => {
@@ -150,7 +152,7 @@ const limitsOf = (options: MeshNatsMigrationOptions): Limits => ({
   maxStateBytes: Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES)),
   maxReplay: Math.max(1, Math.floor(options.maxReplay ?? DEFAULT_MAX_REPLAY)),
   maxStateTombstones: Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_TOMBSTONES)),
-  maxPayloadBytes: Math.max(1, Math.floor(options.maxPayloadBytes ?? 1024 * 1024)),
+  maxPayloadBytes: Math.max(1, Math.min(MAX_MESSAGE_BYTES, Math.floor(options.maxPayloadBytes ?? MAX_MESSAGE_BYTES))),
 });
 const entryBytes = (key: string, entry: unknown): number => Buffer.byteLength(key, "utf8") + Buffer.byteLength(JSON.stringify(entry) ?? "", "utf8");
 
@@ -160,15 +162,22 @@ const entryBytes = (key: string, entry: unknown): number => Buffer.byteLength(ke
  * entries) under `maxStateBytes`. A bound fails with LIMIT before the caller retires, renames or commits anything.
  */
 const project = async (port: JetStreamPort, stream: string, limits: Limits): Promise<{ projection: Snapshot; head: number }> => {
+  // pi-fabric#907: a stream may be compacted (a snapshot, then a purge below it). Start from its latest verified snapshot
+  // through the backend's own loader (bounds, chunk chain, digest), then apply every later message here.
+  const loaded = await NatsStateBackend.loadLatestSnapshot({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
+    maxEventBytes: MAX_MESSAGE_BYTES, maxStateTombstones: limits.maxStateTombstones, maxStateBytes: limits.maxStateBytes, maxReplay: limits.maxReplay });
   const head = await port.lastSequence(stream);
-  if (head > limits.maxReplay) throw new MeshNatsMigrationLimitError(`stream ${stream} holds ${head} messages, more than maxReplay ${limits.maxReplay}`);
-  let projection = EMPTY;
-  let bytes = 0;
-  for (let seq = 1; seq <= head; seq++) {
+  let projection = loaded ?? EMPTY;
+  if (head - projection.seq > limits.maxReplay) {
+    throw new MeshNatsMigrationLimitError(`stream ${stream} holds ${head - projection.seq} messages after its snapshot, more than maxReplay ${limits.maxReplay}`);
+  }
+  let bytes = [...projection.entries].reduce((sum, [key, entry]) => sum + entryBytes(key, entry), 0);
+  if (bytes > limits.maxStateBytes) throw new MeshNatsMigrationLimitError(`stream ${stream}'s snapshot holds more than maxStateBytes ${limits.maxStateBytes}`);
+  for (let seq = projection.seq + 1; seq <= head; seq++) {
     const message = await port.getMessage(stream, seq);
     if (!message) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} has no message ${seq} (purged?): refusing to migrate`);
     const before = projection;
-    projection = applyNatsMessage(projection, message, limits.maxStateTombstones);
+    projection = applyNatsMessage(projection, message, limits.maxStateTombstones, natsSnapshotLimits({ maxStateBytes: limits.maxStateBytes, maxReplay: limits.maxReplay }));
     if (projection === before || projection.entries === before.entries) continue;
     // Only the keys this batch changed move the running size (the projector already validated the record).
     const changed = (JSON.parse(Buffer.from(message.data).toString("utf8")) as { changes?: { key: string }[] }).changes ?? [];
@@ -234,7 +243,8 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
         throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not ${options.stream}`);
       }
       const subject = `${stream}.state`;
-      await port.ensureStream(stream, subject);
+      // The backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
+      await port.ensureStream(stream, [subject, `${stream}.snapshot`], { maxMsgSize: MAX_MESSAGE_BYTES });
       return body(port, stream, subject);
     });
   } finally { if (owned) await port.close().catch(() => undefined); }

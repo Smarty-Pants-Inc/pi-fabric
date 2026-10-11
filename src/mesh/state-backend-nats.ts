@@ -448,6 +448,15 @@ export class NatsStateBackend implements StateBackend {
 
   private constructor(options: NatsStateBackendOptions) { this.#options = options; this.#limits = natsSnapshotLimits(options); }
 
+  /**
+   * The latest complete, verified snapshot of a stream as a model at its base sequence (undefined: none), through the
+   * backend's own loader (bounds, chunk chain, digest). For a replay that must start after a purge: the migration's
+   * projection (backend-migration-nats.ts), which then applies every later message itself, whatever the lifecycle.
+   */
+  static async loadLatestSnapshot(options: NatsStateBackendOptions): Promise<NatsSnapshot | undefined> {
+    return new NatsStateBackend(options).#loadSnapshot();
+  }
+
   /** Loads the latest snapshot, connects the projector after it and replays up to the stream's current last sequence. */
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);

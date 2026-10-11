@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
 import { importMeshStateToNats, MeshNatsMigrationLimitError, rollbackMeshStateFromNats, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
 import { importMeshState, MeshBackendRefusedError, meshSnapshotDigest, type MeshBackendStep } from "../src/mesh/backend-migration.js";
-import { closeNatsStateBackend, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
+import { connectJetStream } from "../src/mesh/state-backend-nats-client.js";
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
@@ -47,6 +48,9 @@ const connection = (target: Target): MeshNatsMigrationOptions => {
   return { servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!, stream: natsTestStream() };
 };
 /** A target whose port a closed nats backend may have closed: a new port on the same fake server each time. */
+/** A raw JetStream port on the target (the fake's, or a real connection). */
+const rawPort = async (options: MeshNatsMigrationOptions): Promise<JetStreamPort> =>
+  options.port ?? connectJetStream(options.servers!);
 const reconnectable = (target: Target): () => MeshNatsMigrationOptions => {
   if (target === "nats") { const options = connection(target); return () => options; }
   const server = fakeJetStream();
@@ -99,6 +103,30 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     // The stream is retired: a nats store refuses it, and a rerun of the rollback only verifies.
     await expect(openNatsStateBackend({ root, stream: imported.stream, ...(after.port ? { port: after.port } : { servers: after.servers!, monitoringUrl: after.monitoringUrl! }) }))
       .rejects.toThrow(/retired/);
+  }, 60_000);
+
+  it("a compacted stream (a snapshot, then a purge below it, pi-fabric#907) still rolls back with every write", async () => {
+    const root = tempRoot("compacted");
+    await seedFileRoot(root);
+    const connect = reconnectable(targetKind);
+    const imported = await importMeshStateToNats(root, connect());
+    const options = connect();
+    const backend = await openNatsStateBackend({ root, stream: imported.stream, snapshotEvery: 0,
+      ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    for (let index = 0; index < 5; index++) await backend.put({ key: `after/${index}`, value: index, identity });
+    expect(await backend.compact()).toBe(true);
+    await backend.put({ key: "after/last", value: "tail", identity });
+    closeNatsStateBackend(root);
+    const raw = await rawPort(connect());
+    try { expect(await raw.firstSequence(imported.stream)).toBeGreaterThan(1); } finally { if (targetKind === "nats") await raw.close(); }
+    const back = await rollbackMeshStateFromNats(root, connect());
+    expect(back).toMatchObject({ epoch: 2, entries: 28 + 6 });
+    const file = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+    stores.push(file);
+    expect(file.get("after/last")?.value).toBe("tail");
+    expect(file.get("after/4")?.value).toBe(4);
+    expect(file.get("seed/solo")?.value).toBe("plain");
+    expect(fileDigest(root)).toBe(back.digest);
   }, 60_000);
 
   it("an import and a rollback with no writes in between give back the exact file digest", async () => {

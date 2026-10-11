@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 describe("startup mesh lock selector", () => {
-  it.each([undefined, 1] as const)("%s keeps the B68 v1 wire with exclusive publication and detached release", async (lockProtocol) => {
+  it.each([undefined, 1] as const)("%s keeps the B68 v1 wire with exclusive publication and its release", async (lockProtocol) => {
     const mesh = store(lockProtocol === undefined ? {} : { lockProtocol });
     const lock = path.join(mesh.root, ".lock");
     const mkdir = vi.spyOn(fs, "mkdirSync");
@@ -39,10 +39,19 @@ describe("startup mesh lock selector", () => {
       });
     });
     expect(mesh.lockProtocol).toBe(1);
-    const released = `${lock}.released.${token}`;
-    expect(rename).toHaveBeenCalledWith(lock, released);
-    expect(remove).toHaveBeenCalledWith(released, { recursive: true, force: true });
-    expect(remove).not.toHaveBeenCalledWith(lock, { recursive: true, force: true });
+    if (process.platform === "linux") {
+      // smarty-dev#8777: the fd-pinned release never renames or recursively removes the shared name; it unlinks its
+      // own owner through the held directory and rmdirs the name only while it is still that directory.
+      expect(token).not.toBe("");
+      expect(rename).not.toHaveBeenCalledWith(lock, expect.anything());
+      expect(remove).not.toHaveBeenCalledWith(lock, expect.anything());
+    } else {
+      // Non-Linux keeps main's detached release.
+      const released = `${lock}.released.${token}`;
+      expect(rename).toHaveBeenCalledWith(lock, released);
+      expect(remove).toHaveBeenCalledWith(released, { recursive: true, force: true });
+      expect(remove).not.toHaveBeenCalledWith(lock, { recursive: true, force: true });
+    }
     expect(fs.existsSync(lock)).toBe(false);
   });
 

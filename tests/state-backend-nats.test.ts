@@ -1,0 +1,382 @@
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError,
+  MeshStateNatsRefusedError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
+} from "../src/mesh/state-backend-nats.js";
+import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
+import { MeshBatchConflictError } from "../src/mesh/state-file.js";
+import type { MeshIdentity } from "../src/mesh/event-log.js";
+import type { MeshStoreContext } from "../src/mesh/mesh-lock.js";
+import { fakeJetStream, type FakeJetStreamServer } from "./helpers/nats-jetstream-fake.js";
+
+// smarty-dev#7504 phase 1: the single-host JetStream state backend (docs/mesh-backends.md option (c)) against an
+// in-process fake of the five JetStream operations it uses. The real server runs in phase 2's conformance job.
+const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) closeNatsStateBackend(root); });
+const root = () => { const value = path.join(os.tmpdir(), `nats-state-${Math.random().toString(36).slice(2)}`); roots.push(value); return value; };
+const open = (server: FakeJetStreamServer, extra: Partial<Parameters<typeof openNatsStateBackend>[0]> = {}) =>
+  openNatsStateBackend({ root: root(), port: server.port(), stream: "S", lockTimeoutMs: 2_000, ...extra });
+const encode = (record: unknown) => Buffer.from(JSON.stringify(record));
+const settle = () => new Promise<void>(resolve => setImmediate(resolve));
+
+describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
+  it("puts, reads its own write at once, lists in key order, deletes with a CAS tombstone", async () => {
+    const backend = await open(fakeJetStream());
+    const a = await backend.put({ key: "ns/b", value: 2, identity });
+    await backend.put({ key: "ns/a", value: 1, identity });
+    expect(backend.get("ns/b")).toMatchObject({ key: "ns/b", value: 2, version: a.version });
+    expect(backend.listAll("ns/").map(entry => entry.key)).toEqual(["ns/a", "ns/b"]);
+    expect(backend.list("ns/", 1).map(entry => entry.key)).toEqual(["ns/a"]);
+    const deleted = await backend.delete({ key: "ns/b", ifVersion: a.version });
+    expect(deleted.deleted).toBe(true);
+    expect(backend.get("ns/b")).toBeUndefined();
+    // The tombstone keeps the key's version: a put that expects "absent and never seen" (0) conflicts.
+    await expect(backend.put({ key: "ns/b", value: 3, identity, ifVersion: 0 })).rejects.toThrow();
+    await backend.put({ key: "ns/b", value: 3, identity, ifVersion: deleted.version! });
+    expect(backend.get("ns/b")?.value).toBe(3);
+  });
+
+  it("runs writeBatch atomically: prepare sees the snapshot, an aborting conflict writes nothing, callbacks run", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "k/a", value: 1, identity });
+    const before = server.messages.length;
+    await expect(backend.writeBatch({ identity, ops: [{ kind: "put", key: "k/b", value: 2 }, { kind: "put", key: "k/a", value: 9, ifVersion: 999 }] }))
+      .rejects.toBeInstanceOf(MeshBatchConflictError);
+    expect(server.messages.length).toBe(before);
+    let effects: { changed: readonly string[] } | undefined;
+    const results = await backend.writeBatch({ identity, ops: [],
+      prepare: view => [{ kind: "put", key: "k/c", value: (view.get("k/a")?.value as number) + 1 }],
+      commitOutbox: effect => { effects = effect; } });
+    expect(results).toEqual([{ key: "k/c", applied: true, version: expect.any(Number) }]);
+    expect(backend.get("k/c")?.value).toBe(2);
+    expect(effects?.changed).toEqual(["k/c"]);
+    expect(server.messages.length).toBe(before + 1);
+  });
+
+  it("projector: applying a message twice, or a redelivery, changes nothing; a second host replays to the same state", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    for (let index = 0; index < 5; index++) await backend.put({ key: `p/${index}`, value: index, identity });
+    await backend.delete({ key: "p/2" });
+    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 }, server.messages[0]!, 100);
+    expect(applyNatsMessage(once, server.messages[0]!, 100)).toBe(once);
+    const replica = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
+    expect(replica.listAll("p/")).toEqual(backend.listAll("p/"));
+    expect(replica.stateStamp()?.split(":").at(-1)).toBe(String(server.messages.length));
+    replica.close();
+  });
+
+  it("a lost ack is retried with the same message id: one stored message, one commit, never applied twice", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "d/count", value: 0, identity });
+    let lose = true;
+    server.beforePublish = () => { if (lose) { lose = false; return "lose-ack"; } };
+    // The retry fails the expected sequence (the real server checks it before its duplicate window); the batch is
+    // then found in the stream by its id, so the increment is not run a second time.
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(1);
+    expect(server.messages.length).toBe(2);
+    expect(backend.get("d/count")?.value).toBe(1);
+  });
+
+  it("a lost ack followed by more than 4,096 foreign batches still reconciles exactly: prepare once, no busy, no double apply", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { lockTimeoutMs: 20_000 });
+    await backend.put({ key: "d/count", value: 0, identity });
+    let lose = true;
+    server.beforePublish = () => { if (lose) { lose = false; return "lose-ack"; } };
+    // My batch is stored; then 5,000 other batches commit before my retry reconciles.
+    server.afterStore = () => {
+      delete server.afterStore;
+      for (let index = 0; index < 5_000; index++) server.append(encode({ format: 1, type: "batch", id: `other-${index}`, base: server.messages.length,
+        highWater: 10_000 + index, changes: [{ key: `f/${index % 10}`, put: { value: index, version: 10_000 + index, updatedAt: 1, updatedBy: identity } }] }));
+    };
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(1);
+    expect(server.messages.length).toBe(5_002);
+    expect(backend.get("d/count")?.value).toBe(1);
+    expect(backend.diagnostics().nats?.casRetries).toBe(0);
+  });
+
+  it("a CAS failure after a lost ack whose batch was NOT stored runs prepare again (another writer took the slot)", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "d/count", value: 0, identity });
+    let calls = 0;
+    server.beforePublish = () => {
+      if (++calls !== 1) return;
+      // Another writer commits first, then my first attempt gets no answer and is not stored.
+      server.append(encode({ format: 1, type: "batch", id: "other", base: server.messages.length, highWater: 50_000,
+        changes: [{ key: "d/other", put: { value: 1, version: 50_000, updatedAt: 1, updatedBy: identity } }] }));
+      throw Object.assign(new Error("timeout"), { transient: true });
+    };
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(2);
+    expect(backend.get("d/count")?.value).toBe(1);
+    expect(server.messages.length).toBe(3);
+  });
+
+  it("a publish that never gets an answer is an unknown outcome, not a retryable busy error", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { lockTimeoutMs: 30 });
+    // Every publish times out before the server stores anything.
+    server.beforePublish = () => { throw Object.assign(new Error("timeout: no responders"), { transient: true }); };
+    await expect(backend.put({ key: "u/a", value: 1, identity })).rejects.toThrow(/OUTCOME_UNKNOWN/);
+    expect(server.messages.length).toBe(0);
+  });
+
+  it("a final publish error (an oversized payload, a permission) is thrown at once, never retried", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    let publishes = 0;
+    server.beforePublish = () => { publishes++; throw new Error("MAX_PAYLOAD_EXCEEDED"); };
+    await expect(backend.put({ key: "m/a", value: 1, identity })).rejects.toThrow(/MAX_PAYLOAD_EXCEEDED/);
+    expect(publishes).toBe(1);
+  });
+
+  it("a broken projector delivery fails closed: reads and writes throw", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "x/a", value: 1, identity });
+    server.breakDelivery(new Error("consumer deleted"));
+    expect(() => backend.get("x/a")).toThrow(/consumer deleted/);
+    await expect(backend.put({ key: "x/b", value: 1, identity })).rejects.toThrow(/consumer deleted/);
+    expect(backend.diagnostics().nats?.failure).toMatch(/consumer deleted/);
+  });
+
+  it("CAS retry: another writer commits between prepare and publish; the batch runs again on the new state", async () => {
+    const server = fakeJetStream();
+    const first = await open(server);
+    const second = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
+    await first.put({ key: "c/count", value: 0, identity });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    let injected = false;
+    server.beforePublish = () => {
+      if (injected) return;
+      injected = true;
+      // The other writer's commit lands at the stream head first (its own expected sequence held).
+      server.append(Buffer.from(JSON.stringify({ format: 1, type: "batch", base: server.messages.length, highWater: 1_000,
+        changes: [{ key: "c/count", put: { value: 10, version: 1_000, updatedAt: 1, updatedBy: identity } }] })));
+    };
+    let prepares = 0;
+    await second.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "c/count", value: (view.get("c/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(2);
+    expect(second.get("c/count")?.value).toBe(11);
+    await settle();
+    expect(first.get("c/count")?.value).toBe(11);
+    expect(second.diagnostics().nats?.casRetries).toBe(1);
+    // A conflicting ifVersion on the key the other writer changed aborts after the catch-up.
+    delete server.beforePublish;
+    const stale = first.get("c/count")!.version;
+    await second.put({ key: "c/count", value: 12, identity });
+    await expect(first.put({ key: "c/count", value: 13, identity, ifVersion: stale })).rejects.toThrow(/compare-and-swap failed for c\/count/);
+    second.close();
+  });
+
+  it("a single put or delete CAS conflict throws what the file backend throws (a plain Error, the same message); writeBatch keeps MeshBatchConflictError", async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const fs = await import("node:fs");
+    const fileRoot = root();
+    fs.mkdirSync(fileRoot, { recursive: true, mode: 0o700 });
+    const file = new MeshStore(fileRoot, 64 * 1024, 100, { stateBackend: "file" });
+    const backend = await open(fakeJetStream());
+    const failure = async (write: () => Promise<unknown>) => { try { await write(); } catch (error) { return error as Error; } throw new Error("no conflict"); };
+    try {
+      await file.put({ key: "a", value: 1, identity });
+      await backend.put({ key: "a", value: 1, identity });
+      const expected = await failure(() => file.put({ key: "a", value: 2, identity, ifVersion: 0 }));
+      const put = await failure(() => backend.put({ key: "a", value: 2, identity, ifVersion: 0 }));
+      expect(put.constructor).toBe(expected.constructor);
+      expect(put).not.toBeInstanceOf(MeshBatchConflictError);
+      expect(put.message).toBe(expected.message);
+      const expectedDelete = await failure(() => file.delete({ key: "a", ifVersion: 99 }));
+      const deleted = await failure(() => backend.delete({ key: "a", ifVersion: 99 }));
+      expect(deleted.constructor).toBe(expectedDelete.constructor);
+      expect(deleted.message).toBe(expectedDelete.message);
+      await expect(backend.writeBatch({ identity, ops: [{ kind: "put", key: "a", value: 3, ifVersion: 0 }] })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    } finally { file.closeState(); fs.rmSync(fileRoot, { recursive: true, force: true }); }
+  });
+
+  it("orders state tokens: a token reads its own state after later writes; stamps advance with the stream", async () => {
+    const backend = await open(fakeJetStream());
+    await backend.put({ key: "t/a", value: 1, identity });
+    const token = backend.stateToken();
+    const stamp = backend.stateStamp()!;
+    await backend.put({ key: "t/a", value: 2, identity });
+    expect(backend.get("t/a", { snapshot: token })?.value).toBe(1);
+    expect(backend.get("t/a")?.value).toBe(2);
+    const seq = (value: string) => Number(value.split(":").at(-1));
+    expect(seq(backend.stateStamp()!)).toBeGreaterThan(seq(stamp));
+  });
+
+  it("a fresh read refuses (busy, retryable) while the projector lags the stream", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "f/a", value: 1, identity });
+    // Another host commits while this host's projector is held back; confirmWritable learns the stream's head.
+    server.pause();
+    server.append(encode({ format: 1, type: "batch", base: 1, highWater: 50,
+      changes: [{ key: "f/a", put: { value: 5, version: 50, updatedAt: 1, updatedBy: identity } }] }));
+    await backend.confirmWritable();
+    expect(() => backend.get("f/a", { fresh: true })).toThrow(MeshStateNatsBusyError);
+    expect(backend.get("f/a")?.value).toBe(1); // a non-fresh read serves the applied model
+    server.resume();
+    await settle(); await settle();
+    expect(backend.get("f/a", { fresh: true })).toMatchObject({ value: 5 });
+  });
+
+  describe("refusals (never a fallback to file)", () => {
+    it.each([
+      ["a server older than 2.11", { version: "2.10.22", syncAlways: true }, /older than 2\.11/],
+      ["a server that does not fsync every write", { version: "2.14.7", syncAlways: false }, /sync_always/],
+      ["a server that does not report its sync policy", { version: "2.14.7", syncAlways: undefined }, /sync_always/],
+    ])("refuses %s", async (_name, facts, reason) => {
+      const server = fakeJetStream();
+      Object.assign(server, facts);
+      await expect(open(server)).rejects.toThrow(reason);
+    });
+
+    it("accepts a periodic-sync server only when the operator says so", async () => {
+      const server = fakeJetStream();
+      server.syncAlways = false;
+      await expect(open(server, { acceptPeriodicSync: true })).resolves.toBeInstanceOf(NatsStateBackend);
+    });
+
+    it("refuses a retired stream, and reads and writes once it is retired", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      await backend.put({ key: "r/a", value: 1, identity });
+      server.append(encode({ format: 1, type: "retire", epoch: 2 }));
+      await settle();
+      expect(() => backend.get("r/a")).toThrow(MeshStateNatsRefusedError);
+      await expect(backend.put({ key: "r/b", value: 1, identity })).rejects.toThrow(MeshStateNatsRefusedError);
+      await expect(open(server)).rejects.toThrow(/retired/);
+    });
+
+    it("follows the lifecycle table: begin, commit with its epoch, retire; then nothing", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      server.append(encode({ format: 1, type: "import-begin", epoch: 1 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("importing");
+      server.append(encode({ format: 1, type: "import-commit", epoch: 1 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("ready");
+      await backend.put({ key: "l/a", value: 1, identity });
+      server.append(encode({ format: 1, type: "retire", epoch: 2 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("retired");
+      expect(backend.diagnostics().nats?.failure).toBeUndefined();
+    });
+
+    it.each([
+      ["import-commit after retire (it would reopen the stream)", [{ type: "retire", epoch: 2 }, { type: "import-commit", epoch: 2 }]],
+      ["import-commit without import-begin", [{ type: "import-commit", epoch: 1 }]],
+      ["import-commit with another epoch", [{ type: "import-begin", epoch: 1 }, { type: "import-commit", epoch: 2 }]],
+      ["import-begin while importing", [{ type: "import-begin", epoch: 1 }, { type: "import-begin", epoch: 2 }]],
+      ["retire with a stale epoch", [{ type: "retire", epoch: 0 }]],
+      ["retire after retire", [{ type: "retire", epoch: 2 }, { type: "retire", epoch: 3 }]],
+      ["import-begin after retire", [{ type: "retire", epoch: 2 }, { type: "import-begin", epoch: 3 }]],
+      ["a batch after retire", [{ type: "retire", epoch: 2 }, { type: "batch", id: "late", base: 1, highWater: 1, changes: [] }]],
+    ])("fails closed on an illegal lifecycle record: %s", async (_name, records) => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      for (const record of records) server.append(encode({ format: 1, ...record }));
+      await settle(); await settle();
+      expect(backend.diagnostics().nats?.failure).toMatch(/illegal while|after the stream was retired/);
+      expect(() => backend.get("x")).toThrow(MeshStateNatsRefusedError);
+      // A host opening this stream refuses too.
+      await expect(open(server)).rejects.toBeInstanceOf(MeshStateNatsRefusedError);
+    });
+
+    it("refuses plaintext to a non-loopback server or monitoring URL, before connecting; loopback stays plaintext", async () => {
+      // No port: these would load the client and connect; the refusal comes first.
+      for (const servers of [["nats://10.0.0.5:4222"], ["nats.example.com:4222"], ["127.0.0.1:4222", "nats://192.168.1.2:4222"]]) {
+        await expect(openNatsStateBackend({ root: root(), servers })).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+      }
+      await expect(openNatsStateBackend({ root: root(), servers: ["tls://127.0.0.1:4222"], monitoringUrl: "http://10.0.0.5:8222" }))
+        .rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+      expect(() => assertNatsTransportSecure("tls://nats.example.com:4222", "tls:")).not.toThrow();
+      expect(() => assertNatsTransportSecure("https://nats.example.com:8222", "https:")).not.toThrow();
+      for (const loopback of ["nats://127.0.0.1:4222", "127.9.8.7:4222", "nats://localhost:4222", "nats://[::1]:4222"]) {
+        expect(() => assertNatsTransportSecure(loopback, "tls:")).not.toThrow();
+      }
+      expect(() => assertNatsTransportSecure("http://127.0.0.1:8222", "https:")).not.toThrow();
+      // Not loopback: a name that only starts like one.
+      expect(() => assertNatsTransportSecure("nats://127.0.0.1.example.com:4222", "tls:")).toThrow(MeshStateNatsInsecureError);
+    });
+
+    it("derives distinct streams for roots whose old truncated names collided", () => {
+      const oldName = (at: string) => `FABRIC_MESH_${Buffer.from(path.resolve(at)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
+      const tail = "/shared/mesh/root/with/a/long/common/suffix/state";
+      const [left, right] = [`/srv/a1${tail}`, `/srv/b2${tail}`];
+      expect(oldName(left)).toBe(oldName(right));
+      expect(natsStreamName(left)).not.toBe(natsStreamName(right));
+      expect(natsStreamName(left)).toMatch(/^FABRIC_MESH_[0-9a-f]{32}$/);
+      expect(natsStreamName(left)).toBe(natsStreamName(`/srv/a1/x/..${tail}`));
+    });
+
+    it("refuses writes while the stream is importing", async () => {
+      const server = fakeJetStream();
+      server.append(encode({ format: 1, type: "import-begin", epoch: 1 }));
+      const backend = await open(server);
+      await expect(backend.put({ key: "i/a", value: 1, identity })).rejects.toThrow(/importing/);
+    });
+
+    it("fails closed on a batch that could not have passed the CAS (a protocol violation)", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      server.append(encode({ format: 1, type: "batch", base: 7, highWater: 1, changes: [] }));
+      await settle();
+      expect(() => backend.get("v/a")).toThrow(/committed on sequence 7/);
+    });
+
+    it("the selector's nats factory returns only a prepared backend; an unprepared root refuses", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      const prepared = roots.at(-1)!;
+      expect(preparedNatsStateBackend(prepared)).toBe(backend);
+      const context = (at: string) => ({ root: at, maxEventBytes: 1 << 20, maxReadEvents: 100, lock: undefined as never }) as MeshStoreContext;
+      expect(createStateBackend(context(prepared), { stateBackend: "nats" })).toBe(backend);
+      expect(() => createStateBackend(context(root()), { stateBackend: "nats" })).toThrow(MeshStateBackendNotBuiltError);
+    });
+
+    it("a write that keeps losing the CAS gives up as busy (retryable), within its budget", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server, { lockTimeoutMs: 50 });
+      server.beforePublish = () => {
+        server.append(encode({ format: 1, type: "batch", base: server.messages.length, highWater: server.messages.length + 1, changes: [] }));
+      };
+      await expect(backend.put({ key: "b/a", value: 1, identity })).rejects.toBeInstanceOf(MeshStateNatsBusyError);
+    });
+  });
+
+  it("serves a MeshStore opened with stateBackend nats on a prepared root", async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const fs = await import("node:fs");
+    const meshRoot = root();
+    fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
+    await openNatsStateBackend({ root: meshRoot, port: fakeJetStream().port(), stream: "M" });
+    const store = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
+    try {
+      const written = await store.put({ key: "shared/a", value: { n: 1 }, identity });
+      expect(store.get("shared/a")).toMatchObject({ value: { n: 1 }, version: written.version });
+      expect(store.listAll("shared/").map(entry => entry.key)).toEqual(["shared/a"]);
+      expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
+    } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+  });
+
+  it("loads no NATS client unless a backend is opened without a port", async () => {
+    const port: JetStreamPort = fakeJetStream().port();
+    await open({ ...fakeJetStream(), port: () => port } as unknown as FakeJetStreamServer);
+    expect(Object.keys(await import("../src/mesh/state-backend-nats.js"))).not.toContain("connectJetStream");
+  });
+});

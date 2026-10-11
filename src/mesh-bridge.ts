@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
-import { DEFAULT_CALL_TIMEOUT_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
+import { DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
 import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
 
@@ -31,7 +31,7 @@ const HANDOFF_USAGE: ReadonlyMap<string, string> = new Map([
 ]);
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]
 ${[...HANDOFF_USAGE.values()].map((line) => `  ${line}`).join("\n")}`;
 
@@ -135,6 +135,20 @@ export const runBridge = async (
   const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
   if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
   const cursorPath = required(flags, "cursor");
+  const logLevel = flags.get("log-level") ?? "info";
+  if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
+  // The per-link bound on events crossing only as addressed to the hub factory (default 30/min,
+  // burst 60, and 512 KiB/min, burst 1 MiB).
+  const factoryRate = {
+    perMinute: Number(flags.get("factory-rate") ?? DEFAULT_FACTORY_RATE.perMinute),
+    burst: Number(flags.get("factory-burst") ?? DEFAULT_FACTORY_RATE.burst),
+    bytesPerMinute: Number(flags.get("factory-bytes") ?? DEFAULT_FACTORY_RATE.bytesPerMinute),
+    byteBurst: Number(flags.get("factory-byte-burst") ?? DEFAULT_FACTORY_RATE.byteBurst),
+  };
+  if (!(Number.isFinite(factoryRate.perMinute) && factoryRate.perMinute > 0)) throw new Error("--factory-rate must be a positive number of events a minute");
+  if (!(Number.isSafeInteger(factoryRate.burst) && factoryRate.burst > 0)) throw new Error("--factory-burst must be a positive integer");
+  if (!(Number.isSafeInteger(factoryRate.bytesPerMinute) && factoryRate.bytesPerMinute > 0)) throw new Error("--factory-bytes must be a positive integer of bytes a minute");
+  if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
   const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;
@@ -166,6 +180,8 @@ export const runBridge = async (
       localName, remoteName, local, remote: linked, cursorPath,
       stopMs: Math.min(callTimeoutMs, 5_000),
       log,
+      factoryRate,
+      ...(logLevel === "debug" ? { debug: (message: string) => log(`debug: ${message}`) } : {}),
     });
     const running = bridge;
     const aborted = new Promise<void>((resolve) => {

@@ -44,6 +44,18 @@ snapshot of the model, in chunks on the batch subject and one end record on `<st
 after the model's sequence. It then purges the stream below the first chunk. Any commit inside the chain abandons the
 snapshot (its chunks are inert). A host opens from the latest end record, and a projector whose delivery skips
 sequences (a purge passed it) reloads from it. A stream purged without a snapshot is refused.
+- **Snapshot integrity:** the end record commits to the sha256 of the canonical body (sorted by key), the previous
+snapshot's digest, the body's bytes and entries, and the lifecycle (status, epoch). A loading host re-checks all of it
+after the join. Every live projector re-serializes its own model when it applies an end record and compares the
+digest and the chain. Any mismatch (an altered, dropped or swapped chunk, a wrong epoch) fails closed
+(`FABRIC_MESH_STATE_NATS_SNAPSHOT_INTEGRITY`). This is integrity, not authentication: a stream writer that forges a
+whole self-consistent snapshot is caught by live projectors, not by a host that opens after it (the same trust as
+forging a batch).
+- **Bounds:** chunks, chunk size, bytes and entries are checked against the state bound (`maxStateBytes`, 32 MiB)
+before anything is fetched or joined; the replay after the snapshot is checked against `maxReplay` (100 000) before
+the consumer starts (`FABRIC_MESH_STATE_NATS_LIMIT`). Nothing is truncated.
+- **Repeated purges:** a gap seen during a re-sync is recorded, not dropped; the re-sync re-checks the stream's first
+sequence and loops (3 times), then the backend fails closed (`FABRIC_MESH_STATE_NATS_UNAVAILABLE`), never stale.
 - **The read model:** in memory, rebuilt at open from the snapshot plus the messages after it. Persisting it in the `state.db` schema, the
 cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must

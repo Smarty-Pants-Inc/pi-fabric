@@ -9,6 +9,10 @@ export interface FakeJetStreamServer {
   readonly firstSeq: number;
   /** Runs before each purge is applied (inject a racing writer). */
   beforePurge?: () => void;
+  /** Runs (awaited) before a consumer starts: the window between a snapshot load and the consumer start. */
+  beforeConsume?: (afterSeq: number) => Promise<void> | void;
+  /** Hides stored messages from getMessage (a dropped chunk). */
+  readonly hidden: Set<number>;
   /** Ports opened on this server (one per backend, like separate connections). */
   port(): FakePort;
   version: string;
@@ -50,7 +54,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
     return message.seq;
   };
   const server: FakeJetStreamServer = {
-    messages, version: "2.14.7", syncAlways: true,
+    messages, version: "2.14.7", syncAlways: true, hidden: new Set<number>(),
     get firstSeq() { return firstSeq; },
     append: (data, subject) => store(data, subject),
     pause: () => { paused ??= []; },
@@ -72,7 +76,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         getMessage: async (_stream, seq) => {
           calls.push("getMessage");
           await new Promise<void>(resolve => setImmediate(resolve));
-          const message = live(seq);
+          const message = server.hidden.has(seq) ? undefined : live(seq);
           return message && { seq: message.seq, data: message.data };
         },
         lastBySubject: async (_stream, subject) => {
@@ -107,6 +111,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         },
         consume: async (_stream, afterSeq, onMessage, onError) => {
           calls.push("consume");
+          await server.beforeConsume?.(afterSeq);
           if (onError) breakers.add(onError);
           // Like an ordered consumer: in order, from the first message still stored after `afterSeq` (a purge skips).
           let delivered = afterSeq;

@@ -35,6 +35,7 @@ import { normalizeScope, type FabricScope } from "../src/scope.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
+  residentActorRoots,
   residentDeliveryPrefix,
   residentHostId,
   residentResultPath,
@@ -2699,6 +2700,81 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await client.removeActor(actor.id);
     } finally {
       await control.close();
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
+    }
+  });
+
+  // pi-fabric#843 review (smarty-dev#8487): a REAL resident restart. The resident host process
+  // gets SIGTERM, an older runtime's save drops resolvedBinding, the owner re-ensures the actor
+  // and the new host process republishes the idle presence the router reads with its verified
+  // model/thinking, with no new run; a forged row's model, which the run path refuses, stays unknown.
+  it("republishes a verified legacy actor binding after a real resident SIGTERM restart, without a run (pi-fabric#843)", { timeout: 120_000 }, async () => {
+    const state = await rootHarness("resident-binding-restart");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
+      mainAgent: state.mainAgent, hostPath });
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const presence = (id: string) =>
+      state.mesh.get(`actors/${state.config.sessionId}/${id}`)?.value as Record<string, unknown> | undefined;
+    const registryFile = (id: string): string => {
+      const roots = Object.values(residentActorRoots(state.config));
+      const file = roots.map(root => path.join(root, "actors.json")).find(candidate => fs.existsSync(candidate) &&
+        (JSON.parse(fs.readFileSync(candidate, "utf8")) as { actors: Array<{ id: string }> }).actors.some(row => row.id === id));
+      if (!file) throw new Error(`No registry row for ${id}`);
+      return file;
+    };
+    const row = (id: string) => (JSON.parse(fs.readFileSync(registryFile(id), "utf8")) as { actors: Array<Record<string, unknown>> })
+      .actors.find(candidate => candidate.id === id)!;
+    const runs = (): string[] => {
+      const directory = path.join(state.config.residencyRoot, "runs");
+      return fs.existsSync(directory) ? fs.readdirSync(directory) : [];
+    };
+    try {
+      const bound = await client.createActor({ name: "review pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", modelReason: "review pair", thinking: "high" });
+      const forged = await client.createActor({ name: "forged pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", thinking: "high" });
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      expect(row(bound.id).resolvedBinding).toMatchObject({ model: "provider/visible", thinking: "high" });
+      const before = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      const runsBefore = runs();
+
+      // Real SIGTERM of the resident host process; wait for the process itself to exit.
+      await stopResident(state.config);
+      expect(residentProcessAlive(before.pid, before.processStartTime)).toBe(false);
+      // Seed what an older runtime's save leaves: rows without resolvedBinding, one with a
+      // forged model. Drop the old presence so only the restarted process can write it.
+      for (const [id, model] of [[bound.id, undefined], [forged.id, "provider/forged"]] as const) {
+        const file = registryFile(id);
+        const registry = JSON.parse(fs.readFileSync(file, "utf8")) as { actors: Array<Record<string, unknown>> };
+        const target = registry.actors.find(candidate => candidate.id === id)!;
+        delete target.resolvedBinding;
+        if (model) target.model = model;
+        fs.writeFileSync(file, JSON.stringify(registry));
+        await state.mesh.delete({ key: `actors/${state.config.sessionId}/${id}` });
+      }
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+
+      // The owner re-ensures the actor: a new resident host process loads the legacy rows.
+      await client.ensureActor(bound.id);
+      const after = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      expect(after.pid).not.toBe(before.pid);
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      expect(presence(bound.id)).toMatchObject({ id: bound.id, status: "idle", model: "provider/visible",
+        modelReason: "review pair", thinking: "high" });
+      await waitFor(() => presence(forged.id) !== undefined, 20_000);
+      // The resident resolver refuses the forged selector; give it time to settle, then prove unknown.
+      await delay(1_500);
+      expect(presence(forged.id)?.status).toBe("idle");
+      expect(presence(forged.id)).not.toHaveProperty("model");
+      expect(presence(forged.id)).not.toHaveProperty("thinking");
+      // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.
+      expect(runs()).toEqual(runsBefore);
+      expect(row(bound.id).lastRunId).toBeUndefined();
+      expect(row(forged.id).lastRunId).toBeUndefined();
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+    } finally {
       await client.close();
       await state.participants.close();
       await stopResident(state.config);

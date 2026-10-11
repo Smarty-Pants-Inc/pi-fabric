@@ -407,15 +407,20 @@ export interface FabricActorInfo {
   capabilityDigest?: string;
   missingCapabilities?: string[];
   /** Persistent reason an activation is blocked; cleared after a later successful activation.
-   * classification says why the block does or does not expire. Only an explicitly transient
-   * code (provider-transient, activation-window-lost, child-exit-before-admission) carries
-   * retryAt: from then on the block no longer gates routing and is reported as
-   * activationBlockExpired instead (smarty-dev#8487). Credential, permission, security-policy,
-   * quota, invalid-request, context-overflow, failing-preparation and unknown stay blocked. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number; retryAt?: number; classification?: string };
-  /** History of a transient block whose backoff ended; the next activation runs normally.
-   * Another failure blocks again with a doubled backoff; a completed run clears it. */
-  activationBlockExpired?: { lastBlockedReason: string; code: string; since: number; count: number; expiredAt: number; classification?: string };
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   validWhile?: FabricActorValidWhileSource;
   /** Host-maintained, bounded records topic projection for validWhile. */
   records?: FabricActorRecordsOptions;

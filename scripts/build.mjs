@@ -85,6 +85,7 @@ const lazyEntryPoints = [
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
   "src/fabric-runtime-state.ts",
+  "src/provider-error-class.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",

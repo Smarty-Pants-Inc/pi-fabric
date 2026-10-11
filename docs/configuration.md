@@ -374,7 +374,9 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "rootGoneTtlMs": 7200000
   },
   "actors": {
-    "maxSessionBytes": 20971520
+    "maxSessionBytes": 20971520,
+    "transientBlockCooldownMs": 600000,
+    "transientBlockMaxMs": 3600000
   },
   "memory": {
     "enabled": true,
@@ -957,6 +959,8 @@ credential: this process then publishes nudges and raises alarms), `alarmTo`,
 configuration, never a caller's. It needs the mesh. See [records](records.md).
 
 ## Actors
+
+`actors.transientBlockCooldownMs` (default `600000`, 10 minutes; from 1000 to 86400000) is how long a transient activation block gates routing. Transient blocks come from provider stream errors, timeouts, and preparation or lock timeouts. After the cooldown, the actor is routable again and its next activation is a probe. Each transient failure of a probe doubles the backoff, up to `actors.transientBlockMaxMs` (default `3600000`, 60 minutes). Hard blocks, such as credentials, configuration or a model that is not allowed, never expire. See [actor activation blocks](agents.md) (smarty-dev#6509).
 
 `actors.maxSessionBytes` limits the size of a persistent actor's Pi session file, in bytes. The default is `20971520` (20 MiB). Set it to `0` to disable the limit. Before a run starts, Fabric checks the session file. A larger file gets the same reset as `agents.resetSession()`, with trigger `size`: Fabric archives the file and the run starts a fresh session. So Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [fresh actor sessions](agents.md#fresh-actor-sessions).
 

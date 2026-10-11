@@ -35,6 +35,16 @@ afterEach(() => {
   }
 });
 
+describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
+  it("defaults to 10 minutes capped at 60 and bounds overrides", () => {
+    expect(normalizeFabricConfig({}).actors).toMatchObject({ transientBlockCooldownMs: 600_000, transientBlockMaxMs: 3_600_000 });
+    expect(normalizeFabricConfig({ actors: { transientBlockCooldownMs: 120_000, transientBlockMaxMs: 900_000 } }).actors)
+      .toMatchObject({ transientBlockCooldownMs: 120_000, transientBlockMaxMs: 900_000 });
+    expect(normalizeFabricConfig({ actors: { transientBlockCooldownMs: 1, transientBlockMaxMs: "x" } }).actors)
+      .toMatchObject({ transientBlockCooldownMs: 1_000, transientBlockMaxMs: 3_600_000 });
+  });
+});
+
 describe("host-only explicit model exceptions (#3134)", () => {
   it("defaults to Astra and supports an empty rollback or normalized override", () => {
     expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);

@@ -12,6 +12,7 @@ Upstream merge 114f5e55, 103 conflicted files: **98 fresh, 5 replayed (#541), 25
 
 - The two later merges of current main add 4 conflicts, all fresh: 3 in 30aa4e91 and 1 in 5f32bbac. Two of them (`src/agents/request.ts`, `src/index.ts`) also conflicted in #541. Counting those 4 rows, the table has 107 rows: 102 fresh, 5 replayed, 27 fresh overlapping #541.
 - The merge of main f2814332 adds 12 more conflicts, all fresh, in their own section ("Merge of current main (f2814332)") at the end.
+- The merge of main f8a03c8e adds 3 more conflicts, all fresh, in their own section ("Merge of current main (f8a03c8e)") after it.
 - Fork-lead reviews the fresh rows independently. The replayed rows repeat #541's resolution of the same conflict.
 
 Difference from the 98/5/30 quoted in the part 2 summary: 98 and 5 match. That summary's 30 was the 25 fresh rows that also conflicted in #541's merges plus 5 test files (`tests/agents-provider-services.test.ts`, `tests/agents-provider.test.ts`, `tests/node-process-runtime.test.ts`, `tests/process-transport.test.ts`, `tests/verified-providers.test.ts`). #541's merge commits edited those 5 without a conflict. By that wider measure (the #541 merge result differs from both of its parents, `git show --cc`), 26 fresh rows qualify, not 5. So this table counts conflicts only and names the edit-only merges in the overlap column. Counted with the 5 replayed rows, which all conflicted in #541 too, the overlap is 30 rows.
@@ -390,6 +391,30 @@ Evidence (logs in the m4 task's artifacts, outside the repo):
   - `vitest related` on the 28 source files: 515 files, 508 passed, 5 skipped, 2 failed; 11223 tests passed, 128 skipped, 3 failed (`vitest-related.log`, `.json`). The 2 `wait-aliases` failures are a 100 ms execution deadline under load; `principal-relay` "a scheduled mesh.publish keeps the turn principal..." (6370b5e0, round 2) is flaky: alone it fails 1 of 8 runs both at 66f19a32 and on this merge. Both files pass alone (64 of 64, `rerun-2-failing.log`).
   - The 49 changed test files plus the liveness, retention, control-plane, incarnation, actor-session-relaunch and mesh-grants suites (65 files): 62 passed, 2 skipped (opt-in real-Pi E2Es), 1 failed; 3248 tests passed (`vitest-direct-named.log`, `.json`). The failure, `residency-completed-retention` "wrong transport", is a `waitFor` deadline; the file passes alone, 12 of 12.
   - Opt-in real-Pi E2Es (`FABRIC_9241_REAL_PI=1`, `FABRIC_8467_REAL_PI=1`): `session-actor-relaunch-real-pi` and `mesh-exit-cleanup-real-pi.e2e`, 4 of 4 passed (`real-pi-e2e.log`).
+
+### Merge of current main (f8a03c8e)
+
+Parents 55571003 (this branch, the f2814332 merge d316c841 and its review receipts included) and f8a03c8e (`refs/remotes/origin/main-now`). Main since f2814332: #869 (SQLite checkpoint and fsyncs off the writer lock), #841 (provider-dead alarms), #874 (transient-block cooldown and preparation timeouts), #843 (presence binding on restart), #857 (moved-main handoff). `git merge` (rerere off) reported **3 conflicted files, 3 hunks**, all **fresh**. No behaviour decision was needed: in each hunk the two sides built different things, so the resolution is a union.
+
+| File | Method | Overlap | Resolution |
+|---|---|---|---|
+| `docs/configuration.md` | fresh | conflicted in upstream merge 114f5e55 | full example config, `actors` block: main's two new keys `transientBlockCooldownMs: 600000` and `transientBlockMaxMs: 3600000` (#874), with ours' upstream `memory` and `trace` blocks after it. Main's prose for both keys auto-merged unchanged |
+| `src/actors/manager.ts` | fresh | conflicted in 114f5e55 and in the f2814332 merge d316c841 | union of imports: ours `FabricMessageSender`/`FabricScope` and the scope helpers (`launchScope`, `normalizeScope`, `processSender`, `senderStamp`, `senderTrusted`); main's `activationBlockClass` and `type ActivationBlockClass` added to the `activation-failure.js` import (#874). #874's and #843's bodies auto-merged |
+| `src/index.ts` | fresh | conflicted in 114f5e55 (replayed #541) and in the 5f32bbac merge | kept our thin entry, byte-identical to 55571003 (upstream 0.110.1 moved the extension body to `src/extension.ts`); ported main's only `src/index.ts` change since f2814332 (#841) into `src/extension.ts`: `ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery()` on the `registerMainProviderRecovery` call |
+
+No line is lost. For each conflicted file, both parents were diffed against the merge (for `src/index.ts`, the merged `src/index.ts` plus `src/extension.ts`):
+
+- Every line that either side added since the base f2814332 is in the merge: `docs/configuration.md` 129 ours and 4 main lines, `src/actors/manager.ts` 56 and 122, `src/index.ts` 3 and 1. Missing: 0.
+- Every parent line absent from the merge is a line that the other side changed since the base. Unexplained: 0 for every file and parent.
+- `src/index.ts`: the 88 main lines absent from `src/index.ts` plus `src/extension.ts` are exactly the base lines that 0.110.1 had already restructured at 55571003. The merge restores the one line that was missing at 55571003 (`ownsNonRetryable`).
+
+Evidence (logs in the qs32729 task's artifacts, outside the repo):
+
+- `bun install --frozen-lockfile`: no changes.
+- `bun run typecheck`: 0 errors (`c-typecheck.log`).
+- `bun run build`: "44 startup files, 1112563 startup bytes, 69 stable lazy entries, 145 chunks", within the budget (`c-build.log`).
+- Tests for the conflicted areas, `--maxWorkers=12` (21 files: `actor-manager`, `actor-manager-startup`, `actor-transient-block-e2e`, `actor-transient-block-resident-e2e`, `main-provider-dead`, `main-provider-dead-real-pi`, `main-provider-recovery`, `provider-error-class`, `stall-alarms`, `stall-alarms-resume`, `stall-alarms-real-pi`, `control-plane`, `control-plane-incarnation`, `config`, `runner-default-docs`, `process-placement-startup`, plus main's auto-merged `mesh-bridge-handoff`, `mesh-state-sqlite-checkpoint-timing`, `mesh-state-sqlite-slow-fsync`, `residency`, `agents-provider`): 19 files passed, 2 skipped (the opt-in real-Pi files); 1316 tests passed, 4 skipped, 0 failed (`c-vitest.log`, `.json`).
+- Opt-in real-Pi E2E for #841 through the ported `src/extension.ts` line (`FABRIC_8742_REAL_PI=1`, `main-provider-dead-real-pi`): 3 of 3 passed (`c-real-pi-8742.log`). `stall-alarms-real-pi` needs an installed-Pi evidence setup and was not run.
 
 ## Independent per-row review receipts (non-test rows)
 

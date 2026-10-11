@@ -604,6 +604,9 @@ export class ActorManager {
   #registryFingerprint: string | undefined;
   #savedActors: { owned: string; critical: string; fingerprint: string | undefined } | undefined;
   readonly #lazyMessages = new WeakMap<ManagedActor, Record<string, unknown>>();
+  // smarty-dev#8487: a legacy row's binding verified at load against this owner's
+  // effective run binding. A derived view only: never saved, rechecked on each read.
+  readonly #restoredBindings = new WeakMap<ManagedActor, FabricActorRunBinding>();
   readonly #unarchivedMessages = new WeakMap<ManagedActor, FabricActorMessage[]>();
   readonly #resetMessages = new WeakSet<ManagedActor>();
   #registrySaveTimer: NodeJS.Timeout | undefined;
@@ -5268,14 +5271,6 @@ export class ActorManager {
           ...(typeof binding.model === "string" ? { model: binding.model } : {}),
           ...(typeof binding.modelReason === "string" ? { modelReason: binding.modelReason } : {}),
           ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
-        } } : typeof record.model === "string" && record.model ? { resolvedBinding: {
-          // smarty-dev#8487: a row without a run binding (written before #7682 or
-          // rebuilt by an older runtime) republishes its persisted model/thinking
-          // after a restart, as create does; idle presence must not be unknown
-          // until a run. Never a reader overlay; a row without a model stays unknown.
-          model: record.model,
-          ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
-          thinking: isFabricThinking(record.thinking) ? record.thinking : this.agents.config.thinking,
         } } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),
@@ -5372,6 +5367,7 @@ export class ActorManager {
     // previously loaded actor). Publish owned presence through the existing
     // retry queue after loading the complete registry, without rewriting it.
     for (const actor of loaded) {
+      this.#restoreLoadedBinding(actor);
       if (this.#ownershipDecision(actor.id)) this.#pendingPresence.add(actor.id);
     }
     this.#schedulePresenceRetry();
@@ -5885,6 +5881,50 @@ export class ActorManager {
     };
   }
 
+  /**
+   * smarty-dev#8487 (pi-fabric#843 review): a registry row without a run binding
+   * (written before #7682 or rebuilt by an older runtime) may advertise its persisted
+   * model/thinking only when they EXACTLY equal what an owner-defaults run here would
+   * pin: this owning root's session overlay applied (#runBinding), then the selector
+   * admitted and canonicalized as a run does (#resolvedRunBinding). A foreign root
+   * cannot see the owner's overlay, and a route-class actor's model is chosen per run;
+   * a mismatch, refusal, or resolver error leaves the binding unknown (fail closed).
+   */
+  #restoreLoadedBinding(actor: ManagedActor): void {
+    if (actor.resolvedBinding || !actor.model || actor.routeClass !== undefined || actor.rootId !== this.#rootId) return;
+    const effective = this.#runBinding(actor);
+    const thinking = effective.thinking ?? this.agents.config.thinking;
+    if (effective.model !== actor.model || thinking !== (actor.thinking ?? this.agents.config.thinking)) return;
+    const candidate: FabricActorRunBinding = { model: actor.model,
+      ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}), thinking };
+    const settle = (resolved: FabricActorRunBinding, deferred: boolean): void => {
+      // A canonical selector other than the persisted one (alias, retarget) runs another model.
+      if (resolved.model !== candidate.model) return;
+      if (deferred && (this.#closing || this.#actors.get(actor.id) !== actor || actor.resolvedBinding ||
+        !this.#sameRunBinding(actor, candidate))) return;
+      this.#restoredBindings.set(actor, candidate);
+      // A synchronous result precedes this load's own presence publication.
+      if (deferred) void this.#publishBindingView(actor).catch(() => undefined);
+    };
+    let resolving: FabricActorRunBinding | Promise<FabricActorRunBinding>;
+    try { resolving = this.#resolvedRunBinding(actor, effective); } catch { return; }
+    if (resolving instanceof Promise) void resolving.then((resolved) => settle(resolved, true), () => undefined);
+    else settle(resolving, false);
+  }
+
+  /** Whether an owner-defaults run here would still pin exactly this (pre-resolution) binding. */
+  #sameRunBinding(actor: ManagedActor, binding: FabricActorRunBinding): boolean {
+    const now = this.#runBinding(actor);
+    return now.model === binding.model && now.modelReason === binding.modelReason &&
+      (now.thinking ?? this.agents.config.thinking) === binding.thinking;
+  }
+
+  /** A restored legacy binding, unknown again once an owner overlay or default diverges. */
+  #restoredBinding(actor: ManagedActor): FabricActorRunBinding | undefined {
+    const restored = this.#restoredBindings.get(actor);
+    return restored && this.#sameRunBinding(actor, restored) ? restored : undefined;
+  }
+
   #rememberResolvedBinding(actor: ManagedActor, binding: FabricActorRunBinding): void {
     const live = this.#actors.get(actor.id);
     // Model admission may await while a registry reload replaces the executing
@@ -5905,7 +5945,7 @@ export class ActorManager {
     const session = registryView ? undefined : this.#bindings.get(actor.id);
     // Shared observers cannot know a legacy row's last admitted binding. An
     // omitted model/thinking means unknown, not this reader's session overlay.
-    const effective = registryView ? actor.resolvedBinding ?? {} : this.#runBinding(actor);
+    const effective = registryView ? actor.resolvedBinding ?? this.#restoredBinding(actor) ?? {} : this.#runBinding(actor);
     return {
       id: actor.id,
       scope: this.#actorScope,

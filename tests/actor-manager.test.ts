@@ -272,26 +272,23 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       actorManagers.push(reader);
       const before = fs.readFileSync(file, "utf8");
       expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
-      // A legacy row's persisted model/thinking (#8487), else unknown: never this reader's overlay.
-      const persisted = hasDefaults ? { model: "provider/project", thinking: "medium" } : { model: undefined, thinking: undefined };
+      // A foreign root cannot see the owner's overlay, so even a legacy row's persisted
+      // model/thinking stays unknown here (pi-fabric#843): never this reader's overlay.
       const shared = reader.listOwned(true)[0]!;
-      expect(shared.model).toBe(persisted.model);
-      expect(shared.thinking).toBe(persisted.thinking);
+      expect(shared.model).toBeUndefined();
+      expect(shared.thinking).toBeUndefined();
       expect(shared.binding).toBeUndefined();
       const member = actorParticipantRecord(shared, `session:${sessionId}`, "host", `session:${sessionId}`, `session:${sessionId}`);
-      expect(member.model).toBe(persisted.model);
-      expect(member.thinking).toBe(persisted.thinking);
+      expect(member.model).toBeUndefined();
+      expect(member.thinking).toBeUndefined();
       expect(fs.readFileSync(file, "utf8")).toBe(before);
       // A binding-only presence publication also must not stamp the overlay
       // into either shared presence or the registry.
       await reader.setModel(actor.id, `provider/${sessionId}-new`);
-      const presence = state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value as Record<string, unknown> | undefined;
-      expect(presence?.model).toBe(persisted.model);
-      expect(presence?.thinking).toBe(persisted.thinking);
-      // A prior reader's close may persist the restored binding: the row's own value, never an overlay.
-      const saved = row(state.root, actor.id).resolvedBinding;
-      if (hasDefaults && saved !== undefined) expect(saved).toEqual(persisted);
-      else expect(saved).toBeUndefined();
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
+      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
+      // A restored binding is a derived view: never saved, so never an overlay in the row.
+      expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
       expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
       expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
       await reader.close();
@@ -374,6 +371,128 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       expect(value).not.toHaveProperty("thinking");
     }
     expect(restarted.status(actor.id).projectDefaults).toEqual({ scope: "project", ...persisted });
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  // pi-fabric#843 review: a legacy row's persisted model/thinking is advertised only when
+  // it EXACTLY equals what an owner-defaults run on this owning host would pin, after the
+  // owner's session overlay and the run path's selector admission/canonicalization.
+  const legacyRow = async (
+    state: ReturnType<typeof setup>,
+    request: { model: string; modelReason?: string; thinking?: "medium" | "high" },
+    edit?: (row: Record<string, unknown>) => void,
+  ) => {
+    const actor = await state.actors.create({ name: "legacy-verify", instructions: "Observe.", ...request });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].resolvedBinding;
+    edit?.(registry.actors[0]);
+    fs.writeFileSync(file, JSON.stringify(registry));
+    await state.mesh.delete({ key: `actors/test/${actor.id}` });
+    return actor;
+  };
+  const restartWith = (state: ReturnType<typeof setup>, resolvePiModel?: (model: string) => string | Promise<string>) => {
+    const restarted = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, ...(resolvePiModel ? { resolvePiModel } : {}),
+    });
+    actorManagers.push(restarted);
+    return restarted;
+  };
+  const presenceOf = (state: ReturnType<typeof setup>, id: string) =>
+    state.mesh.get(`actors/test/${id}`)?.value as Record<string, unknown> | undefined;
+  // The current registry: "luna" is an alias of the canonical key; "provider/forged" does not exist.
+  const canonical = (model: string): string => {
+    if (model === "provider/forged") throw new Error(`Model ${model} is not available to this Pi session`);
+    return model === "luna" ? "cliproxyapi/gpt-6-luna" : model;
+  };
+  const resolvers = [
+    ["sync", (model: string) => canonical(model)],
+    ["async", async (model: string) => { await new Promise(resolve => setTimeout(resolve, 30)); return canonical(model); }],
+  ] as const;
+  const settled = async (resolver: ReturnType<typeof vi.fn>) => {
+    await Promise.allSettled(resolver.mock.results.map(result => result.value));
+    await new Promise(resolve => setTimeout(resolve, 80));
+  };
+
+  it.each(resolvers)("restores a legacy row equal to the owner's canonical effective binding with a %s resolver, without a run (pi-fabric#843)", async (_kind, resolve) => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
+    const resolver = vi.fn(resolve);
+    const restarted = restartWith(state, resolver);
+    await waitFor(() => presenceOf(state, actor.id)?.model !== undefined, 10_000);
+    expect(presenceOf(state, actor.id)).toMatchObject({ status: "idle", model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
+    expect(resolver).toHaveBeenCalledWith("cliproxyapi/gpt-6-luna", false);
+    // Verified and advertised, never persisted as if a run had admitted it.
+    expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it.each(resolvers.flatMap(([kind, resolve]) => [
+    [kind, "a stale alias the run path now canonicalizes to another key", "luna", resolve],
+    [kind, "a forged model the run path refuses", "provider/forged", resolve],
+    [kind, "a model the current policy denies", "provider/denied", resolve],
+  ] as const))("omits a legacy row whose persisted model differs from the effective binding (%s resolver): %s (pi-fabric#843)", async (_kind, _case, persisted, resolve) => {
+    const state = setup(true, undefined, undefined, undefined, {}, { deniedModels: ["provider/denied"] });
+    const actor = await legacyRow(state, { model: "cliproxyapi/gpt-6-luna", thinking: "high" }, row => { row.model = persisted; });
+    const resolver = vi.fn(resolve);
+    const restarted = restartWith(state, resolver);
+    await waitFor(() => presenceOf(state, actor.id) !== undefined, 10_000);
+    await settled(resolver);
+    expect(presenceOf(state, actor.id)?.status).toBe("idle");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    expect(restarted.listOwned(true)[0]?.thinking).toBeUndefined();
+    // The persisted value remains the project default; only the advertised binding is unknown.
+    expect(restarted.status(actor.id).projectDefaults).toMatchObject({ model: persisted, thinking: "high" });
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it.each<[string, { model?: string; thinking?: "low" | "medium" }, boolean]>([
+    ["a different model", { model: "provider/override" }, false],
+    ["a different thinking level", { thinking: "low" }, false],
+    ["the persisted model and thinking", { model: "provider/project", thinking: "medium" }, true],
+  ])("applies an owner session override before restoring: %s (pi-fabric#843)", async (_case, override, restored) => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "provider/project", thinking: "medium" });
+    // The owner's own session overlay, which #runBinding applies to an owner-defaults run.
+    const bindings = new ActorBindingStore("test", path.join(state.root, "actors"));
+    if (override.model) await bindings.setModel(actor.id, override.model);
+    if (override.thinking) await bindings.setThinking(actor.id, override.thinking);
+    const restarted = restartWith(state);
+    expect(restarted.resolveBinding(actor.id)).toMatchObject({ model: override.model ?? "provider/project", thinking: override.thinking ?? "medium" });
+    await waitFor(() => presenceOf(state, actor.id) !== undefined, 10_000);
+    if (restored) {
+      // The override is exactly the persisted binding: that is what a run would pin.
+      expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "medium" });
+      expect(restarted.listOwned(true)[0]).toMatchObject({ model: "provider/project", thinking: "medium" });
+    } else {
+      expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+      expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+      expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+      expect(restarted.listOwned(true)[0]?.thinking).toBeUndefined();
+    }
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it("withdraws a restored binding once an owner override diverges, and restores it when cleared (pi-fabric#843)", async () => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "provider/project", thinking: "medium" });
+    const restarted = restartWith(state);
+    await waitFor(() => presenceOf(state, actor.id)?.model === "provider/project", 10_000);
+    await restarted.setModel(actor.id, "provider/override");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    await restarted.setModel(actor.id, undefined);
+    expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "medium" });
+    await restarted.setThinking(actor.id, "low");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+    // A project-scope change also moves the effective binding away from the verified row.
+    await restarted.setThinking(actor.id, undefined);
+    await restarted.setModel(actor.id, "provider/next", "project");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
     expect(state.agents.list()).toHaveLength(0);
   }, 20_000);
 

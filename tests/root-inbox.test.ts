@@ -18,7 +18,8 @@ const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => f
 const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
   holdsBatch: () => true,
   holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
-    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data },
+    // The carrier names the shadow's topic: a key claims work on that topic only (#852 security P1).
+    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
   }))).holdsSteer,
 });
 
@@ -102,7 +103,7 @@ describe("RootInbox", () => {
     await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:A");
     await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:B");
     clock.advance(1);
-    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B" } }]))).toEqual(["ack:A"]);
+    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B", topic: "fleet.work.pi-fabric.2" } }]))).toEqual(["ack:A"]);
     // A steer that was only enqueued (Pi has not recorded it) suppresses nothing.
     await work("queued", me.id, "fleet.work.pi-fabric.3", "queued:C");
     clock.advance(1);

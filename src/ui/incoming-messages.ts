@@ -88,10 +88,13 @@ class DeliveredDisplayIndex {
         };
         add("id", item.id); add("delivery", item.deliveryId);
         const data = record(item.data);
+        // Work keys/refs claim work on the carrier's named topic only, as in root-inbox.ts
+        // (#852 security P1); a carrier without data.topic hides no shadow by key or ref.
+        const topic = typeof data.topic === "string" && data.topic.trim() ? data.topic.trim() : undefined;
         if (typeof data.deliveryId === "string" && data.deliveryId) add("delivery", data.deliveryId);
         else if (typeof data.messageId === "string" && data.messageId) add("id", data.messageId);
-        else if (typeof data.key === "string" && data.key.trim()) add("key", data.key.trim());
-        else if (typeof data.ref === "string" && data.ref.trim()) add("ref", data.ref.trim());
+        else if (typeof data.key === "string" && data.key.trim()) { if (topic) add("topic-key", JSON.stringify([topic, data.key.trim()])); }
+        else if (typeof data.ref === "string" && data.ref.trim() && topic) add("topic-ref", JSON.stringify([topic, data.ref.trim()]));
       }
     }
     this.#seen = entries;
@@ -114,8 +117,9 @@ const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: Re
       // work key when a distinct deliveryId/messageId says this is unseen work.
       return !receipts.slice(start + 1, next).some(value => delivered.has(value));
     }
-    const { from_id: from, id, key, ref } = row.attributes;
-    return !from || ![["id", id], ["key", key], ["ref", ref]].some(([kind, value]) =>
+    const { from_id: from, id, key, ref, topic } = row.attributes;
+    const scoped = (value: string | undefined) => topic && value ? JSON.stringify([topic, value]) : undefined;
+    return !from || ![["id", id], ["topic-key", scoped(key)], ["topic-ref", scoped(ref)]].some(([kind, value]) =>
       value && delivered.has(receipt(from, kind!, value)));
   });
 };

@@ -15,7 +15,7 @@ const sender = { id: "session:peer", name: "Build & Test", kind: "main" as const
 const message = (body = "first\n  second\tthird & <safe>"): CustomMessage => ({
   role: "custom", customType: "pi-fabric-agent-message", display: true, timestamp: 123,
   content: `<fabric-agent-message from_name="Build &amp; Test" from_id="session:peer">\n${body.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}\n<data>{"internal":"not a preview"}</data>\n</fabric-agent-message>`,
-  details: { id: "native-1", from: sender, data: { key: "same-work" } },
+  details: { id: "native-1", from: sender, data: { key: "same-work", topic: "fleet.work" } },
 });
 const event = (id: string, text: string, data: unknown = { key: "same-work" }): MeshEvent => ({
   id, sequence: 1, topic: "fleet.work", kind: "work", from: sender, text, data, createdAt: 123,
@@ -199,6 +199,8 @@ describe("incoming Fabric display projection", () => {
     expect(h.render(inbox([event("shadow-1", "duplicate")]))).toEqual([]);
     const mixed = inbox([event("shadow-1", "duplicate"), event("unseen", "new work", { key: "different" })]);
     expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
+    // Same sender and key on another topic is unrelated work (#852 security P1): shown.
+    expect(plain(h.render(inbox([{ ...event("other-topic", "other topic work"), topic: "fleet.alarm" }]))![0]!)).toContain("other topic work");
     const delivery = { ...message(), details: { id: "native-2", from: sender, data: { deliveryId: "D1", key: "same-work" } } };
     h.setBranch([entry(message()), entry(delivery)]);
     expect(h.render(inbox([event("d1", "duplicate D1", { deliveryId: "D1" })]))).toEqual([]);

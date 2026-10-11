@@ -111,14 +111,29 @@ const deliveryIdentity = (data: unknown): { kind: string; value: string } | unde
   if (typeof fields.messageId === "string" && fields.messageId) return { kind: "id", value: fields.messageId };
   return undefined;
 };
-const workReceipts = (fromId: string, data: unknown): string[] => {
+/**
+ * A work key or ref claims work within one topic only (review-fleet-2 security P1 on #852): a
+ * sender can reuse a key across topics, so a sender+key receipt let an unrelated event match an
+ * old receipt and be suppressed. The topic is part of the receipt. Receipts of the older
+ * topic-less kinds ("key", "ref") are never matched again: without a verifiable topic the event
+ * is injected, because a duplicate shadow is cheap and a lost event is not.
+ */
+const topicWorkReceipt = (fromId: string, kind: "key" | "ref", topic: string, value: string): string =>
+  receipt(fromId, `topic-${kind}`, JSON.stringify([topic, value]));
+/** The topic a native carrier names for its work (data.topic); without one its key/ref claims nothing. */
+const carrierTopic = (data: unknown): string | undefined => {
+  const topic = data && typeof data === "object" ? (data as { topic?: unknown }).topic : undefined;
+  return typeof topic === "string" && topic.trim() ? topic.trim() : undefined;
+};
+const workReceipts = (fromId: string, data: unknown, topic: string | undefined): string[] => {
   if (!data || typeof data !== "object") return [];
   const identity = deliveryIdentity(data);
   if (identity) return [receipt(fromId, identity.kind, identity.value)];
+  if (topic === undefined) return [];
   const fields = data as Record<string, unknown>;
   const key = workKey(data);
   const ref = typeof fields.ref === "string" && fields.ref.trim() ? fields.ref.trim() : undefined;
-  return key ? [receipt(fromId, "key", key)] : ref ? [receipt(fromId, "ref", ref)] : [];
+  return key ? [topicWorkReceipt(fromId, "key", topic, key)] : ref ? [topicWorkReceipt(fromId, "ref", topic, ref)] : [];
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
 /**
@@ -136,14 +151,14 @@ const eventReceipts = (event: MeshEvent): string[] => [
   // Host-only publication keys are mesh-wide, even when a different maintenance owner
   // retries. Carry the key into recipient-scoped confirmed session/inbox receipts too.
   ...(event.dedupeKey ? [receipt("", "dedupe", event.dedupeKey)] : []),
-  ...workReceipts(event.from.id, event.data),
+  ...workReceipts(event.from.id, event.data, event.topic),
 ];
 /** What the session's own entries say it holds. */
 export interface RootInboxSession {
   /** Inbox messages collectively holding all of these event ids. */
   holdsBatch(ids: readonly string[]): boolean;
-  /** An agent message (a steer or follow-up) from this sender that carried this work key. */
-  holdsSteer(fromId: string, key: string): boolean;
+  /** An agent message (a steer or follow-up) from this sender that carried this work key and topic. */
+  holdsSteer(fromId: string, key: string, topic: string): boolean;
   /** Confirmed native/inbox receipts from the whole history, not the recent-entry window. */
   delivered?: ReadonlySet<string>;
   /** Canonical session-entry times, so rescanning history cannot renew old receipts. */
@@ -339,10 +354,11 @@ export class RootInbox {
     const key = workKey(event.data);
     if (key === undefined) return false;
     // A shadow that carries its own messageId/deliveryId still matches a follow-up or steer that
-    // carried the same work key and no identity of its own: that carrier claimed the whole key.
-    // A carrier with a different identity is distinct work (its key receipt is never recorded).
-    if (deliveryIdentity(event.data)) return has(receipt(event.from.id, "key", key));
-    return session.holdsSteer(event.from.id, key);
+    // carried the same work key on the same topic and no identity of its own: that carrier claimed
+    // the key there. A carrier with a different identity is distinct work (its key receipt is never
+    // recorded), and a key receipt on another topic or with no topic never suppresses (see above).
+    if (deliveryIdentity(event.data)) return has(topicWorkReceipt(event.from.id, "key", event.topic, key));
+    return session.holdsSteer(event.from.id, key, event.topic);
   }
 
   #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>): boolean {
@@ -477,7 +493,7 @@ export const projectRootInboxReceipt = (value: unknown): unknown => {
     return {
       id: row.id, chain: row.chain, deliveryId: row.deliveryId,
       ...(from ? { from: { id: from.id } } : {}),
-      ...(data ? { data: { key: data.key, ref: data.ref, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
+      ...(data ? { data: { key: data.key, ref: data.ref, topic: data.topic, deliveryId: data.deliveryId, messageId: data.messageId } } : {}),
     };
   };
   const entry = object(value);
@@ -569,20 +585,22 @@ const inboxReceiptSession = (entries: Iterable<readonly [number, unknown]>, coun
     for (const item of carried) {
       const fromId = item?.from?.id;
       const key = workKey(item?.data);
+      const topic = carrierTopic(item?.data);
       if (typeof fromId !== "string") continue;
-      for (const id of workReceipts(fromId, item.data)) remember(id, at);
+      for (const id of workReceipts(fromId, item.data, topic)) remember(id, at);
       if (typeof item.id === "string") remember(receipt(fromId, "id", item.id), at);
       if (typeof item.deliveryId === "string") remember(receipt(fromId, "delivery", item.deliveryId), at);
-      if (key === undefined) continue;
+      // A carrier without a topic claims no work key: its shadow is injected (fail open).
+      if (key === undefined || topic === undefined) continue;
       const keys = steers.get(fromId) ?? new Set<string>();
-      keys.add(key);
+      keys.add(JSON.stringify([topic, key]));
       steers.set(fromId, keys);
     }
   }
   return {
     delivered, deliveredAt,
     holdsBatch: (ids) => hasBatch && ids.every((id) => batchIds.has(id)),
-    holdsSteer: (fromId, key) => steers.get(fromId)?.has(key) ?? false,
+    holdsSteer: (fromId, key, topic) => steers.get(fromId)?.has(JSON.stringify([topic, key])) ?? false,
   };
 };
 

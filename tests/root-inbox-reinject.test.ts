@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,7 @@ const roots: string[] = [];
 const me: MeshIdentity = { id: "session:ops-lead", name: "ops-lead", kind: "main" };
 const peer: MeshIdentity = { id: "session:dev-lead", name: "dev-lead", kind: "main" };
 const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => false };
+const TOPIC = "fleet.work.lanes";
 
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-reinject-"));
@@ -29,8 +31,8 @@ const setup = () => {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, me.id, true, root, "ops-lead");
-  const publish = (data: unknown, text = "shadow") =>
-    mesh.publish({ topic: "fleet.work.lanes", kind: "report", from: peer, to: me.id, text, data });
+  const publish = (data: unknown, text = "shadow", topic = TOPIC) =>
+    mesh.publish({ topic, kind: "report", from: peer, to: me.id, text, data });
   return { root, mesh, entries, box, main, publish, advance: (ms: number) => { now += ms; }, session: () => rootInboxSession(entries) };
 };
 afterEach(() => {
@@ -63,13 +65,13 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
     expect((await h.box().next(notHeld)).events.map(event => event.id)).toEqual([fresh.id]);
   });
 
-  it("suppresses a shadow carrying a messageId when the follow-up carried the same key without an identity", async () => {
+  it("suppresses a shadow carrying a messageId when the follow-up carried the same key and topic without an identity", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
-    h.main.deliverAgent({ from: peer, message: "already handled", delivery: "followUp", data: { key: "lane:7709" } });
+    h.main.deliverAgent({ from: peer, message: "already handled", delivery: "followUp", data: { key: "lane:7709", topic: TOPIC } });
     await h.publish({ key: "lane:7709", messageId: "sender-local-7709" }); h.advance(1);
     expect((await inbox.next(h.session())).events).toEqual([]);
     // A carrier with its own, different identity is distinct work and stays deliverable.
-    h.main.deliverAgent({ from: peer, message: "other", delivery: "followUp", data: { key: "lane:42", messageId: "A" } });
+    h.main.deliverAgent({ from: peer, message: "other", delivery: "followUp", data: { key: "lane:42", messageId: "A", topic: TOPIC } });
     const distinct = await h.publish({ key: "lane:42", messageId: "B" }); h.advance(1);
     expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([distinct.id]);
   });
@@ -95,11 +97,68 @@ describe("root inbox injects a batch once (R-token-waste)", () => {
         undelivered.push(await h.publish({ key: `work:${index}` }));
         continue;
       }
-      h.main.deliverAgent({ from: peer, message: `work ${index}`, delivery: "followUp", data: { key: `work:${index}` } });
+      h.main.deliverAgent({ from: peer, message: `work ${index}`, delivery: "followUp", data: { key: `work:${index}`, topic: TOPIC } });
       await h.publish({ key: `work:${index}`, messageId: `local:${index}` });
     }
     h.advance(1);
     expect((await inbox.next(h.session())).events.map(event => event.id)).toEqual(undelivered.map(event => event.id));
+  });
+
+  // review-fleet-2 security P1 on cdb29afd: a work-key receipt matched on sender + key only, so an
+  // unrelated event on another topic with a reused key was suppressed instead of reaching the lead.
+  it("scopes a consumed work key to its topic: same sender and key on another topic is still injected", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const first = await h.publish({ key: "lane:1" }, "first", "fleet.work.lanes"); h.advance(1);
+    const batch = await inbox.next(notHeld);
+    expect(batch.events.map(event => event.id)).toEqual([first.id]);
+    const { details } = rootInboxMessage(batch.events);
+    await inbox.consume(details.ids, details.receipts);
+    // Same sender, same key, another topic: unrelated work, injected.
+    const other = await h.publish({ key: "lane:1" }, "unrelated", "fleet.alarm.ci"); h.advance(1);
+    const second = await inbox.next(notHeld);
+    expect(second.events.map(event => event.id)).toEqual([other.id]);
+    const delivered = rootInboxMessage(second.events).details;
+    await inbox.consume(delivered.ids, delivered.receipts);
+    // Same sender, key and topic: a shadow copy of consumed work, suppressed.
+    await h.publish({ key: "lane:1" }, "copy", "fleet.work.lanes");
+    await h.publish({ key: "lane:1", messageId: "copy-with-id" }, "copy", "fleet.work.lanes"); h.advance(1);
+    expect((await h.box().next(notHeld)).events).toEqual([]);
+  });
+
+  it("keeps two events with the same sender and key on two topics in one batch", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const a = await h.publish({ key: "lane:2" }, "a", "fleet.work.lanes");
+    const b = await h.publish({ key: "lane:2" }, "b", "fleet.work.other");
+    await h.publish({ key: "lane:2" }, "a again", "fleet.work.lanes"); h.advance(1);
+    expect((await inbox.next(notHeld)).events.map(event => event.id)).toEqual([a.id, b.id]);
+  });
+
+  it("matches a follow-up's work key on the topic it names only, and fails open without a topic", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    h.main.deliverAgent({ from: peer, message: "handled", delivery: "followUp", data: { key: "lane:3", topic: "fleet.work.lanes" } });
+    await h.publish({ key: "lane:3" }, "copy", "fleet.work.lanes");
+    await h.publish({ key: "lane:3", messageId: "copy-3" }, "copy", "fleet.work.lanes");
+    const other = await h.publish({ key: "lane:3" }, "unrelated", "fleet.alarm.ci");
+    const otherWithId = await h.publish({ key: "lane:3", messageId: "unrelated-3" }, "unrelated", "fleet.alarm.ci"); h.advance(1);
+    const first = await inbox.next(h.session());
+    expect(first.events.map(event => event.id)).toEqual([other.id, otherWithId.id]);
+    const delivered = rootInboxMessage(first.events).details;
+    await inbox.consume(delivered.ids, delivered.receipts);
+    // A follow-up that names no topic has no verifiable topic: its key suppresses nothing.
+    h.main.deliverAgent({ from: peer, message: "no topic", delivery: "followUp", data: { key: "lane:4" } });
+    const plain = await h.publish({ key: "lane:4" }, "plain");
+    const withId = await h.publish({ key: "lane:4", messageId: "local-4" }, "with id"); h.advance(1);
+    expect((await h.box().next(h.session())).events.map(event => event.id)).toEqual([plain.id, withId.id]);
+  });
+
+  it("never suppresses with an older topic-less sender+key receipt", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const legacy = createHash("sha256").update(JSON.stringify([peer.id, "key", "lane:5"])).digest("hex");
+    const session: RootInboxSession = { ...notHeld, delivered: new Set([legacy]) };
+    await inbox.consume(["older-event"], [legacy]);
+    const plain = await h.publish({ key: "lane:5" });
+    const withId = await h.publish({ key: "lane:5", messageId: "local-5" }); h.advance(1);
+    expect((await inbox.next(session)).events.map(event => event.id)).toEqual([plain.id, withId.id]);
   });
 
   it("bounds one injection and summarizes the overflow in one line", async () => {

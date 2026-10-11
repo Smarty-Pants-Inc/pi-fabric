@@ -174,14 +174,23 @@ const sweep = async (meshRoot: string, options: {
   const residents = new Map<string, string>();
   const ambiguous = new Set<string>();
   const registries: string[] = [];
+  // Only a directory can hold a registry. A link (it could alias a registry directory) or a directory that is not ours
+  // is uncertain. An entry that vanished between the listing and its lstat (an atomic write's temp file) and a
+  // non-directory (a hard-linked or foreign file) cannot be a registry root, so they are not uncertainty
+  // (pi-fabric#850: the live dry run on 0d506b18 stopped every delete on one such entry). actors.json itself is
+  // checked by registryReferences, which refuses a link, a hard link or a foreign file.
   const discover = (root: string, depth = 0, found = registries): void => {
     if (absent(root)) return;
     if (depth > 4 || !ownedStat(root)?.isDirectory()) throw new Error(`Actor references are uncertain: ${root}`);
     if (!absent(path.join(root, "actors.json"))) found.push(root);
     for (const name of fs.readdirSync(root)) {
       if (["runs", "handoff-session", "child-completions"].includes(name)) continue;
-      const child = path.join(root, name); const stat = ownedStat(child);
-      if (!stat) throw new Error(`Actor references are uncertain: ${child}`);
+      const child = path.join(root, name);
+      const stat = fs.lstatSync(child, { throwIfNoEntry: false });
+      if (!stat) continue;
+      if (stat.isSymbolicLink() || (stat.isDirectory() && process.getuid && stat.uid !== process.getuid())) {
+        throw new Error(`Actor references are uncertain: ${child}`);
+      }
       if (stat.isDirectory()) discover(child, depth + 1, found);
     }
   };
@@ -227,9 +236,9 @@ const sweep = async (meshRoot: string, options: {
     const before = names();
     const found: string[] = [];
     try { discover(actorsRoot, 0, found); }
-    catch {
+    catch (error) {
       rootsChanged = true;
-      skipped.push({ path: actorsRoot, reason: "actor registry roots are uncertain; no further run is deleted" });
+      skipped.push({ path: actorsRoot, reason: `actor registry roots are uncertain (${(error as Error).message}); no further run is deleted` });
       return true;
     }
     registries.splice(0, registries.length, ...found);

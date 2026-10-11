@@ -339,6 +339,29 @@ describe("final pre-delete check fences", () => {
     expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
   });
 
+  // pi-fabric#850 round 2 (the live dry run on 0d506b18): a re-walk met an entry that vanished between the listing and
+  // its lstat, or a hard-linked file, and stopped every later delete. Neither can be a registry root.
+  it.each(["an entry that vanishes during the re-walk", "a hard-linked file"])("keeps collecting when a re-walk meets %s", async kind => {
+    const mesh = deadRootMesh();
+    const session = path.join(mesh.root, "actors", "01a118ab-new-session");
+    const injected = onStatusRead(mesh.old, () => {
+      write(path.join(session, "actors.json"), JSON.stringify({ actors: [] }));
+      if (kind === "a hard-linked file") { write(path.join(session, "note.json"), "{}"); fs.linkSync(path.join(session, "note.json"), path.join(session, "note-copy.json")); }
+    });
+    if (kind !== "a hard-linked file") {
+      const list = fs.readdirSync;
+      vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+        const names = (list as (...args: unknown[]) => unknown)(target, ...rest);
+        return target === session && Array.isArray(names) && names.every(name => typeof name === "string") ? [...names, "actors.json.4242.tmp"] : names;
+      }) as typeof fs.readdirSync);
+    }
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.skipped).toEqual([]);
+    expect(applied.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
+    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+  });
+
   it("stops every later delete when the registry tree becomes uncertain after discovery", async () => {
     const mesh = deadRootMesh();
     const elsewhere = tmp("fabric-linked-registry-");

@@ -10,6 +10,7 @@ import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
 const STREAM_NOT_FOUND = 10059;
+const TRANSIENT = new Set(["TimeoutError", "NoRespondersError", "ConnectionError", "RequestError", "ClosedConnectionError"]);
 const apiCode = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }
@@ -48,15 +49,19 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         return { seq: ack.seq, duplicate: ack.duplicate };
       } catch (error) {
         if (apiCode(error) === WRONG_LAST_SEQUENCE) throw new NatsWrongLastSequenceError(expectLastSequence, (error as Error).message);
+        // No answer (the ack may be lost): the backend retries with the same id. Anything else is final.
+        // (nats-core's error classes, by name: @nats-io/transport-node does not re-export them.)
+        if (error instanceof Error && TRANSIENT.has(error.name)) throw Object.assign(error, { transient: true });
         throw error;
       }
     },
-    consume: async (stream, afterSeq, onMessage: (message: NatsStreamMessage) => void) => {
+    consume: async (stream, afterSeq, onMessage: (message: NatsStreamMessage) => void, onError) => {
       const consumer = await js.consumers.get(stream, afterSeq === 0
         ? { deliver_policy: DeliverPolicy.All }
         : { deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: afterSeq + 1 });
       const messages = await consumer.consume();
-      void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })();
+      void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
+        .catch(error => onError?.(error));
       return { stop: async () => { await messages.close(); } };
     },
     close: async () => { await nc.drain(); },

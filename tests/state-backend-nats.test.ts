@@ -89,9 +89,28 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const server = fakeJetStream();
     const backend = await open(server, { lockTimeoutMs: 30 });
     // Every publish times out before the server stores anything.
-    server.beforePublish = () => { throw new Error("timeout: no responders"); };
+    server.beforePublish = () => { throw Object.assign(new Error("timeout: no responders"), { transient: true }); };
     await expect(backend.put({ key: "u/a", value: 1, identity })).rejects.toThrow(/OUTCOME_UNKNOWN/);
     expect(server.messages.length).toBe(0);
+  });
+
+  it("a final publish error (an oversized payload, a permission) is thrown at once, never retried", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    let publishes = 0;
+    server.beforePublish = () => { publishes++; throw new Error("MAX_PAYLOAD_EXCEEDED"); };
+    await expect(backend.put({ key: "m/a", value: 1, identity })).rejects.toThrow(/MAX_PAYLOAD_EXCEEDED/);
+    expect(publishes).toBe(1);
+  });
+
+  it("a broken projector delivery fails closed: reads and writes throw", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "x/a", value: 1, identity });
+    server.breakDelivery(new Error("consumer deleted"));
+    expect(() => backend.get("x/a")).toThrow(/consumer deleted/);
+    await expect(backend.put({ key: "x/b", value: 1, identity })).rejects.toThrow(/consumer deleted/);
+    expect(backend.diagnostics().nats?.failure).toMatch(/consumer deleted/);
   });
 
   it("CAS retry: another writer commits between prepare and publish; the batch runs again on the new state", async () => {

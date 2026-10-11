@@ -47,10 +47,14 @@ export interface JetStreamPort {
   ensureStream(stream: string, subject: string): Promise<{ lastSeq: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
-  /** Publishes with `expect.lastSequence` and `msgID`. A duplicate msgID returns the original sequence, `duplicate`. */
+  /**
+   * Publishes with `expect.lastSequence` and `msgID`. A wrong last sequence throws `NatsWrongLastSequenceError`; no
+   * answer (a timeout, no responders, a dropped connection: the ack may be lost) throws an error with `transient: true`;
+   * anything else (an oversized payload, a permission) is final.
+   */
   publish(subject: string, data: Uint8Array, options: { expectLastSequence: number; msgID: string }): Promise<{ seq: number; duplicate: boolean }>;
-  /** Delivers every message after `afterSeq`, in order, then each new one as it is stored. */
-  consume(stream: string, afterSeq: number, onMessage: (message: NatsStreamMessage) => void): Promise<{ stop(): Promise<void> }>;
+  /** Delivers every message after `afterSeq`, in order, then each new one as it is stored; a broken delivery calls `onError`. */
+  consume(stream: string, afterSeq: number, onMessage: (message: NatsStreamMessage) => void, onError?: (error: unknown) => void): Promise<{ stop(): Promise<void> }>;
   close(): Promise<void>;
 }
 
@@ -211,19 +215,22 @@ export class NatsStateBackend implements StateBackend {
     const backend = new NatsStateBackend(options);
     const { lastSeq } = await options.port.ensureStream(options.stream, options.subject);
     backend.#knownSeq = lastSeq;
-    backend.#consumer = await options.port.consume(options.stream, 0, message => backend.#apply(message));
+    backend.#consumer = await options.port.consume(options.stream, 0, message => backend.#apply(message), error => backend.#fail(error));
     await backend.#appliedThrough(lastSeq);
     return backend;
+  }
+
+  /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
+  #fail(error: unknown): void {
+    if (this.#failure !== undefined || this.#closed) return;
+    this.#failure = error instanceof Error ? error : new Error(String(error));
+    for (const waiter of this.#waiters.splice(0)) waiter.reject(this.#failure);
   }
 
   #apply(message: NatsStreamMessage): void {
     if (this.#failure !== undefined) return;
     try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES); }
-    catch (error) {
-      this.#failure = error;
-      for (const waiter of this.#waiters.splice(0)) waiter.reject(error);
-      return;
-    }
+    catch (error) { this.#fail(error); return; }
     this.#knownSeq = Math.max(this.#knownSeq, message.seq);
     const ready = this.#waiters.filter(waiter => waiter.seq <= this.#snapshot.seq);
     this.#waiters = this.#waiters.filter(waiter => waiter.seq > this.#snapshot.seq);
@@ -360,7 +367,7 @@ export class NatsStateBackend implements StateBackend {
     for (;;) {
       try { return (await this.#options.port.publish(this.#options.subject, data, { expectLastSequence: base, msgID })).seq; }
       catch (error) {
-        if (error instanceof NatsWrongLastSequenceError || this.#closed) throw error;
+        if (error instanceof NatsWrongLastSequenceError || this.#closed || (error as { transient?: unknown })?.transient !== true) throw error;
         if (performance.now() >= deadline) throw new MeshStateNatsOutcomeUnknownError(msgID, (error as Error).message);
       }
     }

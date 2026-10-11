@@ -16,6 +16,8 @@ export interface FakeJetStreamServer {
   /** Holds deliveries to consumers (a slow projector) until `resume`. */
   pause(): void;
   resume(): void;
+  /** Breaks every consumer's delivery (its onError). */
+  breakDelivery(error: Error): void;
 }
 
 export interface FakePort extends JetStreamPort { readonly calls: string[] }
@@ -24,6 +26,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
   const messages: NatsStreamMessage[] = [];
   const ids = new Map<string, number>();
   const listeners = new Set<(message: NatsStreamMessage) => void>();
+  const breakers = new Set<(error: Error) => void>();
   let paused: (() => void)[] | undefined;
   const later = (run: () => void) => { if (paused) paused.push(run); else setImmediate(run); };
   const store = (data: Uint8Array): number => {
@@ -37,6 +40,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
     append: store,
     pause: () => { paused ??= []; },
     resume: () => { const queued = paused ?? []; paused = undefined; for (const run of queued) setImmediate(run); },
+    breakDelivery: (error) => { for (const broken of breakers) broken(error); },
     port: () => {
       const calls: string[] = [];
       let open = true;
@@ -58,11 +62,12 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
           const seq = store(data);
           ids.set(msgID, seq);
-          if (verdict === "lose-ack") throw new Error("timeout: no ack");
+          if (verdict === "lose-ack") throw Object.assign(new Error("timeout: no ack"), { name: "TimeoutError", transient: true });
           return { seq, duplicate: false };
         },
-        consume: async (_stream, afterSeq, onMessage) => {
+        consume: async (_stream, afterSeq, onMessage, onError) => {
           calls.push("consume");
+          if (onError) breakers.add(onError);
           let delivered = afterSeq;
           const listener = (message: NatsStreamMessage) => { if (message.seq === delivered + 1) { delivered = message.seq; onMessage(message); } };
           for (const message of messages.slice(afterSeq)) later(() => listener(message));

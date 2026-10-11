@@ -13,6 +13,7 @@ Upstream merge 114f5e55, 103 conflicted files: **98 fresh, 5 replayed (#541), 25
 - The two later merges of current main add 4 conflicts, all fresh: 3 in 30aa4e91 and 1 in 5f32bbac. Two of them (`src/agents/request.ts`, `src/index.ts`) also conflicted in #541. Counting those 4 rows, the table has 107 rows: 102 fresh, 5 replayed, 27 fresh overlapping #541.
 - The merge of main f2814332 adds 12 more conflicts, all fresh, in their own section ("Merge of current main (f2814332)") at the end.
 - The merge of main f8a03c8e adds 3 more conflicts, all fresh, in their own section ("Merge of current main (f8a03c8e)") after it.
+- The merge of main 048e031e adds 3 more conflicts, all fresh, in their own section ("Merge of current main (048e031e)") after that.
 - Fork-lead reviews the fresh rows independently. The replayed rows repeat #541's resolution of the same conflict.
 
 Difference from the 98/5/30 quoted in the part 2 summary: 98 and 5 match. That summary's 30 was the 25 fresh rows that also conflicted in #541's merges plus 5 test files (`tests/agents-provider-services.test.ts`, `tests/agents-provider.test.ts`, `tests/node-process-runtime.test.ts`, `tests/process-transport.test.ts`, `tests/verified-providers.test.ts`). #541's merge commits edited those 5 without a conflict. By that wider measure (the #541 merge result differs from both of its parents, `git show --cc`), 26 fresh rows qualify, not 5. So this table counts conflicts only and names the edit-only merges in the overlap column. Counted with the 5 replayed rows, which all conflicted in #541 too, the overlap is 30 rows.
@@ -415,6 +416,30 @@ Evidence (logs in the qs32729 task's artifacts, outside the repo):
 - `bun run build`: "44 startup files, 1112563 startup bytes, 69 stable lazy entries, 145 chunks", within the budget (`c-build.log`).
 - Tests for the conflicted areas, `--maxWorkers=12` (21 files: `actor-manager`, `actor-manager-startup`, `actor-transient-block-e2e`, `actor-transient-block-resident-e2e`, `main-provider-dead`, `main-provider-dead-real-pi`, `main-provider-recovery`, `provider-error-class`, `stall-alarms`, `stall-alarms-resume`, `stall-alarms-real-pi`, `control-plane`, `control-plane-incarnation`, `config`, `runner-default-docs`, `process-placement-startup`, plus main's auto-merged `mesh-bridge-handoff`, `mesh-state-sqlite-checkpoint-timing`, `mesh-state-sqlite-slow-fsync`, `residency`, `agents-provider`): 19 files passed, 2 skipped (the opt-in real-Pi files); 1316 tests passed, 4 skipped, 0 failed (`c-vitest.log`, `.json`).
 - Opt-in real-Pi E2E for #841 through the ported `src/extension.ts` line (`FABRIC_8742_REAL_PI=1`, `main-provider-dead-real-pi`): 3 of 3 passed (`c-real-pi-8742.log`). `stall-alarms-real-pi` needs an installed-Pi evidence setup and was not run.
+
+### Merge of current main (048e031e)
+
+Parents 085e829c (this branch: 203ebd37 plus the PR #864 P1 liveness fix) and 048e031e (`refs/remotes/origin/main-now`). Main since f8a03c8e: #878 (actor registry reads skip the open when unchanged), #879 (pinned zig for the native helpers), #863 (each root inbox event reaches the model once, acked by id), #829 (opaque launchers replay the profile's explicit extensions), #853 (context overflow is typed and retried). `git merge` (rerere off) reported **3 conflicted files, 3 hunks**, all **fresh**. In two hunks both sides built the same thing; main's form is kept and nothing is dropped.
+
+| File | Method | Overlap | Resolution |
+|---|---|---|---|
+| `scripts/assert-build-artifacts.mjs` | fresh | conflicted in upstream merge 114f5e55 | forbidden eager-module list: union. Ours' 27 markers (upstream 0.110.1's `src/core/file-lock.ts`, native discovery, extractive memory, entropy compiler and trial, image overlays, kitty viewport) plus main's two new ones, `src/topology/root-inbox.ts` and `src/topology/root-inbox-context.ts` (#863): 29 markers, none dropped. Main's pinned-zig manifest check (#879) and its `worker/profile-extensions.js` lazy entry (#829) auto-merged |
+| `src/index.ts` | fresh | conflicted in 114f5e55 (replayed #541), in the 5f32bbac merge and in the f8a03c8e merge 93929fe6 | kept our thin entry, byte-identical to 085e829c (upstream 0.110.1 moved the extension body to `src/extension.ts`). Ported main's only `src/index.ts` change since f8a03c8e (#863) into `src/extension.ts`: the root inbox imports come from `root-inbox-shared.js` (with `ROOT_INBOX_CUSTOM_TYPE`); the context projection became `projectContext`, with main's lazily loaded `root-inbox-context.js` filter between the prewalk planning filter and skill-marker expansion; the `context` handler loads the filter at the first request that holds an inbox message, then projects once. Our `projectContext` stays async, because it keeps ours' first-use orphan repair (`compaction.repairOrphans`) |
+| `src/worker.ts` | fresh | conflicted in 114f5e55 | both sides restricted the opaque-launcher `--no-extensions` fence to the `pi` runner with the same predicate. Kept main's `opaqueFabricLauncher` constant, which #829's profile-extension replay reads below it, plus ours' note that `pi-durable` keeps native discovery. #853's overflow typing and retry auto-merged |
+
+No line is lost. For each conflicted file, both parents were diffed against the merge (for `src/index.ts`, the merged `src/index.ts` plus `src/extension.ts`):
+
+- Every line that either side added since the base f8a03c8e is in the merge, except the 3 resolution lines named above: the old forbidden-list line on each side (merged into one; its entries were checked one by one, 0 missing), ours' `--no-extensions` line (same predicate as main's `opaqueFabricLauncher`), and main's synchronous `projectContext` signature (async here). `scripts/assert-build-artifacts.mjs`: 53 ours and 11 main lines; `src/worker.ts`: 147 and 94; `src/index.ts`: 3 and 32.
+- Every other parent line absent from the merge is a line that the other side changed since the base. Unexplained: 0.
+- `src/mesh/bridge-handoff.ts` and `src/fabric-runtime-state.ts` import `root-inbox.js` exactly as on main, and `src/mesh/bridge.ts`, `stall-alarms.ts`, `fabric-state.ts` and `root-inbox-delivery.ts` import `root-inbox-shared.js` as on main, so `root-inbox.ts` stays out of the startup graph.
+
+Evidence (logs in the qs32729 task's artifacts, outside the repo):
+
+- `bun install --frozen-lockfile`: lockfile unchanged; it installed main's new `@types/semver` into `node_modules`.
+- `bun run typecheck`: 0 errors (`merge-typecheck.log`).
+- `bun run build`: "44 startup files, 1100252 startup bytes, 70 stable lazy entries, 146 chunks", within the budget of 45 files and 1150 KiB (`merge-build.log`). `bun run assert:lazy-graph`: host-package-free (46 files checked).
+- Tests for the conflicted files, `--maxWorkers=12` (25 files: `build-artifacts`, `native-toolchain`, `root-inbox*` including main's `root-inbox-ack`, `index-root-inbox`, `session-entry-retention`, `wake-causes`, `main-agent-startup`, `worker-profile-extensions`, `actor-context-overflow`, `worker-release-loader`, `worker-resident-startup`, `worker-activation-window`, `worker-e2e`, `worker-retry-profile`, `durable-worker-host`, `worker-context-admission`, `worker-startup`, plus main's auto-merged `actor-registry-open-churn`, `actor-registry-cache` and `actor-manager`): 25 files passed; 786 tests passed, 67 skipped, 0 failed (`merge-conflict-tests.log`).
+- Liveness, lock, retention, scratch and resident-host suites (`tests/liveness*`, `tests/*lock*`, `tests/retention*`, `tests/scratch*`, `tests/residency-host*`; 27 files): 475 passed, 3 skipped, 0 failed (`merge-fix-suites.log`).
 
 ## Independent per-row review receipts (non-test rows)
 

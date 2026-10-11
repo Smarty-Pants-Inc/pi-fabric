@@ -105,6 +105,23 @@ function failClosed(error: unknown): never {
   }
 }
 
+// smarty-dev#3238 round 2: the worker types this refusal as CONTEXT_OVERFLOW from this frame,
+// bound to its run, nonce and hook like the readiness ACK, never from the stderr text below.
+function reportWindowRefusal(tokens: number, contextWindow: number): void {
+  try {
+    fs.writeSync(1, `${JSON.stringify({
+      type: "fabric_activation_window_refusal",
+      runId: process.env.PI_FABRIC_PARENT_RUN,
+      nonce: process.env.PI_FABRIC_ACTIVATION_NONCE,
+      protocol: 1,
+      hook: fs.realpathSync(fileURLToPath(import.meta.url)),
+      code: "context-overflow",
+      tokens,
+      contextWindow,
+    })}\n`);
+  } catch { /* the fail-closed exit below still stops the run, untyped */ }
+}
+
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
 export default async function activationWindow(pi: ExtensionAPI): Promise<void> {
   let window: ActivationWindow | undefined;
@@ -287,6 +304,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             }
             const tokens = estimateTextTokens(encoded);
             if (tokens > model.contextWindow) {
+              reportWindowRefusal(tokens, model.contextWindow);
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
             const conversationTokens = estimateTextTokens(JSON.stringify(context.messages.filter(message => message.role !== "system")));

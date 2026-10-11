@@ -390,6 +390,46 @@ Existing workers are not retroactively changed by rebuilding or reloading the pa
 
 Pi workers with extensions enabled also inherit the parent session's `pi-multiprovider` `/switch-account` pin, when that extension is installed. Fabric forwards the pin as `PI_MULTIPROVIDER_SESSION_PINS`; the child rebinds it to its own session id. This is host state, not a model argument. Claude and Veda runners, and `extensions: false` children, do not receive it. A resolved request or parent-session account pin keeps one-shot placed tasks local with audit reason `inherited account pins require the local worker`, so the existing pin forwarding/rebinding contract is not silently dropped.
 
+### Profile guards through custom Pi launchers
+
+Native `cli.js` launchers keep Pi's resource discovery and trust behavior. When a
+custom or shell launcher has no discoverable native SDK, Fabric still passes
+`--no-extensions` to prevent automatic discovery of another Fabric generation.
+For extension-enabled runs it also passes explicit `-e` paths for the selected
+personal profile's non-Fabric extensions and installed package extensions.
+The profile is `PI_CODING_AGENT_DIR`, or `~/.pi/agent`; relative settings paths
+resolve from that profile directory. Fabric does not install missing packages or
+replay project resources, and its pinned Fabric extension loads separately. An
+installed npm package whose version does not satisfy the configured spec is
+skipped with a warning, because Pi would otherwise reinstall it.
+Explicitly disabled extensions and resident startup probes do not replay profile
+hooks.
+
+Include and exclude filters match each extension's path as listed, or as reached
+through a selected directory, exactly as Pi matches them, even when that
+directory is a symlink. Exclusions also match the symlink target's path, so an
+exclusion written against the target holds too. Each file is then passed once:
+as in Pi, its highest-ranked entry decides whether it loads, and an excluded
+entry is not overridden by a lower-ranked entry for the same file. Top-level
+settings outrank packages, and a top-level exclusion also wins when a package
+lists the identical path (Pi would keep the package entry there). A top-level
+inclusion of that identical path does not re-enable a package's exclusion,
+matching Pi.
+
+The worker log's `fabric_profile_extensions` event records extension basenames,
+`loadedCount` (paths supplied to Pi), and `skippedCount`. Missing or invalid
+entries are skipped independently with one counted `worker_warning` per entry;
+these warnings also appear in the run receipt. Pi remains responsible for loading
+the supplied extension modules.
+
+The replay fails closed. If the profile's `settings.json` exists but cannot be
+read or is not a JSON object, Fabric refuses to launch the task: the run fails
+before the launcher starts, with an error naming the settings file and the
+reason (never its contents), and the worker log records a
+`fabric_profile_extensions_refused` event. A missing `settings.json` means no
+profile configuration, so there is nothing to replay and the task launches.
+Native `cli.js` launchers are unaffected.
+
 ### Choose the child's language
 
 `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` accept `kernel: "typescript" | "python" | "inherit"`. Omit it or use `"inherit"` to inherit the caller's `executor.kernel`; use a concrete value so a skill or model can choose its strongest language for the task. Workflow agents, `rlm.query`, and council members/synthesis forward the same option. This selects the **child's** Fabric language, not the language of the current `fabric_exec` program; that program still uses its configured kernel.
@@ -478,7 +518,7 @@ return { audit, supervisor };
 
 A Main session's actors keep a mesh cursor in the session's actor directory. After `/reload` or a restart of that session, they receive the topic events that were published while no runtime was reading them. A longer downtime replays only its last 10 minutes, and a new session starts at the current end of the log.
 
-A local Main with `mesh.enabled` has a work inbox (smarty-dev#754): `fleet.*` events whose `to` is its session id or name, and that no steer or follow-up delivered. Main receives them as one `<fabric-inbox>` message at turn start and when a completed run settles. An event younger than 60 s waits, so its steer arrives first. Confirmed steer/follow-up and consumed inbox receipts are indexed from the whole session history and cached per recipient across reloads. Delivery IDs take precedence over message IDs, then work keys, then ref-only fallback: distinct deliveries sharing a ref or key are not collapsed. The persisted cache is age-pruned at the inbox horizon and capped at 1,024 hashes, evicting oldest receipts first; its serialized cursor, receipts, timestamps and pending metadata target at most 75% of `mesh.maxEventBytes`. Canonical session history still suppresses receipts evicted by the capacity cap; the cache is not an unbounded lifetime ledger after history deletion. Cursor/pending recovery is independent of receipt eviction. Queued native messages are not receipts. Addressed shadows older than 2 h are expired on the first drain, including saved pending batches, and counted in one passive `pi-fabric-inbox-summary` line without starting a model turn. `PI_FABRIC_INBOX_HORIZON_MS` configures the horizon in positive milliseconds; blank, invalid, zero or negative values use the 2 h default. Expiry changes only injection: the events remain available through `mesh.read`. On a Pi that queues a triggered message behind a live prompt preflight and reports that preflight with `ctx.isPromptPending()` (it sets `pi.hostCapabilities.triggeredMessageQueuesBehindPreflight`, Smarty-Pants-Inc/pi#74, and `promptPendingVisible`, Smarty-Pants-Inc/pi#76), an idle Main also reads the inbox every 15 s (`PI_FABRIC_INBOX_WAKE_MS`) and starts a turn for it (smarty-dev#1595): an event published to an idle Main starts a turn about 60–75 s later. Because each wake is a model turn, an idle Main wakes at most once per 5 minutes (`PI_FABRIC_INBOX_WAKE_COOLDOWN_MS`); an event of kind `p0` or `steer` wakes it at once. Each idle wake publishes one `fabric.inbox.wake` event (kind `idle-wake`, data `{count, reason, ids}`), so wakes can be counted from the mesh log. After a run that the user cancelled or that failed, the idle wake stays off until the next turn starts. While a prompt is in its preflight, the timer sends nothing: that prompt's turn start takes the batch. On an older Pi the idle wake is off: a wake could start a run while a prompt is still in its preflight, and that prompt would fail.
+A local Main with `mesh.enabled` has a work inbox (smarty-dev#754): `fleet.*` events whose `to` is its session id or name, and that no steer or follow-up delivered. Main receives them as one `<fabric-inbox>` message at turn start and when a completed run settles. An event younger than 60 s waits, so its steer arrives first. Confirmed steer/follow-up and consumed inbox receipts are indexed from the whole session history and cached per recipient across reloads. Delivery IDs take precedence over message IDs, then work keys, then ref-only fallback: distinct deliveries sharing a ref or key are not collapsed. The persisted cache is age-pruned at the inbox horizon and capped at 1,024 hashes, evicting oldest receipts first; its serialized cursor, receipts, timestamps and pending metadata target at most 75% of `mesh.maxEventBytes`. Canonical session history still suppresses receipts evicted by the capacity cap; the cache is not an unbounded lifetime ledger after history deletion. Cursor/pending recovery is independent of receipt eviction. Queued native messages are not receipts. An inbox message that enters a turn acknowledges its event IDs in the cursor state (smarty-dev#8962): they are never injected again, whether or not the session file confirms the message, and a fully acknowledged batch moves the cursor at once. A high-water sequence that is never lowered (a save merges the stored one) and up to 256 out-of-order acknowledged IDs stop a reload, a re-scan from an older cursor or a stale writer from injecting them again. The model also sees each inbox event once: the request-time `context` hook keeps the first copy of an event ID and cuts every later copy from the request, including copies Pi queued before the acknowledgement. A mixed batch keeps its new events. An acknowledged event whose first copy compaction summarized away is cut from every copy. The session file keeps every message. Addressed shadows older than 2 h are expired on the first drain, including saved pending batches and pending events the live log no longer returns, and counted in one passive `pi-fabric-inbox-summary` line without starting a model turn. `PI_FABRIC_INBOX_HORIZON_MS` configures the horizon in positive milliseconds; blank, invalid, zero or negative values use the 2 h default. Expiry changes only injection: the events remain available through `mesh.read`. On a Pi that queues a triggered message behind a live prompt preflight and reports that preflight with `ctx.isPromptPending()` (it sets `pi.hostCapabilities.triggeredMessageQueuesBehindPreflight`, Smarty-Pants-Inc/pi#74, and `promptPendingVisible`, Smarty-Pants-Inc/pi#76), an idle Main also reads the inbox every 15 s (`PI_FABRIC_INBOX_WAKE_MS`) and starts a turn for it (smarty-dev#1595): an event published to an idle Main starts a turn about 60–75 s later. Because each wake is a model turn, an idle Main wakes at most once per 5 minutes (`PI_FABRIC_INBOX_WAKE_COOLDOWN_MS`); an event of kind `p0` or `steer` wakes it at once. Each idle wake publishes one `fabric.inbox.wake` event (kind `idle-wake`, data `{count, reason, ids}`), so wakes can be counted from the mesh log. After a run that the user cancelled or that failed, the idle wake stays off until the next turn starts. While a prompt is in its preflight, the timer sends nothing: that prompt's turn start takes the batch. On an older Pi the idle wake is off: a wake could start a run while a prompt is still in its preflight, and that prompt would fail.
 
 The first durable request starts one hidden resident host for the current root when needed. Every durable actor create/import and one-shot spawn uses its authoritative fenced request path, including the first actor in an empty registry. It publishes the owner in the standard participant directory. Fabric routes `steer`, `followUp`, `tell`, blocking `ask`, and `stop` through the acknowledged mesh control plane. The process uses the captured agent, mesh, timeout, recursion, and cost-ceiling configuration. It also uses the runner, model, and tool capabilities that the originating call explicitly authorized. Users do not configure a daemon profile or workflow policy.
 

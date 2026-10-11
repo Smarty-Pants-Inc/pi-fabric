@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -360,6 +360,10 @@ export class FabricState {
   /** Mark injected inbox events consumed, so no later turn injects them again (R-token-waste). */
   async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
     await this.#current()?.consumeRootInbox(ids, receipts);
+  }
+  /** Whether the root inbox acked this event (smarty-dev#8962): the context hook shows it once. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#current()?.rootInboxAcked(id, sequence) ?? false;
   }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {

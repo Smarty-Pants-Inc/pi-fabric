@@ -401,13 +401,19 @@ export class FabricRuntimeState {
     return batch;
   }
 
-  /** Record inbox events that entered a turn as consumed (R-token-waste); never injected again. */
+  /**
+   * Record inbox events that entered a turn as consumed (R-token-waste); never injected again.
+   * An ack is one-shot (smarty-dev#8962): never behind the polling gate, which skips a call while
+   * a read is in flight or backing off. The inbox acks in memory at once and queues the write.
+   */
   async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
     if (!ids.length || !this.#meshActivationReady()) return;
-    await this.#inboxRetry.run(async () => {
-      if (!this.#meshActivationReady()) return;
-      await this.#rootInbox?.consume(ids, receipts);
-    });
+    await this.#rootInbox?.consume(ids, receipts);
+  }
+
+  /** Whether the root inbox acked this event (smarty-dev#8962); synchronous, for the context hook. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#rootInbox?.acked(id, sequence) ?? false;
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */

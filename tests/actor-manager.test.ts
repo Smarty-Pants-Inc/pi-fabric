@@ -3758,9 +3758,10 @@ describe("ActorManager", () => {
   it.each([
     ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.\nFabric activation window failed: Error: Activation window lost current activation messages",
       "activation-window-lost", "Fabric activation window failed: Error: Activation window lost current activation messages"],
-    ["Error: earlier failure\nError: Context exceeds window: 100 > 80", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    // smarty-dev#3238 round 2: error text alone never classifies a context overflow (typed CONTEXT_OVERFLOW only).
+    ["Error: earlier failure\nError: Context exceeds window: 100 > 80", "unknown", "Error: Context exceeds window: 100 > 80"],
     ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior\r\nError: Activation window lost current activation messages\r\n    at activate (C:\\Users\\fleet bot\\Error\\worker.js:42:7)\r\n", "activation-window-lost", "Error: Activation window lost current activation messages"],
-    ["Error: Context exceeds window: 100 > 80\n    at activate (/home/fleet/Error/worker.js:42:7)", "context-overflow", "Error: Context exceeds window: 100 > 80"],
+    ["Error: Context exceeds window: 100 > 80\n    at activate (/home/fleet/Error/worker.js:42:7)", "unknown", "Error: Context exceeds window: 100 > 80"],
     ["Child Pi exited before requested model admission completed; task was not sent", "child-exit-before-admission", "Child Pi exited before requested model admission completed; task was not sent"],
     ["Error: Activation window lost current activation messages\nError: unrelated terminal failure\nWarning: turnProvenance is unavailable", "unknown", "Error: unrelated terminal failure"],
     ["[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; legacy behavior", "unknown", "Unknown activation failure"],
@@ -4079,7 +4080,13 @@ describe("ActorManager", () => {
       const time = clock();
       const actor = await s.actors.create({ name: "overflowed", instructions: "Respond.", responseMode: "text" });
       const wakes = captureWakes();
-      await failOnce(s.actors, s.agents, actor.id, "Error: Context exceeds window: 100 > 80");
+      // smarty-dev#3238 round 2 (#853): only the run's typed CONTEXT_OVERFLOW code is an overflow;
+      // error text that quotes "Context exceeds window" is classified "unknown" (still never expires).
+      const overflow = "Error: Context exceeds window: 100 > 80";
+      vi.spyOn(s.agents, "run").mockResolvedValueOnce({ id: "overflow-run", status: "failed", error: overflow,
+        errorCode: "CONTEXT_OVERFLOW", toolCalls: 0 } as unknown as Awaited<ReturnType<AgentManager["run"]>>);
+      await expect(s.actors.ask(actor.id, "activate")).rejects.toThrow(overflow);
+      await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
       const blocked = s.actors.status(actor.id).activationBlocked!;
       expect(blocked).toMatchObject({ code: "context-overflow", count: 1 });
       expect(blocked).not.toHaveProperty("retryAt");

@@ -2,7 +2,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
@@ -11,6 +11,8 @@ import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
+  ContextEvent,
+  ContextEventResult,
   ExtensionAPI,
   ExtensionContext,
   MessageUpdateEvent,
@@ -1359,7 +1361,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     await extractiveHistory.prepare(context, event.prompt);
   });
 
-  pi.on("context", async (event, context) => {
+  // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
+  // an inbox message, not at startup; without one it has nothing to cut. Once loaded it runs on
+  // every request, synchronously.
+  let inboxContext: typeof import("./topology/root-inbox-context.js") | undefined;
+  const projectContext = async (event: ContextEvent, context: ExtensionContext): Promise<ContextEventResult | undefined> => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
       ? state.prewalk.pendingContinuationMessage(sessionId)
@@ -1377,8 +1383,21 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       state.initialized && state.prewalk.isArmed(sessionId),
       state.initialized && state.prewalk.planRequired(sessionId),
     );
-    let changed = continuation.changed || planning.changed;
-    const messages = planning.messages.map((message) => {
+    // Each root inbox event reaches the model once (smarty-dev#8962), including copies Pi queued
+    // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
+    const filter = inboxContext;
+    const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
+      acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
+      compactedCopies: () => {
+        try {
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+        } catch {
+          return new Map();
+        }
+      },
+    }) : { messages: planning.messages, changed: false };
+    let changed = continuation.changed || planning.changed || inbox.changed;
+    const messages = inbox.messages.map((message) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
         const content = expandSkillDirMarkersInSkillBlock(message.content);
@@ -1404,6 +1423,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const repaired = repairToolResultPairing(messages);
     if (repaired.messages !== messages) return { messages: repaired.messages };
     return changed ? { messages } : undefined;
+  };
+  pi.on("context", (event, context) => {
+    // Nothing is projected before the load, so the request is projected once, after it.
+    if (inboxContext || !event.messages.some((message) => (message as { customType?: unknown }).customType === ROOT_INBOX_CUSTOM_TYPE)) {
+      return projectContext(event, context);
+    }
+    return import("./topology/root-inbox-context.js").then((module) => {
+      inboxContext = module;
+      return projectContext(event, context);
+    });
   });
 
   pi.on("context", (event, context) => {

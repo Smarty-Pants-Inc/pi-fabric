@@ -1416,7 +1416,9 @@ export class QuickJsRuntime {
       if (abortHandler) options.signal?.removeEventListener("abort", abortHandler);
       const unawaitedHostCalls = pendingHostPromises.size > 0;
       if (hostTasks.size > 0) {
-        abortHostCalls("Fabric guest execution ended before its host calls settled");
+        // Ours: a delivered reply's task may still be finishing its chain; let host tasks
+        // settle within the grace before aborting (an early abort fabricates resident
+        // outcome uncertainty for replies the guest already received).
         const settled = await settleWithin(hostTasks, HOST_TASK_SETTLE_GRACE_MS);
         if (!settled) {
           abortHostCalls("Fabric guest execution ended before its host calls settled");

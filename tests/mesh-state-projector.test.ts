@@ -593,3 +593,21 @@ describe("state projector (sqlite, after cutover)", () => {
     expect(leaseOf()).toBe(lease);
   });
 });
+
+// smarty-dev#7548: the projector's own connection goes through the one gate (state-gate.ts), like its store's:
+// a state.db replaced between the store's checks and that open is refused, never opened by path.
+describe.skipIf(process.platform !== "linux")("the projector connection's gate (smarty-dev#7548)", () => {
+  it("refuses a state.db swapped in before the projector's own open", async () => {
+    const root = tempRoot("gate-swap");
+    let opens = 0;
+    const open = (file: string) => {
+      if (++opens === 2) { // the projector connection, after the store's
+        fs.copyFileSync(file, `${file}.swap`);
+        fs.renameSync(`${file}.swap`, file); // another inode at the same name
+      }
+      return openNodeSqlite(file);
+    };
+    await expect(openProjector(root, { open })).rejects.toThrow(/opened a different file than the one checked/);
+    expect(opens).toBe(2);
+  });
+});

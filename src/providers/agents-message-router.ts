@@ -1,3 +1,4 @@
+import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { terminalRejectionFields } from "../agents/terminal-target.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
@@ -6,7 +7,7 @@ import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
-import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import { controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
@@ -334,11 +335,13 @@ export class AgentMessageRouter {
       from?: MeshIdentity;
       wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    assertSteerPriority(options.priority, kind);
     // Resolve the child's bound target before recovery so retries retain the same
     // actor ownership/fence checks rather than trying to recover the alias itself.
     if (id === "spawner") {
@@ -454,6 +457,7 @@ export class AgentMessageRouter {
       from?: MeshIdentity;
       wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
@@ -499,6 +503,7 @@ export class AgentMessageRouter {
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
+          ...(options.priority ? { priority: options.priority } : {}),
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
             : {}),
@@ -520,6 +525,7 @@ export class AgentMessageRouter {
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       if (!this.control || participant.controlProtocol === "legacy") {
+        if (options.priority) throw new Error("interrupt priority requires the Fabric Main control protocol");
         return context?.signal || options.principal
           ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
           : this.actorManager.steerRemote(participant.id, message, kind, data);
@@ -533,6 +539,7 @@ export class AgentMessageRouter {
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           data,
+          ...(options.priority ? { priority: options.priority } : {}),
           // Carry the local Main default across runtime generations (#3015).
           ...(kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
@@ -549,6 +556,8 @@ export class AgentMessageRouter {
         },
       );
     }
+
+    if (options.priority) throw new Error("interrupt priority is supported only for a Main target");
 
     // Explicit Main addresses never reach task/actor resolution, even when absent.
     if (id.trim().startsWith("session:")) {
@@ -682,6 +691,12 @@ export class AgentMessageRouter {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    try {
+      assertSteerPriority(command.priority, command.operation);
+      if (command.priority && !(this.mainAgent.local && this.mainAgent.matches(command.targetId))) {
+        throw new Error("interrupt priority is supported only for a Main target");
+      }
+    } catch (error) { return { accepted: false, error: error instanceof Error ? error.message : String(error) }; }
     if (command.operation === "setModel" || command.operation === "setThinking") {
       return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
     }
@@ -756,6 +771,7 @@ export class AgentMessageRouter {
         principal: provenance?.principal,
         message,
         delivery: command.operation,
+        ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
@@ -763,8 +779,10 @@ export class AgentMessageRouter {
         ...(command.data === undefined ? {} : { data: command.data }),
         }));
       } catch (error) {
-        // A full followUp queue, for example: the sender sees why.
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+        // Admission refusals retain their typed code across verified mesh/bridge ACKs.
+        const errorCode = interruptErrorCode(error);
+        return { accepted: false, error: error instanceof Error ? error.message : String(error),
+          ...(errorCode ? { errorCode, notRun: true } : {}) };
       }
       return {
         accepted: true,

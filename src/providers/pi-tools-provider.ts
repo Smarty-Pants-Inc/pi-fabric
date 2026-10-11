@@ -21,6 +21,7 @@ import { runAbortable, throwIfAborted } from "../async-settlement.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
 import type { LandlockBashConfinement, LandlockSettings } from "../core/landlock.js";
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
@@ -34,6 +35,7 @@ import {
   formatShellHangNotice,
   raceShellHang,
   trackShellOperations,
+  shellTrackingPrefix,
 } from "../core/shell-jobs.js";
 import { parseShellMonitor, shellMonitorSchema } from "../core/shell-monitor.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
@@ -503,24 +505,26 @@ export class PiToolsProvider implements FabricProvider {
       if (job.durable && this.#landlockEnabled()) {
         throw new Error("Landlock enforce refuses durable shell tasks: jev-fabric would run them outside the confinement");
       }
-      let local = job.durable
+      const nativeLocal = createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+      // Reserved Landlock controls never reach an unconfined child (main #738).
+      let local: typeof nativeLocal = job.durable
         ? await this.#shellJobs.durable!.launch(job, {
             shellPath: options?.shellPath, label: job.options.description, filtered: middleware !== undefined,
             command: typeof args.command === "string" ? args.command : "", cwd, ownerId: job.options.ownerId,
             notify,
           })
-        : createLocalBashOperations(options?.shellPath !== undefined ? { shellPath: options.shellPath } : undefined);
+        : { exec: (command, launchCwd, launchOptions) =>
+            nativeLocal.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) };
       if (this.#landlockEnabled()) {
-        const { LandlockBashConfinement, groupOperations, landlockCommand } = await import("../core/landlock.js");
+        const { LandlockBashConfinement, groupOperations } = await import("../core/landlock.js");
         this.#landlock ??= new LandlockBashConfinement(this.#cwd);
         const originalCommand = String(args.command ?? "");
-        const { escape, command } = landlockCommand(originalCommand);
-        args.command = command;
         // S2: each command leads its own process group; the host keeps its kernel id.
         const shell = getShellConfig(options?.shellPath);
         local = this.#landlock.operations(
           groupOperations(this.#landlock.helperPath, ["-c"]), groupOperations(shell.shell, shell.args),
-          shell.shell, path.dirname(job.pidPath), escape, originalCommand,
+          shell.shell, path.dirname(job.pidPath), () => this.#getLandlockSettings?.(), originalCommand,
+          [shellTrackingPrefix(job.pidPath, "bash"), ...(options?.commandPrefix ? [`${options.commandPrefix}\n`] : [])],
         );
         // S2: temp custody starts before middleware may delay the inner launch.
         holds.push(this.#landlock.hold());
@@ -540,8 +544,10 @@ export class PiToolsProvider implements FabricProvider {
       if (job.options.monitor) throw new Error("PowerShell monitors require host shell operations support");
       return this.#definitionFor(name, args);
     }
+    const nativeOperations = operationsFactory();
     return create(cwd, {
-      operations: trackShellOperations(operationsFactory(), job, "powershell"),
+      operations: trackShellOperations({ exec: (command, launchCwd, launchOptions) =>
+        nativeOperations.exec(command, launchCwd, { ...launchOptions, env: childProcessEnvironment(launchOptions.env) }) }, job, "powershell"),
     });
   }
 

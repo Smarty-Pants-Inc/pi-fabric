@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { childProcessEnvironment } from "../core/atomic-write.js";
 
 const OUTPUT_MAX_BYTES = 1024 * 1024;
 const LINE_MAX_CHARS = 1024 * 1024;
@@ -74,7 +75,8 @@ export class JevFabricCli {
   constructor(readonly binary: string, readonly home: string) {}
 
   #env(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
-    return { ...(env ?? process.env), JEV_FABRIC_HOME: this.home };
+    // Reserved Landlock controls never reach an unconfined child (main #738).
+    return { ...childProcessEnvironment(env ?? process.env), JEV_FABRIC_HOME: this.home };
   }
 
   run(args: readonly string[], options: RunOptions = {}): Promise<string> {

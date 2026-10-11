@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { childProcessEnvironment } from "../core/atomic-write.js";
 
 const BANNER_TIMEOUT_MS = 15_000;
 const CLOSE_GRACE_MS = 5_000;
@@ -33,7 +34,7 @@ export class JevFabricServe {
   static open(binary: string, options: { home: string; cwd: string; timeoutMs: number; evaluations?: number; tokens?: number; env?: NodeJS.ProcessEnv }): Promise<JevFabricServe> {
     return new Promise((resolve, reject) => {
       const child = spawn(binary, ["--", "serve", "--timeout-ms", String(options.timeoutMs), String(options.evaluations ?? 0), String(options.tokens ?? 0)], {
-        cwd: options.cwd, env: { ...(options.env ?? process.env), JEV_FABRIC_HOME: options.home },
+        cwd: options.cwd, env: { ...childProcessEnvironment(options.env ?? process.env), JEV_FABRIC_HOME: options.home },
         stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       });
       const exited = new Promise<void>(done => child.once("close", () => done()));

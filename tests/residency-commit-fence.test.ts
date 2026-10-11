@@ -331,6 +331,9 @@ describe("resident creation cache boundaries", () => {
     try {
       const first = await state.client.createActor(actorRequest("before-expiry", "expiring"));
       clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000 + 1);
+      // Advance the creation-cache clock without accidentally expiring the owning Main's lease.
+      // A live Main would keep heartbeating throughout these ten minutes.
+      await state.participants.refresh();
       const next = await state.client.createActor(actorRequest("after-expiry", "expiring"));
       expect(next.id).not.toBe(first.id);
       expect(new ActorRegistryStore(state.config.sessionActorRoot!).records()).toHaveLength(2);

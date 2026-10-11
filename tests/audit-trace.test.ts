@@ -14,10 +14,18 @@ import {
   type FabricExecutionFailureStageV1,
 } from "../src/audit/trace.js";
 import { FabricActivityStore } from "../src/activity/store.js";
+import { projectFabricAuditArgs } from "../src/audit/projection.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import type { FabricProvider } from "../src/protocol.js";
+
+describe("agent message audit parity", () => {
+  it.each(["agents.send", "agents.steer"])("retains only the target for %s", ref => {
+    expect(projectFabricAuditArgs(ref, { id: "session:receiver", message: "private HOLD", priority: "interrupt", data: { private: true } }).value)
+      .toEqual({ id: "session:receiver" });
+  });
+});
 
 const descriptor = {
   name: "echo",

@@ -433,7 +433,9 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe("fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
+    expect(err).toBe("fabric-mesh-backend: accepted gap smarty-dev#8116: a lock-free holder whose /proc/<pid>/fd "
+      + "is unreadable and that opens state.db between the lease probe and the commit (under the fence) is not detected\n"
+      + "fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 
@@ -934,5 +936,70 @@ describe("fabric-mesh-backend CLI", () => {
     const broken = await run("status", "--root", root);
     expect(broken.code).toBe(3);
     expect(broken.out).toMatch(/fence {9}VIOLATED/);
+  });
+});
+
+// smarty-dev#7548: the backend tool's FenceDb and the file-mode fence's meta read open state.db only through the
+// one gate (state-gate.ts openPrivateStateDb), as the store does: never by path behind a symlinked or shared root.
+describe.skipIf(process.platform === "win32")("the one gate for every state.db open (smarty-dev#7548)", () => {
+  const rolledBack = async (label: string): Promise<string> => {
+    const root = tempRoot(label);
+    await seedFileRoot(root);
+    await importMeshState(root);
+    await rollbackMeshState(root); // backend=file at the file's epoch: readers and writers use state.json
+    expect(resolveMeshStateSource(root)).toMatchObject({ source: "file" });
+    assertFileStateWritable(root);
+    return root;
+  };
+
+  // pi-fabric#846 SEC P2: the root is checked before state.db is created, and a refusal raises the operator alarm.
+  it("a refused root gets no state.db from the import or a creating store open", async () => {
+    const root = tempRoot("gate-no-create");
+    await seedFileRoot(root);
+    fs.chmodSync(root, 0o770);
+    await expect(importMeshState(root)).rejects.toThrow(/is group or other writable/);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    const fresh = tempRoot("gate-no-create-store"); // empty: a creating open passes the import-first guard
+    fs.chmodSync(fresh, 0o770);
+    await expect(SqliteStateStore.open(fresh, 64 * 1024, 1_000, { initialize: "create" })).rejects.toThrow(/is group or other writable/);
+    expect(fs.existsSync(path.join(fresh, "state.db"))).toBe(false);
+  });
+
+  it("a FenceDb refusal raises onAlarm before it is rethrown", async () => {
+    const root = await rolledBack("gate-alarm");
+    fs.chmodSync(root, 0o770);
+    const alarms: MeshBackendAlarm[] = [];
+    expect(() => resolveMeshStateSource(root, { onAlarm: (alarm) => alarms.push(alarm) })).toThrow(/is group or other writable/);
+    await expect(meshBackendStatus(root, { onAlarm: (alarm) => alarms.push(alarm) })).rejects.toThrow(/is group or other writable/);
+    expect(alarms).toEqual([expect.objectContaining({ code: "FABRIC_MESH_BACKEND_FENCE", root, message: expect.stringMatching(/group or other writable/) }),
+      expect.objectContaining({ code: "FABRIC_MESH_BACKEND_FENCE", root })]);
+  });
+
+  it("FenceDb and the fence meta read refuse a group-writable root", async () => {
+    const root = await rolledBack("gate-shared");
+    fs.chmodSync(root, 0o770);
+    expect(() => resolveMeshStateSource(root)).toThrow(/is group or other writable/);
+    expect(() => assertFileStateWritable(root)).toThrow(/is group or other writable/);
+  });
+
+  it("FenceDb and the fence meta read refuse a symlinked root", async () => {
+    const real = await rolledBack("gate-link");
+    const link = path.join(tempRoot("gate-link-parent"), "mesh");
+    fs.symlinkSync(real, link);
+    expect(() => resolveMeshStateSource(link)).toThrow(/is a symbolic link/);
+    expect(() => assertFileStateWritable(link)).toThrow(/is a symbolic link/);
+  });
+
+  it("refuses a root under a group- or other-writable ancestor, and accepts a sticky one (like /tmp)", async () => {
+    const parent = tempRoot("gate-ancestor");
+    const root = path.join(parent, "mesh");
+    await seedFileRoot(root);
+    await importMeshState(root);
+    fs.chmodSync(parent, 0o777);
+    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(/its ancestor .* is group or other writable without the sticky bit/);
+    expect(() => resolveMeshStateSource(root)).toThrow(/without the sticky bit/);
+    fs.chmodSync(parent, 0o1777);
+    expect(resolveMeshStateSource(root)).toMatchObject({ source: "sqlite" });
+    fs.chmodSync(parent, 0o700);
   });
 });

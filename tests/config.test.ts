@@ -10,6 +10,7 @@ import {
   effectiveToolCaptureConfig,
   loadFabricConfig,
   loadFabricConfigForScope,
+  loadGlobalFabricConfig,
   normalizeFabricConfig,
   saveFabricConfig,
 } from "../src/config.js";
@@ -45,7 +46,7 @@ describe("host-only explicit model exceptions (#3134)", () => {
     fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: ["provider/expensive"] } } }));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { modelPolicy: { requireReason: [] } } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["provider/expensive"]);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra", "provider/expensive"]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
   });
@@ -104,12 +105,12 @@ describe("host-only processSlice (#4383)", () => {
       expect(normalizeFabricConfig({ agents: { processSlice } }).agents.processSlice).toBeUndefined();
     }
   });
-  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+  it.each([true, false])("ignores project overrides and unprovisioned host slices (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { processSlice: "workspace.slice" } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
-    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBe("batch.slice");
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
   });
 });
 
@@ -140,6 +141,17 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
 });
 
 describe("Fabric configuration", () => {
+  it("golden: no files preserve main's built-in executor.landlock default across all loaders", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(DEFAULT_FABRIC_CONFIG.executor.landlock).toEqual({ mode: "off", disabled: false });
+    for (const loaded of [loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+      loadFabricConfigForScope(options, "global"), loadFabricConfigForScope(options, "project")]) {
+      expect(loaded.executor.landlock).toEqual(DEFAULT_FABRIC_CONFIG.executor.landlock);
+    }
+    expect(fs.readdirSync(agentDir)).toEqual([]);
+    expect(fs.readdirSync(cwd)).toEqual([]);
+  });
   it("defaults automatic per-host reload concurrency to six and preserves explicit unlimited mode", () => {
     expect(DEFAULT_FABRIC_CONFIG.selfReloadConcurrency).toBe(6);
     expect(normalizeFabricConfig({}).selfReloadConcurrency).toBe(6);
@@ -394,6 +406,32 @@ describe("Fabric configuration", () => {
     expect(blank.agents.model).toBeUndefined();
     const nonString = normalizeFabricConfig({ agents: { model: 42 } });
     expect(nonString.agents.model).toBeUndefined();
+  });
+
+  it("tracks configured thinking without marking the built-in level as configured", () => {
+    expect(normalizeFabricConfig({}).agents.configuredThinking).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { thinking: "medium" } }).agents.configuredThinking).toBe("medium");
+    expect(normalizeFabricConfig({ agents: { thinking: "high" } }).agents.configuredThinking).toBe("high");
+    expect(normalizeFabricConfig({ agents: { thinking: "turbo" } }).agents.configuredThinking).toBeUndefined();
+  });
+
+  it("keeps user/project thinking provenance through the default-seeded merge", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    const options = { cwd, agentDir, projectTrusted: true };
+    const globalPath = path.join(agentDir, "fabric.json");
+    const projectPath = path.join(cwd, ".pi", "fabric.json");
+    expect(loadFabricConfig(options).agents.configuredThinking).toBeUndefined();
+    fs.writeFileSync(globalPath, JSON.stringify({ agents: { model: "provider/global" } }));
+    expect(loadFabricConfig(options).agents.configuredThinking).toBeUndefined();
+    fs.writeFileSync(globalPath, JSON.stringify({ agents: { model: "provider/global", thinking: "medium" } }));
+    expect(loadFabricConfig(options).agents).toMatchObject({ model: "provider/global", configuredThinking: "medium" });
+    fs.writeFileSync(projectPath, JSON.stringify({ agents: { model: "provider/project", thinking: "high" } }));
+    expect(loadFabricConfig(options).agents).toMatchObject({ model: "provider/project", configuredThinking: "high" });
+    expect(loadFabricConfig({ ...options, projectTrusted: false }).agents)
+      .toMatchObject({ model: "provider/global", configuredThinking: "medium" });
+    fs.writeFileSync(projectPath, JSON.stringify({ agents: { thinking: "invalid" } }));
+    expect(loadFabricConfig(options).agents.configuredThinking).toBeUndefined();
   });
 
   it("normalizes the default runner and independent Claude settings", () => {

@@ -125,6 +125,8 @@ function createPiArgumentNormalizer() {
         }
       }
     }
+    // ponytail: native core optionals are nonnullable. A nullable exact-core
+    // override here would lose its null; revisit if one is ever declared.
     const optionalFields = __piOptionalFields[name];
     if (optionalFields) {
       for (const key of optionalFields) {

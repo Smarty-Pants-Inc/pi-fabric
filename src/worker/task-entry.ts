@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import type { CreateAgentSessionRuntimeFactory } from "@earendil-works/pi-coding-agent";
 import { applyTaskRetryDefaults } from "./retry-profile.js";
 import { installFabricResourcePin } from "./resource-pin.js";
+import { installTerminalAnswerBoundary } from "./terminal-boundary.js";
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
@@ -89,6 +90,47 @@ const failures = runtime.diagnostics.filter(diagnostic => diagnostic.type === "e
 if (failures.length) {
   await runtime.dispose();
   throw new Error(failures.map(diagnostic => diagnostic.message).join("\n"));
+}
+// The SDK entry also owns ordinary tasks with explicit retry settings. Preserve
+// native launch controls and settings; the terminal fence is independent of retry.
+if (args.includes("--no-auto-compaction")) {
+  const session = runtime.session as typeof runtime.session & { disableAutoCompactionForProcess?: () => void };
+  if (session.disableAutoCompactionForProcess) session.disableAutoCompactionForProcess();
+  else {
+    // Older SDKs lack the process-local switch. Never persist the CLI override
+    // into the canonical shared profile.
+    const settings = runtime.services.settingsManager;
+    const compaction = settings.getCompactionSettings.bind(settings);
+    settings.getCompactionSettings = () => ({ ...compaction(), enabled: false });
+  }
+}
+if (process.env.PI_FABRIC_TERMINAL_TASK === "1") {
+  const directory = process.env.PI_FABRIC_AGENT_RUN_DIR;
+  const runId = process.env.PI_FABRIC_PARENT_RUN;
+  if (!directory || !runId) throw new Error("Terminal task has no owned run identity");
+  const totals = { turns: 0, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+  // IPC can overtake stdout during a large final answer. Keep native attempt
+  // accounting ahead of the terminal listener so its immutable status remains
+  // complete even when the worker has not consumed earlier stream frames yet.
+  runtime.session.agent.subscribe(event => {
+    if (event.type === "turn_end") totals.turns++;
+    if (event.type === "tool_execution_start") totals.toolCalls++;
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const usage = event.message.usage;
+      for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) totals.usage[key] += usage[key];
+      totals.usage.cost += usage.cost.total;
+    }
+  });
+  installTerminalAnswerBoundary(runtime.session, directory, runId, receipt => {
+    const message = [...runtime.session.agent.state.messages].reverse().find(message => message.role === "assistant");
+    // Do not write around native RPC's serialized stdout queue: a large answer
+    // may still be flushing. IPC preserves this receipt frame independently.
+    const assistant = message?.role === "assistant" ? { usage: message.usage, model: message.model,
+      provider: message.provider, timestamp: message.timestamp } : undefined;
+    process.send?.({ type: "fabric_final_answer", runId, receiptId: receipt.id, assistant,
+      totals: { ...totals, turns: totals.turns + 1 } });
+  }, process.env.PI_FABRIC_REPLY_FILE, process.env.PI_FABRIC_TASK_RESUMING === "1");
+  process.channel?.unref();
 }
 applyHttpProxySettings(runtime.services.settingsManager.getGlobalSettings().httpProxy);
 configureHttpDispatcher(runtime.services.settingsManager.getHttpIdleTimeoutMs());

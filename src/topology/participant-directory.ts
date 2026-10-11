@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
+import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
@@ -62,6 +64,9 @@ const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
+// ponytail: bounded; it covers a few publish holds at today's ~250 ms (smarty-dev#8305); still far
+// under LOCK_TIMEOUT_MS 10 s. At 250 ms one hold ahead of the refresh failed the send (smarty-dev#6477).
+export const ROUTING_REFRESH_LOCK_BUDGET_MS = 2_000;
 /**
  * Addressable across a live reload, but a failed reload stops accepting after this lease.
  * quiesce("reload") writes it once, at the start of teardown; nothing renews it until the new
@@ -272,6 +277,23 @@ const remoteHostValid = (value: unknown): boolean =>
 const optionalStrings = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   keys.every((key) => value[key] === undefined || typeof value[key] === "string");
 
+let ownProcessIdentity: { pid: number; host: string; startTime?: string } | undefined;
+/** This process's identity, read once: stable for the process's life. */
+const ownMainProcess = (): { pid: number; host: string; startTime?: string } => {
+  if (!ownProcessIdentity) {
+    // Linux /proc/<pid>/stat field 22 (start ticks), after comm; the same value residency's processStartTime reads.
+    let startTime: string | undefined;
+    if (process.platform === "linux") {
+      try {
+        const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+        startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+      } catch { /* unknown: the record carries no start time */ }
+    }
+    ownProcessIdentity = { pid: process.pid, host: os.hostname(), ...(startTime ? { startTime } : {}) };
+  }
+  return ownProcessIdentity;
+};
+
 const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
@@ -282,7 +304,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
+    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -495,6 +517,9 @@ export interface ParticipantDirectoryOptions {
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
+  /** Complete runtime mesh activation before any presence write. A lock timeout
+   * follows the same startup warning and background refresh retry as publication. */
+  beforePublication?: () => Promise<void>;
   /** Prepare outside custody; validate exact registry generations inside the
    * existing publication fence before any ownership/presence write. */
   preparePublicationFence?: () => () => boolean;
@@ -502,12 +527,12 @@ export interface ParticipantDirectoryOptions {
   listReadCacheMs?: number;
   /** Registry -> mesh/key order for shared publication. Accepted actor file copies
    * may follow outside custody with exact token validation under their key lock. */
-  withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
+  withPublicationFence?: <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>) => Promise<T>;
   /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
    * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
   waitForPublicationRetry?: () => Promise<void>;
   /** Extra presence writes share this host's one fenced heartbeat acquisition. */
-  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void };
+  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void; actorIds?: readonly string[] };
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -532,7 +557,16 @@ export interface ParticipantDirectoryOptions {
    * Explicit refresh()/quiesce() calls still publish from the owner's last live snapshot.
    */
   live?: () => boolean;
+  /**
+   * Once per outage: more than LIFECYCLE_LOST_TICKS consecutive heartbeats found no live
+   * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
+   * must say so visibly instead of vanishing from the directory in silence.
+   */
+  onLifecycleLost?: (ticks: number) => void;
 }
+
+/** Heartbeats a retired lifecycle may skip quietly (a rebind is normally immediate). */
+export const LIFECYCLE_LOST_TICKS = 2;
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
@@ -558,6 +592,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
+  /** Consecutive heartbeats skipped for want of a live lifecycle; degraded past the limit. */
+  #retiredTicks = 0;
+  #degraded = false;
   #refreshing: Promise<void> | undefined;
   #actorRenewing: Promise<void> | undefined;
   /** Last independent file renewal of each stopped actor (see STOPPED_ACTOR_RENEW_MS). */
@@ -614,6 +651,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try { return this.options.live?.() ?? true; } catch { return false; }
   }
 
+  /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
+  get degraded(): boolean { return this.#degraded; }
+
+  #lifecycleTick(live: boolean): void {
+    if (live) {
+      this.#retiredTicks = 0;
+      this.#degraded = false;
+      return;
+    }
+    if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
+    this.#degraded = true;
+    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+      `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
+    try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
+  }
+
   registerSource(source: ParticipantSnapshotSource): () => void {
     this.#sources.add(source);
     if (this.#timer) this.scheduleRefresh();
@@ -636,8 +689,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.options.enabled) {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
+      this.#retiredTicks = 0;
+      this.#degraded = false;
       this.#timer = setInterval(() => {
-        if (this.#closed || !this.#live()) return;
+        if (this.#closed) return;
+        const live = this.#live();
+        this.#lifecycleTick(live);
+        if (!live) return;
         void this.#renewActors();
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;
@@ -738,6 +796,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Include preparation in #refreshing so a cold heartbeat coalesces and close
     // drains it, but do not acquire any registry fence until identity is ready.
     const operation = this.#ownIncarnation.then(async () => {
+      if (this.#closed) return false;
+      if (this.options.beforePublication) await this.options.beforePublication();
       if (this.#closed) return false;
       if (this.#prepareFileLocks) {
         await prepareParticipantFileLocks(this.mesh);
@@ -1381,7 +1441,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.list({ scope: "project", includeStale: true, fresh: true });
         this.#routingReadAt = Date.now();
         this.#routingError = undefined;
-      }, 250);
+      }, ROUTING_REFRESH_LOCK_BUDGET_MS);
     } catch (error) {
       this.#routingError = error;
       throw error;
@@ -1509,6 +1569,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       updatedAt: main.updatedAt,
       pendingMessages: main.pendingMessages,
       controlProtocol: "v1",
+      mainProcess: ownMainProcess(),
     };
   }
 
@@ -1855,6 +1916,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
         ? [{ key: entry.key, version: entry.version, participant }] : [];
     });
     const actorCopies: Array<{ key: string; version: number }> = [];
+    // smarty-dev#8526: renewals of actor files this host already owns run after the registry
+    // fence, like actorCopies: the key lock plus a fresh registry-lineage check at the write
+    // decision is the receipt adoption shares (it changes lineage holding this key's lock).
+    const actorRenewals: Array<() => Promise<void>> = [];
+    const renewOutsideFence = (record: FabricParticipantRecord): boolean => !!validPublication &&
+      !!this.options.withPublicationFence && !!this.options.actorRenewalAllowed &&
+      record.kind === "actor" && record.actorOwnershipToken !== undefined;
     const copyCommitted = async (key: string, version: number, participant: FabricParticipantRecord): Promise<void> => {
       if (validPublication && this.options.actorRenewalAllowed && participant.kind === "actor" && participant.actorOwnershipToken !== undefined) {
         actorCopies.push({ key, version });
@@ -1902,8 +1970,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // hold it (review/astra round 4 on #142).
           const key = keyFor(PARTICIPANT_PREFIX, record.id);
           const migrating = existingById.get(record.id)?.entry;
-          const publish = async (): Promise<void> => {
+          const publish = async (afterFence = false): Promise<void> => {
             const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
+              if (afterFence && !this.options.actorRenewalAllowed!(record)) return false;
               const taken = (entry: MeshStateEntry | undefined): boolean => {
                 if (!entry || ownParticipant(entry) !== undefined) return false;
                 const holder = participantFromEntry(entry);
@@ -1917,7 +1986,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
             }
           };
           if (migrating || !ownParticipant(filesByKey.get(key))) await publish();
-          else deferredFileWrites.push(publish);
+          else if (renewOutsideFence(record)) actorRenewals.push(() => publish(true));
+          else deferredFileWrites.push(() => publish());
         }
       }
       for (const copy of copies) await copyCommitted(copy.key, copy.version, copy.participant);
@@ -2001,7 +2071,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
       let committedAt = 0;
       const results = await this.mesh.writeBatch({ identity: this.options.identity, ops,
-        prepare: view => compactExpiredHostRecords(view, this.mesh.root, this.options.hostId),
+        prepare: view => {
+          this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
+          return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
+        },
         // In-process bookkeeping only (no view, no file): it needs no state custody, so it runs as the
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
         // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
@@ -2014,12 +2087,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return committedAt;
     };
+    // smarty-dev#8526: the actors this round can write, so the fence locks only their registries.
+    // undefined (every registry, as before) when the round also writes a root/legacy record,
+    // removes an own record, or carries a batch op not attributed to an actor id.
+    const fencedActors = ((): ReadonlySet<string> | undefined => {
+      const ids = new Set(publication?.actorIds ?? []);
+      if (publication && publication.ops.length > 0 && publication.actorIds === undefined) return undefined;
+      // Prepared ops are the batch, the statePuts and (only) a legacy session delete.
+      if (ops.length > (publication?.ops.length ?? 0) + statePuts.size || legacyChanged || legacyPut !== undefined) return undefined;
+      if (existing.some(({ participant }) => !desired.has(participant.id)) ||
+        fileEntries.some(entry => { const own = ownParticipant(entry); return own !== undefined && !desired.has(own.id); })) return undefined;
+      for (const record of [...statePuts.values(), ...fileWrites, ...activityWrites, ...copies.map(copy => copy.participant)]) {
+        if (record.kind !== "actor") return undefined;
+        ids.add(record.id);
+      }
+      return ids.size > 0 ? ids : undefined;
+    })();
     const committed = validPublication && this.options.withPublicationFence
-      ? await this.options.withPublicationFence(commitPrepared) : await commitPrepared();
+      ? await this.options.withPublicationFence(commitPrepared, fencedActors) : await commitPrepared();
     // The shared receipt already committed. Copies recheck that exact receipt
     // AND current registry lineage while holding the actor key; adoption takes
     // the same key before changing lineage. New/changed actor files therefore
     // need no registry custody, keeping first publication of 50 actors bounded.
+    for (const renew of actorRenewals) await renew();
     for (const copy of actorCopies) await this.#copyCommitted(copy.key, copy.version);
     return committed;
   }
@@ -2068,6 +2158,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (participant?.kind === "actor" && this.options.actorRenewalAllowed &&
         !this.options.actorRenewalAllowed(participant)) return undefined;
       if (this.#renewalAhead(current, committed)) return undefined;
+      if (participant) this.#assertRootPublishable(participant);
       return committed?.version === version && participant && isLocal(participant, this.options.hostId)
         ? committed : undefined;
     }, this.#fileLockOptions()));
@@ -2252,13 +2343,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   // A files-only write, decided under the key's lock: stamped now, the time of that decision.
+  /** Under the same key lock or state transaction as the write: a root Main never publishes its root
+   * participant while an operator actor removal fences that root (smarty-dev#7817). */
+  #assertRootPublishable(record: FabricParticipantRecord | undefined): true {
+    if (record?.kind === "root" && record.id === this.options.rootId && mainPublicationFenced(this.mesh.root, record.id)) {
+      throw new MainPublicationFencedError(record.id);
+    }
+    return true;
+  }
+
   #writeFile(
     record: FabricParticipantRecord,
     allowed: (current: MeshStateEntry | undefined) => boolean,
     durable = false,
   ): Promise<boolean> {
     const key = keyFor(PARTICIPANT_PREFIX, record.id);
-    return writeParticipantFileIf(this.mesh, key, (current) => allowed(current) ? {
+    return writeParticipantFileIf(this.mesh, key, (current) => this.#assertRootPublishable(record) && allowed(current) ? {
       key,
       value: record,
       version: (current?.version ?? 0) + 1,

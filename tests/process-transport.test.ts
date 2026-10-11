@@ -195,6 +195,18 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
+  it("never auto-selects a v1 worker without the receipt/attributed-refusal boundary", async () => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(2);
+    const f = fixture();
+    const legacy = f.release("legacy-terminal-protocol", 1);
+    f.select(legacy);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await probe(f, f.parent);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 1");
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 2");
+  });
+
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {
     const f = fixture(false);
     f.select(f.release("native-incompatible", WORKER_PROTOCOL_VERSION + 1));

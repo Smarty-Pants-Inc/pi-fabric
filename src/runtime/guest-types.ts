@@ -280,7 +280,22 @@ interface FabricLifecycleSubscription {
   lastEventId?: string;
   lastError?: string;
 }
+interface FabricTargetTerminalError extends Error {
+  readonly code: "FABRIC_TARGET_TERMINAL";
+  readonly targetId: string;
+  readonly finalAnswerReceiptId: string;
+}
+interface FabricTargetTerminalNotice {
+  code: "FABRIC_TARGET_TERMINAL";
+  targetId: string;
+  messageId: string;
+  delivery: "steer" | "followUp";
+  finalAnswerReceiptId: string;
+  sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
+}
 interface FabricAgentHandle {
+  /** Durable answer boundary; does not confirm native worker/tree exit. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */
   fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];
@@ -682,10 +697,13 @@ interface FabricActorHostSignal {
 type FabricActorActivation =
   | { readonly kind: "hostEvent"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly event: FabricActorHostEvent; readonly mainRevision: number; readonly taskRevision: number; readonly signal?: FabricActorHostSignal }
   | { readonly kind: "direct"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number }
-  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string };
+  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string; readonly data?: any };
+interface FabricActorRecordsOptions { topic: string; maxEntries?: number; maxAgeMs?: number }
+interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string; readonly fresh: boolean }
+interface FabricActorRecordsView { readonly get: (key: string) => Readonly<FabricActorRecord> | undefined }
 interface FabricActorValidityFacts {
   readonly activation: Readonly<FabricActorActivation>;
-  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number }>;
+  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number; records?: FabricActorRecordsView }>;
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
@@ -759,6 +777,8 @@ interface FabricActorRequestBase {
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
+  /** Bounded host projection; default 512 entries, cap 4096, maxAgeMs default 6 h. Unknown is undefined. */
+  records?: FabricActorRecordsOptions;
   residency?: FabricParticipantResidency;
 }
 type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource & (
@@ -785,6 +805,7 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   runner: FabricAgentRunner;
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
@@ -844,6 +865,7 @@ interface FabricActorInfo {
   activationBlocked?: { reason: string; code: string; since: number; count: number };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
   residency: FabricParticipantResidency;
   queued: number;
   messages: number;
@@ -984,7 +1006,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { complexity?: "simple" | "normal" | "complex" | "delicate"; pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */

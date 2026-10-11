@@ -1,0 +1,149 @@
+# External spawn router (smarty-dev#2890)
+
+Fabric supplies an optional adapter for model-economics-lead's `bin/smarty-route`.
+The policy/model economics engine is **not** implemented here.
+
+Configure only in the selected host agent directory's `fabric.json` (workspace
+configuration cannot execute a router or opt into task disclosure):
+
+```json
+{
+  "agents": {
+    "router": {
+      "command": ["/absolute/path/to/bin/smarty-route"],
+      "timeoutMs": 1500,
+      "mode": "shadow",
+      "includeTask": false
+    }
+  }
+}
+```
+
+`command` is executable + argv, never shell source. The executable must be an
+absolute path: bare names and relative paths are rejected, with no PATH lookup.
+On POSIX the router receives `PATH=/usr/bin:/bin`; on Windows it receives
+`SystemRoot` (resolved case-insensitively from the host), a fixed
+`PATH=<SystemRoot>\System32;<SystemRoot>`, and
+`COMSPEC=<SystemRoot>\System32\cmd.exe`. Windows also explicitly copies the
+process essentials that libuv would otherwise add to the child: `HOMEDRIVE`,
+`HOMEPATH`, `LOGONSERVER`, `SYSTEMDRIVE`, `TEMP`, `USERDOMAIN`, `USERNAME`,
+`USERPROFILE`, and `WINDIR`, when set (case-insensitive host lookup, canonical
+uppercase child keys). Together with `PATH` and `SystemRoot`, these are libuv's
+Windows required-variable allowlist; no other Windows variables, including
+parent `PATHEXT`, are copied. A missing/relative Windows system root fails open
+without starting a command. On either platform only `HOME`, `LANG`, and `TZ`
+are otherwise copied when set; parent `PATH`/`Path`, `COMSPEC`, host credentials,
+agent variables, and loader hooks are never inherited. Script
+routers must name their interpreter explicitly, for example an absolute
+`node.exe` followed by the `.mjs` script path on Windows; there is no shell repair.
+`timeoutMs` defaults to 1500 and clamps to 200–5000 ms. `mode` defaults to `off` (also the kill switch).
+`shadow` records a validated suggestion but keeps the existing static/default
+binding; `enforce` uses the validated suggestion. A missing/failed command,
+nonzero exit, timeout, oversized output, malformed JSON, unknown/denied model,
+or invalid thinking level keeps the static default and records an error.
+An explicit caller model **or thinking** always wins: no router process starts,
+and enabled modes record `decision: "explicit"`. Existing explicit `model: "auto"`
+routing is unchanged; this adapter does not run on `agents.run`, handoff, actor
+activations, or global actor templates.
+
+The hook runs once at public `agents.spawn` or live `agents.create`/`createActor`
+admission, before session/durable forwarding. Models must be exact visible Pi
+`provider/id`, exact model IDs, or configured aliases with visible targets;
+there is no fuzzy matching or registry refresh in router validation. Non-Pi
+configured backend default keys are also recognized. Fleet denied-model policy
+still applies. Thinking must be `off`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, or `max`.
+
+## Command contract for model-economics-lead
+
+Read one JSON object from stdin (newline-terminated) and write one JSON object
+to stdout, then exit 0 within the deadline. Example input:
+
+```json
+{
+  "kind": "spawn",
+  "role": "task-agent",
+  "name": "implementation",
+  "cwd": "/workspace/project",
+  "project": "/workspace/project",
+  "taskDigest": "<lowercase SHA-256 of UTF-8 task bytes>",
+  "taskLength": 1842,
+  "parentId": "session:<id>",
+  "requestedComplexity": "normal",
+  "host": "ryzen5.smartypants.ai",
+  "defaults": { "model": "provider/model", "thinking": "medium" }
+}
+```
+
+- `kind` is `spawn` or `actor`; actor instructions are the task input.
+- `role` is the spawning participant's recorded role, else `task-agent`/`actor`.
+- `name` is null if omitted; `project` is the participant's project root/project,
+  else the runtime cwd. `parentId` is the immediate spawning participant, not
+  necessarily Main.
+- `taskLength` counts UTF-8 **bytes**. File-backed actor instructions remain
+  owner-only: their supplied SHA-256 is forwarded and length is null; the hook
+  does not read or forward the file path/text.
+- `requestedComplexity` is present only if the spawn caller provides the
+  optional `complexity: "simple" | "normal" | "complex" | "delicate"`; never
+  guessed from text. All four values pass through verbatim. `delicate` is Paul's
+  delicate-code class (the only class for Opus in the external router's policy),
+  not an alias for `complex`; Fabric does not implement that model policy.
+- The full `task` string is absent unless host `includeTask: true` explicitly
+  allows it, and remains absent for an owner-only instruction file.
+- `defaults.model` can be null when the backend default is not statically known.
+
+Example output:
+
+```json
+{
+  "model": "provider/model",
+  "thinking": "high",
+  "reason": "normal.implementation",
+  "policyVersion": "1.0.0"
+}
+```
+
+`model` and `thinking` are required. `reason` (at most 2000 characters) and
+`policyVersion` (at most 256) are optional strings. Stdout is bounded to 64 KiB;
+stderr is not captured in decisions. Timeout, abort, and oversized output close
+local pipes and retire the process tree (detached process group on POSIX;
+`taskkill /T /F /PID` on Windows). Fallback joins the Windows helper (bounded to
+1 second, with a direct-child SIGKILL fallback on helper failure) and waits up
+to 1 second for direct-child exit, never for descendant-held `close`. These
+retirement bounds are in addition to the command deadline; a failed native
+tree kill cannot guarantee descendant exit.
+
+## Decision ledger and rollback
+
+Enabled modes append one JSON line to `<mesh>/router/decisions.jsonl`:
+`ts`, `requestDigest` (SHA-256 of request metadata excluding raw task), `kind`,
+`mode`, `decision` (`explicit`/`default`/`enforce`), `pick`, `actual`, `latencyMs`,
+and `error` (fixed adapter code or null). A valid pick includes its canonical
+model/thinking and optional reason/version codes. Only these structured grammars
+are preserved unchanged (case-sensitive, full-string matches):
+
+- `reason`: `^(policy:task/[a-z0-9-]{1,32}|capacity-hold|taskclass:[a-z0-9-]{1,32}|default|unavailable|normal\.implementation)$`.
+  All other string reasons become `other`, including task-text fragments with
+  spaces or more than 32 characters after `policy:task/` or `taskclass:`.
+- `policyVersion`: `^v[0-9]+(-[a-z0-9.]{1,32})?$`,
+  `^[0-9]+\.[0-9]+(\.[0-9]+)?$`, or `^[0-9a-f]{7,40}$`.
+  For example, `v1-2026.10.09`, `1.2.3`, and a lowercase hexadecimal SHA pass
+  through; all other string versions become `unknown`.
+
+No whitespace (including trailing line terminators) or truncation is accepted.
+Rejected raw values, raw tasks, and router stderr never enter the ledger.
+
+The router directory is created with mode 0700 and must be a real directory
+(`lstat`, not a symlink), owned by the current uid with private permissions
+where the OS exposes uid/mode checks. The ledger is opened append-only with
+`O_NOFOLLOW` (where supported) and mode 0600; links and non-regular files are
+refused. Before an append would exceed 8 MiB, the ledger rotates to
+`decisions.jsonl.1`, replacing the single previous archive.
+
+Logging failures warn to stderr without failing or changing spawn selection.
+A read-only or unsafe mesh cannot guarantee a persisted decision; repair
+permissions before relying on shadow evidence.
+
+Rollback: set host `agents.router.mode` to `off` and reload Fabric (or remove
+`agents.router`). No command, router module load, or decision write occurs in
+off mode. Existing static/inherited defaults resume unchanged.

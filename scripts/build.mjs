@@ -51,6 +51,7 @@ const lazyEntryPoints = [
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/spawn-router.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
@@ -180,6 +181,20 @@ await build({
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  logLevel: "info",
+});
+
+// The bash tool_call envelope invokes a real file: the fleet guard refuses computed -e code.
+// Keep watchdog/group custody code out of the extension graph and out of inline shell operands.
+await build({
+  entryPoints: ["src/bash-idle-watchdog.ts"],
+  outfile: "dist/bash-idle-watchdog.js",
   bundle: true,
   packages: "external",
   platform: "node",

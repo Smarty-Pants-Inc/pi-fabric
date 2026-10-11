@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,13 +8,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_HANDOFF_PREFIX, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { BridgeHandoffRefusedError, handOffNativeIdentity, listHandoffs } from "../src/mesh/bridge-handoff.js";
 import { MeshStore, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
-import { main } from "../src/mesh-bridge.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { participantFilePresent, writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#9074: a Main moved off the hub keeps its session id; the hub's handoff lets exactly one
-// bridge link present it. Real MeshStores, the real bridge presence computation, a stdio transport.
+// bridge link present it. Real MeshStores, the real bridge presence computation, a stdio transport;
+// the handoff itself runs as move-main.sh runs it, the built CLI in its own process on the mesh root.
 const roots: string[] = [];
 const links: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -74,7 +75,9 @@ const link = (hub: MeshStore, far: MeshStore, remoteName: string, root: string) 
  * on the remote host qs32729 with the same session id. "lead" is a live hub Main.
  */
 const fixture = async (options: { mainProcess?: NativeOptions["mainProcess"] } = {}) => {
-  let now = 1_800_000_000_000;
+  // Ten minutes back on the real clock: once the fixture is built, the frozen test clock is the real
+  // time it started, so the built CLI (its own process, the real clock) sees the same dead and live leases.
+  let now = Date.now() - 10 * 60_000;
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-handoff-"));
   roots.push(root);
@@ -95,6 +98,28 @@ const fixture = async (options: { mainProcess?: NativeOptions["mainProcess"] } =
   return { root, hub, far, stale, child, lead, moved, ...qs, advance: (ms: number) => { now += ms; }, now: () => now };
 };
 
+/**
+ * The built `mesh-bridge handoff` CLI (bin/mesh-bridge runs dist: build first; CI builds before its tests), as
+ * move-main.sh runs it on the hub: a real process on real files, on the real clock. Its exit status and output.
+ */
+const cli = (...args: string[]) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+  const child = spawn(process.execPath, [path.resolve("bin/mesh-bridge"), ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+  child.once("error", reject);
+  child.once("close", (code) => resolve({ code, stdout, stderr }));
+});
+/** One CLI run: its exit status, and its stdout parsed as the one JSON object it must be. */
+const cliJson = async (...args: string[]) => {
+  const run = await cli(...args);
+  let json: Record<string, unknown>;
+  try { json = JSON.parse(run.stdout) as Record<string, unknown>; }
+  catch { throw new Error(`mesh-bridge ${args.join(" ")} printed no single JSON object (exit ${run.code}):\n${run.stdout}${run.stderr}`); }
+  return { code: run.code, json, stderr: run.stderr };
+};
+
 const send = (f: Awaited<ReturnType<typeof fixture>>, far = f.far) =>
   far.publish({ topic: "fabric.control.command", kind: "followUp", from: f.moved.identity, to: f.lead.id, data: command(f.lead.id, f.moved.id) });
 
@@ -111,11 +136,21 @@ describe("hub handoff of a moved Main's native identity (smarty-dev#9074)", () =
     expect(on(f.hub, "fabric.control.command")).toHaveLength(0);
     expect(f.logs.join("\n")).toMatch(/sender claims a hub identity/);
 
-    const result = await handOffNativeIdentity(f.hub, { session: f.stale.sessionId, link: "qs32729", operator: "hosts-lead" });
+    // The handoff as move-main.sh runs it on the hub: the built CLI, its own process, the hub's mesh root.
+    const handed = await cliJson("handoff", "--mesh", f.hub.root, "--session", f.stale.sessionId, "--link", "qs32729", "--operator", "hosts-lead");
+    expect(handed.code, handed.stderr).toBe(0);
+    const result = handed.json as { record: { handedOffAt: number }; retired: string[] };
     expect(result.record).toEqual({ format: 1, id: f.stale.id, sessionId: f.stale.sessionId, name: "mover", link: "qs32729",
-      handedOffAt: f.now(), operator: "hosts-lead", hub: os.hostname() });
+      handedOffAt: expect.any(Number), operator: "hosts-lead", hub: os.hostname() });
+    // Stamped on the CLI's own (real) clock, after the fixture's.
+    expect(result.record.handedOffAt).toBeGreaterThanOrEqual(f.now());
+    expect(result.record.handedOffAt).toBeLessThan(f.now() + 60_000);
+    expect(handed.json).toMatchObject({ ok: true, action: "handoff", id: f.stale.id, link: "qs32729",
+      message: `native identity ${f.stale.id} handed off to link qs32729 at ${new Date(result.record.handedOffAt).toISOString()} by hosts-lead`,
+      evidence: { id: f.stale.id, hub: os.hostname(), participants: [{ source: "file" }] } });
     expect(result.retired).toEqual([`participant file ${participantKey(f.stale.id)}`, `host record ${hostKey(f.stale.id)}`]);
     expect(participantFilePresent(f.hub.root, participantKey(f.stale.id))).toBe(false);
+    expect(f.hub.get(hostKey(f.stale.id))).toBeUndefined();
     expect(f.hub.get(handoffKey(f.stale.id))?.value).toEqual(result.record);
 
     await f.bridge.step();
@@ -215,24 +250,57 @@ describe("hub handoff of a moved Main's native identity (smarty-dev#9074)", () =
       .rejects.toThrow(/live/);
   });
 
-  it("the CLI prints one JSON result for move-main.sh: handed off, refused, listed and revoked", async () => {
+  it("the built CLI prints one JSON result for move-main.sh: handed off, refused, listed and revoked", async () => {
     const f = await fixture();
-    const printed: Array<Record<string, unknown>> = [];
-    const out = (value: unknown) => { printed.push(value as Record<string, unknown>); };
-    const live = await native(f.hub, "lead2", f.now());
-    expect(await main(["handoff", "--mesh", f.hub.root, "--session", live.sessionId, "--link", "qs32729", "--operator", "paul"], out)).toBe(1);
-    expect(printed.at(-1)).toMatchObject({ ok: false, refused: expect.stringMatching(/live/),
+    // Live on the CLI's real clock for the whole test.
+    const live = await native(f.hub, "lead2", f.now(), { lifeMs: 10 * 60_000 });
+    const refused = await cliJson("handoff", "--mesh", f.hub.root, "--session", live.sessionId, "--link", "qs32729", "--operator", "paul");
+    expect(refused.code, refused.stderr).toBe(1);
+    expect(refused.json).toMatchObject({ ok: false, action: "handoff", refused: expect.stringMatching(/live/),
       message: expect.stringMatching(new RegExp(`^refused: native identity ${live.id} not handed off to link qs32729: `)) });
-    expect(await main(["handoff", "--mesh", f.hub.root, "--session", f.stale.sessionId, "--link", "qs32729", "--operator", "paul"], out)).toBe(0);
-    expect(printed.at(-1)).toMatchObject({ ok: true, id: f.stale.id, link: "qs32729", record: { operator: "paul" },
-      message: `native identity ${f.stale.id} handed off to link qs32729 at ${new Date(f.now()).toISOString()} by paul` });
-    expect(await main(["handoff-list", "--mesh", f.hub.root], out)).toBe(0);
-    expect(printed.at(-1)).toMatchObject({ ok: true, handoffs: [{ handoff: { id: f.stale.id, link: "qs32729" }, inForce: true }] });
-    expect(await main(["handoff-revoke", "--mesh", f.hub.root, "--session", f.stale.sessionId], out)).toBe(0);
-    expect(printed.at(-1)).toMatchObject({ ok: true, message: `handoff of native identity ${f.stale.id} revoked` });
+    expect(f.hub.get(handoffKey(live.id))).toBeUndefined();
+    const handed = await cliJson("handoff", "--mesh", f.hub.root, "--session", f.stale.sessionId, "--link", "qs32729", "--operator", "paul");
+    expect(handed.code, handed.stderr).toBe(0);
+    const at = (handed.json as { record: { handedOffAt: number } }).record.handedOffAt;
+    expect(handed.json).toMatchObject({ ok: true, id: f.stale.id, link: "qs32729", record: { operator: "paul" },
+      message: `native identity ${f.stale.id} handed off to link qs32729 at ${new Date(at).toISOString()} by paul` });
+    const listed = await cliJson("handoff-list", "--mesh", f.hub.root);
+    expect(listed.code, listed.stderr).toBe(0);
+    expect(listed.json).toMatchObject({ ok: true, handoffs: [{ handoff: { id: f.stale.id, link: "qs32729" }, inForce: true }] });
+    const revoked = await cliJson("handoff-revoke", "--mesh", f.hub.root, "--session", f.stale.sessionId);
+    expect(revoked.code, revoked.stderr).toBe(0);
+    expect(revoked.json).toMatchObject({ ok: true, message: `handoff of native identity ${f.stale.id} revoked` });
     expect(f.hub.get(handoffKey(f.stale.id))).toBeUndefined();
-    expect(await main(["handoff", "--mesh", path.join(f.root, "missing"), "--session", f.stale.sessionId, "--link", "qs32729"], out)).toBe(2);
+    const missing = await cliJson("handoff", "--mesh", path.join(f.root, "missing"), "--session", f.stale.sessionId, "--link", "qs32729");
+    expect(missing).toMatchObject({ code: 2, json: { ok: false, message: `usage: Not a Fabric mesh directory: ${path.join(f.root, "missing")}` } });
     expect(fs.existsSync(path.join(f.root, "missing"))).toBe(false);
-    expect(await main(["handoff", "--mesh", f.hub.root, "--session", "x", "--link", "qs32729"], out)).toBe(2);
+    expect(await cliJson("handoff", "--mesh", f.hub.root, "--session", "x", "--link", "qs32729"))
+      .toMatchObject({ code: 2, json: { ok: false, message: "usage: Not a Main session id: x" } });
+  });
+
+  it("the built CLI answers a missing or malformed flag with the JSON usage result and exit 2, writing nothing", async () => {
+    const f = await fixture();
+    const before = f.hub.listAll();
+    const synopsis = {
+      handoff: "mesh-bridge handoff --mesh ROOT --session ID --link NAME [--operator NAME] [--lock-protocol 1|2]",
+      "handoff-revoke": "mesh-bridge handoff-revoke --mesh ROOT --session ID [--lock-protocol 1|2]",
+      "handoff-list": "mesh-bridge handoff-list --mesh ROOT [--lock-protocol 1|2]",
+    } as const;
+    const cases: Array<[keyof typeof synopsis, string[], string]> = [
+      ["handoff", ["--mesh", f.hub.root, "--session", f.stale.sessionId, "--operator", "paul"], "--link is required"],
+      ["handoff", ["--mesh", f.hub.root, "--link", "qs32729"], "--session is required"],
+      ["handoff", ["--session", f.stale.sessionId, "--link", "qs32729"], "--mesh is required"],
+      ["handoff", ["--mesh", f.hub.root, "--session", f.stale.sessionId, "--link"], "Bad argument: --link"],
+      ["handoff-revoke", ["--mesh", f.hub.root], "--session is required"],
+      ["handoff-list", [], "--mesh is required"],
+      ["handoff-list", ["--mesh", f.hub.root, "--lock-protocol", "3"], "--lock-protocol must be 1 or 2"],
+    ];
+    for (const [mode, flags, message] of cases) {
+      const run = await cliJson(mode, ...flags);
+      expect({ args: [mode, ...flags], code: run.code, json: run.json, stderr: run.stderr })
+        .toEqual({ args: [mode, ...flags], code: 2, json: { ok: false, action: mode, message: `usage: ${message}`, usage: synopsis[mode] }, stderr: "" });
+    }
+    expect(f.hub.listAll()).toEqual(before);
+    expect(participantFilePresent(f.hub.root, participantKey(f.stale.id))).toBe(true);
   });
 });

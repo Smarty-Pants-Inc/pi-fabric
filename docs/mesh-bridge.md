@@ -167,8 +167,10 @@ this host; or another link holding a live mirror of it. Otherwise it removes the
 record and root participant (record and file), and in the same state commit writes the handoff
 record `topology/handoffs/<sha256(id)>` with the link, time, operator and hub host. Output is one
 JSON object (`ok`, `message`, the record, what it retired and what it observed); exit 0 handed off,
-1 refused, 2 usage. `handoff-list` shows every handoff and whether it is in force;
-`handoff-revoke` removes one.
+1 refused, 2 usage. A usage error (a missing or malformed flag, a path that is not a mesh root, a
+bad session id) writes nothing and is one JSON object too: `ok: false`, `message: "usage: ..."`
+and the command's synopsis in `usage`. `handoff-list` shows every handoff and whether it is in
+force; `handoff-revoke` removes one.
 
 The handoff is the only authority: local write access to the hub's mesh. The bridge writes only
 mirror records and bridged events there, and agents cannot write `topology/` keys through the

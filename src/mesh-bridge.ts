@@ -23,14 +23,28 @@ import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
 const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
+// The handoff commands' synopses, also returned in their JSON usage result.
+const HANDOFF_USAGE: ReadonlyMap<string, string> = new Map([
+  ["handoff", "mesh-bridge handoff --mesh ROOT --session ID --link NAME [--operator NAME] [--lock-protocol 1|2]"],
+  ["handoff-revoke", "mesh-bridge handoff-revoke --mesh ROOT --session ID [--lock-protocol 1|2]"],
+  ["handoff-list", "mesh-bridge handoff-list --mesh ROOT [--lock-protocol 1|2]"],
+]);
+
 const USAGE = `usage:
   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]
-  mesh-bridge handoff --mesh ROOT --session ID --link NAME [--operator NAME] [--lock-protocol 1|2]
-  mesh-bridge handoff-revoke --mesh ROOT --session ID [--lock-protocol 1|2]
-  mesh-bridge handoff-list --mesh ROOT [--lock-protocol 1|2]`;
+${[...HANDOFF_USAGE.values()].map((line) => `  ${line}`).join("\n")}`;
 
-const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
+/**
+ * How a command reports an argument the operator must fix. run and agent throw it; the bin prints
+ * it and exits 2. The handoff commands throw BridgeHandoffUsageError, which their dispatcher turns
+ * into the documented JSON usage result with exit 2 (smarty-dev#9074).
+ */
+type UsageFault = (message: string) => Error;
+const cliUsage: UsageFault = (message) => new Error(`${message}\n${USAGE}`);
+const handoffUsage: UsageFault = (message) => new BridgeHandoffUsageError(message);
+
+const parseArgs = (argv: string[], usage: UsageFault = cliUsage): { mode: string; flags: Map<string, string>; command: string[] } => {
   const [mode = "", ...rest] = argv;
   const flags = new Map<string, string>();
   const split = rest.indexOf("--");
@@ -38,15 +52,15 @@ const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; 
   for (let index = 0; index < own.length; index += 2) {
     const flag = own[index]!;
     const value = own[index + 1];
-    if (!flag.startsWith("--") || value === undefined) throw new Error(`Bad argument: ${flag}\n${USAGE}`);
+    if (!flag.startsWith("--") || value === undefined) throw usage(`Bad argument: ${flag}`);
     flags.set(flag.slice(2), value);
   }
   return { mode, flags, command: split >= 0 ? rest.slice(split + 1) : [] };
 };
 
-const required = (flags: Map<string, string>, name: string): string => {
+const required = (flags: Map<string, string>, name: string, usage: UsageFault = cliUsage): string => {
   const value = flags.get(name);
-  if (!value) throw new Error(`--${name} is required\n${USAGE}`);
+  if (!value) throw usage(`--${name} is required`);
   return value;
 };
 
@@ -71,13 +85,18 @@ export const transportCommand = (flags: Map<string, string>, command: string[]):
   ];
 };
 
-export const openBridgeStore = (root: string, flags: Map<string, string>, options: Pick<MeshStoreOptions, "stateBackend"> = {}): MeshStore => {
+export const openBridgeStore = (
+  root: string,
+  flags: Map<string, string>,
+  options: Pick<MeshStoreOptions, "stateBackend"> = {},
+  usage: UsageFault = (message) => new Error(message),
+): MeshStore => {
   const selected = flags.get("lock-protocol") ?? "1";
-  if (selected !== "1" && selected !== "2") throw new Error("--lock-protocol must be 1 or 2");
+  if (selected !== "1" && selected !== "2") throw usage("--lock-protocol must be 1 or 2");
   const capacity = flags.get("max-state-bytes");
   const maxStateBytes = capacity === undefined ? undefined : Number(capacity);
   if (maxStateBytes !== undefined && (!Number.isSafeInteger(maxStateBytes) || maxStateBytes < MAX_EVENT_BYTES * 2)) {
-    throw new Error(`--max-state-bytes must be a safe integer of at least ${MAX_EVENT_BYTES * 2}`);
+    throw usage(`--max-state-bytes must be a safe integer of at least ${MAX_EVENT_BYTES * 2}`);
   }
   return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
     lockProtocol: selected === "1" ? 1 : 2,
@@ -187,27 +206,27 @@ export const runBridge = async (
  * refused (nothing written), 2 usage.
  */
 const runHandoff = async (mode: string, flags: Map<string, string>, out: (value: unknown) => void): Promise<number> => {
-  const root = path.resolve(required(flags, "mesh"));
+  const root = path.resolve(required(flags, "mesh", handoffUsage));
   // A wrong path must fail, never become a new empty mesh holding a handoff.
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory() ||
     !["state.json", "state.db"].some((name) => fs.existsSync(path.join(root, name)))) {
     throw new BridgeHandoffUsageError(`Not a Fabric mesh directory: ${root}`);
   }
   // A root switched to SQLite is written there, whatever this environment selects.
-  const store = openBridgeStore(root, flags, readMeshStateMovedMarker(root) !== undefined ? { stateBackend: "sqlite" } : {});
+  const store = openBridgeStore(root, flags, readMeshStateMovedMarker(root) !== undefined ? { stateBackend: "sqlite" } : {}, handoffUsage);
   try {
     if (mode === "handoff-list") {
       out({ ok: true, action: mode, handoffs: listHandoffs(store) });
       return 0;
     }
-    const id = handoffRootId(required(flags, "session"));
+    const id = handoffRootId(required(flags, "session", handoffUsage));
     if (mode === "handoff-revoke") {
       const removed = await revokeHandoff(store, id);
       out({ ok: true, action: mode, id, removed: removed ?? null,
         message: removed ? `handoff of native identity ${id} revoked` : `no handoff of native identity ${id}` });
       return 0;
     }
-    const link = required(flags, "link");
+    const link = required(flags, "link", handoffUsage);
     try {
       const result = await handOffNativeIdentity(store, {
         session: id, link, operator: flags.get("operator") ?? process.env.SUDO_USER ?? os.userInfo().username,
@@ -231,16 +250,19 @@ export const main = async (
   argv: string[],
   out: (value: unknown) => void = (value) => void process.stdout.write(`${JSON.stringify(value, null, 2)}\n`),
 ): Promise<number> => {
-  const { mode, flags, command } = parseArgs(argv);
-  if (mode === "handoff" || mode === "handoff-revoke" || mode === "handoff-list") {
+  const synopsis = HANDOFF_USAGE.get(argv[0] ?? "");
+  if (synopsis !== undefined) {
+    const mode = argv[0]!;
     try {
-      return await runHandoff(mode, flags, out);
+      // A missing or malformed flag is a usage error too: one JSON object, exit 2, nothing written.
+      return await runHandoff(mode, parseArgs(argv, handoffUsage).flags, out);
     } catch (error) {
       if (!(error instanceof BridgeHandoffUsageError)) throw error;
-      out({ ok: false, action: mode, message: `usage: ${error.message}` });
+      out({ ok: false, action: mode, message: `usage: ${error.message}`, usage: synopsis });
       return 2;
     }
   }
+  const { mode, flags, command } = parseArgs(argv);
   if (mode === "agent") {
     await runAgent(flags);
     return 0;

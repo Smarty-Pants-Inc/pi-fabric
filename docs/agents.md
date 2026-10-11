@@ -360,6 +360,14 @@ entries are skipped independently with one counted `worker_warning` per entry;
 these warnings also appear in the run receipt. Pi remains responsible for loading
 the supplied extension modules.
 
+The replay fails closed. If the profile's `settings.json` exists but cannot be
+read or is not a JSON object, Fabric refuses to launch the task: the run fails
+before the launcher starts, with an error naming the settings file and the
+reason (never its contents), and the worker log records a
+`fabric_profile_extensions_refused` event. A missing `settings.json` means no
+profile configuration, so there is nothing to replay and the task launches.
+Native `cli.js` launchers are unaffected.
+
 ### Choose the child's language
 
 `agents.run`, `agents.spawn`, `agents.create`, and `agents.handoff` accept `kernel: "typescript" | "python" | "inherit"`. Omit it or use `"inherit"` to inherit the caller's `executor.kernel`; use a concrete value so a skill or model can choose its strongest language for the task. Workflow agents, `rlm.query`, and council members/synthesis forward the same option. This selects the **child's** Fabric language, not the language of the current `fabric_exec` program; that program still uses its configured kernel.

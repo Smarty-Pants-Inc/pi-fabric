@@ -40,27 +40,51 @@ const filter = (files: string[], patterns: string[], base: string): string[] => 
   });
 };
 
+/** The selected profile's settings.json exists but cannot be read or parsed.
+ * An opaque launcher runs with --no-extensions, so continuing would start the
+ * task without the profile's guard extensions: refuse instead (fail closed).
+ * The message names the file and a fixed reason only, never file contents or
+ * parser snippets (which can echo secrets).
+ */
+export class ProfileSettingsError extends Error {
+  readonly settingsFile: string;
+  readonly reason: string;
+  constructor(settingsFile: string, reason: string) {
+    super(`Refusing to launch the task: profile settings ${settingsFile} ${reason}. The custom Pi launcher runs with --no-extensions, so the profile's guard extensions would not load; fix the settings file`);
+    this.name = "ProfileSettingsError";
+    this.settingsFile = settingsFile;
+    this.reason = reason;
+  }
+}
+
 /** Opaque launchers cannot expose Pi's pre-load discovery API. Replay only the
  * selected personal profile's explicit extensions/packages, never auto-discovery
  * or project resources (whose trust boundary belongs to Pi). Filesystem discovery
  * mirrors Pi's path bases, manifests, conventional directories and filters; it
  * neither imports extension code/a peer SDK nor installs missing packages.
+ * A missing settings.json has nothing to replay. Settings that exist but cannot
+ * be read or are not a JSON object throw {@link ProfileSettingsError}.
  */
 export const resolveProfileExtensions = (pinnedFabricPath: string, environment: NodeJS.ProcessEnv = process.env): ProfileExtensions => {
   const paths: string[] = [];
   const warnings = new Map<string, string>();
   const warn = (entry: string, reason: string): void => { if (!warnings.has(entry)) warnings.set(entry, `Profile extension ${entry} skipped: ${reason}`); };
   let profile: string;
-  let settings: Record<string, unknown>;
-  try {
-    profile = path.resolve(resolveAgentDir(environment.PI_CODING_AGENT_DIR ?? ""));
-    const parsed: unknown = JSON.parse(fs.readFileSync(path.join(profile, "settings.json"), "utf8").replace(/^\uFEFF/, ""));
-    if (!record(parsed)) throw new Error("invalid settings");
-    settings = parsed;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") warn("settings.json", "unreadable or invalid settings");
-    return { paths, names: [], warnings: [...warnings.values()] };
+  try { profile = path.resolve(resolveAgentDir(environment.PI_CODING_AGENT_DIR ?? "")); }
+  catch { throw new ProfileSettingsError("settings.json", "cannot be located (PI_CODING_AGENT_DIR does not resolve to a profile directory)"); }
+  const settingsFile = path.join(profile, "settings.json");
+  let text: string;
+  try { text = fs.readFileSync(settingsFile, "utf8"); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { paths, names: [], warnings: [] }; // No profile config: nothing to replay.
+    throw new ProfileSettingsError(settingsFile, `cannot be read${typeof code === "string" && /^E[A-Z0-9]+$/.test(code) ? ` (${code})` : ""}`);
   }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text.replace(/^\uFEFF/, "")); }
+  catch { throw new ProfileSettingsError(settingsFile, "is not valid JSON"); }
+  if (!record(parsed)) throw new ProfileSettingsError(settingsFile, "is not a JSON object");
+  const settings = parsed;
   const pinned = real(pinnedFabricPath);
   const isFabric = (file: string): boolean => {
     if (real(file) === pinned || fabricResourceRoot(file, "extensions")) return true;

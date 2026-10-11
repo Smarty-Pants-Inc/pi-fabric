@@ -457,8 +457,22 @@ const main = async (): Promise<void> => {
   }
   if (opaqueFabricLauncher && options.extensions && !options.residentStartupProbe) {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/profile-extensions.ts" : "./worker/profile-extensions.js";
-    const { resolveProfileExtensions } = await import(profileModule) as typeof import("./worker/profile-extensions.js");
-    const profile = resolveProfileExtensions(pinnedFabricExtension!);
+    const { resolveProfileExtensions, ProfileSettingsError } = await import(profileModule) as typeof import("./worker/profile-extensions.js");
+    let profile: ReturnType<typeof resolveProfileExtensions>;
+    try { profile = resolveProfileExtensions(pinnedFabricExtension!); }
+    catch (error) {
+      if (!(error instanceof ProfileSettingsError)) throw error;
+      // Fail closed: this launcher runs with --no-extensions, so unreadable or
+      // invalid profile settings would start the task without its guards.
+      appendLog(`${JSON.stringify({ type: "fabric_profile_extensions_refused", settingsFile: error.settingsFile, reason: error.reason })}\n`);
+      record.status = "failed"; record.error = error.message;
+      record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+      writeRunRecord(options.statusFile, record); terminalWritten = true;
+      await executionSettled();
+      await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
+      process.exitCode = 1;
+      return;
+    }
     for (const extension of profile.paths) piArguments.push("-e", extension);
     for (const [index, warning] of profile.warnings.entries()) {
       record.warnings = [...(record.warnings ?? []), warning];

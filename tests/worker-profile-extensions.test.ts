@@ -7,19 +7,37 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { resolveProfileExtensions } from "../src/worker/profile-extensions.js";
+import { ProfileSettingsError, resolveProfileExtensions } from "../src/worker/profile-extensions.js";
 import { resolveRetrySdk } from "../src/worker/retry-profile.js";
 import { recoveryTimeScale } from "../src/worker/recovery-watchdog.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const servers: http.Server[] = [];
+const locked: string[] = [];
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   vi.restoreAllMocks(); vi.unstubAllEnvs();
+  for (const file of locked.splice(0)) fs.chmodSync(file, 0o600);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
+const SECRET = "SECRET-SENTINEL-8606";
+/** Writes a settings.json the resolver must refuse; returns the expected reason. */
+const brokenSettings = (profile: string, mode: string): string => {
+  const file = path.join(profile, "settings.json");
+  if (mode === "malformed") { fs.writeFileSync(file, `{"apiKey": "${SECRET}"`); return "is not valid JSON"; }
+  if (mode === "wrong-shape") { fs.writeFileSync(file, JSON.stringify([SECRET])); return "is not a JSON object"; }
+  if (mode === "directory") { fs.mkdirSync(file); return "cannot be read (EISDIR)"; }
+  // unreadable: a real file whose read permission is removed.
+  fs.writeFileSync(file, JSON.stringify({ apiKey: SECRET, extensions: [] })); fs.chmodSync(file, 0o000); locked.push(file);
+  return "cannot be read (EACCES)";
+};
+/** Windows ignores POSIX read bits and root bypasses them: there is no permission failure to observe. */
+const chmodIneffective = (file: string): string | undefined => {
+  try { fs.readFileSync(file); } catch { return undefined; }
+  return `chmod 000 left settings.json readable on ${process.platform}${process.getuid?.() === 0 ? " as root" : ""}; permission refusal cannot be observed`;
+};
 const fixture = () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-profile-extensions-"))); roots.push(root);
   const profile = path.join(root, "profile"); fs.mkdirSync(profile);
@@ -155,11 +173,18 @@ describe("opaque profile extension resolution", () => {
     expect(result.paths).toEqual([valid]); expect(result.warnings).toHaveLength(3);
     expect(result.warnings.some(warning => warning.includes("cyclic"))).toBe(true);
   });
-  it.each(["missing", "malformed", "wrong-shape"])("does not throw for %s profile settings", mode => {
-    const f = fixture();
-    if (mode === "malformed") fs.writeFileSync(path.join(f.profile, "settings.json"), "{");
-    if (mode === "wrong-shape") f.settings([]);
-    expect(profileResult(f)).toEqual({ paths: [], names: [], warnings: mode === "missing" ? [] : ["Profile extension settings.json skipped: unreadable or invalid settings"] });
+  it("treats missing profile settings as nothing to replay", () => {
+    expect(profileResult(fixture())).toEqual({ paths: [], names: [], warnings: [] });
+  });
+  it.for(["malformed", "wrong-shape", "directory", "unreadable"])("fails closed for %s profile settings, naming the file but not its contents", (mode, ctx) => {
+    const f = fixture(); const file = path.join(f.profile, "settings.json");
+    const reason = brokenSettings(f.profile, mode);
+    if (mode === "unreadable") { const why = chmodIneffective(file); if (why) ctx.skip(why); }
+    let thrown: unknown;
+    try { profileResult(f); } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(ProfileSettingsError);
+    expect(thrown).toMatchObject({ settingsFile: file, reason, message: new ProfileSettingsError(file, reason).message });
+    expect((thrown as Error).message).toContain(file); expect((thrown as Error).message).not.toContain(SECRET);
   });
 });
 
@@ -193,12 +218,31 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     expect(result.status, result.error).toBe("completed"); const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
     expect(argv).toContain("--no-extensions"); expect(argv).not.toContain(guard); expect(events(result.logFile!).some(event => event.type === "fabric_profile_extensions")).toBe(false);
   });
-  it("starts despite malformed settings and records one counted warning", async () => {
+  it.for(["malformed", "unreadable"])("refuses the launch for %s profile settings before the launcher runs", async (mode, ctx) => {
     const f = fixture(); installWorker(f); fs.writeFileSync(f.pinned, "export default function() {}\n");
-    fs.writeFileSync(path.join(f.profile, "settings.json"), "{");
-    const result = await managerFor(f, shim(f, path.resolve("tests/fixtures/fake-pi-rpc.mjs"))).run({ task: "malformed settings", transport: "process", extensions: true, tools: [] });
-    expect(result.status, result.error).toBe("completed"); expect(result.warnings).toEqual(["Profile extension settings.json skipped: unreadable or invalid settings"]);
-    expect(events(result.logFile!).find(event => event.type === "fabric_profile_extensions")).toMatchObject({ loadedCount: 0, skippedCount: 1 });
+    const file = path.join(f.profile, "settings.json");
+    const reason = brokenSettings(f.profile, mode);
+    if (mode === "unreadable") { const why = chmodIneffective(file); if (why) ctx.skip(why); }
+    const argvFile = path.join(f.root, "argv.json");
+    const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
+    const result = await managerFor(f, shim(f, recorder)).run({ task: `${mode} settings`, transport: "process", extensions: true, tools: [] });
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(new ProfileSettingsError(file, reason).message); expect(result.error).not.toContain(SECRET);
+    expect(fs.existsSync(argvFile)).toBe(false);
+    const log = events(result.logFile!);
+    expect(log.filter(event => event.type === "fabric_profile_extensions_refused")).toEqual([{ type: "fabric_profile_extensions_refused", settingsFile: file, reason }]);
+    expect(log.some(event => event.type === "fabric_profile_extensions")).toBe(false);
+    expect(JSON.stringify(log)).not.toContain(SECRET);
+  });
+  it("launches with missing profile settings: nothing to replay", async () => {
+    const f = fixture(); const parent = installWorker(f); fs.writeFileSync(f.pinned, "export default function() {}\n");
+    const argvFile = path.join(f.root, "argv.json");
+    const recorder = f.file("argv-recorder.mjs", `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2))); await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc.mjs")).href)});`);
+    const result = await managerFor(f, shim(f, recorder)).run({ task: "missing settings", transport: "process", extensions: true, tools: [] });
+    expect(result.status, result.error).toBe("completed"); expect(result.warnings ?? []).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(argvFile, "utf8"))).toEqual(["--mode", "rpc", "--session", path.join(path.dirname(result.logFile!), "session.jsonl"), "--no-extensions",
+      "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "--no-tools", "--thinking", "medium"]);
+    expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: [], loadedCount: 0, skippedCount: 0 }]);
   });
   it.each(["shim", "native"])("%s real Pi process preserves the profile guard (native argv remains unchanged)", async launch => {
     const f = fixture(); const parent = installWorker(f);

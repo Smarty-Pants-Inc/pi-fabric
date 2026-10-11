@@ -102,11 +102,11 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     const committed = fs.readFileSync(decisionPath, "utf8");
     const ack = JSON.parse(fs.readFileSync(ackPath, "utf8"));
     const command: ResidentCommand = { format: 3, requestId, rootId, operation: "createActor", request, createdAt: ack.completedAt };
-    await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
+    await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS", ownerIncarnation: host.control.incarnation }, client.hostId);
     await waitFor(() => host.agents.listForUi().some(run => run.actorId === actor.id && "turns" in run && run.turns > 0));
     const writer = host.agents.listForUi().find(run => run.actorId === actor.id)!;
     expect(writer.status).toBe("running");
-    expect(await control.request(client.hostId, actor.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
+    expect(await control.request(client.hostId, actor.id, "stop", { ownerIncarnation: host.control.incarnation }, client.hostId)).toMatchObject({ acknowledged: true });
     expect(await client.actorStatus(actor.id)).toMatchObject({ id: actor.id, status: "stopped" });
     expect(host.agents.status(writer.id)).toMatchObject({ status: "running", actorId: actor.id, turns: 3 });
 
@@ -130,7 +130,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
     expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
 
     // Stop only the original fixture worker through the same public route; stop joins physical exit.
-    expect(await control.request(client.hostId, writer.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
+    expect(await control.request(client.hostId, writer.id, "stop", { ownerIncarnation: host.control.incarnation }, client.hostId)).toMatchObject({ acknowledged: true });
     await waitFor(() => host.actors.inFlightCount() === 0);
     expect(host.agents.status(writer.id).status).toBe("stopped");
     // Actor drain/logical stop may precede the native-close release on Windows.
@@ -243,14 +243,14 @@ it.skipIf(process.platform === "win32").each([
     const committed = fs.readFileSync(decisionPath, "utf8");
     const ack = JSON.parse(fs.readFileSync(ackPath, "utf8"));
     const command: ResidentCommand = { format: 3, requestId, rootId, operation: "createActor", request, createdAt: ack.completedAt };
-    await control.request(client.hostId, actor.id, "followUp", { message: "start nested writer", data: { primaryCrashPath: crash, nestedReleasePath: release, nestedObservationPath: observation } }, client.hostId);
+    await control.request(client.hostId, actor.id, "followUp", { message: "start nested writer", ownerIncarnation: host.control.incarnation, data: { primaryCrashPath: crash, nestedReleasePath: release, nestedObservationPath: observation } }, client.hostId);
     await waitFor(() => fs.existsSync(observation) && host.agents.listForUi().some(run => run.actorId === actor.id && "turns" in run && run.turns > 0));
     const writer = host.agents.listForUi().find(run => run.actorId === actor.id)!;
     const child = JSON.parse(fs.readFileSync(observation, "utf8")) as { id: string; pid: number; statusFile: string };
     expect(Number.isSafeInteger(child.pid) && child.pid > 0).toBe(true);
     expect(processAlive(child.pid)).toBe(true);
     expect(JSON.parse(fs.readFileSync(child.statusFile, "utf8"))).toMatchObject({ id: child.id, status: "running", turns: 4 });
-    expect(await control.request(client.hostId, actor.id, "stop", {}, client.hostId)).toMatchObject({ acknowledged: true });
+    expect(await control.request(client.hostId, actor.id, "stop", { ownerIncarnation: host.control.incarnation }, client.hostId)).toMatchObject({ acknowledged: true });
     // Crash only the primary. A dead primary is not a tree-exit receipt: the
     // process transport retains the observed nested writer and the actor drain.
     fs.writeFileSync(crash, "crash");

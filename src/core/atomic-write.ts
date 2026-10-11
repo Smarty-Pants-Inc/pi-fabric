@@ -16,6 +16,30 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+export interface PhysicalHostIdentity { machineId: string; bootId: string }
+export const validBootId = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+/** Hostnames and mesh hostIds are labels, never evidence that a PID is local.
+ * Keep machine evidence independent of boot evidence: unreadable procfs must not erase locality. */
+export const readPhysicalMachineId = (): string | undefined => {
+  try {
+    const machineId = fs.readFileSync("/etc/machine-id", "utf8").trim().toLowerCase();
+    return /^[0-9a-f]{32}$/.test(machineId) ? machineId : undefined;
+  } catch { return undefined; }
+};
+
+/** Missing/unreadable boot identity is unknown, never evidence of a previous boot. */
+export const readPhysicalHostIdentity = (): PhysicalHostIdentity | undefined => {
+  const machineId = readPhysicalMachineId();
+  if (!machineId) return undefined;
+  try {
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().toLowerCase();
+    return validBootId(bootId) ? { machineId, bootId } : undefined;
+  } catch { return undefined; }
+};
+
+
 const DARWIN_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 
 /** Only identities from this platform's native reader are comparable; unknown stays live. */
@@ -125,6 +149,8 @@ export interface AtomicWriteOptions {
   // of times with linear backoff before surfacing the error.
   renameRetries?: number;
   renameRetryDelayMs?: number;
+  /** External ownership CAS after staging, immediately before EACH rename attempt. A throw leaves the target untouched. */
+  beforeRename?: () => void;
 }
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);
@@ -174,6 +200,7 @@ export const renameAtomic = (
   const attempts = Math.max(1, options?.renameRetries ?? 8);
   const delay = options?.renameRetryDelayMs ?? 25;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    options?.beforeRename?.(); // Validation errors are not transient rename failures.
     try {
       fs.renameSync(source, target);
       return;
@@ -648,6 +675,11 @@ export class MeshLockTimeoutError extends Error {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** A write that wrote nothing and may succeed later: a lock timeout, or a SQLite WAL-cap refusal
+ * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+export const isMeshWriteDeferred = (error: unknown): error is Error =>
+  isMeshLockTimeout(error) || (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+
 /** Best-effort protocol writes may swallow conflicts, but not a retryable lock wait. */
 export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   if (isMeshLockTimeout(error)) throw error;
@@ -692,7 +724,7 @@ export class MeshBackgroundRetry {
     this.#suppressed = 0;
   }
   failure(error: unknown): boolean {
-    const transient = isMeshLockTimeout(error);
+    const transient = isMeshWriteDeferred(error);
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
@@ -701,7 +733,9 @@ export class MeshBackgroundRetry {
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    this.#backoff(error, "mesh lock timeout; retrying", "mesh lock recovered");
+    // A lock timeout and a SQLite WAL-cap refusal (#835) are both deferred writes; each names
+    // its own cause in the retry line and shares the one #809 warning window.
+    this.#backoff(error, isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying", "mesh lock recovered");
     return true;
   }
 
@@ -720,8 +754,8 @@ export class MeshBackgroundRetry {
     const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
     // At most one retry line per instance per window (default 60 s), even across
     // successful acquisitions: a flapping lock must not print one warning per short outage.
-    // The first warning is immediate and carries the holder diagnostics. Lock timeouts and
-    // explicitly admitted observed faults (fault()) share this window.
+    // The first warning is immediate and carries the holder diagnostics. Lock timeouts,
+    // WAL-cap refusals (#835) and explicitly admitted observed faults (fault()) share this window.
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";

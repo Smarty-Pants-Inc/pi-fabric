@@ -32,7 +32,7 @@ import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
@@ -98,7 +98,7 @@ const FAULT_RETRY_MAX_MS = 5_000;
 const DELIVERY_MAX_ATTEMPTS = 8;
 // Admission pressure/reload and transient storage faults can recover without a new
 // notification. Unknown errors (including validation/refusal) never earn a timer.
-const isRetryableDeliveryError = (error: unknown): boolean => isMeshLockTimeout(error) ||
+const isRetryableDeliveryError = (error: unknown): boolean => isMeshWriteDeferred(error) ||
   (error instanceof Error && (/Main(?:'s)?(?:.*followUp queue is full| busy)|no follow-up journal open|(?:journal|inbox).*closed|closed.*(?:journal|inbox)|^Main could not record the (?:message|followUp):|barrier.*(?:unavailable|closed)/i.test(error.message) ||
     ["EAGAIN", "EBUSY", "EINTR", "ETIMEDOUT", "EMFILE", "ENFILE", "EIO"].includes((error as NodeJS.ErrnoException).code ?? "")));
 /** Exact inputs a faulted delivery pass retains; delivery retries own only their keys. */
@@ -1712,7 +1712,9 @@ export class ResidencyClient {
             this.#deliveryAttempts.set(entry.key, DELIVERY_MAX_ATTEMPTS);
             this.#faultObligation?.deliveries.delete(entry.key);
           }
-          if (isMeshLockTimeout(error)) throw error;
+          // Back off a locked or WAL-capped mesh (#835); retain ordinary failed senders
+          // without blocking the other entries in this pass.
+          if (isMeshWriteDeferred(error)) throw error;
           fault ??= error;
         }
       }
@@ -1725,7 +1727,7 @@ export class ResidencyClient {
       // Keep failed work as owned obligations: its next notification/receipt, or one
       // bounded fault retry of exactly these inputs, never an idle all-mesh drain.
       for (const key of receiptKeys) this.#pendingDeliveries.add(key);
-      if (isMeshLockTimeout(error)) {
+      if (isMeshWriteDeferred(error)) {
         const obligation = this.#faultObligationState();
         // The outage may have interrupted discovery itself: retain its exact inputs.
         obligation.mesh ||= meshDirty;
@@ -1745,7 +1747,7 @@ export class ResidencyClient {
         for (const claim of claims) { this.#claimEntries.delete(claim.key); obligation.claims.add(claim.key); }
         for (const key of claimKeys) obligation.claims.add(key);
       }
-      if (isMeshLockTimeout(error)) throw error; // Let the owned background retry back off the outage.
+      if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
       if (diagnostic !== this.#completionFault) console.warn(diagnostic);
       this.#completionFault = diagnostic;

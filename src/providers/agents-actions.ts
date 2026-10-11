@@ -22,7 +22,7 @@ const runProperties = {
     type: "string",
     pattern: RUNNER_ID_SOURCE,
     maxLength: 64,
-    description: "Execution harness: pi-durable (default), pi, claude, veda, or a runner registered through pi-fabric/runners. Defaults to agents.runner.",
+    description: "Execution harness: pi (default), pi-durable (opt-in isolated durable Pi host), claude, veda, or a runner registered through pi-fabric/runners. Defaults to agents.runner.",
   },
   kernel: {
     type: "string",

@@ -293,7 +293,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
   },
   "agents": {
     "enabled": true,
-    "runner": "pi-durable",
+    "runner": "pi",
     "transport": "process",
     "claude": {
       "binary": "claude"

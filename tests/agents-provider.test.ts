@@ -2219,7 +2219,9 @@ describe("AgentsProvider runner support", () => {
     const runProperties = (run?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     const spawnProperties = (spawn?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     for (const properties of [runProperties, spawnProperties]) {
-      expect(properties.runner?.description).toContain("pi, claude, veda");
+      expect(properties.runner?.description).toContain("claude, veda");
+      // Fork default: pi; pi-durable is opt-in (PR #864 review).
+      expect(properties.runner?.description).toMatch(/^Execution harness: pi \(default\), pi-durable \(opt-in/);
       expect(new RegExp(properties.runner!.pattern!).test("veda")).toBe(true);
       expect(new RegExp(properties.runner!.pattern!).test("Bad Runner")).toBe(false);
     }

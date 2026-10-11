@@ -114,6 +114,11 @@ if (process.platform === "linux") {
   if (!pinned && (manifest.toolchain !== "unpinned" || !/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? "")))) {
     throw new Error(`Native manifest names no pinned zig and no unpinned gcc or clang compiler: ${manifest.toolchain} ${manifest.compiler}`);
   }
+  // CI and release builds ship the helpers: only a local development build may stay on the host compiler.
+  if (!pinned && (process.env.CI === "true" || process.env.FABRIC_NATIVE_CC_PINNED === "1")) {
+    throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
+  }
+  if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
   for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {

@@ -115,6 +115,25 @@ describe("FabricToolOwnership", () => {
 
     expect(ownership.release()).toBe(false);
   });
+
+  it("a repeated release never reads an invalidated host (Pi 0.87 overlapping reload, smarty-dev#8588)", () => {
+    const state = hostWith(["read", "custom_tool"]);
+    let stale = false;
+    const host = {
+      getActiveTools: () => { if (stale) throw new Error("This extension ctx is stale after session replacement or reload."); return state.host.getActiveTools(); },
+      setActiveTools: (names: string[]) => { if (stale) throw new Error("stale"); state.host.setActiveTools(names); },
+    };
+    const ownership = new FabricToolOwnership(host);
+    ownership.apply(true);
+    // First session_shutdown restores while the generation is live; Pi then invalidates it and
+    // emits session_shutdown to the same generation again for the overlapping second reload.
+    expect(ownership.release()).toBe(true);
+    stale = true;
+    expect(() => ownership.release()).not.toThrow();
+    expect(ownership.release()).toBe(false);
+    // Never owned anything: no host read at all.
+    expect(new FabricToolOwnership(host).release()).toBe(false);
+  });
 });
 
 describe("createToolOwnershipReassertion", () => {

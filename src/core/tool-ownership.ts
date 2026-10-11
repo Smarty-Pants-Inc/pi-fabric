@@ -177,7 +177,10 @@ export class FabricToolOwnership {
     return this.#setIfChanged(active, next);
   }
 
+  /** Idempotent: with nothing saved it never reads the host, so a repeated session_shutdown
+   * on an already invalidated generation (Pi 0.87's overlapping reload) cannot hit its stale API. */
   release(): boolean {
+    if (!this.#savedNativeCoreTools && this.#savedHiddenExtensionTools.size === 0) return false;
     return this.#restore(this.host.getActiveTools());
   }
 

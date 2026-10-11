@@ -5,6 +5,7 @@ import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
@@ -479,9 +480,8 @@ const meshSweepSlot = (name: string): number | undefined => {
   const match = name.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(name.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
   return match ? Number(match[1]) : undefined;
 };
-/** Whether a slot file names a sweep that is provably still running: its recorded sweeper pid is alive and its
- * /proc start time is read and equals the recorded one. Anything else (no sweeper recorded, a torn or foreign file, an
- * unreadable start time, a reused pid) does not block, so a lost claim can never stop retention for good. */
+/** Diagnostics only (pi-fabric#883 SEC P1): whether a slot file names a sweeper whose pid and /proc start time still
+ * match. It only keeps that slot file from being dropped; single flight is the sweep lock (lockMeshRetentionSweep). */
 const liveMeshSweeper = (file: string): boolean => {
   const claim = readJson<{ sweeper?: { pid?: unknown; startTime?: unknown } }>(file, 4096);
   const pid = claim?.sweeper?.pid, startTime = claim?.sweeper?.startTime;
@@ -491,19 +491,14 @@ const liveMeshSweeper = (file: string): boolean => {
 /**
  * Claim this interval's mesh-wide sweep. Exactly one process per mesh wins a slot: the claim
  * is an exclusive create of the slot's file, so two owners never both start a sweep in the
- * same interval. Single flight (smarty-dev#7916, measured on Ryzen 1: a sweep can outlast its interval): no claim
- * while any other slot file names a provably live sweeper (recordMeshRetentionSweeper). Other slot files, but the
- * previous one, are dropped once a newer slot is claimed, unless their sweeper still runs.
+ * same interval. Single flight across slots (a sweep can outlast its interval, smarty-dev#7916) is the sweep lock,
+ * taken before this claim (lockMeshRetentionSweep). Other slot files, but the previous one, are dropped once a newer
+ * slot is claimed, unless their recorded sweeper still runs.
  */
 export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, now = Date.now()): boolean => {
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
   const slot = Math.floor(now / intervalMs);
   const name = `${MESH_RETENTION_SWEEP_PREFIX}${slot}.json`;
-  try {
-    for (const other of fs.readdirSync(meshRoot)) {
-      if (other !== name && meshSweepSlot(other) !== undefined && liveMeshSweeper(path.join(meshRoot, other))) return false;
-    }
-  } catch { /* unlisted: no proof of a live sweep; claim as before */ }
   try {
     const fd = fs.openSync(path.join(meshRoot, name), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
     try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, claimedAt: now })); } finally { fs.closeSync(fd); }
@@ -520,8 +515,42 @@ export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, no
   } catch { /* stale slot files are tiny; the next claim retries */ }
   return true;
 };
-/** Record the sweep process this slot's claim started (its pid and /proc start time), so the next slot's claim can
- * tell whether it still runs. No readable start time: nothing is recorded, and the next claim is not blocked. */
+/** The mesh retention sweep's lock file (pi-fabric#883 SEC P1). */
+export const MESH_RETENTION_SWEEP_LOCK = ".mesh-retention-sweep.lock";
+/**
+ * Single flight of the mesh retention sweep (pi-fabric#883 SEC P1): an exclusive flock(2) on the lock file, taken
+ * before the slot claim. Returns the locked descriptor, which the claimer passes to the sweep process (inherited as
+ * fd 3) and then closes, so the SWEEP holds the lock from its first instruction until it exits; a crash releases it.
+ * "busy": a sweep holds it, skip. Throws when the lock state is uncertain (flock missing, an open or ownership
+ * error, an unexpected exit): the caller does not sweep and alarms.
+ */
+// ponytail: reuses residency/file-lock.ts lockFile (util-linux flock(1) on an inherited open file description, the
+// resident host's lock) instead of a native addon or wrapping the sweep in `flock`: the descriptor is handed to the
+// sweep, so the kernel ties the lock to the sweep's lifetime without any pid record.
+export const lockMeshRetentionSweep = async (meshRoot: string): Promise<number | "busy"> => {
+  try { return await lockFile(path.join(meshRoot, MESH_RETENTION_SWEEP_LOCK), 0); }
+  catch (error) { if (error instanceof FileLockBusy) return "busy"; throw error; }
+};
+/**
+ * The only way a mesh retention sweep starts (pi-fabric#883 SEC/CODE P1): a successful non-blocking lock, then this
+ * interval's slot claim, then `start(lockFd)`, which must hand the descriptor to the sweep process. The descriptor is
+ * closed here afterwards, so only the sweep keeps the lock. No record, an unreadable or failed record, or a scan
+ * error never leads to a sweep: "busy" (a sweep holds the lock), "claimed" (this slot already ran), or "uncertain"
+ * (the lock state is unknown; the caller alarms). Skipping a daily sweep is safe.
+ */
+export const startLockedMeshRetentionSweep = async (meshRoot: string, intervalMs: number, start: (lockFd: number) => void,
+  now = Date.now()): Promise<"started" | "busy" | "claimed" | { uncertain: string }> => {
+  let lock: number | "busy";
+  try { lock = await lockMeshRetentionSweep(meshRoot); }
+  catch (error) { return { uncertain: error instanceof Error ? error.message : String(error) }; }
+  if (lock === "busy") return "busy";
+  try {
+    if (!claimMeshRetentionSweep(meshRoot, intervalMs, now)) return "claimed";
+    start(lock);
+    return "started";
+  } finally { fs.closeSync(lock); }
+};
+/** Diagnostics only: record the sweep process this slot's claim started (its pid and /proc start time). */
 export const recordMeshRetentionSweeper = (meshRoot: string, intervalMs: number, pid: number, now: number): void => {
   const startTime = processStartTime(pid);
   if (startTime === undefined) return;

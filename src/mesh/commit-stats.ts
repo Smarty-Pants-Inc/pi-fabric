@@ -491,6 +491,27 @@ const readRegularFile = (file: string): string => {
   } finally { fs.closeSync(descriptor); }
 };
 
+/** Bytes of a stats file's tail that hold its newest minutes (two full minutes are under 4 KiB). */
+const LOCK_STATS_PEEK_BYTES = 8192;
+/**
+ * The newest minute before `current` in a stats file, from a bounded tail read: -1 when the file
+ * holds none, undefined when the tail cannot tell. `minutes` is the last key and sorted, and
+ * JSON escapes every quote inside a string, so these patterns match only the array itself.
+ */
+const peekNewestCompleteMinute = (file: string, current: number): number | undefined => {
+  try {
+    const descriptor = fs.openSync(file, READ_FLAGS);
+    try {
+      const { size } = fs.fstatSync(descriptor);
+      const buffer = Buffer.alloc(Math.min(size, LOCK_STATS_PEEK_BYTES));
+      const tail = buffer.toString("utf8", 0, fs.readSync(descriptor, buffer, 0, buffer.length, size - buffer.length));
+      let newest = -1;
+      for (const [, minute] of tail.matchAll(/\{"minute":(\d+),/g)) if (+minute! < current) newest = Math.max(newest, +minute!);
+      return newest >= 0 || tail.includes("\"minutes\":[") ? newest : undefined;
+    } finally { fs.closeSync(descriptor); }
+  } catch { return undefined; }
+};
+
 /** Start of a window of `span` complete minutes before `now`, the current minute included. */
 const lockStatsWindowStartMs = (now: number, span: number): number => (Math.floor(now / 60_000) - span) * 60_000;
 
@@ -514,17 +535,24 @@ export const readLockStats = (root: string, problems: string[] = [],
   // window is summarizeLockStats's exactly: the `span` complete minutes before the current one.
   const span = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(options.minutes ?? LOCK_STATS_RETAIN_MINUTES)));
   const since = lockStatsWindowStartMs(options.now ?? Date.now(), span);
-  const candidates: Array<{ name: string; mtimeMs: number }> = [];
+  let candidates: Array<{ name: string; mtimeMs: number; regular: boolean }> = [];
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     try {
-      const { mtimeMs } = fs.lstatSync(path.join(directory, name));
-      if (mtimeMs >= since) candidates.push({ name, mtimeMs });
+      const stat = fs.lstatSync(path.join(directory, name));
+      if (stat.mtimeMs >= since) candidates.push({ name, mtimeMs: stat.mtimeMs, regular: stat.isFile() });
     } catch (error) {
       if (errorCodeOf(error) !== "ENOENT") problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Over the cap, a file that provably holds no complete minute of the window (only the current,
+  // incomplete one, say) takes no slot (smarty-dev#7894). Only then: the usual case reads no more.
+  if (candidates.length > LOCK_STATS_MAX_FILES) {
+    const current = Math.floor(since / 60_000) + span;
+    candidates = candidates.filter(({ name, regular }) =>
+      !regular || (peekNewestCompleteMinute(path.join(directory, name), current) ?? current) >= current - span);
+  }
   if (candidates.length > LOCK_STATS_MAX_FILES) {
     problems.push(`${directory}: ${candidates.length} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`);
     candidates.length = LOCK_STATS_MAX_FILES;

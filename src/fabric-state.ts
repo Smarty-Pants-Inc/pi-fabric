@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RootInboxBatch, RootInboxSession } from "./topology/root-inbox.js";
+import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -10,6 +10,7 @@ import {
   FABRIC_COMPONENT_PROVIDER_NAMES,
   FABRIC_PROVIDER_COMPONENT_PREFIX,
 } from "./components/provider-component.js";
+import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import type { FabricOwnedModelGuidance } from "./components/model-guidance.js";
 import type { FabricComponentGraph } from "./components/types.js";
 import {
@@ -68,6 +69,15 @@ export interface FabricStateOptions {
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
   entryIdentity?: FabricLoadedFileIdentity;
 }
+
+// Survives extension generations (reload, session replacement) in this Pi process.
+// A shared mesh is not a session scope: unrelated cwds must not inherit a Main's re-arm hint.
+const PUBLISHED_MAIN_SCOPES = Symbol.for("pi-fabric.published-main-scopes.v1");
+const publishedMainScopes = (): Set<string> => {
+  const holder = globalThis as Record<symbol, Set<string> | undefined>;
+  return holder[PUBLISHED_MAIN_SCOPES] ??= new Set<string>();
+};
+const mainPresenceScope = (meshRoot: string, cwd: string): string => JSON.stringify([meshRoot, path.resolve(cwd)]);
 
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
 type ActivationFailureHook = () => void | Promise<void>;
@@ -279,11 +289,11 @@ export class FabricState {
     // Publish this Main in the shared participant directory at startup, so
     // peers can find and steer an idle session before it first uses Fabric.
     if (this.config.mesh.announce) return true;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ??
-      (this.config.mesh.root
-        ? path.resolve(projectRoot, this.config.mesh.root)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    const meshRoot = this.#meshRoot(context);
+    // Re-arm on session_start (smarty-dev#5962/#4313): a Main this process already published
+    // keeps its presence across /reload and session replacement. Its old heartbeat retired with
+    // the old ctx; waiting for first tool use let the lease lapse and the Main vanish silently.
+    if (publishedMainScopes().has(mainPresenceScope(meshRoot, context.cwd))) return true;
     const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const actorRoots = [
       path.join(meshRoot, "actors"),
@@ -309,10 +319,26 @@ export class FabricState {
     });
   }
 
+  #meshRoot(context: ExtensionContext): string {
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    return process.env.PI_FABRIC_MESH_ROOT ??
+      (this.config.mesh.root
+        ? path.resolve(projectRoot, this.config.mesh.root)
+        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+  }
+
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] { return this.#current()?.peerInfos(options) ?? []; }
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
-    return this.#current()?.nextRootInbox(session, idle);
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
+    return this.#current()?.nextRootInbox(session, idle, options);
+  }
+  /** Mark injected inbox events consumed, so no later turn injects them again (R-token-waste). */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    await this.#current()?.consumeRootInbox(ids, receipts);
+  }
+  /** Whether the root inbox acked this event (smarty-dev#8962): the context hook shows it once. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#current()?.rootInboxAcked(id, sequence) ?? false;
   }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
@@ -329,13 +355,22 @@ export class FabricState {
   componentGraph(): FabricComponentGraph {
     return this.#current()?.componentGraph() ?? { components: [], edges: [], cycles: [] };
   }
-  modelGuidance(): FabricOwnedModelGuidance[] { return this.#current()?.modelGuidance() ?? []; }
+  modelGuidance(): FabricOwnedModelGuidance[] {
+    // Built-in provider guidance is a pure function of configuration, so it is
+    // already available before (and independent of) runtime activation.
+    return this.#current()?.modelGuidance() ?? (this.#config && !this.#managedHost ? builtinModelGuidance(this.#config) : []);
+  }
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
     return this.#current()?.participantInfos(options) ?? [];
   }
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#current()?.mainOwnsProviderRecovery() ?? false;
+  }
+
   reportMainProviderError(message: string): Promise<unknown> {
     return this.#required().reportMainProviderError(message);
   }
@@ -583,6 +618,12 @@ export class FabricState {
         this.#runtime = candidate;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
+        try {
+          if (config.mesh.enabled && context.isProjectTrusted() &&
+            resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {
+            publishedMainScopes().add(mainPresenceScope(this.#meshRoot(context), context.cwd));
+          }
+        } catch { /* best-effort re-arm hint; the next first use still activates */ }
         return candidate;
       } catch (error) {
         try {

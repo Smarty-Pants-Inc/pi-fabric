@@ -3,6 +3,7 @@ import childProcess from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { FabricState } from "../src/fabric-state.js";
 import { FabricManagedHost } from "../src/managed-host.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { AgentService, createAgentServiceClient, createAgentServiceHandler, createAgentsProvider } from "../src/agents.js";
@@ -13,6 +14,20 @@ vi.mock("../src/agents/manager.js", async (importOriginal) => {
 });
 
 describe("managed runtime early composition", () => {
+  it("keeps native Jev guidance out of closed-world managed bootstrap", async () => {
+    const forbidden = () => { throw new Error("Ambient host access"); };
+    const pi = { events: { emit: vi.fn() } } as unknown as ExtensionAPI;
+    const context = {
+      cwd: "/not-a-real-hosted-directory", hasUI: false, ui: { setStatus: vi.fn() },
+      isProjectTrusted: forbidden,
+      sessionManager: new Proxy({}, { get: forbidden }),
+    } as unknown as ExtensionContext;
+    const state = new FabricState(pi, new CapturedToolCatalog(), { managedHost: { providers: [] } });
+    try {
+      await state.bootstrap(context);
+      expect(state.modelGuidance()).toEqual([]);
+    } finally { await state.shutdown(); }
+  });
   it("mounts hosted agents and reloads without native manager, filesystem, config, model-history or session access", async () => {
     const service = new AgentService({rootId: "root", port: {execute: async () => ({status: "completed", text: "hosted"})}});
     const provider = createAgentsProvider(createAgentServiceClient(createAgentServiceHandler(service, "root")));
@@ -33,6 +48,7 @@ describe("managed runtime early composition", () => {
     try {
       await runtime.initialize(context);
       expect(runtime.initialized).toBe(true);
+      expect(runtime.modelGuidance()).toEqual([]);
       expect(runtime.registry.has("cache")).toBe(false);
       const invocation = {cwd: context.cwd, signal: undefined, parentToolCallId: "test", nestedToolCallId: "nested", extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10000};
       expect(await runtime.registry.invoke("agents.run", {task: "hosted"}, invocation)).toMatchObject({status: "completed", text: "hosted"});

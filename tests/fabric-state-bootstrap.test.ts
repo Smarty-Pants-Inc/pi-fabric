@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { resolveFabricModelGuidance } from "../src/components/model-guidance.js";
 import { FabricState } from "../src/fabric-state.js";
 import type { FabricComponentDefinition, FabricProvider } from "../src/protocol.js";
 
@@ -324,6 +325,44 @@ describe("FabricState lazy bootstrap", () => {
     vi.unstubAllEnvs();
   });
 
+  it("re-arms a published Main only in its cwd, not an unrelated damaged-config session on the same mesh", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, ui: { toolDisplay: "full" } });
+    const other = project();
+    const harness = runtimeHarness();
+    const first = createState(harness.loader);
+    const replacement = createState(harness.loader);
+    const unrelated = createState(harness.loader);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", path.join(cwd, "shared-mesh"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    try {
+      const context = contextAt(cwd, "published-main");
+      await first.bootstrap(context);
+      expect(first.shouldEagerlyActivate(context)).toBe(false);
+      await first.ensure(context);
+      await first.shutdown("reload");
+
+      // Both a reload and /new in the same cwd retain the published heartbeat.
+      for (const sessionId of ["published-main", "replacement-main"]) {
+        const next = contextAt(cwd, sessionId);
+        await replacement.bootstrap(next);
+        expect(replacement.shouldEagerlyActivate(next)).toBe(true);
+      }
+
+      // The same process and mesh do not make another cwd a published Main.
+      fs.writeFileSync(path.join(other, ".pi", "fabric.json"), "{ damaged config");
+      const next = contextAt(other, "unrelated-main");
+      await unrelated.bootstrap(next);
+      expect(unrelated.config.ui.toolDisplay).toBe("compact");
+      expect(unrelated.shouldEagerlyActivate(next)).toBe(false);
+      expect(harness.loader).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([first.shutdown(), replacement.shutdown(), unrelated.shutdown()]);
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
   it("announces a trusted Main at startup only when mesh.announce is set", async () => {
     const quiet = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true } });
     const quietState = createState(runtimeHarness().loader);
@@ -539,5 +578,40 @@ describe("FabricState lazy bootstrap", () => {
     await state.shutdown();
     expect(runtime.shutdown).toHaveBeenCalled();
     expect(state.initialized).toBe(false);
+  });
+});
+
+describe("FabricState built-in model guidance", () => {
+  // The Jev block must be part of the first system prompt. Registering it only
+  // when the runtime activates rewrites the prompt suffix mid-session and drops
+  // the provider prefix cache for the whole conversation.
+  it("resolves the Jev guidance before the runtime activates", async () => {
+    const cwd = project();
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      expect(harness.instances).toEqual([]);
+      const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+        model: "probe/probe", target: "main",
+      });
+      expect(resolved.appendText).toContain("Jev supplies typed Choice");
+      expect(resolved.sources.map((source) => source.label)).toEqual(["jev-programs"]);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("omits the Jev guidance when disabled or under Schema enforce", async () => {
+    for (const config of [{ jev: { enabled: false } }, { schema: { mode: "enforce" } }]) {
+      const cwd = project(config);
+      const harness = runtimeHarness();
+      const state = createState(harness.loader);
+      try {
+        await state.bootstrap(contextAt(cwd));
+        const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+          model: "probe/probe", target: "main",
+        });
+        expect(resolved.appendText ?? "").not.toContain("Jev supplies");
+      } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+    }
   });
 });

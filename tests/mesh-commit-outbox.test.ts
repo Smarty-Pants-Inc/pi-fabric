@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox, withStateFence } from "../src/mesh/commit-outbox.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
+import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 
 // smarty-dev#6477 L2b: state-domain fences and the durable commit outbox (plan R3, R11).
 const roots: string[] = [];
@@ -46,6 +48,20 @@ describe("withStateFence", () => {
     await expect(withStateFence(other, identity, () => true, 0)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
     fs.rmSync(lock, { recursive: true, force: true });
     expect(await withStateFence(other, identity, () => true, 0)).toBe(true);
+  });
+
+  // smarty-dev#7451 item 8: a WAL-cap refusal wrote nothing, like a lock timeout, so the fence and the residency
+  // background retry (MeshBackgroundRetry) retry it with backoff instead of reporting it as a failure.
+  it("retries a WAL-cap refusal within its budget, and the background retry backs it off", async () => {
+    const mesh = store();
+    const refused = () => new MeshStateWalCapError(200 * 1024 * 1024, 96 * 1024 * 1024);
+    const tryLock = mesh.withTryLock.bind(mesh);
+    vi.spyOn(mesh, "withTryLock").mockImplementationOnce(async () => { throw refused(); }).mockImplementation(tryLock);
+    expect(await withStateFence(mesh, identity, () => "ran", 1_000)).toBe("ran");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const retry = new MeshBackgroundRetry("resident delivery", 100, 400);
+    expect(await retry.run(() => { throw refused(); })).toBe("retry");
+    expect(retry.waitMs).toBeGreaterThan(0);
   });
 });
 

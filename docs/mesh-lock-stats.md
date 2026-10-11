@@ -23,15 +23,16 @@ For each class and wall-clock minute: acquisitions, wait time (request to custod
 `withTryLock` scopes or an explicit zero-wait `exclusive`, which fail by design while the lock is
 busy). An ordinary write whose remaining budget ran out before custody is a timeout, not a try.
 
-Each process writes `<mesh>/lock-stats/<host>-<pid>.json` just after every minute in which it took
-the lock, and at exit. The file holds at most the last 60 complete minutes (the longest
+Each process writes `<mesh>/lock-stats/<host>-<pid>.json` on the next acquisition after a minute
+boundary, at exit, or on an explicit flush. A quiet process keeps its final samples in memory
+until one of those events; recording never schedules an idle timer. The file holds at most the last 60 complete minutes (the longest
 `--minutes` window) plus the current one and is replaced by an atomic
 rename, without fsync and without any lock. The temporary is a unique name created exclusively and
 never through a symlink (mode 0600). A `lock-stats` directory that is a symlink, not a directory,
 owned by another user or group/other-writable disables recording for that root, with one line in
 the profile's private `fabric-lock-stats.log` (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
-Files untouched for 24 hours are pruned. Nothing runs
-before a process's first acquisition. Set `PI_FABRIC_LOCK_STATS=0` to turn recording off for a
+Files untouched for 24 hours are pruned during a real flush, at most hourly; a quiet root is not
+polled for pruning. Nothing runs before a process's first acquisition. Set `PI_FABRIC_LOCK_STATS=0` to turn recording off for a
 process; test runs set it, and the lock-stats suites opt back in.
 
 ## Usage
@@ -50,7 +51,18 @@ The reader takes regular files only (no symlinks), at most 1 MiB each and 4096 f
 file only when every counter is a non-negative integer, every duration finite and non-negative,
 every histogram 14 buckets long and every class known. Other files are ignored with a warning on
 stderr; with a gate flag they also exit 3, so a gate never passes on files it could not read.
-Host labels are printed with control characters escaped.
+Host and writer labels are printed with control characters escaped.
+
+The file's optional `writer` object records the script basename (`argv1`),
+`PI_FABRIC_AGENT_NAME` (`agentName`), `PI_FABRIC_ACTOR_ID` (`actorId`),
+`PI_FABRIC_ACTOR_NAME` (`actorName`), `PI_FABRIC_ROLE` (`role`), `SMARTY_ROLE`
+(`smartyRole`), and the parent PID (`ppid`). These facts are captured once at the
+recorder's first acquisition and retained on every rewrite, so an exited writer
+stays attributable without a process scan. Unset or blank strings are omitted;
+strings are trimmed and limited to 128 characters. Files from older writers
+remain valid without this object. Malformed writer metadata fails a gate like
+malformed counters. The top-pids table shows a compact `writer` column; `--json`
+keeps the separate facts in `pids[].writer`.
 
 `PI_FABRIC_COMMIT_STATS` (commits and bytes by key family) and `PI_FABRIC_COMMIT_TRACE` (keys and
 callers) complement this view.

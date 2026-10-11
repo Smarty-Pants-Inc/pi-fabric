@@ -12,6 +12,8 @@ const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
 const peer: MeshIdentity = { id: "session:sender", name: "sender", kind: "main" };
 const HOUR = 60 * 60_000;
+const TOPIC = "fleet.work.pi-fabric.3036";
+const withTopic = (data: unknown) => data && typeof data === "object" ? { topic: TOPIC, ...data } : data;
 const setup = (maxEventBytes = 64 * 1024) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-dedup-"));
   roots.push(root);
@@ -24,8 +26,9 @@ const setup = (maxEventBytes = 64 * 1024) => {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, me.id, true, root, "recipient");
-  const followUp = (data?: unknown, delivery: "steer" | "followUp" = "followUp") => main.deliverAgent({ from: peer, message: "already handled", delivery, data });
-  const publish = (data: unknown = { key: "work:1" }, to = me.id, from = peer) => mesh.publish({ topic: "fleet.work.pi-fabric.3036", kind: "ack", from, to, text: "shadow", data });
+  // A carrier's work key/ref claims work on the topic it names only (#852 security P1).
+  const followUp = (data?: unknown, delivery: "steer" | "followUp" = "followUp") => main.deliverAgent({ from: peer, message: "already handled", delivery, data: withTopic(data) });
+  const publish = (data: unknown = { key: "work:1" }, to = me.id, from = peer) => mesh.publish({ topic: TOPIC, kind: "ack", from, to, text: "shadow", data });
   return { root, mesh, entries, box, main, followUp, publish, advance: (ms: number) => { now += ms; }, session: () => rootInboxSession(entries) };
 };
 afterEach(() => {
@@ -157,7 +160,7 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     const held = new MainAgentController({ on: () => undefined, sendMessage: () => { throw new Error("not delivered"); } } as unknown as ExtensionAPI, me.id, true, h.root, "held");
     held.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false, signal: { aborted: false } } as unknown as ExtensionContext, 120_000);
     try {
-      held.deliverAgent({ from: peer, message: "queued", delivery: "followUp", data: { key: "work:1" } });
+      held.deliverAgent({ from: peer, message: "queued", delivery: "followUp", data: { key: "work:1", topic: TOPIC } });
       await h.publish(); h.advance(1);
       const first = await inbox.next(h.session());
       expect(first.events).toHaveLength(1);
@@ -181,7 +184,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
     } as unknown as ExtensionContext, 0, path.join(h.root, "persisted-followups.json"));
     return { ...h, main, manager: () => manager, reload: () => { manager = SessionManager.open(manager.getSessionFile()!); },
       session: () => confirmedRootInboxSession(manager),
-      followUp: () => main.deliverAgent({ from: peer, message: "native work", delivery: "followUp", data: { key: "work:1" }, triggerTurn: false }),
+      followUp: () => main.deliverAgent({ from: peer, message: "native work", delivery: "followUp", data: { key: "work:1", topic: TOPIC }, triggerTurn: false }),
       receipts: (inbox: RootInbox) => (h.mesh.get(inbox.key, { fresh: true })?.value as { delivered?: string[] } | undefined)?.delivered ?? [],
       record: (events: Parameters<typeof rootInboxMessage>[0]) => {
         const message = rootInboxMessage(events);
@@ -324,9 +327,9 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
     expect(value.delivered.length).toBeLessThanOrEqual(1024);
     expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThan(limit * 0.75);
     const last = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
-      details: { from: peer, data: { key: `capacity:${threshold + 39}` } } }]).delivered!][0];
+      details: { from: peer, data: { key: `capacity:${threshold + 39}`, topic: TOPIC } } }]).delivered!][0];
     const first = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
-      details: { from: peer, data: { key: "capacity:0" } } }]).delivered!][0];
+      details: { from: peer, data: { key: "capacity:0", topic: TOPIC } } }]).delivered!][0];
     expect(value.delivered).toContain(last);
     expect(value.delivered).not.toContain(first);
     h.entries.length = 0;

@@ -46,6 +46,7 @@ const harness = () => {
   let view: FabricConversationView | undefined;
   let done: () => void = () => {};
   const requestRender = vi.fn();
+  const watches = vi.spyOn(fs, "watch");
   const tui = { mode: "fullscreen", requestRender, terminal: { rows: 30, columns: 100, write: vi.fn() } } as unknown as TUI;
   const findModel = vi.fn(() => ({ contextWindow: 100_000 }));
   const context = { mode: "tui", cwd: directory, modelRegistry: { find: findModel }, ui: {
@@ -56,6 +57,14 @@ const harness = () => {
   const controller = new FabricUiController(state);
   controllers.push(controller);
   return { state, records, context, controller, logFile, requestRender, findModel,
+    changed: () => vi.mocked(state.agents.subscribeUi).mock.calls.at(-1)?.[0]?.(),
+    fileChanged: () => {
+      // Deliver the actual fs.watch callback deterministically under the fake clock.
+      for (const call of watches.mock.calls) {
+        const callback = (call as unknown[]).at(-1) as (event: string, filename: string) => void;
+        callback("change", path.basename(logFile));
+      }
+    },
     view: () => view!, done: () => done(),
     async open(id = "a") {
       view = undefined;
@@ -75,7 +84,7 @@ afterEach(() => {
 });
 
 describe("controller preview performance", () => {
-  it("reuses hierarchy/model lookups across frames and skips unchanged idle poll projection/repaint", async () => {
+  it("reuses hierarchy/model lookups across frames and performs no idle reads, projection or repaint", async () => {
     vi.useFakeTimers();
     const project = vi.spyOn(targetProjection, "conversationTargets");
     const reads = vi.spyOn(NativeConversationReader.prototype, "read");
@@ -91,9 +100,9 @@ describe("controller preview performance", () => {
     vi.mocked(h.state.actors.instructions).mockClear();
     reads.mockClear();
     await vi.advanceTimersByTimeAsync(3000);
-    expect(reads).toHaveBeenCalledTimes(3);
+    expect(reads).not.toHaveBeenCalled();
     expect(project).not.toHaveBeenCalled();
-    expect(h.findModel).toHaveBeenCalledTimes(3); // once per distinct model, not per target/frame
+    expect(h.findModel).not.toHaveBeenCalled();
     expect(h.state.actors.messages).not.toHaveBeenCalled();
     expect(h.state.actors.instructions).not.toHaveBeenCalled();
     expect(h.requestRender).not.toHaveBeenCalled();
@@ -105,6 +114,7 @@ describe("controller preview performance", () => {
     await h.open();
     h.requestRender.mockClear();
     fs.appendFileSync(h.logFile, JSON.stringify({ type: "message_end", message: assistantMessage("native appended", 4) }) + "\n");
+    h.fileChanged();
     await vi.advanceTimersByTimeAsync(1000);
     expect(h.requestRender).toHaveBeenCalledTimes(1);
     expect(h.view().render(100).join("\n")).toContain("native appended");
@@ -112,11 +122,25 @@ describe("controller preview performance", () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(h.requestRender).not.toHaveBeenCalled();
     h.records[0]!.status = "running";
+    h.changed();
     await vi.advanceTimersByTimeAsync(1000);
     h.view().render(100);
     h.requestRender.mockClear();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(h.requestRender.mock.calls.length).toBeGreaterThan(1); // native 80ms Working animation plus poll
+    expect(h.requestRender.mock.calls.length).toBeGreaterThan(1); // native 80ms Working animation, no data poll
+  });
+
+  it("redraws on a real visible transcript append without a manager event or poll", async () => {
+    const h = harness();
+    const { pending } = await h.open();
+    try {
+      h.requestRender.mockClear();
+      fs.appendFileSync(h.logFile, JSON.stringify({ type: "message_end", message: assistantMessage("real watched append", 4) }) + "\n");
+      await vi.waitFor(() => expect(h.requestRender).toHaveBeenCalled(), { timeout: 2_000 });
+      expect(h.view().render(100).join("\n")).toContain("real watched append");
+      h.done();
+      await pending;
+    } finally { h.done(); await pending; }
   });
 
   it("suspends inactive readers without dropping loaded pinned history, scroll, drafts or unavailable fallback", async () => {
@@ -165,6 +189,7 @@ describe("controller preview performance", () => {
     await h.open();
     h.findModel.mockReturnValue({ contextWindow: 200_000 });
     h.requestRender.mockClear();
+    h.changed();
     await vi.advanceTimersByTimeAsync(1000);
     expect(h.requestRender).toHaveBeenCalledTimes(1);
     h.records[0]!.model = "test/replacement";
@@ -174,6 +199,7 @@ describe("controller preview performance", () => {
       id: "a", name: "a", kind: "agent", ownerHostId: "new-owner", rootId: "main", local: false,
       stale: true, capabilities: ["steer", "followUp", "stop"],
     }] as never);
+    h.changed();
     await vi.advanceTimersByTimeAsync(1000);
     expect(h.findModel).toHaveBeenCalledWith("test", "replacement");
     expect(h.controller.snapshot().agents.find((agent) => agent.id === "a")).toMatchObject({

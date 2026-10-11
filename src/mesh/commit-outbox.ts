@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from "./store.js";
 
 // State-domain helpers for lock call sites (smarty-dev#6477 L2b, plan R3 and R11).
@@ -43,7 +43,7 @@ export const withStateFence = async <T>(
     try {
       await (deadline === undefined ? fence() : mesh.withTryLock(fence, Math.max(0, deadline - Date.now())));
     } catch (error) {
-      if (entered || deadline === undefined || !isMeshLockTimeout(error) || Date.now() >= deadline) throw error;
+      if (entered || deadline === undefined || !isMeshWriteDeferred(error) || Date.now() >= deadline) throw error;
       await new Promise((resolve) => setTimeout(resolve, 1));
       continue;
     }

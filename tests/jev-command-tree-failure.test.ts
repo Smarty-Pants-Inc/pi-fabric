@@ -8,7 +8,7 @@ const signal = () => new AbortController().signal;
 const request = { state: { text: "offline" }, questions: { yes: { type: "noul" as const, instructions: "Offline?" } } };
 afterEach(() => {
   Object.defineProperty(process, "platform", platform);
-  vi.restoreAllMocks(); vi.clearAllMocks();
+  vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllEnvs();
 });
 
 // SR-7 scope cut: Windows has no persistent owned-tree identity for a command
@@ -41,9 +41,12 @@ describe("SR-7 Windows refuses command-backed credentials before spawning", () =
     expect(spawn).not.toHaveBeenCalled();
   });
   it("POSIX still spawns the command in its own detached group", async () => {
+    vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE", "1");
+    // #738 scrubs reserved controls while preserving command argv and group custody.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_FABRIC_LANDLOCK_")));
     Object.defineProperty(process, "platform", { ...platform, value: "linux" });
     spawn.mockImplementationOnce(() => { throw new Error("FAKE_SECRET"); });
     await expect(new JevCredentials(["offline-credential-fixture", "--flag"], {}).resolve(signal())).rejects.toThrow(/^Jev credential resolver failed$/);
-    expect(spawn).toHaveBeenCalledWith("offline-credential-fixture", ["--flag"], { detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    expect(spawn).toHaveBeenCalledWith("offline-credential-fixture", ["--flag"], { env, detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   });
 });

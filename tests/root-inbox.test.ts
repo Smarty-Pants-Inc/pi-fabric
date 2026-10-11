@@ -18,7 +18,8 @@ const notHeld: RootInboxSession = { holdsBatch: () => false, holdsSteer: () => f
 const withSteers = (steers: Array<{ from: string; data: unknown }>): RootInboxSession => ({
   holdsBatch: () => true,
   holdsSteer: rootInboxSession(steers.map(({ from, data }) => ({
-    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data },
+    // The carrier names the shadow's topic: a key claims work on that topic only (#852 security P1).
+    type: "custom_message", customType: "pi-fabric-agent-message", details: { from: { id: from }, data: { topic: "fleet.work.pi-fabric.1", ...data as object } },
   }))).holdsSteer,
 });
 
@@ -102,7 +103,7 @@ describe("RootInbox", () => {
     await work("ack", me.id, "fleet.work.pi-fabric.1", "ack:A");
     await work("ack", me.id, "fleet.work.pi-fabric.2", "ack:B");
     clock.advance(1);
-    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B" } }]))).toEqual(["ack:A"]);
+    expect(await keys(withSteers([{ from: peer.id, data: { key: "ack:B", topic: "fleet.work.pi-fabric.2" } }]))).toEqual(["ack:A"]);
     // A steer that was only enqueued (Pi has not recorded it) suppresses nothing.
     await work("queued", me.id, "fleet.work.pi-fabric.3", "queued:C");
     clock.advance(1);
@@ -141,8 +142,8 @@ describe("RootInbox", () => {
     expect(message.customType).toBe("pi-fabric-inbox");
     expect(message.content).toContain('ref="Smarty-Pants-Inc/pi-fabric#1"');
     expect(message.content).toContain("ETA ~09:30Z &lt;PR&gt;");
-    expect(message.content).toContain("[cut at 8192 bytes; read the whole event with mesh.read(");
-    expect(message.content.length).toBeLessThan(12_000);
+    expect(message.content).toContain("[cut at 4096 bytes; read the whole event with mesh.read(");
+    expect(message.content.length).toBeLessThan(6_000);
   });
 
   it("recognises split per-sender receipts and does not return the pending aggregate", async () => {

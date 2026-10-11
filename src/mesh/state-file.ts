@@ -1,13 +1,15 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError } from "../core/atomic-write.js";
+import childProcess from "node:child_process";
+import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
-import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, type MeshStateMovedMarker } from "./backend-fence.js";
+import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { MeshCommitEffects, MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
@@ -88,6 +90,46 @@ export const jsonClone = <T>(value: T): T => {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error("Mesh values must be JSON-serializable");
   return JSON.parse(serialized) as T;
+};
+
+/**
+ * Deep check of a parsed state.json document, for callers that must not act on doubt (retention --apply,
+ * smarty-dev#7916). The tolerant reader below accepts `{"format":1,"entries":{"k":null}}`; this does not: the
+ * envelope has only known fields and every entry is a complete entry under its own key. Returns the first problem.
+ */
+export const meshStateDocumentProblem = (value: unknown): string | undefined => {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item);
+  const count = (item: unknown): boolean => Number.isSafeInteger(item) && (item as number) >= 0;
+  if (!object(value)) return "not an object";
+  const known = new Set(["format", "revisionFormat", "entries", "versions", "tombstoneOrder", "highWater", "readGeneration", "readJournalHash"]);
+  const unknown = Object.keys(value).find(key => !known.has(key));
+  if (unknown !== undefined) return `unknown field ${JSON.stringify(unknown)}`;
+  if (value.format !== 1 && value.format !== 2) return "unknown format";
+  if (value.revisionFormat !== undefined && value.revisionFormat !== 2) return "unknown revisionFormat";
+  if (value.highWater !== undefined && !count(value.highWater)) return "invalid highWater";
+  for (const field of ["readGeneration", "readJournalHash"] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") return `invalid ${field}`;
+  }
+  if (value.versions !== undefined && (!object(value.versions) || !Object.values(value.versions).every(count))) return "invalid versions";
+  if (value.tombstoneOrder !== undefined && (!Array.isArray(value.tombstoneOrder) || !value.tombstoneOrder.every(key => typeof key === "string"))) {
+    return "invalid tombstoneOrder";
+  }
+  if (!object(value.entries)) return "entries is not an object";
+  const entryFields = new Set(["key", "value", "version", "updatedAt", "updatedBy"]);
+  for (const [key, entry] of Object.entries(value.entries)) {
+    const at = `entry ${JSON.stringify(key)}`;
+    if (!object(entry)) return `${at} is not an object`;
+    if (Object.keys(entry).some(field => !entryFields.has(field))) return `${at} has an unknown field`;
+    if (entry.key !== key) return `${at} names another key`;
+    if (!count(entry.version)) return `${at} has an invalid version`;
+    if (typeof entry.updatedAt !== "number" || !Number.isFinite(entry.updatedAt) || entry.updatedAt < 0) return `${at} has an invalid updatedAt`;
+    const by = entry.updatedBy;
+    if (!object(by) || typeof by.id !== "string" || typeof by.name !== "string" || typeof by.kind !== "string" ||
+        (by.sessionId !== undefined && typeof by.sessionId !== "string") || (by.verified !== undefined && typeof by.verified !== "string")) {
+      return `${at} has an invalid updatedBy`;
+    }
+  }
+  return undefined;
 };
 
 const isMeshStateFile = (value: unknown): value is MeshStateFile => {
@@ -253,6 +295,8 @@ interface PreparedStateCommit {
   namespaces: Record<string, string> | undefined;
   serializedText: string;
   temporary?: string;
+  /** Unregisters the staged temp from the process-exit cleanup hook. */
+  releaseTemporary?: () => void;
 }
 const WRITE_SNAPSHOT_CHANGED = Symbol("mesh write snapshot changed");
 
@@ -319,12 +363,28 @@ const statStamp = (filePath: string): string | undefined => {
   }
 };
 
+// ponytail: the same no-follow test as state-sqlite.ts assertPrivatePath (pi-fabric#694 P2-E; #713's root gate),
+// inlined because state-sqlite.ts imports this module. The SQLite open re-runs its own gate on this exact path.
+const privateStateFile = (file: string): boolean => {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile()) return false; // lstat: a symbolic link is never a file here
+  if (process.platform === "win32" || typeof process.getuid !== "function") return true;
+  return stat.uid === process.getuid() && (stat.mode & 0o022) === 0;
+};
+
 /**
  * Strict read-only check of a mesh root's state.json (pi-fabric#157). An absent file is a valid empty
  * mesh; a present file that is empty, damaged, or not a state envelope (`{}`, `null`) throws. The
  * runtime MeshStore stays tolerant; readers that must not report false absence call this first.
  */
 export const assertMeshStateReadable = (root: string, maxBytes = DEFAULT_MAX_STATE_BYTES): void => {
+  // After the SQLite switch state.json is the moved marker and state.db is the state: a SQLite store reads it
+  // and a file store's reads fail closed on the marker (smarty-dev#6477), so the marker is not damage here.
+  // A marker without its database, or with anything but our own private regular file there (a symbolic link to
+  // another mesh's database, a directory, a foreign or group/world-writable file), still fails closed below:
+  // the marker is not state, so the read throws (an alarm, never an empty mesh).
+  const moved = readMeshStateMovedMarker(root);
+  if (moved !== undefined && privateStateFile(path.join(root, "state.db"))) return;
   const file = path.resolve(root, "state.json");
   const identity = stateReadIdentity(file, maxBytes);
   const shared = processReadSnapshots.get(file)?.deref();
@@ -514,6 +574,31 @@ export interface StateFileOptions {
   writeReadJournal?: boolean;
 }
 
+const PREPARED_SWEEP_MS = 10 * 60_000;
+const PREPARED_REUSE_AGE_MS = 60 * 60_000;
+const PREPARED_STATE_NAME = /^([1-9]\d*)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.prepared\.tmp$/i;
+
+// ponytail: native process tools already report wall-clock birth time; avoid a second
+// /proc tick/boot-time conversion. Unknown or second-resolution evidence stays conservative.
+const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
+  try {
+    let executable: string;
+    let args: string[];
+    if (process.platform === "linux" || process.platform === "darwin") {
+      executable = "/bin/ps";
+      args = ["-p", String(pid), "-o", "lstart="];
+    } else if (process.platform === "win32" && process.env.SystemRoot) {
+      executable = path.win32.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`];
+    } else return false;
+    const start = childProcess.execFileSync(executable, args, { encoding: "utf8", timeout: 2_000,
+      maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+      env: childProcessEnvironment({ ...process.env, LC_ALL: "C", TZ: "UTC" }) }).trim();
+    return Date.parse(process.platform === "win32" ? start : `${start} UTC`) > modifiedAt;
+  } catch { return false; }
+};
+
 export class StateFile implements StateBackend {
   readonly kind = "file" as const;
   /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
@@ -541,6 +626,7 @@ export class StateFile implements StateBackend {
   #stateCache: ParsedStateSnapshot | undefined;
   #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
   #journalBase: JournalBase | undefined;
+  #lastPreparedSweep = -Infinity;
 
   constructor(context: MeshStoreContext, options: StateFileOptions) {
     const { root, maxEventBytes } = context;
@@ -563,6 +649,40 @@ export class StateFile implements StateBackend {
       : Math.max(MIN_BACKGROUND_MESH_READ_CACHE_MS, Math.floor(options.backgroundReadCacheMs));
     this.#readActive = options.readActive;
     this.#writeReadJournal = options.writeReadJournal !== false;
+    this.#sweepPreparedState();
+  }
+
+  #sweepPreparedState(): void {
+    const now = Date.now();
+    if (now - this.#lastPreparedSweep < PREPARED_SWEEP_MS) return;
+    this.#lastPreparedSweep = now;
+    let removed = 0;
+    try {
+      const prefix = `${path.basename(this.#statePath)}.`;
+      for (const entry of fs.readdirSync(this.root, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+        const match = PREPARED_STATE_NAME.exec(entry.name.slice(prefix.length));
+        if (!match) continue;
+        const pid = Number(match[1]);
+        if (!Number.isSafeInteger(pid) || pid === process.pid) continue;
+        const file = path.join(this.root, entry.name);
+        try {
+          let dead = false;
+          try { process.kill(pid, 0); }
+          catch (error) {
+            if (errorCode(error) !== "ESRCH") continue;
+            dead = true;
+          }
+          if (!dead) {
+            const modifiedAt = fs.statSync(file).mtimeMs;
+            if (now - modifiedAt <= PREPARED_REUSE_AGE_MS || !processStartedAfter(pid, modifiedAt)) continue;
+          }
+          fs.unlinkSync(file);
+          removed++;
+        } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
+      }
+    } catch { /* Best-effort cleanup; ordinary state operations retain their own errors. */ }
+    if (removed) console.info(`[mesh] Removed ${removed} abandoned prepared state file(s)`);
   }
 
   /** A failed locked operation means this store's view is behind (see MeshLock.withLock). */
@@ -779,6 +899,7 @@ export class StateFile implements StateBackend {
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
     commit: (prepared: P) => T, cleanup?: (prepared: P) => void, lockClass: MeshLockClass = "other"): Promise<T> {
     const scope = this.#lock.tryLockScope.getStore();
+    if (!scope?.active) this.#sweepPreparedState();
     const deadline = Date.now() + this.#lock.lockTimeoutMs;
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
     // write into a bounded custody try. Await constructor preparation outside custody;
@@ -834,8 +955,18 @@ export class StateFile implements StateBackend {
         // State remains a soft-state atomic replacement (no durability policy change).
         // Stage the large write off-lock too; custody only compares identity and renames.
         const temporary = `${this.#statePath}.${process.pid}.${randomUUID()}.prepared.tmp`;
-        writeFileAtomic(temporary, prepared.encoded.serialized);
+        // Registered before staging: an exit while this write awaits the mesh lock (a Main
+        // /quit, a worker/resident exit or SIGTERM) removes it (smarty-dev#6622). A kill -9
+        // leaves it to the existing prepared-state sweep or the host reaper's janitor.
+        const release = trackTemporary(temporary);
+        try { writeFileAtomic(temporary, prepared.encoded.serialized); }
+        catch (error) {
+          try { fs.rmSync(temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+          release();
+          throw error;
+        }
         prepared.temporary = temporary;
+        prepared.releaseTemporary = release;
       }
       return { state, ...outcome, prepared };
     }, ({ state, result, keys, prepared }) => {
@@ -845,6 +976,7 @@ export class StateFile implements StateBackend {
     }, ({ prepared }) => {
       if (prepared?.temporary) {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
+        prepared.releaseTemporary?.();
       }
     }, "put/delete");
   }
@@ -858,8 +990,8 @@ export class StateFile implements StateBackend {
   // previous one is dropped from the copy), so the canonical header alone identifies the commit
   // whether or not the optional signal is published afterwards. The stamped copy is cached.
   #commitState(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined, keys: string[], caller: string[] | undefined,
-    namespaces?: Record<string, string>): void {
-    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller);
+    namespaces?: Record<string, string>, beforeCommit?: () => void): void {
+    this.#commitPreparedState(this.#prepareStateCommit(state, reuse, keys, this.#journalBase, namespaces), keys, caller, beforeCommit);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -899,7 +1031,7 @@ export class StateFile implements StateBackend {
     return epoch === undefined ? 0 : storageRevision(epoch);
   };
 
-  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[]): void {
+  #commitPreparedState(prepared: PreparedStateCommit, keys: string[], caller?: string[], beforeCommit?: () => void): void {
     const { stamped, generation, encoded, journal, namespaces, serializedText } = prepared;
     // Kernel witness (read-journal.ts): the tuple of OUR inode, taken through a descriptor opened
     // on the staged file before the rename, so a replacement right after the rename cannot borrow
@@ -913,8 +1045,9 @@ export class StateFile implements StateBackend {
     if (journal && prepared.temporary) try { staged = fs.openSync(prepared.temporary, "r"); } catch { /* no witness */ }
     let witnessStat: fs.BigIntStats | undefined;
     try {
-      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath);
-      else writeFileAtomic(this.#statePath, encoded.serialized);
+      const commitOptions = beforeCommit ? { beforeRename: beforeCommit } : undefined;
+      if (prepared.temporary) renameAtomic(prepared.temporary, this.#statePath, commitOptions);
+      else writeFileAtomic(this.#statePath, encoded.serialized, commitOptions);
       if (journal) {
         try { witnessStat = staged !== undefined ? fs.fstatSync(staged, { bigint: true }) : fs.statSync(this.#statePath, { bigint: true }); }
         catch { /* no witness: readers hash */ }
@@ -1086,7 +1219,7 @@ export class StateFile implements StateBackend {
   async writeBatch(input: StateBackendBatchInput, committed?: (changed: readonly string[]) => void): Promise<MeshBatchResult[]> {
     const caller = commitTraceCaller();
     for (const op of input.ops) this.#validateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
@@ -1189,12 +1322,13 @@ export class StateFile implements StateBackend {
         changed = true;
       }
       if (!changed) {
+        input.beforeCommit?.();
         this.#cacheState(state, undefined);
       } else {
         state.tombstoneOrder = [...tombstones];
         compactStateTombstones(state, this.#maxStateTombstones);
         const changedKeys = results.filter(result => result.applied).map(result => result.key);
-        this.#commitState(state, reuse, changedKeys, caller, namespaces);
+        this.#commitState(state, reuse, changedKeys, caller, namespaces, input.beforeCommit);
         committed?.(changedKeys);
       }
       input.afterCommit?.(view);

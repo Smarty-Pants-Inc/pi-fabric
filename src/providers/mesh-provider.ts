@@ -4,7 +4,7 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
-import { invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
+import { fabricHostCallerId, invocationFabricPrincipal, snapshotFabricInvocation } from "../fabric-provenance.js";
 import { MeshStore, type MeshIdentity } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC } from "../lifecycle/types.js";
@@ -150,6 +150,86 @@ const descriptors: FabricActionDescriptor[] = [
 ];
 
 
+/** Fixed typed refusal: caller identity is captured by the host, never read from arguments. */
+export class MeshHostPublishError extends Error {
+  readonly code = "FABRIC_MESH_HOST_PUBLISH_REQUIRED";
+  readonly retryable = false;
+  constructor() {
+    super("Mesh dedupeKey and publishBatch require a trusted host component publisher");
+    this.name = "MeshHostPublishError";
+  }
+}
+
+const assertHostPublisher = (context: FabricInvocationContext): string => {
+  const caller = fabricHostCallerId(context);
+  if (caller === undefined) throw new MeshHostPublishError();
+  return caller;
+};
+
+const assertDedupeKey = (args: Record<string, unknown>, context: FabricInvocationContext): void => {
+  if (!Object.hasOwn(args, "dedupeKey")) return;
+  assertHostPublisher(context);
+  if (typeof args.dedupeKey !== "string" || Buffer.byteLength(args.dedupeKey, "utf8") < 1 ||
+      Buffer.byteLength(args.dedupeKey, "utf8") > 512) {
+    throw new Error("Mesh dedupeKey must be a string of 1..512 UTF-8 bytes");
+  }
+};
+
+const assertPublishArguments = (actionName: string, args: Record<string, unknown>, context: FabricInvocationContext): void => {
+  if (actionName === "publish") assertDedupeKey(args, context);
+  if (actionName === "publishBatch") {
+    assertHostPublisher(context);
+    if (!Array.isArray(args.events) || !args.events.length || args.events.length > 256) {
+      throw new Error("Mesh publish batch must contain 1..256 events");
+    }
+    for (const event of args.events) {
+      if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error("Mesh batch events must be objects");
+      assertDedupeKey(event as Record<string, unknown>, context);
+    }
+  }
+};
+
+const namespacedDedupeKey = (args: Record<string, unknown>, context: FabricInvocationContext): string | undefined => {
+  if (!Object.hasOwn(args, "dedupeKey")) return undefined;
+  const caller = assertHostPublisher(context);
+  // Length-frame the component id so delimiter-containing ids/keys cannot collide. The
+  // 512-byte limit applies to the caller's raw key, not this host-owned receipt namespace.
+  return `component:${Buffer.byteLength(caller, "utf8")}:${caller}:${args.dedupeKey as string}`;
+};
+
+const assertPublishTopic = (topic: string): void => {
+  if (topic.startsWith(INTERNAL_CONTROL_PREFIX) || topic === INTERNAL_HOST_EVENT_TOPIC ||
+      topic === FABRIC_PARTICIPANT_LIFECYCLE_TOPIC) {
+    throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
+  }
+};
+
+const publicPublish = descriptors.find(descriptor => descriptor.name === "publish")!;
+const publicPublishSchema = publicPublish.inputSchema as { properties: Record<string, unknown> };
+const hostPublishSchema = {
+  ...publicPublish.inputSchema as object,
+  properties: {
+    ...publicPublishSchema.properties,
+    dedupeKey: { type: "string", minLength: 1, maxLength: 512, description: "Host-only key: 1..512 UTF-8 bytes, scoped to this component" },
+  },
+};
+const hostDescriptors: FabricActionDescriptor[] = descriptors.map(descriptor =>
+  descriptor.name === "publish" ? { ...descriptor, inputSchema: hostPublishSchema } : descriptor);
+hostDescriptors.push({
+  name: "publishBatch",
+  description: "Publish a bounded durable prefix in order; retry keyed events to recover their original identities",
+  inputSchema: {
+    type: "object",
+    properties: { events: { type: "array", minItems: 1, maxItems: 256, items: hostPublishSchema } },
+    required: ["events"],
+    additionalProperties: false,
+  },
+  risk: "agent",
+  namespace: "coordination",
+});
+const meshDescriptors = (context: FabricInvocationContext): FabricActionDescriptor[] =>
+  fabricHostCallerId(context) === undefined ? descriptors : hostDescriptors;
+const normalizeHostMeshArgs = actionArgNormalizer(() => hostDescriptors);
 
 // Argument repair derives from the action schemas plus the shared synonym
 // lexicon; no mesh-specific table remains.
@@ -168,8 +248,9 @@ export class MeshProvider implements FabricProvider {
 
   async list(
     request: FabricProviderListRequest,
-    _context: FabricInvocationContext,
+    context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor[]> {
+    const descriptors = meshDescriptors(context);
     const query = request.query?.toLowerCase();
     return query
       ? descriptors.filter((descriptor) =>
@@ -180,16 +261,31 @@ export class MeshProvider implements FabricProvider {
 
   async describe(
     actionName: string,
-    _context: FabricInvocationContext,
+    context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    return descriptors.find((descriptor) => descriptor.name === actionName);
+    if (actionName === "publishBatch") assertHostPublisher(context);
+    return meshDescriptors(context).find((descriptor) => descriptor.name === actionName);
+  }
+
+  guardArguments(
+    actionName: string,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+  ): Record<string, unknown> {
+    // Before generic repair or nullish-option stripping: a forbidden key is never ignored.
+    assertPublishArguments(actionName, args, context);
+    return args;
   }
 
   prepareArguments(
     actionName: string,
     args: Record<string, unknown>,
+    context: FabricInvocationContext,
   ): Record<string, unknown> {
-    return normalizeMeshArgs(actionName, args);
+    this.guardArguments(actionName, args, context);
+    const normalized = (fabricHostCallerId(context) === undefined ? normalizeMeshArgs : normalizeHostMeshArgs)(actionName, args);
+    this.guardArguments(actionName, normalized, context);
+    return normalized;
   }
 
   async invoke(
@@ -202,14 +298,10 @@ export class MeshProvider implements FabricProvider {
       case "self":
         return this.identity;
       case "publish": {
+        assertPublishArguments(actionName, args, context);
         const topic = String(args.topic);
-        if (
-          topic.startsWith(INTERNAL_CONTROL_PREFIX) ||
-          topic === INTERNAL_HOST_EVENT_TOPIC ||
-          topic === FABRIC_PARTICIPANT_LIFECYCLE_TOPIC
-        ) {
-          throw new Error(`Fabric mesh topic is reserved for host coordination: ${topic}`);
-        }
+        assertPublishTopic(topic);
+        const dedupeKey = namespacedDedupeKey(args, context);
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
@@ -218,6 +310,7 @@ export class MeshProvider implements FabricProvider {
             from: this.identity,
             principal: invocationFabricPrincipal(context),
             signal: context.signal,
+            ...(dedupeKey === undefined ? {} : { dedupeKey }),
             ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
             ...(typeof args.to === "string" ? { to: args.to } : {}),
             ...(text === undefined ? {} : { text }),
@@ -228,6 +321,28 @@ export class MeshProvider implements FabricProvider {
           ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
           : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
+      }
+      case "publishBatch": {
+        assertPublishArguments(actionName, args, context);
+        const events = args.events as Record<string, unknown>[];
+        // Capture/validate the entire request before any append. The store owns per-event
+        // receipts and bounded-prefix admission; never wrap an uncertain batch in a retry.
+        const inputs = await Promise.all(events.map(async event => {
+          const topic = String(event.topic);
+          assertPublishTopic(topic);
+          const checked = typeof event.text === "string" ? await outgoingMessageNotice(event.text, context, this.identity.id) : undefined;
+          const dedupeKey = namespacedDedupeKey(event, context);
+          return {
+            topic, from: this.identity, principal: invocationFabricPrincipal(context), signal: context.signal,
+            ...(dedupeKey === undefined ? {} : { dedupeKey }),
+            ...(typeof event.kind === "string" ? { kind: event.kind } : {}),
+            ...(typeof event.to === "string" ? { to: event.to } : {}),
+            ...(checked ? { text: checked.text } : {}),
+            ...(event.data !== undefined ? { data: event.data } : {}),
+          };
+        }));
+        context.signal?.throwIfAborted();
+        return this.store.publishBatch(inputs);
       }
       case "read":
         return this.store.read({

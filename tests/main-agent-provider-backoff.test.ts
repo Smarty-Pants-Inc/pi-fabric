@@ -27,9 +27,11 @@ const setup = (flushMs: number, journal = true) => {
   mains.push(main);
   main.attachFollowUpDrain(ctx, flushMs, journal ? path.join(root, "followups.json") : undefined);
   const emit = (name: string, event: any = {}) => { for (const fn of handlers.get(name) ?? []) fn(event, ctx); };
+  // A classified retryable error (5xx): an unclassified one (no status or body) alarms on the third
+  // in a row instead (smarty-dev#8742, tests/main-provider-dead.test.ts).
   const fail = () => {
     emit("agent_start");
-    emit("turn_end", { message: { stopReason: "error" } });
+    emit("turn_end", { message: { stopReason: "error", errorMessage: "503 upstream connect error" } });
     emit("agent_before_settle", { outcome: "error" });
     emit("agent_settled", { outcome: "error" });
   };

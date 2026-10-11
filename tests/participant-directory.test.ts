@@ -7,11 +7,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { confirmWitnessPlatform, ParticipantDirectory, ROUTING_REFRESH_LOCK_BUDGET_MS } from "../src/topology/participant-directory.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -111,13 +112,22 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     const directory = fixture();
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
-    // A state operation bounded to 250 ms, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
-    const read = vi.spyOn(directory.mesh, "withTryLock");
+    // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
+    // smarty-dev#7651: withStateFence passes the budget LEFT (deadline - Date.now()), which drops to
+    // 1999 when a millisecond ticks between computing the deadline and the try. Bound it by the clock
+    // time that elapsed around the call instead of demanding the exact constant.
+    const tryLock = directory.mesh.withTryLock.bind(directory.mesh);
+    let triedAt = 0;
+    const read = vi.spyOn(directory.mesh, "withTryLock").mockImplementation((operation, timeout) => {
+      triedAt ||= Date.now(); return tryLock(operation, timeout);
+    });
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
+    const calledAt = Date.now();
     await directory.refreshRoutingView();
     expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(250);
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeGreaterThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS - (triedAt - calledAt));
     expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
@@ -152,6 +162,27 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     await directory.refreshRoutingView();
     expect(directory.routingUnavailable()).toBeUndefined();
   });
+
+  // smarty-dev#6477: one fleet publish holds the lock ~250 ms (smarty-dev#8305); a 250 ms budget
+  // failed the send behind one hold. The budget covers a few holds and still bounds a stuck holder.
+  const holdLock = (directory: ParticipantDirectory, ms: number): Promise<void> =>
+    new MeshLock(directory.mesh.root, {}, () => undefined)
+      .withLockAcrossAwait(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  it("survives a ~400 ms publish hold and still fails past its lock budget", async () => {
+    const directory = fixture();
+    let hold = holdLock(directory, 400);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await directory.refreshRoutingView();
+    expect(directory.routingUnavailable()).toBeUndefined();
+    await hold;
+
+    hold = holdLock(directory, ROUTING_REFRESH_LOCK_BUDGET_MS + 300);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(directory.refreshRoutingView()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(directory.routingUnavailable()).toBeDefined();
+    await hold;
+  }, 10_000);
 
   it("does not refresh a closed directory", async () => {
     const directory = fixture();
@@ -746,8 +777,7 @@ describe("ParticipantDirectory host leases", () => {
         // A legacy reader has no host-file fallback: its fixed 15 s TTL must never lapse.
         expect(now - mesh.get("sessions/idle", { fresh: true })!.updatedAt).toBeLessThan(15_000);
         // Read the canonical file here; fake wall-clock jumps do not change filesystem clocks.
-        const leaseFile = fs.readdirSync(path.join(mesh.root, "host-leases"))[0]!;
-        const lease = JSON.parse(fs.readFileSync(path.join(mesh.root, "host-leases", leaseFile), "utf8"));
+        const lease = JSON.parse(fs.readFileSync(hostLeasePath(mesh.root, identity.id), "utf8"));
         expect(lease.expiresAt).toBe(now + 15_000);
         expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
       }
@@ -1536,7 +1566,20 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBe(0);
         hold();
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+        // smarty-dev#8305: a later outage inside the warning window is counted, not printed.
+        // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
+        expect(warn).toHaveBeenCalledOnce();
+
+        // The first real acquisition after the window prints the final summary of both
+        // suppressed retries (the continuous outage's second timeout and the later outage).
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        vi.setSystemTime(Date.now() + 60_000);
+        expect(retry.waitMs).toBe(0);
+        expect(await tick()).toBe("done");
+        expect(recovered).toHaveBeenCalledTimes(2);
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls[1]![0]).toMatch(
+          /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();

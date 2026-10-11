@@ -92,6 +92,8 @@ const routedProvider = (state: ReturnType<typeof setup>, actors: ActorManager, a
   const source = (local: boolean): FabricParticipantSource => {
     const member: FabricParticipantInfo = {
       format: 1, id: actor.id, name: actor.name, kind: "actor", rootId: identity.id, ownerHostId: "host:owner", ownerIdentityId: identity.id,
+      // An ASK can share the owner's startup millisecond; advertise its actual epoch.
+      ownerIncarnation: ownerControl.incarnation,
       status: "idle", runner: "pi", transport: "host", capabilities: ["ask", "steer", "followUp", "actor-bindings"],
       startedAt: 1, updatedAt: 1, controlProtocol: "v1", local, stale: false,
     };
@@ -201,6 +203,22 @@ describe("resident queued binding defaults", () => {
     expect(state.results[0]).toMatchObject({ status: "completed", model: binding.model ?? "provider/config", thinking: binding.thinking ?? "low" });
   });
 
+  it("routes a foreign Main ASK in the owner startup millisecond using its advertised incarnation", async () => {
+    const state = setup(10); const actors = state.open(); state.release();
+    const actor = await actors.create({ name: "foreign startup", instructions: "Watch", residency: "durable" });
+    await actors.setModel(actor.id, "provider/private"); await actors.setThinking(actor.id, "xhigh");
+    const at = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      const { provider, context } = routedProvider(state, actors, actor, false);
+      await provider.invoke("ask", { id: actor.id, message: "same-millisecond ask", model: "provider/foreign" }, context);
+    } finally {
+      clock.mockRestore();
+    }
+    expect(state.results[0]).toMatchObject({ status: "completed" });
+    expect({ model: state.launches[0]!.model, thinking: state.launches[0]!.thinking }).toEqual({ model: "provider/foreign", thinking: undefined });
+  });
+
   it("own-root omitted fields still follow current session defaults after mailbox restore", async () => {
     const state = setup(10); const actors = state.open();
     const actor = await actors.create({ name: "own restored", instructions: "Watch", residency: "durable" });
@@ -247,6 +265,7 @@ describe("resident queued binding defaults", () => {
     const dir = path.join(state.actorRoot, actor.id);
     const key = (await import("node:crypto")).createHash("sha256").update([identity.id, "session"].join("\0")).digest("hex").slice(0, 16);
     const registry = JSON.parse(fs.readFileSync(path.join(state.actorRoot, "actors.json"), "utf8"));
+    delete registry.actors[0].projectDefaults; // Exercise the pre-resolved-binding registry format.
     registry.actors[0].model = "provider/new"; registry.actors[0].thinking = "max";
     fs.writeFileSync(path.join(state.actorRoot, "actors.json"), JSON.stringify(registry));
     const records = ["mesh:work.items", "host:input", "direct", "direct"].map((source, index) => ({

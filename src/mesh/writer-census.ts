@@ -121,6 +121,11 @@ const writerKey = (writer: CensusWriter): string => writer.pid === undefined
  * record by pid alone is also reported unknown: the pid may be another host's writer.
  */
 export async function census(root: string): Promise<WriterCensusReport> {
+  return censusSync(root);
+}
+
+/** The same census, synchronous: the readiness gate recomputes it under the migration fence (smarty-dev#7815). */
+export function censusSync(root: string): WriterCensusReport {
   const writers: CensusWriter[] = [];
   const unknown: CensusUnknown[] = [];
   const seen = new Set<string>();

@@ -1,4 +1,4 @@
-import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance } from "../fabric-provenance.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
@@ -9,8 +9,9 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, validateActorCoalesceKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
+import { normalizeActorRecords } from "../actors/records.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -25,6 +26,7 @@ import type {
   FabricAgentMessageResult,
   FabricMainAgentTarget,
   FabricMainAgentBindingResult,
+  FabricSteerPriority,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -41,6 +43,7 @@ import {
 } from "../lifecycle/types.js";
 import {
   FabricControlPlane,
+  controlOwnerIncarnation,
   type FabricControlCommand,
   type FabricControlAcceptance,
 } from "../topology/control-plane.js";
@@ -246,6 +249,9 @@ const compactHandoffResult = (
     usage: result.usage,
   },
   implementation: result.value ?? result.text,
+  ...(result.partialText !== undefined ? { partialText: result.partialText } : {}),
+  ...(result.warnings?.length ? { warnings: result.warnings } : {}),
+  ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
   ...(result.error ? { error: result.error } : {}),
 });
 
@@ -262,6 +268,7 @@ const actorRequest = (
       )
     : undefined;
   const topics = stringArray(args.topics);
+  const records = normalizeActorRecords(args.records);
   const tools = stringArray(args.tools);
   const requires = Array.isArray(args.requires)
     ? args.requires.reduce<Array<string | FabricCapabilityRequirement>>(
@@ -303,6 +310,8 @@ const actorRequest = (
   }
   validateActorInferenceContext(args.inferenceContext, runner);
   validateActorCoalesceKey(args.coalesceKey);
+  validateActorDedupeKey(args.dedupeKey);
+  const activation = normalizeActorActivation(args.activation);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
   const kernelRequest = {
@@ -337,6 +346,8 @@ const actorRequest = (
     ...(typeof args.triggerTurn === "boolean" ? { triggerTurn: args.triggerTurn } : {}),
     ...(typeof args.coalesce === "boolean" ? { coalesce: args.coalesce } : {}),
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
+    ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
+    ...(activation ? { activation } : {}),
     ...(activationFilter ? { activationFilter } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
@@ -368,6 +379,7 @@ const actorRequest = (
     ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
     ...(validWhile ? { validWhile } : {}),
+    ...(records ? { records } : {}),
   };
 };
 
@@ -375,7 +387,7 @@ const actorRequest = (
 // lexicon; no agents-specific table remains.
 export const normalizeAgentsArgs = actionArgNormalizer(() => AGENTS_ACTION_DESCRIPTORS);
 
-const MESSAGE_ACTIONS = new Set(["ask", "tell", "steer", "followUp"]);
+const MESSAGE_ACTIONS = new Set(["ask", "tell", "send", "steer", "followUp"]);
 
 // Messaging calls accept "to" (the mesh.publish spelling) as an alias of "id".
 // sessionId is rejected with the exact fix: the generic synonym repair would
@@ -486,6 +498,10 @@ export class AgentsProvider implements FabricProvider {
         from: single
           ? lifecycleSourceIdentity(first.event.source)
           : lifecycleSourceIdentity(last.event.source),
+        // Display/provenance keep the existing representative sender. The local
+        // admission snapshot retains every observed event; it never crosses the wire.
+        ...withFabricWakeAdmission({}, batch.map(item => fabricWakeCause(
+          lifecycleSourceIdentity(item.event.source), "host-event", item.event.event, item.event.id))),
         triggerTurn: batch.some((delivery) => delivery.subscription.triggerTurn),
       },
     );
@@ -565,6 +581,52 @@ export class AgentsProvider implements FabricProvider {
     );
     // Templates and unbound live actors retain their dynamic defaults, after validation.
     return request.model ? { ...request, ...modelResolutionMetadata(resolved), model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
+  }
+
+  async #routeCreationDefault<T extends {
+    model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
+    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"];
+  }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
+    const config = this.manager.config.router;
+    if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
+    const self = this.participants.self();
+    const runner = request.runner ?? this.manager.config.runner;
+    const defaultModel = request.model ?? this.manager.defaultModel(runner);
+    const defaults = {
+      ...(defaultModel ? { model: defaultModel } : {}),
+      thinking: request.thinking ?? this.manager.config.thinking,
+    };
+    const { routeAgentCreation } = await import("../agents/spawn-router.js");
+    const selected = await routeAgentCreation({
+      config, meshRoot: this.actorManager.mesh.root, kind,
+      role: self.role ?? (kind === "actor" ? "actor" : "task-agent"),
+      ...(request.name !== undefined ? { name: request.name } : {}),
+      cwd: kind === "spawn" ? await this.manager.resolveCwd(request.cwd, context.signal) : this.manager.cwd,
+      project: self.projectRoot ?? self.project ?? this.manager.cwd,
+      ...(kind === "spawn" ? { task: String(args.task) }
+        : typeof args.instructions === "string" ? { task: args.instructions }
+        : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
+      parentId: self.id, defaults,
+      ...(request.complexity ? { complexity: request.complexity } : {}),
+      explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
+      validateModel: model => {
+        this.manager.assertModelAllowed(model, runner);
+        // Non-Pi configured backend defaults are known keys; otherwise require
+        // an exact visible Pi id/alias, never a ranked closest match or a refresh.
+        if (runner !== "pi" && model === this.manager.defaultModel(runner)) return model;
+        const resolved = resolveAvailablePiModel(model, {
+          aliases: this.modelsConfig().aliases,
+          available: context.extensionContext.modelRegistry.getAvailable().map(model => ({
+            provider: String(model.provider), id: String(model.id),
+          })), exact: true, closest: false,
+        });
+        const canonical = `${resolved.provider}/${resolved.id}`;
+        this.manager.assertModelAllowed(canonical, runner);
+        return canonical;
+      },
+      ...(context.signal ? { signal: context.signal } : {}),
+    });
+    return selected ? { ...request, ...selected } : request;
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
@@ -823,7 +885,7 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = await this.#prepareSpawnRequest(args, context);
+        const request = await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context);
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...baseRequest } = request;
         const durableCwd = request.residency === "durable" && request.cwd !== undefined
@@ -1192,9 +1254,11 @@ export class AgentsProvider implements FabricProvider {
       }
       case "createActor":
       case "create": {
-        const request = await this.#admitActorRequest(
+        const admitted = await this.#admitActorRequest(
           actorRequest(args, context, this.manager, args.scope !== "global", this.callerThinking()), context, false,
         );
+        const request = args.scope === "global" ? admitted
+          : await this.#routeCreationDefault("actor", args, admitted, context);
         if (args.scope === "global") {
           checkCommit();
           const { instructionsFile: _file, sha256: _digest, ...base } = request;
@@ -1243,13 +1307,14 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
+        const ownerIncarnation = controlOwnerIncarnation(participant);
         const ownRoot = participant.rootId === this.mainAgent.id;
         const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
         }
-        if (!this.control || participant.controlProtocol === "legacy") {
+        if (!this.control) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }
         context.signal?.throwIfAborted();
@@ -1259,6 +1324,7 @@ export class AgentsProvider implements FabricProvider {
           "ask",
           {
             principal: invocationFabricPrincipal(context),
+            ownerIncarnation,
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
@@ -1284,6 +1350,7 @@ export class AgentsProvider implements FabricProvider {
           { binding: actorRunBinding(args),
             ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
+      case "send":
       case "steer":
         return this.routeMessage(
           String(args.id),
@@ -1291,7 +1358,8 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "steer",
           context,
-          { ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
+          { ...(args.priority === undefined ? {} : { priority: args.priority as FabricSteerPriority }),
+            ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "cancelFollowUp":
         return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
@@ -1335,6 +1403,7 @@ export class AgentsProvider implements FabricProvider {
         return result;
       }
       case "actorStatus": {
+        await this.actorManager.reconcileSessionOrphans();
         const id = String(args.id);
         let actor: FabricActorInfo | undefined;
         try {
@@ -1342,7 +1411,7 @@ export class AgentsProvider implements FabricProvider {
         } catch (error) {
           if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
         }
-        if (actor && this.actorManager.owns(actor.id)) return actor;
+        if (actor && (actor.sessionOrphan && actor.status === "stopped" || this.actorManager.owns(actor.id))) return actor;
         // A retained definition is not a fresh execution snapshot. Recover its
         // exact owner before a resident query or the synchronous live overlay.
         await this.#resolveActorTarget(actor?.id ?? id);
@@ -1366,6 +1435,7 @@ export class AgentsProvider implements FabricProvider {
       }
       case "actors": {
         if (args.scope === "global") return this.globalActors.list();
+        await this.actorManager.reconcileSessionOrphans();
         const local = this.#actorsWithLiveState();
         const resident = this.#liveResidentActorClient();
         if (!resident) return local;
@@ -1644,7 +1714,10 @@ export class AgentsProvider implements FabricProvider {
     context?: FabricInvocationContext,
     options: {
       from?: MeshIdentity;
+      /** Diagnostic producer snapshot only; never sender authority. */
+      wakeCause?: FabricWakeCause;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
@@ -1798,6 +1871,9 @@ export class AgentsProvider implements FabricProvider {
 
   /** Registry definitions/bindings are useful; non-owned execution snapshots are not (#2726). */
   #actorWithLiveState(actor: FabricActorInfo): FabricActorReadInfo {
+    // A fenced terminal root-gone decision outranks stale owner advertisements and
+    // must remain inspectable without entering routing lease grace/recovery.
+    if (actor.status === "stopped" && actor.sessionOrphan) return actor;
     if (this.actorManager.owns(actor.id)) return actor;
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
@@ -1981,12 +2057,13 @@ export class AgentsProvider implements FabricProvider {
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }
+    const ownerIncarnation = controlOwnerIncarnation(participant);
     if (!this.control) throw new Error("Fabric control plane is unavailable");
     const result = await this.control.request(
       participant.ownerHostId,
       participant.id,
       "stop",
-      {},
+      { ownerIncarnation },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
     );

@@ -1,6 +1,9 @@
 import type { AgentRunRequest } from "./types.js";
+import { normalizeAgentRequires } from "./input-validation.js";
+import { normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 import { isFabricThinking } from "../thinking.js";
 import { parseAgentNice } from "./priority.js";
+import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { aliasThinking, type FabricModelAliases } from "../core/model-resolution.js";
 
 const stringArray = (value: unknown): string[] | undefined => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
@@ -9,9 +12,29 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
   throw new Error(`Invalid Fabric agent kernel: ${String(value)}`);
 };
 
+/**
+ * True when fleet policy would deny the configured selector: the selector itself or any target of the alias it
+ * names, compared as assertFabricModelAllowed compares (trimmed, case-insensitive). ponytail: any denied alias
+ * target counts, because alias resolution may pick it; a denied configured default then falls back to the
+ * caller's admitted binding instead of failing later in the policy check.
+ */
+const configuredModelDenied = (
+  model: string,
+  denied: readonly string[] | undefined,
+  aliases: FabricModelAliases | undefined,
+): boolean => {
+  if (!denied?.length) return false;
+  const blocked = new Set(denied.map((entry) => entry.trim().toLowerCase()));
+  const key = model.trim().toLowerCase();
+  if (blocked.has(key)) return true;
+  const name = aliases ? Object.keys(aliases).find((alias) => alias.toLowerCase() === key) : undefined;
+  const targets = name !== undefined && aliases ? aliases[name]?.targets ?? [] : [];
+  return targets.some((target) => blocked.has(target.trim().toLowerCase()));
+};
+
 export const normalizeAgentRunRequest = (
   args: Record<string, unknown>,
-  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
+  defaults: {runner: NonNullable<AgentRunRequest["runner"]>; model?: string; configuredThinking?: AgentRunRequest["thinking"]; deniedModels?: readonly string[]; timeoutMs: number; inheritedModel?: {provider: string; id: string}; inheritedThinking?: string | undefined; models?: {aliases?: FabricModelAliases}},
   options: {allowCwd?: boolean} = {},
 ): AgentRunRequest => {
   if (args.model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
@@ -29,26 +52,40 @@ export const normalizeAgentRunRequest = (
       ? args.runner
       : defaults.runner;
   const explicitModel = typeof args.model === "string" ? args.model.trim() || undefined : undefined;
-  // The caller's admitted Pi binding wins over package/workspace defaults, also in
-  // actor/task processes whose Main target is remote. Never infer from that target.
-  const inheritedModel = runner === "pi" && !explicitModel && defaults.inheritedModel
+  // A configured default that fleet policy denies does not win: fall back to the caller's admitted
+  // binding (#2490), so the deny-replacement path stays where it was before #6062.
+  const configuredModel = runner === "pi" && defaults.model
+    && !configuredModelDenied(defaults.model, defaults.deniedModels, defaults.models?.aliases)
+    ? defaults.model : undefined;
+  // Configured defaults win. Otherwise inherit the caller's admitted Pi binding,
+  // also in actor/task processes whose Main target is remote. Never infer from that target.
+  const inheritedModel = runner === "pi" && !explicitModel && !configuredModel && defaults.inheritedModel
     ? `${defaults.inheritedModel.provider}/${defaults.inheritedModel.id}` : undefined;
-  const requestedModel = explicitModel ?? inheritedModel ?? (runner === "pi" ? defaults.model : undefined);
+  const requestedModel = explicitModel ?? configuredModel ?? inheritedModel;
   const thinking = isFabricThinking(args.thinking) ? args.thinking
     : inheritedModel && isFabricThinking(defaults.inheritedThinking) ? defaults.inheritedThinking
+    : isFabricThinking(defaults.configuredThinking) ? defaults.configuredThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
-  if (args.needs !== undefined && (!Array.isArray(args.needs) || !args.needs.every(entry => typeof entry === "string" && !!entry.trim()))) {
-    throw new Error("Invalid agent needs: expected nonempty capability strings");
+  if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
+    throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
   }
+  const requires = normalizeAgentRequires(args.requires);
+  const needs = normalizeAgentCapabilityTokens(args.needs);
   const timeoutMs = typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > defaults.timeoutMs ? args.timeoutMs : undefined;
   const kernel = checkedKernel(args.kernel);
   const nice = parseAgentNice(args.nice);
+  const bashIdleSeconds = args.bashIdleSeconds;
+  if (bashIdleSeconds !== undefined && (typeof bashIdleSeconds !== "number" || !Number.isInteger(bashIdleSeconds) ||
+    bashIdleSeconds < 0 || bashIdleSeconds > MAX_ACTOR_BASH_TIMEOUT_S)) {
+    throw new Error(`bashIdleSeconds must be a non-negative integer at most ${MAX_ACTOR_BASH_TIMEOUT_S} (0 = no idle limit)`);
+  }
   if (args.recursive === true && args.extensions === false) {
     throw new Error("Recursive Fabric requires extensions enabled; omit recursive or extensions: false");
   }
   return {
     task: String(args.task),
+    ...(args.complexity !== undefined ? { complexity: args.complexity as NonNullable<AgentRunRequest["complexity"]> } : {}),
     runner,
     ...(typeof args.routeClass === "string" ? { routeClass: args.routeClass } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
@@ -66,8 +103,10 @@ export const normalizeAgentRunRequest = (
       : {}),
     ...(thinking ? { thinking } : {}),
     ...(nice !== undefined ? { nice } : {}),
+    ...(bashIdleSeconds !== undefined ? { bashIdleSeconds } : {}),
     ...(tools ? { tools } : {}),
-    ...(args.needs !== undefined ? { needs: [...args.needs as string[]] } : {}),
+    ...(needs !== undefined ? { needs } : {}),
+    ...(requires !== undefined ? { requires } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(typeof args.extensions === "boolean"
       ? { extensions: args.extensions }

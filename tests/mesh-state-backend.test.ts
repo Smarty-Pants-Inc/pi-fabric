@@ -59,7 +59,11 @@ describe("state backend selection", () => {
     expect(resolveMeshStateBackend(undefined, undefined)).toBe("file");
     expect(resolveMeshStateBackend(undefined, "sqlite")).toBe("sqlite");
     expect(resolveMeshStateBackend(undefined, " Shadow ")).toBe("shadow");
-    expect(resolveMeshStateBackend(undefined, "bogus")).toBe("file");
+    // pi-fabric#796: an unknown non-empty override is refused, never ignored; empty counts as unset.
+    expect(() => resolveMeshStateBackend(undefined, "bogus")).toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be file, shadow, sqlite or nats/);
+    expect(() => resolveMeshStateBackend(undefined, "jetstream")).toThrow(/PI_FABRIC_MESH_STATE_BACKEND/);
+    expect(resolveMeshStateBackend(undefined, "  ")).toBe("file");
+    expect(resolveMeshStateBackend(undefined, "")).toBe("file");
     expect(resolveMeshStateBackend("file", "sqlite")).toBe("file");
     expect(() => resolveMeshStateBackend("bogus" as "file")).toThrow(/mesh.stateBackend/);
     const root = tempRoot("select");
@@ -75,8 +79,9 @@ describe("state backend selection", () => {
     expect(() => normalizeFabricConfig({ mesh: { stateBackend: "postgres" } })).toThrow(/mesh.stateBackend/);
     vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");
     expect(normalizeFabricConfig({ mesh: { stateBackend: "file" } }).mesh.stateBackend).toBe("sqlite");
+    // pi-fabric#796: an unknown override fails config loading; it no longer falls back to the file setting.
     vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "nope");
-    expect(normalizeFabricConfig({ mesh: { stateBackend: "shadow" } }).mesh.stateBackend).toBe("shadow");
+    expect(() => normalizeFabricConfig({ mesh: { stateBackend: "shadow" } })).toThrow(/PI_FABRIC_MESH_STATE_BACKEND must be/);
   });
 
   it("the file backend creates no SQLite file", async () => {
@@ -255,6 +260,9 @@ describe("sqlite backend acquisition", () => {
   it("never takes the mesh .lock for state", async () => {
     const root = tempRoot("nolock");
     const store = open(root, { stateBackend: "sqlite" });
+    // A fixture's first open of a fresh root installs the marker under the import's fence (custody.lock and
+    // .lock, smarty-dev#6477 review round 2): that is initialisation, not state, so it happens before watching.
+    expect(store.listAll("")).toEqual([]);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     try {
@@ -265,7 +273,8 @@ describe("sqlite backend acquisition", () => {
       await new Promise(resolve => setTimeout(resolve, 50));
     } finally { watcher.close(); }
     expect(seen.filter(name => name.startsWith(".lock"))).toEqual([]);
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // state.json is only the moved marker a fresh root's initialisation leaves (smarty-dev#6477), never state.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
   });
 

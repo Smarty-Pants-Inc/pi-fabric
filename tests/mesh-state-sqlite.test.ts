@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import {
   filesystemRefusal, MeshStateRetiredError, openNodeSqlite, SqliteStateStore, type SqliteConnection, type SqliteStateStoreOptions,
@@ -574,21 +574,27 @@ describe("SqliteStateStore", () => {
         store.close();`, [root, go, stop, String(index)])),
     ];
     await waitFor(() => fs.readdirSync(root).filter(name => name.startsWith("ready-")).length === writers + readers, 90_000, `${procs} children ready`);
-    let maxWal = 0, lastWal = 0, appended = 0, wins = 0;
+    // smarty-dev#7651 (pi-fabric#891 review): measure what each of the maintainer's TRUNCATE statements actually
+    // removed, not a count or a size-sample inference. The maintainer runs in this process; its TRUNCATE is one
+    // synchronous statement, so the WAL size right before and right after it bounds exactly what it emptied. An
+    // ineffective win removes 0; a truncate and regrow is counted exactly.
+    const { StatementSync } = process.getBuiltinModule("node:sqlite") as { StatementSync: { prototype: { get: (...args: unknown[]) => unknown } } };
+    const statementGet = StatementSync.prototype.get;
+    let removed = 0, inLoad = true;
+    vi.spyOn(StatementSync.prototype, "get").mockImplementation(function (this: { sourceSQL?: string }, ...args: unknown[]) {
+      if (!inLoad || this.sourceSQL !== "PRAGMA wal_checkpoint(TRUNCATE)") return statementGet.apply(this, args);
+      const before = maintainer.walBytes();
+      try { return statementGet.apply(this, args); }
+      finally { removed += Math.max(0, before - maintainer.walBytes()); }
+    });
+    let maxWal = 0;
     const sampler = setInterval(() => {
-      const wal = maintainer.walBytes();
-      const won = maintainer.stats().checkpoints.truncate;
-      // A lower bound on the bytes appended since the last sample. After a reset the WAL restarted from 0, so at
-      // least `wal` bytes were appended: a reset seen as a drop, or a maintainer TRUNCATE win (its count, not the
-      // size, so a truncate-and-regrow inside one 10 ms sample is not missed). Otherwise only the growth.
-      appended += wal < lastWal || won > wins ? wal : wal - lastWal;
-      wins = won;
-      lastWal = wal;
-      maxWal = Math.max(maxWal, wal);
-      if (won > 0 && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
+      maxWal = Math.max(maxWal, maintainer.walBytes());
+      if (removed > 0 && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
     }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
+    inLoad = false;
     fs.writeFileSync(stop, "");
     const readerResults = await Promise.all(children.slice(writers).map(entry => entry.done));
     clearInterval(sampler);
@@ -597,17 +603,17 @@ describe("SqliteStateStore", () => {
     const reads = readerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { reads: number }).reads, 0);
     const stats = maintainer.stats();
     const walTraffic = writerResults.reduce((sum, result) => sum + (JSON.parse(result.stdout) as { filled: number }).filled, 0) * 3_000;
-    // Evidence for the PR: WAL bound versus the bytes written through it.
-    console.log(JSON.stringify({ maxWal, appended, walTraffic, reads, checkpoints: stats.checkpoints }));
+    // Evidence for the PR: the WAL peak and what the maintainer's in-load TRUNCATEs removed.
+    const appended = maintainer.walBytes() + removed;
+    console.log(JSON.stringify({ maxWal, removed, appended, walTraffic, reads, checkpoints: stats.checkpoints }));
     expect(reads).toBeGreaterThan(readers);
+    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). smarty-dev#7651: the
+    // maintainer must win AND that win must actually shrink the WAL while the readers run, within a window bounded
+    // by work (capped at 4x the traffic), not by a 16 MiB peak, which measured how often the busy-backoff TRUNCATE
+    // wins on the runner's CPU (windows-latest: 36-44 MiB with 0-2 wins). A starved checkpoint fails at truncate,
+    // an ineffective one at removed. No peak bound: the writers' own WAL resets run in other processes, unmeasured.
     expect(stats.checkpoints.truncate).toBeGreaterThan(0);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe): its peak is then every
-    // byte appended in the run. smarty-dev#7651: bound the peak by what this run appended, not by 16 MiB, which
-    // measured how often the busy-backoff TRUNCATE wins on the runner's CPU (windows-latest: 36-44 MiB with 0-2 wins;
-    // 2 cores here: 25-40 MiB). A starved checkpoint fails at truncate > 0 (the window is capped); a WAL that never
-    // resets leaves peak == appended; a TRUNCATE that is counted but does not empty the WAL fails at checkpoint(0) below.
-    expect(appended).toBeGreaterThan(walTraffic);
-    expect(maxWal).toBeLessThan(appended);
+    expect(removed).toBeGreaterThan(0);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();

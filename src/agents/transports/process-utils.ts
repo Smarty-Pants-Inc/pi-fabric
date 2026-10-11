@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../../core/atomic-write.js";
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -48,7 +49,7 @@ export const executeFile = (
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
         ...(options.cwd ? { cwd: options.cwd } : {}),
-        ...(options.env ? { env: options.env } : {}),
+        env: childProcessEnvironment(options.env),
         ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
         // Query callers opt into SIGKILL; preserve cooperative termination for
         // existing mutating commands (for example git releasing its lock files).
@@ -336,7 +337,7 @@ export const spawnDetached = async (
     "fabric-scope", marker!, scopeUnit!, runtime, workerPath, ...workerArguments,
   ] : [workerPath, ...workerArguments], {
     cwd,
-    ...(environment ? { env: environment } : {}),
+    env: childProcessEnvironment(environment),
     detached: process.platform !== "win32",
     stdio: tracksExecution ? ["ignore", "ignore", "ignore", "ipc"] : "ignore",
   });
@@ -544,7 +545,15 @@ export const spawnDetached = async (
     const buffer = Buffer.alloc(4096);
     // Positioned reads keep a retained descriptor useful after scope removal,
     // and never consume the next populated notification's file offset.
-    const size = fs.readSync(scopeEventsFd, buffer, 0, buffer.length, 0);
+    let size: number;
+    try { size = fs.readSync(scopeEventsFd, buffer, 0, buffer.length, 0); }
+    catch (error) {
+      // ponytail: cgroup v2 refuses to remove a cgroup that still has processes (EBUSY), so a removed
+      // scope (systemd collects it on empty: kernfs answers ENODEV on the retained fd, smarty-dev#6829) proves
+      // populated 0. Only removal: every other read error (EACCES, EIO, ...) still fails closed.
+      if ((error as NodeJS.ErrnoException).code === "ENODEV") return true;
+      throw error;
+    }
     const populated = buffer.toString("utf8", 0, size).match(/^populated ([01])$/m)?.[1];
     if (populated === undefined) throw new Error("Owned scope populated receipt is unreadable");
     return populated === "0";

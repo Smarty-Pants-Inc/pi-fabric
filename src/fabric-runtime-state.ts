@@ -29,6 +29,7 @@ import type { JevObservationHost } from "./jev/observation.js";
 import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
+import { isMainInterruptSupervisor } from "./interrupt-authority.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
 import { FabricComponentCatalog } from "./components/catalog.js";
 import { FabricComponentLoader } from "./components/loader.js";
@@ -374,6 +375,15 @@ export class FabricRuntimeState {
     return batch;
   }
 
+  /** Record inbox events that entered a turn as consumed (R-token-waste); never injected again. */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    if (!ids.length || !this.#meshActivationReady()) return;
+    await this.#inboxRetry.run(async () => {
+      if (!this.#meshActivationReady()) return;
+      await this.#rootInbox?.consume(ids, receipts);
+    });
+  }
+
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
   recordsWake: (() => Promise<void>) | undefined;
 
@@ -672,6 +682,14 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
+      {
+        isSupervisor: (sender, rootId) => {
+          if (sender.kind !== "actor") return false;
+          try {
+            return isMainInterruptSupervisor(sender, rootId, this.#actors?.status(sender.id));
+          } catch { return false; }
+        },
+      },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
     );
     this.#mainAgent = mainAgent;

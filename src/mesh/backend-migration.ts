@@ -94,6 +94,7 @@ import type { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
+import { assertPrivateStateRoot, openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
 export { assertFileStateWritable, MeshBackendFenceError, readMeshStateMovedMarker, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource };
@@ -147,6 +148,12 @@ export interface MeshBackendOptions {
    * (smarty-dev#7815: the reader readiness gate is re-checked here, see reader-proof.ts).
    */
   beforeCommit?: (commit: { phase: "importing" | "sqlite"; fromEpoch: number; toEpoch: number }) => void;
+  /**
+   * Runs under the fence of an import or cutover, before this operation opens state.db (smarty-dev#7936:
+   * the readiness gate's write-lease probe needs this process to hold no fd on it). A throw aborts the
+   * switch with nothing changed.
+   */
+  beforeOpen?: () => void | Promise<void>;
   /** Fence violations and late writers. The error is thrown as well. */
   onAlarm?: (alarm: MeshBackendAlarm) => void;
 }
@@ -383,17 +390,25 @@ class FenceDb {
     const file = path.join(root, STATE_DB);
     const exists = fs.statSync(file, { throwIfNoEntry: false }) !== undefined;
     if (!exists && !create) return undefined;
-    if (intent === "write") {
-      const refusal = filesystemRefusal(root);
-      if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    let db: SqliteConnection;
+    try {
+      if (intent === "write") {
+        const refusal = filesystemRefusal(root); // before any side effect; the gate below checks again
+        if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+      }
+      if (!exists) {
+        fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+        assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
+        // O_EXCL: when this succeeds no connection in this process has the file open.
+        try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      }
+      db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
+    } catch (error) {
+      // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
+      if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);
+      throw error;
     }
-    if (!exists) {
-      fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-      // O_EXCL: when this succeeds no connection in this process has the file open.
-      try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    }
-    const db = (options.open ?? openNodeSqlite)(file);
     try {
       db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
       db.exec("PRAGMA trusted_schema = OFF");
@@ -787,6 +802,7 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   return holdFence(root, options, async (lock) => {
+    await options.beforeOpen?.();
     const census = await adviseCensus(options);
     const fence = FenceDb.open(root, options, "write", true)!;
     try {

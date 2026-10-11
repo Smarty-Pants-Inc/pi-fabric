@@ -1,5 +1,6 @@
 import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
+import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -67,12 +68,15 @@ export interface FabricControlCommand {
   /** Diagnostic producer metadata, never used for command admission or authority. */
   wakeCause?: FabricWakeCause | undefined;
   triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
   cancelCommandId?: string;
   requestedAt: number;
   deadlineAt?: number;
 }
+
+import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
 
 export interface FabricControlAcceptance {
   code?: "FABRIC_TARGET_TERMINAL";
@@ -95,14 +99,17 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
+  errorCode?: FabricInterruptErrorCode;
   /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
   notRun?: true;
 }
 
 /** An owner's rejection; `notRun` only when the owner proved the handler did not run. */
 class FabricControlRejection extends Error {
-  constructor(message: string, readonly notRun: boolean) {
+  constructor(message: string, readonly notRun: boolean, readonly code?: FabricInterruptErrorCode) {
     super(message);
+    if (code) this.name = code === "FABRIC_INTERRUPT_NOT_AUTHORIZED"
+      ? "FabricInterruptNotAuthorizedError" : "FabricInterruptRateLimitedError";
   }
 }
 
@@ -198,6 +205,7 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     (data.destinationRemoteHost !== undefined && data.destinationRemoteHost !== null &&
       typeof data.destinationRemoteHost !== "string") ||
     (data.operation === "cancel" && typeof data.cancelCommandId !== "string") ||
+    (data.priority !== undefined && (data.priority !== "interrupt" || data.operation !== "steer")) ||
     (data.bindingProvenance !== undefined &&
       (!isObject(data.bindingProvenance) || data.bindingProvenance.kind !== "owner-defaults" ||
         typeof data.bindingProvenance.rootId !== "string")) ||
@@ -270,6 +278,7 @@ export interface FabricControlInput {
   data?: unknown;
   wakeCause?: FabricWakeCause | undefined;
   triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
   binding?: FabricActorRunBinding;
   bindingProvenance?: FabricActorBindingProvenance;
 }
@@ -424,6 +433,7 @@ export class FabricControlPlane {
     ownerIdentityId = ownerHostId,
     options: FabricControlRequestOptions = {},
   ): Promise<FabricControlResult> {
+    assertSteerPriority(input.priority, operation);
     // Freeze diagnostic producer attribution before publication or an observation retry yields.
     input = { ...input, wakeCause: copyFabricWakeCause(input.wakeCause) };
     // One logical message key survives both observation retries and a proven-notRun resend.
@@ -654,6 +664,7 @@ export class FabricControlPlane {
           ...(input.data !== undefined ? { data: input.data } : {}),
           ...(input.wakeCause !== undefined ? { wakeCause: copyFabricWakeCause(input.wakeCause) } : {}),
           ...(input.triggerTurn !== undefined ? { triggerTurn: input.triggerTurn } : {}),
+          ...(input.priority !== undefined ? { priority: input.priority } : {}),
           ...(input.binding !== undefined ? { binding: input.binding } : {}),
           ...(input.bindingProvenance !== undefined ? { bindingProvenance: input.bindingProvenance } : {}),
           requestedAt: committedAt,
@@ -684,6 +695,7 @@ export class FabricControlPlane {
             ? `${error}; not delivered, safe to resend.`
             : error,
           acknowledged.notRun === true,
+          acknowledged.errorCode,
         );
       }
       return { commandId, acceptance: acknowledged };
@@ -1005,6 +1017,8 @@ export class FabricControlPlane {
         ? { result: event.data.result }
         : {}),
       ...(typeof event.data.error === "string" ? { error: event.data.error } : {}),
+      ...(event.data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || event.data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
+        ? { errorCode: event.data.errorCode } : {}),
       ...(event.data.accepted !== true && event.data.notRun === true ? { notRun: true as const } : {}),
     });
   }
@@ -1421,6 +1435,7 @@ export class FabricControlPlane {
             ? { result: acceptance.result }
             : {}),
           ...(acceptance.error ? { error: acceptance.error } : {}),
+          ...(acceptance.errorCode ? { errorCode: acceptance.errorCode } : {}),
           ...(!acceptance.accepted && terminalRejectionFields(acceptance)?.targetId === command.targetId
             ? terminalRejectionFields(acceptance) : {}),
           ...(!acceptance.accepted && acceptance.notRun ? { notRun: true } : {}),

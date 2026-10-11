@@ -4,7 +4,8 @@
  * A leaf module: state-file.ts calls `assertFileStateWritable` on its real commit path, under the
  * mesh `.lock`, right before the state.json rename, and backend-migration.ts (which imports
  * state-file.ts) re-exports it with `MeshBackendFenceError`. It therefore imports nothing from
- * state-file.ts, store.ts or state-sqlite.ts at runtime (only types), and opens SQLite at first use.
+ * state-file.ts, store.ts or state-sqlite.ts at runtime (only types), and opens SQLite at first use,
+ * through the leaf state-gate.ts like every other state.db connection (smarty-dev#7548).
  *
  * Cost: one `fs.statSync` of `<root>/state.db` per write. A root without state.db (every legacy
  * file root) writes as before without opening SQLite; the reader rule (`meshStateSourceOf`) still
@@ -17,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { storageRevision } from "../verified/storage.js";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
+import { openPrivateStateDb } from "./state-gate.js";
 
 export interface MeshBackendAlarm {
   code: "FABRIC_MESH_BACKEND_FENCE" | "FABRIC_MESH_BACKEND_LATE_WRITER";
@@ -209,7 +211,7 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
 };
 
 /** node:sqlite at first use (AGENTS.md startup budget); the subset the guard needs. */
-const openDefault = (file: string): Pick<SqliteConnection, "exec" | "prepare" | "close"> => {
+const openDefault = (file: string): SqliteConnection => {
   const sqlite = process.getBuiltinModule?.("node:sqlite") as typeof import("node:sqlite") | undefined;
   if (!sqlite?.DatabaseSync) throw new Error("node:sqlite is unavailable in this runtime (Node >= 22.13 required)");
   const database = new sqlite.DatabaseSync(file, { timeout: 0 });
@@ -220,12 +222,13 @@ const openDefault = (file: string): Pick<SqliteConnection, "exec" | "prepare" | 
       return { run: (...params) => statement.run(...params), get: (...params) => statement.get(...params), all: (...params) => statement.all(...params) };
     },
     close: () => { database.close(); },
+    get isTransaction() { return database.isTransaction; },
   };
 };
 
 /** meta.backend and meta.epoch of an existing state.db (undefined when uninitialised), on a short-lived connection. */
 const readFenceMeta = (root: string, options: MeshBackendFenceOptions): { backend: string; epoch: number } | undefined => {
-  const db = (options.open ?? openDefault)(path.join(root, STATE_DB));
+  const db = openPrivateStateDb(path.join(root, STATE_DB), options.open ?? openDefault); // the one gate (smarty-dev#7548)
   try {
     db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
     db.exec("PRAGMA trusted_schema = OFF");

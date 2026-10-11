@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -128,6 +129,7 @@ interface ActorQueueItem {
 
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
+import { isMainSupervisorRequest } from "../interrupt-authority.js";
 
 interface SettledWindow {
   acceptedAt: number;
@@ -142,6 +144,7 @@ interface ManagedActor {
   id: string;
   name: string;
   rootId: string;
+  supervisorFor?: string;
   // Fencing token written when a host adopts this lineage: a lineage adopted
   // this recently still has an adopter finding its footing — do not adopt
   // over it until ORPHAN_ADOPTION_RETRY_MS has elapsed.
@@ -433,6 +436,9 @@ const ACTOR_DEAD_LETTER_ALARM_MS = 60 * 60 * 1000;
 export const ACTOR_BLOCK_REALARM_AFTER_MS = 2 * 60 * 60 * 1000;
 /** ...at most once per this interval per actor while it stays blocked. */
 export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
+/** A `pending` re-alarm claim older than this was left by a crash: a later sweep takes it over.
+ * Far above a publish's bounded mesh-lock wait (10 s), so a live slow publish is not doubled. */
+export const ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS = 5 * 60 * 1000;
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
 export class ActorPreparationError extends Error {
@@ -838,8 +844,10 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, checkActive, onCommit }: {
+    { asRegistryOwner = false, beforeCommit, checkActive, onCommit, supervisorOwner = this.identity }: {
       asRegistryOwner?: boolean;
+      /** Host-only: verified resident creator, never request fields. */
+      supervisorOwner?: MeshIdentity;
       beforeCommit?: (id: string) => void | Promise<void>;
       checkActive?: () => void;
       /** Synchronous receipt registration, before the first creation effect; no await follows before insertion. */
@@ -928,6 +936,8 @@ export class ActorManager {
       id,
       name,
       rootId: this.#rootId,
+      ...(supervisorOwner.kind === "main" && supervisorOwner.id === this.#rootId && isMainSupervisorRequest(request)
+        ? { supervisorFor: this.#rootId } : {}),
       ...(this.#project ? { project: this.#project } : {}),
       instructions: request.instructions,
       status: "idle",
@@ -4450,7 +4460,7 @@ export class ActorManager {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
+      const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
       if (child.pid) {
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
@@ -4467,14 +4477,17 @@ export class ActorManager {
     if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
     const slot = Math.floor((now - blocked.since - ACTOR_BLOCK_REALARM_AFTER_MS) / ACTOR_BLOCK_REALARM_EVERY_MS);
     const key = actorRealarmKey(actor.id);
+    // A `pending` claim whose publish is overdue no longer covers its slot (smarty-dev#7905).
     const covers = (entry: MeshStateEntry | undefined): boolean => {
-      const claimed = entry?.value as { since?: unknown; slot?: unknown } | undefined;
-      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot;
+      const claimed = entry?.value as { since?: unknown; slot?: unknown; state?: unknown; at?: unknown } | undefined;
+      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot &&
+        !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
     };
     if (covers(this.mesh.get(key))) return;
     const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
       since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
       pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
+    const claimed = { since: blocked.since, slot, at: now, owner: this.identity.id, state: "pending" };
     void (async () => {
       // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
       // tombstone, so a claim removed when an earlier block cleared can be taken again.
@@ -4483,23 +4496,32 @@ export class ActorManager {
         const current = view.get(key);
         if (covers(current)) return [];
         previous = current;
-        return [{ kind: "put", key, ifVersion: view.version(key), onConflict: "skip",
-          value: { since: blocked.since, slot, at: now, owner: this.identity.id } }];
+        return [{ kind: "put", key, ifVersion: view.version(key), onConflict: "skip", value: claimed }];
       } }).catch(() => [] as MeshBatchResult[]);
       // No applied claim: another sweep or owner holds this slot, and only it publishes.
       const claim = results.find((result) => result.key === key && result.applied);
       if (!claim) return;
-      // ponytail: claim before publish. A crash between the two loses this slot's alarm and the
-      // next slot alarms; for a repeat alarm that is the safe direction (never a duplicate).
+      // Release the slot, fenced to our claim, so the next sweep retries.
+      const release = () => (previous
+        ? this.mesh.put({ key, identity: previous.updatedBy, value: previous.value, ifVersion: claim.version })
+        : this.mesh.delete({ key, ifVersion: claim.version })).catch(() => undefined);
+      // Claim before publish: a crash between the two leaves a `pending` claim that a later sweep
+      // takes over after the publish timeout. Never publish for a block that cleared or changed
+      // episode, or a claim another sweep took over meanwhile (smarty-dev#7905). ponytail: an unchanged
+      // version means the same slot and owner; any rewrite of the key bumps it.
+      if (this.#actors.get(actor.id)?.activationBlocked?.since !== blocked.since || this.mesh.get(key)?.version !== claim.version) {
+        await release();
+        return;
+      }
       // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
       try {
         await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity, data });
       } catch {
-        // Release the slot, fenced to our claim, so the next sweep retries.
-        await (previous
-          ? this.mesh.put({ key, identity: previous.updatedBy, value: previous.value, ifVersion: claim.version })
-          : this.mesh.delete({ key, ifVersion: claim.version })).catch(() => undefined);
+        await release();
+        return;
       }
+      await this.mesh.put({ key, identity: this.identity, value: { ...claimed, state: "published" }, ifVersion: claim.version })
+        .catch(() => undefined);
     })();
   }
 
@@ -4781,6 +4803,7 @@ export class ActorManager {
       id: actor.id,
       name: actor.name,
       rootId: actor.rootId,
+      ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}),
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
       ...(actor.project ? { project: actor.project } : {}),
@@ -5229,6 +5252,8 @@ export class ActorManager {
         id: record.id,
         name: record.name,
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
+        ...(typeof record.supervisorFor === "string" && record.supervisorFor === record.rootId
+          ? { supervisorFor: record.supervisorFor } : {}),
         ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
         ...(Array.isArray(record.adoptedFrom)
@@ -5903,6 +5928,7 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ...(actor.supervisorFor === actor.rootId ? { supervisorFor: actor.supervisorFor } : {}),
       ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,

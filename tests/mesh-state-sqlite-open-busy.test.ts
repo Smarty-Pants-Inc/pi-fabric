@@ -9,6 +9,7 @@ import { StoreBridgeSide } from "../src/mesh/bridge.js";
 import { checkpointFlagRaised, lowerCheckpointFlag, ownerToken, raiseCheckpointFlag, reclaimClaimPath, removeOwnedFile, SqliteStateStore, tryLockFile }
   from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
+import { processStartTime } from "../src/residency/process-identity.js";
 
 // smarty-dev#6477 P0 (sqlite soak): wal_autocheckpoint=0 and no production checkpointer let the hub's WAL grow
 // to 48 MB, and a raw "database is locked" (SQLITE_BUSY) escaped as fatal and stopped a mesh-bridge on restart.
@@ -180,13 +181,16 @@ describe("synchronous busy retries stay inside their wall-clock budget (PR #691 
       sleepSync(5); // what SQLite's busy handler spends before it gives up
       throw Object.assign(new Error("database is locked"), { errcode: 5 });
     });
+    // The monotonic clock advances only by the blocking waits (handler and retry sleeps), as on an idle CPU:
+    // a loaded runner's preemption is not the retry loop's time (smarty-dev#7651, and Windows' 15.6 ms tick #7630).
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, ms) => { clock += ms ?? 0; return "timed-out"; });
     const { error, ms } = timed(() => store.listAll(""));
     expectRetryableBusy(error);
     expect(attempts).toBeGreaterThan(1); // it does retry
-    // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms (+ timer slack).
-    // Windows (smarty-dev#7630): Atomics.wait ends on a ~15.6 ms timer tick, so a first attempt ending just inside
-    // the budget (< 9 ms), its 1 ms sleep and one more 5 ms attempt can each round up to a tick: ~9 + 2 x 15.6 ms.
-    expect(ms).toBeLessThan(15 + (process.platform === "win32" ? 2 * 15.6 + 10 : 10));
+    // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms, waits included.
+    expect(ms).toBeLessThanOrEqual(15);
   });
 
   it("a busy first open under an exclusive hold blocks for <= ~40 ms, busy-handler waits included", async () => {
@@ -518,6 +522,93 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     const crashed = raiseCheckpointFlag(root, ownerToken());
     age(crashed, 5_000);
     expect(checkpointFlagRaised(root)).toBe(false);
+  });
+
+  // smarty-dev#7421: a crashed holder's flag is removed by the next writer's scan; a live holder's flag stays.
+  it("the next writer removes a crashed holder's stale flag and keeps a live holder's", () => {
+    const root = lockRoot();
+    const crash = `import { createJiti } from "jiti"; import { pathToFileURL } from "node:url";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+      const { raiseCheckpointFlag, ownerToken } = await jiti.import("./src/mesh/state-sqlite.ts");
+      process.stdout.write(raiseCheckpointFlag(process.argv[1], ownerToken())); process.exit(0);`; // no lowerCheckpointFlag
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", crash, root], { cwd: process.cwd(), encoding: "utf8" });
+    const crashed = child.stdout;
+    expect(path.basename(crashed).startsWith(`${child.pid}.`)).toBe(true);
+    const live = raiseCheckpointFlag(root, ownerToken());
+    age(crashed, 5_000);
+    age(live, 5_000); // a live holder's stale flag is kept: only a dead holder's flag is removed
+    expect(checkpointFlagRaised(root)).toBe(false);
+    // Without /proc (Windows, macOS) a token records no start ticks ("-"), so the scan fails closed and keeps the
+    // dead holder's flag too; it is stale, so it never makes writers yield (pi-fabric#834 review).
+    const linux = process.platform === "linux";
+    expect(path.basename(crashed).split(".")[1] === "-").toBe(!linux);
+    const expected = linux ? [live] : [crashed, live];
+    expect(fs.readdirSync(path.dirname(live)).sort()).toEqual(expected.map((flag) => path.basename(flag)).sort());
+  });
+
+  // pi-fabric#834 review: the flag scan fails closed, and its removal is tryLockFile's claim plus recheck.
+  const staleFlag = (root: string, name: string): string => {
+    const dir = path.join(root, "state-checkpoint.flags");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const flag = path.join(dir, name);
+    fs.writeFileSync(flag, "", { mode: 0o600 });
+    age(flag, 5_000);
+    return flag;
+  };
+  const uuid = "00000000-0000-0000-0000-000000000000";
+  const flagsLeft = (root: string) => fs.readdirSync(path.join(root, "state-checkpoint.flags")).sort();
+
+  it.skipIf(process.platform !== "linux")("pid reuse: the same pid with other start ticks is removed, with the same ticks kept", () => {
+    const root = lockRoot();
+    staleFlag(root, `${process.pid}.1.${uuid}`);
+    const mine = `${process.pid}.${processStartTime(process.pid)}.${uuid}`;
+    staleFlag(root, mine);
+    expect(checkpointFlagRaised(root)).toBe(false);
+    expect(flagsLeft(root)).toEqual([mine]);
+    expect(fs.readdirSync(root).sort()).toEqual(["state-checkpoint.flags"]); // no claim left behind
+  });
+
+  it("keeps a flag without start ticks, even when its pid is gone", () => {
+    const root = lockRoot();
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+    const kept = [`${gone}.${uuid}`, `${gone}.-.${uuid}`].sort(); // a pre-#694 token, and one written without /proc
+    for (const name of kept) staleFlag(root, name);
+    expect(checkpointFlagRaised(root)).toBe(false);
+    expect(flagsLeft(root)).toEqual(kept);
+  });
+
+  it.skipIf(process.platform !== "linux")("keeps a live pid's flag when its start time cannot be read", () => {
+    const root = lockRoot();
+    const name = `${process.pid}.1.${uuid}`; // other ticks: removable only once they are read
+    staleFlag(root, name);
+    const readFileSync = fs.readFileSync.bind(fs);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (String(file).startsWith("/proc/")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      return readFileSync(file, options as BufferEncoding);
+    }) as typeof fs.readFileSync);
+    try { expect(checkpointFlagRaised(root)).toBe(false); } finally { vi.mocked(fs.readFileSync).mockRestore(); }
+    expect(flagsLeft(root)).toEqual([name]);
+  });
+
+  it("a dead holder's flag replaced between the verdict and the removal survives", () => {
+    const root = lockRoot();
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+    const flag = staleFlag(root, `${gone}.12345.${uuid}`);
+    const openSync = fs.openSync.bind(fs);
+    let raced = false;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (!raced && String(file).includes(".reclaim.")) {
+        raced = true; // the name is raised again (a fresh inode) after the scan's verdict, before its unlink
+        fs.rmSync(flag);
+        fs.writeFileSync(flag, "", { mode: 0o600 });
+      }
+      return openSync(file, ...(rest as [fs.OpenMode]));
+    }) as typeof fs.openSync);
+    try { checkpointFlagRaised(root); } finally { vi.mocked(fs.openSync).mockRestore(); }
+    expect(raced).toBe(true);
+    expect(fs.existsSync(flag)).toBe(true);
+    expect(checkpointFlagRaised(root)).toBe(true); // the fresh flag still makes writers yield
+    expect(fs.readdirSync(root).sort()).toEqual(["state-checkpoint.flags"]);
   });
 
   // pi-fabric#694 P2-D: an existing flag directory is never followed or written through unless it is ours.

@@ -36,7 +36,7 @@ const setup = (flushMs = 120_000) => {
   const alarms: FabricMainProviderDeadEvent[] = [];
   const released: unknown[] = [];
   const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root", true,
-    (event) => { released.push(event); }, (event) => { alarms.push(event); });
+    (event) => { released.push(event); }, {}, (event) => { alarms.push(event); });
   main.attachFollowUpDrain(ctx, flushMs);
   const emit = (name: string, event: unknown) => { for (const handler of handlers.get(name) ?? []) handler(event, ctx); };
   /** The failed run ends: Pi settles with an error outcome and goes idle. */

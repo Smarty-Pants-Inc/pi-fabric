@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
-import { verifiedRemove } from "./verified-remove.js";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
 export const SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -178,6 +177,8 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       // smarty-dev#7916: only the judged root inode and a tree of our own entries; off Linux main's removal
       // (smarty-dev#7858). No getuid on Linux means no ownership proof: nothing is removed.
       const directory = candidate.directory;
+      // First use only: scratch is eager (output budget, shell jobs); its deferred sweep is not.
+      const { verifiedRemove } = await import("./verified-remove.js");
       if (!verifiedRemove(directory, candidate.root, { deleter: "sweepScratch",
         fallback: () => { fs.rmSync(directory, { recursive: true, force: true }); return true; } }).removed) continue;
       result.removed.push(candidate.directory);

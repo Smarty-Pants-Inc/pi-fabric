@@ -40,6 +40,8 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
+  // The scratch sweep's verified removal: first use only, off the eager scratch graph.
+  "src/storage/verified-remove.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",

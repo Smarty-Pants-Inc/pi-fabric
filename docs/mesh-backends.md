@@ -173,8 +173,13 @@ then import. The details:
   A changed source refuses; use a fresh stream (an import never purges).
 - **Rerun with the marker:** the stream is checked against the kept copy, then committed.
 - **Rollback:** it retires the stream and exports the projection through the `state.json`
-  encoder into `state.json.nats-rollback-<E+2>.tmp`. It reads the temp back, checks the digest
+  encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest
   and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+- **Files:** every file is created with O_CREAT|O_EXCL|O_NOFOLLOW at 0600 and checked as our own
+  regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
+- **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,
+  `maxStateBytes` of projected state and of the export, and `maxStateTombstones` (bounded as the
+  backend bounds them). A limit refuses before any retire, rename or commit.
 - **Not built:** the sqlite-direct path and abort (`unretire`).
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every

@@ -19,7 +19,7 @@
  *
  * Rollback (nats -> file), under the fence: publish `retire{E+1}` with the expected last sequence (every later nats
  * write fails its CAS and projectors refuse), project the stream at `retire`, export it through the normal
- * state.json encoder into `state.json.nats-rollback-<E+1>.tmp` (fsync, read back, digest), and rename it over the
+ * state.json encoder into `state.json.nats-rollback-<E+1>-<uuid>.tmp` (fsync, read back, digest), and rename it over the
  * marker. A rerun with a retired stream redoes the export and the rename.
  *
  * The local locks fence this host only; other hosts are fenced by the stream itself (every nats write carries an
@@ -40,7 +40,19 @@ const DEFAULT_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_LOCK_MS = 60_000;
 /** One chunk's changes stay well under the server's default max_payload (1 MiB). */
 const CHUNK_BYTES = 512 * 1024;
-const MAX_TOMBSTONES = Number.MAX_SAFE_INTEGER; // the import carries every tombstone; the backend bounds them after
+/** The backend's own tombstone bound (state-backend-nats.ts DEFAULT_TOMBSTONES): the projection forgets as it does. */
+const DEFAULT_MAX_TOMBSTONES = 2_048;
+/** At most this many stream messages are replayed by one projection (a stream that long needs a snapshot first). */
+const DEFAULT_MAX_REPLAY = 1_000_000;
+
+/** A bound of the migration was exceeded: nothing was retired, renamed or committed. */
+export class MeshNatsMigrationLimitError extends MeshBackendRefusedError {
+  readonly limitCode = "FABRIC_MESH_NATS_MIGRATION_LIMIT";
+  constructor(detail: string) {
+    super(`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT: ${detail}`);
+    this.name = "MeshNatsMigrationLimitError";
+  }
+}
 
 export interface MeshNatsMigrationOptions {
   /** A JetStream port (tests); otherwise `servers` (and `monitoringUrl`, `tls`) connect the official client. */
@@ -52,7 +64,12 @@ export interface MeshNatsMigrationOptions {
   acceptPeriodicSync?: boolean;
   /** The stream; default `natsStreamName(root)`. A rerun must name the same one (the marker records it). */
   stream?: string;
+  /** The state size bound (as both stores). Default 32 MiB. */
   maxStateBytes?: number;
+  /** The most stream messages one projection replays. Default 1,000,000. */
+  maxReplay?: number;
+  /** The tombstone bound (as the nats backend's `maxStateTombstones`). Default 2,048. */
+  maxStateTombstones?: number;
   lockTimeoutMs?: number;
   lockProtocol?: 1 | 2;
   /** Synchronous crash-point hook (tests stop the tool here). */
@@ -81,9 +98,29 @@ const fsyncDirectory = (directory: string): void => {
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 };
 
+/** Our own regular file: never a symbolic link, a device or another user's file (pi-fabric#918 security P1). */
+const assertOwnRegular = (file: string, stat: fs.Stats): void => {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (!stat.isFile() || (uid !== undefined && stat.uid !== uid)) {
+    throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${file} is not a regular file of this user`);
+  }
+};
+
+/**
+ * Creates `file` (it must not exist: O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600), checks the descriptor is our regular file,
+ * writes `data` and fsyncs. A pre-created path (a symbolic link to a target outside the root) refuses; nothing is truncated.
+ */
 const writeDurably = (file: string, data: Uint8Array | string): void => {
-  const descriptor = fs.openSync(file, "w", 0o600);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+  let descriptor: number;
+  try { descriptor = fs.openSync(file, flags, 0o600); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST" || code === "ELOOP") throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${file} already exists (${code})`);
+    throw error;
+  }
   try {
+    assertOwnRegular(file, fs.fstatSync(descriptor));
     const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
     let offset = 0;
     while (offset < bytes.byteLength) offset += fs.writeSync(descriptor, bytes, offset, bytes.byteLength - offset);
@@ -106,14 +143,38 @@ const snapshotOf = (projection: Snapshot): MeshStateSnapshot & { versions: Recor
   highWater: projection.highWater,
 });
 
-/** Replays the whole stream through the backend's own projector (fails closed on any protocol violation). */
-const project = async (port: JetStreamPort, stream: string): Promise<{ projection: Snapshot; head: number }> => {
+interface Limits { maxStateBytes: number; maxReplay: number; maxStateTombstones: number }
+const limitsOf = (options: MeshNatsMigrationOptions): Limits => ({
+  maxStateBytes: Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES)),
+  maxReplay: Math.max(1, Math.floor(options.maxReplay ?? DEFAULT_MAX_REPLAY)),
+  maxStateTombstones: Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_TOMBSTONES)),
+});
+const entryBytes = (key: string, entry: unknown): number => Buffer.byteLength(key, "utf8") + Buffer.byteLength(JSON.stringify(entry) ?? "", "utf8");
+
+/**
+ * Replays the stream through the backend's own projector (fails closed on any protocol violation), within the
+ * limits: at most `maxReplay` messages, tombstones bounded as the backend bounds them, and the live state (keys and
+ * entries) under `maxStateBytes`. A bound fails with LIMIT before the caller retires, renames or commits anything.
+ */
+const project = async (port: JetStreamPort, stream: string, limits: Limits): Promise<{ projection: Snapshot; head: number }> => {
   const head = await port.lastSequence(stream);
+  if (head > limits.maxReplay) throw new MeshNatsMigrationLimitError(`stream ${stream} holds ${head} messages, more than maxReplay ${limits.maxReplay}`);
   let projection = EMPTY;
+  let bytes = 0;
   for (let seq = 1; seq <= head; seq++) {
     const message = await port.getMessage(stream, seq);
     if (!message) throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} has no message ${seq} (purged?): refusing to migrate`);
-    projection = applyNatsMessage(projection, message, MAX_TOMBSTONES);
+    const before = projection;
+    projection = applyNatsMessage(projection, message, limits.maxStateTombstones);
+    if (projection === before || projection.entries === before.entries) continue;
+    // Only the keys this batch changed move the running size (the projector already validated the record).
+    const changed = (JSON.parse(Buffer.from(message.data).toString("utf8")) as { changes?: { key: string }[] }).changes ?? [];
+    for (const { key } of changed) {
+      const old = before.entries.get(key);
+      const now = projection.entries.get(key);
+      bytes += (now === undefined ? 0 : entryBytes(key, now)) - (old === undefined ? 0 : entryBytes(key, old));
+    }
+    if (bytes > limits.maxStateBytes) throw new MeshNatsMigrationLimitError(`stream ${stream} projects more than maxStateBytes ${limits.maxStateBytes} at message ${seq}`);
   }
   return { projection, head };
 };
@@ -162,9 +223,9 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions,
     }
     return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
       const marker = readMeshStateNatsMarker(root);
-      const stream = marker?.stream ?? options.stream ?? natsStreamName(root);
-      if (marker && options.stream !== undefined && options.stream !== marker.stream) {
-        throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.stream}, not ${options.stream}`);
+      const stream = marker?.natsStream ?? options.stream ?? natsStreamName(root);
+      if (marker && options.stream !== undefined && options.stream !== marker.natsStream) {
+        throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not ${options.stream}`);
       }
       const subject = `${stream}.state`;
       await port.ensureStream(stream, subject);
@@ -186,6 +247,34 @@ const publish = async (port: JetStreamPort, subject: string, data: Uint8Array, e
 const readSource = (file: string, options: MeshNatsMigrationOptions): MeshStateFile =>
   decodeMeshStateFile(file, options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES, false);
 
+/** The kept source copy (a fixed name): our own regular file, never followed through a link; undefined when absent. */
+const readKeptCopy = (copy: string, options: MeshNatsMigrationOptions): MeshStateFile | undefined => {
+  const stat = fs.lstatSync(copy, { throwIfNoEntry: false });
+  if (stat === undefined) return undefined;
+  assertOwnRegular(copy, stat);
+  return readSource(copy, options);
+};
+
+/** Keeps the source at `copy`: an existing copy must be our regular file with the source's digest, else refuse. */
+const keepCopy = (root: string, copy: string, source: MeshStateFile, digest: string, options: MeshNatsMigrationOptions): void => {
+  const existing = readKeptCopy(copy, options);
+  if (existing !== undefined) {
+    if (meshSnapshotDigest(existing) !== digest) throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${copy} exists and holds another state`);
+    return;
+  }
+  writeDurably(copy, encodeMeshStateFile(source).serialized);
+  fsyncDirectory(root);
+};
+
+/** The export of a projection, within `maxStateBytes` (checked BEFORE the stream is retired). */
+const encodeExport = (state: ReturnType<typeof snapshotOf>, limits: Limits): Buffer => {
+  const serialized = encodeMeshStateFile({ readGeneration: randomUUID(), format: 1, revisionFormat: 2, ...state } as MeshStateFile).serialized;
+  if (serialized.byteLength > limits.maxStateBytes) {
+    throw new MeshNatsMigrationLimitError(`the export is ${serialized.byteLength} bytes, more than maxStateBytes ${limits.maxStateBytes}`);
+  }
+  return serialized;
+};
+
 /** Imports a file root's state into its NATS stream and moves state.json to the NATS marker. */
 export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
   run(root, options, async (port, stream, subject) => {
@@ -193,12 +282,15 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     if (fs.existsSync(path.join(root, "state.db")) || readMeshStateMovedMarker(root)) {
       throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${root}: it has state.db; roll it back to file first (rollbackMeshState)`);
     }
+    const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);
-    let { projection, head } = await project(port, stream);
+    let { projection, head } = await project(port, stream, limits);
     if (marker) {
       // Rerun after the marker: the stream must hold the kept copy's state; commit it if it is still importing.
       const copy = path.join(root, `${STATE_JSON}.nats-cutover-${marker.epoch}`);
-      const digest = meshSnapshotDigest(readSource(copy, options));
+      const kept = readKeptCopy(copy, options);
+      if (kept === undefined) throw new MeshBackendRefusedError(`Fabric mesh NATS import rerun refused: ${copy} is missing`);
+      const digest = meshSnapshotDigest(kept);
       if (projection.status === "ready" && projection.epoch === marker.epoch) {
         return { root, stream, epoch: marker.epoch, digest, entries: projection.entries.size, tombstones: projection.tombstones.length, converged: true };
       }
@@ -218,6 +310,10 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     // A file root without state.db is at epoch 0 (an epoch-stamped state.json needs its state.db), so E+1 = 1; every
     // import uses its own empty stream, whose lifecycle starts at 0.
     const epoch = 1;
+    const tombstones = normalizeSnapshot(source).tombstones.length;
+    if (tombstones > limits.maxStateTombstones) {
+      throw new MeshNatsMigrationLimitError(`state.json holds ${tombstones} tombstones, more than maxStateTombstones ${limits.maxStateTombstones}`);
+    }
     const chunks = importChunks(source, epoch);
     if (head === 0) {
       head = await publish(port, subject, record({ format: 1, type: "import-begin", epoch, digest, generation }), 0, `${stream}-import-begin-${epoch}`);
@@ -243,7 +339,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       head = await publish(port, subject, chunk, seq - 1, `${stream}-import-${epoch}-${index}`);
       options.onStep?.("nats-import-chunk");
     }
-    ({ projection, head } = await project(port, stream));
+    ({ projection, head } = await project(port, stream, limits));
     const projected = meshSnapshotDigest(snapshotOf(projection));
     if (projection.status !== "importing" || projected !== digest) {
       throw new MeshBackendRefusedError(`Fabric mesh NATS import verification failed: the stream projects ${projected}, state.json is ${digest}`);
@@ -254,9 +350,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       throw new MeshBackendRefusedError("Fabric mesh state.json changed during the NATS import (a writer ignored .lock); rerun with a fresh stream");
     }
     // Keep the source (the rerun's and the operator's reference), then the marker, then the commit.
-    const copy = path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`);
-    writeDurably(copy, encodeMeshStateFile(source).serialized);
-    fsyncDirectory(root);
+    keepCopy(root, path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`), source, digest, options);
     options.onStep?.("nats-copy");
     replaceDurably(root, statePath, encodeMeshStateNatsMarker(stream, epoch));
     options.onStep?.("nats-marker");
@@ -269,8 +363,9 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
 export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
   run(root, options, async (port, stream, subject) => {
     root = path.resolve(root);
+    const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);
-    let { projection, head } = await project(port, stream);
+    let { projection, head } = await project(port, stream, limits);
     if (!marker) {
       // A rerun after the rename: done when the stream is retired and state.json holds its state.
       const digest = meshSnapshotDigest(snapshotOf(projection));
@@ -283,14 +378,16 @@ export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrati
       if (projection.epoch !== marker.epoch) {
         throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is at epoch ${projection.epoch}, the marker at ${marker.epoch}`);
       }
+      encodeExport(snapshotOf(projection), limits); // LIMIT before the stream is retired
       head = await publish(port, subject, record({ format: 1, type: "retire", epoch: marker.epoch + 1 }), head, `${stream}-retire-${marker.epoch + 1}`);
       options.onStep?.("nats-retire");
-      ({ projection, head } = await project(port, stream));
+      ({ projection, head } = await project(port, stream, limits));
     }
     const state = snapshotOf(projection);
     const digest = meshSnapshotDigest(state);
-    const temporary = path.join(root, `${STATE_JSON}.nats-rollback-${projection.epoch}.tmp`);
-    writeDurably(temporary, encodeMeshStateFile({ readGeneration: randomUUID(), format: 1, revisionFormat: 2, ...state } as MeshStateFile).serialized);
+    // A random name, created exclusively: a pre-created path (a link) can never make the export write elsewhere.
+    const temporary = path.join(root, `${STATE_JSON}.nats-rollback-${projection.epoch}-${randomUUID()}.tmp`);
+    writeDurably(temporary, encodeExport(state, limits));
     fsyncDirectory(root);
     if (meshSnapshotDigest(readSource(temporary, options)) !== digest) {
       throw new MeshBackendRefusedError(`Fabric mesh NATS export verification of ${temporary} failed`);

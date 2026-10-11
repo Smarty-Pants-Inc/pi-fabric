@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
-import { importMeshStateToNats, rollbackMeshStateFromNats, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
+import { importMeshStateToNats, MeshNatsMigrationLimitError, rollbackMeshStateFromNats, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
 import { importMeshState, MeshBackendRefusedError, meshSnapshotDigest, type MeshBackendStep } from "../src/mesh/backend-migration.js";
 import { closeNatsStateBackend, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
 import { decodeMeshStateFile } from "../src/mesh/state-file.js";
@@ -57,6 +57,7 @@ const crashAt = (step: MeshBackendStep): Pick<MeshNatsMigrationOptions, "onStep"
 
 describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s server (smarty-dev#9670)", (target) => {
   const it = itFor(target);
+  const targetKind = target;
   if (target === "nats") reportNatsSkip();
 
   it("round trip: the stream, a nats store and the exported state.json all carry the file digest", async () => {
@@ -66,7 +67,7 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     const options = connect();
     const imported = await importMeshStateToNats(root, options);
     expect(imported).toMatchObject({ digest, epoch: 1, entries: 28, tombstones: 3, converged: false });
-    expect(readMeshStateNatsMarker(root)).toMatchObject({ stream: imported.stream, epoch: 1 });
+    expect(readMeshStateNatsMarker(root)).toMatchObject({ natsStream: imported.stream, epoch: 1 });
     expect(meshSnapshotDigest(decodeMeshStateFile(path.join(root, "state.json.nats-cutover-1"), 64 * 1024 * 1024, false))).toBe(digest);
     // A file-mode store refuses the moved root; a nats store on the stream reads the imported state and writes.
     expect(() => new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" }).get("seed/solo")).toThrow(/moved to NATS stream/);
@@ -156,6 +157,62 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     expect(resumed).toBeGreaterThanOrEqual(2); // the stored chunks are verified, only the rest are published
     expect((await rollbackMeshStateFromNats(root, options)).digest).toBe(digest);
   }, 120_000);
+
+  it("a link pre-created at the kept-copy path refuses the import and its target stays unchanged; a link at the old rollback name is never followed", async () => {
+    const root = tempRoot("links");
+    const digest = await seedFileRoot(root);
+    const outside = tempRoot("outside");
+    const victim = path.join(outside, "victim.txt");
+    fs.writeFileSync(victim, "keep me");
+    fs.symlinkSync(victim, path.join(root, "state.json.nats-cutover-1"));
+    await expect(importMeshStateToNats(root, reconnectable(targetKind)())).rejects.toThrow(/nats-cutover-1 is not a regular file of this user/);
+    expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+    expect(fileDigest(root)).toBe(digest);
+
+    // A regular kept copy that holds another state refuses too.
+    fs.unlinkSync(path.join(root, "state.json.nats-cutover-1"));
+    fs.writeFileSync(path.join(root, "state.json.nats-cutover-1"), fs.readFileSync(path.join(root, "state.json")));
+    const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
+    stores.push(store);
+    await store.put({ key: "changed/after/copy", value: 1, identity });
+    store.closeState();
+    await expect(importMeshStateToNats(root, reconnectable(targetKind)())).rejects.toThrow(/nats-cutover-1 exists and holds another state/);
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+
+    const clean = tempRoot("links-rollback");
+    const cleanDigest = await seedFileRoot(clean);
+    const connect = reconnectable(targetKind);
+    await importMeshStateToNats(clean, connect());
+    fs.symlinkSync(victim, path.join(clean, "state.json.nats-rollback-2.tmp"));
+    expect((await rollbackMeshStateFromNats(clean, connect())).digest).toBe(cleanDigest);
+    expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
+    expect(fileDigest(clean)).toBe(cleanDigest);
+  }, 60_000);
+
+  it("LIMIT: an over-cap stream refuses the rollback and stays unretired; an over-cap source publishes nothing", async () => {
+    const root = tempRoot("limits");
+    const digest = await seedFileRoot(root);
+    const connect = reconnectable(targetKind);
+    await importMeshStateToNats(root, connect());
+    await expect(rollbackMeshStateFromNats(root, { ...connect(), maxStateBytes: 1_024 })).rejects.toThrow(/^LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT: .*maxStateBytes/);
+    await expect(rollbackMeshStateFromNats(root, { ...connect(), maxReplay: 2 })).rejects.toBeInstanceOf(MeshNatsMigrationLimitError);
+    expect(readMeshStateNatsMarker(root)).toBeDefined();
+    // Not retired: a nats store still opens on the stream, and a rollback in bounds then succeeds.
+    const options = connect();
+    const stream = readMeshStateNatsMarker(root)!.natsStream;
+    const backend = await openNatsStateBackend({ root, stream, ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    expect(backend.diagnostics().nats?.status).toBe("ready");
+    closeNatsStateBackend(root);
+    expect((await rollbackMeshStateFromNats(root, connect())).digest).toBe(digest);
+
+    const over = tempRoot("limits-source");
+    await seedFileRoot(over); // 3 tombstones
+    const sourceOptions = reconnectable(targetKind)();
+    await expect(importMeshStateToNats(over, { ...sourceOptions, maxStateTombstones: 2 })).rejects.toThrow(/LIMIT: .*3 tombstones/);
+    expect(readMeshStateNatsMarker(over)).toBeUndefined();
+    expect((await importMeshStateToNats(over, sourceOptions)).converged).toBe(false); // the stream was left empty
+  }, 60_000);
 
   it("refuses a sqlite root, and a rerun whose state.json changed after a crash before the marker", async () => {
     const sqliteRoot = tempRoot("sqlite");

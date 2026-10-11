@@ -113,12 +113,21 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
     // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
-    const read = vi.spyOn(directory.mesh, "withTryLock");
+    // smarty-dev#7651: withStateFence passes the budget LEFT (deadline - Date.now()), which drops to
+    // 1999 when a millisecond ticks between computing the deadline and the try. Bound it by the clock
+    // time that elapsed around the call instead of demanding the exact constant.
+    const tryLock = directory.mesh.withTryLock.bind(directory.mesh);
+    let triedAt = 0;
+    const read = vi.spyOn(directory.mesh, "withTryLock").mockImplementation((operation, timeout) => {
+      triedAt ||= Date.now(); return tryLock(operation, timeout);
+    });
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
+    const calledAt = Date.now();
     await directory.refreshRoutingView();
     expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBe(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeGreaterThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS - (triedAt - calledAt));
     expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();

@@ -86,6 +86,7 @@ import {
 import { completionRecipientFromRun, saveCompletion } from "../agents/completion-journal.js";
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { ensureResidentGenerations, recordResidentGenerationExit } from "./generation-exit.js";
 import { ResidentRequestRetention } from "./retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
@@ -270,6 +271,8 @@ export class ResidentHost {
   #deliveryCommitsRecovered = false;
   #flushingDeliveries: Promise<unknown> | undefined;
   readonly #token = randomUUID();
+  /** The owner token this host publishes in owner.json: its generation (smarty-dev#7950). */
+  get generation(): string { return this.#token; }
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
   #idleCheckQueued = false;
@@ -840,6 +843,8 @@ export class ResidentHost {
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.launch.attempt ? { attempt: this.launch.attempt } : {}) } : {}),
       };
+      // Where this generation's exit record goes (smarty-dev#7950), made while this host owns the root.
+      ensureResidentGenerations(this.config.residencyRoot);
       atomicWrite(this.#ownerPath, owner);
       fs.rmSync(this.#errorPath, { force: true });
       // A publisher can die after commit but before writing any root-local wake request.
@@ -2511,7 +2516,9 @@ export type ResidentExitReason = "idle-exit" | "dormant" | "handover-release" | 
  * this filesystem (owner.json unlink), so this adds no new stall class; an
  * async or timed write could land after the release (#2010). The residual
  * window between owned() and the open is a few syscalls, reachable only by a
- * same-uid process; closing it needs an fd-relative open (smarty-dev#7950).
+ * same-uid process. This line is the human-readable copy; the durable record is
+ * the generation's exit.json (generation-exit.ts), which has no such window
+ * because its path is private to this generation (smarty-dev#7950).
  */
 export const reportResidentExit = (residencyRoot: string, reason: ResidentExitReason,
   owned: () => boolean = () => true, constants: Partial<typeof fs.constants> = fs.constants): void => {
@@ -2557,8 +2564,14 @@ const runResidentHost = async (
   const host = new ResidentHost(config, (idleReason = "idle-exit") => finishIdle?.(idleReason), modelRegistry,
     residentHostLaunchContext(config), processWorkSessionId);
   // The last act before close releases owner.json (smarty-dev#1882).
-  host.beforeRelease = (failure, owned) =>
-    reportResidentExit(config.residencyRoot, failure === undefined ? reason ?? "error" : "error", owned);
+  host.beforeRelease = (failure, owned) => {
+    const exitReason = failure === undefined ? reason ?? "error" : "error";
+    reportResidentExit(config.residencyRoot, exitReason, owned);
+    // The durable record: generation-private, created once, so the launcher writes none for this exit. The
+    // path is never another generation's, so owned() only keeps a host that never owned the root from writing.
+    if (owned()) recordResidentGenerationExit(config.residencyRoot,
+      { format: 1, generation: host.generation, writer: "host", reason: exitReason, pid: process.pid, at: Date.now() });
+  };
   await host.start();
   if (signal?.aborted) {
     reason = "stopped";

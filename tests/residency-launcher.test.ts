@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { observeResidentOwner } from "../src/residency/launcher-owner.js";
 
@@ -146,5 +147,95 @@ setInterval(() => {}, 1000);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
+  });
+});
+
+// smarty-dev#7950: an owned child that exits with no host-written reason (SIGKILL, a crash) still leaves exactly one
+// durable record naming its generation, and the launcher's write never touches a file a successor owns. Real
+// launcher, real child process, real signals; the child is a fake host that publishes owner.json like the real one.
+describe.skipIf(!hasLauncher || process.platform !== "linux")("resident launcher: per-generation exit record", () => {
+  const startTime = (pid: number): string => {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
+  };
+  const waitFor = async (predicate: () => boolean, ms = 15_000): Promise<void> => {
+    const until = Date.now() + ms;
+    while (!predicate()) {
+      if (Date.now() > until) throw new Error("Timed out");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  };
+  const state = (pid: number): string | undefined => {
+    try { const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]; }
+    catch { return undefined; }
+  };
+  const tree = (dir: string): Record<string, string> => Object.fromEntries(fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+    .filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name))
+    .map(file => [path.relative(dir, file), fs.readFileSync(file, "utf8")]));
+  const setup = (reportFirst: boolean) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-generation-"));
+    const root = path.join(base, "root");
+    fs.mkdirSync(root);
+    const generation = randomUUID();
+    const hostBinary = path.join(base, "fake-host.mjs");
+    // Like the real host: make generations/ while it owns the root, then publish owner.json with its token.
+    fs.writeFileSync(hostBinary, `import fs from 'node:fs'; import path from 'node:path';
+const root = ${JSON.stringify(root)};
+const stat = fs.readFileSync('/proc/self/stat', 'utf8');
+const processStartTime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+fs.mkdirSync(path.join(root, 'generations'), { mode: 0o700 });
+fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, processStartTime, token: ${JSON.stringify(generation)} }));
+${reportFirst ? `fs.writeFileSync(path.join(root, 'generations', ${JSON.stringify(generation + ".exit.json")}), JSON.stringify({ format: 1, generation: ${JSON.stringify(generation)}, writer: 'host', reason: 'idle-exit' }), { flag: 'wx' });` : ""}
+setInterval(() => {}, 1000);
+`);
+    const configPath = path.join(root, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({ cwd: root, piBinary: hostBinary }));
+    const launcher = spawn(process.execPath, [launcherPath, "--config", configPath], { cwd: root, stdio: "ignore" });
+    const exited = new Promise(resolve => launcher.once("exit", resolve));
+    const owner = () => { try { return JSON.parse(fs.readFileSync(path.join(root, "owner.json"), "utf8")) as { pid: number }; } catch { return undefined; } };
+    return { base, root, generation, launcher, exited, owner,
+      records: () => fs.existsSync(path.join(root, "generations")) ? fs.readdirSync(path.join(root, "generations")) : [],
+      close: () => { if (launcher.exitCode === null && launcher.signalCode === null) launcher.kill("SIGKILL"); fs.rmSync(base, { recursive: true, force: true }); } };
+  };
+
+  it("a SIGKILLed owned child leaves exactly one record naming its generation; a successor's root files are byte-unchanged", { timeout: 30_000 }, async () => {
+    const f = setup(false);
+    try {
+      await waitFor(() => f.owner() !== undefined);
+      const child = f.owner()!.pid;
+      await new Promise(resolve => setTimeout(resolve, 500)); // the launcher observes ownership (50 ms loop)
+      // Freeze the launcher, kill its owned child, and let a successor take the root before the launcher runs again.
+      process.kill(f.launcher.pid!, "SIGSTOP");
+      process.kill(child, "SIGKILL");
+      await waitFor(() => state(child) === "Z"); // dead, not yet reaped by the stopped launcher
+      const successor = randomUUID();
+      fs.writeFileSync(path.join(f.root, "owner.json"), JSON.stringify({ pid: process.pid, processStartTime: startTime(process.pid), token: successor }));
+      fs.appendFileSync(path.join(f.root, "launcher.log"), JSON.stringify({ event: "successor-line" }) + "\n");
+      fs.writeFileSync(path.join(f.root, "error.json"), "successor");
+      fs.writeFileSync(path.join(f.root, "generations", `${successor}.marker`), "successor");
+      const before = tree(f.root);
+      process.kill(f.launcher.pid!, "SIGCONT");
+      await f.exited;
+      const after = tree(f.root);
+      const name = path.join("generations", `${f.generation}.exit.json`);
+      expect(Object.keys(after).filter(file => !(file in before))).toEqual([name]);
+      for (const [file, bytes] of Object.entries(before)) expect(after[file], file).toBe(bytes);
+      expect(JSON.parse(after[name]!)).toMatchObject({ format: 1, generation: f.generation, writer: "launcher", reason: "unreported",
+        pid: child, code: null, signal: "SIGKILL" });
+      expect(fs.statSync(path.join(f.root, name)).mode & 0o777).toBe(0o600);
+    } finally { f.close(); }
+  });
+
+  it("a child that wrote its own record before a SIGKILL keeps exactly that one record", { timeout: 30_000 }, async () => {
+    const f = setup(true);
+    try {
+      await waitFor(() => f.owner() !== undefined && f.records().length === 1);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      process.kill(f.owner()!.pid, "SIGKILL");
+      await f.exited;
+      expect(f.records()).toEqual([`${f.generation}.exit.json`]);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${f.generation}.exit.json`), "utf8")))
+        .toMatchObject({ writer: "host", reason: "idle-exit" });
+    } finally { f.close(); }
   });
 });

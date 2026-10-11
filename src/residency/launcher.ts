@@ -15,6 +15,7 @@ import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepin
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
 import { readResidentIdleExit } from "./idle-exit.js";
+import { recordResidentGenerationExit } from "./generation-exit.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
   HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
@@ -67,6 +68,8 @@ interface Attempt {
   seenOwner: boolean;
   claimedOwner: boolean;
   ownerToken?: string;
+  /** The owner token the child published while it owned the root (smarty-dev#7950). */
+  generation?: string;
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
@@ -358,8 +361,15 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       });
     }
     void attempt.native.exit.then(({ code, signal }) => {
-      // #2010: after a clean owned release this directory may already belong
-      // to the next generation. Do not make a late diagnostic mutation there.
+      // #2010: after an owned release this directory may already belong to the
+      // next generation. Do not write its shared files (launcher.log) then. An
+      // owned child's exit goes only to its own generation's record, created
+      // once: the host wrote it at release, else (SIGKILL, a crash) we do.
+      if (attempt.generation) {
+        recordResidentGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
+          reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
+        return;
+      }
       // A very short configured idle window can release before our first owner sample.
       const idleExit = readResidentIdleExit(root, launchConfig.rootId);
       if (code === 0 && !signal && idleExit?.pid === child.pid &&
@@ -381,6 +391,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
+    if (live !== undefined && live === attempt.child.pid && typeof owner?.token === "string") attempt.generation ??= owner.token;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;

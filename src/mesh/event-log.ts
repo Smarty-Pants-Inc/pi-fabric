@@ -243,6 +243,18 @@ export class EventLog {
     return barrier;
   }
 
+  /**
+   * Durability barrier for events (smarty-dev#9313): resolves once every event committed to the
+   * live log before the call, by any process on this root, is on disk. It is the same group-commit
+   * barrier a durable publish uses: one fsync of events.jsonl and its namespace, outside `.lock`
+   * (a queued barrier that has not started yet covers this call too). Archived events need nothing
+   * more: each archive line is fdatasynced before its event goes live. No live log, no event.
+   */
+  async sync(): Promise<void> {
+    if (!fs.existsSync(this.#eventsPath)) return;
+    await this.#confirmEventsAfterRelease();
+  }
+
   /** The live barrier stays after release. Receipt installation/removal reacquires .lock
    * and compares the intent identity: compaction or a retry may already have settled and
    * evicted it, or a new publication may now own this same key. Never resurrect a receipt. */

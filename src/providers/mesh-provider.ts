@@ -155,7 +155,7 @@ export class MeshHostPublishError extends Error {
   readonly code = "FABRIC_MESH_HOST_PUBLISH_REQUIRED";
   readonly retryable = false;
   constructor() {
-    super("Mesh dedupeKey and publishBatch require a trusted host component publisher");
+    super("Mesh dedupeKey, publishBatch and sync require a trusted host component publisher");
     this.name = "MeshHostPublishError";
   }
 }
@@ -175,8 +175,19 @@ const assertDedupeKey = (args: Record<string, unknown>, context: FabricInvocatio
   }
 };
 
+/** Upper bound of a host `mesh.sync` budget: a barrier that cannot confirm within it reports failure. */
+const MAX_SYNC_BUDGET_MS = 60_000;
+
 const assertPublishArguments = (actionName: string, args: Record<string, unknown>, context: FabricInvocationContext): void => {
   if (actionName === "publish") assertDedupeKey(args, context);
+  if (actionName === "sync") {
+    // Same trust class as dedupeKey and publishBatch (smarty-dev#9313): checked before any argument.
+    assertHostPublisher(context);
+    if (Object.hasOwn(args, "budgetMs") && (typeof args.budgetMs !== "number" || !Number.isFinite(args.budgetMs) ||
+        args.budgetMs < 0 || args.budgetMs > MAX_SYNC_BUDGET_MS)) {
+      throw new Error(`Mesh sync budgetMs must be a number in 0..${MAX_SYNC_BUDGET_MS}`);
+    }
+  }
   if (actionName === "publishBatch") {
     assertHostPublisher(context);
     if (!Array.isArray(args.events) || !args.events.length || args.events.length > 256) {
@@ -227,6 +238,18 @@ hostDescriptors.push({
   risk: "agent",
   namespace: "coordination",
 });
+hostDescriptors.push({
+  name: "sync",
+  description: "Durability barrier: resolve once every mesh event and state write made before the call is on disk; " +
+    "await it before fsyncing an external cursor or delivered mark that covers them",
+  inputSchema: {
+    type: "object",
+    properties: { budgetMs: { type: "number", minimum: 0, maximum: MAX_SYNC_BUDGET_MS, description: "SQLite state checkpoint budget, default 1000" } },
+    additionalProperties: false,
+  },
+  risk: "agent",
+  namespace: "coordination",
+});
 const meshDescriptors = (context: FabricInvocationContext): FabricActionDescriptor[] =>
   fabricHostCallerId(context) === undefined ? descriptors : hostDescriptors;
 const normalizeHostMeshArgs = actionArgNormalizer(() => hostDescriptors);
@@ -263,7 +286,7 @@ export class MeshProvider implements FabricProvider {
     actionName: string,
     context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    if (actionName === "publishBatch") assertHostPublisher(context);
+    if (actionName === "publishBatch" || actionName === "sync") assertHostPublisher(context);
     return meshDescriptors(context).find((descriptor) => descriptor.name === actionName);
   }
 
@@ -343,6 +366,14 @@ export class MeshProvider implements FabricProvider {
         }));
         context.signal?.throwIfAborted();
         return this.store.publishBatch(inputs);
+      }
+      case "sync": {
+        assertPublishArguments(actionName, args, context);
+        context.signal?.throwIfAborted();
+        // Every event through this sequence (and every state write) committed before the call.
+        const through = this.store.latestSequence();
+        await this.store.sync(typeof args.budgetMs === "number" ? args.budgetMs : undefined);
+        return { synced: true, through };
       }
       case "read":
         return this.store.read({

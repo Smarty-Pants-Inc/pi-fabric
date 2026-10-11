@@ -3,7 +3,8 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
@@ -341,6 +342,30 @@ export class MeshStore {
 
   read(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): MeshEvent[] {
     return this.#events.read(input);
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
+   * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite
+   * state within about `budgetMs`. A trusted producer awaits it before it fsyncs its own cursor or
+   * delivered mark, so an OS crash can never keep a cursor past an event or state record it covers.
+   * No writer lock is held while it syncs: events use the group-commit barrier of a durable publish
+   * (fsync of events.jsonl and its namespace after `.lock`); SQLite state uses the PASSIVE
+   * checkpoint barrier (smarty-dev#6100: no copy or fsync under SQLite's writer lock); file state
+   * fsyncs state.json and its namespace. A caller must not advance its external record on a throw.
+   */
+  async sync(budgetMs = 1_000): Promise<void> {
+    if (!Number.isFinite(budgetMs) || budgetMs < 0) throw new Error("Mesh sync budgetMs must be a finite number >= 0");
+    const deadline = Date.now() + budgetMs;
+    for (;;) {
+      try { await this.#events.sync(); break; }
+      catch (error) {
+        // A compaction renamed the live log during the namespace check; the next barrier covers it.
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+        await delay(1 + Math.random() * 3);
+      }
+    }
+    await this.#state.sync(Math.max(0, deadline - Date.now()));
   }
 
   nextEventAfter(after: number): MeshEvent | undefined {

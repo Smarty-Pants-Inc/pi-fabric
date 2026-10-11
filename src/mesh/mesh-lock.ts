@@ -3,10 +3,10 @@ import { MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { lockTokenLocality, localityLockToken, ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -66,11 +66,12 @@ export const describeLockHolder = (ownerPath: string): string => {
   } catch {
     return " (lock directory has no owner record)";
   }
-  const [, pidText, createdText] = owner.trim().split("\n");
+  const [token, pidText, createdText] = owner.trim().split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return " (lock owner record is unreadable)";
   const createdAt = Number(createdText);
   const held = Number.isFinite(createdAt) ? ` for ${Math.max(0, Math.round((Date.now() - createdAt) / 1000))} s` : "";
+  if (lockTokenLocality(token) === "foreign") return ` held by pid ${pid} (another host or PID namespace; not probed)${held}`;
   if (!processAlive(pid)) return ` held by pid ${pid} (not running)${held}`;
   let state = "";
   try {
@@ -212,7 +213,8 @@ export class MeshLock {
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
-    const token = randomUUID();
+    // The token names this process's host, PID namespace and boot (lockTokenLocality).
+    const token = localityLockToken();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
@@ -375,7 +377,12 @@ export class MeshLock {
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
-      if (processAlive(pid)) {
+      // The local signal probe answers only for this host, PID namespace and boot: an owner
+      // elsewhere is unknown, never dead (an invisible PID is not ESRCH proof). An owner from
+      // an earlier boot of this host is dead. Untagged (older) owners keep the plain probe.
+      const locality = lockTokenLocality(token);
+      if (locality === "foreign") return false;
+      if (locality !== "previous-boot" && processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         // Registry-fenced publication cannot start even a bounded native read.
         // Fail closed; the ordinary outside-custody admission lane obtains fresh

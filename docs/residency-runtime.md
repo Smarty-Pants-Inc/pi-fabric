@@ -151,10 +151,14 @@ stolen.
 The resident host is a long-lived owner. Its start lock and `owner.json` carry
 additive `identity` and `heartbeatAt` fields, and the format stays `1`. The
 heartbeat refreshes every 10 s, and a heartbeat older than 45 s is stale. The
-Schema commit lock heartbeats the same way while a transaction runs. Short
-mesh, actor-store and file locks carry an identity line only. Across
-namespaces, their creation time serves as the heartbeat, with a 10-minute hold
-ceiling (or the lock's stale window, if longer). Scratch markers record
+Schema commit lock heartbeats the same way while a transaction runs. File and
+actor-binding locks carry an identity line only. Across namespaces, their
+creation time serves as the heartbeat, with a 10-minute hold ceiling (or the
+lock's stale window, if longer); past it the owner is `unknown`, not dead.
+Mesh, custody and actor-registry locks keep their line wire and name the
+writer's host, PID namespace and boot in the owner token instead; an owner from
+another host or namespace is never recovered on a local `ESRCH`, and one from
+an earlier boot of the same host is dead. Scratch markers record
 identity and no heartbeat, so the sweeper leaves a foreign owner's scratch
 alone.
 

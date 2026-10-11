@@ -11,7 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -1011,6 +1011,50 @@ export const currentOwnerIdentity = (): OwnerIdentity => {
     startedAt: startedAt ?? Math.round(performance.timeOrigin),
   };
   return { ...cachedIdentity };
+};
+
+// Lock-token locality. Line-oriented shared-storage locks whose wire cannot grow (the B68
+// three-line mesh lock above all) carry their writer's place in the token instead:
+// `<uuid>-<host><pid-namespace><boot>`, three 6-hex digests (`------` when unknown). The
+// token keeps the [a-f0-9-] alphabet that mesh lock-queue ticket names require, and old
+// readers only compare tokens for equality, so the wire is unchanged. A reader trusts its
+// local `kill(pid, 0)` answer only for a token from its own host, PID namespace and boot; any
+// other place is unknown, which is never death. As in ownerLiveness, an owner on the same host
+// from an earlier boot is dead: no process outlives its kernel boot.
+const LOCALITY_UNKNOWN = "------";
+const LOCALITY_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const LOCALITY_TOKEN = new RegExp(`^${LOCALITY_UUID}-([0-9a-f]{6})([0-9a-f]{6}|-{6})([0-9a-f]{6}|-{6})$`);
+const LOCALITY_TAG = /^([0-9a-f]{6})([0-9a-f]{6}|-{6})([0-9a-f]{6}|-{6})$/;
+const localityDigest = (value: string | undefined): string =>
+  value === undefined ? LOCALITY_UNKNOWN : createHash("sha256").update(value).digest("hex").slice(0, 6);
+
+/** The locality tag of an owner identity (this process by default). */
+export const ownerLocalityTag = (
+  identity: Pick<OwnerIdentity, "hostname" | "pidNamespace" | "bootId"> = currentOwnerIdentity(),
+): string => `${localityDigest(identity.hostname)}${localityDigest(identity.pidNamespace)}${localityDigest(identity.bootId)}`;
+
+/** A fresh lock-owner token naming this process's host, PID namespace and boot. */
+export const localityLockToken = (): string => `${randomUUID()}-${ownerLocalityTag()}`;
+
+/**
+ * Where a lock token's writer ran, relative to this process:
+ * - `local`: same host, PID namespace and boot; the signal probe is trustworthy.
+ * - `previous-boot`: same host, another (known) boot; the owner is dead.
+ * - `foreign`: another host or PID namespace (or an unknown boot); unknown, never dead.
+ * - `untagged`: an older writer; callers keep their pre-locality probe.
+ */
+export type LockTokenLocality = "local" | "previous-boot" | "foreign" | "untagged";
+
+export const lockTokenLocality = (token: string | undefined, self = ownerLocalityTag()): LockTokenLocality => {
+  const owner = token === undefined ? null : LOCALITY_TOKEN.exec(token);
+  const own = LOCALITY_TAG.exec(self);
+  if (!owner || !own) return "untagged";
+  const [, host, namespace, boot] = owner;
+  if (host === own[1] && namespace === own[2] && boot === own[3]) return "local";
+  if (host === own[1] && boot !== own[3] && boot !== LOCALITY_UNKNOWN && own[3] !== LOCALITY_UNKNOWN) {
+    return "previous-boot";
+  }
+  return "foreign";
 };
 
 const boundedString = (value: unknown, max: number): value is string =>

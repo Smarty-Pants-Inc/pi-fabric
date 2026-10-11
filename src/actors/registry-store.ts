@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { AtomicFileWriter, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, localityLockToken, lockTokenLocality, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
 import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
@@ -412,7 +412,8 @@ export class ActorRegistryStore {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + Math.min(timeoutMs, ACTOR_REGISTRY_LOCK_TIMEOUT_MS);
-    const token = randomUUID();
+    // The token names this process's host, PID namespace and boot (lockTokenLocality).
+    const token = localityLockToken();
     const started = this.#ownProcessStart;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
     fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
@@ -437,10 +438,14 @@ export class ActorRegistryStore {
             createdText.trim() !== "" && Number.isFinite(Number(createdText));
           // A torn fourth line cannot prove PID reuse. Unknown/denied identities stay live.
           const recordedStart = firstOwner.endsWith("\n") && startText && /^\d+$/.test(startText) ? startText : undefined;
-          const alive = validPid && processAlive(pid);
+          // The local probe answers only for this host, PID namespace and boot: an owner
+          // elsewhere is unknown and never reaped (an invisible PID is not proof of death).
+          // An owner from an earlier boot of this host is dead; untagged owners keep the probe.
+          const locality = lockTokenLocality(holder);
+          const alive = validPid && locality !== "previous-boot" && processAlive(pid);
           const actualStart = alive && recordedStart ? processStartTime(pid) : undefined;
-          const dead = alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
-            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS;
+          const dead = locality !== "foreign" && (alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
+            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS);
           if (dead) {
             const current = fs.lstatSync(lockPath);
             if (current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&

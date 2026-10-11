@@ -1,7 +1,7 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
+import { lockTokenLocality, localityLockToken, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
 
 /**
  * File custody lock (smarty-dev#6477 L5). `exclusive()` users that only guard files beside the
@@ -63,7 +63,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
   const deadline = Date.now() + Math.max(0, timeoutMs);
-  const token = randomUUID();
+  // The token names this process's host, PID namespace and boot (lockTokenLocality).
+  const token = localityLockToken();
   // Keep full UUID ownership receipts; only transient filesystem names need a short token.
   const pathToken = randomBytes(4).toString("hex");
   const started = Object.hasOwn(options, "ownIncarnation") ? options.ownIncarnation
@@ -156,6 +157,13 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     if (hostQualified && (!machineId || fields.length !== 7 || fields[4] !== machineId)) return false;
     const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
     const previousBoot = bootKnown && fields[5] !== physical!.bootId;
+    // The local probe answers only for this host, PID namespace and boot. Machine/boot evidence
+    // does not cover the PID namespace: an owner elsewhere is unknown and never recovered,
+    // unless physical evidence proves an earlier boot. A host-lease gate never trusts the
+    // hostname-based previous-boot tag; plain custody does, as ownerLiveness does.
+    const locality = lockTokenLocality(token);
+    if (locality === "foreign" && !previousBoot) return false;
+    const taggedPreviousBoot = !hostQualified && locality === "previous-boot";
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
       (fields.length !== 4 && fields.length !== 5 && !(hostQualified && fields.length === 7))) return false;
     if (hostQualified && !bootKnown) {
@@ -164,7 +172,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       const ownerStat = fs.lstatSync(path.join(lock, "owner"));
       if (!ownerStat.isFile() || Date.now() - Math.max(stat.mtimeMs, ownerStat.mtimeMs) <= CUSTODY_LOCK_STALE_MS ||
         processAlive(pid)) return false;
-    } else if (!previousBoot && processAlive(pid)) {
+    } else if (!previousBoot && !taggedPreviousBoot && processAlive(pid)) {
       if (!validProcessIncarnation(recordedStart)) return false;
       // Our own pid with another incarnation is a dead predecessor; with ours, a live caller.
       const remaining = deadline - Date.now();

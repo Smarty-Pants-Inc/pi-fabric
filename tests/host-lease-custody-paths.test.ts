@@ -35,7 +35,8 @@ describe("host lease custody path compatibility", () => {
       expect(fs.existsSync(path.join(s.compact, MESH_CUSTODY_LOCK_NAME, "owner"))).toBe(true);
       expect(fs.existsSync(s.legacy)).toBe(false);
       const receipt = fs.readFileSync(path.join(s.compact, MESH_CUSTODY_LOCK_NAME, "owner"), "utf8");
-      expect(receipt.split("\n")[0]).toMatch(/^[a-f0-9-]{36}$/); // Ownership UUID is not truncated.
+      // Ownership UUID is not truncated; the suffix names the owner's host, PID namespace and boot.
+      expect(receipt.split("\n")[0]).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}-[a-f0-9-]{18}$/);
       await expect(s.mesh.leaseCustody(s.file, rejected)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       return "held";
     })).resolves.toBe("held");

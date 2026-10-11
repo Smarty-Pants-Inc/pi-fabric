@@ -90,6 +90,51 @@ const launch = async (bridge: MeshBridge) => {
   return { steps, running, failure: () => failure };
 };
 
+// smarty-dev#9751: an idle bridge (no timer armed) must carry a remote append within about 1 s, without polling.
+describe("idle wake (smarty-dev#9751)", () => {
+  for (const backend of [undefined, "sqlite"] as const) {
+    it(`carries a remote command to a hub native within 1 s of an idle wait (${backend ?? "file"} state)`, async () => {
+      const f = fixture(true, backend);
+      const lead = await native(f.hub, "lead");
+      const lane = await native(f.far, "lane");
+      const live = await launch(f.bridge);
+      await sleep(1_500); // past startup settling: idle, no pending presence work
+      const steps = live.steps.mock.calls.length;
+      await f.far.publish({ topic: "fabric.control.command", kind: "command", from: lane.identity, to: lead.id,
+        data: { commandId: "c-9751", replyTo: lane.id } });
+      const started = performance.now();
+      while (!events(f.hub).some(event => event.topic === "fabric.control.command") && performance.now() - started < 1_000) await sleep(10);
+      expect(events(f.hub).some(event => event.topic === "fabric.control.command"), `steps ${steps} -> ${live.steps.mock.calls.length}`).toBe(true);
+      expect(f.requests.some(op => /wait|poll/i.test(op))).toBe(false);
+      expect(live.failure()).toBeUndefined();
+    });
+  }
+});
+
+// smarty-dev#9751: a hub sender that is no participant (a factory host) gets the ACK of a command this link carried;
+// an ACK for a command the link never carried still does not cross.
+describe("ACK relay to a non-participant hub sender (smarty-dev#9751)", () => {
+  it("relays the ACK of a carried command to its factory-host replyTo, and nothing else to that name", async () => {
+    const f = fixture();
+    await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const factory: MeshIdentity = { id: "factory-host:ryzen1", name: "factory-host", kind: "agent" };
+    const live = await launch(f.bridge);
+    await f.hub.publish({ topic: "fabric.control.command", kind: "steer", from: factory, to: lane.id,
+      data: { version: 1, commandId: "c-carried", replyTo: factory.id, targetId: lane.id, operation: "steer" } });
+    await until(() => events(f.far).some(event => event.topic === "fabric.control.command"));
+    const ack = (commandId: string) => f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: lane.identity, to: factory.id,
+      data: { commandId, targetId: lane.id, accepted: true } });
+    await ack("c-unknown");
+    await ack("c-carried");
+    await until(() => events(f.hub).some(event => event.topic === "fabric.control.ack"));
+    await settle();
+    expect(events(f.hub).filter(event => event.topic === "fabric.control.ack").map(event => (event.data as { commandId: string }).commandId))
+      .toEqual(["c-carried"]);
+    expect(live.failure()).toBeUndefined();
+  });
+});
+
 describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   it("exits a native process with no watches when stdin ends before a queued hello runs", () => {
     const f = fixture(false);

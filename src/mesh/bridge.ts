@@ -40,6 +40,8 @@ const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
+/** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
+const MAX_AWAITING_ACKS = 4_096;
 /** A bridge call the remote has not answered by then closes the transport. */
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
@@ -1511,6 +1513,8 @@ export class MeshBridge {
   #factoryRefilledAt = Number.NEGATIVE_INFINITY;
   /** A deferred factory event holds the inbound drain until this time (this bridge's clock). */
   #factoryWaiting = false;
+  /** Command id to the hub sender's replyTo, for commands this link carried out (smarty-dev#9751). */
+  readonly #awaitingAck = new Map<string, string>();
   #factoryRetryAt = Number.NEGATIVE_INFINITY;
   #factoryDeferrals = 0;
   #factoryLoggedAt = Number.NEGATIVE_INFINITY;
@@ -1571,6 +1575,14 @@ export class MeshBridge {
    */
   #outbound(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): BridgePublish {
     const data = isObject(event.data) ? event.data : {};
+    // smarty-dev#9751: a hub sender that is no participant (a factory host) still gets the ACK of a command
+    // this link carried out for it: remember its replyTo by command id (bounded, oldest first out).
+    if (direction === "toRemote" && event.topic === "fabric.control.command" && typeof data.commandId === "string" &&
+        typeof data.replyTo === "string") {
+      this.#awaitingAck.delete(data.commandId);
+      this.#awaitingAck.set(data.commandId, data.replyTo);
+      if (this.#awaitingAck.size > MAX_AWAITING_ACKS) this.#awaitingAck.delete(this.#awaitingAck.keys().next().value!);
+    }
     let from = event.from;
     if (direction === "toLocal" && rules.identities) {
       const identity = rules.identities.get(event.from.id);
@@ -1973,6 +1985,12 @@ export class MeshBridge {
     return { forwarded, dropped };
   }
 
+  /** An inbound ACK for a command this link carried out, addressed to that command's replyTo (smarty-dev#9751). */
+  #awaitedAck(event: MeshEvent): boolean {
+    const commandId = isObject(event.data) ? event.data.commandId : undefined;
+    return event.topic === "fabric.control.ack" && typeof commandId === "string" && this.#awaitingAck.get(commandId) === event.to;
+  }
+
   #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
     // This is control-plane routing metadata, not a business field on work events or ACKs.
     // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
@@ -1991,7 +2009,7 @@ export class MeshBridge {
     // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
     // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
     // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
-    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && isHubFactoryEvent(event)))) {
+    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";

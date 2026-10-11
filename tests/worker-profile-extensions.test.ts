@@ -8,6 +8,8 @@ import { DefaultPackageManager, SettingsManager } from "@earendil-works/pi-codin
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { resolveProfileExtensions } from "../src/worker/profile-extensions.js";
+import { resolveRetrySdk } from "../src/worker/retry-profile.js";
+import { recoveryTimeScale } from "../src/worker/recovery-watchdog.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -223,7 +225,9 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     expect(toolResult).toMatchObject({ role: "tool", content: expect.stringContaining("profile marker guard refused PROFILE_GUARD_MARKER") });
     const argv = JSON.parse(fs.readFileSync(loaded, "utf8"));
     const session = path.join(path.dirname(result.logFile!), "session.jsonl");
-    expect(argv).toEqual(["--mode", "rpc", "--session", session, ...(launch === "shim" ? ["--no-extensions", "-e", guard] : []), "-e", f.pinned,
+    // A native launcher runs through the SDK task entry (final-answer fence),
+    // which receives its SDK directory and recovery scale ahead of Pi's argv.
+    expect(argv).toEqual([...(launch === "native" ? [resolveRetrySdk(cli), String(recoveryTimeScale())] : []), "--mode", "rpc", "--session", session, ...(launch === "shim" ? ["--no-extensions", "-e", guard] : []), "-e", f.pinned,
       "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/actor-bash-hook.js"), "--tools", "bash", "--model", "proof/offline", "--thinking", "medium"]);
     expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual(launch === "shim" ? [{ type: "fabric_profile_extensions", names: ["marker-guard.ts"], loadedCount: 1, skippedCount: 0 }] : []);
     const sessionEvents = events(session);

@@ -10,6 +10,7 @@ import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { normalizeActorRecords } from "./records.js";
 import type {
   FabricActorActivationPolicy,
   FabricActorDelivery,
@@ -270,6 +271,7 @@ export class GlobalActorRegistry {
           : existing.activationFilter !== undefined && !this.#invalidFilters.has(existing.id)
             ? { activationFilter: existing.activationFilter }
             : {}),
+      ...(patch.records !== undefined ? { records: patch.records } : existing.records ? { records: existing.records } : {}),
       ...(patch.validWhile !== undefined
         ? { validWhile: patch.validWhile }
         : existing.validWhile
@@ -346,6 +348,7 @@ export class GlobalActorRegistry {
         ? { activationFilter: clone(def.activationFilter) }
         : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
+      ...(def.records ? { records: clone(def.records) } : {}),
     };
     return request;
   }
@@ -405,6 +408,7 @@ export class GlobalActorRegistry {
     validateActorDedupeKey(def.dedupeKey);
     const activation = normalizeActorActivation(def.activation);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
+    const records = normalizeActorRecords(def.records);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
       typeof def.validWhile.source === "string" &&
@@ -442,6 +446,7 @@ export class GlobalActorRegistry {
       ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       ...(validWhile ? { validWhile } : {}),
+      ...(records ? { records } : {}),
     };
   }
 
@@ -549,11 +554,13 @@ export class GlobalActorRegistry {
       let requires: FabricCapabilityRequirement[] | undefined;
       let activation: FabricActorActivationPolicy | undefined;
       try { activation = normalizeActorActivation(record.activation); } catch { /* unreadable policy is off */ }
+      let records: FabricActorRequest["records"];
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
         validateActorDedupeKey(record.dedupeKey);
         requires = normalizeRequirements(record.requires);
+        records = normalizeActorRecords(record.records);
       } catch {
         continue;
       }
@@ -595,6 +602,7 @@ export class GlobalActorRegistry {
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),
+        ...(records ? { records } : {}),
       };
       actors.set(def.id, def);
     }

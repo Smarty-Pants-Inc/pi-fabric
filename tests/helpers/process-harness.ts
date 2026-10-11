@@ -27,7 +27,9 @@ const CHILD = path.resolve("tests/fixtures/process-harness-child.mjs");
 
 export const processHarness = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-harness-"));
-  const log: LaunchLog = launchLog(root);
+  let log: LaunchLog;
+  try { log = launchLog(root); }
+  catch (error) { fs.rmSync(root, { recursive: true, force: true }); throw error; }
   const children: ChildProcess[] = [];
   const start = (args: string[]): HarnessChild => {
     const child = spawn(process.execPath, [CHILD, ...args], { cwd: process.cwd(), env: { ...process.env, ...log.env },
@@ -89,9 +91,11 @@ export const processHarness = () => {
     /** The real `fabric-actors` CLI in its own process, paused at `pauseAt` (see the child fixture). */
     remover: (pauseAt: "fence-temp" | "fence-link" | "beforeTreeMove" | "none", cli: string[]) => start(["remover", pauseAt, ...cli]),
     close: async () => {
-      for (const child of children) child.stdin?.destroy();
-      await stopAllOwned(log.owned(), 2_000, 5_000);
-      fs.rmSync(root, { recursive: true, force: true });
+      try {
+        for (const child of children) child.stdin?.destroy();
+        await stopAllOwned(log.owned(), 2_000, 5_000);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
     },
   };
 };
+export type ProcessHarness = ReturnType<typeof processHarness>;

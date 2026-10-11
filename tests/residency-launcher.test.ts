@@ -172,7 +172,7 @@ describe.skipIf(!hasLauncher || process.platform !== "linux")("resident launcher
   const tree = (dir: string): Record<string, string> => Object.fromEntries(fs.readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name))
     .map(file => [path.relative(dir, file), fs.readFileSync(file, "utf8")]));
-  const setup = (reportFirst: boolean) => {
+  const setup = (report: "none" | "complete" | "partial") => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-launcher-generation-"));
     const root = path.join(base, "root");
     fs.mkdirSync(root);
@@ -185,7 +185,9 @@ const stat = fs.readFileSync('/proc/self/stat', 'utf8');
 const processStartTime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
 fs.mkdirSync(path.join(root, 'generations'), { mode: 0o700 });
 fs.writeFileSync(path.join(root, 'owner.json'), JSON.stringify({ pid: process.pid, processStartTime, token: ${JSON.stringify(generation)} }));
-${reportFirst ? `fs.writeFileSync(path.join(root, 'generations', ${JSON.stringify(generation + ".exit.json")}), JSON.stringify({ format: 1, generation: ${JSON.stringify(generation)}, writer: 'host', reason: 'idle-exit' }), { flag: 'wx' });` : ""}
+${report === "none" ? "" : `fs.writeFileSync(path.join(root, 'generations', ${JSON.stringify(generation + ".exit.json")}), ${report === "complete"
+    ? `JSON.stringify({ format: 1, generation: ${JSON.stringify(generation)}, writer: 'host', reason: 'idle-exit', pid: process.pid, at: Date.now() })`
+    : `'{"format":1,"gen'`}, { flag: 'wx', mode: 0o600 });`}
 setInterval(() => {}, 1000);
 `);
     const configPath = path.join(root, "config.json");
@@ -199,7 +201,7 @@ setInterval(() => {}, 1000);
   };
 
   it("a SIGKILLed owned child leaves exactly one record naming its generation; a successor's root files are byte-unchanged", { timeout: 30_000 }, async () => {
-    const f = setup(false);
+    const f = setup("none");
     try {
       await waitFor(() => f.owner() !== undefined);
       const child = f.owner()!.pid;
@@ -227,7 +229,7 @@ setInterval(() => {}, 1000);
   });
 
   it("a child that wrote its own record before a SIGKILL keeps exactly that one record", { timeout: 30_000 }, async () => {
-    const f = setup(true);
+    const f = setup("complete");
     try {
       await waitFor(() => f.owner() !== undefined && f.records().length === 1);
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -236,6 +238,19 @@ setInterval(() => {}, 1000);
       expect(f.records()).toEqual([`${f.generation}.exit.json`]);
       expect(JSON.parse(fs.readFileSync(path.join(f.root, "generations", `${f.generation}.exit.json`), "utf8")))
         .toMatchObject({ writer: "host", reason: "idle-exit" });
+    } finally { f.close(); }
+  });
+
+  it("a child that left an incomplete record before a SIGKILL: the launcher keeps that exit in error.json and says why", { timeout: 30_000 }, async () => {
+    const f = setup("partial");
+    try {
+      await waitFor(() => f.owner() !== undefined && f.records().length === 1);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      process.kill(f.owner()!.pid, "SIGKILL");
+      await f.exited;
+      expect(f.records()).toEqual([`${f.generation}.exit.json`]);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "error.json"), "utf8")).error)
+        .toMatch(new RegExp(`Resident generation ${f.generation} exited \\(SIGKILL\\); its exit record is invalid: the existing record is unreadable: .*JSON`));
     } finally { f.close(); }
   });
 });

@@ -21,6 +21,7 @@
 //     fence-link       the fence file is linked, its flock is not taken yet (sync)
 //     beforeTreeMove   inside the fenced check-plus-delete, after the final check (stdin "continue" resumes)
 //     none             no pause
+//   generation-exit <root> <generation> before-link|after-link   a host's exit record, paused around its link
 // A synchronous pause blocks the thread (Atomics.wait), so only a signal ends it.
 import fs from "node:fs";
 import os from "node:os";
@@ -132,4 +133,19 @@ if (role === "main") {
       process.exit(0);
     }
   }
+} else if (role === "generation-exit") {
+  // A host writing its generation exit record (src/residency/generation-exit.ts), paused around the publishing
+  // link: before-link (the complete temp file is written, not linked) or after-link (published).
+  const [root, generation, pauseAt] = args;
+  const { recordResidentGenerationExit } = await jiti.import("./src/residency/generation-exit.ts");
+  const link = fs.linkSync;
+  fs.linkSync = (from, to) => {
+    const record = String(to).endsWith(".exit.json");
+    if (record && pauseAt === "before-link") { emit({ event: "paused", at: pauseAt }); blockForever(); }
+    const result = link(from, to);
+    if (record && pauseAt === "after-link") { emit({ event: "paused", at: pauseAt }); blockForever(); }
+    return result;
+  };
+  emit({ event: "exit", result: recordResidentGenerationExit(root, { format: 1, generation, writer: "host", reason: "idle-exit", pid: process.pid, at: Date.now() }) });
+  process.exit(0);
 } else throw new Error(`Unknown role: ${role}`);

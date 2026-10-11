@@ -110,6 +110,9 @@ export const processHarness = () => {
         stop: async () => { child.send("close"); await child.next("closed", 60_000); return child.kill("SIGTERM"); },
       });
     },
+    /** A host writing its generation exit record, paused before or after the publishing link (smarty-dev#7950). */
+    generationExit: (residencyRoot: string, generation: string, pauseAt: "before-link" | "after-link") =>
+      start(["generation-exit", residencyRoot, generation, pauseAt]),
     close: async () => {
       try {
         for (const child of children) child.stdin?.destroy();

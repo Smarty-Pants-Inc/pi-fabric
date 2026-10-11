@@ -366,8 +366,13 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       // owned child's exit goes only to its own generation's record, created
       // once: the host wrote it at release, else (SIGKILL, a crash) we do.
       if (attempt.generation) {
-        recordResidentGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
+        const recorded = recordResidentGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
           reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
+        // A record exists but is not a complete one for this generation: keep this exit in error.json, as for
+        // other launcher failures (its fence: smarty-dev#9627), and say why.
+        if (recorded.outcome === "invalid") {
+          writeFailure(root, `Resident generation ${attempt.generation} exited (${signal ?? code ?? "unknown"}); its exit record is invalid: ${recorded.reason}`);
+        }
         return;
       }
       // A very short configured idle window can release before our first owner sample.

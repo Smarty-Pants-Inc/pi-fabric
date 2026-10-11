@@ -78,10 +78,10 @@ const hostFacts = (entry: MeshStateEntry | undefined): string => {
   if (!isRecord(value)) return JSON.stringify(["invalid", value ?? null]);
   const identity = isRecord(value.identity) ? value.identity : {};
   return JSON.stringify([entry.key, entry.updatedBy?.id ?? null, value.format ?? null, value.id ?? null, value.rootId ?? null,
-    identity.id ?? null, identity.kind ?? null, value.startedAt ?? null, value.remoteHost ?? null]);
+    identity.id ?? null, identity.kind ?? null, value.incarnationToken ?? null, value.startedAt ?? null, value.remoteHost ?? null]);
 };
 const leaseFacts = (lease: FabricHostLease | undefined): string => lease
-  ? JSON.stringify([lease.id, lease.rootId, lease.identityId, lease.startedAt ?? null, lease.session?.id ?? null, lease.session?.startedAt ?? null])
+  ? JSON.stringify([lease.id, lease.rootId, lease.identityId, lease.incarnationToken ?? null, lease.startedAt ?? null, lease.session?.id ?? null, lease.session?.startedAt ?? null])
   : "absent";
 const closureFacts = (entry: MeshStateEntry | undefined): string => entry ? JSON.stringify([entry.updatedBy?.id ?? null, entry.value ?? null]) : "absent";
 

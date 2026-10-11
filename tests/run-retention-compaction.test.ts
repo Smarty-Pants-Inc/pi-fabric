@@ -155,6 +155,8 @@ describe("six-hour terminal run compaction", () => {
     const { root } = make(); const sessionFile = path.join(root, "session.jsonl");
     const names = ["session.jsonl.20260927T150000000Z.bak", "session.jsonl.20260927T150000000Z-2.bak", "session.jsonl.20260927T150000000Z-10.bak", "session.jsonl.20260926T150000000Z.bak", "session.jsonl.20260925T150000000Z.id.orphan-noheader.bak"];
     for (const name of names) fs.writeFileSync(path.join(root, name), name);
+    // Rotation order is trusted data (smarty-dev#7916): each backup's mtime follows its rotation.
+    for (const [order, index] of [3, 0, 1, 2].entries()) fs.utimesSync(path.join(root, names[index]!), 1_000 + order, 1_000 + order);
     fs.writeFileSync(sessionFile, "live session");
     const store = new ActorLogStore({ maxEventBytes: 8192 }, { eventContextChars: 1000 }, { actorRunArchiveMs: 7 * 24 * HOUR });
     store.pruneRuns({ sessionFile }, now);

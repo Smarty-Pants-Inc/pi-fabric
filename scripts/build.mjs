@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { build } from "esbuild";
+import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildLandlock } from "./build-landlock.mjs";
@@ -58,6 +58,7 @@ const lazyEntryPoints = [
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
+  "src/provider-error-class.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
@@ -106,7 +107,19 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
 ];
 
-buildLandlock();
+// smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).
+const nativeDigests = buildLandlock();
+const nativeDefine = { __FABRIC_NATIVE_DIGESTS__: JSON.stringify(JSON.stringify(nativeDigests)) };
+// Every bundle gets the digests merged into its own `define`: a second `define:` key in a call (another
+// change's constants) would otherwise silently replace them, and the gate then fails closed for every
+// operator ("no embedded digest in this build"; smarty-dev#7651). assert-build-artifacts checks the result.
+const build = (options) => esbuild({ ...options, define: { ...options.define, ...nativeDefine } });
+
+// The production authority path is a literal. Only Vitest may substitute a
+// private fixture path; there is no production rollout/requirement switch.
+const hostPolicyConstants = {
+  __FABRIC_HOST_POLICY_PATH__: JSON.stringify("/etc/smarty/fabric-policy.json"),
+};
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
@@ -129,6 +142,7 @@ const result = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   splitting: true,
   sourcemap: true,
   metafile: true,
@@ -160,6 +174,7 @@ const standalone = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   metafile: true,
   logLevel: "info",
@@ -187,6 +202,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   logLevel: "info",
 });
@@ -214,6 +230,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   logLevel: "info",
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });

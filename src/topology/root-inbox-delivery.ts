@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshEvent } from "../mesh/store.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, fabricWakeMessage } from "../fabric-provenance.js";
-import { rootInboxMessage } from "./root-inbox.js";
+import { rootInboxBudget, rootInboxMessage } from "./root-inbox.js";
 
 /** Retained/mixed-version events need positive, recorded admission evidence. */
 const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || event.verification === "bridge"
@@ -20,6 +20,10 @@ export const deliverRootInbox = (
     seen.add(key);
     return true;
   });
+  // One injection stays within the inbox budget across all its messages (R-token-waste): the
+  // overflow is one summary line in the last message, never more full event bodies.
+  const { shown, overflow } = rootInboxBudget(events);
+  events = shown;
   let start = 0;
   while (start < events.length) {
     const first = events[start]!;
@@ -31,8 +35,9 @@ export const deliverRootInbox = (
       while (end < events.length && JSON.stringify(eventProvenance(events[end]!)) === key) end++;
     }
     const batch = events.slice(start, end);
-    const message = rootInboxMessage(batch);
-    const wakeCauses = batch.map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
+    const extra = end === events.length ? overflow : [];
+    const message = rootInboxMessage(batch, extra);
+    const wakeCauses = [...batch, ...extra].map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
     // One native message can admit several sources. Keep the whole FIFO cause
     // list, including on legacy hosts that batch events from different senders.
     pi.sendMessage(fabricWakeMessage(pi, message, options, wakeCauses),

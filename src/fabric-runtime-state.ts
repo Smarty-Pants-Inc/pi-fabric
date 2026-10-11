@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -29,6 +29,7 @@ import type { JevObservationHost } from "./jev/observation.js";
 import type { JevProgramManager } from "./jev/manager.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
+import { isMainInterruptSupervisor } from "./interrupt-authority.js";
 import { CapturedToolCatalog, type CapturedToolEntry } from "./capture/catalog.js";
 import { FabricComponentCatalog } from "./components/catalog.js";
 import { FabricComponentLoader } from "./components/loader.js";
@@ -117,6 +118,7 @@ import {
   type FabricAgentMessageDelivery,
   type FabricAgentMessageResult,
   type FabricMainAgentInfo,
+  type FabricMainProviderDeadEvent,
 } from "./main-agent.js";
 import { followUpDrainSupported } from "./host-compatibility.js";
 import { deliverActorToMain } from "./actors/main-delivery.js";
@@ -371,6 +373,15 @@ export class FabricRuntimeState {
       batch = await (idle ? this.#rootInbox?.wake(session, idle) : this.#rootInbox?.next(session, options));
     });
     return batch;
+  }
+
+  /** Record inbox events that entered a turn as consumed (R-token-waste); never injected again. */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    if (!ids.length || !this.#meshActivationReady()) return;
+    await this.#inboxRetry.run(async () => {
+      if (!this.#meshActivationReady()) return;
+      await this.#rootInbox?.consume(ids, receipts);
+    });
   }
 
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
@@ -671,6 +682,15 @@ export class FabricRuntimeState {
       identity.kind === "main" ? sessionId : undefined,
       context.mode !== "print" && context.mode !== "json",
       (event) => { void this.publishOpsEvent("fabric.main.wake", "provider-backoff-released", event); },
+      {
+        isSupervisor: (sender, rootId) => {
+          if (sender.kind !== "actor") return false;
+          try {
+            return isMainInterruptSupervisor(sender, rootId, this.#actors?.status(sender.id));
+          } catch { return false; }
+        },
+      },
+      (event) => { this.#alarmProviderDead(mainAgentId, event); },
     );
     this.#mainAgent = mainAgent;
     // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
@@ -819,9 +839,16 @@ export class FabricRuntimeState {
       if (!isMeshLockTimeout(error)) throw error;
       initialMeshError = error;
     }
+    // Capture this activation's directory: no control may claim/run before its epoch
+    // commits, after failed renewal, or through a replacement generation's lease.
+    const controlParticipants = participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      // Both gates: this activation's custody/succession completed (main) AND its
+      // directory epoch is committed under a live, renewed lease (#709).
+      canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
-      canConsumeMesh: () => meshActivationReady,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
@@ -1114,6 +1141,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
+            transientBlockCooldownMs: this.#config.actors.transientBlockCooldownMs,
+            transientBlockMaxMs: this.#config.actors.transientBlockMaxMs,
             // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
             wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -1138,6 +1167,8 @@ export class FabricRuntimeState {
             role,
             retention: this.#config.retention,
             maxSessionBytes: this.#config.actors.maxSessionBytes,
+            transientBlockCooldownMs: this.#config.actors.transientBlockCooldownMs,
+            transientBlockMaxMs: this.#config.actors.transientBlockMaxMs,
             // Read live at each drain: reloadConfig deep-assigns this.#config, so removal revokes (smarty-dev#6144).
             wakeText: () => this.#config?.agents.wakeText,
             resolvePiModel: async (model, requiredPin) => (await resolveParticipantPiModel(model, { requiredPin: requiredPin ?? false, closest: false })).key,
@@ -1951,6 +1982,26 @@ export class FabricRuntimeState {
    */
   backgroundWorkCount(): number {
     return this.#shellJobs.unannounced() + (this.#shellInbox?.pendingCount() ?? 0) + (this.#jevPrograms?.runningCount() ?? 0);
+  }
+
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#mainAgent?.ownsProviderRecovery() ?? false;
+  }
+
+  /**
+   * smarty-dev#8742: a provider-dead Main is loud. The ops event sits beside
+   * provider-backoff-released; the ops.owner alarms reuse the inbox-age addressing and bridge.
+   */
+  #alarmProviderDead(rootId: string, event: FabricMainProviderDeadEvent): void {
+    void this.publishOpsEvent("fabric.main.wake", "fabric.main.provider-dead",
+      { rootId, ...providerDeadAlarmFields(event), held: event.held, heldCount: event.held.length }).catch(() => undefined);
+    if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
+    const mesh = this.#mesh, identity = this.#identity;
+    const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
+    void this.#backgroundMesh.enqueue(() => providerDeadAlarms(mesh, identity, rootId, event, owner)).catch((error: unknown) => {
+      console.warn("[pi-fabric] provider-dead ops.owner alarm failed", error);
+    });
   }
 
   /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */

@@ -429,6 +429,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.ensure(context);
       await state.reportMainProviderError(message);
     },
+    ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery(),
   });
   pi.on("input", (event) => {
     if ((event as { source?: string }).source !== "extension") escapeLatched = false;
@@ -661,6 +662,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       else if (rootInboxTurn - queuedAt > 1) queuedRootInboxIds.delete(id);
     }
     return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
+  };
+  const consumeInjectedInbox = async (details: unknown): Promise<void> => {
+    if (!state.initialized) return;
+    const fields = (details && typeof details === "object" ? details : {}) as { ids?: unknown; receipts?: unknown };
+    const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    const ids = strings(fields.ids);
+    if (ids.length) await state.consumeRootInbox(ids, strings(fields.receipts)).catch(() => undefined);
   };
   const reconcileRootInbox = async (
     context: ExtensionContext, options: RootInboxReconcileOptions, pendingMessages?: readonly InboxQueueMessage[],
@@ -1287,6 +1295,15 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     // Only capable Pi consumes nextTurn after hooks; legacy Pi needs the hook result.
     if (!fabricProvenanceSupported(pi)) return { message: rootInboxMessage(events) };
     deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false });
+  });
+
+  // An inbox message that entered a turn is consumed (R-token-waste): its events are never
+  // injected again, even while the canonical session file has not confirmed the message.
+  pi.on("message_end", async (event) => {
+    const message = event.message as unknown as { role?: string; customType?: string; details?: unknown };
+    if (message.role !== "custom" || message.customType !== "pi-fabric-inbox") return undefined;
+    await consumeInjectedInbox(message.details);
+    return undefined;
   });
 
   // Records addressed to this root reach it with its next turn (smarty-dev#754 C4).

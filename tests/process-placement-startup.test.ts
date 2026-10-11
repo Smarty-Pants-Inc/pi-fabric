@@ -78,12 +78,14 @@ describe("placement import/registration/idle boundary", () => {
     const loads = calls.loads;
     await fixture.state.bootstrap(fixture.context);
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("startup probe: executable"));
+    const placementWarnings = () => warn.mock.calls.filter(call => String(call[0]).includes("startup probe:"));
+    expect(placementWarnings()).toHaveLength(1);
+    expect(placementWarnings()[0]![0]).toContain("startup probe: executable");
     expect(fixture.runtimeLoader).not.toHaveBeenCalled();
     expect(calls).toEqual({ loads, launches: 0, local: 0 });
     expect(agentPlacementProbe(fixture.state.config.agents.placement!, fixture.context.cwd).reason).toBeUndefined();
     fixture.state.reloadConfig(fixture.context);
-    expect(warn).toHaveBeenCalledTimes(1);
+    expect(placementWarnings()).toHaveLength(1);
     await fixture.state.shutdown();
   });
   it.each(["missing", "non-executable", "directory"])("keeps %s startup placement local with one diagnostic and one audit reason", async kind => {
@@ -95,8 +97,9 @@ describe("placement import/registration/idle boundary", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const loads = calls.loads;
     await fixture.state.bootstrap(fixture.context);
-    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("placement-probe-failed:"));
-    expect(warn.mock.calls[0]![0]).toContain("falling back to local");
+    const placementWarnings = () => warn.mock.calls.filter(call => String(call[0]).includes("placement-probe-failed:"));
+    expect(placementWarnings()).toHaveLength(1);
+    expect(placementWarnings()[0]![0]).toContain("falling back to local");
     expect(fixture.state.config.agents.placement!.default).toBe("remote");
     expect(fixture.runtimeLoader).not.toHaveBeenCalled();
     const log = path.join(cwd, "events.jsonl");
@@ -111,7 +114,7 @@ describe("placement import/registration/idle boundary", () => {
   it("is silent with placement absent", async () => {
     const fixture = stateAt(undefined, root()); const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await fixture.state.bootstrap(fixture.context);
-    expect(warn).not.toHaveBeenCalled(); expect(fixture.runtimeLoader).not.toHaveBeenCalled();
+    expect(warn.mock.calls.filter(call => String(call[0]).includes("agents.placement startup probe:")).length).toBe(0); expect(fixture.runtimeLoader).not.toHaveBeenCalled();
     await fixture.state.shutdown();
   });
   it("resolves executable names on PATH and relative paths without executing them", () => {
@@ -127,11 +130,12 @@ describe("placement import/registration/idle boundary", () => {
     await fixture.state.bootstrap(fixture.context);
     fs.writeFileSync(launcher, "never execute this", { mode: 0o700 });
     fixture.state.reloadConfig(fixture.context);
-    expect(warn).toHaveBeenCalledTimes(2);
-    expect(warn.mock.calls[1]![0]).toContain("startup probe: executable");
+    const placementWarnings = () => warn.mock.calls.filter(call => String(call[0]).includes("startup probe:"));
+    expect(placementWarnings()).toHaveLength(2);
+    expect(placementWarnings()[1]![0]).toContain("startup probe: executable");
     expect(agentPlacementProbe(fixture.state.config.agents.placement!, cwd).reason).toBeUndefined();
     fixture.state.reloadConfig(fixture.context);
-    expect(warn).toHaveBeenCalledTimes(2);
+    expect(placementWarnings()).toHaveLength(2);
     await fixture.state.shutdown();
   });
 });

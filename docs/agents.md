@@ -24,6 +24,51 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
+### Interrupt-priority steer
+
+For a time-critical HOLD to an interactive Main, use:
+
+```ts
+await agents.send({ id: "session:<id>", message: "HOLD: do not start the change", priority: "interrupt" });
+// agents.steer accepts the same optional priority; send is its alias.
+```
+
+When Main has an active tool call, it journals the steer, invokes Pi's native
+`ctx.abort()` (the Escape cancellation path), then delivers the HOLD as a
+user-role Fabric message after the aborted run settles. Fabric does not retry the
+aborted tool. Older held followUps stay behind the HOLD. If Main is idle or has
+no active tool call, this is an ordinary steer. Omit priority to keep the
+existing tool-boundary queue. Only `"interrupt"` is valid; followUp, non-Main
+participants and legacy control routes reject it. Interrupt has narrower authority than
+ordinary steer: the verified sender must be this Main's own root session or its
+owner-created supervisor bound to that root. Configuration cannot grant this
+authority. An unauthorized request fails with
+`FABRIC_INTERRUPT_NOT_AUTHORIZED` and is not delivered, even as an ordinary steer.
+Bridge admission checks the bridge-verified identity, never identities in message data.
+
+Main admits at most one actual interrupt per turn, including the HOLD-induced
+restart. Another authorized sender's interrupt in that turn becomes an ordinary
+steer without another abort. The same sender must wait 60 seconds between actual
+interrupts to this target; requests inside that window fail with
+`FABRIC_INTERRUPT_RATE_LIMITED` and are not delivered. Cooldown refusal takes
+precedence over same-turn coalescing; an idempotent retry of an already-admitted
+command remains a duplicate, not a second interrupt.
+
+The native supervisor convention is an owner-created `supervisor` or
+`*-supervisor` directive actor observing `agent_settled`, with `delivery: "steer"`
+and `triggerTurn: true`. Creation records an immutable `supervisorFor` root
+binding; a name, ordinary actor membership, later configuration changes or a
+forged message field cannot grant it. Old records without this binding remain
+closed; recreate the supervisor from its owning Main to grant it. Adoption to a
+different root does not transfer the original root's delegation.
+
+The receiver must run this Fabric version on a Pi host with `ctx.abort()` and
+`agent_settled`. Native cancellation is cooperative: a blocked event loop or a
+tool that ignores Pi's abort signal cannot meet a fixed preemption deadline.
+Owner stop, reload and session replacement retain their existing vetoes; journal
+replay never issues a second abort. This API does not interrupt Herdr-typed prompts
+or the fleet work-inbox/report-relay path.
+
 Fabric injections carry structured [turn provenance](turn-provenance.md) on capable Pi hosts. The sender is the admitted participant; message text cannot select a human channel or principal.
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
@@ -123,6 +168,8 @@ Inbox delivery receipts require the completion carrier in Pi's actual session JS
 
 Completion recovery keeps worker-attempt candidates separate from the supervisor's settled logical-run outcome. A failed startup or recoverable stop is not delivered or returned by a durable wait while its pinned supervisor can still retry it. An orphan candidate becomes eligible only after that supervisor process is gone; a settled outcome takes precedence. Legacy launch manifests without a supervisor identity cannot prove orphan settlement, so their worker status stays retained and is never automatically promoted.
 
+Receipt-time archival preserves the settled result's bytes and inode, but a visible rename is not a durability confirmation. The journal retains a durable pending hard link until the archive directory, source directory, and their namespace ancestors have been synced. Recovery re-archives a restored source or re-confirms a crash-left archive before retiring its versioned claim or removing its worker attempt. Even claimless recovery can restore a lost rename from the pending link. Receipts continue to suppress duplicate delivery; idle scans inspect pending evidence, never archived history.
+
 Full journal results are readable only by the original recipient session or its validated, claimed exact-lane successor (same project root, cwd, name and role). Other sessions see bounded status metadata and the pending/addressed-to state, never private task, text, error, structured value, usage or log/session details; their reads do not acknowledge the recipient's result. Receipted outcomes do not replay to later successors; a successor cannot clean up or read logs for predecessor-owned runs. Journal result availability is not durable-run operational ownership: ordinary local runs continue to use their local manager for log and cleanup. Durable receipts fence replay. An unreadable, malformed, or identity-mismatched fence fails closed: no successor claim, private body access, delivery, or replacement receipt; the source is retained and a storage diagnostic is surfaced until repaired. Their live mesh claims are retired with ownership/version checks and crash leftovers are reconciled even when notifications are disabled.
 
 ### Actor children and reply targets
@@ -221,7 +268,7 @@ Fabric does not discover a replacement by name, role, or principal. The original
 `PI_FABRIC_MAIN_AGENT_ID` and `PI_FABRIC_SESSION_ID` remain the root topology and
 storage fields; they are not overwritten with a nested task's return address.
 
-A process task's `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
+A process task's `agents.send`, `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
 address only its bound spawner, that spawner's ancestor chain, or an explicitly
 allowlisted exact Main session. Other Main-bound sends fail before publication
 with `TaskEscalationTargetError` (`FABRIC_TASK_ESCALATION_TARGET_DENIED`), naming
@@ -443,6 +490,8 @@ Extension-enabled Pi children inherit the parent’s full-code mode, including o
 ### Durable participant residency
 
 `agents.spawn()` and `agents.create()` accept `residency: "session" | "durable"`. The default is `session`. It keeps the usual lifecycle: the current Pi host owns the participant and stops or suspends it when the host shuts down. The model chooses `durable` during execution. Users do not configure it as a setting.
+
+A session actor is suspended, not stopped, when its Main reloads or exits. If the Main stays gone past the restart grace (120 s, with proof that its process died), a peer Main or its resident host retires the actor in its registry: it is `stopped` with `stopReason: "host-exit"` and a `sessionOrphan` marker. When the same session starts again (`pi --session <id>`, a herdr relaunch, or a resume), Fabric restarts every such actor in that session. Each keeps its id, instructions, filters, topics and mailbox. It resumes from the session's saved mesh cursor, so a long downtime replays only the last few minutes. Fabric never restarts a stopped actor whose `stopReason` is `explicit` (`agents.stop` or `agents.remove`) or `directive` (the actor stopped itself). It also never restarts an older stopped row that has no reason or root-gone marker. The owning Main removes a stopped actor of its own with `agents.remove({ id })` (smarty-dev#9241).
 
 ```ts
 const audit = await agents.spawn({
@@ -803,11 +852,29 @@ Main message receipts include `triggered: true | false` when the owner can repor
 
 A provider/compaction failure holds triggering peer `followUp` and `steer` messages until 60 seconds after the failure; consecutive failures without a successful turn double this delay, capped at 30 minutes. Held receipts include `reason: "provider-backoff until <ISO timestamp>"`. Fabric retains the messages (with the existing durable journal and quotas) and schedules their release at the deadline, even with the ordinary busy followUp drain disabled. Only one byte/provenance-bounded triggering batch is handed to Pi for a retry whose outcome is still unknown: remaining batches and new peer wakes stay in Fabric, not Pi's native continuation queue. New held admissions during that attempt report `reason: "provider-retry in flight"`. One best-effort `fabric.main.wake` mesh event per released batch, with kind `provider-backoff-released`, reports its message IDs and deadline. A successful turn resets the delay. Successful manual compaction also releases held wakes once Pi becomes idle, even with `mesh.followUpFlushMs: 0`, without resetting the consecutive-failure count. Escape/owner halts still suppress wakes indefinitely and cancel the timer; passive and `nextTurn` context do not arm it. An older owner or non-Main target may omit the field: treat that as unknown, not as `false`. A replayed control acknowledgement retains the original admission report; it does not describe a new wake. Existing cancellation gates and `steer` delivery semantics are unchanged.
 
+A **non-retryable** provider error is never provider-backoff (smarty-dev#8742). Pi exposes only the failed assistant message to extensions (its `after_provider_response` hook fires for successful responses only), so Fabric classifies the HTTP status and JSON error body Pi formats into `errorMessage`: an HTTP 4xx other than 408, 429 and a throttling 409, a 409 whose body type is `invalid_request_error` (or another request/credential error type), or the gateway token `compaction_affinity_missing` (the raw-text fallback when no status survived). `X-Should-Retry` is not visible to extensions. 5xx, 429, a bare 409, network errors and Pi's `provider_limit` stay on the backoff above, unchanged. On a non-retryable error Main holds peer wakes, warns, and at the next idle boundary runs `ctx.compact` once (the path a human `/compact` takes). A completed compaction allows one attempt: the held work, or a one-time continuation of the failed turn when nothing is held. Success clears the incident. A failed compaction, or a second non-retryable failure of that attempt, raises one alarm. Any end of Fabric's own recovery compaction other than an explicit owner cancel counts as a failed compaction: an error, an extension veto, a no-op, or Pi's native compaction deadline, whether Pi reports it as aborted or not. The `session_compact_failed` event alone raises the alarm. An owner cancel halts Main as before. The alarm is a `ctx.ui.notify` warning, a `fabric.main.wake` event with kind `fabric.main.provider-dead`, an `ops.owner` / `fabric.main.provider-dead` event to Main's owner identity, and an `ops.owner` / `inbox.age.alarm` fired at once to the sender of every held message (all of them, up to Main's 200; published in batches of at most 50), once per address: it lists that sender's held message ids (the owner's lists all, at most 50 ids plus `heldCount`) and reuses the age pass's dedupe key for the address's first held message, so it crosses the mesh bridge to remote senders and the age pass never repeats it. No timer retries afterwards. Held receipts report `triggered: false` with `reason: "provider-dead (non-retryable: <short error>); …"` (at most 200 characters, so it survives the control acknowledgement). Owner input, a successful turn, or a later compaction (one more attempt, no second alarm) ends the hold.
+
+The short error, notices, receipt reasons and alarm data carry only allowlisted tokens: the HTTP status, a known error type (such as `invalid_request_error`), and a fixed code (`compaction_affinity_missing`), for example `409 invalid_request_error: compaction_affinity_missing`. Provider message text never appears in them, because a provider can echo prompt or secret content and these fields reach peers, owners and the mesh bridge. The full provider text stays in the failed assistant message in the local session log. The same rule covers the `BLOCKED: provider error: <short error>` report that follows a retryable error's one automatic retry (#4012): its notice, session message and report payload carry the same short error, never the provider's first line.
+
+The recovery compaction and the one attempt after it wait for Main to be idle without polling. One zero-delay tick leaves the hook that armed the step. If Main is busy at that tick, the step stays pending with no timer, and the next lifecycle edge re-arms it: the end of a run (`agent_end` or a settle), the end of a compaction (`session_compact`, `session_compact_failed` or the completion of Fabric's own `ctx.compact`), `session_tree`, the drain's idle waiters, or a newly held peer message.
+
+An **unclassified** error (no HTTP status, no JSON body, no known token: a connection reset, for example) stays on the backoff, so a single network blip does not alarm. Main counts unclassified failed runs at their final settle, after Pi's own retries. The third in a row with no successful turn between them raises the same provider-dead alarm with cause `unclassified-repeated` and stops the backoff. Receipts then report `reason: "provider-dead (unclassified); 3 failures in a row, ops alarmed, held until owner input"`. Owner input ends the hold but does not reset the count. Only a successful turn resets it. A classified retryable error between unclassified ones neither counts nor resets.
+
 Exact-id `followUp`, `steer`, and `tell` use the same participant directory and mesh root as `peers()`, including participant files, state-only records and bridge mirrors. A cached miss is retried with a fresh read. If discovery lists the target but control presence is not yet admissible, the call throws `FabricParticipantNotYetMirroredError` (`code: FABRIC_PARTICIPANT_NOT_YET_MIRRORED`, `retryable: true`, “not yet mirrored”); retry after the next bridge presence refresh. Discovery never bypasses owner/capability or bridge admission checks. Messages to print/JSON roots fail with `FabricParticipantNonInteractiveError`.
 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The owner records each command it admits, so a replayed command is answered from the record and not run again. Each host keeps these records and their outcomes in its own store under the mesh root (`control-seen/`) until the command has expired and left the event log. Each claim is also made in the shared state, so owners that run an older Fabric version for the same host cannot run the command again. That shared copy is kept while the command is in the retained event log, unless the fleet owner has ended support for runtimes before Fabric B8 (see [architecture](architecture.md)). The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
 A root session stays reachable for 5 minutes after its lease lapses, because a late heartbeat under mesh lock contention does not mean the session ended. Fabric sends the command to that root's last owner host, which acknowledges it when the session is alive. After 5 minutes, or when the target has no record on this mesh root, the `Unknown Fabric participant` error states the reason.
+
+### Owner incarnation fencing
+
+Every owner activation publishes a fresh `ownerIncarnation` on its participant records, including same-process Main reloads and resident relaunches. Directory-routed controls capture that value before command publication. **Execution-bound** operations (`stop`, `ask`, cancellation and resident lifecycle/stop) depend on the specific activation: an unclaimed command for an earlier activation is refused before execution with `FabricControlStaleIncarnationError` (`code: FABRIC_CONTROL_STALE_INCARNATION`). Fabric does **not** automatically retry this refusal: re-read the participant and decide whether a new command is still wanted.
+
+For a peer advertising fencing, an explicit incarnation on unclaimed `steer` and `followUp` must match the exact current owner incarnation in both rollout modes. A same-session reload refuses a queued predecessor epoch with the same typed stale-incarnation error; the caller must re-resolve and explicitly decide whether to send a fresh message. A different session has a different target ID, and a message is never retargeted to that replacement. Main and resident control consumption stays gated on successful durable publication/renewal of the current activation's participant epoch; unpublished commands remain queued and expired commands are not executed.
+
+ACKs carry the claiming activation's incarnation. For all epoch-bound requests, a sender ignores other-incarnation successes and ordinary errors; an authenticated fencing refusal must name the exact rejected incarnation, or explicitly report `staleIncarnation: null` when the received command omitted its epoch. An omitted marker is not that attestation. Epochless requests to older owners accept legacy ACKs, with the same stable owner identity, target and bridge-link authentication checks. Already-claimed work remains deduplicated: replay reports its original outcome/incarnation or an indeterminate outcome, never a second delivery. Reuse an idempotency key only with unchanged input, including the originally captured incarnation; new execution-bound intent requires an explicit new decision, not reinterpreting an old key.
+
+Rollout is destination-advertised: a fresh participant record without `ownerIncarnation` selects the existing legacy delivery path, unfenced, with one single-line counted warning per logical request. Version-1 owners without epochs receive epochless control commands; legacy-protocol Main/actor peers keep the existing `fabric.steer` relay. A valid published incarnation fences explicit stale epochs regardless of its protocol label; malformed advertised epochs are refused before publication. At an upgraded owner, the host-only [`mesh.controlIncarnationFence`](configuration.md#mesh) defaults to `"warn"`: unclaimed controls or messages omitting the epoch retain legacy admission, native or bridged, with a counted receiving-owner warning naming the sender at most once per sender per hour. Explicit wrong or stale epochs are refused in both modes. `"enforce"` also refuses omission, regardless of timestamps or uptime; removing only an epoch cannot downgrade a command in that mode. Flip to enforce only after every host runs a release containing this PR ([smarty-dev#7514](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7514)). The immutable sender `requestCreatedAt` is still captured before publication/lock waits for origin diagnostics, and `requestedAt` stays commit-stamped so waits do not spend the existing delivery/ACK budget. The bridge carries bound incarnation/origin fields unchanged. Recorded predecessor claims/outcomes remain observable without new execution. Fencing assumes a single active owner per host ID.
 
 ### Peer labels and queue gates
 
@@ -954,6 +1021,24 @@ not the execution/restart `attempts` counter. Callerless work (mesh, host, and t
 with 5-second, 15-second, 60-second, then 5-minute backoff; preparation failure never discards
 its pending activation. After three preparation requeues, further failures report
 `failing-preparation` and raise one owner alarm until a successful activation clears it.
+
+A failed activation records `activationBlocked` on the actor, and routers (factory review
+routing) skip a blocked actor. Its `class` says whether it can recover by itself
+(smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or
+429, a timeout, or a preparation or lock timeout (code `preparation-timeout`). It records
+`blockedAt` and `backoffMs`, and expires at `retryAt`: after `actors.transientBlockCooldownMs`
+(default 10 minutes). After expiry, the actor info and the published actor record show
+`activationBlockExpired` instead, so routers admit the actor again. Its next activation, queued
+or routed, is the probe. A probe that completes clears the block. A probe that fails transiently
+blocks again with the backoff doubled, up to `actors.transientBlockMaxMs` (default 60 minutes).
+A failure inside the cooldown restarts the same cooldown and does not double it. A `hard` block
+has no expiry. This covers credentials, permissions, policy, quota, a rejected request, context
+overflow, a preparation failure other than a timeout, and any cause Fabric does not recognise. A
+hard block stays until a run completes, the cause is fixed, or the actor is re-created. The class,
+times and backoff are stored in the actor registry, so they survive a restart. On load, Fabric
+re-classifies an older `unknown` or `failing-preparation` block from its stored reason with the
+current rules. So an actor that an older host blocked for good on a transient cause recovers
+without being re-created.
 A routed mesh event is accepted only once the receiver's persisted queue holds it; only then
 does the host's mesh cursor pass it. Preparation retries run from that queue and never hold
 the cursor, so one failing actor cannot stall other actors' events or archive catch-up, and a

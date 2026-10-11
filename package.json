@@ -49,6 +49,7 @@
     "dist/",
     "config/landlock-roles.json",
     "native/fabric-landlock.c",
+    "native/fabric-mesh-lease.c",
     "skillsets/",
     "docs/",
     "README.md",

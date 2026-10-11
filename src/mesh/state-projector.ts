@@ -56,6 +56,7 @@ import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
+import { openPrivateStateDb } from "./state-gate.js";
 import { journalCursorOf, verifyStateJournalEndpoint, type JournalCursor } from "./read-journal.js";
 import type { StateDivergence } from "./state-backend.js";
 import type { MeshStateEntry } from "./state-file.js";
@@ -571,7 +572,7 @@ export class StateProjector {
     });
     let db: SqliteConnection | undefined;
     try {
-      db = (options.open ?? openNodeSqlite)(store.file);
+      db = openPrivateStateDb(store.file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
       db.exec("PRAGMA busy_timeout = 2");
       db.exec("PRAGMA synchronous = NORMAL");
       db.exec("PRAGMA wal_autocheckpoint = 0");
@@ -741,7 +742,7 @@ export class StateProjector {
       this.#backendFence();
       if (!(await this.#elect())) return;
       if (this.mode === "shadow") await this.#project();
-      this.#maintain();
+      await this.#maintain();
     });
     this.#writeStatus(false);
     return this.status();
@@ -903,7 +904,7 @@ export class StateProjector {
     return true;
   }
 
-  #maintain(): void {
+  async #maintain(): Promise<void> {
     const now = Date.now();
     if (this.#walDirty && now - this.#lastCheckpointAt >= this.#checkpointMs) {
       // Re-checked here: election may have awaited, and a checkpoint of an exporting database is refused.
@@ -911,8 +912,9 @@ export class StateProjector {
       this.#lastCheckpointAt = now;
       this.#walDirty = false;
       try {
-        // R10: the elected projector is the checkpointer: PASSIVE, TRUNCATE when large and growing.
-        this.#store.checkpoint();
+        // R10: the elected projector is the checkpointer: PASSIVE, TRUNCATE when large and growing. smarty-dev#6100:
+        // settled guarded attempts, so no TRUNCATE copies, syncs or waits under SQLite's writer lock.
+        await this.#store.checkpointSettled();
         this.#stats.checkpoints += 1;
       } catch (error) {
         this.#stats.errors += 1;

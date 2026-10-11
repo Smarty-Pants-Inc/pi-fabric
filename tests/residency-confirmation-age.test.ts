@@ -45,7 +45,7 @@ it("preserves shared commit age across overdue copies; consumption and sequence 
   const entered = new Promise<void>(r => { copied = r; }), blocked = new Promise<void>(r => { release = r; });
   const real = await vi.importActual<typeof files>("../src/topology/participant-files.js");
   vi.mocked(files.writeParticipantFileIf).mockImplementation(async (...args) => { copied(); await blocked; return real.writeParticipantFileIf(...args); });
-  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "owner", pollMs: 20, canConsumeMesh: () => directory.canConsumeMesh() });
+  const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: "owner", ownerIncarnation: directory.ownerIncarnation, pollMs: 20, canConsumeMesh: () => directory.canConsumeMesh() });
   const handler = vi.fn(() => ({ accepted: true, messageId: "once" })); control.start(handler);
   const sender = new FabricControlPlane(new MeshStore(root, 65536, 1000), { ...identity, id: "sender" }, { enabled: true, hostId: "sender", pollMs: 20, acknowledgementTimeoutMs: 5000 }); sender.start(() => ({ accepted: false }));
   const starting = directory.start(); let result: Promise<unknown> | undefined;
@@ -64,7 +64,7 @@ it("preserves shared commit age across overdue copies; consumption and sequence 
     expect(directory.canConsumeMesh()).toBe(false);
     // Stage control traffic after the overdue copy: no handler or sequence while the lock is unavailable.
     fs.rmSync(path.join(root, ".lock"), { recursive: true });
-    result = sender.request("owner", "actor", "followUp", { message: "work" }).catch(e => e);
+    result = sender.request("owner", "actor", "followUp", { message: "work", ownerIncarnation: directory.ownerIncarnation }).catch(e => e);
     await pause(180);
     expect(handler).not.toHaveBeenCalled();
     for (const dir of fs.readdirSync(path.join(root, "control-seen"))) {

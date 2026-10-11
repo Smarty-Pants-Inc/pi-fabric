@@ -194,6 +194,7 @@ interface FabricParticipantInfo {
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   status: string;
@@ -860,8 +861,21 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
   records?: FabricActorRecordsOptions;
@@ -870,7 +884,9 @@ interface FabricActorInfo {
   messages: number;
   createdAt: number;
   updatedAt: number;
-  /** Fenced terminal foreign session-root record; never grants adoption/restart. */
+  /** Stopped only: explicit (agents.stop/remove), directive (its own stop) or host-exit (its session Main exited; that session's restart revives it). */
+  stopReason?: "explicit" | "directive" | "host-exit";
+  /** Fenced terminal foreign session-root record; never grants adoption. Its own session's restart revives it. */
   sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
@@ -951,7 +967,10 @@ type FabricMessageArgs = FabricMessageTarget & {
   /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
   idempotencyKey?: string;
 };
-type FabricMessageSteerArgs = FabricMessageArgs;
+type FabricMessageSteerArgs = FabricMessageArgs & {
+  /** Main only: preempt a running tool via native abort, then steer. No tool retry. */
+  priority?: "interrupt";
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -1066,6 +1085,9 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
+  /** Alias of steer; uses the same authority and default delivery. */
+  send(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
+  send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;

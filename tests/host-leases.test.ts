@@ -34,6 +34,18 @@ describe("host lease files on a transient read failure", () => {
     return { root, lease, failReads };
   };
 
+  it("round-trips UUID incarnation metadata and rejects malformed token fields", () => {
+    const { root, lease } = setup();
+    const current = { ...lease(1_000), startedAt: 1, incarnationToken: "655b0506-8a9c-4667-b87f-cc7779a22d06" };
+    writeHostLease(root, current);
+    expect(readHostLeaseCurrent(root, current.id)).toEqual(current);
+    expect(readHostLeases(root).get(current.id)).toEqual(current);
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    for (const incarnationToken of [null, 1, ""]) {
+      fs.writeFileSync(file, JSON.stringify({ format: 1, ...current, incarnationToken }));
+      expect(readHostLeaseCurrent(root, current.id)).toBeUndefined();
+    }
+  });
   it("round-trips the optional reload marker without adding it to ordinary leases", () => {
     const { root, lease } = setup();
     const reload = { ...lease(1_000), reloadUntil: lease(1_000).expiresAt };

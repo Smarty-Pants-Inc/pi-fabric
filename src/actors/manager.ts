@@ -121,6 +121,8 @@ interface ActorQueueItem {
   preparationAttempts?: number;
   /** Already retried once on a fresh session after a context overflow (smarty-dev#3238). */
   overflowRetried?: boolean;
+  /** A resumed item's ownership refusals before any launch (#912 round 4); at RESUMED_REFUSAL_CAP it is reported. */
+  ownershipRefusals?: number;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
   /** Unread outcome retained as context, never as a runnable activation. */
@@ -439,6 +441,8 @@ export const ACTOR_PREPARATION_TIMEOUT_MS = 30_000;
 export const ACTOR_RETENTION_BATCH_SIZE = { win32: 1, other: 8 } as const;
 /** Caller-owned asks have a finite budget; callerless work remains pending (#816). */
 const ACTOR_PREPARATION_MAX_RETRIES = 3;
+/** A resumed item refused by ownership this often before it ran is reported and loses its parked exemption. */
+const RESUMED_REFUSAL_CAP = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
@@ -3432,6 +3436,7 @@ export class ActorManager {
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
         let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
+        let enodevDelivered = false; // its durable delivery receipt is written; commit after the queue ack
         let handoffConsumed = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
         let runStopped = false;
@@ -3672,9 +3677,10 @@ export class ActorManager {
             continue;
           }
           this.#recordMessage(this.#liveActor(actor), message);
-          // smarty-dev#8935: delivered under a confirmed owner; only now does the recovered run settle.
+          // smarty-dev#8935: delivered under a confirmed owner. A durable receipt first; the run settles (marker
+          // removed) only after the queue acknowledged the activation, below (crash-safe, #912 round 4).
           if (enodevRecovered) {
-            try { this.agents.commitEnodevRecovery?.(result.id); } catch { /* the marker stays; retention keeps the veto */ }
+            try { enodevDelivered = this.agents.noteEnodevDelivered?.(result.id) ?? false; } catch { /* marker stays */ }
           }
           await this.#publishNotification({
               topic: "fabric.actor.output",
@@ -3729,7 +3735,12 @@ export class ActorManager {
             // completed is recorded, not rerun, so its side effects do not repeat.
             // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
             if (runCompleted && !enodevRecovered) this.#drop(actor, [item], message);
-            else this.#park(actor, [item], message);
+            else {
+              // #912 round 4: a resumed item refused before any launch spends no restart attempt, so count the
+              // refusals: from the cap on it loses its parked-queue exemption, and its owner hears it once.
+              if (item.resumed && !workerLaunched) this.#noteResumedRefusal(actor, item);
+              this.#park(actor, [item], message);
+            }
             this.#scheduleRestoreParked();
             continue;
           }
@@ -3818,6 +3829,9 @@ export class ActorManager {
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.
           this.#finishInFlight(actor.id, item, handoffConsumed, runCompleted);
+          if (enodevDelivered && (!this.#persistent || this.#persistQueue(actor.id, true))) {
+            try { this.agents.commitEnodevRecovery?.(runId!); } catch { /* the receipt settles it at the next start */ }
+          }
           queueMicrotask(() => this.#resumeSettledWindows(actor.id));
           // Status coalescing can make the idle boundary visible before the next
           // monitor poll. Reconcile native live receipts before exposing that
@@ -5877,6 +5891,7 @@ export class ActorManager {
             executionStarted: item.executionStarted === true,
             preparationAttempts: item.preparationAttempts ?? 0,
             ...(item.overflowRetried ? { overflowRetried: true } : {}),
+            ...(item.ownershipRefusals ? { ownershipRefusals: item.ownershipRefusals } : {}),
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
             ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
           }))];
@@ -6217,6 +6232,7 @@ export class ActorManager {
         executionStarted: false, // this restoration has not launched a new worker
         preparationAttempts: counter(value.preparationAttempts),
         ...((value as { overflowRetried?: unknown }).overflowRetried === true ? { overflowRetried: true } : {}),
+        ...(counter((value as { ownershipRefusals?: unknown }).ownershipRefusals) ? { ownershipRefusals: counter((value as { ownershipRefusals?: unknown }).ownershipRefusals) } : {}),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {
         if (!this.#childCompletionStore(actor).retained(value.id, this.#logs.retention.actorRunArchiveMs)) continue;
@@ -6719,6 +6735,17 @@ export class ActorManager {
   // moved past them, so a transient ownership change must not drop them: they wait here
   // and run again once this host owns the actor. Caller items (ask, steer) are rejected
   // as before, so their caller hears about the move (smarty-dev#442).
+  #noteResumedRefusal(actor: ManagedActor, item: ActorQueueItem): void {
+    item.ownershipRefusals = (item.ownershipRefusals ?? 0) + 1;
+    if (item.ownershipRefusals !== RESUMED_REFUSAL_CAP) return;
+    const text = `actor ${actor.name} (${actor.id}): a resumed activation (${item.id}) was refused by ownership ` +
+      `${RESUMED_REFUSAL_CAP} times before it ran; it now counts against the parked queue limit (smarty-dev#8935)`;
+    console.warn(`[pi-fabric] ${text}`);
+    void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+      text, data: { actorId: actor.id, itemId: item.id, reason: "resumed-ownership-refused", refusals: RESUMED_REFUSAL_CAP } })
+      .catch(() => undefined);
+  }
+
   #park(actor: ManagedActor, items: readonly ActorQueueItem[], reason: string): void {
     const parked = this.#parked.get(actor.id) ?? [];
     for (const item of items) {
@@ -6726,7 +6753,8 @@ export class ActorManager {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
       else parked.push(item);
     }
-    while (parked.length > this.meshConfig.actorQueueLimit + this.#overflowCap() + parked.filter((queued) => queued.resumed).length) {
+    while (parked.length > this.meshConfig.actorQueueLimit + this.#overflowCap() +
+      parked.filter((queued) => queued.resumed && (queued.ownershipRefusals ?? 0) < RESUMED_REFUSAL_CAP).length) {
       this.#recordDropped(actor, parked.shift()!, `${reason}; the parked queue is full`);
     }
     if (parked.length > 0) this.#parked.set(actor.id, parked);

@@ -259,6 +259,90 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 90_000);
 
+  // pi-fabric#912 round 4: crash injection between delivery, the queue ack and the commit.
+  it("crash after the queue ack, before the commit: the restart settles the run as delivered, never lost or rerun", async () => {
+    const { actor, id, directory, actors, second, restart } = await interruptedRun();
+    const commit = vi.spyOn(second, "commitEnodevRecovery").mockReturnValue(false); // the process dies here
+    const first = actors(second);
+    try {
+      await vi.waitFor(() => expect(commit).toHaveBeenCalledWith(id), { timeout: 15_000, interval: 20 });
+    } finally {
+      await first.close();
+      await second.close();
+    }
+    expect(vetoed(directory)).toBe(true);
+    expect(fs.existsSync(path.join(directory, "enodev-delivered.json"))).toBe(true);
+    const next = restart();
+    const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const warn = vi.spyOn(console, "warn");
+    const owner = actors(next);
+    try {
+      await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 10_000, interval: 20 });
+      const settled = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+      expect(settled).toMatchObject({ status: "completed", text: "SAVED_ANSWER", enodevDelivered: true });
+      expect(settled.settledLost).toBeUndefined();
+      expect(warn.mock.calls.some(([line]) => String(line).includes("settled as delivered"))).toBe(true);
+      expect(relaunched).not.toHaveBeenCalled();
+    } finally {
+      await owner.close();
+      await next.close();
+    }
+  }, 90_000);
+
+  it("crash after delivery, before the queue ack: the restart recovers the answer again, with no rerun", async () => {
+    const { actor, id, directory, actorRoot, actors, second, restart } = await interruptedRun();
+    const queueFile = path.join(actorRoot, actor.id, fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!);
+    const beforeAck = fs.readFileSync(queueFile, "utf8");
+    const commit = vi.spyOn(second, "commitEnodevRecovery").mockReturnValue(false);
+    const first = actors(second);
+    try {
+      await vi.waitFor(() => expect(commit).toHaveBeenCalledWith(id), { timeout: 15_000, interval: 20 });
+    } finally {
+      await first.close();
+      await second.close();
+    }
+    fs.writeFileSync(queueFile, beforeAck); // the queue ack never reached the disk
+    const next = restart();
+    const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const owner = actors(next);
+    try {
+      await vi.waitFor(() => expect(owner.status(actor.id)).toMatchObject({ lastRunId: id }), { timeout: 15_000, interval: 20 });
+      await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 10_000, interval: 20 });
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", enodevDelivered: true });
+      expect(relaunched).not.toHaveBeenCalled();
+    } finally {
+      await owner.close();
+      await next.close();
+    }
+  }, 90_000);
+
+  it("a resumed activation refused by ownership three times before it runs is reported once and counted", async () => {
+    const { actor, directory, actors, second, launched, mesh, actorRoot } = await interruptedRun();
+    launched.mockRestore();
+    let owned = true;
+    let refusals = 0;
+    const run = second.run.bind(second);
+    vi.spyOn(second, "run").mockImplementation(async (...args: Parameters<AgentManager["run"]>) => {
+      owned = false;
+      try { return await run(...args); } finally { refusals++; setTimeout(() => { owned = true; }, 30); }
+    });
+    const after = actors(second, "session:reload", { canManageActor: () => owned });
+    const alarms = () => mesh.read({ after: 0, limit: 1_000 })
+      .filter(event => event.topic === "ops.owner" && (event.data as { reason?: string } | undefined)?.reason === "resumed-ownership-refused");
+    try {
+      await vi.waitFor(() => expect(refusals).toBeGreaterThanOrEqual(4), { timeout: 30_000, interval: 50 });
+      await vi.waitFor(() => expect(alarms()).toHaveLength(1), { timeout: 10_000, interval: 20 });
+      expect(alarms()[0]).toMatchObject({ to: "session:reload", data: { actorId: actor.id, refusals: 3 } });
+      expect(vetoed(directory)).toBe(true); // the marker and the answer stay
+    } finally {
+      await after.close();
+      await second.close();
+    }
+    const saved = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id,
+      fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!), "utf8"));
+    expect(saved.items[0].ownershipRefusals).toBeGreaterThanOrEqual(3);
+  }, 90_000);
+
   it("an unreadable queue parent directory is unknown, not absent: nothing settles", async () => {
     const { actor, directory, actorRoot, actors, second } = await interruptedRun();
     const own = fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!;

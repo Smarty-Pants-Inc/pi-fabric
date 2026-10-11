@@ -135,7 +135,25 @@ export const peekEnodevRun = (directory: string, actorId: string, activationId: 
 export const settleEnodevRun = (directory: string, actorId: string, activationId: string): AgentRunResult | undefined => {
   const run = inspect(directory, actorId);
   if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
-  return settle(directory, run, { status: "completed", text: run.text });
+  return settle(directory, run, { status: "completed", enodevDelivered: true, text: run.text });
+};
+
+/**
+ * pi-fabric#912 round 4, crash safety. The actor writes this durable receipt when it delivered a recovered answer,
+ * BEFORE it acknowledges the activation in its queue and long before the marker goes. Each crash point then has one
+ * outcome on restart:
+ * - before the receipt, or after it but before the queue ack: the activation is still pending, the marker is there,
+ *   and the answer is recovered again (at least once; no rerun);
+ * - after the queue ack, before the commit: the activation is no longer pending; the lost sweep finds the receipt
+ *   and settles the run as delivered (enodevDelivered), not lost.
+ * The marker is removed only by the commit, after the queue ack.
+ */
+export const ENODEV_DELIVERED_FILE = "enodev-delivered.json";
+export const noteEnodevDelivered = (directory: string, runId: string, activationId: string): void =>
+  writeJsonAtomic(path.join(directory, ENODEV_DELIVERED_FILE), { version: 1, runId, activationId, deliveredAt: Date.now() }, { durable: true });
+export const enodevDelivered = (directory: string, runId: string, activationId: string): boolean => {
+  const receipt = readJson(path.join(directory, ENODEV_DELIVERED_FILE));
+  return receipt?.version === 1 && receipt.runId === runId && receipt.activationId === activationId;
 };
 
 /**
@@ -146,6 +164,11 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
 export const settleLostEnodevRun = (directory: string, actorId: string, pending: ReadonlySet<string>): string | undefined => {
   const run = inspect(directory, actorId);
   if (!run || pending.has(run.activationId)) return undefined;
+  // Crash after delivery and the queue ack, before the commit (#912 round 4): it WAS delivered; settle it so.
+  if (run.text !== undefined && enodevDelivered(directory, run.id, run.activationId)) {
+    settle(directory, run, { status: "completed", enodevDelivered: true, text: run.text });
+    return run.activationId;
+  }
   // settledLost marks it for the install check (pi-fabric#912): a lost run's answer reached no actor.
   settle(directory, run, run.text === undefined
     ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and its activation is no longer pending" }

@@ -17,7 +17,8 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { countUnknownEnodevStarts, enodevUnresolvedRuns, peekEnodevRun, settleEnodevRun, settleLostEnodevRun } from "./enodev-recovery.js";
+import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+  settleLostEnodevRun } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -2409,7 +2410,15 @@ export class AgentManager {
     return undefined;
   }
 
-  /** The actor delivered a recovered answer: settle its run (terminal record, archive, marker removed last). */
+  /** The actor delivered a recovered answer: its durable receipt, written before the actor acks its queue. */
+  noteEnodevDelivered(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    noteEnodevDelivered(pending.directory, runId, pending.activationId);
+    return true;
+  }
+
+  /** The actor acked the delivered activation in its queue: settle its run (terminal record, archive, marker last). */
   commitEnodevRecovery(runId: string): boolean {
     const pending = this.#enodevCommits.get(runId);
     if (!pending) return false;
@@ -2435,6 +2444,11 @@ export class AgentManager {
       if (activationId === undefined) continue;
       this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
       this.#retentionRevision++;
+      if (enodevDelivered(directory, path.basename(directory), activationId)) {
+        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+          `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
+        continue;
+      }
       console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }

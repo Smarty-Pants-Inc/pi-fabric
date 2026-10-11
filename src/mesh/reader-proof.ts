@@ -307,6 +307,13 @@ export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}):
   catch (error) { return unavailable(`helper integrity: ${helper} cannot be opened (${errno(error)})`); }
   let result: { error?: Error; status: number | null; stdout: string };
   try {
+    // smarty-dev#8145: another user who can write the helper or its directory could change what runs.
+    // Owned by us (or root) and not group/other-writable, checked on the opened fd and the directory.
+    const euid = process.geteuid?.();
+    for (const [what, stat] of [[helper, fs.fstatSync(fd)], [path.dirname(helper), fs.statSync(path.dirname(helper))]] as const) {
+      const unsafe = ownership(stat, stat.uid === 0 ? 0 : euid);
+      if (unsafe) return unavailable(`helper integrity: ${what} is ${unsafe}`);
+    }
     const actual = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
     if (actual !== expected) return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the embedded digest ${expected}`);
     probe.afterHash?.();

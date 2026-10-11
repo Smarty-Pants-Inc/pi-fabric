@@ -459,6 +459,40 @@ sys.stdin.readline()`;
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
 
+  // smarty-dev#8145 item 3: the swap race end to end, through the operator's bin on a copy of the built package.
+  it.skipIf(binSkip !== "")(`end to end: a helper swapped at its path in a loop never reports a held state.db free${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pkg = tempDir("pkg");
+    fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
+    fs.cpSync(path.resolve("bin"), path.join(pkg, "bin"), { recursive: true });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    // A racing child swaps a fake ("free" for every file) and the real helper at the path, without pause.
+    const racer = spawn(process.execPath, ["-e", `
+const fs = require("node:fs");
+const [helper] = process.argv.slice(1);
+fs.linkSync(helper, helper + ".real");
+fs.writeFileSync(helper + ".fake", '#!/bin/sh\\nfor f in "$@"; do echo "free $f"; done\\n', { mode: 0o700 });
+// Hard links, not rewrites: a swap is two syscalls, so it lands often inside the hash-to-exec window.
+for (let i = 0; ; i++) {
+  fs.linkSync(helper + (i % 2 ? ".real" : ".fake"), helper + ".next");
+  fs.renameSync(helper + ".next", helper);
+}`, helper], { stdio: "ignore" });
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      for (let run = 0; run < 8; run++) {
+        const result = spawnSync(process.execPath, [path.join(pkg, "bin/fabric-mesh-backend"), "cutover", "--root", root,
+          "--accept-unready", "factory,fabric@unknown"], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
+        expect(result.status, result.stderr).toBe(3);
+        // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
+        expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
+      }
+      expect(await backendOf(root)).toBe("importing");
+    } finally {
+      racer.kill("SIGKILL");
+      await holder.release();
+    }
+  }, 120_000);
+
   it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const copy = tempDir("helper");
@@ -478,6 +512,27 @@ sys.stdin.readline()`;
     fs.symlinkSync(leaseHelperPath(), link);
     expect(probeStateDbLeases(root, { helper: link })[0]!.reason).toContain(`helper integrity: ${link} cannot be opened (ELOOP)`);
     expect(probeStateDbLeases(root, { expectedDigest: "" })[0]!.reason).toContain("helper integrity: no embedded digest in this build");
+  });
+
+  // smarty-dev#8145 item 2: another user who can write the helper or its directory could change what runs.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group- or other-writable helper or helper directory${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const copy = tempDir("helper");
+    const helper = path.join(copy, "fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(copy, 0o700);
+    fs.chmodSync(helper, 0o700);
+    expect(probeStateDbLeases(root, { helper })).toEqual([]);
+    fs.chmodSync(helper, 0o720);
+    expect(probeStateDbLeases(root, { helper })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${helper} is group/other-writable (mode 720)`) });
+    fs.chmodSync(helper, 0o700);
+    fs.chmodSync(copy, 0o703);
+    try {
+      const refused = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper } });
+      expect(refused.code).toBe(3);
+      expect(refused.err).toContain(`helper integrity: ${copy} is group/other-writable (mode 703)`);
+    } finally { fs.chmodSync(copy, 0o700); }
   });
 
   it.skipIf(leaseSkip !== "")(`executes the hashed fd: a helper swapped at its path after the hash never runs${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {

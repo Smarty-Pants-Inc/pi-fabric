@@ -6,7 +6,7 @@
 // then the build pins its flags (CFLAGS, LDFLAGS and compiler search variables from the environment are
 // ignored) and accepts only gcc or clang.
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -36,6 +36,7 @@ export function buildLandlock() {
     throw new Error(`native helper build refuses compiler ${cc} (${compiler || version.error?.message || `exit ${version.status}`}): gcc or clang only`);
   }
   mkdirSync("dist/native", { recursive: true });
+  chmodSync("dist/native", statSync("dist/native").mode & 0o755);
   const helpers = {};
   for (const helper of NATIVE_HELPERS) {
     const hashes = [];
@@ -53,6 +54,8 @@ export function buildLandlock() {
       }
       if (hashes[0] !== hashes[1]) throw new Error(`${helper} is not reproducible: two builds differ (${hashes[0]} vs ${hashes[1]}) with ${compiler}`);
       copyFileSync(join(outputs[0], helper), `dist/native/${helper}`);
+      // smarty-dev#8145: the lease probe refuses a group/other-writable helper, whatever the umask.
+      chmodSync(`dist/native/${helper}`, statSync(`dist/native/${helper}`).mode & 0o755);
     } finally { for (const dir of outputs) rmSync(dir, { recursive: true, force: true }); }
     helpers[helper] = hashes[0];
   }

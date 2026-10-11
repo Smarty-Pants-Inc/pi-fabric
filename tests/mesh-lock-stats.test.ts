@@ -266,6 +266,45 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(stale)).toBe(false);
   });
 
+  it("keeps a stats file its writer refreshes between the age check and the delete (smarty-dev#7879)", () => {
+    const root = path.join(temp(), "mesh");
+    const directory = path.join(root, "lock-stats");
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // `once`: the writer's refresh lands right before the pruner moves or deletes the file.
+    // `twice`: and a second refresh lands just after the pruner moved the first one aside.
+    const once = path.join(directory, "once-3.json");
+    const twice = path.join(directory, "twice-4.json");
+    const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+    for (const file of [once, twice]) {
+      fs.writeFileSync(file, "{}");
+      fs.utimesSync(file, old, old);
+    }
+    const refresh = (file: string, body: string): void => {
+      fs.writeFileSync(`${file}.next`, body);
+      renameSync(`${file}.next`, file);
+    };
+    const renameSync = fs.renameSync, unlinkSync = fs.unlinkSync;
+    const refreshed = new Set<string>();
+    const before = (file: string): void => {
+      if (refreshed.has(file) || (file !== once && file !== twice)) return;
+      refreshed.add(file);
+      refresh(file, `{"fresh":"${path.basename(file)}"}`);
+    };
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      before(String(from));
+      renameSync(from, to);
+      if (String(from) === twice && String(to) !== twice) refresh(twice, "{\"fresh\":2}");
+    });
+    vi.spyOn(fs, "unlinkSync").mockImplementation((file) => { before(String(file)); unlinkSync(file); });
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "custody", 1, 1);
+    registry[lockKey]!.flush();
+    expect([...refreshed].sort()).toEqual([once, twice]);
+    expect(fs.readFileSync(once, "utf8")).toBe("{\"fresh\":\"once-3.json\"}");
+    expect(fs.readFileSync(twice, "utf8")).toBe("{\"fresh\":2}");
+    expect(fs.readdirSync(directory).filter(name => !name.startsWith(lockStatsHost())).sort()).toEqual(["once-3.json", "twice-4.json"]);
+  });
+
   it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);

@@ -135,7 +135,6 @@ const readJson = <T>(filePath: string): T | undefined => {
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
-
 export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
@@ -244,6 +243,8 @@ export class ResidentHost {
   #idleSince = Date.now();
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
+  /** Predecessor route epochs this activation inherited per dormant actor (#774 + #709). */
+  readonly #retainedIncarnations = new Map<string, string>();
   #wakeRecovery: ResidentWakeRecoveryReader | undefined;
   #wakeRecoveryPending: Promise<void> | undefined;
   #wakeRecoveryIgnored = 0;
@@ -377,6 +378,7 @@ export class ResidentHost {
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       ownerIncarnation: this.participants.ownerIncarnation,
       controlIncarnationFence: config.mesh.controlIncarnationFence,
+      retainedOwnerIncarnation: targetId => this.#retainedIncarnations.get(targetId),
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
@@ -704,6 +706,7 @@ export class ResidentHost {
         this.#wakeWatchNeedsReprobe = true;
         this.#scheduleIdleCheck();
       });
+      this.#retainDormantRouteEpochs(); // before control consumes, and before routes are rewritten
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
@@ -1403,6 +1406,31 @@ export class ResidentHost {
       console.warn(`[pi-fabric] resident dormancy deferred: wake capacity (${RESIDENT_WAKE_INDEX_MAX_ROOTS}) full or unavailable; staying resident for ${this.config.residencyRoot}`);
     }
     return available;
+  }
+
+  /**
+   * A dormant actor's retained route keeps naming the epoch of the activation that went
+   * dormant; senders address it (#774) and the fence refuses foreign epochs (#709). Inherit
+   * that epoch only for actors this activation woke from that route: owned, durable, same
+   * ownership token, and loaded from a dormant registry row. Crash restarts of a live actor,
+   * other targets and older epochs stay fenced.
+   */
+  #retainDormantRouteEpochs(): void {
+    this.#retainedIncarnations.clear();
+    const routes = readWakeJson<ResidentWakeRoutes>(path.join(this.config.residencyRoot, "wake-routes.json"));
+    if (routes?.format !== 1 || routes.rootId !== this.config.rootId || routes.hostId !== this.hostId || !Array.isArray(routes.actors)) return;
+    const owned = new Map(this.actors.listOwned().map(actor => [actor.id, actor]));
+    for (const entry of routes.actors) {
+      const participant = entry?.participant;
+      const actor = owned.get(entry?.id);
+      if (!participant || !actor || participant.format !== 1 || participant.kind !== "actor" || participant.id !== actor.id ||
+          participant.rootId !== actor.rootId || participant.ownerHostId !== this.hostId || participant.controlProtocol !== "v1" ||
+          actor.residency !== "durable" || typeof actor.ownershipToken !== "string" ||
+          participant.actorOwnershipToken !== actor.ownershipToken || !this.actors.loadedDormant(actor.id) ||
+          typeof participant.ownerIncarnation !== "string" || !participant.ownerIncarnation ||
+          participant.ownerIncarnation === this.participants.ownerIncarnation) continue;
+      this.#retainedIncarnations.set(actor.id, participant.ownerIncarnation);
+    }
   }
 
   #writeWakeRoutes(): void {

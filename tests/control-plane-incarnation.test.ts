@@ -101,6 +101,40 @@ describe("owner incarnation rollout gate", () => {
   });
 });
 
+describe("dormant-route successor (#774)", () => {
+  it("admits only the retained target's predecessor epoch, ACKs under it, and keeps every other epoch fenced", async () => {
+    const mesh = store(temp());
+    const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
+    const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+    const send = (targetId: string, key: string) => sender.request("session:owner", targetId, "followUp",
+      { message: "to a dormant route", ownerIncarnation: previous.incarnation }, "session:owner", { idempotencyKey: key }).catch(error => error);
+    const retained = send("actor:dormant", "retained");
+    const other = send("actor:other", "other");
+    await vi.waitFor(() => expect(commands(mesh)).toHaveLength(2)); await previous.close();
+    const successor = new FabricControlPlane(mesh, identity("session:owner"), { enabled: true, hostId: "session:owner", pollMs: 20,
+      acknowledgementTimeoutMs: 1_000, controlIncarnationFence: "enforce",
+      retainedOwnerIncarnation: targetId => targetId === "actor:dormant" ? previous.incarnation : undefined });
+    planes.push(successor);
+    expect(successor.incarnation).not.toBe(previous.incarnation);
+    const handler = vi.fn(() => ({ accepted: true, messageId: "woken" })); successor.start(handler);
+    expect(await retained).toMatchObject({ acknowledged: true, messageId: "woken" });
+    expect(await other).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+    expect(handler).toHaveBeenCalledOnce();
+    expect(acks(mesh)).toContainEqual(expect.objectContaining({ data: expect.objectContaining({
+      targetId: "actor:dormant", accepted: true, ownerIncarnation: previous.incarnation }) }));
+    expect(acks(mesh)).toContainEqual(expect.objectContaining({ data: expect.objectContaining({
+      targetId: "actor:other", accepted: false, ownerIncarnation: successor.incarnation, staleIncarnation: previous.incarnation }) }));
+    // An older/foreign epoch for the retained target, and omission in enforce, stay fenced.
+    await expect(sender.request("session:owner", "actor:dormant", "followUp", { message: "older", ownerIncarnation: "older:epoch" }, "session:owner"))
+      .rejects.toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+    expect(handler).toHaveBeenCalledOnce();
+    // The successor's own epoch is still admitted for the same target.
+    await expect(sender.request("session:owner", "actor:dormant", "followUp", { message: "fresh", ownerIncarnation: successor.incarnation }, "session:owner"))
+      .resolves.toMatchObject({ acknowledged: true });
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("owner incarnation admission and durable receipts", () => {
   it.each(["stop", "ask"] as const)("refuses queued %s after a reload, tells the sender, and never resends", async operation => {
     const mesh = store(temp());

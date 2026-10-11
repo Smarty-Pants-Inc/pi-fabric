@@ -613,6 +613,8 @@ export class ActorManager {
   readonly #notifications = new MeshBackgroundQueue("actor notification/reap");
   /** Actor ids named by the last successfully parsed registry (undefined until one is). */
   #registryIds: Set<string> | undefined;
+  /** Registry rows that were dormant when this runtime loaded them (#774 dormant-route successor). */
+  readonly #loadedDormant = new Set<string>();
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
@@ -1073,6 +1075,9 @@ export class ActorManager {
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor, true, registryView));
   }
+
+  /** Whether this runtime loaded the actor's registry row as dormant, i.e. it woke that actor's dormant route. */
+  loadedDormant(id: string): boolean { return this.#loadedDormant.has(id); }
 
   /** Whether at least one owned durable actor can be made dormant right now. */
   hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
@@ -5354,6 +5359,7 @@ export class ActorManager {
       // A new runtime is awake. Re-evaluate dormancy under its current work/owner
       // custody instead of carrying a retired host's idle decision through reload.
       const status = record.status === "stopped" ? "stopped" : "idle";
+      if (record.status === "dormant") this.#loadedDormant.add(record.id);
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
         record.delivery === "followUp" ||

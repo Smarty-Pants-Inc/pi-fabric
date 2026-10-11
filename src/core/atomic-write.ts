@@ -1,3 +1,15 @@
+/** Reserved Landlock controls are host-owned and must not propagate to unrelated children. */
+export const childProcessEnvironment = (environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv =>
+  Object.fromEntries(Object.entries(environment).filter(([key]) => !key.startsWith("PI_FABRIC_LANDLOCK_")));
+
+/** Bash's policy wrapper consumes escape requests before supplying these native-helper controls. */
+export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => ({
+  ...childProcessEnvironment(environment),
+  ...(environment.PI_FABRIC_LANDLOCK_SHELL !== undefined
+    ? { PI_FABRIC_LANDLOCK_SHELL: environment.PI_FABRIC_LANDLOCK_SHELL } : {}),
+  ...(environment.PI_FABRIC_LANDLOCK_WRITES !== undefined
+    ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
+});
 import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
@@ -22,7 +34,7 @@ export type IncarnationCommandRunner = (
 ) => Promise<string>;
 
 const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
-  childProcess.execFile(executable, args, { ...options, encoding: "utf8" }, (error, stdout) => {
+  childProcess.execFile(executable, args, { ...options, env: childProcessEnvironment(options.env), encoding: "utf8" }, (error, stdout) => {
     if (error) reject(error);
     else resolve(stdout);
   });
@@ -292,6 +304,40 @@ export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);
 };
 
+// Temps this process staged and has not yet renamed or removed (smarty-dev#6622).
+// An exit (a Main /quit, a worker/resident exit or a handled SIGTERM) can end the
+// process while a writer awaits the mesh lock with its staged state temp on disk;
+// a try/finally never runs then. The bounded exit hook below removes them. Every
+// name carries this pid, so the hook never touches a temp another live pid owns.
+const ownedTemporaries = new Set<string>();
+/** At most this many temps are removed by the synchronous exit hook. */
+export const EXIT_TEMP_CLEANUP_LIMIT = 256;
+let temporaryExitHook: (() => void) | undefined;
+
+/** Removes this process's still-staged temps; synchronous, bounded, best-effort. */
+export const removeOwnedTemporaries = (): number => {
+  let removed = 0;
+  for (const file of [...ownedTemporaries].slice(0, EXIT_TEMP_CLEANUP_LIMIT)) {
+    ownedTemporaries.delete(file);
+    try { fs.rmSync(file, { force: true }); removed += 1; } catch { /* Best-effort exit cleanup. */ }
+  }
+  return removed;
+};
+
+/** Registers a temp this process owns (its name must carry process.pid) until the
+ * returned release runs: on process exit it is removed by a bounded hook. */
+export const trackTemporary = (file: string): (() => void) => {
+  ownedTemporaries.add(file);
+  if (!temporaryExitHook) {
+    temporaryExitHook = () => { removeOwnedTemporaries(); };
+    process.once("exit", temporaryExitHook);
+  }
+  return () => { ownedTemporaries.delete(file); };
+};
+
+/** Test/diagnostic view of the temps currently registered for exit cleanup. */
+export const trackedTemporaries = (): readonly string[] => [...ownedTemporaries];
+
 export const writeFileAtomic = (
   filePath: string,
   contents: string | Uint8Array,
@@ -324,6 +370,7 @@ export const writeFileAtomic = (
     }
   }
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const release = trackTemporary(temporary);
   try {
     if (options?.durable) {
       const fd = fs.openSync(temporary, "w", options.mode ?? 0o600);
@@ -343,7 +390,7 @@ export const writeFileAtomic = (
     if (options?.durable) syncDirectoryChain(directory);
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
-    fs.rmSync(temporary, { force: true });
+    try { fs.rmSync(temporary, { force: true }); } finally { release(); }
   }
 };
 
@@ -563,6 +610,7 @@ const writeFileAtomicAsync = async (
     mode: options?.dirMode ?? 0o700,
   });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const release = trackTemporary(temporary);
   try {
     await fs.promises.writeFile(temporary, contents, {
       encoding: "utf8",
@@ -570,7 +618,7 @@ const writeFileAtomicAsync = async (
     });
     await renameAtomicAsync(temporary, filePath, options);
   } finally {
-    await fs.promises.rm(temporary, { force: true });
+    try { await fs.promises.rm(temporary, { force: true }); } finally { release(); }
   }
 };
 
@@ -654,15 +702,26 @@ export interface MeshBackgroundOwner {
   onRecovery?: () => void;
 }
 
+export const DEFAULT_MESH_RETRY_WARNING_WINDOW_MS = 60_000;
+
+/** `PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS`: positive milliseconds; blank or invalid uses 60 s. */
+export const meshRetryWarningWindowMs = (): number => {
+  const raw = process.env.PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS;
+  const value = Number(raw);
+  return raw?.trim() && Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_MESH_RETRY_WARNING_WINDOW_MS;
+};
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
   #delay = 0;
   #retryAt = 0;
-  #reported = false;
+  #lastReportedAt: number | undefined;
+  #suppressed = 0;
   #running = false;
   #retired = false;
   #consecutiveFailures = 0;
-  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000, readonly owner?: MeshBackgroundOwner) {}
+  constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000, readonly owner?: MeshBackgroundOwner,
+    readonly warningWindowMs = meshRetryWarningWindowMs()) {}
 
   get retired(): boolean { return this.#retired; }
 
@@ -704,12 +763,22 @@ export class MeshBackgroundRetry {
   }
 
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
+  #resetBackoff(): void { this.#delay = 0; this.#retryAt = 0; }
+  /** A confirmed acquisition: reset backoff, never the warning window (smarty-dev#8305). */
   success(): void {
-    this.#delay = 0;
-    this.#retryAt = 0;
-    this.#reported = false;
+    this.#resetBackoff();
     this.#consecutiveFailures = 0;
     this.owner?.onRecovery?.();
+    if (!this.#suppressed || this.#lastReportedAt === undefined) return;
+    const now = Date.now();
+    const elapsedMs = now - this.#lastReportedAt;
+    if (elapsedMs < this.warningWindowMs) return;
+    // Final summary: retries suppressed after the last line are reported once the window
+    // has passed, so an outage that ends inside a window is not silently dropped. It takes
+    // that window's single line; a later outage inside it is counted, not printed.
+    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    this.#lastReportedAt = now;
+    this.#suppressed = 0;
   }
   failure(error: unknown): boolean {
     if (this.#retired) return false;
@@ -718,9 +787,11 @@ export class MeshBackgroundRetry {
     this.owner?.onFailure?.(error, this.#consecutiveFailures);
     const transient = isMeshLockTimeout(error);
     if (!transient && !this.owner) {
-      // Unowned handlers retain their visible permanent-failure behavior. Owned lifecycle
-      // probes and ticks retry every error, without treating Pi's error text as an owner fact.
-      this.success();
+      // Unowned handlers retain their visible permanent-failure behavior: contain the callback,
+      // surface unrelated bugs and preserve its existing retry cadence. Owned lifecycle probes
+      // and ticks retry every error, without treating Pi's error text as an owner fact.
+      // Not proof that the lock is free: no recovery summary, suppression is kept.
+      this.#resetBackoff();
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
@@ -728,14 +799,23 @@ export class MeshBackgroundRetry {
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
     const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
-    this.#retryAt = Date.now() + delayMs;
-    if (!this.#reported) {
-      // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
-      // not once per poll, which would flood a throttled host's stderr.
+    const now = Date.now();
+    this.#retryAt = now + delayMs;
+    const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;
+    // At most one retry line per instance per window (default 60 s), even across
+    // successful acquisitions: a flapping lock must not print one warning per short outage.
+    // The first warning is immediate and carries the holder diagnostics. Owned non-lock
+    // failures never print Pi's error text.
+    if (elapsedMs >= this.warningWindowMs) {
+      const summary = this.#suppressed > 0
+        ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
       console.warn(transient
-        ? `[pi-fabric] ${this.label}: mesh lock timeout; retrying in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`
-        : `[pi-fabric] ${this.label}: background operation failed; retrying in ${delayMs} ms`);
-      this.#reported = true;
+        ? `[pi-fabric] ${this.label}: mesh lock timeout; retrying in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}${summary}`
+        : `[pi-fabric] ${this.label}: background operation failed; retrying in ${delayMs} ms${summary}`);
+      this.#lastReportedAt = now;
+      this.#suppressed = 0;
+    } else {
+      this.#suppressed++;
     }
     return transient || Boolean(this.owner);
   }

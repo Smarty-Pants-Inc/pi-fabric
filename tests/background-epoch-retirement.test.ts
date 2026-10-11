@@ -167,7 +167,8 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
     failing = true;
     await retry.run(operation);
     expect(failures).toEqual([1, 2, 3, 4, 1]);
-    expect(warn).toHaveBeenCalledTimes(2);
+    // Recovery resets the failure count, not the per-instance warning window (smarty-dev#8305).
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it("a transient CURRENT context-probe failure keeps the heartbeat and renews on the next tick", async () => {

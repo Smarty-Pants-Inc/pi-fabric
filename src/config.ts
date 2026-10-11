@@ -381,7 +381,17 @@ const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE
   throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
 };
 
+/** Host rollout policy for controls whose sender omits the destination epoch. */
+export type MeshControlIncarnationFence = "warn" | "enforce";
+const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFence => {
+  if (value === undefined) return "warn";
+  if (value === "warn" || value === "enforce") return value;
+  throw new Error("mesh.controlIncarnationFence must be warn or enforce");
+};
+
 export interface FabricMeshConfig {
+  /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
+  controlIncarnationFence: MeshControlIncarnationFence;
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
@@ -651,6 +661,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxSessionBytes: 20 * 1024 * 1024,
   },
   mesh: {
+    controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
     enabled: true,
@@ -1407,6 +1418,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ),
     },
     mesh: {
+      controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
@@ -1832,6 +1844,9 @@ const resolveFabricConfig = (
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
+      const mesh = { ...objectValue(document.mesh) };
+      delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
+      document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
       delete landlock.disabled; // Host-only fleet kill switch wins over lane config.

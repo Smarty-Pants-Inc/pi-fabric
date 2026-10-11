@@ -837,9 +837,16 @@ export class FabricRuntimeState {
       if (!isMeshLockTimeout(error)) throw error;
       initialMeshError = error;
     }
+    // Capture this activation's directory: no control may claim/run before its epoch
+    // commits, after failed renewal, or through a replacement generation's lease.
+    const controlParticipants = participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      // Both gates: this activation's custody/succession completed (main) AND its
+      // directory epoch is committed under a live, renewed lease (#709).
+      canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
-      canConsumeMesh: () => meshActivationReady,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,

@@ -228,26 +228,57 @@ export class ActorRegistryStore {
       throw error;
     }
     let renamed = false;
+    let barrierDue = false;
+    let committedGeneration: string | undefined;
+    const rollback = (): void => {
+      if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
+      else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
+    };
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
-      commit: (): void => {
+      /**
+       * Under custody: the payload commit, the rename and (unless `deferBarrier`) the directory barrier.
+       * smarty-dev#6100: `deferBarrier` leaves the post-rename directory fsync chain to `barrier()`, which the
+       * caller runs AFTER releasing the fence and before acknowledging the write (update() does).
+       */
+      commit: (options: { deferBarrier?: boolean } = {}): void => {
         try {
           payload.commit();
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
-          if (durable) syncDirectoryChain(this.#actorRoot);
+          if (durable && options.deferBarrier !== true) syncDirectoryChain(this.#actorRoot);
           this.#payloads.publishHeads(changedHeads);
           payload.accept(changedHeads, accepted);
-          this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
+          committedGeneration = this.fingerprint();
+          barrierDue = durable && options.deferBarrier === true;
+          this.#snapshot = { generation: committedGeneration, bytes: serialized, actors: accepted };
         } catch (error) {
-          if (renamed) {
-            if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
-            else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
-          }
+          if (renamed) rollback();
           this.#snapshot = undefined;
           throw error;
         } finally {
           registryReadCache.delete(this.#registryPath);
+        }
+      },
+      /**
+       * smarty-dev#6100: the deferred post-rename directory barrier, outside custody. The file's bytes and the
+       * pre-rename barriers were synced before the fence; only the directory entry remains. A writer that took the
+       * fence after this rename built its generation on ours under custody and runs its own barrier before it
+       * acknowledges, so syncing the entry late never exposes an acknowledged write to a power loss. On a failure
+       * the barrier is retried under custody with a generation re-check: still ours, the old contract holds (one
+       * more try, else roll back and throw); superseded, the error is thrown without touching the newer generation.
+       */
+      barrier: async (): Promise<void> => {
+        if (!barrierDue) return;
+        barrierDue = false;
+        try { syncDirectoryChain(this.#actorRoot); return; } catch (error) {
+          await this.withLock(() => {
+            if (this.fingerprint() !== committedGeneration) throw error;
+            try { syncDirectoryChain(this.#actorRoot); } catch (again) {
+              try { rollback(); } finally { this.#snapshot = undefined; registryReadCache.delete(this.#registryPath); }
+              throw again;
+            }
+          });
         }
       },
       dispose: () => fs.rmSync(temporary, { force: true }),
@@ -278,13 +309,18 @@ export class ActorRegistryStore {
     if (!mutation) return undefined;
     const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
     try {
+      // smarty-dev#6100: custody covers only the generation check, the rename and the payload commit; the directory
+      // barrier runs after release, before the write is acknowledged.
       const committed = await locked(() => {
         if (!prepared.valid() || mutation.validate?.() === false) return false;
         live();
-        prepared.commit();
+        prepared.commit({ deferBarrier: true });
         return true;
       });
-      if (committed) return mutation.value;
+      if (committed) {
+        await prepared.barrier();
+        return mutation.value;
+      }
     } finally { prepared.dispose(); }
     vetoed = true;
     // One optimistic attempt keeps the uncontended fence cheap. After any race,
@@ -293,6 +329,7 @@ export class ActorRegistryStore {
     // Caller-local cancellation/ownership validation still vetoes publication. A veto
     // re-selects from a fresh snapshot; one that persists is never reported as
     // success: undefined means only that select() declined to write.
+    let barrier: (() => Promise<void>) | undefined;
     const attempt = (): T | undefined | typeof VETOED => {
       live();
       const current = this.snapshot();
@@ -303,7 +340,8 @@ export class ActorRegistryStore {
         live();
         if (prepared.valid() && selected.validate?.() !== false) {
           live();
-          prepared.commit();
+          prepared.commit({ deferBarrier: true });
+          barrier = prepared.barrier;
           return selected.value;
         }
       } finally { prepared.dispose(); }
@@ -325,6 +363,7 @@ export class ActorRegistryStore {
       // locked() rechecks the deadline after the backoff, before trying the fence.
       result = await locked(attempt);
     }
+    await barrier?.(); // smarty-dev#6100: the committed attempt's directory barrier, after release
     return result;
   }
 
@@ -496,6 +535,21 @@ export class ActorRegistryStore {
 
   /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
+    // smarty-dev#7791: an unchanged registry is answered from one stat of the path, with no open. stat follows the
+    // path exactly as open does, so it names the inode the open would read; the hit rule is the open path's own
+    // (same generation, local clock already proven for that dev:ino, bytes older than the racy window). Anything
+    // else (changed, missing, unproven) takes the descriptor-bound path below.
+    const cached = registryReadCache.get(this.#registryPath);
+    if (cached) {
+      let stat: fs.BigIntStats | undefined;
+      try { stat = fs.statSync(this.#registryPath, { bigint: true }); } catch { stat = undefined; }
+      if (stat && cached.generation === `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
+        registryReadCache.delete(this.#registryPath);
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
+    }
     let fd: number;
     try { fd = fs.openSync(this.#registryPath, "r"); }
     catch (error) { this.releaseReadCache(); throw error; }

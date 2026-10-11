@@ -593,6 +593,9 @@ export class ResidentHost {
         meshCursorPath: path.join(config.residencyRoot, "actor-mesh-cursor.json"),
         retention: this.#retention,
         ...(typeof config.actors?.maxSessionBytes === "number" ? { maxSessionBytes: config.actors.maxSessionBytes } : {}),
+        // smarty-dev#6509: the transient activation block cooldown and backoff cap.
+        ...(typeof config.actors?.transientBlockCooldownMs === "number" ? { transientBlockCooldownMs: config.actors.transientBlockCooldownMs } : {}),
+        ...(typeof config.actors?.transientBlockMaxMs === "number" ? { transientBlockMaxMs: config.actors.transientBlockMaxMs } : {}),
         wakeText: currentWakeText,
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),
         prepareModelRoute: async (input, signal) => {

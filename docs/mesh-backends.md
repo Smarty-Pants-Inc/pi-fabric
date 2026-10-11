@@ -146,7 +146,10 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    refuse. The migrator projects the stream and checks the digest against the source snapshot
    (as the `import-verify` step). It then re-reads the source and compares it with G0, as
    cutover does today.
-3. **Commit.** Install the moved marker (`backend: "nats"`, epoch E+1) over `state.json`. Then
+3. **Commit.** Install the NATS moved marker (epoch E+1) over `state.json`. It is the SQLite
+   marker's exact shape plus `natsStream`, so every release since pi-fabric#627 (main c58cec72)
+   refuses it on its tolerant read as well (a new `format` would read as damage there, so as an
+   EMPTY mesh). Releases before c58cec72 know no marker, the same gap the SQLite cutover accepts. Then
    publish `import-commit{E+1}` with the expected last sequence. Then set the local flag to
    `nats`. Every crash point reruns from the stream head plus the marker, as the `importing`
    rerun does now.

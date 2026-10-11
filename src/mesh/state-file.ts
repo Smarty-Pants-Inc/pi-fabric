@@ -226,7 +226,7 @@ const readState = (
   // pi-fabric#627 review round 3: cutover's moved marker (backend-fence.ts). Never state, damage or an
   // empty mesh, for strict and tolerant reads alike: this file-mode store fails closed (a write is
   // refused before it stages anything; a reader does not report false absence).
-  throw moved.format === "nats" ? meshStateMovedToNatsError(filePath, moved) : meshStateMovedError(filePath, moved);
+  throw isMeshStateNatsMarker(moved) ? meshStateMovedToNatsError(filePath, moved) : meshStateMovedError(filePath, moved);
 };
 
 // smarty-dev#2014 read signal: state.read-signal.json, rewritten best effort after each commit

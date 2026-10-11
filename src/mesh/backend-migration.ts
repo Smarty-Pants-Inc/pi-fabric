@@ -1201,7 +1201,7 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
   } else if (nats) {
     status.fileEpoch = nats.epoch;
     status.fileMoved = true;
-    status.natsStream = nats.stream;
+    status.natsStream = nats.natsStream;
   } else try {
     const file = readFile(root, options);
     status.fileEpoch = fileEpochOf(file);

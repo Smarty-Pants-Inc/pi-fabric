@@ -1713,7 +1713,8 @@ export const ownsFile = (file: string, token: string): boolean => {
 
 // A checkpoint request's own flag: raising it again refreshes its mtime; lowering it removes only it.
 // An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
-// zero or one) per pending check; a crashed request's flag goes stale and is ignored.
+// zero or one) per pending check; a crashed request's flag goes stale and is ignored, and the scan removes it
+// once its holder is proven dead (smarty-dev#7421: the tryLockFile rule, pid plus start ticks; see removeDeadFlag).
 // An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D);
 // anything else is refused with a clear error and never written through.
 export const raiseCheckpointFlag = (root: string, token: string): string => {
@@ -1736,11 +1737,33 @@ export const checkpointFlagRaised = (root: string): boolean => {
   let names: string[];
   try { assertPrivatePath(dir, "directory"); names = fs.readdirSync(dir); } catch { return false; } // a foreign directory raises nothing
   const now = Date.now();
+  let raised = false;
   for (const name of names) {
-    const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
-    if (stat && now - stat.mtimeMs < CHECKPOINT_FLAG_STALE_MS) return true;
+    const flag = path.join(dir, name);
+    const stat = fs.lstatSync(flag, { throwIfNoEntry: false });
+    if (!stat) continue;
+    if (now - stat.mtimeMs < CHECKPOINT_FLAG_STALE_MS) { raised = true; continue; }
+    removeDeadFlag(dir, name, stat);
   }
-  return false;
+  return raised;
+};
+
+// smarty-dev#7421 (pi-fabric#834 review): fail closed. A flag is removed only when its name records start ticks
+// and that pid is gone or runs with other ticks; missing ticks (a pre-#694 token, or no /proc) or an unreadable
+// start time keep it. The state root is on a local filesystem (filesystemRefusal), so its holders share this host.
+// The removal is tryLockFile's reclaim: an exclusive claim keyed by the dead record (outside the flag directory,
+// so it never reads as a flag), then the same inode and mtime again; a flag replaced or refreshed meanwhile stays.
+const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
+  const holder = lockHolder(name);
+  if (holder?.started === undefined || residentProcessAlive(holder.pid, holder.started)) return;
+  const token = ownerToken();
+  const claim = reclaimClaimPath(dir, `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`);
+  if (!tryLockFile(claim, CHECKPOINT_FLAG_STALE_MS, token)) return;
+  try {
+    const flag = path.join(dir, name);
+    const current = fs.lstatSync(flag, { throwIfNoEntry: false });
+    if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) fs.unlinkSync(flag);
+  } catch { /* already gone */ } finally { removeOwnedFile(claim, token); }
 };
 
 /**

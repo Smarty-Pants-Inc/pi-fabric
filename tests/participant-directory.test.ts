@@ -1557,7 +1557,20 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBe(0);
         hold();
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+        // smarty-dev#8305: a later outage inside the warning window is counted, not printed.
+        // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
+        expect(warn).toHaveBeenCalledOnce();
+
+        // The first real acquisition after the window prints the final summary of both
+        // suppressed retries (the continuous outage's second timeout and the later outage).
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        vi.setSystemTime(Date.now() + 60_000);
+        expect(retry.waitMs).toBe(0);
+        expect(await tick()).toBe("done");
+        expect(recovered).toHaveBeenCalledTimes(2);
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls[1]![0]).toMatch(
+          /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();

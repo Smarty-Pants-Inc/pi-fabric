@@ -4,9 +4,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
 import { normalizeFabricConfig } from "../src/config.js";
-import { MESH_STATE_BUSY_CODE, MeshShadowNotReconciledError, MeshStateBusyError, MeshStateFileReadChangedError, resolveMeshStateBackend,
+import { MESH_STATE_BUSY_CODE, MeshShadowNotReconciledError, MeshStateBusyError, MeshStateFileReadChangedError, MeshStateNatsBridgeRefusedError, resolveMeshStateBackend,
   ShadowStateBackend, SqliteStateBackend, type MeshCommitEffects } from "../src/mesh/state-backend.js";
-import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { closeNatsStateBackend, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshBatchConflictError, MeshStore, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry,
   type MeshStoreOptions } from "../src/mesh/store.js";
@@ -267,6 +269,26 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
     await expect(store.writeBatch({ identity, ops: [{ kind: "put", key: "k", value: 2, ifVersion: 7 }],
       commitOutbox: () => { called = true; } })).rejects.toBeInstanceOf(MeshBatchConflictError);
     expect(called).toBe(false);
+  });
+});
+
+describe("nats refuses a bridge: the interim R20 fence decision (smarty-dev#7504, #717)", () => {
+  it("a root where a bridge holds events refuses nats with the named error; a root without a bridge opens", async () => {
+    const bridged = tempRoot("nats-bridged");
+    const backend = await openNatsStateBackend({ root: bridged, port: fakeJetStream().port(), stream: "B" });
+    await backend.put({ key: "topology/hosts/remote-1", value: { format: 1, id: "remote-1", remoteHost: "peer-a" }, identity });
+    expect(() => open(bridged, { stateBackend: "nats" })).toThrow(MeshStateNatsBridgeRefusedError);
+    expect(() => open(bridged, { stateBackend: "nats" })).toThrow(/FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: .*topology\/hosts\/remote-1 is mirrored from peer-a.*smarty-dev#717/);
+
+    const plain = tempRoot("nats-plain");
+    const local = await openNatsStateBackend({ root: plain, port: fakeJetStream().port(), stream: "P" });
+    await local.put({ key: "topology/hosts/local-1", value: { format: 1, id: "local-1" }, identity });
+    const store = open(plain, { stateBackend: "nats" });
+    expect(store.stateBackend).toBe("nats");
+    expect(store.get("topology/hosts/local-1")?.value).toMatchObject({ id: "local-1" });
+    // A bridge never starts on a nats store either; on file it does.
+    expect(() => new StoreBridgeSide(store, "peer-a")).toThrow(/FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: .*a bridge cannot run on a nats store/);
+    expect(() => new StoreBridgeSide(open(tempRoot("file-bridge")), "peer-a")).not.toThrow();
   });
 });
 

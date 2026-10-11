@@ -12,7 +12,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 
 /**
@@ -441,6 +441,7 @@ export class StoreBridgeSide implements BridgeSide {
     readonly now: () => number = Date.now,
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
+    assertBridgeStateBackend(store.root, store.stateBackend);
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
       lease: (lease: BridgeLease, view, replay) => this.#applyLease(lease, view, replay),
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement

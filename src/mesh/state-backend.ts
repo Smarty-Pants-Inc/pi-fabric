@@ -393,9 +393,40 @@ export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendF
   shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
   // smarty-dev#7504: the factory is synchronous, the NATS connection and the stream replay are not. A host prepares
   // the backend first (`openNatsStateBackend`); an unprepared root refuses, never falls back.
-  nats: { create: (context) => preparedNatsStateBackend(context.root) ?? (() => {
-    throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
-  })() },
+  nats: { create: (context) => {
+    const backend = preparedNatsStateBackend(context.root);
+    if (!backend) throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
+    assertNoBridgeOnNats(context.root, backend);
+    return backend;
+  } },
+};
+
+/**
+ * Interim R20 fence decision (smarty-dev#7504 phase 2, docs/mesh-backends.md "Bridges"): on `nats`, the state write
+ * fence excludes no other writer, so a bridge's held-event ownership check (security F2) cannot hold. A root where a
+ * bridge holds events (a mirrored remote host record) refuses `nats`, and a bridge refuses a `nats` store, until the
+ * event log moves onto the stream (smarty-dev#717) or a lease fences it.
+ */
+export class MeshStateNatsBridgeRefusedError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED";
+  constructor(root: string, detail: string) {
+    super(`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: ${root}: ${detail}; the nats backend has no R20 write fence for a bridge's `
+      + "held events until smarty-dev#717 (docs/mesh-backends.md, Bridges)");
+    this.name = "MeshStateNatsBridgeRefusedError";
+  }
+}
+
+const assertNoBridgeOnNats = (root: string, backend: StateBackend): void => {
+  const bridged = backend.listAllShared("topology/hosts/").find(entry => {
+    const value = entry.value as { remoteHost?: unknown } | null;
+    return typeof value === "object" && value !== null && typeof value.remoteHost === "string";
+  });
+  if (bridged) throw new MeshStateNatsBridgeRefusedError(root, `a bridge holds events here (${bridged.key} is mirrored from ${String((bridged.value as { remoteHost: string }).remoteHost)})`);
+};
+
+/** A bridge side on a `nats` store refuses (the same interim decision). */
+export const assertBridgeStateBackend = (root: string, kind: string): void => {
+  if (kind === "nats") throw new MeshStateNatsBridgeRefusedError(root, "a bridge cannot run on a nats store");
 };
 
 /**

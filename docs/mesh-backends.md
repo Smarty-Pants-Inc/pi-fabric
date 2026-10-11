@@ -29,6 +29,10 @@ replays the stream. The factory then returns that prepared backend.
 - **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
 `acceptPeriodicSync`; a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
 (busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **Bridges (interim):** on `nats` the R20 state write fence excludes no other writer, so a bridge's held-event
+ownership check (security F2) cannot hold. A root where a bridge holds events (a mirrored remote host record) refuses
+`nats`, and a bridge refuses a `nats` store (`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED`). This lasts until the event log
+moves onto the state stream (smarty-dev#717) or a lease fences the append.
 - **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
 `retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
 protocol violation: the projector fails closed.

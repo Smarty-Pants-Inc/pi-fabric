@@ -6,6 +6,8 @@ import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
+import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -19,6 +21,8 @@ interface RunRootOwner {
   childrenStopped?: boolean;
 }
 interface RunRecordSummary {
+  id?: string;
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   status?: string;
   actorId?: string;
   finishedAt?: number;
@@ -209,8 +213,11 @@ const runTreeVeto = (
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
 };
+// Native receipt completion precedes teardown. An exit-only status rewrite
+// must not restart retention; deletion still requires receipt and exit checks.
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
-  time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
+  time(record.finalAnswerReceipt?.recordedAt) ? record.finalAnswerReceipt.recordedAt :
+    time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
@@ -246,6 +253,88 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
   }
   return true;
 };
+/** A refusal journal is not a sender route receipt. Every unconsumed admission
+ * needs its retained delivered notice; pending, malformed and linked artifacts veto. */
+const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
+  const answerFile = path.join(root, "final-answer.json");
+  const controls = path.join(root, "terminal-controls"), notices = path.join(root, "terminal-notices");
+  // Read original native admissions before trusting any worker consumption row.
+  const admissions = new Map<string, TerminalAdmission>();
+  const steering = path.join(root, "steer.jsonl");
+  if (fs.existsSync(steering)) {
+    if (!ownedStat(steering)?.isFile()) return false;
+    for (const line of fs.readFileSync(steering, "utf8").split("\n")) {
+      if (expired()) return false;
+      if (!line.trim()) continue;
+      const entry = JSON.parse(line);
+      if (entry?.type !== "steer" && entry?.type !== "follow_up") continue;
+      const admission = terminalAdmissionFromEntry(entry);
+      if (!admission || admissions.has(admission.id)) return false;
+      admissions.set(admission.id, admission);
+    }
+  }
+  if (!fs.existsSync(answerFile)) {
+    if (fs.existsSync(notices) && (!ownedStat(notices)?.isDirectory() || fs.readdirSync(notices).length > 0)) return false;
+    if (!fs.existsSync(controls)) return true;
+    if (!ownedStat(controls)?.isDirectory()) return false;
+    // A failed/interrupted task need not have a final answer. Already consumed
+    // controls remain known collectible artifacts; queued/unknown ones do not.
+    return fs.readdirSync(controls).every(name => {
+      if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      return !!control && control.state === "delivered" &&
+        Object.keys(control).every(key => ["id", "state", "delivery", "provenance"].includes(key)) &&
+        terminalControlMatchesAdmission(control, admissions.get(name.slice(0, -5)));
+    });
+  }
+  if (!ownedStat(answerFile)?.isFile()) return false;
+  const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
+  // Retained trees can be copied under archive aliases. Bind the receipt to
+  // the original run identity, not its collection path; controls still require
+  // their exact original admission below.
+  const answer = typeof record?.id === "string" ? readFinalAnswerReceipt(root, record.id) : undefined;
+  if (!answer || expired() || record?.id !== answer.runId || record.finalAnswerReceipt?.id !== answer.id ||
+      record.finalAnswerReceipt.recordedAt !== answer.recordedAt || record.actorId) return false;
+  const routed = new Set<string>();
+  if (fs.existsSync(notices)) {
+    if (!ownedStat(notices)?.isDirectory()) return false;
+    for (const name of fs.readdirSync(notices)) {
+      if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json(?:\.delivered)?$/.test(name)) return false;
+      const deliveredName = name.endsWith(".delivered") ? name : `${name}.delivered`;
+      const notice = readJson<{ code?: string; targetId?: string; messageId?: string; delivery?: string; finalAnswerReceiptId?: string; sender?: { id?: string; kind?: string; verified?: string } }>(path.join(notices, deliveredName));
+      if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== answer.runId ||
+          notice.finalAnswerReceiptId !== answer.id || deliveredName !== `${notice.messageId}.json.delivered` ||
+          !["steer", "followUp"].includes(notice.delivery ?? "") || !notice.sender?.id ||
+          !["mesh", "bridge"].includes(notice.sender.verified ?? "") || !["main", "actor", "agent", "remote"].includes(notice.sender.kind ?? "")) return false;
+      const admission = admissions.get(notice.messageId!);
+      if (!admission || notice.delivery !== admission.delivery || !terminalSenderMatches(notice.sender, admission.sender)) return false;
+      if (!name.endsWith(".delivered")) {
+        const pending = readJson<unknown>(path.join(notices, name));
+        if (JSON.stringify(pending) !== JSON.stringify(notice)) return false;
+      }
+      routed.add(notice.messageId!);
+    }
+  }
+  const consumed = new Set<string>();
+  if (fs.existsSync(controls)) {
+    if (!ownedStat(controls)?.isDirectory()) return false;
+    for (const name of fs.readdirSync(controls)) {
+      if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const id = name.slice(0, -5), admission = admissions.get(id);
+      if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
+          !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
+          control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
+      if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
+      else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
+    }
+  }
+  for (const id of admissions.keys()) {
+    if (expired() || !consumed.has(id) && !routed.has(id)) return false;
+  }
+  return true;
+};
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
@@ -266,12 +355,14 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
   try {
+    if (!safeTerminalArtifacts(root, expired)) return false;
     for (const name of fs.readdirSync(root)) {
       if (expired()) return false;
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && (runFile(name) || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
+      if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
+      if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;

@@ -15,7 +15,7 @@ import type { MeshEvent } from "./store.js";
  *   <dir>/PENDING.json                   a publish between its archive append and its commit
  *   <dir>/<yyyy>/<mm>/<dd>/<topic>.jsonl  one line per event, the same bytes as the live log
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
- *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json durable per-file SHA-256 state and counters
+ *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json rebuildable SHA-256 checkpoints and counters
  *   <dir>/DIGEST-REPAIR.json              deferred oversized legacy line (read off-lock)
  *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  positive event-identity abort markers
  *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and advisory live confirmation
@@ -75,7 +75,7 @@ export interface MeshArchiveRecovery {
   /** This is the first publish of this boot: after a reboot, the synced archive lines are the truth. */
   rebooted: boolean;
   /** Archived events past the live log's end, in sequence order, to go live again. */
-  promote: Array<MeshArchiveEntry & { file: string }>;
+  promote: Array<MeshArchiveEntry & { file: string; offset?: number }>;
 }
 
 export interface MeshArchiveDigestRepair {
@@ -90,7 +90,7 @@ export interface MeshArchiveRecoveryPlan {
   metadata: string;
   pendingRepair?: { file: string; size: number; digest: DigestCheckpoint };
   identities: Array<{ file: string; identity: string }>;
-  promote: Array<MeshArchiveEntry & { file: string }>;
+  promote: Array<MeshArchiveEntry & { file: string; offset?: number }>;
 }
 
 /** An optimistic read raced an archive writer; retry before making any mutations. */
@@ -283,8 +283,14 @@ export class MeshArchive {
       writeFileAtomic(path.join(this.dir, "PENDING.json"), `${JSON.stringify(pending)}\n`);
       const bytes = Buffer.from(`${entry.line}\n`, "utf8");
       writeAll(descriptor, bytes);
+      // The ONE durable barrier of an ordinary publish (smarty-dev#8305): the event's archive
+      // bytes are on disk before it can go live. HEAD, PENDING, the digest checkpoint and an
+      // unkeyed index are advisory metadata: losing them cannot erase the segment's event.
       fs.fdatasyncSync(descriptor);
-      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) });
+      // A keyed index replaces a durable `absent` reservation: it is an intent-recovery fence
+      // and stays durable, after the bytes it names. Nothing resolves an unkeyed index.
+      this.#writeIndex(entry.event.sequence, { sequence: entry.event.sequence, id: entry.event.id, file: relative, offset: pending.size, length: bytes.length, ...(entry.event.dedupeKey ? { committed: false } : {}) }, entry.event.dedupeKey !== undefined);
+      // Rare: a new segment's (and day's) name must be durable before its event goes live.
       if (fresh) this.#syncDays(relative);
     } catch (error) {
       if (descriptor !== undefined) fs.closeSync(descriptor);
@@ -299,7 +305,9 @@ export class MeshArchive {
 
   /** The event is live: it is committed. Moves the head and seals any closed day. */
   commit(pending: MeshArchivePending, sealClosedDays = true): void {
-    if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)));
+    // Advisory checkpoint of bytes begin() already synced: plain. A lost or stale one is a
+    // valid prefix (rebuilt in slices); every truncation path saves its checkpoint durably.
+    if (pending.digestAfter) this.#saveDigest(pending.file, pending.digestAfter, fs.statSync(path.join(this.dir, pending.file)), false);
     if (pending.dedupe) this.confirmLive(pending.sequence, pending.id);
     // PENDING goes first: a stop before the head moves leaves a head that is behind, and the
     // catch-up skips the event it finds already archived.
@@ -315,6 +323,27 @@ export class MeshArchive {
     if (!indexed || "absent" in indexed) return;
     if (indexed.id !== id) throw new MeshArchiveLookupUnavailableError("Cannot commit a mismatched archive sequence index");
     if (indexed.committed === false) this.#writeIndex(sequence, { ...indexed, committed: true });
+  }
+
+  /**
+   * A promoted keyed line is positive evidence: synced archive bytes, now live again. A power
+   * loss between begin()'s fdatasync and its durable index leaves the `absent` reservation
+   * (or a torn plain write): rebuild the exact address so settleIntent neither ignores nor
+   * republishes it. A different identity at the sequence still fails closed (confirmLive).
+   */
+  #rebuildPromotedIndex(entry: MeshArchiveEntry & { file?: string; offset?: number }): void {
+    const { event, line, file, offset } = entry;
+    let indexed: MeshArchiveIndexEntry | { absent: true } | undefined;
+    try { indexed = this.#readJson(path.relative(this.dir, this.#indexPath(event.sequence))); }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; indexed = undefined; }
+    const unusable = indexed === undefined || indexed === null || typeof indexed !== "object" ||
+      ("absent" in indexed && indexed.absent === true) || typeof (indexed as MeshArchiveIndexEntry).id !== "string";
+    if (unusable && file !== undefined && offset !== undefined) {
+      this.#writeIndex(event.sequence, { sequence: event.sequence, id: event.id, file, offset,
+        length: Buffer.byteLength(line, "utf8") + 1, committed: true });
+      return;
+    }
+    this.confirmLive(event.sequence, event.id);
   }
 
   /** The event never went live: cut it back out of its file. */
@@ -406,7 +435,7 @@ export class MeshArchive {
         } finally { fs.closeSync(descriptor); }
       }
     }
-    const found = new Map<string, MeshArchiveEntry & { file: string }>();
+    const found = new Map<string, MeshArchiveEntry & { file: string; offset: number }>();
     for (const day of this.#days()) {
       const directory = path.join(this.dir, day);
       identities.push({ file: day, identity: fileIdentity(fs.statSync(directory)) });
@@ -435,13 +464,20 @@ export class MeshArchive {
             const split = position === 0 ? 0 : bytes.indexOf(0x0a) + 1;
             if (!split && position > 0) { carry = bytes; continue; }
             carry = bytes.subarray(0, split);
-            const lines = completeLines(bytes.subarray(split).toString("utf8"));
+            // Complete lines with their exact segment address (completeLines' split, by byte).
+            const lines: Array<{ line: string; offset: number }> = [];
+            for (let start = split; ;) {
+              const newline = bytes.indexOf(0x0a, start);
+              if (newline < 0) break;
+              if (newline > start) lines.push({ line: bytes.subarray(start, newline).toString("utf8"), offset: position + start });
+              start = newline + 1;
+            }
             for (let i = lines.length - 1; i >= 0; i--) {
-              const line = lines[i]!;
+              const { line, offset } = lines[i]!;
               const event = parseEvent(line);
               if (!event) continue;
               if (event.sequence <= lastLive) { done = true; break; }
-              if (aborted?.[event.sequence] !== event.id) found.set(event.id, { event, line, file });
+              if (aborted?.[event.sequence] !== event.id) found.set(event.id, { event, line, file, offset });
             }
           }
         } finally { fs.closeSync(descriptor); }
@@ -504,8 +540,8 @@ export class MeshArchive {
   }
 
   /** After a new boot's recovery: the promoted events are live. Records the boot, durably. */
-  recovered(last: (MeshArchiveEntry & { file: string }) | undefined, promoted: MeshArchiveEntry[] = []): void {
-    for (const { event } of promoted) if (event.dedupeKey) this.confirmLive(event.sequence, event.id);
+  recovered(last: (MeshArchiveEntry & { file: string }) | undefined, promoted: Array<MeshArchiveEntry & { file?: string; offset?: number }> = []): void {
+    for (const entry of promoted) if (entry.event.dedupeKey) this.#rebuildPromotedIndex(entry);
     if (last) this.#writeHead({ sequence: last.event.sequence, id: last.event.id, file: last.file });
     writeDurable(path.join(this.dir, "BOOT"), currentBoot());
   }
@@ -775,8 +811,8 @@ export class MeshArchive {
     return path.join(this.dir, MESH_ARCHIVE_SEQUENCE_INDEX, String(Math.floor(sequence / 1024)), `${sequence}.json`);
   }
 
-  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }): void {
-    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable: true });
+  #writeIndex(sequence: number, entry: MeshArchiveIndexEntry | { sequence: number; absent: true }, durable = true): void {
+    writeFileAtomic(this.#indexPath(sequence), JSON.stringify(entry), { durable });
   }
 
   #readJson<T>(relative: string): T | undefined {
@@ -817,12 +853,16 @@ export class MeshArchive {
     writeFileAtomic(path.join(this.dir, "HEAD.json"), `${JSON.stringify(head)}\n`);
   }
 
+  // Once-per-archive bootstrap metadata, durable (smarty-dev#8305): nextEventAfter trusts
+  // firstSequence to route compacted-history reads here. Its data is fsynced before the rename
+  // and the first (fresh) segment's #syncDays syncs this root before any event goes live, so a
+  // segment line never outlives MESH.json. Every later publish only sees it exists: no sync.
   #describeMesh(firstSequence: number): void {
     const file = path.join(this.dir, "MESH.json");
     if (fs.existsSync(file)) return;
     writeFileAtomic(file, `${JSON.stringify({
       version: 1, meshRoot: this.meshRoot, host: os.hostname(), firstSequence, createdAt: new Date().toISOString(),
-    })}\n`);
+    })}\n`, { durable: true });
   }
 
   // A torn last line belongs to an append that never returned: cut it, as the live log does.
@@ -865,7 +905,15 @@ export class MeshArchive {
   }
 
   #loadDigest(relative: string, stat: fs.Stats): DigestCheckpoint {
-    const saved = this.#readJson<DigestCheckpoint>(this.#digestPath(relative));
+    // A plain (smarty-dev#8305) checkpoint may be missing, stale or torn after a power loss:
+    // it is a cache of the segment's own bytes, so anything unreadable is rebuilt from them.
+    let saved: DigestCheckpoint | undefined;
+    try { saved = this.#readJson<DigestCheckpoint>(this.#digestPath(relative)); }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+    if (saved !== undefined && (typeof saved !== "object" || saved === null || typeof saved.identity !== "string" ||
+        typeof saved.hash !== "object" || saved.hash === null || !Number.isSafeInteger(saved.hash.bytes) ||
+        !Number.isSafeInteger(saved.lines) || !Number.isSafeInteger(saved.firstSequence) ||
+        !Number.isSafeInteger(saved.lastSequence))) saved = undefined;
     const identity = fileIdentity(stat);
     const prior = saved?.identity.split(":");
     // Checkpoints are installed only after the live append (or catch-up). Both protocols
@@ -874,8 +922,8 @@ export class MeshArchive {
     const appended = prior?.[0] === String(stat.dev) && prior[1] === String(stat.ino) &&
       Number(prior[2]) < stat.size;
     if (saved?.version === 1 && (saved.identity === identity || appended) && saved.hash.bytes <= stat.size) {
-      new ArchiveSha256(saved.hash); // Reject a malformed checkpoint; never emit a false seal.
-      return saved;
+      // Reject a malformed checkpoint (rebuild below); never emit a false seal.
+      try { new ArchiveSha256(saved.hash); return saved; } catch { /* rebuild */ }
     }
     // Replacement, shrink, or same-size modification: never trust a stale digest. Legacy
     // data is rebuilt in bounded slices, with oversized lines parsed only off-lock.
@@ -919,9 +967,9 @@ export class MeshArchive {
     this.#countLine(digest, entry.event);
   }
 
-  #saveDigest(relative: string, digest: DigestCheckpoint, stat: fs.Stats): void {
+  #saveDigest(relative: string, digest: DigestCheckpoint, stat: fs.Stats, durable = true): void {
     digest.identity = fileIdentity(stat);
-    writeFileAtomic(path.join(this.dir, this.#digestPath(relative)), `${JSON.stringify(digest)}\n`, { durable: true });
+    writeFileAtomic(path.join(this.dir, this.#digestPath(relative)), `${JSON.stringify(digest)}\n`, { durable });
   }
 
   #seal(day: string, budget: { bytes: number }): boolean {

@@ -40,6 +40,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/spawn-router.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -91,7 +92,9 @@ const lazy = [
   "worker/run-record.js",
   "worker/session-export.js",
 ];
-const entries = [...stable, ...lazy];
+// Executable-only entry: syntax/declarations/maps are required, but importing it runs a command.
+const executable = ["bash-idle-watchdog.js"];
+const entries = [...stable, ...lazy, ...executable];
 const declarations = entries.map((file) => file.replace(/\.js$/, ".d.ts"));
 const required = [
   "worker-protocol.json",
@@ -182,7 +185,7 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
+for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
@@ -196,6 +199,10 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
+  .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
+  throw new Error("Spawn router adapter escaped into the eager/provider static graph");
+}
 if (/src\/judge(?:\/|-cli)/.test(initialSource)) throw new Error("Judge code escaped into startup graph");
 if (manifest.bin?.["fabric-judge"] !== "./bin/fabric-judge" || !existsSync(join(root, "bin/fabric-judge"))) throw new Error("Missing fabric-judge bin");
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));

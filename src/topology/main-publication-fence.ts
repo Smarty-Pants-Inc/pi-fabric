@@ -116,12 +116,25 @@ export const acquireMainPublicationFence = async (meshRoot: string, rootId: stri
 };
 
 /**
- * THE path that removes (moves to its archive) a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
- * Main publication fence, run the final check under it, delete, release in finally. A Main cannot publish
- * its root participant between the check and the delete. The live host path is smarty-dev#8090.
+ * THE path for every delete (or archive move) of a root's actor tree, offline (smarty-dev#7817) and live
+ * (ActorManager cleanup, smarty-dev#8090): hold the root's Main publication fence, run the final check under it,
+ * delete, release in finally. A Main cannot publish its root participant between the check and the delete.
+ *
+ * - An operator removal passes `check` (its dead-root liveness check). A removal the Main itself asked for passes
+ *   none: it is still fenced, so a live Main's refresh during the delete is refused once and retried at its next
+ *   heartbeat (ParticipantDirectory treats MainPublicationFencedError as a retry, not an error).
+ * - Windows has no flock (smarty-dev#7858): a removal with a `check` refuses there (fail closed, an accepted platform
+ *   limit); one without a check deletes unfenced, as before, since no liveness claim depends on the fence.
+ * - Not here: ActorManager.close() removing a non-persistent actor root. That tree is the Main's own ephemeral
+ *   (session, in-process) actor root, not a root's durable tree; no other process owns or publishes for it.
  */
 export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void | Promise<void>,
   check?: () => void | Promise<void>): Promise<void> => {
+  if (process.platform === "win32") {
+    if (check) throw new Error("An operator actor removal needs the Main publication fence, which needs flock; refusing on Windows (smarty-dev#7858)");
+    await remove();
+    return;
+  }
   const release = await acquireMainPublicationFence(meshRoot, rootId);
   try {
     await check?.();

@@ -9,6 +9,7 @@ import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
+import { deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
@@ -213,7 +214,7 @@ interface ManagedActor {
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
   inFlightRun?: { id: string; startedAt: number };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
-  removal?: { requestedAt: number; runId?: string; runStartedAt?: number };
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; operator?: OperatorRemoval };
   lastError?: string;
   /** Why a stopped actor stopped; only host-exit is restarted by its session's next start (smarty-dev#9241). */
   stopReason?: FabricActorStopReason;
@@ -237,6 +238,10 @@ export const parseBashTimeoutSeconds = (value: unknown): number => {
   return value;
 };
 
+/** An operator's confirmed dead-root removal (smarty-dev#8090): its liveness check runs again, under the root's
+ * Main publication fence, right before the tree delete, also after a deferred finish or a host restart. */
+interface OperatorRemoval { confirmDeadRoot: string }
+
 interface RemovalCleanup {
   id: string;
   sessionDir: string;
@@ -244,6 +249,7 @@ interface RemovalCleanup {
   lastRunId?: string;
   pending?: string;
   owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
+  operator?: OperatorRemoval;
 }
 
 type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
@@ -631,6 +637,9 @@ export class ActorManager {
   readonly #prepareModelRoute: ((input: ActorModelRouteInput, signal: AbortSignal) => Promise<ModelRouteDecision>) | undefined;
   readonly #lineageAlive: ((rootId: string) => boolean) | undefined;
   readonly #deadRootFilter: (() => FabricDeadRootFilterConfig | undefined) | undefined;
+  readonly #operatorRemovalCheck: ((operator: OperatorRemoval) => () => Promise<void>) | undefined;
+  /** The operator assertion of a removal in progress, until its cleanup marker carries it. */
+  readonly #removalOperator = new Map<string, OperatorRemoval>();
   #deadRoots: DeadRootCache | undefined;
   readonly #claimResidency: FabricParticipantResidency | undefined;
   readonly #rootId: string;
@@ -773,6 +782,8 @@ export class ActorManager {
        * absent or mode "off" never skips. Only durable actors' callerless mesh/host events are checked.
        */
       deadRootFilter?: () => FabricDeadRootFilterConfig | undefined;
+      /** The resident host's operator liveness check for a confirmed dead-root removal (smarty-dev#8090). */
+      operatorRemovalCheck?: (operator: OperatorRemoval) => () => Promise<void>;
       adoptionGraceMs?: number;
       claimResidency?: FabricParticipantResidency;
       rootId?: string;
@@ -846,6 +857,7 @@ export class ActorManager {
     this.#prepareModelRoute = options.prepareModelRoute;
     this.#lineageAlive = options.lineageAlive;
     this.#deadRootFilter = options.deadRootFilter;
+    this.#operatorRemovalCheck = options.operatorRemovalCheck;
     this.#adoptionGraceMs = options.adoptionGraceMs ?? ORPHAN_ADOPTION_RETRY_MS;
     this.#claimResidency = options.claimResidency;
     this.#rootId = options.rootId ?? identity.id;
@@ -2498,10 +2510,11 @@ export class ActorManager {
    */
   async remove(
     id: string,
-    { wait = true }: { wait?: boolean } = {},
+    { wait = true, operator }: { wait?: boolean; operator?: OperatorRemoval } = {},
   ): Promise<RemovalResult> {
     // Resolve aliases only against registered actors; cleanup retries require the exact full id.
     const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) ? id : this.#requireOwnedActor(id).id;
+    if (operator) this.#removalOperator.set(actorId, operator);
     // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
     const call = this.#removeCalls.get(actorId) ?? this.#remove(actorId);
     this.#removeCalls.set(actorId, call);
@@ -2548,9 +2561,11 @@ export class ActorManager {
     const drain = running?.drain;
     if (drain) {
       const inFlightRun = running.inFlightRun;
+      const operator = this.#removalOperator.get(actor.id);
       actor.removal = {
         requestedAt: Date.now(),
         ...(inFlightRun ? { runId: inFlightRun.id, runStartedAt: inFlightRun.startedAt } : {}),
+        ...(operator ? { operator } : {}),
       };
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
       // removal is accepted only once it is saved (review round 1 on pi-fabric#160).
@@ -2714,6 +2729,7 @@ export class ActorManager {
           typeof cleanup.presenceKey !== "string" || !/^actors\/[^/]+\/[^/]+$/.test(cleanup.presenceKey) ||
           !cleanup.presenceKey.endsWith(`/${id}`) ||
           (cleanup.lastRunId !== undefined && typeof cleanup.lastRunId !== "string") ||
+          (cleanup.operator !== undefined && typeof cleanup.operator?.confirmDeadRoot !== "string") ||
           (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
             typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
             !Number.isFinite(cleanup.owner.requestedAt)))) return undefined;
@@ -2738,8 +2754,15 @@ export class ActorManager {
     }
     try {
       await this.#joinStoppedRun(cleanup.id);
-      await this.#bindings.delete(cleanup.id);
-      fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      // smarty-dev#8090: every actor-tree delete goes through the one fenced helper. An operator removal's
+      // liveness check runs under the fence first; a refusal keeps the tree and leaves the cleanup pending.
+      const operator = cleanup.operator;
+      const check = operator ? (this.#operatorRemovalCheck?.(operator)
+        ?? (async () => { throw new Error("operator removal check unavailable in this process"); })) : undefined;
+      await deleteRootActorTree(this.mesh.root, cleanup.owner?.rootId ?? this.#rootId, async () => {
+        await this.#bindings.delete(cleanup.id);
+        fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      }, check);
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
         if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
@@ -2775,6 +2798,9 @@ export class ActorManager {
     };
     cleanup.owner ??= { name: actor.name, rootId: actor.rootId, residency: actor.residency,
       requestedAt: actor.removal?.requestedAt ?? Date.now() };
+    const operator = actor.removal?.operator ?? this.#removalOperator.get(actor.id);
+    if (operator) cleanup.operator ??= operator;
+    this.#removalOperator.delete(actor.id);
     // Re-establish the barrier on every attempt, including a marker left by a failed rename
     // directory sync. A visible marker alone is not proof that the obligation is durable.
     if (this.#persistent && this.meshConfig.enabled) {
@@ -5673,6 +5699,8 @@ export class ActorManager {
                 requestedAt: record.removal.requestedAt,
                 ...(typeof record.removal.runId === "string" ? { runId: record.removal.runId } : {}),
                 ...(typeof record.removal.runStartedAt === "number" ? { runStartedAt: record.removal.runStartedAt } : {}),
+                ...(typeof record.removal.operator?.confirmDeadRoot === "string"
+                  ? { operator: { confirmDeadRoot: record.removal.operator.confirmDeadRoot } } : {}),
               },
             }
           : {}),

@@ -19,6 +19,7 @@ interface ResidentHostLaunchContext {
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
+import { fencedOperatorCheck } from "../actors/remove-offline.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -587,6 +588,11 @@ export class ResidentHost {
         lineageAlive,
         // smarty-dev#6062: read per activation, so turning mode "off" in config takes effect live.
         deadRootFilter: () => (currentConfig().agents ?? config.agents)?.deadRootFilter,
+        // smarty-dev#8090: an operator removal's liveness check, rebuilt from its persisted assertion and run under
+        // the root's Main publication fence (inside the state transaction, under the root participant key lock).
+        operatorRemovalCheck: ({ confirmDeadRoot }) => () => fencedOperatorCheck(this.mesh,
+          { id: residentHostId(config.rootId), name: "resident operator removal", kind: "agent" }, config.rootId,
+          get => assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), confirmDeadRoot)),
         claimResidency: "durable",
         rootId: config.rootId,
         // Recorded on every actor it creates, and the only project whose orphans it adopts, and
@@ -1638,6 +1644,11 @@ export class ResidentHost {
         if (candidates.length !== 1) throw new Error(candidates.length
           ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
         const actor = candidates[0]!;
+        // smarty-dev#8090: the tree delete needs the flock-held Main publication fence; fail closed on Windows,
+        // before any change, as the offline remover does (smarty-dev#7858).
+        if (command.action === "remove" && command.dryRun !== true && process.platform === "win32") {
+          throw new Error("A live operator actor removal needs the Main publication fence, which needs flock; refusing on Windows (smarty-dev#7858)");
+        }
         if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
         } else {
@@ -1648,7 +1659,8 @@ export class ResidentHost {
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+            : await this.#removeResidentActor(actor.id, requestId, () => check(),
+              command.confirmDeadRoot !== undefined ? { confirmDeadRoot: command.confirmDeadRoot } : undefined);
         }
       } else if (command.operation === "actors") {
         response = {
@@ -1718,14 +1730,15 @@ export class ResidentHost {
     return response;
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void,
+    operator?: { confirmDeadRoot: string }): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
       throw new Error(`Resident host does not own ${id}`);
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false });
+    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {

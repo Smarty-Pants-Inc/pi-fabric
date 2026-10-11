@@ -758,13 +758,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return;
         }
         if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
-          void this.#backgroundRefresh.run(() => this.refresh(), false);
+          void this.#backgroundRefresh.run(this.#fencedRetry(() => this.refresh()), false);
         }
       }, this.#heartbeatMs);
       this.#timer.unref();
       this.#installExitHook();
     }
-    await this.refresh();
+    // A Main starting while an actor-tree delete fences its root publishes at its next heartbeat.
+    await (this.#timer ? this.#fencedRetry(() => this.refresh())() : this.refresh());
+  }
+
+  /**
+   * smarty-dev#8090: a refresh refused because an actor-tree delete holds this root's Main publication fence is
+   * retried at the next heartbeat. It is not a failure: no warning line, no lock backoff, no alarm, and it must
+   * never count toward a mesh outage (rule for pi-fabric#893's deferred-write outage tracker: do not count a
+   * MainPublicationFencedError). The delete holds the fence only for its check and delete.
+   */
+  #fencedRetry(operation: () => Promise<void>): () => Promise<void> {
+    return () => operation().catch((error: unknown) => {
+      if (!(error instanceof MainPublicationFencedError)) throw error;
+    });
   }
 
   // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
@@ -855,7 +868,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
       if (!this.#live()) return;
-      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
+      void this.#backgroundRefresh.run(this.#fencedRetry(() => this.#runRefresh(false)), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -1073,6 +1086,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       await this.refresh();
     } catch (error) {
       if (!isMeshLockTimeout(error)) this.#refreshError = error;
+      if (error instanceof MainPublicationFencedError) return; // the next heartbeat retries (smarty-dev#8090)
       this.#backgroundRefresh.failure(error);
     }
   }
@@ -1618,8 +1632,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // This never grants admission: refresh still needs the real mesh lock.
     // A typed lock timeout already has a single host recovery lane. Idle consumers
     // call this gate as often as every 100 ms; they must not multiply attempts.
-    if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
-      void this.#backgroundRefresh.run(() => this.refresh(), false);
+    // A fenced refresh waits for its next heartbeat, not for the next gate call (smarty-dev#8090).
+    if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !(this.#refreshError instanceof MainPublicationFencedError) &&
+        !this.#closed && !this.#quiescing && this.#timer) {
+      void this.#backgroundRefresh.run(this.#fencedRetry(() => this.refresh()), false);
     }
     return confirmed;
   }

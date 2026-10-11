@@ -16,10 +16,11 @@ import type { FabricParticipantRecord } from "../../src/topology/types.js";
 /** A real root Main publishing its root participant through ParticipantDirectory (in this process, or in a
  * separate Main process: tests/fixtures/process-harness-child.mjs). */
 export const mainDirectory = (meshRoot: string, rootId: string,
-  mainProcess: { pid: number; host: string; startTime?: string } = { pid: process.pid, host: os.hostname() }): ParticipantDirectory => {
+  mainProcess: { pid: number; host: string; startTime?: string } = { pid: process.pid, host: os.hostname() },
+  { heartbeatMs = 60_000 }: { heartbeatMs?: number } = {}): ParticipantDirectory => {
   const identity: MeshIdentity = { id: rootId, name: "main", kind: "main" };
   const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000), {
-    enabled: true, hostId: rootId, rootId, identity, heartbeatMs: 60_000, leaseMs: 120_000, reapDeadHosts: false });
+    enabled: true, hostId: rootId, rootId, identity, heartbeatMs, leaseMs: Math.max(120_000, 2 * heartbeatMs), reapDeadHosts: false });
   directory.registerSource(() => [{ format: 1, id: rootId, kind: "root", rootId, ownerHostId: rootId, ownerIdentityId: rootId,
     name: "main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
     sessionId: "dead-root", startedAt: Date.now(), updatedAt: Date.now(), pendingMessages: false, controlProtocol: "v1",

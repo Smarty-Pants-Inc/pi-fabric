@@ -32,7 +32,7 @@ replays the stream. The factory then returns that prepared backend.
 - **Bridges (interim):** on `nats` the R20 state write fence excludes no other writer, so a bridge's held-event
 ownership check (security F2) cannot hold. A root where a bridge holds events (a mirrored remote host record) refuses
 `nats`, and a bridge refuses a `nats` store (`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED`). This lasts until the event log
-moves onto the state stream (smarty-dev#717) or a lease fences the append.
+moves onto the state stream (smarty-dev#9725) or a lease fences the append.
 - **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
 `retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
 protocol violation: the projector fails closed.
@@ -179,7 +179,9 @@ then import. The details:
   regular file. An existing kept copy must be ours and hold the source's digest, else the import refuses.
 - **Limits (`LIMIT: FABRIC_MESH_NATS_MIGRATION_LIMIT`):** `maxReplay` stream messages,
   `maxStateBytes` of projected state and of the export, and `maxStateTombstones` (bounded as the
-  backend bounds them). A limit refuses before any retire, rename or commit.
+  backend bounds them), and `maxPayloadBytes` per import chunk (default 1 MiB, the server default),
+  checked before `import-begin`. A rollback counts its own `retire` record against `maxReplay`. A
+  limit refuses before any retire, rename or commit.
 - **Not built:** the sqlite-direct path and abort (`unretire`).
 
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readMeshStateNatsMarker } from "../src/mesh/backend-fence.js";
 import { importMeshStateToNats, MeshNatsMigrationLimitError, rollbackMeshStateFromNats, type MeshNatsMigrationOptions } from "../src/mesh/backend-migration-nats.js";
 import { importMeshState, MeshBackendRefusedError, meshSnapshotDigest, type MeshBackendStep } from "../src/mesh/backend-migration.js";
@@ -212,6 +212,62 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     await expect(importMeshStateToNats(over, { ...sourceOptions, maxStateTombstones: 2 })).rejects.toThrow(/LIMIT: .*3 tombstones/);
     expect(readMeshStateNatsMarker(over)).toBeUndefined();
     expect((await importMeshStateToNats(over, sourceOptions)).converged).toBe(false); // the stream was left empty
+  }, 60_000);
+
+  it("maxReplay counts the retire record: head == maxReplay refuses before retiring, head == maxReplay - 1 rolls back", async () => {
+    const root = tempRoot("replay-boundary");
+    const digest = await seedFileRoot(root);
+    const connect = reconnectable(targetKind);
+    await importMeshStateToNats(root, connect());
+    const options = connect();
+    const backend = await openNatsStateBackend({ root, stream: readMeshStateNatsMarker(root)!.natsStream,
+      ...(options.port ? { port: options.port } : { servers: options.servers!, monitoringUrl: options.monitoringUrl! }) });
+    const head = backend.diagnostics().nats!.appliedSeq;
+    closeNatsStateBackend(root);
+    await expect(rollbackMeshStateFromNats(root, { ...connect(), maxReplay: head })).rejects.toThrow(/^LIMIT: .*with the retire record it exceeds maxReplay/);
+    expect(readMeshStateNatsMarker(root)).toBeDefined(); // not retired, the marker stands, nothing exported
+    expect((await rollbackMeshStateFromNats(root, { ...connect(), maxReplay: head + 1 })).digest).toBe(digest);
+    expect(fileDigest(root)).toBe(digest);
+  }, 60_000);
+
+  it("a corrupted kept-copy write is caught by its read-back before state.json becomes the marker", async () => {
+    const root = tempRoot("torn-copy");
+    const digest = await seedFileRoot(root);
+    const original = fs.writeSync;
+    let corrupted = 0;
+    const spy = vi.spyOn(fs, "writeSync").mockImplementation(((descriptor: number, data: Buffer, ...rest: unknown[]) => {
+      // The kept copy is the only state envelope this import writes: flip one value, same length, still JSON.
+      if (Buffer.isBuffer(data) && corrupted === 0 && data.includes("\"plain\"")) {
+        corrupted++;
+        data = Buffer.from(data.toString("utf8").replace("\"plain\"", "\"plaiN\""), "utf8");
+      }
+      return (original as (...args: unknown[]) => number)(descriptor, data, ...rest);
+    }) as typeof fs.writeSync);
+    try {
+      await expect(importMeshStateToNats(root, reconnectable(targetKind)())).rejects.toThrow(/does not read back as the source/);
+    } finally { spy.mockRestore(); }
+    expect(corrupted).toBe(1);
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+    expect(fileDigest(root)).toBe(digest);
+  }, 60_000);
+
+  it("one entry larger than the server's max payload refuses before import-begin: the stream never enters importing", async () => {
+    const root = tempRoot("max-payload");
+    const store = new MeshStore(root, 2 * 1024 * 1024, 1_000, { stateBackend: "file" });
+    stores.push(store);
+    await store.put({ key: "big/one", value: "x".repeat(1_100_000), identity });
+    store.closeState();
+    const digest = fileDigest(root);
+    const connect = reconnectable(targetKind);
+    const options = connect();
+    await expect(importMeshStateToNats(root, options)).rejects.toThrow(/^LIMIT: .*more than the server's max payload 1048576/);
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+    expect(fileDigest(root)).toBe(digest);
+    const probe = connect();
+    const backend = await openNatsStateBackend({ root, ...(options.stream ? { stream: options.stream } : {}),
+      ...(probe.port ? { port: probe.port } : { servers: probe.servers!, monitoringUrl: probe.monitoringUrl! }) });
+    expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 0, status: "ready" });
+    closeNatsStateBackend(root);
   }, 60_000);
 
   it("refuses a sqlite root, and a rerun whose state.json changed after a crash before the marker", async () => {

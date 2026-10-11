@@ -70,6 +70,8 @@ export interface MeshNatsMigrationOptions {
   maxReplay?: number;
   /** The tombstone bound (as the nats backend's `maxStateTombstones`). Default 2,048. */
   maxStateTombstones?: number;
+  /** The server's `max_payload` (one message). Default 1 MiB, the nats-server default. */
+  maxPayloadBytes?: number;
   lockTimeoutMs?: number;
   lockProtocol?: 1 | 2;
   /** Synchronous crash-point hook (tests stop the tool here). */
@@ -143,11 +145,12 @@ const snapshotOf = (projection: Snapshot): MeshStateSnapshot & { versions: Recor
   highWater: projection.highWater,
 });
 
-interface Limits { maxStateBytes: number; maxReplay: number; maxStateTombstones: number }
+interface Limits { maxStateBytes: number; maxReplay: number; maxStateTombstones: number; maxPayloadBytes: number }
 const limitsOf = (options: MeshNatsMigrationOptions): Limits => ({
   maxStateBytes: Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES)),
   maxReplay: Math.max(1, Math.floor(options.maxReplay ?? DEFAULT_MAX_REPLAY)),
   maxStateTombstones: Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_TOMBSTONES)),
+  maxPayloadBytes: Math.max(1, Math.floor(options.maxPayloadBytes ?? 1024 * 1024)),
 });
 const entryBytes = (key: string, entry: unknown): number => Buffer.byteLength(key, "utf8") + Buffer.byteLength(JSON.stringify(entry) ?? "", "utf8");
 
@@ -264,6 +267,11 @@ const keepCopy = (root: string, copy: string, source: MeshStateFile, digest: str
   }
   writeDurably(copy, encodeMeshStateFile(source).serialized);
   fsyncDirectory(root);
+  // Read the new copy back BEFORE state.json becomes the marker: a torn or corrupted write never stands for the source.
+  const written = readKeptCopy(copy, options);
+  if (written === undefined || meshSnapshotDigest(written) !== digest) {
+    throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${copy} does not read back as the source (digest mismatch); state.json is unchanged`);
+  }
 };
 
 /** The export of a projection, within `maxStateBytes` (checked BEFORE the stream is retired). */
@@ -315,6 +323,12 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       throw new MeshNatsMigrationLimitError(`state.json holds ${tombstones} tombstones, more than maxStateTombstones ${limits.maxStateTombstones}`);
     }
     const chunks = importChunks(source, epoch);
+    // A single change larger than one message (a chunk holds at least one change) refuses here, BEFORE import-begin:
+    // the stream never enters importing for a state it cannot hold.
+    const largest = chunks.reduce((max, chunk) => Math.max(max, chunk.byteLength), 0);
+    if (largest > limits.maxPayloadBytes) {
+      throw new MeshNatsMigrationLimitError(`one import chunk is ${largest} bytes, more than the server's max payload ${limits.maxPayloadBytes} (a single entry is too large)`);
+    }
     if (head === 0) {
       head = await publish(port, subject, record({ format: 1, type: "import-begin", epoch, digest, generation }), 0, `${stream}-import-begin-${epoch}`);
       options.onStep?.("nats-import-begin");
@@ -378,7 +392,11 @@ export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrati
       if (projection.epoch !== marker.epoch) {
         throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is at epoch ${projection.epoch}, the marker at ${marker.epoch}`);
       }
-      encodeExport(snapshotOf(projection), limits); // LIMIT before the stream is retired
+      // LIMIT before the stream is retired: the export size, and the replay that will include the retire record.
+      if (head + 1 > limits.maxReplay) {
+        throw new MeshNatsMigrationLimitError(`stream ${stream} holds ${head} messages; with the retire record it exceeds maxReplay ${limits.maxReplay}`);
+      }
+      encodeExport(snapshotOf(projection), limits);
       head = await publish(port, subject, record({ format: 1, type: "retire", epoch: marker.epoch + 1 }), head, `${stream}-retire-${marker.epoch + 1}`);
       options.onStep?.("nats-retire");
       ({ projection, head } = await project(port, stream, limits));

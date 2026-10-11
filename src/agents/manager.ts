@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
+import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -1243,8 +1244,8 @@ export class AgentManager {
       }
       const runDirectory = path.join(this.#runRoot, id);
       // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
-      // verified retention refuses (group-writable). recursive applies the mode only to directories it creates.
-      fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+      // verified retention refuses (group-writable). Only directories it creates are changed.
+      mkdirPrivate(runDirectory);
       // Establish custody before a worker can produce its only full outcome. A
       // later disk failure cannot leave a terminal source collectible without a fence.
       if (this.#onSettled || this.#onStoppedAtClose || routeDispatch) {
@@ -2549,7 +2550,7 @@ export class AgentManager {
     const deadlineAt = Date.now() + options.deadlineMs;
     if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
     const file = followUpFile(managed.runDirectory, messageId);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    mkdirPrivate(path.dirname(file));
     fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
     let receipt: AgentSteerResult;
     try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }

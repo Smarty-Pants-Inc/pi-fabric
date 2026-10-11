@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { mkdirPrivate } from "../storage/private-dir.js";
 import type {
   AgentRunRecord,
   AgentRunRouteMetadata,
@@ -96,7 +97,7 @@ export const createRunningRecord = (
 });
 
 export const writeRunRecord = (filePath: string, record: AgentRunRecord): void => {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 }); // smarty-dev#9016: 0700 under any umask
+  mkdirPrivate(path.dirname(filePath)); // smarty-dev#9016: 0700 under any umask
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify(record, null, 2), {
     encoding: "utf8",

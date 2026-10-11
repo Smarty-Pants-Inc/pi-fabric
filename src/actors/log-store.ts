@@ -4,13 +4,22 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
+import { closeDirectory, mkdirPrivate } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
 
-/** chmod 0700 every directory of a copied tree (lstat: links are never followed). */
+/** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
+ * file or a foreign entry is skipped, never followed (pi-fabric#875 round 1 P1-2). */
 const closeDirectories = (directory: string, depth = 0): void => {
-  if (depth > 64 || !fs.lstatSync(directory).isDirectory()) return;
-  fs.chmodSync(directory, 0o700);
+  if (depth > 64 || !closeDirectory(directory)) return;
   for (const name of fs.readdirSync(directory)) closeDirectories(path.join(directory, name), depth + 1);
+};
+/** Every directory from `directory` up to `root` is ours and not group- or other-writable (lstat, no link). */
+const privateChain = (directory: string, root: string): boolean => {
+  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (!stat?.isDirectory() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0) return false;
+    if (current === path.resolve(root) || path.dirname(current) === current) return true;
+  }
 };
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -93,7 +102,7 @@ export class ActorLogStore {
   async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
-    fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
+    mkdirPrivate(dest);
     const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
     if (fs.existsSync(receipt)) {
       const archivedReceipt = path.join(dest, "route-dispatch-receipt.json");
@@ -113,7 +122,13 @@ export class ActorLogStore {
         fs.cpSync(nested, path.join(dest, "nested"), { recursive: true });
         // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
         // the archive itself (smarty-dev#9016). Files keep their modes.
-        closeDirectories(path.join(dest, "nested"));
+        // ponytail: a writable-by-others ancestor would let another uid swap a path while we walk it, so the tree is
+        // changed only when the whole chain from the archive up to the actor's log root is ours and closed. Otherwise
+        // it is left as copied; retention keeps refusing it (the safe side), and one line says why.
+        if (process.platform !== "win32") {
+          if (privateChain(dest, path.dirname(actor.sessionFile))) closeDirectories(path.join(dest, "nested"));
+          else console.warn(`[pi-fabric] archive ${dest}: an ancestor up to the actor log root is not our private directory; nested directories keep their copied modes`);
+        }
       } catch {
         /* best-effort recursive run retention */
       }

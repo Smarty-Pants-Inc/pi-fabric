@@ -425,6 +425,8 @@ export interface SqliteStateStats {
   busyRetries: number;
   transientRetries: number;
   fifoJoins: number;
+  /** Writers of this store waiting for the writer lock now (smarty-dev#9805: returns to 0 after every write). */
+  writesWaiting?: number;
   maxWaitMs: number;
   maxHoldMs: number;
   totalHoldMs: number;
@@ -1437,7 +1439,7 @@ export class SqliteStateStore {
 
   stats(): SqliteStateStats {
     const timing = this.#stats.checkpointTiming;
-    return { ...this.#stats, checkpoints: { ...this.#stats.checkpoints },
+    return { ...this.#stats, writesWaiting: this.#writesWaiting, checkpoints: { ...this.#stats.checkpoints },
       checkpointTiming: { ...timing, passive: { ...timing.passive }, truncate: { ...timing.truncate } },
       ...(this.#stats.lastCheckpoint ? { lastCheckpoint: { ...this.#stats.lastCheckpoint } } : {}) };
   }
@@ -1583,12 +1585,13 @@ export class SqliteStateStore {
     let yieldedMs = 0;
     let waiting = true;
     this.#writesWaiting += 1;
-    // smarty-dev#9805: a newcomer that finds anyone queued queues behind them, never barging the FIFO head.
-    if (this.#queueBusy()) {
-      ticket = this.#ticket(Math.max(0, deadline - started));
-      if (ticket) this.#stats.fifoJoins += 1;
-    }
     try {
+      // smarty-dev#9805: a newcomer that finds anyone queued queues behind them, never barging the FIFO head. Inside
+      // the try (pi-fabric#936 round 3): the finally always releases the ticket and #writesWaiting.
+      if (this.#queueBusy()) {
+        ticket = this.#ticket(Math.max(0, deadline - started));
+        if (ticket) this.#stats.fifoJoins += 1;
+      }
       for (;;) {
         const iteration = performance.now();
         let yielding = false;
@@ -1599,7 +1602,7 @@ export class SqliteStateStore {
         if (!walCapExempt) this.#refuseAboveWalCap();
         // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
         if (yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) { this.#stats.checkpoints.writerYields += 1; yielding = true; }
-        else if (!ticket || ticket.mayContend()) {
+        else if (!ticket || this.#mayContend(ticket)) {
           const now = performance.now();
           if (attempts > 0) maxGap = Math.max(maxGap, now - last);
           last = now;
@@ -1668,6 +1671,13 @@ export class SqliteStateStore {
       try { this.#queueDirectory = meshLockQueueDirectory(this.file); } catch { this.#queueDirectory = null; }
     }
     return this.#queueDirectory !== null && meshLockQueueBusy(this.#queueDirectory);
+  }
+
+  // Advisory admission fails open (pi-fabric#936 round 3): a queue error (EACCES, EIO) closes the ticket and this
+  // writer joins the plain contest instead of failing the write.
+  #mayContend(ticket: MeshLockTicket): boolean {
+    try { return ticket.mayContend(); }
+    catch { ticket.close(); return true; }
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {

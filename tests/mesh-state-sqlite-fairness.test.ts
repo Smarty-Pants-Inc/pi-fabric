@@ -83,6 +83,29 @@ const tickets = (root: string) => {
   catch { return []; }
 };
 
+describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)("SQLite mesh writer queue fails open (pi-fabric#936 round 3)", () => {
+  it("an inaccessible queue directory (mode 000) never fails a write, and no waiter is left counted", async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sqlite-queue-denied-"));
+    roots.push(parent);
+    const root = path.join(parent, "mesh"); // its queue namespace lives in this private parent, not the shared tmpdir
+    fs.mkdirSync(root, { mode: 0o700 });
+    const store = await SqliteStateStore.open(root, 65536, 1000, { initialize: "create" });
+    const queue = meshLockQueueDirectory(path.join(root, "state.db"));
+    const namespace = path.dirname(queue);
+    fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+    fs.chmodSync(namespace, 0o000); // as if another user planted it: every stat or listing under it is EACCES
+    try {
+      const identity = { id: "tester", name: "tester", kind: "agent" as const };
+      await Promise.all(Array.from({ length: 8 }, (_, index) => store.put({ key: `d/${index}`, value: index, identity })));
+      expect(store.listAll("d/")).toHaveLength(8);
+      expect(store.stats().writesWaiting).toBe(0);
+    } finally {
+      fs.chmodSync(namespace, 0o700);
+      store.close();
+    }
+  });
+});
+
 describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smarty-dev#9805)", () => {
   it("16 contenders with short holds: no write waits longer than 2 x (16 x max hold), and the event loop stays responsive", async () => {
     const root = await fresh();
@@ -128,7 +151,9 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
       const [root, index] = process.argv.slice(1);
       const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 60_000 });
       fs.writeFileSync(path.join(root, "ready-" + index), "");
-      await store.writeBatch({ identity, ops: [], prepare: () => { console.log(JSON.stringify({ at: Date.now() })); return [{ kind: "put", key: "w/" + index, value: 1 }]; } });
+      let at = 0;
+      await store.writeBatch({ identity, ops: [], prepare: () => { at = Date.now(); return [{ kind: "put", key: "w/" + index, value: 1 }]; } });
+      console.log(JSON.stringify({ at, writesWaiting: store.stats().writesWaiting }));
       store.close();`;
     // The first waiter finds the queue empty, fails once and becomes the FIFO head.
     const head = run(single, [root, "head"]);
@@ -142,10 +167,16 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
     const released = Number(fs.readFileSync(path.join(root, "released"), "utf8"));
     const results = await Promise.all(waiters.map((waiter) => waiter.done));
     for (const result of results) expect(result.code, result.stderr).toBe(0);
-    const firstWrite = Math.min(...results.map((result) => (JSON.parse(result.stdout.trim().split("\n").at(-1)!) as { at: number }).at));
+    const survivors = results.map((result) => JSON.parse(result.stdout.trim().split("\n").at(-1)!) as { at: number; writesWaiting: number });
+    const firstWrite = Math.min(...survivors.map((survivor) => survivor.at));
     console.log(JSON.stringify({ takeoverMs: firstWrite - released }));
     // The dead head's ticket is reaped by its successor (pid gone); the stall bound is MeshLockTicket's 2 s cap.
     expect(firstWrite - released).toBeLessThanOrEqual(2_000);
+    // Every remaining writer committed, and each left nothing behind: no waiter count, no ticket.
+    expect(survivors.map((survivor) => survivor.writesWaiting)).toEqual(Array(15).fill(0));
+    const check = await SqliteStateStore.open(root, 65536, 1000);
+    try { expect(check.listAll("w/").map((entry) => entry.key).sort()).toEqual(Array.from({ length: 15 }, (_, index) => `w/${index}`).sort()); }
+    finally { check.close(); }
     expect(tickets(root)).toEqual([]);
   }, 180_000);
 });

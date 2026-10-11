@@ -1,3 +1,15 @@
+/** Reserved Landlock controls are host-owned and must not propagate to unrelated children. */
+export const childProcessEnvironment = (environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv =>
+  Object.fromEntries(Object.entries(environment).filter(([key]) => !key.startsWith("PI_FABRIC_LANDLOCK_")));
+
+/** Bash's policy wrapper consumes escape requests before supplying these native-helper controls. */
+export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => ({
+  ...childProcessEnvironment(environment),
+  ...(environment.PI_FABRIC_LANDLOCK_SHELL !== undefined
+    ? { PI_FABRIC_LANDLOCK_SHELL: environment.PI_FABRIC_LANDLOCK_SHELL } : {}),
+  ...(environment.PI_FABRIC_LANDLOCK_WRITES !== undefined
+    ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
+});
 import { retryDelayMs } from "./retry-backoff.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
@@ -22,7 +34,7 @@ export type IncarnationCommandRunner = (
 ) => Promise<string>;
 
 const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
-  childProcess.execFile(executable, args, { ...options, encoding: "utf8" }, (error, stdout) => {
+  childProcess.execFile(executable, args, { ...options, env: childProcessEnvironment(options.env), encoding: "utf8" }, (error, stdout) => {
     if (error) reject(error);
     else resolve(stdout);
   });

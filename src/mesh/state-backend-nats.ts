@@ -63,7 +63,7 @@ type NatsChange =
 
 /** A stream message. `batch` is a committed writeBatch; `retire` ends the stream's authority (rollback). */
 type NatsRecord =
-  | { format: 1; type: "batch"; base: number; highWater: number; changes: NatsChange[] }
+  | { format: 1; type: "batch"; id: string; base: number; highWater: number; changes: NatsChange[] }
   | { format: 1; type: "retire"; epoch: number }
   | { format: 1; type: "import-begin"; epoch: number }
   | { format: 1; type: "import-commit"; epoch: number };
@@ -89,9 +89,12 @@ interface NatsSnapshot {
   readonly tombstones: readonly string[];
   readonly highWater: number;
   readonly status: "ready" | "importing" | "retired";
+  /** The ids of the most recent batches and their sequences (bounded): did MY batch commit after an uncertain ack? */
+  readonly recent: ReadonlyMap<string, number>;
 }
 
-const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready" };
+const RECENT_IDS = 4_096;
+const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", recent: new Map() };
 
 /** Thrown by reads and writes once the stream is retired (rolled back to sqlite or file), or while it is importing. */
 export class MeshStateNatsRefusedError extends Error {
@@ -109,6 +112,15 @@ export class MeshStateNatsBusyError extends MeshLockTimeoutError {
     super(` (NATS state: ${detail})`, 1, 0);
     this.message = `FABRIC_MESH_STATE_BUSY: ${detail}`;
     this.name = "MeshStateNatsBusyError";
+  }
+}
+
+/** A publish got no answer within the write budget: the batch may or may not have committed. Not retryable as is. */
+export class MeshStateNatsOutcomeUnknownError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN";
+  constructor(readonly batchId: string, detail: string) {
+    super(`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN: batch ${batchId} got no acknowledgement (${detail}); re-read before writing again`);
+    this.name = "MeshStateNatsOutcomeUnknownError";
   }
 }
 
@@ -146,7 +158,11 @@ export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMess
     const forgotten = tombstones.shift()!;
     if (!entries.has(forgotten)) versions.delete(forgotten);
   }
-  return { seq: message.seq, entries, versions, tombstones, highWater: Math.max(snapshot.highWater, storageRevision(record.highWater)), status: snapshot.status };
+  const recent = new Map(snapshot.recent);
+  if (typeof record.id === "string") recent.set(record.id, message.seq);
+  if (recent.size > RECENT_IDS) recent.delete(recent.keys().next().value!);
+  return { seq: message.seq, entries, versions, tombstones, highWater: Math.max(snapshot.highWater, storageRevision(record.highWater)),
+    status: snapshot.status, recent };
 };
 
 const sortedKeys = (keys: Iterable<string>): string[] => [...keys].sort((left, right) => left.localeCompare(right));
@@ -299,23 +315,30 @@ export class NatsStateBackend implements StateBackend {
         return planned.results;
       }
       input.beforeCommit?.();
-      const record: NatsRecord = { format: 1, type: "batch", base: snapshot.seq, highWater: planned.highWater, changes: planned.changes };
+      const id = randomUUID();
+      const record: NatsRecord = { format: 1, type: "batch", id, base: snapshot.seq, highWater: planned.highWater, changes: planned.changes };
       const data = encode(record);
       if (data.byteLength > this.#options.maxEventBytes * Math.max(1, planned.changes.length) + 64 * 1024) {
         throw new Error("Fabric mesh NATS batch exceeds its size bound");
       }
       let seq: number;
       try {
-        seq = await this.#publish(data, snapshot.seq, deadline);
+        seq = await this.#publish(data, snapshot.seq, id, deadline);
       } catch (error) {
         if (!(error instanceof NatsWrongLastSequenceError)) throw error;
-        this.#casRetries++;
-        if (performance.now() >= deadline) throw new MeshStateNatsBusyError(`another writer kept committing (${attempt} attempts)`);
-        // Catch up to the stream's head, then run the batch again on the new model.
+        // Catch up to the stream's head. The server checks the expected sequence before the duplicate window, so a
+        // retry of MY stored batch (its ack was lost) also fails this way: it is then in the stream under its id.
         const last = await this.#options.port.lastSequence(this.#options.stream);
         this.#knownSeq = Math.max(this.#knownSeq, last);
         await this.#appliedThrough(last);
-        continue;
+        const committed = this.#snapshot.recent.get(id);
+        if (committed === undefined) {
+          // Another writer won: run the batch again on the new model.
+          this.#casRetries++;
+          if (performance.now() >= deadline) throw new MeshStateNatsBusyError(`another writer kept committing (${attempt} attempts)`);
+          continue;
+        }
+        seq = committed;
       }
       this.#knownSeq = Math.max(this.#knownSeq, seq);
       await this.#appliedThrough(seq);
@@ -328,16 +351,17 @@ export class NatsStateBackend implements StateBackend {
 
   /**
    * One publish of one batch. A lost ack (a timeout, a dropped connection) is retried with the SAME message id and
-   * expected sequence: the server's duplicate window returns the original sequence when the first one was stored,
-   * so a retry never commits twice. A wrong last sequence is the caller's (another writer won).
+   * expected sequence. If the first copy was stored, the stream moved past `base` and the retry fails the expected
+   * sequence: the caller then finds the batch in the stream by its id (never commits it twice). If it was not stored
+   * and nothing else was, the retry stores it (or the duplicate window returns it). Past the deadline with no answer,
+   * the outcome is unknown: that is not a retryable busy error, the caller must re-read.
    */
-  async #publish(data: Uint8Array, base: number, deadline: number): Promise<number> {
-    const msgID = randomUUID();
+  async #publish(data: Uint8Array, base: number, msgID: string, deadline: number): Promise<number> {
     for (;;) {
       try { return (await this.#options.port.publish(this.#options.subject, data, { expectLastSequence: base, msgID })).seq; }
       catch (error) {
         if (error instanceof NatsWrongLastSequenceError || this.#closed) throw error;
-        if (performance.now() >= deadline) throw new MeshStateNatsBusyError(`publish not acknowledged: ${(error as Error).message}`);
+        if (performance.now() >= deadline) throw new MeshStateNatsOutcomeUnknownError(msgID, (error as Error).message);
       }
     }
   }
@@ -454,6 +478,8 @@ export interface OpenNatsStateBackendOptions {
   root: string;
   /** NATS server URLs (the real client); ignored when `port` is given (tests). */
   servers?: string[];
+  /** Host-only: the server's monitoring endpoint (`http://host:8222`), read for `/varz` sync_always. */
+  monitoringUrl?: string;
   port?: JetStreamPort;
   stream?: string;
   maxEventBytes?: number;
@@ -474,7 +500,8 @@ export const natsStreamName = (root: string): string =>
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
-  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? []);
+  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [],
+    options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl });
   try {
     const server = await port.server();
     if (!versionAtLeast(server.version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${server.version} is older than ${MIN_SERVER.join(".")}`);

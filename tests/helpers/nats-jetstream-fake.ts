@@ -50,9 +50,10 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           calls.push("publish");
           if (!open) throw new Error("connection closed");
           await new Promise<void>(resolve => setImmediate(resolve));
+          // nats-server 2.14 checks the expected last sequence BEFORE the duplicate window (measured on the real server).
+          if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
           const seen = ids.get(msgID);
           if (seen !== undefined) return { seq: seen, duplicate: true };
-          if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
           const verdict = server.beforePublish?.(data);
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
           const seq = store(data);

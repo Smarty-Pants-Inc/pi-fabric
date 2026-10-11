@@ -62,7 +62,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const backend = await open(server);
     for (let index = 0; index < 5; index++) await backend.put({ key: `p/${index}`, value: index, identity });
     await backend.delete({ key: "p/2" });
-    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready" }, server.messages[0]!, 100);
+    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", recent: new Map() }, server.messages[0]!, 100);
     expect(applyNatsMessage(once, server.messages[0]!, 100)).toBe(once);
     const replica = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
     expect(replica.listAll("p/")).toEqual(backend.listAll("p/"));
@@ -70,14 +70,28 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     replica.close();
   });
 
-  it("a lost ack is retried with the same message id: one stored message, one commit", async () => {
+  it("a lost ack is retried with the same message id: one stored message, one commit, never applied twice", async () => {
     const server = fakeJetStream();
     const backend = await open(server);
+    await backend.put({ key: "d/count", value: 0, identity });
     let lose = true;
     server.beforePublish = () => { if (lose) { lose = false; return "lose-ack"; } };
-    await backend.put({ key: "d/a", value: 1, identity });
-    expect(server.messages.length).toBe(1);
-    expect(backend.get("d/a")?.value).toBe(1);
+    // The retry fails the expected sequence (the real server checks it before its duplicate window); the batch is
+    // then found in the stream by its id, so the increment is not run a second time.
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(1);
+    expect(server.messages.length).toBe(2);
+    expect(backend.get("d/count")?.value).toBe(1);
+  });
+
+  it("a publish that never gets an answer is an unknown outcome, not a retryable busy error", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { lockTimeoutMs: 30 });
+    // Every publish times out before the server stores anything.
+    server.beforePublish = () => { throw new Error("timeout: no responders"); };
+    await expect(backend.put({ key: "u/a", value: 1, identity })).rejects.toThrow(/OUTCOME_UNKNOWN/);
+    expect(server.messages.length).toBe(0);
   });
 
   it("CAS retry: another writer commits between prepare and publish; the batch runs again on the new state", async () => {

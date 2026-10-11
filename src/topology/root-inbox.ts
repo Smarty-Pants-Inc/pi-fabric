@@ -16,6 +16,12 @@ import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
  * older than the configurable horizon are expired on first drain without buying model turns.
+ *
+ * An event whose message entered a turn is acknowledged by id (smarty-dev#8962): it is never
+ * injected again, whatever the session file confirms. A fully acknowledged batch moves the cursor
+ * at once. A per-root high-water mark (never lowered, merged from the stored state on every save)
+ * plus a bounded set of out-of-order acked ids keep a re-scan from an older cursor, a reload or a
+ * stale writer from injecting anything at or below the mark again.
  */
 export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
@@ -43,6 +49,8 @@ const SAVE_INTERVAL_MS = 10 * 60_000;
 const MAX_BATCH_EVENTS = 20;
 /** Bound persisted dedup independently of session lifetime; leave 25% for mesh/headroom. */
 const MAX_DELIVERED_RECEIPTS = 1024;
+/** Acked ids kept above the high-water mark; a pending batch holds at most MAX_BATCH_EVENTS. */
+const MAX_ACKED_IDS = 256;
 const RECEIPT_VALUE_FRACTION = 0.75;
 const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
@@ -93,7 +101,18 @@ interface RootInboxState {
   delivered?: string[];
   /** Receipt times parallel to delivered. Legacy string-only states migrate on first save. */
   deliveredAt?: number[];
+  /** High-water mark above `after`: no event at or below it is injected again. Never lowered. */
+  ackedThrough?: number;
+  /** Ids acked out of order above the mark, each with an upper bound of its mesh sequence. */
+  acked?: Array<[string, number]>;
 }
+
+const sequenceOf = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) ? value : Number.NEGATIVE_INFINITY;
+const parseAcks = (value: unknown): Array<[string, number]> => Array.isArray(value)
+  ? value.filter((item): item is [string, number] => Array.isArray(item) && typeof item[0] === "string" &&
+    typeof item[1] === "number" && Number.isFinite(item[1])).map(([id, bound]) => [id, bound])
+  : [];
 
 const workKey = (data: unknown): string | undefined => {
   const key = data && typeof data === "object" ? (data as { key?: unknown }).key : undefined;
@@ -171,9 +190,12 @@ export class RootInbox {
   #savedAt = 0;
   #wokeAt = Number.NEGATIVE_INFINITY;
   #delivered = new Map<string, number>();
+  #acks = new Map<string, number>();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
+  /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
+  readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
 
-  close(): Promise<void> { return this.#notifications.close(); }
+  async close(): Promise<void> { await Promise.all([this.#ackWrites.close(), this.#notifications.close()]); }
 
   constructor(
     readonly mesh: MeshStore,
@@ -198,24 +220,34 @@ export class RootInbox {
     receiptsChanged = JSON.stringify(state) !== this.#saved || receiptsChanged;
     receiptsChanged = this.#remember(session.delivered ?? [], session.deliveredAt) || receiptsChanged;
     let skippedStale = 0;
-    if (state.pending) {
-      if (options.turnEnd) await this.#alarmPending(state).catch(error => {
-        // An observational alarm must never keep confirmed work wedged behind publication.
-        console.warn(`[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      const holdsBatch = session.holdsBatch(state.pending.ids);
+    if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
+      // An observational alarm must never keep confirmed work wedged behind publication.
+      console.warn(`[pi-fabric] root inbox alarm: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    // An ack can land while this read awaits the mesh: it may commit this very batch.
+    const held = state.pending;
+    if (held) {
+      // Acked ids are never delivered again (smarty-dev#8962); a fully acked batch commits.
+      const unacked = held.through <= this.#mark() ? [] : held.ids.filter((id) => !this.#acks.has(id));
+      const holdsBatch = unacked.length === 0 || session.holdsBatch(held.ids);
       if (options.commitOnly && !holdsBatch) {
         await this.#save(receiptsChanged);
         return { events: [], through: state.after };
       }
-      const pending = this.#reread(state.after, state.pending);
+      const reread = this.#reread(state.after, held);
+      const pending = reread.filter((event) => !this.#acked(event));
       if (holdsBatch) {
         this.#remember(pending.flatMap(eventReceipts));
       } else {
-        // A missing retained event proves neither delivery nor expiry. Keep its id pending.
-        const found = new Set(pending.map((event) => event.id));
-        const missing = state.pending.ids.filter((id) => !found.has(id) &&
+        // A missing retained event proves neither delivery nor expiry. Keep its id pending, until
+        // the batch itself is older than the stale horizon: its events are older still.
+        const found = new Set(reread.map((event) => event.id));
+        let missing = unacked.filter((id) => !found.has(id) &&
           !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id)));
+        if (missing.length && this.#now() - held.since > this.#horizon()) {
+          skippedStale += missing.length;
+          missing = [];
+        }
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
         const events = pending.filter((event) => {
           if (this.#stale(event)) { skippedStale++; return false; }
@@ -224,15 +256,15 @@ export class RootInbox {
           return false;
         });
         if (events.length || missing.length) {
-          state.pending.ids = [...events.map((event) => event.id), ...missing];
+          held.ids = [...events.map((event) => event.id), ...missing];
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
           // is not durable admission, including after a mesh acquisition timeout.
           await this.#save(true);
-          return { events, through: state.pending.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) };
+          return this.#unacked({ events, through: held.through, ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) });
         }
       }
-      state.after = Math.max(state.after, state.pending.through);
-      delete state.pending;
+      state.after = Math.max(state.after, held.through);
+      if (state.pending === held) delete state.pending;
       await this.#save(true);
     }
     if (options.commitOnly) {
@@ -252,7 +284,7 @@ export class RootInbox {
     }
     state.pending = { through: batch.through, ids: batch.events.map((event) => event.id), since: this.#now() };
     await this.#save(true);
-    return batch;
+    return this.#unacked(batch);
   }
 
   /**
@@ -288,10 +320,28 @@ export class RootInbox {
    * next reconcile and a later shadow of the same work is suppressed too.
    */
   async consume(ids: readonly string[], receipts: readonly string[] = []): Promise<void> {
-    this.#load();
+    this.ack(ids, receipts);
+    await this.#ackWrites.enqueue(() => this.#save(true));
+  }
+
+  /**
+   * Acknowledge events by id (smarty-dev#8962), in memory at once: a read in flight cannot
+   * redeliver them, and `consume` persists the ack. An id of the pending batch is kept until the
+   * whole batch is acked; then the cursor and the high-water mark move past the batch.
+   */
+  ack(ids: readonly string[], receipts: readonly string[] = []): void {
+    const state = this.#load();
     this.#trimReceipts();
-    const changed = this.#remember([...ids.map(eventReceipt), ...receipts]);
-    await this.#save(changed);
+    this.#remember([...ids.map(eventReceipt), ...receipts]);
+    const pending = state.pending;
+    for (const id of ids) {
+      if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
+    }
+    if (pending && pending.ids.every((id) => this.#acks.has(id))) {
+      state.after = Math.max(state.after, pending.through);
+      delete state.pending;
+    }
+    this.#syncAcks();
   }
 
   /**
@@ -308,7 +358,47 @@ export class RootInbox {
     const pending = state.pending && !session.holdsBatch(state.pending.ids) ? state.pending : undefined;
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session)) : []), ...this.#scan(after, session, false).events];
+  }
+
+  /** Everything at or below this sequence was delivered and acked, or decided: never again. */
+  #mark(): number {
+    const state = this.#state!;
+    return Math.max(state.after, state.ackedThrough ?? Number.NEGATIVE_INFINITY);
+  }
+
+  #acked(event: MeshEvent): boolean { return event.sequence <= this.#mark() || this.#acks.has(event.id); }
+
+  /** Drop what an ack recorded while this read awaited the mesh. */
+  #unacked(batch: RootInboxBatch): RootInboxBatch {
+    const events = batch.events.filter((event) => !this.#acked(event));
+    return events.length === batch.events.length ? batch : { ...batch, events };
+  }
+
+  /** Prune acks the mark covers and bound the rest; keep the stored mark only above the cursor. */
+  #syncAcks(): void {
+    const state = this.#state!;
+    if (state.ackedThrough !== undefined && state.ackedThrough <= state.after) delete state.ackedThrough;
+    const mark = this.#mark();
+    let entries = [...this.#acks].filter(([, bound]) => bound > mark);
+    if (entries.length > MAX_ACKED_IDS) entries = entries.sort((a, b) => a[1] - b[1]).slice(-MAX_ACKED_IDS);
+    this.#acks = new Map(entries);
+    if (entries.length) state.acked = entries;
+    else delete state.acked;
+  }
+
+  /**
+   * Another writer of this cursor (a reloaded predecessor finishing a read) can hold an older
+   * cached view. The stored mark and acks are merged in before a save, so they are never lowered.
+   */
+  #absorb(): void {
+    const value = this.mesh.get(this.key)?.value as Partial<RootInboxState> | undefined;
+    if (!value || typeof value !== "object") return;
+    const state = this.#state!;
+    const theirs = Math.max(sequenceOf(value.after), sequenceOf(value.ackedThrough));
+    if (theirs > this.#mark()) state.ackedThrough = theirs;
+    for (const [id, bound] of parseAcks(value.acked)) if (!this.#acks.has(id)) this.#acks.set(id, bound);
+    this.#syncAcks();
   }
 
   #scan(after: number, session: RootInboxSession, bounded = true, onDelivered?: (event: MeshEvent) => void): RootInboxBatch {
@@ -328,7 +418,8 @@ export class RootInbox {
       for (const event of page) {
         if (event.createdAt > cutoff) return result();
         if (event.topic.startsWith(WORK_TOPIC_PREFIX) && event.to !== undefined && names.has(event.to)) {
-          if (this.#stale(event)) skippedStale++;
+          if (this.#acked(event)) { /* Delivered and acked, at or below the mark: never again. */ }
+          else if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session)) onDelivered?.(event);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
             const size = Math.min(Buffer.byteLength(event.text ?? ""), MAX_EVENT_TEXT_BYTES);
@@ -454,7 +545,10 @@ export class RootInbox {
           ...(pending.alarmed === true ? { alarmed: true } : {}),
         } }
         : {}),
+      ...(saved && sequenceOf(value!.ackedThrough) > value!.after! ? { ackedThrough: value!.ackedThrough! } : {}),
     };
+    this.#acks = new Map(parseAcks(value?.acked));
+    this.#syncAcks();
     this.#delivered = new Map((this.#state.delivered ?? []).map((id, index) => {
       const at = value?.deliveredAt?.[index];
       return [id, typeof at === "number" && Number.isFinite(at) ? at : this.#now()];
@@ -466,6 +560,7 @@ export class RootInbox {
   }
 
   async #save(now: boolean): Promise<void> {
+    this.#absorb();
     this.#trimReceipts();
     const text = JSON.stringify(this.#state);
     if (text === this.#saved) return;

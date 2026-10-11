@@ -15,7 +15,8 @@ import path from "node:path";
  * ponytail: Node has no mkdirat or openat. The fd base is `/proc/self/fd` (Linux) or `/dev/fd` (macOS), whichever is
  * proven at first use to resolve a held directory; it pins the parent by its descriptor (the same pin as
  * mesh/fence-lock.ts and verified-remove.ts), and O_NOFOLLOW guards the last component, so a symlink or a rename
- * anywhere above cannot redirect the walk. With neither base there is no path-based fallback: creation fails closed.
+ * anywhere above cannot redirect the walk. Linux without a working /proc/self/fd fails closed. Where no base resolves a
+ * held directory elsewhere (macOS: /dev/fd/N is not traversable), the validated walk (openWalked) is used instead.
  * Windows has no POSIX owners or modes: main's plain recursive mkdir stays there.
  *
  * Every directory the walk passes or meets must be safe:
@@ -38,6 +39,8 @@ export const privateDirTestHooks: {
   stat?: (directory: string, stat: fs.Stats) => fs.Stats;
   linkStat?: (directory: string, stat: fs.Stats) => fs.Stats;
   fdBases?: string[];
+  /** Replaces process.platform for the fallback choice (a darwin host on a Linux runner). */
+  platform?: NodeJS.Platform;
 } = {};
 
 let provenBase: { candidates: string; base: string | undefined } | undefined;
@@ -104,9 +107,20 @@ const tighten = (fd: number, stat: fs.Stats, walked: string): fs.Stats => {
 export const closeDirectory = (directory: string): boolean => {
   if (process.platform === "win32") return true;
   let fd: number;
-  try { fd = fs.openSync(directory, NOFOLLOW_DIRECTORY); } catch { return false; }
+  let before: fs.Stats | undefined;
+  try { fd = fs.openSync(directory, NOFOLLOW_DIRECTORY); }
+  catch (error) {
+    // A copy made under a umask such as 0400 leaves our own fresh directory unreadable (0300): give the owner read
+    // and search back by path, then open it. ponytail: only for a real directory we own (lstat), and its use here is
+    // a tree this archive just created inside a held 0700 directory, so only our own uid could swap it in between.
+    if (code(error) !== "EACCES") return false;
+    before = fs.lstatSync(directory, { throwIfNoEntry: false });
+    if (!before?.isDirectory() || (process.getuid && before.uid !== process.getuid())) return false;
+    try { fs.chmodSync(directory, 0o700); fd = fs.openSync(directory, NOFOLLOW_DIRECTORY); } catch { return false; }
+  }
   try {
     const stat = fs.fstatSync(fd);
+    if (before && (stat.dev !== before.dev || stat.ino !== before.ino)) return false;
     if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) return false;
     fs.fchmodSync(fd, 0o700);
     return true;
@@ -141,7 +155,10 @@ const openHeld = (target: string, anchor: string | undefined, base: string): Pri
           healable = false;
         } else if (code(error) === "ENOENT") {
           privateDirTestHooks.beforeCreate?.(walked);
-          try { fs.mkdirSync(at(fd, name), { mode: 0o700 }); created = true; }
+          // Right after OUR mkdir (never on EEXIST): 0700 through the same fd-pinned path, before the open. A umask such as
+          // 0400 leaves 0300, which O_RDONLY cannot open (pi-fabric#875 round 5 CODE P1). Our fresh directory, in a
+          // held parent, cannot be swapped by another uid.
+          try { fs.mkdirSync(at(fd, name), { mode: 0o700 }); created = true; fs.chmodSync(at(fd, name), 0o700); }
           catch (mkdirError) { if (code(mkdirError) !== "EEXIST") throw mkdirError; } // a competing creator: validated below
           try { child = fs.openSync(at(fd, name), NOFOLLOW_DIRECTORY); }
           catch (openError) { throw new UnsafeDirectory(`${walked} changed while it was created (${code(openError)})`); }
@@ -163,18 +180,76 @@ const openHeld = (target: string, anchor: string | undefined, base: string): Pri
   return { path: `${base}/${held}`, fd: held, close: () => fs.closeSync(held) };
 };
 
+/**
+ * The walk where no fd base resolves a held directory (macOS: /dev/fd/N is not traversable). Each component is lstat'ed
+ * and validated with the same rules, created with mkdir 0700 (an EEXIST is validated again, never skipped), then opened
+ * O_DIRECTORY|O_NOFOLLOW and required to be the same dev and ino as the lstat (a swap before the open refuses); a
+ * created one is set to 0700 and a healed one tightened through that fd. Archive leaves are still created
+ * O_EXCL|O_NOFOLLOW, by full path (writeArchiveFile).
+ * ponytail: macOS has no traversable /dev/fd/N and Node has no openat, so a swap of an already validated ancestor
+ * between its check and a later use remains possible there (a named residual, its own follow-up issue). Linux uses the
+ * fd-pinned walk (openHeld). Strictly stronger than main, which validated nothing.
+ */
+const openWalked = (target: string, anchor: string | undefined): PrivateDirectory => {
+  safeDirectory(fs.lstatSync("/"), "/");
+  let fd = fs.openSync("/", NOFOLLOW_DIRECTORY);
+  try {
+    let walked = "/";
+    let healable = true;
+    for (const name of target.split(path.sep).filter(Boolean)) {
+      walked = path.join(walked, name);
+      let stat = fs.lstatSync(walked, { throwIfNoEntry: false });
+      let created = false;
+      if (!stat) {
+        privateDirTestHooks.beforeCreate?.(walked);
+        try { fs.mkdirSync(walked, { mode: 0o700 }); created = true; fs.chmodSync(walked, 0o700); } // see openHeld (umask 0400)
+        catch (error) { if (code(error) !== "EEXIST") throw error; } // a competing creator: validated below
+        stat = fs.lstatSync(walked);
+      }
+      let flags = NOFOLLOW_DIRECTORY;
+      if (stat.isSymbolicLink()) {
+        const link = privateDirTestHooks.linkStat?.(walked, stat) ?? stat;
+        if (link.uid !== 0) throw new UnsafeDirectory(`${walked} is a symbolic link or not a directory`);
+        created = false; healable = false; flags = FOLLOW_DIRECTORY;
+        stat = fs.statSync(walked);
+      }
+      if (!stat.isDirectory()) throw new UnsafeDirectory(`${walked} is a symbolic link or not a directory`);
+      let child: number;
+      try { child = fs.openSync(walked, flags); }
+      catch (error) { throw new UnsafeDirectory(`${walked} changed while it was validated (${code(error)})`); }
+      try {
+        const opened = fs.fstatSync(child);
+        if (opened.dev !== stat.dev || opened.ino !== stat.ino) throw new UnsafeDirectory(`${walked} changed while it was validated`);
+        if (created && opened.isDirectory() && opened.uid === process.getuid?.()) fs.fchmodSync(child, 0o700);
+        else {
+          const seen = privateDirTestHooks.stat?.(walked, opened) ?? opened;
+          safeDirectory(healable && underAnchor(walked, anchor) ? tighten(child, seen, walked) : seen, walked);
+        }
+      } catch (error) { fs.closeSync(child); throw error; }
+      fs.closeSync(fd);
+      fd = child;
+    }
+  } catch (error) { fs.closeSync(fd); throw error; }
+  const held = fd;
+  return { path: target, fd: held, close: () => fs.closeSync(held) };
+};
+
 /** Create or validate `directory` (see the module comment) and hold it open. `anchor`: the caller's own Fabric root,
- * at or below which our own group/other-writable directories are tightened. Throws on any unsafe directory, and when
- * no fd base works (no path-based fallback). */
+ * at or below which our own group/other-writable directories are tightened. Throws on any unsafe directory. Linux
+ * needs a working /proc/self/fd (else it fails closed); another POSIX host without a traversable fd base (macOS) uses
+ * the validated walk; Windows keeps main's plain recursive mkdir. */
 export const openPrivateDir = (directory: string, anchor?: string): PrivateDirectory => {
   const target = path.resolve(directory);
-  if (process.platform === "win32") {
+  const platform = privateDirTestHooks.platform ?? process.platform;
+  if (platform === "win32") {
     fs.mkdirSync(target, { recursive: true });
     return { path: target, fd: undefined, close: () => undefined };
   }
+  const root = anchor === undefined ? undefined : path.resolve(anchor);
   const base = fdBase();
-  if (base === undefined) throw new UnsafeDirectory(`cannot create ${target} safely: no fd-relative path (/proc/self/fd or /dev/fd) on this host`);
-  return openHeld(target, anchor === undefined ? undefined : path.resolve(anchor), base);
+  if (base !== undefined) return openHeld(target, root, base);
+  if (platform === "linux") throw new UnsafeDirectory(`cannot create ${target} safely: /proc/self/fd does not resolve a held directory on this Linux host`);
+  return openWalked(target, root);
 };
 
 /** `mkdir -p` whose created directories are exactly 0700, through trusted directories only. Throws on any unsafe one. */
@@ -202,7 +277,8 @@ export const writeArchiveFile = (held: PrivateDirectory, name: string, content: 
   const create = (entry: string): void => {
     const fd = fs.openSync(path.join(held.path, entry),
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try { fs.writeFileSync(fd, bytes); if (durable) fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    // 0600 whatever the umask (0400 would leave 0200), through the creating fd.
+    try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, bytes); if (durable) fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   };
   const syncDirectory = (): void => { if (durable && held.fd !== undefined) fs.fsyncSync(held.fd); };
   try { create(name); syncDirectory(); return true; }

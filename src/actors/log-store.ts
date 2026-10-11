@@ -139,6 +139,7 @@ export class ActorLogStore {
         try {
           // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
           fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
+          fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
           if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
           fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
           // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like

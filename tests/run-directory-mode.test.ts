@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -201,13 +201,93 @@ it.skipIf(process.platform === "win32")("writes new archive entries 0600, and re
 });
 
 // pi-fabric#875 round 4 (CODE P1): no path-based fallback. Without a working fd base, creation fails closed.
-it.skipIf(process.platform === "win32")("fails closed with no fd-relative path, and creates nothing", async () => {
+it.skipIf(process.platform !== "linux")("on Linux, fails closed when /proc/self/fd is unusable, and creates nothing", async () => {
   const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
   const root = tmp("fabric-private-nofd-");
   privateDirTestHooks.fdBases = [path.join(root, "no-such-fd-base")];
-  try { expect(() => mkdirPrivate(path.join(root, "run"))).toThrow(/no fd-relative path/); }
+  try { expect(() => mkdirPrivate(path.join(root, "run"))).toThrow(/does not resolve a held directory on this Linux host/); }
   finally { delete privateDirTestHooks.fdBases; }
   expect(fs.existsSync(path.join(root, "run"))).toBe(false);
+});
+
+// pi-fabric#875 round 5 (CODE P1): under umask 0400, mkdir(0700) gives 0300, which O_RDONLY cannot open. The new
+// directory is set to 0700 right after our mkdir, before the open; archive files are set to 0600 through their fd.
+it.skipIf(process.platform === "win32")("creates usable 0700 directories and 0600 archive files under umask 0400", async () => {
+  const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-umask-0400-");
+  const { source, sessionFile, store, root: archiveRoot } = archiveFixture();
+  umask = process.umask(0o400);
+  mkdirPrivate(path.join(root, "a", "run"));
+  await store.retainRun({ sessionFile }, "run-1", source);
+  process.umask(umask); umask = undefined;
+  for (const directory of [path.join(root, "a"), path.join(root, "a", "run")]) expect(mode(directory), directory).toBe(0o700);
+  const archive = path.join(archiveRoot, "actor", "runs", "run-1");
+  expect(mode(archive)).toBe(0o700);
+  expect(mode(path.join(archive, "status.json"))).toBe(0o600);
+  expect(fs.readFileSync(path.join(archive, "status.json"), "utf8")).toBe("{}");
+});
+
+// pi-fabric#875 round 5: macOS has no traversable /dev/fd/N. There (forced here: no fd base, platform darwin) the
+// validated descriptor-free walk is used, never a refusal of every run and never main's unvalidated mkdir.
+describe.skipIf(process.platform === "win32")("without a traversable fd base (darwin)", () => {
+  const darwin = async () => {
+    const module = await import("../src/storage/private-dir.js");
+    module.privateDirTestHooks.fdBases = [path.join(tmp("fabric-no-fd-base-"), "none")];
+    module.privateDirTestHooks.platform = "darwin";
+    restoreHooks = () => { delete module.privateDirTestHooks.fdBases; delete module.privateDirTestHooks.platform; };
+    return module;
+  };
+  let restoreHooks: (() => void) | undefined;
+  afterEach(() => { restoreHooks?.(); restoreHooks = undefined; });
+
+  it("falls back to the validated walk: directories it creates are 0700, under umask 0177 too", async () => {
+    const { mkdirPrivate } = await darwin();
+    const root = tmp("fabric-darwin-walk-");
+    umask = process.umask(0o177);
+    mkdirPrivate(path.join(root, "a", "run"));
+    for (const directory of [path.join(root, "a"), path.join(root, "a", "run")]) expect(mode(directory), directory).toBe(0o700);
+    fs.writeFileSync(path.join(root, "a", "run", "file"), "x");
+  });
+
+  it("creates usable 0700 directories under umask 0400 too", async () => {
+    const { mkdirPrivate } = await darwin();
+    const root = tmp("fabric-darwin-0400-");
+    umask = process.umask(0o400);
+    mkdirPrivate(path.join(root, "a", "run"));
+    process.umask(umask); umask = undefined;
+    for (const directory of [path.join(root, "a"), path.join(root, "a", "run")]) expect(mode(directory), directory).toBe(0o700);
+  });
+
+  it("still refuses a symlinked ancestor", async () => {
+    const { mkdirPrivate } = await darwin();
+    const root = tmp("fabric-darwin-link-");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.symlinkSync(outside, path.join(root, "link"));
+    expect(() => mkdirPrivate(path.join(root, "link", "run"))).toThrow(/symbolic link/);
+    expect(fs.readdirSync(outside)).toEqual([]);
+  });
+
+  it("archives 0700/0600 and never writes through a planted leaf symlink", async () => {
+    await darwin();
+    const { root, source, sessionFile, store, archive } = plantedArchive();
+    const victim = path.join(root, "victim");
+    fs.writeFileSync(victim, "victim", { mode: 0o600 });
+    fs.symlinkSync(victim, path.join(archive, "status.json"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await store.retainRun({ sessionFile }, "run-1", source);
+    expect(fs.readFileSync(victim, "utf8")).toBe("victim");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/archive entry status\.json exists and is not our regular file/));
+    expect(mode(archive)).toBe(0o755);
+    expect(mode(path.join(archive, "reply.json"))).toBe(0o600);
+    const fresh = await (async () => {
+      const again = archiveFixture();
+      await again.store.retainRun({ sessionFile: again.sessionFile }, "run-2", again.source);
+      return path.join(again.root, "actor", "runs", "run-2");
+    })();
+    expect(mode(fresh)).toBe(0o700);
+    expect(mode(path.join(fresh, "status.json"))).toBe(0o600);
+  });
 });
 
 it.skipIf(process.platform === "win32" || !fs.existsSync("/dev/fd"))("works through a /dev/fd base", async () => {

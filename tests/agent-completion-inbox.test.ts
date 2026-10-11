@@ -303,6 +303,60 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"]]);
   });
 
+  // smarty-dev#9271: Pi counts a compacting Main as busy, and a compaction on an idle Main (a manual
+  // /compact, Fabric's retry of a failed compaction) is followed by no agent_settled. The idle check
+  // that found Main compacting used to skip delivery for good, until some other turn.
+  it.each(["session_compact", "session_compact_failed"])("delivers a completion that landed during an idle Main's compaction once %s ends it", async (end) => {
+    const h = harness();
+    h.idle();
+    h.emit("agent_settled");                                       // the run settled; Main is idle
+    h.idle(false);                                                 // /compact: busy without a run
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();                  // never into a compacting Main
+    h.emit(end, { reason: "manual" });                             // Pi is still busy while its handlers run
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.idle();                                                      // Pi clears its compaction state
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.sendMessage.mock.calls.map(([message, options]) => [message.details.ids, options]))
+      .toEqual([[["a"], { deliverAs: "steer", triggerTurn: true }]]);
+    h.emit("agent_settled");
+    h.emit("session_compact", { reason: "manual" });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();                  // exactly once, retries stopped
+  });
+
+  it("rechecks a busy Main with a bounded backoff until delivered, then stops", async () => {
+    const h = harness();
+    const isIdle = vi.spyOn(h.context, "isIdle");
+    h.inbox.enqueue(result("a"));                                   // Main busy, no event will follow
+    const checks: number[] = [];
+    for (const step of [40, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
+      await vi.advanceTimersByTimeAsync(step);
+      checks.push(isIdle.mock.calls.length);
+    }
+    expect(checks).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);              // 1 s doubling, capped at 30 s
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.idle();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    const settledChecks = isIdle.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(isIdle.mock.calls.length).toBe(settledChecks);           // nothing pending: no more timers
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    // A run's own boundary takes a busy-deferred result first; the pending retry then stops.
+    h.idle(false);
+    h.inbox.enqueue(result("b"));
+    await vi.advanceTimersByTimeAsync(100);
+    h.boundary();
+    expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"]]);
+    const afterBoundary = isIdle.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(isIdle.mock.calls.length - afterBoundary).toBeLessThanOrEqual(1);
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("still starts no run by itself after an abort while nothing else runs", async () => {
     const h = harness();
     h.boundary("aborted");

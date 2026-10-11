@@ -9,11 +9,17 @@
  * fabric-mesh-lease --watch PARENTPID CONTROLDIR FILE... (smarty-dev#8116): inotify watches on each FILE's directory
  * and on each existing FILE's inode go up BEFORE the same lease probe, so an open after the probe is an
  * event, whatever the opener's dumpability or locks. After the probe lines it prints "watching". Each file
- * created in CONTROLDIR asks for a report: per FILE "net OPENS CLOSES FILE" (by name, in its directory),
+ * created in CONTROLDIR asks for a report: per FILE "opens OPENS PROBED FILE": OPENS by name in its directory,
+ * PROBED the helper's own probe open (0 or 1). The caller takes its final report BEFORE its own first open of any
+ * FILE, so every other open is foreign: it refuses when OPENS exceeds PROBED. Closes are never netted, and nothing
+ * is subtracted for the caller (pi-fabric#881): inotify merges an event with an identical one at the queue tail
+ * (same wd, mask and name; the pid is not compared), so an own open could swallow a foreign one. Merging with the
+ * PROBE's open is safe: a foreign open during the probe holds the inode, so F_SETLEASE fails ("held"), and the
+ * probe's own IN_CLOSE right after its open is a different event, so a later foreign open cannot merge into it;
  * "alias FILE" (its inode opened through another name: a hard link), "moved FILE", then "overflow" (lost
  * events), "newdir" (a missing directory appeared) and "invalidated" (a watched directory or file inode was
  * deleted, moved or its watch dropped, so a replacement would go unwatched) when they apply, and "end N".
- * The caller subtracts its own open fds. It dies with PARENTPID (PR_SET_PDEATHSIG, then a getppid check).
+ * It dies with PARENTPID (PR_SET_PDEATHSIG, then a getppid check).
  */
 #include <asm/unistd.h>
 #include <linux/fcntl.h>
@@ -60,7 +66,9 @@ static long slash(const char *p) { long at = -1; for (long i = 0; p[i]; i++) if 
 #define SELF_EVENTS (IN_DELETE_SELF | IN_MOVE_SELF)
 #define FILE_EVENTS (IN_OPEN | IN_CLOSE | SELF_EVENTS | IN_DONT_FOLLOW)
 #define DIR_EVENTS (IN_OPEN | IN_CLOSE | IN_CREATE | IN_DELETE | IN_MOVE | SELF_EVENTS | IN_ONLYDIR | IN_DONT_FOLLOW)
-static struct target { char *path; long dir, wd; unsigned long opens, closes, inode, seen; int gen, alias, moved; } T[MAXF];
+static struct target { char *path; long dir, wd; unsigned long opens, closes, inode, seen; int gen, alias, moved, probed; } T[MAXF];
+static long parent;
+static int opened;
 static char dirs[MAXF][4096];
 static long D[MAXF], nfiles, ndirs, inotify;
 static int overflow, newdir, invalidated;
@@ -78,7 +86,7 @@ static void report(unsigned long seq) {
     for (long i = 0; i < nfiles; i++) {
         struct target *t = &T[i];
         if (t->gen && t->inode > t->seen) t->alias = 1;
-        out("net "); number(t->opens); out(" "); number(t->closes); out(" "); out(t->path); out("\n");
+        out("opens "); number(t->opens); out(" "); number(t->probed); out(" "); out(t->path); out("\n");
         if (t->alias) { out("alias "); out(t->path); out("\n"); }
         if (t->moved) { out("moved "); out(t->path); out("\n"); }
     }
@@ -121,7 +129,6 @@ static long probe(char *file);
 
 __attribute__((noreturn)) static void watching(long argc, char **argv) {
     if (argc < 5 || argc - 4 > MAXF) fail("usage: --watch PARENTPID CONTROLDIR FILE...", -22);
-    long parent = 0;
     for (const char *p = argv[2]; *p; p++) {
         if (*p < '0' || *p > '9' || parent > 1L << 40) fail("PARENTPID", -22);
         parent = parent * 10 + (*p - '0');
@@ -152,7 +159,7 @@ __attribute__((noreturn)) static void watching(long argc, char **argv) {
         }
         watch(t);
     }
-    for (long i = 4; i < argc; i++) probe(argv[i]);
+    for (long i = 4; i < argc; i++) { opened = 0; probe(argv[i]); T[i - 4].probed = opened; }
     out("watching\n");
     static char buffer[4096] __attribute__((aligned(8)));
     unsigned long seq = 0;
@@ -174,6 +181,7 @@ static long probe(char *file) {
     if (fd == -ENOENT) { out("absent "); }
     else if (fd < 0) { out("error "); number(-fd); out(" "); status = 2; }
     else {
+        opened = 1; /* this probe's own IN_OPEN, when watched */
         long lease = SYS(fcntl, fd, F_SETLEASE, F_WRLCK);
         if (lease == 0) SYS(fcntl, fd, F_SETLEASE, F_UNLCK); /* release at once */
         SYS(close, fd, 0, 0);

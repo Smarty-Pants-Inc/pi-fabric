@@ -258,7 +258,9 @@ export const embeddedNativeDigests = (): Record<string, string> => {
 /** Injection points of the lease probe (tests). */
 export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string;
   /** Tests: the expected sha256 instead of the embedded one. */ expectedDigest?: string;
-  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void }
+  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void;
+  /** Tests (pi-fabric#881): run inside the switch's fenced watch, right before and after its final report. */
+  beforeReport?: () => void; afterReport?: () => void }
 
 /** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
 export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
@@ -353,7 +355,7 @@ const verifiedLeaseHelper = (root: string, files: readonly string[], probe: Leas
 export interface StateDbLeaseWatch {
   /** The lease probe's verdict, taken after the watches went up. */
   holders: StateDbHolder[];
-  /** Opens since the probe that this process does not hold now; synchronous (a commit hook). */
+  /** Every open since the probe but the probe's own; synchronous. Call it before this process opens any of the files. */
   check(): StateDbHolder[];
   stop(): void;
 }
@@ -416,22 +418,19 @@ export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions 
         else if (Date.now() > until) return leaseUnavailable(`the lease watch did not report (${WATCH_DOC})`);
         else sleepSync(2);
       }
-      // This process's own open descriptors of the files, by path (a deleted file's fd does not count).
-      const own = new Map<string, number>();
-      for (const entry of (() => { try { return fs.readdirSync("/proc/self/fd"); } catch { return []; } })()) {
-        try { const link = fs.readlinkSync(path.join("/proc/self/fd", entry)); if (files.includes(link)) own.set(link, (own.get(link) ?? 0) + 1); }
-        catch { /* closed meanwhile */ }
-      }
       const result: StateDbHolder[] = [];
       const hold = (file: string, why: string): void => {
         result.push({ pid: 0, name: `holder@lease:${path.relative(root, file)}`, reason: `unidentified holder of ${file} (${why}; ${WATCH_DOC})` });
       };
       for (const line of report) {
-        const net = /^net (\d+) (\d+) (.+)$/.exec(line);
+        // pi-fabric#881 (Astra P1): the report comes before this process's first own open (the caller's contract), so
+        // every open but the probe's own is foreign. No close is netted and nothing is subtracted: inotify merges an
+        // event with an identical one at the queue tail, whoever opened. Fail closed.
+        const opens = /^opens (\d+) (\d+) (.+)$/.exec(line);
         const flag = /^(alias|moved) (.+)$/.exec(line);
-        if (net && files.includes(net[3]!)) {
-          const others = Number(net[1]) - Number(net[2]) - (own.get(net[3]!) ?? 0);
-          if (others > 0) hold(net[3]!, `${others} open(s) since the lease probe that this process does not hold`);
+        if (opens && files.includes(opens[3]!)) {
+          const others = Number(opens[1]) - Number(opens[2]);
+          if (others > 0) hold(opens[3]!, `${others} open(s) since the lease probe`);
         } else if (flag && files.includes(flag[2]!)) {
           hold(flag[2]!, flag[1] === "alias" ? "opened through another name (a hard link) since the lease probe" : "moved since the lease probe");
         } else return leaseUnavailable(`the lease watch reported ${line === "overflow" ? "lost events (inotify queue overflow)" : line === "newdir" ? "a new state-shadow directory"

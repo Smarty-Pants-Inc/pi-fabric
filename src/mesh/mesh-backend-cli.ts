@@ -199,13 +199,13 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   let ownFds: string[] | undefined;
   // smarty-dev#7936: the write-lease probe runs while this process holds no fd on state.db: before the
   // fence (the preflight) and under it before the switch opens state.db (beforeOpen). Under the fence it
-  // runs as a watch (smarty-dev#8116): each check before a commit adds the opens since the probe that
-  // this process does not hold, where our own connection would make a new probe refuse.
+  // runs as a watch (smarty-dev#8116) whose final report comes BEFORE this process's first own open
+  // (pi-fabric#881): its verdict stands for the checks before each commit.
   let fencedWatch: StateDbLeaseWatch | undefined;
+  let fencedLeases: StateDbHolder[] | undefined;
   let underFence = false;
   const leaseHolders = (): StateDbHolder[] => !underFence ? probeStateDbLeases(options.root, leaseProbe)
-    : fencedWatch ? [...fencedWatch.holders, ...fencedWatch.check()]
-      : [{ pid: 0, name: "holder@lease-probe", reason: "the state.db lease probe did not run under the fence (smarty-dev#7936)" }];
+    : fencedLeases ?? [{ pid: 0, name: "holder@lease-probe", reason: "the state.db lease probe did not run under the fence (smarty-dev#7936)" }];
   const inventory = (): RequiredReader[] => {
     let writers: MeshCensusWriter[];
     let unattributed: MeshCensusWriter[] = [];
@@ -253,10 +253,16 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   const outerOpen = library.beforeOpen;
   library.beforeOpen = async () => {
     await outerOpen?.();
-    // smarty-dev#8116: neither a held lease (any open breaks it, ours included) nor a re-probe (our own fds
-    // make it refuse) covers the window from this probe to each commit; the helper's inotify watch does.
+    // smarty-dev#8116, pi-fabric#881: the watch runs from before the lease probe to its final report, which is taken
+    // here, BEFORE this process's first own open of the files (FenceDb.open follows). Every open in that window is
+    // foreign but the probe's own, so the rule is exact (no own open to subtract, none to merge with). From the
+    // report to each commit is the accepted residual r0 of smarty-dev#8116.
     fencedWatch?.stop();
     fencedWatch = await watchStateDbLeases(options.root, leaseProbe);
+    leaseProbe.beforeReport?.();
+    fencedLeases = [...fencedWatch.holders, ...fencedWatch.check()];
+    fencedWatch.stop();
+    leaseProbe.afterReport?.();
     underFence = true;
   };
   const outer = library.beforeCommit;

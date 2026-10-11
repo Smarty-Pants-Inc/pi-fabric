@@ -106,6 +106,8 @@ const lazyEntryPoints = [
   "src/worker/run-log.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
+  // Isolated U2 prototype: buildable without wiring it into the runtime graph.
+  "src/topology/nats-kv-leases.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

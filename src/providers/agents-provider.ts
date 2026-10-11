@@ -1307,7 +1307,6 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
-        const ownerIncarnation = controlOwnerIncarnation(participant);
         const ownRoot = participant.rootId === this.mainAgent.id;
         const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
@@ -1318,27 +1317,39 @@ export class AgentsProvider implements FabricProvider {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }
         context.signal?.throwIfAborted();
-        return this.control.requestResult<FabricActorMessage>(
-          participant.ownerHostId,
-          participant.id,
-          "ask",
-          {
-            principal: invocationFabricPrincipal(context),
-            ownerIncarnation,
-            message,
-            ...(args.data === undefined ? {} : { data: args.data }),
-            ...(needsBinding ? { binding } : {}),
-            ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
-          },
-          participant.ownerIdentityId,
-          {
-            timeoutMs: (actor?.timeoutMs ?? this.manager.config.timeoutMs) +
-              REMOTE_ASK_ACK_GRACE_MS,
-            ...(context.signal ? { signal: context.signal } : {}),
-            routedRemoteHost: participant.remoteHost ?? null,
-            detachOnMainCeiling: isInteractiveMain(context.extensionContext),
-          },
-        );
+        const control = this.control;
+        // One key for the ask and its one dormant-wake resend (same commandId, one claim).
+        const idempotencyKey = randomUUID();
+        return this.#router.sendAfterDormantWake(participant, owner => {
+          if (!owner.capabilities.includes("ask")) {
+            throw new Error(`Fabric actor owner ${owner.ownerHostId} does not support remote ask`);
+          }
+          if (needsBinding && !owner.capabilities.includes("actor-bindings")) {
+            throw new Error(`Fabric actor owner ${owner.ownerHostId} does not support session bindings`);
+          }
+          return control.requestResult<FabricActorMessage>(
+            owner.ownerHostId,
+            owner.id,
+            "ask",
+            {
+              principal: invocationFabricPrincipal(context),
+              ownerIncarnation: controlOwnerIncarnation(owner),
+              message,
+              ...(args.data === undefined ? {} : { data: args.data }),
+              ...(needsBinding ? { binding } : {}),
+              ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+            },
+            owner.ownerIdentityId,
+            {
+              timeoutMs: (actor?.timeoutMs ?? this.manager.config.timeoutMs) +
+                REMOTE_ASK_ACK_GRACE_MS + (owner.stale ? 90_000 : 0),
+              idempotencyKey,
+              ...(context.signal ? { signal: context.signal } : {}),
+              routedRemoteHost: owner.remoteHost ?? null,
+              detachOnMainCeiling: isInteractiveMain(context.extensionContext),
+            },
+          );
+        });
       }
       case "tell":
         return this.routeMessage(
@@ -1879,13 +1890,13 @@ export class AgentsProvider implements FabricProvider {
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
     const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
-    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: "unknown" };
+    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: actor.status === "dormant" ? "dormant" : "unknown" };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
     const run = live.actorRun;
     const runId = removal?.runId ?? run?.id;
     const runAge = formatAge(now - (removal?.runStartedAt ?? run?.startedAt ?? removal?.requestedAt ?? now));
-    const status = live.status === "idle" || live.status === "queued" ||
+    const status = live.status === "dormant" || live.status === "idle" || live.status === "queued" ||
       live.status === "preparing" || live.status === "waiting" ||
       live.status === "running" || live.status === "stopped" ? live.status : "unknown";
     return {

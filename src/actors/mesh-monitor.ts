@@ -55,6 +55,8 @@ export class ActorMeshMonitor {
        * restart replays the gap it missed and not a long downtime (#37's replay storm).
        */
       maxReplayAgeMs?: number | undefined;
+      /** Sleeping residents replay subscribed events after live-log compaction. */
+      replayAll?: boolean;
       beforePoll(): boolean;
       /** Rechecked per event: a page can outlast the resident host lease. */
       canConsumeMesh?: (() => boolean) | undefined;
@@ -101,6 +103,10 @@ export class ActorMeshMonitor {
     }
     this.#startSafetyNet();
     this.schedule();
+  }
+
+  caughtUp(): boolean {
+    return !this.#polling && this.#archiveAfter === undefined && this.#safeCursor.cursor === this.mesh.latestOffset();
   }
 
   /** Checked release receipt; normal best-effort writes are NOT a handover barrier. */
@@ -237,7 +243,7 @@ export class ActorMeshMonitor {
           return;
         }
         if (this.#delivered(event)) continue;
-        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event)) {
+        if (this.#replayFloor !== undefined && event.createdAt < this.#replayFloor && !isWork(event) && !this.callbacks.replayAll) {
           if (typeof event.sequence === "number" && typeof event.id === "string") this.#last = { sequence: event.sequence, id: event.id };
           continue;
         }
@@ -258,7 +264,7 @@ export class ActorMeshMonitor {
         }
         // A receiver that is full holds the event: while catching up, and for work events always
         // (smarty-dev#754), so work waits for room instead of being dropped.
-        if (accepted === false && (catchingUp || isWork(event))) {
+        if (accepted === false && (catchingUp || isWork(event) || this.callbacks.replayAll)) {
           // A full actor queue rejected this event while catching up (smarty-dev#472): keep
           // the cursor on it and offer it again later; earlier events are already delivered.
           // The boundary comes from this same read, so a compaction since cannot move it.
@@ -307,7 +313,7 @@ export class ActorMeshMonitor {
     let handedOn = false;
     for (const event of older) {
       if (this.callbacks.canConsumeMesh?.() === false) return false;
-      if (isWork(event) && !this.#delivered(event)) {
+      if ((isWork(event) || this.callbacks.replayAll) && !this.#delivered(event)) {
         const accepted = this.callbacks.onEvent(event);
         if (this.callbacks.canConsumeMesh?.() === false) return false;
         if (accepted === false) {

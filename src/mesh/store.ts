@@ -9,6 +9,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-f
 import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import { indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
@@ -259,6 +260,8 @@ export interface MeshStoreOptions {
   writeReadJournal?: boolean;
   /** Keyed-state backend (smarty-dev#6477 L2a). Explicit wins; else PI_FABRIC_MESH_STATE_BACKEND; else "file". */
   stateBackend?: MeshStateBackendKind;
+  /** A resident startup owns a scoped recovery pass before opening ordinary dispatch. */
+  canWakeResidents?: () => boolean;
 }
 
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
@@ -268,6 +271,7 @@ export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
   readonly #events: EventLog;
+  readonly #canWakeResidents: () => boolean;
   /** This store's census registration (directory identity), released once by closeState(). */
   #censusRecord: string | undefined;
 
@@ -277,11 +281,17 @@ export class MeshStore {
     readonly maxReadEvents: number,
     options: MeshStoreOptions = {},
   ) {
+    this.#canWakeResidents = options.canWakeResidents ?? (() => true);
     // A failed operation under the lock drops the parsed state (see MeshLock.withLock).
     this.#lock = new MeshLock(root, options, () => this.#state.dropCache());
     const context: MeshStoreContext = { root, maxEventBytes, maxReadEvents, lock: this.#lock };
     this.#state = createStateBackend(context, options);
-    this.#events = new EventLog(context, options);
+    this.#events = new EventLog(context, options, event => {
+      if (!fs.existsSync(path.join(this.root, "residency"))) return;
+      const subscriptions = event.topic === "fabric.participant.lifecycle"
+        ? this.#state.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as WakeSubscription) : [];
+      indexResidentDeliveries(this.root, event, subscriptions);
+    });
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     // Best effort: the writer census is advisory, never a gate (smarty-dev#6982), so a failed
     // record changes nothing here; the census reports the writer's evidence as unknown instead.
@@ -331,12 +341,29 @@ export class MeshStore {
 
   // Events (event-log.ts).
 
-  publish(input: MeshPublishInput): Promise<MeshEvent> {
-    return this.#events.publish(input);
+  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+    const event = await this.#events.publish(input);
+    await this.#wakeAfterPublish([event]);
+    return event;
   }
 
-  publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
-    return this.#events.publishBatch(inputs);
+  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    const events = await this.#events.publishBatch(inputs);
+    await this.#wakeAfterPublish(events);
+    return events;
+  }
+
+  async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
+    if (!events.length || !this.#canWakeResidents() || !fs.existsSync(path.join(this.root, "residency"))) return;
+    try {
+      const { wakeResidentActors } = await import("../residency/wake.js");
+      await wakeResidentActors(this, events);
+    } catch (error) {
+      // Already committed: throwing would invite a duplicate publish. The durable pending
+      // index and archived event survive even without a wake request; startup or the next
+      // publish retries the drain. Report failure rather than inventing delivery.
+      console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
+    }
   }
 
   read(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): MeshEvent[] {

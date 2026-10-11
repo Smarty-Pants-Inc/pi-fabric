@@ -1,6 +1,7 @@
 import path from "node:path";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
+import { trackResidentProcessWork } from "../residency/process-work.js";
 import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
@@ -150,8 +151,10 @@ export class CapturedToolsProvider implements FabricProvider {
     ]), context.signal) };
     throwIfAborted(context.signal);
     const entry = this.catalog.require(actionName);
-    return this.#scheduler.run(entry.definition.executionMode, () =>
-      runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
+    return trackResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.(), () =>
+      this.#scheduler.run(entry.definition.executionMode, () =>
+        runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
+      ),
     );
   }
 

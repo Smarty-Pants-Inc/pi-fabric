@@ -1723,7 +1723,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
       const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
       await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
-      await waitFor(() => participant()?.status === "idle" && Boolean(passive.status(actor.id).lastRunId));
+      await waitFor(() => ["idle", "dormant"].includes(participant()?.status ?? "") && Boolean(passive.status(actor.id).lastRunId));
       const baseline = passive.status(actor.id);
       expect(passive.owns(actor.id)).toBe(false);
       const definition = passive.definition(actor.id);
@@ -1743,7 +1743,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
         actorRun: { id: running.actorRun!.id } });
       expect(live.actorMessages).toBeGreaterThan(baseline.messages);
-      expect(passive.status(actor.id)).toMatchObject({ status: "idle", queued: 0, lastRunId: baseline.lastRunId });
+      expect(passive.status(actor.id)).toMatchObject({ status: baseline.status, queued: 0, lastRunId: baseline.lastRunId });
       const single = await provider.invoke("actorStatus", { id: actor.id }, context);
       const listed = (await provider.invoke("actors", {}, context) as Array<{ id: string }>).find(row => row.id === actor.id);
       for (const view of [single, listed]) {
@@ -1753,11 +1753,13 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(passive.definition(actor.id)).toEqual(definition);
       // The real worker cannot finish FIRST until both provider reads above agree.
       fs.writeFileSync(releasePath, "release\n");
-      await waitFor(() => participant()?.status === "idle" && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
+      await waitFor(() => ["idle", "dormant"].includes(participant()?.status ?? "") && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
       const idleSingle = await provider.invoke("actorStatus", { id: actor.id }, context) as { inFlightRun?: unknown; lastRunId?: string };
       const idleListed = (await provider.invoke("actors", {}, context) as Array<{ id: string; inFlightRun?: unknown }>).find(row => row.id === actor.id)!;
       for (const view of [idleSingle, idleListed]) {
-        expect(view).toMatchObject({ status: "idle", queued: 0, messages: participant()!.actorMessages });
+        // The two independent reads may straddle the idle -> dormant event.
+        expect(["idle", "dormant"]).toContain((view as { status?: string }).status);
+        expect(view).toMatchObject({ queued: 0, messages: participant()!.actorMessages });
         expect(view.inFlightRun).toBeUndefined();
       }
       expect(idleSingle.lastRunId).not.toBe(baseline.lastRunId);
@@ -2692,12 +2694,14 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const after = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
       expect(after.pid).not.toBe(before.pid);
       await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
-      expect(presence(bound.id)).toMatchObject({ id: bound.id, status: "idle", model: "provider/visible",
+      // A restarted idle durable actor may already be dormant: it still accepts deliveries and wakes.
+      expect(["idle", "dormant"]).toContain(presence(bound.id)?.status);
+      expect(presence(bound.id)).toMatchObject({ id: bound.id, model: "provider/visible",
         modelReason: "review pair", thinking: "high" });
       await waitFor(() => presence(forged.id) !== undefined, 20_000);
       // The resident resolver refuses the forged selector; give it time to settle, then prove unknown.
       await delay(1_500);
-      expect(presence(forged.id)?.status).toBe("idle");
+      expect(["idle", "dormant"]).toContain(presence(forged.id)?.status);
       expect(presence(forged.id)).not.toHaveProperty("model");
       expect(presence(forged.id)).not.toHaveProperty("thinking");
       // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.

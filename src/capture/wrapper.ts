@@ -1,4 +1,11 @@
-import type { ExtensionRunner, RegisteredTool, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ExtensionRunner, RegisteredTool, ToolDefinition } from "@earendil-works/pi-coding-agent";
+
+// Resident work accounting is needed only once a captured tool runs. Load it at
+// first use so it stays out of the startup static graph; its counters live on
+// globalThis, so every importer shares one ledger.
+let processWorkLoad: Promise<typeof import("../residency/process-work.js")> | undefined;
+const loadProcessWork = () => processWorkLoad ??= import("../residency/process-work.js")
+  .catch((error: unknown) => { processWorkLoad = undefined; throw error; });
 
 // Local mirror of wrapRegisteredTool/wrapToolDefinition (pi 0.84.2,
 // core/extensions/wrapper.js and core/tools/tool-definition-wrapper.js).
@@ -58,28 +65,35 @@ export const wrapRegisteredToolForCapture = (
     execute: async (toolCallId, params, signal, onUpdate, ctx): Promise<any> => {
       const invocationSignal = signal as AbortSignal | undefined;
       invocationSignal?.throwIfAborted();
-      const activeBefore = runner.getActiveTools();
-      const result = await execute(toolCallId, params, signal, onUpdate, ctx);
-      // A browser/process tool can settle after reload canceled its caller. Never
-      // read the retired runner or merge its tools into a successor (#5962).
+      const { retainResidentProcessWork } = await loadProcessWork();
+      // Never start a tool whose caller aborted while the ledger loaded.
       invocationSignal?.throwIfAborted();
-      const activeAfter = runner.getActiveTools();
-      const activeAfterNames = new Set(activeAfter);
-      const removedToolNames = activeBefore.filter((name) => !activeAfterNames.has(name));
-      if (removedToolNames.length > 0) {
-        onToolsRemoved?.(removedToolNames);
-        return result;
-      }
-      const beforeNames = new Set(activeBefore);
-      const addedToolNames = activeAfter.filter((name) => !beforeNames.has(name));
-      if (addedToolNames.length === 0) {
-        return result;
-      }
-      const previous = ((result as { addedToolNames?: string[] } | undefined)?.addedToolNames) ?? [];
-      return {
-        ...(result as Record<string, unknown>),
-        addedToolNames: [...new Set([...previous, ...addedToolNames])],
-      };
+      const context = (ctx ?? runner.createContext()) as ExtensionContext;
+      const releaseWork = retainResidentProcessWork(context.sessionManager?.getSessionId?.());
+      try {
+        const activeBefore = runner.getActiveTools();
+        const result = await execute(toolCallId, params, signal, onUpdate, context);
+        // A browser/process tool can settle after reload canceled its caller. Never
+        // read the retired runner or merge its tools into a successor (#5962).
+        invocationSignal?.throwIfAborted();
+        const activeAfter = runner.getActiveTools();
+        const activeAfterNames = new Set(activeAfter);
+        const removedToolNames = activeBefore.filter((name) => !activeAfterNames.has(name));
+        if (removedToolNames.length > 0) {
+          onToolsRemoved?.(removedToolNames);
+          return result;
+        }
+        const beforeNames = new Set(activeBefore);
+        const addedToolNames = activeAfter.filter((name) => !beforeNames.has(name));
+        if (addedToolNames.length === 0) {
+          return result;
+        }
+        const previous = ((result as { addedToolNames?: string[] } | undefined)?.addedToolNames) ?? [];
+        return {
+          ...(result as Record<string, unknown>),
+          addedToolNames: [...new Set([...previous, ...addedToolNames])],
+        };
+      } finally { releaseWork(); }
     },
   };
 };

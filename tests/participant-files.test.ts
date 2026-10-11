@@ -612,13 +612,15 @@ describe("participant files", () => {
         })
         .mockImplementationOnce(async () => { throw new Error("copy failed"); });
       const a = directory(root, "a", () => [actor("session:a")]);
-      await a.start();
+      // Removing A's lease is now terminal for its incarnation (#7313): its delayed
+      // copy must not recreate the lease or confirm after B has taken the record.
+      await expect(a.start()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
       expect(stateOwner(root)).toBe("session:b");
       expect(owner(root)).not.toBe("session:a");                 // A's delayed copy was dropped
       const c = directory(root, "c", () => []);
       await c.start();
       expect(c.get(shared, Date.now(), { fresh: true })).toMatchObject({ ownerHostId: "session:b", stale: false });
-      await a.refresh();
+      await expect(a.refresh()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
       expect(stateOwner(root)).toBe("session:b");                // A never takes K back from live B
       await b!.refresh();
       expect(owner(root)).toBe("session:b");                     // B's copy is made again

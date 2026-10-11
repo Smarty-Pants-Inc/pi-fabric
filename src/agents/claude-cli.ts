@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -12,8 +13,8 @@ const spawnCli = (
   args: readonly string[],
   options: SpawnOptions,
 ): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
-  ? crossSpawn(process.execPath, [command, ...args], options)
-  : crossSpawn(command, [...args], options);
+  ? crossSpawn(process.execPath, [command, ...args], { ...options, env: childProcessEnvironment(options.env) })
+  : crossSpawn(command, [...args], { ...options, env: childProcessEnvironment(options.env) });
 
 const MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
 const MODEL_DISCOVERY_MAX_CHARS = 2_000_000;

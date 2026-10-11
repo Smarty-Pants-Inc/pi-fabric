@@ -132,6 +132,12 @@ export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
 export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+/**
+ * Why a stopped actor stopped (smarty-dev#9241). explicit: agents.stop/remove; directive: the actor's
+ * own stop directive; host-exit: its session Main exited and the root-gone reconciler retired it.
+ * Only host-exit is restarted, by the same session's next start. A reload never stops an actor.
+ */
+export type FabricActorStopReason = "explicit" | "directive" | "host-exit";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -329,6 +335,8 @@ export interface FabricActorInfo {
   /** Length of those instructions, in UTF-16 code units (JavaScript string length). */
   instructionsLength?: number;
   rootId?: string;
+  /** Immutable interrupt delegation minted only by the owning Main at supervisor creation. */
+  supervisorFor?: string;
   /** Exact registry lineage token; changes on adoption, including a return to the same root. */
   ownershipToken?: string;
   /** The session that owns and runs the actor (from its `session:<id>` root), whoever reads it. */
@@ -336,7 +344,9 @@ export interface FabricActorInfo {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
-  /** Terminal foreign session-root record, not authority to adopt or restart it. */
+  /** Present only while stopped; missing on a legacy stop means explicit. */
+  stopReason?: FabricActorStopReason;
+  /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */
   sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
@@ -388,8 +398,16 @@ export interface FabricActorInfo {
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * classification says why the block does or does not expire. Only an explicitly transient
+   * code (provider-transient, activation-window-lost, child-exit-before-admission) carries
+   * retryAt: from then on the block no longer gates routing and is reported as
+   * activationBlockExpired instead (smarty-dev#8487). Credential, permission, security-policy,
+   * quota, invalid-request, context-overflow, failing-preparation and unknown stay blocked. */
+  activationBlocked?: { reason: string; code: string; since: number; count: number; retryAt?: number; classification?: string };
+  /** History of a transient block whose backoff ended; the next activation runs normally.
+   * Another failure blocks again with a doubled backoff; a completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; since: number; count: number; expiredAt: number; classification?: string };
   validWhile?: FabricActorValidWhileSource;
   /** Host-maintained, bounded records topic projection for validWhile. */
   records?: FabricActorRecordsOptions;

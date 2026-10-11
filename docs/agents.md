@@ -24,6 +24,51 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
+### Interrupt-priority steer
+
+For a time-critical HOLD to an interactive Main, use:
+
+```ts
+await agents.send({ id: "session:<id>", message: "HOLD: do not start the change", priority: "interrupt" });
+// agents.steer accepts the same optional priority; send is its alias.
+```
+
+When Main has an active tool call, it journals the steer, invokes Pi's native
+`ctx.abort()` (the Escape cancellation path), then delivers the HOLD as a
+user-role Fabric message after the aborted run settles. Fabric does not retry the
+aborted tool. Older held followUps stay behind the HOLD. If Main is idle or has
+no active tool call, this is an ordinary steer. Omit priority to keep the
+existing tool-boundary queue. Only `"interrupt"` is valid; followUp, non-Main
+participants and legacy control routes reject it. Interrupt has narrower authority than
+ordinary steer: the verified sender must be this Main's own root session or its
+owner-created supervisor bound to that root. Configuration cannot grant this
+authority. An unauthorized request fails with
+`FABRIC_INTERRUPT_NOT_AUTHORIZED` and is not delivered, even as an ordinary steer.
+Bridge admission checks the bridge-verified identity, never identities in message data.
+
+Main admits at most one actual interrupt per turn, including the HOLD-induced
+restart. Another authorized sender's interrupt in that turn becomes an ordinary
+steer without another abort. The same sender must wait 60 seconds between actual
+interrupts to this target; requests inside that window fail with
+`FABRIC_INTERRUPT_RATE_LIMITED` and are not delivered. Cooldown refusal takes
+precedence over same-turn coalescing; an idempotent retry of an already-admitted
+command remains a duplicate, not a second interrupt.
+
+The native supervisor convention is an owner-created `supervisor` or
+`*-supervisor` directive actor observing `agent_settled`, with `delivery: "steer"`
+and `triggerTurn: true`. Creation records an immutable `supervisorFor` root
+binding; a name, ordinary actor membership, later configuration changes or a
+forged message field cannot grant it. Old records without this binding remain
+closed; recreate the supervisor from its owning Main to grant it. Adoption to a
+different root does not transfer the original root's delegation.
+
+The receiver must run this Fabric version on a Pi host with `ctx.abort()` and
+`agent_settled`. Native cancellation is cooperative: a blocked event loop or a
+tool that ignores Pi's abort signal cannot meet a fixed preemption deadline.
+Owner stop, reload and session replacement retain their existing vetoes; journal
+replay never issues a second abort. This API does not interrupt Herdr-typed prompts
+or the fleet work-inbox/report-relay path.
+
 Fabric injections carry structured [turn provenance](turn-provenance.md) on capable Pi hosts. The sender is the admitted participant; message text cannot select a human channel or principal.
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
@@ -123,6 +168,8 @@ Inbox delivery receipts require the completion carrier in Pi's actual session JS
 
 Completion recovery keeps worker-attempt candidates separate from the supervisor's settled logical-run outcome. A failed startup or recoverable stop is not delivered or returned by a durable wait while its pinned supervisor can still retry it. An orphan candidate becomes eligible only after that supervisor process is gone; a settled outcome takes precedence. Legacy launch manifests without a supervisor identity cannot prove orphan settlement, so their worker status stays retained and is never automatically promoted.
 
+Receipt-time archival preserves the settled result's bytes and inode, but a visible rename is not a durability confirmation. The journal retains a durable pending hard link until the archive directory, source directory, and their namespace ancestors have been synced. Recovery re-archives a restored source or re-confirms a crash-left archive before retiring its versioned claim or removing its worker attempt. Even claimless recovery can restore a lost rename from the pending link. Receipts continue to suppress duplicate delivery; idle scans inspect pending evidence, never archived history.
+
 Full journal results are readable only by the original recipient session or its validated, claimed exact-lane successor (same project root, cwd, name and role). Other sessions see bounded status metadata and the pending/addressed-to state, never private task, text, error, structured value, usage or log/session details; their reads do not acknowledge the recipient's result. Receipted outcomes do not replay to later successors; a successor cannot clean up or read logs for predecessor-owned runs. Journal result availability is not durable-run operational ownership: ordinary local runs continue to use their local manager for log and cleanup. Durable receipts fence replay. An unreadable, malformed, or identity-mismatched fence fails closed: no successor claim, private body access, delivery, or replacement receipt; the source is retained and a storage diagnostic is surfaced until repaired. Their live mesh claims are retired with ownership/version checks and crash leftovers are reconciled even when notifications are disabled.
 
 ### Actor children and reply targets
@@ -221,7 +268,7 @@ Fabric does not discover a replacement by name, role, or principal. The original
 `PI_FABRIC_MAIN_AGENT_ID` and `PI_FABRIC_SESSION_ID` remain the root topology and
 storage fields; they are not overwritten with a nested task's return address.
 
-A process task's `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
+A process task's `agents.send`, `agents.steer`, `agents.followUp`, or `agents.tell` to a Main may
 address only its bound spawner, that spawner's ancestor chain, or an explicitly
 allowlisted exact Main session. Other Main-bound sends fail before publication
 with `TaskEscalationTargetError` (`FABRIC_TASK_ESCALATION_TARGET_DENIED`), naming
@@ -403,6 +450,8 @@ Extension-enabled Pi children inherit the parent’s full-code mode, including o
 ### Durable participant residency
 
 `agents.spawn()` and `agents.create()` accept `residency: "session" | "durable"`. The default is `session`. It keeps the usual lifecycle: the current Pi host owns the participant and stops or suspends it when the host shuts down. The model chooses `durable` during execution. Users do not configure it as a setting.
+
+A session actor is suspended, not stopped, when its Main reloads or exits. If the Main stays gone past the restart grace (120 s, with proof that its process died), a peer Main or its resident host retires the actor in its registry: it is `stopped` with `stopReason: "host-exit"` and a `sessionOrphan` marker. When the same session starts again (`pi --session <id>`, a herdr relaunch, or a resume), Fabric restarts every such actor in that session. Each keeps its id, instructions, filters, topics and mailbox. It resumes from the session's saved mesh cursor, so a long downtime replays only the last few minutes. Fabric never restarts a stopped actor whose `stopReason` is `explicit` (`agents.stop` or `agents.remove`) or `directive` (the actor stopped itself). It also never restarts an older stopped row that has no reason or root-gone marker. The owning Main removes a stopped actor of its own with `agents.remove({ id })` (smarty-dev#9241).
 
 ```ts
 const audit = await agents.spawn({
@@ -768,6 +817,16 @@ Exact-id `followUp`, `steer`, and `tell` use the same participant directory and 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The owner records each command it admits, so a replayed command is answered from the record and not run again. Each host keeps these records and their outcomes in its own store under the mesh root (`control-seen/`) until the command has expired and left the event log. Each claim is also made in the shared state, so owners that run an older Fabric version for the same host cannot run the command again. That shared copy is kept while the command is in the retained event log, unless the fleet owner has ended support for runtimes before Fabric B8 (see [architecture](architecture.md)). The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
 A root session stays reachable for 5 minutes after its lease lapses, because a late heartbeat under mesh lock contention does not mean the session ended. Fabric sends the command to that root's last owner host, which acknowledges it when the session is alive. After 5 minutes, or when the target has no record on this mesh root, the `Unknown Fabric participant` error states the reason.
+
+### Owner incarnation fencing
+
+Every owner activation publishes a fresh `ownerIncarnation` on its participant records, including same-process Main reloads and resident relaunches. Directory-routed controls capture that value before command publication. **Execution-bound** operations (`stop`, `ask`, cancellation and resident lifecycle/stop) depend on the specific activation: an unclaimed command for an earlier activation is refused before execution with `FabricControlStaleIncarnationError` (`code: FABRIC_CONTROL_STALE_INCARNATION`). Fabric does **not** automatically retry this refusal: re-read the participant and decide whether a new command is still wanted.
+
+For a peer advertising fencing, an explicit incarnation on unclaimed `steer` and `followUp` must match the exact current owner incarnation in both rollout modes. A same-session reload refuses a queued predecessor epoch with the same typed stale-incarnation error; the caller must re-resolve and explicitly decide whether to send a fresh message. A different session has a different target ID, and a message is never retargeted to that replacement. Main and resident control consumption stays gated on successful durable publication/renewal of the current activation's participant epoch; unpublished commands remain queued and expired commands are not executed.
+
+ACKs carry the claiming activation's incarnation. For all epoch-bound requests, a sender ignores other-incarnation successes and ordinary errors; an authenticated fencing refusal must name the exact rejected incarnation, or explicitly report `staleIncarnation: null` when the received command omitted its epoch. An omitted marker is not that attestation. Epochless requests to older owners accept legacy ACKs, with the same stable owner identity, target and bridge-link authentication checks. Already-claimed work remains deduplicated: replay reports its original outcome/incarnation or an indeterminate outcome, never a second delivery. Reuse an idempotency key only with unchanged input, including the originally captured incarnation; new execution-bound intent requires an explicit new decision, not reinterpreting an old key.
+
+Rollout is destination-advertised: a fresh participant record without `ownerIncarnation` selects the existing legacy delivery path, unfenced, with one single-line counted warning per logical request. Version-1 owners without epochs receive epochless control commands; legacy-protocol Main/actor peers keep the existing `fabric.steer` relay. A valid published incarnation fences explicit stale epochs regardless of its protocol label; malformed advertised epochs are refused before publication. At an upgraded owner, the host-only [`mesh.controlIncarnationFence`](configuration.md#mesh) defaults to `"warn"`: unclaimed controls or messages omitting the epoch retain legacy admission, native or bridged, with a counted receiving-owner warning naming the sender at most once per sender per hour. Explicit wrong or stale epochs are refused in both modes. `"enforce"` also refuses omission, regardless of timestamps or uptime; removing only an epoch cannot downgrade a command in that mode. Flip to enforce only after every host runs a release containing this PR ([smarty-dev#7514](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7514)). The immutable sender `requestCreatedAt` is still captured before publication/lock waits for origin diagnostics, and `requestedAt` stays commit-stamped so waits do not spend the existing delivery/ACK budget. The bridge carries bound incarnation/origin fields unchanged. Recorded predecessor claims/outcomes remain observable without new execution. Fencing assumes a single active owner per host ID.
 
 ### Peer labels and queue gates
 

@@ -129,6 +129,13 @@ describe.skipIf(process.platform === "win32")("bash idle watchdog (smarty-dev#61
     expect(result.ok).toBe(false);
     expect(result.text).toContain("timed out");
     expect(result.seconds).toBeLessThan(4);
+    // smarty-dev#7651: Pi's kill ends the outer watchdog; the detached envelope then kills its group
+    // on IPC disconnect, asynchronously. Wait (bounded) for that, not for the scheduler.
+    const pidFile = path.join(f.root, "stubborn.pid");
+    for (const deadline = Date.now() + 5_000; Date.now() < deadline;) {
+      if (fs.existsSync(pidFile) && !alive(f.info("stubborn").pid)) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
     expect(alive(f.info("stubborn").pid)).toBe(false);
   });
 

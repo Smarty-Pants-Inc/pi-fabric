@@ -26,6 +26,7 @@ import type {
   FabricAgentMessageResult,
   FabricMainAgentTarget,
   FabricMainAgentBindingResult,
+  FabricSteerPriority,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -42,6 +43,7 @@ import {
 } from "../lifecycle/types.js";
 import {
   FabricControlPlane,
+  controlOwnerIncarnation,
   type FabricControlCommand,
   type FabricControlAcceptance,
 } from "../topology/control-plane.js";
@@ -385,7 +387,7 @@ const actorRequest = (
 // lexicon; no agents-specific table remains.
 export const normalizeAgentsArgs = actionArgNormalizer(() => AGENTS_ACTION_DESCRIPTORS);
 
-const MESSAGE_ACTIONS = new Set(["ask", "tell", "steer", "followUp"]);
+const MESSAGE_ACTIONS = new Set(["ask", "tell", "send", "steer", "followUp"]);
 
 // Messaging calls accept "to" (the mesh.publish spelling) as an alias of "id".
 // sessionId is rejected with the exact fix: the generic synonym repair would
@@ -1305,13 +1307,14 @@ export class AgentsProvider implements FabricProvider {
         if (!participant.capabilities.includes("ask")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
+        const ownerIncarnation = controlOwnerIncarnation(participant);
         const ownRoot = participant.rootId === this.mainAgent.id;
         const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
         }
-        if (!this.control || participant.controlProtocol === "legacy") {
+        if (!this.control) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} has no result control channel`);
         }
         context.signal?.throwIfAborted();
@@ -1321,6 +1324,7 @@ export class AgentsProvider implements FabricProvider {
           "ask",
           {
             principal: invocationFabricPrincipal(context),
+            ownerIncarnation,
             message,
             ...(args.data === undefined ? {} : { data: args.data }),
             ...(needsBinding ? { binding } : {}),
@@ -1346,6 +1350,7 @@ export class AgentsProvider implements FabricProvider {
           { binding: actorRunBinding(args),
             ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
+      case "send":
       case "steer":
         return this.routeMessage(
           String(args.id),
@@ -1353,7 +1358,8 @@ export class AgentsProvider implements FabricProvider {
           args.data,
           "steer",
           context,
-          { ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
+          { ...(args.priority === undefined ? {} : { priority: args.priority as FabricSteerPriority }),
+            ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}) },
         );
       case "cancelFollowUp":
         return this.manager.cancelFollowUp(String(args.id), String(args.messageId));
@@ -1711,6 +1717,7 @@ export class AgentsProvider implements FabricProvider {
       /** Diagnostic producer snapshot only; never sender authority. */
       wakeCause?: FabricWakeCause;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
@@ -2050,12 +2057,13 @@ export class AgentsProvider implements FabricProvider {
     if (!participant.capabilities.includes("stop")) {
       throw new Error(`Fabric participant ${id} cannot be stopped`);
     }
+    const ownerIncarnation = controlOwnerIncarnation(participant);
     if (!this.control) throw new Error("Fabric control plane is unavailable");
     const result = await this.control.request(
       participant.ownerHostId,
       participant.id,
       "stop",
-      {},
+      { ownerIncarnation },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
     );

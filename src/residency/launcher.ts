@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,6 +20,8 @@ import {
   type ResidentLaunchSpec, type ResidentLauncherIdentity, type ResidentHandoverPlan, type ResidentHandoverState,
 } from "./handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
+import { ownedStat } from "../storage/scratch.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -164,10 +167,24 @@ async function captureWedgeEvidence(root: string, config: ResidentHostConfig, at
     leaseText = fs.readFileSync(ownLeasePath(config.meshRoot, owner.hostId), "utf8");
   } catch { /* best effort evidence */ }
   fs.writeFileSync(path.join(dir, "lease.json"), leaseText);
-  const keep = fs.readdirSync(wedges).filter(name => name !== "reports" && fs.statSync(path.join(wedges, name)).isDirectory()).sort();
-  for (const old of keep.slice(0, Math.max(0, keep.length - 5))) fs.rmSync(path.join(wedges, old), { recursive: true, force: true });
+  pruneWedgeEvidence(wedges);
   return dir;
 }
+
+/** Keep the five newest wedge evidence directories. smarty-dev#7916: each is judged with its owned stat and only
+ * that inode is removed (off Linux main's removal). Exported for tests. */
+export const pruneWedgeEvidence = (wedges: string): void => {
+  const judged = new Map<string, fs.Stats | undefined>();
+  const keep = fs.readdirSync(wedges).filter(name => {
+    if (name === "reports" || !fs.statSync(path.join(wedges, name)).isDirectory()) return false;
+    judged.set(name, ownedStat(path.join(wedges, name)));
+    return true;
+  }).sort();
+  for (const old of keep.slice(0, Math.max(0, keep.length - 5))) {
+    const target = path.join(wedges, old), stat = judged.get(old);
+    verifiedRemove(target, stat, { deleter: "wedgeEvidence", fallback: () => { fs.rmSync(target, { recursive: true, force: true }); return true; } });
+  }
+};
 
 const signalChild = (attempt: Attempt, signal: NodeJS.Signals): void => {
   if (attempt.native.exited || !attempt.child.pid) return;
@@ -218,14 +235,17 @@ export const appendResidentLog = (file: string, data: string | Buffer, maxBytes 
   catch { /* absent, or rotation failed: append to the current file */ }
   fs.appendFileSync(file, data);
 };
-const pruneResidentChildLogs = (root: string, keep: string, now = Date.now()): void => {
+/** smarty-dev#7916: the judged lstat (owned) is the only inode removed; off Linux main's removal. Exported for tests. */
+export const pruneResidentChildLogs = (root: string, keep: string, now = Date.now()): void => {
   try {
     for (const name of fs.readdirSync(root)) {
       if (!/^child-.+\.log(\.1)?$/.test(name)) continue;
       const file = path.join(root, name);
       if (file === keep || file === `${keep}.1`) continue;
-      const stat = fs.lstatSync(file);
-      if (stat.isFile() && now - stat.mtimeMs > RESIDENT_CHILD_LOG_RETENTION_MS) fs.rmSync(file, { force: true });
+      const stat = fs.lstatSync(file, { throwIfNoEntry: false }); // the judgment; verifiedRemove proves ownership
+      if (stat?.isFile() && now - stat.mtimeMs > RESIDENT_CHILD_LOG_RETENTION_MS) {
+        verifiedRemove(file, stat, { deleter: "residentChildLogs", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+      }
     }
   } catch { /* diagnostics only; the next launch retries */ }
 };
@@ -290,13 +310,13 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
     const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
       cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
+      env: childProcessEnvironment({ ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
         PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
         // Per-attempt argument, never shared config another client may rewrite.
         PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
-          ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" },
+          ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" }),
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);

@@ -56,6 +56,7 @@ import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
+import { openPrivateStateDb } from "./state-gate.js";
 import { journalCursorOf, verifyStateJournalEndpoint, type JournalCursor } from "./read-journal.js";
 import type { StateDivergence } from "./state-backend.js";
 import type { MeshStateEntry } from "./state-file.js";
@@ -571,7 +572,7 @@ export class StateProjector {
     });
     let db: SqliteConnection | undefined;
     try {
-      db = (options.open ?? openNodeSqlite)(store.file);
+      db = openPrivateStateDb(store.file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
       db.exec("PRAGMA busy_timeout = 2");
       db.exec("PRAGMA synchronous = NORMAL");
       db.exec("PRAGMA wal_autocheckpoint = 0");

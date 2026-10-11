@@ -12,6 +12,7 @@ import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import * as expiry from "../src/residency/request-expiry.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { compactTerminalRunEvents } from "../src/storage/retention.js";
+import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
 import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequest, readResidentRequestDecision, registerResidentCancellation, residentHostId, residentRoot, residentHostStateNote, residentCommandForOwner, type ResidentCommand, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const roots: string[] = [];
@@ -614,12 +615,15 @@ describe("bounded resident request retention", () => {
   });
   it("partial deletion still cannot reopen replay and leaves the acknowledgement for a later scan", () => {
     const dir = root(); const command = seed(dir, old);
+    const decision = path.join(dir, "decisions", `${command.requestId}.json`);
+    // Linux removes through verifiedRemove (smarty-dev#7916): fault its seam; elsewhere main's fs.rmSync fallback.
+    verifiedRemoveTestHooks.beforeOpen = (target) => { if (target === decision) throw new Error("disk fault"); };
     const remove = fs.rmSync;
     const fault = vi.spyOn(fs, "rmSync").mockImplementation((...args) => {
-      if (args[0] === path.join(dir, "decisions", `${command.requestId}.json`)) throw new Error("disk fault");
+      if (args[0] === decision) throw new Error("disk fault");
       return remove(...args);
     });
-    sweep(dir, now);
+    try { sweep(dir, now); } finally { delete verifiedRemoveTestHooks.beforeOpen; }
     expect(exists(dir, "responses", command.requestId)).toBe(false);
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
     expect(exists(dir, "acknowledgements", command.requestId)).toBe(true);

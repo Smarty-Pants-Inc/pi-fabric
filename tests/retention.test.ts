@@ -785,13 +785,12 @@ describe("temporal retention", () => {
       const orphan = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
       for (let index = 0; index < 40; index++) completedRun(path.join(orphan, `run-${index}`));
       fs.writeFileSync(path.join(orphan, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-      let removed = 0;
-      const rm = fs.rmSync;
-      vi.spyOn(fs, "rmSync").mockImplementation((...args: Parameters<typeof fs.rmSync>) => { removed++; return rm(...args); });
+      // Removal is verified and directory-relative (smarty-dev#7916): count the runs gone, not the rm calls.
+      const removed = () => 40 - fs.readdirSync(orphan).filter((name) => name.startsWith("run-")).length;
       // The clock passes the budget right after the fifth run is removed.
-      vi.spyOn(performance, "now").mockImplementation(() => (removed >= 5 ? 10_000 : 0));
+      vi.spyOn(performance, "now").mockImplementation(() => (removed() >= 5 ? 10_000 : 0));
       expect(budgetSweep(tempRoot, 1_000)).toEqual({ removedRoots: [], removedRuns: [] });
-      expect(removed).toBe(5);
+      expect(removed()).toBe(5);
       expect(fs.readdirSync(orphan).filter((name) => name.startsWith("run-"))).toHaveLength(35);
       vi.restoreAllMocks();
       expect(budgetSweep(tempRoot).removedRoots).toEqual([orphan]);

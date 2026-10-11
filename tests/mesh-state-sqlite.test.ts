@@ -155,6 +155,25 @@ describe("SqliteStateStore", () => {
     expect((await open(root)).get("who/am")?.value).toBe("mine");
   });
 
+  // smarty-dev#7548: one process may hold two roots (the shadow-mode resident host: state-shadow/ and
+  // state-projector/). A descriptor parked on the other root must not fail this root's reuse closed.
+  it.skipIf(process.platform !== "linux")("accepts reuse on this root while another root held by this process has a parked descriptor (smarty-dev#7548)", async () => {
+    const root = tempRoot("park-two");
+    const other = tempRoot("park-two-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const holders = [await open(other), await open(root)];
+    (await open(other)).close(); // parks a descriptor on the other root
+    (await open(root)).close(); // and one on this root
+    const reopened = await open(root); // SQLite reuses this root's parked descriptor: zero new
+    expect(reopened.get("who/am")?.value).toBe("mine");
+    reopened.close();
+    for (const holder of holders) holder.close();
+  });
+
   it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {
     const root = tempRoot("pragmas");
     const executed: string[] = [];

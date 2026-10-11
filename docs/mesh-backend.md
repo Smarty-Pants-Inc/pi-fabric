@@ -167,10 +167,17 @@ checks the schema and writes it under the fence:
 
 1. `release = basename(realpath(<its release root>/current))` of the running install.
 2. `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
-3. Copy `<mesh>/state.json` into an empty scratch directory and run
-   `fabric-mesh-backend import --root <scratch>` there.
+3. Run `fabric-mesh-backend import --scratch-proof-from <mesh>/state.json --json`. The CLI creates a fresh
+   private (0700) scratch directory itself (`mkdtemp` under the OS temp directory, or under
+   `--scratch-parent DIR`, whose whole chain must be yours or root's, contain no symlink at all, and not be
+   group/other-writable unless root-owned and sticky). It copies `state.json` (a regular file of at most
+   64 MiB) into that directory through the directory fd it holds, checks the path still names that
+   directory, and imports there without the readiness gate: the directory is provably a copy it just
+   made, never a live mesh. Check `"ok": true` and `"scratchProof": true`, and read `"root"`: that is
+   `<scratch>`. On a refusal or error the CLI removes that directory itself, through the held fd; any
+   cleanup failure is a warning on stderr and in `"cleanupWarnings"`. No `--accept-unready` is needed.
 4. Read every entry from `<scratch>` with its own SQLite read path; fail on any error or a count
-   other than the import's `entries`.
+   other than the import's `entries`. Then remove `<scratch>`.
 5. Write the proof JSON (format above) to a private temp file and run
    `fabric-mesh-backend reader-proof --root <mesh> --name <name> --proof-file <temp>`.
    It refuses `fabric*` names and `implementation: "fabric-meshstore"`.

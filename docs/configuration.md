@@ -740,31 +740,30 @@ Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on it
   in another namespace. Reclaiming that holder lets two writers into the critical section.
 - **Pid evidence only in our own namespace:** a reclaimer uses pid evidence (ESRCH, another incarnation) only for a
   holder of ITS OWN namespace.
-- **An earlier boot:** a holder from an earlier boot of the same machine is dead, and is reclaimed at once, but only
-  when the lock root and the owner file are owned by this user and writable by nobody else (otherwise the ids could
-  be forged: unproven). On Windows that ownership cannot be checked, so the earlier-boot verdict is never honored there.
+- **No earlier-boot inference:** another boot id with the same machine id is NOT taken as proof of death (two running
+  VM clones look exactly like that), so it is unproven (pi-fabric#923).
 - **Never reclaimed automatically:** a holder of another namespace, or one whose namespace is unknown or malformed
   (`FABRIC_MESH_LOCK_FOREIGN_HOLDER` / `FABRIC_MESH_LOCK_UNPROVEN_HOLDER`, still a `MeshLockTimeoutError`).
   - **Under protocol 3, a record without a namespace (a holder from before protocol 3) is UNPROVEN too**
     (pi-fabric#923). Its pid may name nothing here although it is alive in another namespace.
-  - The only legacy exception: a host-qualified custody record (`leaseCustody`; it carries the machine and boot ids)
-    from an earlier boot of this machine. A legacy mesh `.lock` record and a plain custody record carry no boot id,
-    so a crashed pre-3 holder of those needs the operator step after the switch.
-  - The error, and a `[pi-fabric] ALARM` line (once per holder), name the lock path and the exact command:
-    `fabric-mesh-backend lock-recover --root DIR --lock mesh|custody --holder TOKEN`. That command acts only on a
-    provably dead holder; run it inside the holder's namespace.
+    No exception: a crashed pre-3 holder, of any lock, needs the operator step after the switch.
+  - The error, and a `[pi-fabric] ALARM` line (once per holder), name the lock path and the exact command, with the
+    root and the token shell-quoted: `fabric-mesh-backend lock-recover --root 'DIR' --lock mesh|custody --holder 'TOKEN'`.
+    That command acts only on a holder of its own namespace whose pid is gone; run it inside the holder's namespace.
   - Its labelled `--unsafe-holder-stopped` override recovers on the operator's word that the holder is stopped,
     prints an ALARM, and appends an audit line naming the operator (uid, user, pid, parent command line, host) to
-    `<root>/lock-recoveries.jsonl`.
+    `<root>/lock-recoveries.jsonl`. The audit is opened without following a symlink and must be a private (0600)
+    regular file of this user. It rotates once at 1 MiB (`.1`). If it cannot be written, nothing is recovered.
 - **Rollout:**
   - Old releases accept only 4- or 5-field (custody: 7-field) records, so they can never reclaim a protocol-3
     record.
   - New releases at protocol 1 or 2 reclaim legacy records by today's rule. At protocol 3 they do not. So switch a
     root to 3 only after its writers run a release that knows it, and recover any crashed old holder with the
     command above.
-- **Windows limit:** the namespace id is a machine and boot identity; it does not tell Windows silos (containers) on
-  one boot apart. A mesh root shared between Windows silos is NOT protected by protocol 3 (tracked on
-  smarty-dev#9569 (d), the handle-based release).
+- **Windows fails closed:** the namespace id there is a machine and boot identity, which cannot tell Windows silos
+  (containers) apart. So under protocol 3 a Windows holder is never reclaimed on pid evidence, even one whose
+  namespace equals ours. A crashed Windows holder needs `--unsafe-holder-stopped`, until the handle-based release of
+  smarty-dev#9569 (d) can prove liveness.
 - **Not covered:** the synchronous SQLite create fence (`holdMeshFenceSync`, a single brief attempt) still writes
   the legacy record.
 - **Residual off Linux:** a holder's release by name is still exposed to a forced rename (smarty-dev#9569 (b)/(d)).

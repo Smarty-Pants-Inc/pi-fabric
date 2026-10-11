@@ -6,12 +6,12 @@
 // Desktop, WSL2, another host on a shared folder) sees ESRCH, or an unrelated process, for a LIVE foreign holder. Lock
 // records of protocol 3 carry the holder's namespace, and a reclaimer uses pid evidence only for its own namespace.
 //
-// The id is `<os>:<machine>:<boot>:<pid namespace>`, so a reclaimer can also tell a holder from an EARLIER BOOT of
-// its own machine (provably dead: every process of that boot is gone) from one in another namespace (alive or not,
-// its pid means nothing here). `-` is an unknown machine: then no previous-boot verdict is possible.
+// The id is `<os>:<machine>:<boot>:<pid namespace>`. Only an EQUAL id lets a reclaimer use pid evidence. Another boot of
+// the same machine id is NOT inferred dead (pi-fabric#923: two running VM clones share a machine id), and a Windows id
+// never qualifies (it cannot tell silos apart): both are unproven, recovered only by the audited operator override.
 //   linux   linux:<machine-id|->:<boot_id>:<pid-ns inode>
 //   darwin  darwin:<IOPlatformUUID|->:<kern.bootsessionuuid>:host
-//   win32   win32:<MachineGuid>:<boot ticks>:host   (Windows silos/containers sharing a root are unsupported)
+//   win32   win32:<MachineGuid>:<boot ticks>:host   (written for diagnosis; never proves a holder dead)
 import fs from "node:fs";
 import path from "node:path";
 import { runIncarnationCommand, type IncarnationCommandRunner } from "./atomic-write.js";
@@ -121,37 +121,22 @@ export const pidNamespaceTestHooks = {
 
 /**
  * May a reclaimer use pid evidence (ESRCH, another incarnation) against this holder (smarty-dev#9569)?
- * - `pid`: the holder is of OUR namespace, or the record is legacy (no namespace line; today's rule, the accepted
- *   residual O3 for processes that have not upgraded);
- * - `previous-boot`: the holder ran on THIS machine (a known, equal machine id) in an earlier boot: every process of
- *   that boot is gone, so it is dead whatever its pid now names; reclaim it;
+ * - `pid`: the holder is of OUR namespace (a protocol-1/2 caller also passes a legacy record, `null`, here);
  * - `foreign`: another namespace: its pid means nothing here; never reclaimed (operator recovery only);
- * - `unproven`: the record names a malformed namespace, or ours is unknown: never reclaimed.
+ * - `unproven`: never reclaimed: the record names a malformed namespace, or ours is unknown; or the same machine id
+ *   with another boot id (pi-fabric#923, fabric-store: no previous-boot inference, since two running VM clones share a
+ *   machine id with different boot ids); or a Windows namespace at all (a machine and boot identity cannot tell
+ *   Windows silos apart, so on Windows nothing is reclaimed on pid evidence under protocol 3).
  */
-export type PidNamespaceVerdict = "pid" | "previous-boot" | "foreign" | "unproven";
+export type PidNamespaceVerdict = "pid" | "foreign" | "unproven";
 export const pidNamespaceVerdict = (recordNs: string | null, ownNs: string | undefined): PidNamespaceVerdict => {
   if (recordNs === null) return "pid";
   if (!wellFormedPidNamespace(recordNs) || !ownNs || !wellFormedPidNamespace(ownNs)) return "unproven";
-  if (recordNs === ownNs) return "pid";
   const record = namespaceParts(recordNs), own = namespaceParts(ownNs);
-  if (record.os === own.os && own.machine !== "-" && record.machine === own.machine && record.boot !== own.boot) return "previous-boot";
+  if (record.os === "win32" || own.os === "win32") return "unproven";
+  if (recordNs === ownNs) return "pid";
+  if (record.os === own.os && record.machine !== "-" && record.machine === own.machine && record.boot !== own.boot) return "unproven";
   return "foreign";
-};
-
-/**
- * May a previous-boot verdict be honored for this lock (pi-fabric#923)? It trusts machine and boot ids written in the
- * owner file, so the lock root and the owner file must be OURS (our uid) and writable by nobody else (no group or
- * world write bit). Otherwise anyone who can write there could forge an "earlier boot" and have a live lock reclaimed:
- * the verdict is then unproven. Without POSIX ownership (Windows) it cannot be checked: unproven, fail closed.
- */
-export const previousBootTrusted = (lock: string): boolean => {
-  if (typeof process.getuid !== "function" || process.platform === "win32") return false;
-  const uid = process.getuid();
-  const mine = (stat: fs.Stats | undefined): boolean => stat !== undefined && stat.uid === uid && (stat.mode & 0o022) === 0;
-  try {
-    return mine(fs.lstatSync(path.dirname(lock), { throwIfNoEntry: false })) && mine(fs.lstatSync(lock, { throwIfNoEntry: false })) &&
-      mine(fs.lstatSync(path.join(lock, "owner"), { throwIfNoEntry: false }));
-  } catch { return false; }
 };
 
 /** The lock code's lazy handle on this module (a stable lazy entry point, scripts/build.mjs). */

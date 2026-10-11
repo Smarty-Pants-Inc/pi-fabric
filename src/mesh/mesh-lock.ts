@@ -421,10 +421,9 @@ export class MeshLock {
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
-      let previousBoot = false;
-      // pi-fabric#923 (fabric-store decision): under protocol 3 a record without a namespace (a v1/v2 holder) is
-      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. A mesh record from before
-      // protocol 3 carries no machine or boot id, so no previous-boot proof exists for it: operator recovery only.
+      // pi-fabric#923 (fabric-store decisions): under protocol 3 a record without a namespace (a v1/v2 holder) is
+      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. There is no previous-boot
+      // inference either (VM clones share a machine id): such holders are recovered only by the operator.
       if (recordNamespace === null && this.#lockProtocol === 3) {
         note.verdict = "unproven"; note.namespace = ""; note.token = token!;
         return false;
@@ -432,13 +431,10 @@ export class MeshLock {
       if (recordNamespace !== null) {
         const namespaces = await import("../core/pid-namespace.js");
         const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
-        let verdict = namespaces.pidNamespaceVerdict(recordNamespace, own);
-        // The previous-boot ids come from the owner file: honored only if nobody else could have written it.
-        if (verdict === "previous-boot" && !namespaces.previousBootTrusted(this.#lockPath)) verdict = "unproven";
-        if (verdict === "foreign" || verdict === "unproven") { note.verdict = verdict; note.namespace = recordNamespace; note.token = token!; return false; }
-        previousBoot = verdict === "previous-boot"; // an earlier boot of this machine: dead, whatever its pid names now
+        const verdict = namespaces.pidNamespaceVerdict(recordNamespace, own);
+        if (verdict !== "pid") { note.verdict = verdict; note.namespace = recordNamespace; note.token = token!; return false; }
       }
-      if (!previousBoot && processAlive(pid)) {
+      if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         // Registry-fenced publication cannot start even a bounded native read.
         // Fail closed; the ordinary outside-custody admission lane obtains fresh

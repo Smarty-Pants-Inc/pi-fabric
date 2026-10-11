@@ -209,21 +209,18 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     // smarty-dev#9569: a protocol-3 record names its holder's PID namespace. Before EVERY branch below (the plain one,
     // and hostQualified with known, previous or unknown boot): pid evidence only for our namespace.
     const recordNamespace = hostQualified ? (fields.length === 8 ? fields[6]! : null) : (fields.length === 6 ? fields[4]! : null);
+    // pi-fabric#923 (fabric-store decision): under protocol 3 no previous-boot inference at all. Two running VM clones
+    // share a machine id with different boot ids, so "another boot" does not prove the holder dead.
+    if (lockProtocol === 3) previousBoot = false;
     if (recordNamespace !== null || lockProtocol === 3) {
       const namespaces = await import("../core/pid-namespace.js");
-      let verdict: "pid" | "previous-boot" | "foreign" | "unproven";
-      if (recordNamespace === null) {
-        // pi-fabric#923 (fabric-store decision): under protocol 3 a record without a namespace is UNPROVEN, except a
-        // host-qualified one whose machine id is ours and whose boot id proves its boot ended (exception (a)).
-        verdict = previousBoot ? "previous-boot" : "unproven";
-      } else verdict = namespaces.pidNamespaceVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false));
-      // Previous-boot ids come from the owner file: honored only if nobody else could have written it.
-      if (verdict === "previous-boot" && !namespaces.previousBootTrusted(lock)) verdict = "unproven";
-      if (verdict === "foreign" || verdict === "unproven") {
+      // Under protocol 3 a record without a namespace is UNPROVEN too: recovered only by the operator.
+      const verdict = recordNamespace === null ? "unproven"
+        : namespaces.pidNamespaceVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false));
+      if (verdict !== "pid") {
         note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
         return false;
       }
-      if (verdict === "previous-boot") previousBoot = true;
     }
     if (hostQualified && !bootKnown && !previousBoot) {
       // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE

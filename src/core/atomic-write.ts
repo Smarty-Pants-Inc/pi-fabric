@@ -687,7 +687,10 @@ export class MeshLockForeignHolderError extends MeshLockTimeoutError {
     super(holder, attempts, maxGapMs);
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
     const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
-    this.recovery = `fabric-mesh-backend lock-recover --root ${JSON.stringify(path.dirname(lockPath))} --lock ${kind} --holder ${holderToken}`;
+    // pi-fabric#923: the root and the token come from disk: POSIX shell single-quoted, so a copied command cannot run
+    // anything else.
+    const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+    this.recovery = `fabric-mesh-backend lock-recover --root ${quote(path.dirname(lockPath))} --lock ${kind} --holder ${quote(holderToken)}`;
     const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
       : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
     this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +

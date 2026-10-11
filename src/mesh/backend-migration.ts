@@ -94,6 +94,7 @@ import type { MeshLock } from "./mesh-lock.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
+import { openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
 export { assertFileStateWritable, MeshBackendFenceError, readMeshStateMovedMarker, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource };
@@ -384,7 +385,7 @@ class FenceDb {
     const exists = fs.statSync(file, { throwIfNoEntry: false }) !== undefined;
     if (!exists && !create) return undefined;
     if (intent === "write") {
-      const refusal = filesystemRefusal(root);
+      const refusal = filesystemRefusal(root); // before any side effect; the gate below checks again
       if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
     }
     if (!exists) {
@@ -393,7 +394,7 @@ class FenceDb {
       try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     }
-    const db = (options.open ?? openNodeSqlite)(file);
+    const db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
     try {
       db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
       db.exec("PRAGMA trusted_schema = OFF");

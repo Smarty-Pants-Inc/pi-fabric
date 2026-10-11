@@ -271,7 +271,11 @@ describe("mesh backend rollback fence (R1)", () => {
       await seedFileRoot(root);
       await importMeshState(root);
       const marker = fs.readFileSync(path.join(root, "state.json"));
-      const before = meshSnapshotDigest((await openSqlite(root)).exportState());
+      const exporter = await openSqlite(root);
+      const before = meshSnapshotDigest(exporter.exportState());
+      // Closed per round: a store left open on round 1's root keeps descriptors SQLite parked there, and the gate's
+      // reuse proof (state-gate.ts openPinned) then fails closed for round 2's root (one process, two roots).
+      exporter.close();
       await expect(rollbackMeshState(root, { onStep: (at) => { if (at === "rollback-switch") throw new Error(at); } }))
         .rejects.toThrow("rollback-switch");
       const meta = rawMeta(root);
@@ -934,5 +938,47 @@ describe("fabric-mesh-backend CLI", () => {
     const broken = await run("status", "--root", root);
     expect(broken.code).toBe(3);
     expect(broken.out).toMatch(/fence {9}VIOLATED/);
+  });
+});
+
+// smarty-dev#7548: the backend tool's FenceDb and the file-mode fence's meta read open state.db only through the
+// one gate (state-gate.ts openPrivateStateDb), as the store does: never by path behind a symlinked or shared root.
+describe.skipIf(process.platform === "win32")("the one gate for every state.db open (smarty-dev#7548)", () => {
+  const rolledBack = async (label: string): Promise<string> => {
+    const root = tempRoot(label);
+    await seedFileRoot(root);
+    await importMeshState(root);
+    await rollbackMeshState(root); // backend=file at the file's epoch: readers and writers use state.json
+    expect(resolveMeshStateSource(root)).toMatchObject({ source: "file" });
+    assertFileStateWritable(root);
+    return root;
+  };
+
+  it("FenceDb and the fence meta read refuse a group-writable root", async () => {
+    const root = await rolledBack("gate-shared");
+    fs.chmodSync(root, 0o770);
+    expect(() => resolveMeshStateSource(root)).toThrow(/is group or other writable/);
+    expect(() => assertFileStateWritable(root)).toThrow(/is group or other writable/);
+  });
+
+  it("FenceDb and the fence meta read refuse a symlinked root", async () => {
+    const real = await rolledBack("gate-link");
+    const link = path.join(tempRoot("gate-link-parent"), "mesh");
+    fs.symlinkSync(real, link);
+    expect(() => resolveMeshStateSource(link)).toThrow(/is a symbolic link/);
+    expect(() => assertFileStateWritable(link)).toThrow(/is a symbolic link/);
+  });
+
+  it("refuses a root under a group- or other-writable ancestor, and accepts a sticky one (like /tmp)", async () => {
+    const parent = tempRoot("gate-ancestor");
+    const root = path.join(parent, "mesh");
+    await seedFileRoot(root);
+    await importMeshState(root);
+    fs.chmodSync(parent, 0o777);
+    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow(/its ancestor .* is group or other writable without the sticky bit/);
+    expect(() => resolveMeshStateSource(root)).toThrow(/without the sticky bit/);
+    fs.chmodSync(parent, 0o1777);
+    expect(resolveMeshStateSource(root)).toMatchObject({ source: "sqlite" });
+    fs.chmodSync(parent, 0o700);
   });
 });

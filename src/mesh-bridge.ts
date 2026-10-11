@@ -4,12 +4,20 @@ import { childProcessEnvironment } from "./core/atomic-write.js";
 //   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE --ssh HOST [--ssh-key KEY]
 //   mesh-bridge run ... -- COMMAND [ARGS...]      (any stdio transport, for tests)
 //   mesh-bridge agent --mesh ROOT --peer NAME     (the remote end; the ssh forced command)
+//   mesh-bridge handoff --mesh ROOT --session ID --link NAME [--operator NAME]
+//                                                 (on the hub: hand a moved Main's dead native identity to one link,
+//                                                  smarty-dev#9074; also handoff-revoke and handoff-list)
 //
 // The remote pins the agent in authorized_keys, so the key can run nothing else:
 //   command="node /opt/pi-fabric/bin/mesh-bridge agent --mesh /home/u/proj/.pi/fabric/mesh --peer dev1",restrict ssh-ed25519 ...
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { DEFAULT_CALL_TIMEOUT_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
-import { MeshStore } from "./mesh/store.js";
+import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
+import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
 
 // Fabric's defaults for mesh.maxEventBytes and mesh.maxReadEvents (src/config.ts).
 const MAX_EVENT_BYTES = 256 * 1024;
@@ -17,7 +25,10 @@ const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
-  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]`;
+  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]
+  mesh-bridge handoff --mesh ROOT --session ID --link NAME [--operator NAME] [--lock-protocol 1|2]
+  mesh-bridge handoff-revoke --mesh ROOT --session ID [--lock-protocol 1|2]
+  mesh-bridge handoff-list --mesh ROOT [--lock-protocol 1|2]`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
   const [mode = "", ...rest] = argv;
@@ -60,7 +71,7 @@ export const transportCommand = (flags: Map<string, string>, command: string[]):
   ];
 };
 
-export const openBridgeStore = (root: string, flags: Map<string, string>): MeshStore => {
+export const openBridgeStore = (root: string, flags: Map<string, string>, options: Pick<MeshStoreOptions, "stateBackend"> = {}): MeshStore => {
   const selected = flags.get("lock-protocol") ?? "1";
   if (selected !== "1" && selected !== "2") throw new Error("--lock-protocol must be 1 or 2");
   const capacity = flags.get("max-state-bytes");
@@ -71,6 +82,7 @@ export const openBridgeStore = (root: string, flags: Map<string, string>): MeshS
   return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
     lockProtocol: selected === "1" ? 1 : 2,
     ...(maxStateBytes === undefined ? {} : { maxStateBytes }),
+    ...options,
   });
 };
 const log = (message: string): void => void process.stderr.write(`mesh-bridge: ${message}\n`);
@@ -169,8 +181,66 @@ export const runBridge = async (
   return spawnError ? 1 : code;
 };
 
-export const main = async (argv: string[]): Promise<number> => {
+/**
+ * The hub's handoff commands (smarty-dev#9074), for move-main.sh. Run them on the hub with the hub
+ * bridge's mesh root, --lock-protocol and environment. One JSON object on stdout; exit 0 done, 1
+ * refused (nothing written), 2 usage.
+ */
+const runHandoff = async (mode: string, flags: Map<string, string>, out: (value: unknown) => void): Promise<number> => {
+  const root = path.resolve(required(flags, "mesh"));
+  // A wrong path must fail, never become a new empty mesh holding a handoff.
+  if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory() ||
+    !["state.json", "state.db"].some((name) => fs.existsSync(path.join(root, name)))) {
+    throw new BridgeHandoffUsageError(`Not a Fabric mesh directory: ${root}`);
+  }
+  // A root switched to SQLite is written there, whatever this environment selects.
+  const store = openBridgeStore(root, flags, readMeshStateMovedMarker(root) !== undefined ? { stateBackend: "sqlite" } : {});
+  try {
+    if (mode === "handoff-list") {
+      out({ ok: true, action: mode, handoffs: listHandoffs(store) });
+      return 0;
+    }
+    const id = handoffRootId(required(flags, "session"));
+    if (mode === "handoff-revoke") {
+      const removed = await revokeHandoff(store, id);
+      out({ ok: true, action: mode, id, removed: removed ?? null,
+        message: removed ? `handoff of native identity ${id} revoked` : `no handoff of native identity ${id}` });
+      return 0;
+    }
+    const link = required(flags, "link");
+    try {
+      const result = await handOffNativeIdentity(store, {
+        session: id, link, operator: flags.get("operator") ?? process.env.SUDO_USER ?? os.userInfo().username,
+      });
+      out({ ok: true, action: mode, id, link,
+        message: `native identity ${id} handed off to link ${link} at ${new Date(result.record.handedOffAt).toISOString()} by ${result.record.operator}`,
+        ...result });
+      return 0;
+    } catch (error) {
+      if (!(error instanceof BridgeHandoffRefusedError)) throw error;
+      out({ ok: false, action: mode, id, link, message: `refused: native identity ${id} not handed off to link ${link}: ${error.reason}`,
+        refused: error.reason, evidence: error.evidence });
+      return 1;
+    }
+  } finally {
+    store.closeState();
+  }
+};
+
+export const main = async (
+  argv: string[],
+  out: (value: unknown) => void = (value) => void process.stdout.write(`${JSON.stringify(value, null, 2)}\n`),
+): Promise<number> => {
   const { mode, flags, command } = parseArgs(argv);
+  if (mode === "handoff" || mode === "handoff-revoke" || mode === "handoff-list") {
+    try {
+      return await runHandoff(mode, flags, out);
+    } catch (error) {
+      if (!(error instanceof BridgeHandoffUsageError)) throw error;
+      out({ ok: false, action: mode, message: `usage: ${error.message}` });
+      return 2;
+    }
+  }
   if (mode === "agent") {
     await runAgent(flags);
     return 0;

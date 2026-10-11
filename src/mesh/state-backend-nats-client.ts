@@ -6,7 +6,7 @@ import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
 import {
-  NatsWrongLastSequenceError, redactNatsUrls, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
+  guardNatsPort, NatsWrongLastSequenceError, redactNatsError, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
 
 /** NATS JetStream API error codes used here. */
@@ -28,16 +28,14 @@ export interface ConnectJetStreamOptions {
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
   // smarty-dev#9663 item 2: a client or fetch error may quote a server URL; never pass its credentials on.
-  const redacted = (error: unknown): Error => {
-    const message = error instanceof Error ? error.message : String(error);
-    return Object.assign(new Error(redactNatsUrls(message)), { name: error instanceof Error ? error.name : "Error" });
-  };
   let nc: Awaited<ReturnType<typeof connect>>;
-  try { nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) }); }
-  catch (error) { throw redacted(error); }
+  let jsm: Awaited<ReturnType<typeof jetstreamManager>>;
+  try {
+    nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) });
+    jsm = await jetstreamManager(nc);
+  } catch (error) { throw redactNatsError(error); }
   const js = jetstream(nc);
-  const jsm = await jetstreamManager(nc);
-  return {
+  return guardNatsPort({
     server: async () => {
       let syncAlways: boolean | undefined;
       if (options.monitoringUrl) {
@@ -45,7 +43,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         try {
           const response = await fetch(new URL("/varz", options.monitoringUrl), { signal: AbortSignal.timeout(5_000) });
           varz = await response.json() as typeof varz;
-        } catch (error) { throw redacted(error); }
+        } catch (error) { throw redactNatsError(error); }
         syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
       }
       return { version: nc.info?.version ?? "0.0.0", syncAlways,
@@ -102,5 +100,5 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       return { stop: async () => { await messages.close(); } };
     },
     close: async () => { await nc.drain(); },
-  };
+  });
 };

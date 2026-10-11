@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
-  NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
+  guardNatsPort, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -906,5 +906,83 @@ describe("JetStream backend P2s (smarty-dev#9663)", () => {
     const server = fakeJetStream();
     server.version = "2.14.7";
     await expect(open(server)).resolves.toBeInstanceOf(NatsStateBackend);
+  });
+});
+
+describe("JetStream backend: round 1 (pi-fabric#937)", () => {
+  const secrets = ["alice", "s3cret", "tok123", "frag456"];
+  /** Every text an error can show: String(), message, stack, url and address fields, its cause chain. */
+  const texts = (error: unknown, depth = 0): string[] => {
+    if (!(error instanceof Error) || depth > 5) return [String(error)];
+    const record = error as unknown as Record<string, unknown>;
+    return [String(error), error.message, error.stack ?? "", String(record.url ?? ""), String(record.address ?? ""),
+      ...("cause" in error && error.cause !== undefined ? texts(error.cause, depth + 1) : [])];
+  };
+  const expectNoSecret = (values: string[]) => { for (const value of values) for (const secret of secrets) expect(value).not.toContain(secret); };
+  const credentialed = "nats://alice:s3cret@10.0.0.5:4222/?token=tok123#token=frag456";
+  const leaky = (label: string) => Object.assign(new Error(`${label} failed at ${credentialed}`),
+    { code: "E_LEAKY", url: credentialed, address: "tls://alice:s3cret@10.0.0.6:4222", cause: new Error(`inner ${credentialed}`) });
+
+  it("SEC P1-1: no fragment, query, userinfo or unparseable-URL credential reaches MeshStateNatsInsecureError", async () => {
+    for (const url of ["nats://10.0.0.5:4222/#token=frag456", "nats://10.0.0.5:4222/?token=tok123", "nats://alice:s3cret@10.0.0.5:4222",
+      "nats://alice:s3cret@[bad/?token=tok123#frag456"]) {
+      const error = await openNatsStateBackend({ root: root(), servers: [url], lookup: resolver }).catch(caught => caught as Error);
+      expect(error, url).toBeInstanceOf(MeshStateNatsInsecureError);
+      expectNoSecret([...texts(error), (error as MeshStateNatsInsecureError).url]);
+    }
+    expect(redactNatsUrl("tls://nats.example.com:4222/#token=frag456")).toBe("tls://nats.example.com:4222/#***");
+    expect(redactNatsUrl("nats://alice:s3cret@[bad/?token=tok123")).toBe("nats://*** (unparseable URL)");
+    expect(redactNatsUrls(`connect to ${credentialed} failed`)).not.toMatch(/alice|s3cret|tok123|frag456/);
+  });
+
+  it("SEC P1-2: the client port's stream, publish and consumer errors leave it redacted, class and code kept", async () => {
+    // Stream operation (open): the error the port throws.
+    const streamServer = fakeJetStream();
+    const streamPort = streamServer.port();
+    streamPort.ensureStream = async () => { throw leaky("ensureStream"); };
+    const opened = await openNatsStateBackend({ root: root(), port: guardNatsPort(streamPort) }).catch(caught => caught as Error);
+    expect(opened).toBeInstanceOf(Error);
+    expect((opened as Error & { code?: string }).code).toBe("E_LEAKY");
+    expectNoSecret(texts(opened));
+
+    // Publish: a final (not transient) error keeps its class.
+    class PublishFailure extends Error {}
+    const server = fakeJetStream();
+    const port = server.port();
+    const publish = port.publish.bind(port);
+    let failPublish = false;
+    port.publish = async (...args) => {
+      if (failPublish) throw Object.assign(new PublishFailure(`publish failed at ${credentialed}`), { url: credentialed, cause: leaky("ack") });
+      return publish(...args);
+    };
+    const backend = await openNatsStateBackend({ root: root(), port: guardNatsPort(port) });
+    await backend.put({ key: "x/a", value: 1, identity });
+    failPublish = true;
+    const published = await backend.put({ key: "x/b", value: 1, identity }).catch(caught => caught as Error);
+    expect(published).toBeInstanceOf(Error);
+    expectNoSecret(texts(published));
+
+    // Consumer: the error the port hands to onError, then every read, write and diagnostics line.
+    failPublish = false;
+    server.breakDelivery(leaky("consumer"));
+    const read = (() => { try { backend.get("x/a"); return undefined; } catch (caught) { return caught as Error; } })();
+    expect(read).toBeInstanceOf(Error);
+    expect((read as Error & { code?: string }).code).toBe("E_LEAKY");
+    expectNoSecret(texts(read));
+    expectNoSecret(texts(await backend.put({ key: "x/c", value: 1, identity }).catch(caught => caught as Error)));
+    expectNoSecret([String(backend.diagnostics().nats?.failure)]);
+  });
+
+  it("CODE P2: a prerelease is below its release: 2.14.7-rc.1 and -beta refused, 2.14.7 and 2.14.8 accepted", async () => {
+    for (const version of ["2.14.7-rc.1", "2.14.7-beta", "v2.14.7-rc.1", "2.14", "garbage"]) {
+      const server = fakeJetStream();
+      server.version = version;
+      await expect(open(server), version).rejects.toThrow(/older than 2\.14\.7/);
+    }
+    for (const version of ["2.14.7", "v2.14.7", "2.14.8", "2.15.0-rc.1", "3.0.0"]) {
+      const server = fakeJetStream();
+      server.version = version;
+      await expect(open(server), version).resolves.toBeInstanceOf(NatsStateBackend);
+    }
   });
 });

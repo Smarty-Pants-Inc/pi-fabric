@@ -12,6 +12,7 @@ import dns from "node:dns";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { gte as semverGte, valid as semverValid } from "semver";
 import { captureStorageDelete, captureStoragePut, storageRevision } from "../verified/storage.js";
 import type { MeshIdentity } from "./event-log.js";
 import type {
@@ -671,7 +672,7 @@ export class NatsStateBackend implements StateBackend {
   /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
   #fail(error: unknown): void {
     if (this.#failure !== undefined || this.#closed) return;
-    this.#failure = error instanceof Error ? error : new Error(String(error));
+    this.#failure = error instanceof Error ? error : new Error(redactNatsUrls(String(error)));
     for (const waiter of this.#waiters.splice(0)) waiter.reject(this.#failure);
   }
 
@@ -916,7 +917,7 @@ export class NatsStateBackend implements StateBackend {
   diagnostics(): StateBackendDiagnostics {
     return { kind: "nats", nats: { stream: this.#options.stream, appliedSeq: this.#snapshot.seq, knownSeq: this.#knownSeq,
       status: this.#snapshot.status, casRetries: this.#casRetries, resyncing: this.#resyncing, snapshotSeq: this.#snapshot.snapshotEnd, snapshots: this.#snapshots,
-      resyncs: this.#resyncs, ...(this.#failure ? { failure: String(this.#failure) } : {}) } } as StateBackendDiagnostics;
+      resyncs: this.#resyncs, ...(this.#failure ? { failure: redactNatsUrls(String(this.#failure)) } : {}) } } as StateBackendDiagnostics;
   }
 
   close(): void {
@@ -938,14 +939,10 @@ export const preparedNatsStateBackend = (root: string): NatsStateBackend | undef
 
 /** Minimum server: 2.14.7, as smarty-dev#7504 requires (per-message TTL and delete markers since 2.11; the KV leases of phase 2). */
 export const MIN_SERVER = [2, 14, 7];
+// Strict semver (pi-fabric#937 round 1): a prerelease (2.14.7-rc.1) is below its release; an unparseable version refuses.
 const versionAtLeast = (version: string, minimum: number[]): boolean => {
-  const parts = version.replace(/^v/, "").split(/[.-]/).slice(0, 3).map(part => Number.parseInt(part, 10));
-  for (let index = 0; index < 3; index++) {
-    const have = parts[index] ?? 0, want = minimum[index] ?? 0;
-    if (!Number.isFinite(have)) return false;
-    if (have !== want) return have > want;
-  }
-  return true;
+  const have = semverValid(version.replace(/^v/, ""));
+  return have !== null && semverGte(have, minimum.join("."));
 };
 
 export interface OpenNatsStateBackendOptions {
@@ -999,16 +996,57 @@ export const redactNatsUrl = (url: string): string => {
     const parsed = new URL(withScheme(url));
     if (parsed.username || parsed.password) { parsed.username = "***"; parsed.password = ""; }
     for (const key of [...parsed.searchParams.keys()]) parsed.searchParams.set(key, "***");
+    if (parsed.hash) parsed.hash = "***"; // pi-fabric#937 round 1: a fragment can carry a token too
     const shown = parsed.toString();
     return withScheme(url) === url ? shown : shown.replace(/^nats:\/\//, "");
   } catch {
-    return url.replace(/\/\/[^/@\s]*@/g, "//***@").replace(/([?&][^=&\s]*=)[^&\s]*/g, "$1***");
+    // Unparseable: nothing after the scheme is shown (any part of it may be a credential).
+    return `${/^[a-z][a-z0-9+.-]*:\/\//i.exec(url)?.[0] ?? ""}*** (unparseable URL)`;
   }
 };
 
 /** Every URL inside a message (a client or fetch error), redacted as redactNatsUrl does. */
 export const redactNatsUrls = (text: string): string =>
   text.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, url => redactNatsUrl(url)).replace(/\b[^\s/@:'"]+:[^\s/@'"]+@/g, "***@");
+
+/**
+ * An error fit to leave the NATS client (pi-fabric#937 round 1): every string field (message, stack, url, address,
+ * ...) has its URLs redacted, and its cause is sanitized the same way (a non-Error cause is dropped). Done in place,
+ * so the class, `code`, `transient` and `apiError()` stay.
+ */
+export const redactNatsError = (error: unknown, depth = 0): Error => {
+  if (!(error instanceof Error)) return new Error(redactNatsUrls(String(error)));
+  try {
+    for (const key of new Set(["message", "stack", ...Object.keys(error)])) {
+      const value = (error as unknown as Record<string, unknown>)[key];
+      if (typeof value === "string") Object.defineProperty(error, key, { value: redactNatsUrls(value), writable: true, configurable: true });
+    }
+    if ("cause" in error) {
+      const cause = depth < 4 && error.cause instanceof Error ? redactNatsError(error.cause, depth + 1) : undefined;
+      Object.defineProperty(error, "cause", { value: cause, writable: true, configurable: true });
+    }
+    return error;
+  } catch {
+    return Object.assign(new Error(redactNatsUrls(error.message)), { name: error.name });
+  }
+};
+
+/**
+ * The one choke point of the real client (pi-fabric#937 round 1): every port method's thrown error, every error it
+ * hands to a callback (`onError`), and the `stop` it returns pass through redactNatsError.
+ */
+export const guardNatsPort = (port: JetStreamPort): JetStreamPort => {
+  const guard = <A extends unknown[], R>(method: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    const safe = args.map(arg => typeof arg !== "function" ? arg
+      : (...inner: unknown[]) => (arg as (...values: unknown[]) => unknown)(...inner.map(value => value instanceof Error ? redactNatsError(value) : value))) as A;
+    let result: R;
+    try { result = await method(...safe); } catch (error) { throw redactNatsError(error); }
+    const stop = (result as { stop?: unknown } | undefined)?.stop;
+    return typeof stop === "function" ? { ...result, stop: guard(stop as () => Promise<unknown>) } as R : result;
+  };
+  return Object.fromEntries(Object.entries(port).map(([key, method]) =>
+    [key, typeof method === "function" ? guard(method as (...args: unknown[]) => Promise<unknown>) : method])) as unknown as JetStreamPort;
+};
 
 export type NatsLookup = (host: string) => Promise<{ address: string; family: number }[]>;
 const systemLookup: NatsLookup = host => dns.promises.lookup(host, { all: true, verbatim: true });

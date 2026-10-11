@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { withFabricHostCaller } from "../src/fabric-provenance.js";
 import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
+import { MeshStateFileNotDurableError } from "../src/mesh/state-file.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
@@ -52,8 +53,11 @@ const runUntilKilled = async (root: string, backend: "file" | "sqlite", ackPath:
   expect(child.signalCode).toBe("SIGKILL");
 };
 
+// File state has no namespace barrier on Windows: its sync() refuses there (see the platform-stubbed tests below).
+const windowsFile = (backend: "file" | "sqlite"): boolean => backend === "file" && process.platform === "win32";
+
 describe.each(["file", "sqlite"] as const)("MeshStore.sync durability barrier (%s state)", backend => {
-  it("a SIGKILLed producer's reopened mesh holds every event and state record its synced cursor covers", async () => {
+  it.skipIf(windowsFile(backend))("a SIGKILLed producer's reopened mesh holds every event and state record its synced cursor covers", async () => {
     const root = tempRoot("mesh-sync-crash-"), out = tempRoot("mesh-sync-ack-");
     const ackPath = path.join(out, "cursor.jsonl");
     await runUntilKilled(root, backend, ackPath, out, 4);
@@ -96,7 +100,7 @@ describe.each(["file", "sqlite"] as const)("MeshStore.sync durability barrier (%
     }
   }, 40_000);
 
-  it("syncs an empty root, and its own commits, without creating anything", async () => {
+  it.skipIf(windowsFile(backend))("syncs an empty root, and its own commits, without creating anything", async () => {
     const root = tempRoot("mesh-sync-empty-");
     const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: backend });
     try {
@@ -118,7 +122,7 @@ describe("MeshStore.sync through (pi-fabric#894)", () => {
   // Process A reserves sequence n (the counter) and pauses under .lock before its append; process B
   // (this test) calls mesh.sync. B's through must stay below n until A appends: a producer that
   // fsyncs its cursor through a reserved-but-unappended n would skip n after a crash.
-  it("never reports a reserved but unappended sequence across processes", async () => {
+  it.skipIf(process.platform === "win32")("never reports a reserved but unappended sequence across processes", async () => {
     const root = tempRoot("mesh-sync-race-"), out = tempRoot("mesh-sync-race-out-");
     const pause = path.join(out, "pause");
     const identity = { id: "sync-race-b", name: "sync-race-b", kind: "agent" as const };
@@ -181,7 +185,7 @@ describe("MeshStore.sync through (pi-fabric#894)", () => {
 });
 
 describe("MeshStore.sync failure", () => {
-  it("rejects when the event fsync fails, so the caller advances nothing", async () => {
+  it.skipIf(process.platform === "win32")("rejects when the event fsync fails, so the caller advances nothing", async () => {
     const root = tempRoot("mesh-sync-fail-");
     const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: "file" });
     try {
@@ -192,5 +196,79 @@ describe("MeshStore.sync failure", () => {
       finally { fs.fsyncSync = real; }
       await store.sync();
     } finally { store.closeState(); }
+  });
+});
+
+// PR #894 review: on Windows syncPathNamespace skips the directory fsync and renameAtomic is a plain rename,
+// so StateFile.sync() cannot confirm the rename that replaced state.json. It fails closed, like NATS
+// acceptPeriodicSync: typed, not retryable, and mesh.sync surfaces it so a producer advances nothing.
+describe("file state sync without a namespace barrier (win32)", () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const onPlatform = async <T>(value: NodeJS.Platform, run: () => Promise<T>): Promise<T> => {
+    Object.defineProperty(process, "platform", { ...platform, value });
+    try { return await run(); } finally { Object.defineProperty(process, "platform", platform); }
+  };
+  const identity = { id: "sync-win", name: "sync-win", kind: "agent" as const };
+
+  it("StateFile.sync rejects as not durable on win32 and resolves on linux", async () => {
+    const root = tempRoot("mesh-sync-win32-");
+    const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: "file" });
+    try {
+      await store.put({ key: "forwarder/cursor/1", value: 1, identity });
+      const state = store.stateBackendHandle;
+      const error = await onPlatform("win32", () => state.sync(1_000).then(() => undefined, (failure: unknown) => failure));
+      expect(error).toBeInstanceOf(MeshStateFileNotDurableError);
+      expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_FILE_NOT_DURABLE", retryable: false, platform: "win32" });
+      expect((error as Error).message).toMatch(/durability is not confirmed.*win32.*not durable/);
+      // Refused before any I/O: an empty root on win32 is refused too (no durability claim at all).
+      const empty = new MeshStore(tempRoot("mesh-sync-win32-empty-"), 64 * 1024, 100, { stateBackend: "file" });
+      try { await expect(onPlatform("win32", () => empty.stateBackendHandle.sync(0))).rejects.toBeInstanceOf(MeshStateFileNotDurableError); }
+      finally { empty.closeState(); }
+      if (process.platform !== "win32") {
+        await expect(onPlatform("linux", () => state.sync(1_000))).resolves.toBeUndefined();
+        // The store stays usable: only the durability claim was refused.
+        expect(store.get("forwarder/cursor/1", { fresh: true })?.value).toBe(1);
+      }
+    } finally { store.closeState(); }
+  });
+
+  it("mesh.sync surfaces the not-durable rejection on win32, and synced on linux", async () => {
+    const root = tempRoot("mesh-sync-win32-provider-");
+    const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: "file" });
+    const participants: FabricParticipantSource = {
+      list: () => [], get: () => undefined, self: () => { throw new Error("unused"); },
+      peers: () => [], async refresh() {}, scheduleRefresh() {},
+    };
+    const provider = new MeshProvider(store, identity, participants);
+    const host = withFabricHostCaller({
+      cwd: process.cwd(), signal: undefined, extensionContext: {} as ExtensionContext,
+      parentToolCallId: "sync-win32", nestedToolCallId: "sync-win32", update() {},
+    } satisfies FabricInvocationContext, "fabric-github.forwarder");
+    try {
+      await store.put({ key: "forwarder/failed/1", value: 1, identity });
+      const event = await store.publish({ topic: "ops.sync", from: identity });
+      await onPlatform("win32", async () => {
+        await expect(store.sync()).rejects.toBeInstanceOf(MeshStateFileNotDurableError);
+        await expect(provider.invoke("sync", {}, host)).rejects.toMatchObject({
+          code: "FABRIC_MESH_STATE_FILE_NOT_DURABLE", retryable: false, message: expect.stringContaining("not durable") });
+      });
+      if (process.platform !== "win32") {
+        await expect(onPlatform("linux", () => provider.invoke("sync", {}, host))).resolves.toEqual({ synced: true, through: event.sequence });
+      }
+    } finally { store.closeState(); }
+  });
+
+  it("shadow state, whose authority is state.json, refuses the same way; SQLite state does not", async () => {
+    const shadow = new MeshStore(tempRoot("mesh-sync-win32-shadow-"), 64 * 1024, 100, { stateBackend: "shadow" });
+    const sqlite = new MeshStore(tempRoot("mesh-sync-win32-sqlite-"), 64 * 1024, 100, { stateBackend: "sqlite" });
+    try {
+      await shadow.put({ key: "forwarder/a", value: 1, identity });
+      await sqlite.put({ key: "forwarder/a", value: 1, identity });
+      await onPlatform("win32", async () => {
+        await expect(shadow.sync()).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_FILE_NOT_DURABLE" });
+        // SQLite commits never rename: its barrier is a checkpoint flushed into state.db in place.
+        await expect(sqlite.sync()).resolves.toMatchObject({ through: 0 });
+      });
+    } finally { shadow.closeState(); sqlite.closeState(); }
   });
 });

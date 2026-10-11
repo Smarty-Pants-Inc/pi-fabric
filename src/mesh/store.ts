@@ -356,7 +356,8 @@ export class MeshStore {
    * No writer lock is held while it syncs: events use the group-commit barrier of a durable publish
    * (fsync of events.jsonl and its namespace after `.lock`); SQLite state uses the PASSIVE
    * checkpoint barrier (smarty-dev#6100: no copy or fsync under SQLite's writer lock); file state
-   * fsyncs state.json and its namespace. A caller must not advance its external record on a throw.
+   * fsyncs state.json and its namespace, and rejects as not durable on Windows (no directory barrier;
+   * MeshStateFileNotDurableError). A caller must not advance its external record on a throw.
    *
    * It resolves with `through`, the highest event sequence committed to the log (a complete line)
    * before this barrier's fsync, so every event at or below it that is still live is now on disk.

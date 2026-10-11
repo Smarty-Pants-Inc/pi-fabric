@@ -284,7 +284,8 @@ return { denied, ordinary, batchPresent: "publishBatch" in mesh };
     expect(h.store.read()).toHaveLength(1);
   }, 30_000);
 
-  it("gives trusted host components the mesh.sync barrier and refuses forged or public callers (smarty-dev#9313)", async () => {
+  // File state sync refuses on Windows (no namespace barrier; see mesh-store-sync.test.ts).
+  it.skipIf(backend === "file" && process.platform === "win32")("gives trusted host components the mesh.sync barrier and refuses forged or public callers (smarty-dev#9313)", async () => {
     const h = await harness(backend);
     const host = await h.publisher();
     const sync = vi.spyOn(h.store, "sync");

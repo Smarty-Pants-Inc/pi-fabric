@@ -600,6 +600,21 @@ const processStartedAfter = (pid: number, modifiedAt: number): boolean => {
   } catch { return false; }
 };
 
+/**
+ * `StateFile.sync()` on a platform with no durable namespace barrier (Windows: no directory fsync, and
+ * `renameAtomic` is a plain rename). state.json is replaced by a rename on every commit, so an fsync of the
+ * file cannot confirm the directory entry survives a power loss. Not retryable: the caller must not advance
+ * an external cursor or delivered mark on it (smarty-dev#9313, same contract as the NATS not-durable error).
+ */
+export class MeshStateFileNotDurableError extends Error {
+  readonly code = "FABRIC_MESH_STATE_FILE_NOT_DURABLE";
+  readonly retryable = false;
+  constructor(readonly platform: NodeJS.Platform) {
+    super(`FABRIC_MESH_STATE_FILE_NOT_DURABLE: Fabric mesh state durability is not confirmed: state.json is replaced by a rename and ${platform} has no directory fsync barrier for it, so a commit may not survive a power loss; not durable`);
+    this.name = "MeshStateFileNotDurableError";
+  }
+}
+
 export class StateFile implements StateBackend {
   readonly kind = "file" as const;
   /** Set by the backend factory when a configured sqlite/shadow backend runs as file. */
@@ -1165,12 +1180,15 @@ export class StateFile implements StateBackend {
    * fsyncs the file the path names now and its namespace, outside `.lock`. A commit made before the
    * call is that file or an older one it replaced, and the directory barrier persists the rename. A
    * concurrent rename during the namespace check is retried within the budget; an I/O error is not.
+   * On Windows there is no directory barrier (syncPathNamespace skips it), so this fails closed with
+   * MeshStateFileNotDurableError instead of claiming durability for the rename.
    */
   async sync(budgetMs: number): Promise<void> {
+    if (process.platform === "win32") throw new MeshStateFileNotDurableError(process.platform);
     const deadline = Date.now() + Math.max(0, budgetMs);
     for (;;) {
       let fd: number;
-      try { fd = fs.openSync(this.#statePath, process.platform === "win32" ? "r+" : "r"); }
+      try { fd = fs.openSync(this.#statePath, "r"); }
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
       try {
         fs.fsyncSync(fd);

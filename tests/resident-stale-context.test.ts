@@ -11,6 +11,7 @@ import piFabric from "../src/index.js";
 import { FabricState } from "../src/fabric-state.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { residentProcessWorkPending } from "../src/residency/process-work.js";
 import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
@@ -30,8 +31,10 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
   const residentRoot = path.join(root, "resident");
   fs.mkdirSync(residentRoot, { recursive: true });
   const configPath = path.join(residentRoot, "config.json");
+  // Native resident Pi sessions differ from the originating Main in config.json.
+  const ownerSessionId = "originating-main-session";
   const config: ResidentHostConfig = {
-    format: RESIDENT_HOST_FORMAT, rootId: `session:${manager.getSessionId()}`, sessionId: manager.getSessionId(),
+    format: RESIDENT_HOST_FORMAT, rootId: `session:${ownerSessionId}`, sessionId: ownerSessionId,
     cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: residentRoot,
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -121,15 +124,20 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
       update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000 };
     pending = before.registry.invoke("extensions.browser_child", {}, invocation).then(value => ({ value }), error => ({ error }));
     await started;
+    expect(residentProcessWorkPending(manager.getSessionId())).toBe(true);
     await session.reload();
     await waitFor(() => fs.existsSync(ownerFile) && JSON.parse(fs.readFileSync(ownerFile, "utf8")).token !== oldOwner);
     expect(shutdown).not.toHaveBeenCalled(); // Reload itself owns teardown, not the retired resident callback.
     expect(residentHosts).toHaveLength(2);
+    expect(residentProcessWorkPending(manager.getSessionId())).toBe(true); // Caller abort did not settle the real child.
+    expect(residentProcessWorkPending(config.sessionId)).toBe(false); // Owner identity is not execution identity.
     expect(residentHosts[1]!.actors.status(actor.id)).toMatchObject({ id: actor.id, name: "review-actor", status: "idle", sessionFile: actorSession });
     expect(await pending).toMatchObject({ error: { message: expect.stringMatching(/closed|abort/i) } });
     children[0]!.process.send("release");
     await children[0]!.closed;
     await waitFor(() => completed === 1);
+    await waitFor(() => !residentProcessWorkPending(manager.getSessionId()));
+    await waitFor(() => residentHosts[1]!.actors.status(actor.id).status === "dormant");
     await new Promise(resolve => setImmediate(resolve));
     expect(staleReads).toBe(0);
     await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("fresh", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext());

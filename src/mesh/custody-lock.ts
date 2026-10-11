@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
 
 /**
@@ -116,16 +117,15 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     }
     await delay(Math.min(Math.max(0, deadline - Date.now()), 5 + Math.floor(Math.random() * 20)));
   }
+  // smarty-dev#8777: release through the directory pinned now (the publication fence's fd-pinned release),
+  // never a check-then-rename by name that a reclaimed, stalled holder could run against its successor.
+  const pin = pinFenceLock(lock, record);
+  if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(` (custody lock ${lock} was reclaimed before entry)`, attempts, maxGapMs);
+  let released = false;
   return () => {
-    try {
-      if (readOwner() !== record) return;
-      // Detach before removal: never recursively delete through the canonical name.
-      const released = `${lock}.released.${pathToken}`;
-      fs.renameSync(lock, released);
-      fs.rmSync(released, { recursive: true, force: true });
-    } catch {
-      // Already recovered or replaced: never delete a successor.
-    }
+    if (released) return;
+    released = true;
+    releaseFenceLock(lock, record, {}, pin);
   };
 };
 

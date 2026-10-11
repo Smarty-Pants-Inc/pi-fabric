@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -214,18 +215,14 @@ export class MeshLock {
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
+    // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
+    // reclaimed, remove its successor's lock. Before the pin exists the release takes the unpinned path.
+    let pin: number | undefined;
     const releaseOwned = (): void => {
-      try {
-        if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
-          // Detach the complete owned directory before unlinking anything inside it.
-          // Interrupted/resumed recursive cleanup must never follow the canonical name.
-          const released = `${this.#lockPath}.released.${token}`;
-          fs.renameSync(this.#lockPath, released);
-          fs.rmSync(released, { recursive: true, force: true });
-        }
-      } catch {
-        // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
-      }
+      const held = pin;
+      pin = undefined;
+      releaseFenceLock(this.#lockPath, ownerRecord, {}, held);
     };
     const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
     try {
@@ -312,6 +309,9 @@ export class MeshLock {
           else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
       }
+      pin = pinFenceLock(this.#lockPath, ownerRecord);
+      // Already reclaimed before we entered: we never held it, so run nothing and release nothing.
+      if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
       if (lockStats) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();

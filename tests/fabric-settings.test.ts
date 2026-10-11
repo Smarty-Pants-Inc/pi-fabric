@@ -972,6 +972,43 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("opens the settings screen as a centered overlay", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-overlay-"));
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    fs.mkdirSync(cwd, { recursive: true });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    const state = {
+      config, kernelReloadRequired: false,
+      ensure: vi.fn(async () => liveLease),
+      reloadConfig: vi.fn(),
+      agents: { claudeModels: vi.fn(async () => []) },
+    };
+    const custom = vi.fn(async (_factory: unknown, _options?: unknown) => {});
+    const context = {
+      mode: "tui", cwd, isProjectTrusted: () => true,
+      modelRegistry: { getAvailable: () => fakeModelSource.models },
+      ui: { notify: vi.fn(), custom },
+    } as unknown as ExtensionContext;
+    try {
+      await openFabricSettings(context, {
+        state: state as unknown as FabricState,
+        applyFabricMode: vi.fn(),
+        capturedTools: { list: () => [] } as unknown as CapturedToolCatalog,
+      });
+      // The overlay path is what makes pi composite the panel and clear native
+      // image placements; the transcript must not shine through it.
+      expect(custom).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({
+          overlay: true,
+          overlayOptions: expect.objectContaining({ anchor: "center", width: "94%", maxHeight: "90%" }),
+        }),
+      );
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("persists tool-display changes through the real settings dialog flow", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-display-"));
     const cwd = path.join(root, "project");

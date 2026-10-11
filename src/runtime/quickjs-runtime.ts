@@ -6,6 +6,7 @@ import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { FabricTargetTerminalError } from "../agents/terminal-target.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
 import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
@@ -29,6 +30,7 @@ type QuickJsModule = Awaited<ReturnType<typeof newQuickJSWASMModuleFromVariant>>
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_MESH_HOST_PUBLISH_REQUIRED: "MeshHostPublishError",
   FABRIC_DIRECTORY_UNAVAILABLE: "FabricDirectoryUnavailableError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
@@ -42,6 +44,10 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (!(error instanceof Error)) return undefined;
   // Preserve only the fixed policy classification, never arbitrary Error fields.
   if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  if (error instanceof FabricTargetTerminalError) return {
+    name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
+    targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
+  };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
   if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;

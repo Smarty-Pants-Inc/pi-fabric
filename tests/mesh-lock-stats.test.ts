@@ -1,10 +1,11 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
+  captureLockStatsWriter, createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_WRITER_MAX_CHARS, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
@@ -49,7 +50,7 @@ afterEach(() => {
 });
 
 describe("mesh lock stats recorder", () => {
-  it("aggregates wait and hold per class and wall-clock minute and writes after the minute", () => {
+  it("aggregates wait and hold per class and flushes after the minute only on real work", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const root = temp();
@@ -63,11 +64,15 @@ describe("mesh lock stats recorder", () => {
     stats.acquired(root, "heartbeat/confirm", 50, 0.2);
     stats.failed(root, "custody", 10_000, false);
     stats.failed(root, "custody", 50, true);
-    expect(vi.getTimerCount()).toBe(1);
+    // Even dirty startup samples have no scheduled flush: a minute boundary is not work.
+    expect(vi.getTimerCount()).toBe(0);
     expect(process.listenerCount("exit")).toBe(exitListeners + 1);
     vi.advanceTimersByTime(49_000);
     expect(fs.existsSync(ownFile(root))).toBe(false);
-    vi.advanceTimersByTime(14_000); // past the minute plus the pid spread (<= 2.5 s)
+    vi.advanceTimersByTime(14_000); // past the minute, still no idle diagnostic wake
+    expect(fs.existsSync(ownFile(root))).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush(); // An explicit diagnostic request publishes the samples.
     const file = read(root);
     expect(file).toMatchObject({ version: 1, host: lockStatsHost(), pid: process.pid, root: fs.realpathSync.native(root) });
     expect(file.minutes).toHaveLength(1);
@@ -261,7 +266,7 @@ describe("mesh lock stats recorder", () => {
     expect(fs.existsSync(stale)).toBe(false);
   });
 
-  it("prunes a quiet root hourly without new acquisitions and drops a removed root", () => {
+  it("prunes a quiet root opportunistically on explicit flush and drops a removed root", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const parent = temp();
@@ -269,7 +274,8 @@ describe("mesh lock stats recorder", () => {
     fs.mkdirSync(root);
     const stats = createLockStats("1")!;
     stats.acquired(root, "custody", 1, 1);
-    vi.advanceTimersByTime(63_000); // written and pruned once; the root is quiet from now on
+    registry[lockKey]!.flush(); // written and pruned once; the root is quiet from now on
+    vi.advanceTimersByTime(63_000);
     const written = fs.statSync(ownFile(root)).mtimeMs;
     const stale = path.join(root, "lock-stats", "gone-1.json");
     const fresh = path.join(root, "lock-stats", "alive-2.json");
@@ -278,22 +284,28 @@ describe("mesh lock stats recorder", () => {
     fs.utimesSync(stale, (T0 - 25 * 60 * 60_000) / 1000, (T0 - 25 * 60 * 60_000) / 1000);
     fs.utimesSync(fresh, T0 / 1000, T0 / 1000);
     vi.advanceTimersByTime(30 * 60_000);
-    expect(fs.existsSync(stale)).toBe(true); // hourly, not every minute
+    registry[lockKey]!.flush();
+    expect(fs.existsSync(stale)).toBe(true); // throttled to at most hourly during actual work
     vi.advanceTimersByTime(31 * 60_000);
+    expect(fs.existsSync(stale)).toBe(true); // no idle pruning timer
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush();
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(fresh)).toBe(true);
     expect(fs.statSync(ownFile(root)).mtimeMs).toBe(written); // pruning did not rewrite
     fs.rmSync(root, { recursive: true, force: true });
-    expect(() => vi.advanceTimersByTime(61 * 60_000)).not.toThrow();
+    vi.advanceTimersByTime(61 * 60_000);
+    expect(() => registry[lockKey]!.flush()).not.toThrow();
     expect(fs.existsSync(root)).toBe(false);
-    // Dropped from tracking: later hourly flushes no longer touch it.
+    // Dropped from tracking: later explicit flushes no longer touch it.
     const readdir = vi.spyOn(fs, "readdirSync");
     vi.advanceTimersByTime(61 * 60_000);
+    registry[lockKey]!.flush();
     expect(readdir.mock.calls.filter(([target]) => String(target).startsWith(root))).toHaveLength(0);
     expect(fs.existsSync(root)).toBe(false);
   });
 
-  it("prunes its own file by age: kept while fresh, removed after 24 h without acquisitions", () => {
+  it("prunes its own file by age on real work: kept while fresh, removed by flush after 24 h", () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const parent = temp();
@@ -301,12 +313,17 @@ describe("mesh lock stats recorder", () => {
     fs.mkdirSync(root);
     const stats = createLockStats("1")!;
     stats.acquired(root, "custody", 1, 1);
-    vi.advanceTimersByTime(63_000); // written (and pruned once); quiet from now on
+    registry[lockKey]!.flush(); // written (and pruned once); quiet from now on
+    vi.advanceTimersByTime(63_000);
     // File times follow the real clock; pin the own file to the fake write time.
     fs.utimesSync(ownFile(root), T0 / 1000, T0 / 1000);
-    vi.advanceTimersByTime(23 * 60 * 60_000); // several hourly prunes within the retention
+    vi.advanceTimersByTime(23 * 60 * 60_000);
+    registry[lockKey]!.flush(); // within the retention: kept
     expect(fs.existsSync(ownFile(root))).toBe(true);
-    vi.advanceTimersByTime(2 * 60 * 60_000); // past 24 h with no acquisition
+    vi.advanceTimersByTime(2 * 60 * 60_000); // past 24 h with no acquisition: still no wake
+    expect(fs.existsSync(ownFile(root))).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    registry[lockKey]!.flush();
     expect(fs.existsSync(ownFile(root))).toBe(false);
     // Still tracked: the next acquisition recreates the file.
     stats.acquired(root, "publish", 1, 2);
@@ -358,6 +375,56 @@ describe("mesh lock stats recorder", () => {
     const stats = first.createLockStats("1");
     expect(second.createLockStats("1")).toBe(stats);
     expect(second.createLockStats("0")).toBe(stats);
+  });
+
+  it("records its writer once at first acquisition, immutable across env changes, flushes and reloads (smarty-dev#8305)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const root = temp();
+    for (const name of ["PI_FABRIC_AGENT_NAME", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ROLE", "SMARTY_ROLE"]) vi.stubEnv(name, "");
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "before-create");
+    const stats = createLockStats("1")!;
+    // Captured at first use, not at creation, and not per acquisition.
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "worker-7");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor-0123456789");
+    vi.stubEnv("SMARTY_ROLE", "task-agent@0123456789ab");
+    stats.acquired(root, "publish", 1, 2);
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "changed");
+    vi.stubEnv("PI_FABRIC_ROLE", "org");
+    registry[lockKey]!.flush();
+    const expected = { argv1: path.basename(process.argv[1]!), agentName: "worker-7", actorId: "actor-0123456789",
+      smartyRole: "task-agent@0123456789ab", ppid: process.ppid };
+    expect(read(root).writer).toEqual(expected);
+    vi.resetModules();
+    const reloaded = await import("../src/mesh/commit-stats.js");
+    const again = reloaded.createLockStats("1")!;
+    expect(again).toBe(stats);
+    vi.setSystemTime(T0 + 60_000);
+    again.acquired(root, "custody", 1, 2); // the next minute's flush rewrites the file
+    expect(read(root).minutes).toHaveLength(2);
+    expect(read(root).writer).toEqual(expected);
+  });
+
+  it("captures only set, bounded, separate source facts", () => {
+    const writer = captureLockStatsWriter({ PI_FABRIC_AGENT_NAME: "  ", PI_FABRIC_ROLE: "r".repeat(500), PI_FABRIC_ACTOR_NAME: "Ada" },
+      "/opt/pi/dist/bridge-worker.js", 42);
+    expect(writer).toEqual({ argv1: "bridge-worker.js", actorName: "Ada", role: "r".repeat(LOCK_STATS_WRITER_MAX_CHARS), ppid: 42 });
+    expect(Object.isFrozen(writer)).toBe(true);
+    expect(captureLockStatsWriter({}, "", -1)).toEqual({});
+  });
+
+  it("keeps an exited child writer attributable from its file", () => {
+    const root = temp();
+    const env = { ...process.env, PI_FABRIC_AGENT_NAME: "child-writer", PI_FABRIC_ACTOR_ID: "", PI_FABRIC_ACTOR_NAME: "",
+      PI_FABRIC_ROLE: "", SMARTY_ROLE: "task-agent" };
+    const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/lock-stats-writer.mjs"),
+      path.resolve("src/mesh/commit-stats.ts"), root], { env, encoding: "utf8", timeout: 30_000 });
+    expect(child.stderr).toBe("");
+    expect(child.status).toBe(0);
+    const file = JSON.parse(fs.readFileSync(path.join(root, "lock-stats", `${lockStatsHost()}-${child.pid}.json`), "utf8")) as LockStatsFile;
+    expect(file.writer).toEqual({ argv1: "lock-stats-writer.mjs", agentName: "child-writer", smartyRole: "task-agent", ppid: process.pid });
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: file.updatedAt + 60_000 });
+    expect(summary.pids[0]!.writer).toEqual(file.writer);
   });
 });
 
@@ -468,6 +535,44 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
   });
 
+  it("carries optional writer facts through read, summary, JSON and table; old files stay valid; a bad writer fails the gate", () => {
+    const root = temp();
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    const minutes = (holdMs: number): LockStatsFile["minutes"] => [{ minute: MINUTE0, classes: { publish: bucket({ n: 1, holdMs }) } }];
+    const write = (name: string, body: unknown): void => fs.writeFileSync(path.join(root, "lock-stats", name), JSON.stringify(body));
+    fixture(root, "ryzen1", 100, minutes(30)); // pre-#8305 file: no writer
+    write("ryzen1-200.json", { version: 1, host: "ryzen1", pid: 200, root, startedAt: T0, updatedAt: T0, minutes: minutes(20),
+      writer: { argv1: "cli.js", agentName: "lane\u001b[2J", smartyRole: "task-agent@abc", ppid: 7, future: "dropped" } });
+    const bad = [{ argv1: 5 }, ["cli.js"], "cli.js", { ppid: -1 }, { agentName: "x".repeat(LOCK_STATS_WRITER_MAX_CHARS + 1) }, null];
+    bad.forEach((writer, index) => write(`evil-${index}.json`,
+      { version: 1, host: "evil", pid: index, root, startedAt: T0, updatedAt: T0, minutes: minutes(1), writer }));
+    const problems: string[] = [];
+    const files = readLockStats(root, problems);
+    expect(files.map(file => file.pid).sort()).toEqual([100, 200]);
+    expect(problems.sort()).toEqual(bad.map((_, index) => `evil-${index}.json: bad writer`));
+    const summary = summarizeLockStats(root, files, { minutes: 2, now });
+    expect(summary.pids.map(row => [row.pid, row.writer])).toEqual([
+      [100, undefined],
+      [200, { argv1: "cli.js", agentName: "lane\u001b[2J", smartyRole: "task-agent@abc", ppid: 7 }],
+    ]);
+    expect("writer" in summary.pids[0]!).toBe(false);
+    let out = "";
+    let err = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: (text: string) => { err += text; }, now };
+    expect(main(["--mesh", root, "--minutes", "2", "--max-busy", "90"], io)).toBe(3);
+    expect(err).toContain("ignored evil-0.json: bad writer");
+    expect(out).toMatch(/top class\s+writer\n/);
+    expect(out).toMatch(/ryzen1-100\s.*publish\s+-\n/);
+    expect(out).toContain("cli.js lane\\u001b[2J task-agent ppid=7");
+    expect(out).not.toContain("\u001b");
+    for (let index = 0; index < bad.length; index++) fs.rmSync(path.join(root, "lock-stats", `evil-${index}.json`));
+    out = "";
+    expect(main(["--mesh", root, "--minutes", "2", "--json", "--max-busy", "90"], io)).toBe(0);
+    const json = JSON.parse(out) as { pids: Array<{ pid: number; writer?: unknown }> };
+    expect(json.pids.find(row => row.pid === 200)!.writer).toEqual(summary.pids[1]!.writer);
+    expect(json.pids.find(row => row.pid === 100)!.writer).toBeUndefined();
+  });
+
   it("escapes control characters in printed host labels", () => {
     const root = temp();
     fs.mkdirSync(path.join(root, "lock-stats"));
@@ -478,5 +583,42 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(main(["--mesh", root, "--minutes", "2"], { stdout: (text: string) => { out += text; }, now: (MINUTE0 + 2) * 60_000 })).toBe(0);
     expect(out).toContain("a\\u001b[2Jb\\u000ac-9");
     expect(out).not.toContain("\u001b");
+  });
+
+  it("skips files modified before the window before the cap, and caps the stalest (smarty-dev#7826)", () => {
+    const root = temp();
+    const directory = path.join(root, "lock-stats");
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    const old = (now - (LOCK_STATS_RETAIN_MINUTES + 5) * 60_000) / 1000;
+    for (let pid = 1; pid <= 5_000; pid++) {
+      fixture(root, "aaa-dead", pid, [{ minute: MINUTE0 - 90, classes: { publish: bucket({ n: 1 }) } }]);
+      fs.utimesSync(path.join(directory, `aaa-dead-${pid}.json`), old, old);
+    }
+    fixture(root, "zzz-bridge", 7, [{ minute: MINUTE0 + 1, classes: { publish: bucket({ n: 3, holdMs: 30 }) } }]);
+    const problems: string[] = [];
+    expect(readLockStats(root, problems, { minutes: 2, now }).map(file => file.host)).toEqual(["zzz-bridge"]);
+    expect(problems).toEqual([]);
+    let out = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: () => {}, now };
+    expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
+    expect(out).toContain("3 acquisitions");
+    // The boundary is the summary window's first minute (MINUTE0 with --minutes 2 at MINUTE0 + 2):
+    // a file last written just before it is skipped; one written at its start is read.
+    fixture(root, "edge-before", 8, [{ minute: MINUTE0 - 1, classes: { publish: bucket({ n: 1 }) } }]);
+    fixture(root, "edge-at", 9, [{ minute: MINUTE0, classes: { publish: bucket({ n: 1 }) } }]);
+    fs.utimesSync(path.join(directory, "edge-before-8.json"), (MINUTE0 * 60_000 - 1) / 1000, (MINUTE0 * 60_000 - 1) / 1000);
+    fs.utimesSync(path.join(directory, "edge-at-9.json"), MINUTE0 * 60, MINUTE0 * 60);
+    expect(readLockStats(root, [], { minutes: 2, now }).map(file => file.host).sort()).toEqual(["edge-at", "zzz-bridge"]);
+    fs.unlinkSync(path.join(directory, "edge-before-8.json"));
+    fs.unlinkSync(path.join(directory, "edge-at-9.json"));
+    // Still over the cap inside the window: the newest are read and the cut is reported.
+    for (let pid = 1; pid <= LOCK_STATS_MAX_FILES; pid++) fixture(root, "aaa-fresh", pid, []);
+    const newer = Date.now() / 1000 + 3_600;
+    fs.utimesSync(path.join(directory, "zzz-bridge-7.json"), newer, newer);
+    const capped: string[] = [];
+    const files = readLockStats(root, capped, { minutes: 2, now });
+    expect(files).toHaveLength(LOCK_STATS_MAX_FILES);
+    expect(files[0]!.host).toBe("zzz-bridge");
+    expect(capped).toEqual([`${directory}: ${LOCK_STATS_MAX_FILES + 1} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`]);
   });
 });

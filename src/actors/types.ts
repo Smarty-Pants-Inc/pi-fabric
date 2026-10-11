@@ -10,6 +10,8 @@ import type { FabricActorActivationFilter } from "./activation-filter.js";
 import type { ActorWakeText } from "./wake-text.js";
 
 export type { FabricActorActivationFilter } from "./activation-filter.js";
+import type { FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
+export type { FabricActorRecord, FabricActorRecordsOptions, FabricActorRecordsView } from "./records.js";
 
 // Pi's extension event union is closed; every member we want the actor host
 // to observe must appear in FABRIC_ACTOR_PI_HOST_EVENTS below. `project_trust`
@@ -118,6 +120,14 @@ export function validateActorCoalesceKey(value: unknown): asserts value is strin
   }
 }
 
+/** An explicit occurrence path into the full mesh event, such as "data.key". */
+export function validateActorDedupeKey(value: unknown): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length > 200 || !COALESCE_KEY_PATTERN.test(value)) {
+    throw new Error(`Invalid actor dedupeKey: ${String(value)} (use a dotted path such as data.key)`);
+  }
+}
+
 export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
@@ -185,6 +195,8 @@ export type FabricActorActivation =
       sequence: number;
       createdAt: number;
       topic: string;
+      /** Immutable triggering mesh data, separate from current records. */
+      data?: unknown;
     };
 
 export interface FabricActorValidityFacts {
@@ -195,9 +207,29 @@ export interface FabricActorValidityFacts {
     taskRevision: number;
     idle: boolean;
     now: number;
+    records?: FabricActorRecordsView;
   };
   /** Untrusted, bounded GitHub text from the local ingress receipt, when agents.wakeText hydrated it (smarty-dev#6144). */
   wakeText?: ActorWakeText;
+}
+
+/** Leading-edge admission policy for host agent_settled observations only. */
+export interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; 0 disables. Runtime windows reset on restart. */
+  minIntervalMs: number;
+}
+
+export function normalizeActorActivation(value: unknown): FabricActorActivationPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+    Object.keys(value).some((key) => key !== "minIntervalMs")) {
+    throw new Error("Invalid actor activation: use { minIntervalMs: non-negative integer }");
+  }
+  const minIntervalMs = (value as { minIntervalMs?: unknown }).minIntervalMs;
+  if (typeof minIntervalMs !== "number" || !Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0) {
+    throw new Error("Invalid actor activation.minIntervalMs: use a non-negative safe integer in milliseconds");
+  }
+  return { minIntervalMs };
 }
 
 /** Public creation input; file instructions are resolved only by the actor owner. */
@@ -223,6 +255,12 @@ export interface FabricActorRequest {
    * same topic with the same value there is replaced by the newer one, in its queue place.
    */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
+  /** Optional per-source leading-edge minimum interval for agent_settled only; omitted is off. */
+  activation?: FabricActorActivationPolicy;
   /**
    * Skip-only rules checked before a queued event runs the model: preset names ("hold",
    * "never-message-events") or rule objects. A skipped event is logged and counted, never run.
@@ -266,6 +304,20 @@ export interface FabricActorRequest {
   requires?: readonly (string | FabricCapabilityRequirement)[];
   /** Serialized guest predicate evaluated before work and before delivery. */
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
+}
+
+export interface FabricActorSessionOrphan {
+  oldRoot: string;
+  oldHost: string;
+  lastUpdated: number;
+  orphanedAt: number;
+  reason: string;
+  leadName?: string;
+  role?: string;
+  /** Durable mesh receipt acknowledged; absent means retry publication on the next read/event. */
+  alarmPublishedAt?: number;
 }
 
 export interface FabricActorInfo {
@@ -284,6 +336,8 @@ export interface FabricActorInfo {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
+  /** Terminal foreign session-root record, not authority to adopt or restart it. */
+  sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
@@ -294,6 +348,11 @@ export interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable
+   * actors discard repeats of the last 256 successfully completed keys across restart.
+   * Independent of coalesceKey; omitted means no completed-key deduplication. */
+  dedupeKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
@@ -332,6 +391,8 @@ export interface FabricActorInfo {
   /** Persistent reason an activation is blocked; cleared after a later successful activation. */
   activationBlocked?: { reason: string; code: string; since: number; count: number };
   validWhile?: FabricActorValidWhileSource;
+  /** Host-maintained, bounded records topic projection for validWhile. */
+  records?: FabricActorRecordsOptions;
   queued: number;
   messages: number;
   createdAt: number;

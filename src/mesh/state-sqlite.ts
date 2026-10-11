@@ -38,12 +38,14 @@
  * `await sync()` after it: a PASSIVE checkpoint (no writer lock) that confirms the WAL is synced
  * through that commit, or throws when it cannot within its budget.
  *
- * Checkpoints (review-opus P2-1): `wal_autocheckpoint=0` on every connection, so no client commit
- * runs a checkpoint. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
- * maintenance holder, tests) checkpoints on an unref'd timer: PASSIVE first (copies and fsyncs
+ * Checkpoints (smarty-dev#6477, replacing review-opus P2-1's `wal_autocheckpoint=0`): every connection
+ * keeps SQLite's built-in autocheckpoint (`WAL_AUTOCHECKPOINT_PAGES`, ~4 MiB). It is PASSIVE and runs on
+ * the committing connection right after its COMMIT, so it never blocks another writer; with it off and
+ * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
+ * maintenance holder, tests) checkpoints on WAL/store notifications (coalesced by a one-shot deadline): PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
  * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
- * few ms, so the checkpointer raises `state-checkpoint.flag` and writers yield while it is fresh
+ * few ms, so the checkpointer raises its own flag in `state-checkpoint.flags/` and writers yield while any is fresh
  * (< 1 s, so a crashed checkpointer stalls nobody for longer). TRUNCATE then holds the writer lock,
  * so the WAL stops growing, and waits only for readers that started before it; new readers read
  * the database file. Reads are single statements (`.get()`/`.all()`, never an iterator or a read
@@ -51,6 +53,14 @@
  * 400 ms), so constant readers cannot starve it. If no maintainer runs, any writer runs the same checkpoint after
  * its COMMIT once the WAL passes `emergencyCheckpointBytes`, so the WAL stays bounded regardless.
  * `journal_size_limit` caps a reset WAL. `stats()` exports the WAL size and checkpoint progress.
+ *
+ * Reader starvation (smarty-dev#6477, full-load soak): with many processes reading constantly, some reader
+ * always holds a WAL read mark, so PASSIVE autocheckpoints copy frames but the WAL never restarts and grows
+ * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (8 MiB), one process at a
+ * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: ONE non-blocking attempt (busy_timeout 0) after
+ * the writer's continuation, outside any transaction, so no client stalls on it. A busy attempt is not
+ * retried (pi-fabric#694 P1-B, R-no-polling): the next commit that finds the WAL above the threshold
+ * tries again, no sooner than 2 s later. Commits drive the reset; nothing sleeps or polls.
  *
  * Rules (design §3B, review-opus P0-1/P3-8): never open `state*.db*` with plain `fs` calls in the
  * same process (closing any descriptor drops that process's POSIX locks; only `stat` is used here);
@@ -71,16 +81,20 @@
  * pass `open` to plug in another driver (for example `bun:sqlite`) through `SqliteConnection`.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
+import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, readMeshStateMovedMarker } from "./backend-fence.js";
+import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { MeshLockTicket } from "./lock-queue.js";
+import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
+import { formatWalReaders, walReaderPids } from "./wal-readers.js";
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -109,12 +123,224 @@ export class MeshStateUnsupportedError extends Error {
   }
 }
 
+/**
+ * smarty-dev#6477: a sqlite-mode open never initialises an authoritative EMPTY database over a root
+ * whose state still lives in state.json. Without an initialised state.db, a state.json that is not
+ * cutover's moved marker and is not empty (entries, tombstones or an allocation clock) is live file
+ * state: refuse BEFORE creating state.db, so the root is left byte-identical (no db, no fence, no epoch).
+ * The import tool (backend-migration.ts) opens the database itself and never comes through here.
+ */
+const assertSqliteRootImported = (root: string): void => {
+  if (stateDbSize(root) > 0) return; // initialised (or being initialised): its meta decides
+  if (classifyStateFile(path.join(root, "state.json")) === "populated") throw importFirst(root, "this root has file-backend state");
+};
+
+/** state.db's size, or -1 when it is absent. */
+const stateDbSize = (root: string): number => {
+  try { return fs.statSync(path.join(root, "state.db")).size; } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return -1;
+    throw error;
+  }
+};
+
+/**
+ * What a state.json holds: "absent"; "empty" (zero-length, or no entries, no tombstones and highWater 0);
+ * "marker" (cutover's moved marker); else "populated" (live file state, or damaged: not provably empty).
+ */
+const classifyStateFile = (file: string): "absent" | "empty" | "marker" | "populated" => {
+  let serialized: string;
+  try { serialized = fs.readFileSync(file, "utf8"); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    throw error;
+  }
+  if (!serialized.trim()) return "empty"; // a zero-length state.json holds nothing
+  let parsed: unknown;
+  try { parsed = JSON.parse(serialized); } catch { parsed = undefined; } // damaged: not provably empty, refuse
+  if (isMeshStateMovedMarker(parsed)) return "marker";
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const state = parsed as { entries?: unknown; versions?: unknown; tombstoneOrder?: unknown; highWater?: unknown };
+    const empty = (value: unknown): boolean => value === undefined || value === null
+      || (typeof value === "object" && Object.keys(value).length === 0);
+    if (state.entries !== null && typeof state.entries === "object" && !Array.isArray(state.entries)
+      && empty(state.entries) && empty(state.versions) && empty(state.tombstoneOrder)
+      && (state.highWater === undefined || state.highWater === 0)) return "empty"; // a fresh root's empty state file
+  }
+  return "populated";
+};
+
+const importFirst = (root: string, why: string): MeshStateUnsupportedError =>
+  new MeshStateUnsupportedError(`Fabric mesh SQLite state refused for ${root}: ${why}; `
+    + `run \`fabric-mesh-backend import --root ${root}\` first (smarty-dev#6477)`);
+
+/**
+ * smarty-dev#6477 part 2: only the import path creates `<root>/state.db` (the file-mode fence). Before any
+ * side effect, a default open needs a non-empty state.db (its flag decides, see assertImportedDatabase);
+ * without one it refuses: loudly when state.json is the moved marker (state.db lost), else "import first".
+ * "create" (fixtures, the import's peers) may initialise a fresh root; "detached" (a shadow copy outside
+ * the mesh root, never a fence) is unguarded.
+ */
+/**
+ * Test fixtures only: tests/fleet-isolation-setup.ts sets this global symbol to "create" so the suite's
+ * existing fixtures that build fresh sqlite roots keep doing so in-process (child processes do not inherit
+ * it). Production code never sets it; an explicit `initialize` always wins.
+ */
+const TEST_FIXTURE_INITIALIZE = Symbol.for("pi-fabric.mesh.sqlite-initialize.test-fixtures");
+const initializeOf = (options: SqliteStateStoreOptions): SqliteStateStoreOptions["initialize"] =>
+  options.initialize ?? ((globalThis as Record<symbol, unknown>)[TEST_FIXTURE_INITIALIZE] === "create" ? "create" : undefined);
+
+const lostDatabase = (root: string): MeshStateUnsupportedError =>
+  new MeshStateUnsupportedError(`Fabric mesh SQLite state refused for ${root}: state.json is the moved marker but state.db is `
+    + "missing or empty; restore state.db from a backup or recover state.json from state.json.cutover-<epoch> (smarty-dev#6477)");
+
+/**
+ * Before any side effect. Returns the mode the open runs in: "create" only on a GENUINELY fresh root (no
+ * state.db, a zero-length one or one with no meta table, and a state.json that is absent or empty: the meta
+ * table is checked on the connection, see hasMeta); "create" over an imported root (an
+ * initialised state.db plus the marker) is a default open (undefined), so its database is checked like any
+ * other. Everything else refuses with the root untouched: an existing database without the marker (never
+ * accepted as imported), file state in state.json, or the marker without its database (review/astra P1).
+ */
+const guardBeforeOpen = (root: string, initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStoreOptions["initialize"] => {
+  if (initialize === "detached") return initialize;
+  if (initialize === "create") {
+    const state = classifyStateFile(path.join(root, "state.json"));
+    if (stateDbSize(root) > 0) {
+      if (state === "marker") return undefined; // the imported shape: open it as a default open does
+      if (state === "populated") throw importFirst(root, "initialize \"create\" found file-backend state in state.json and an existing state.db");
+      // No marker: only a database nothing initialised (no meta table, e.g. a bare WAL header) may be
+      // created; that needs a SQLite read (never plain fs on state.db), so the open decides on the
+      // connection: an initialised one goes through assertImportedDatabase and refuses without the marker.
+    }
+    if (state === "populated") throw importFirst(root, "this root has file-backend state");
+    if (state === "marker") throw lostDatabase(root);
+    return "create";
+  }
+  assertSqliteRootImported(root);
+  if (stateDbSize(root) > 0) return initialize;
+  if (readMeshStateMovedMarker(root)) throw lostDatabase(root);
+  throw importFirst(root, "this root has no imported state.db");
+};
+
+/** Whether the connection's database was already initialised (a meta table): "create" never adopts one. */
+const hasMeta = (db: SqliteConnection): boolean =>
+  db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get() !== undefined;
+
+/**
+ * On the open connection, before initialise seeds anything: an uninitialised state.db is refused, and
+ * backend=sqlite needs the moved marker (cutover installs it BEFORE committing sqlite and rollback
+ * removes it only AFTER committing file, so sqlite without the marker means no import made this
+ * database: an old release's fence over a fresh or file root). Other flags (importing, exporting,
+ * file) keep their own handling in initialise and the writers. The marker is read after the flag.
+ */
+const assertImportedDatabase = (db: SqliteConnection, root: string): void => {
+  const table = db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
+  const backend = table === undefined ? undefined : db.prepare("SELECT value FROM meta WHERE name = 'backend'").get()?.value;
+  if (backend === undefined || backend === null) throw importFirst(root, "state.db is not initialised");
+  if (String(backend) === "sqlite" && !readMeshStateMovedMarker(root)) {
+    throw importFirst(root, "state.db says backend=sqlite but state.json is not the moved marker, so no import created it "
+      + "(inspect state.db and move it aside if it holds nothing)");
+  }
+};
+
+/**
+ * Test-only seam (tests/mesh-state-sqlite-unimported.test.ts): a function under this global symbol runs at
+ * "before-marker" (after initialise, before the re-check), "before-claim" (after the re-check, right before the
+ * exclusive link) and "before-rename" (an empty state.json about to be claimed aside), so a test can populate
+ * state.json in each window. Production never sets it.
+ */
+const CREATE_MARKER_HOOK = Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook");
+const markerHook = (phase: "before-marker" | "before-claim" | "before-rename", root: string): void => {
+  const hook = (globalThis as Record<symbol, unknown>)[CREATE_MARKER_HOOK];
+  if (typeof hook === "function") (hook as (phase: string, root: string) => void)(phase, root);
+};
+
+const raced = (root: string, why: string): MeshStateUnsupportedError => importFirst(root, `initialize "create" raced: ${why}; `
+  + "state.json was left as it is (a state.db this open initialised stays and fences file-mode writers: move it aside if it holds nothing)");
+
+/**
+ * "create" only, on a fresh root: the moved marker at the database's epoch, as a fresh import leaves it. It NEVER
+ * replaces a non-marker state.json (review/astra P1): state.json is re-checked here, then claimed exclusively. An
+ * absent state.json is created with link(2) (fails if anything appeared); an empty one is first renamed aside, so
+ * the inode that is judged is the inode that is replaced, and the marker is linked in only while the name is
+ * still free. A claimed state.json that turns out to be populated is linked back unchanged (same inode, same
+ * bytes) and the open refuses. No step overwrites a name another writer may have just written. Runs under the
+ * fence (review round 2), so a file-mode writer cannot rename over the marker afterwards; the claim protocol
+ * stays for writers that ignore `.lock`.
+ */
+const ensureMovedMarker = (root: string, epoch: number): void => {
+  markerHook("before-marker", root);
+  const file = path.join(root, "state.json");
+  const before = classifyStateFile(file);
+  if (before === "marker") return;
+  if (before === "populated") throw raced(root, "state.json was populated after the fresh-root check");
+  const temp = `${file}.sqlite-create-${process.pid}-${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(temp, "wx", 0o600);
+  try {
+    fs.writeSync(descriptor, encodeMeshStateMovedMarker(epoch));
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  try {
+    markerHook("before-claim", root);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { fs.linkSync(temp, file); return; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const present = classifyStateFile(file);
+      if (present === "marker") return; // a concurrent creator or import installed it
+      if (present === "populated") throw raced(root, "state.json was populated before the marker write");
+      if (present === "absent") continue;
+      // An empty state.json: claim that exact inode, judge it, and only then put the marker in place.
+      const aside = `${file}.sqlite-create-${process.pid}-${randomUUID()}.aside`;
+      markerHook("before-rename", root);
+      try { fs.renameSync(file, aside); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const claimed = classifyStateFile(aside);
+      if (claimed === "empty") {
+        try { fs.linkSync(temp, file); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            try { fs.linkSync(aside, file); fs.rmSync(aside, { force: true }); } catch { /* the aside keeps it */ }
+            throw error;
+          }
+          fs.rmSync(aside, { force: true }); // it held nothing; the name is a newer writer's now
+          if (classifyStateFile(file) === "marker") return;
+          throw raced(root, "state.json was written during the marker write");
+        }
+        fs.rmSync(aside, { force: true });
+        return;
+      }
+      // Populated (or a marker) arrived between the re-check and the claim: put the same inode back.
+      try { fs.linkSync(aside, file); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw raced(root, `state.json changed twice during the marker write; the claimed state is kept at ${aside}`);
+        }
+        throw error;
+      }
+      fs.rmSync(aside, { force: true });
+      if (claimed === "marker") return;
+      throw raced(root, "state.json was populated before the marker write");
+    }
+    throw raced(root, "state.json kept changing during the marker write");
+  } finally { fs.rmSync(temp, { force: true }); }
+};
+
 /** The database was retired (rolled back to the file backend) or re-epoched: use the file path. */
 export class MeshStateRetiredError extends Error {
   readonly code = "FABRIC_MESH_STATE_RETIRED";
   constructor(readonly backend: string, readonly epoch: number, readonly expectedEpoch: number) {
     super(`Fabric mesh state database is ${backend} at epoch ${epoch} (this store opened epoch ${expectedEpoch})`);
     this.name = "MeshStateRetiredError";
+  }
+}
+
+/** A write refused while the WAL is above `walHardCapBytes` (a reader is pinning it). Retryable later. */
+export class MeshStateWalCapError extends Error {
+  readonly code = "FABRIC_MESH_STATE_WAL_CAP";
+  constructor(readonly walBytes: number, readonly capBytes: number, readonly readers = "") {
+    super(`Fabric mesh state write refused: the SQLite WAL is ${walBytes} bytes, above the ${capBytes}-byte cap; `
+      + `a reader is pinning the WAL; restart it or roll back${readers ? ` (WAL readers: ${readers})` : ""}`);
+    this.name = "MeshStateWalCapError";
   }
 }
 
@@ -131,22 +357,43 @@ export interface SqliteStateStoreOptions {
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
-  /** "maintainer" runs the checkpoint timer (projector or maintenance holder). Default "client". */
+  /** "maintainer" watches WAL commits (projector or maintenance holder). Default "client". */
   checkpoint?: "maintainer" | "client";
   /** A WAL file above this size that grew since the last checkpoint escalates PASSIVE to TRUNCATE. Default 4 MiB. */
   checkpointBytes?: number;
   /** WAL size above which any writer checkpoints after its COMMIT. Default 64 MiB. */
   emergencyCheckpointBytes?: number;
-  /** Maintainer timer period. Default 1,000 ms. */
+  /** Minimum spacing of notification-driven maintenance and one busy retry. Default 1,000 ms. */
   checkpointIntervalMs?: number;
   /** First busy budget of a TRUNCATE attempt; doubles after each busy attempt up to 400 ms. Default 50 ms. */
   checkpointBusyMs?: number;
+  /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 8 MiB. */
+  walResetBytes?: number;
+  /**
+   * WAL hard cap (smarty-dev#6477 security pass P1). A reader that pins one snapshot defeats every
+   * checkpoint, so the WAL only grows. Before EVERY write transaction (pi-fabric#694 P1 1) the store stats
+   * the shared `state.db-wal`; above this size it makes ONE non-blocking TRUNCATE attempt and, if the WAL is
+   * still above it, refuses before BEGIN with `MeshStateWalCapError` (reads keep working). The check reads
+   * the shared file, so every store and process sharing the root refuses, a fresh or restarted one included,
+   * and writes recover by themselves once the reader lets go. Default 96 MiB. Must be a finite number
+   * greater than 0: 0 (formerly "disabled"), NaN, Infinity and negative values throw a TypeError at open.
+   */
+  walHardCapBytes?: number;
   /** `journal_size_limit`. Default 16 MiB. */
   journalSizeLimitBytes?: number;
   /** Rows kept in the `changes` feed. Default 4,096. */
   changesRetained?: number;
   /** Driver adapter. Default: node:sqlite, loaded at first use. */
   open?: SqliteOpener;
+  /**
+   * Who may initialise state.db (smarty-dev#6477). Default: nobody; only an imported mesh root opens (an
+   * initialised state.db plus the moved marker), anything else refuses with no side effect. "create":
+   * test fixtures and harnesses only: a FRESH root (no state.json or an empty one) is initialised as an
+   * import would leave it (state.db at epoch 1 plus the moved marker), under the import's fence
+   * (custody.lock, then .lock; fence-lock.ts) from the re-checked guard through the marker. "detached": a database outside the
+   * mesh root that is never a fence (the shadow backend's and the shadow projector's copies).
+   */
+  initialize?: "create" | "detached";
 }
 
 export interface SqliteStateStats {
@@ -162,7 +409,8 @@ export interface SqliteStateStats {
   maxAfterCommitMs: number;
   afterCommitReacquired: number;
   afterCommitIntervened: number;
-  checkpoints: { passive: number; truncate: number; truncateBusy: number; emergency: number; failed: number; writerYields: number };
+  checkpoints: { passive: number; truncate: number; truncateBusy: number; emergency: number; failed: number; writerYields: number;
+    walResets: number; walResetBusy: number };
   lastCheckpoint?: { busy: number; log: number; checkpointed: number };
   walBytes: number;
   maxWalBytes: number;
@@ -179,6 +427,27 @@ export interface SqliteStateExport {
   backend: string;
   epoch: number;
   commit: number;
+}
+
+/** A key the change feed named since a reader's commit: its current row, or its tombstone version (0: gone). */
+export interface SqliteDeltaKey {
+  key: string;
+  entry: MeshStateEntry | undefined;
+  /** The live version, else the retained tombstone's, else 0 (exportState's `versions`). */
+  version: number;
+}
+
+/** `SqliteStateStore.readDelta`: what changed after a reader's commit, from one read transaction. */
+export interface SqliteStateDelta {
+  /** The live `stateStamp()` of the snapshot this delta brings a reader to. */
+  stamp: string;
+  commit: number;
+  /** False when the feed no longer covers every commit after `after`: read `exportLive()` instead. */
+  complete: boolean;
+  /** Each changed key once, in first-change order. */
+  changed: SqliteDeltaKey[];
+  /** Every retained tombstone `[key, version]` in eviction order, only when the predicted count was wrong. */
+  tombstones?: Array<[string, number]>;
 }
 
 export interface SqliteStateChanges {
@@ -198,9 +467,28 @@ const ENVELOPE_BYTES = 256;
 // A TRUNCATE checkpoint must win the writer lock against writers that retry every few ms; SQLite's
 // own busy handler would lose that race (the FULL unfairness of design §1.5). Writers therefore
 // yield while this flag is fresh. It is a separate inode, never one of the state.db* files.
-const CHECKPOINT_FLAG = "state-checkpoint.flag";
+// One flag file per active checkpoint request, so requests never share or clear each other's flag
+// (pi-fabric#691 review). Writers yield while any fresh one exists.
+const CHECKPOINT_FLAGS = "state-checkpoint.flags";
 const CHECKPOINT_FLAG_STALE_MS = 1_000;
 const MAX_TRUNCATE_BUDGET_MS = 400;
+// The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, one attempt.
+const WAL_RESET_LOCK = "state-wal-reset.lock";
+const WAL_RESET_LOCK_STALE_MS = 2_000;
+// A busy reset: this process's next attempt waits for a commit at least this much later.
+const WAL_RESET_BACKOFF_MS = 2_000;
+const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
+// ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
+// within minutes (~6-7 min at 2.5 commits/s); normal peaks are ~6-11 MiB (smarty-dev#6477).
+const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
+/** `walHardCapBytes`, validated: a finite number greater than 0 (pi-fabric#694: 0 no longer disables the cap). */
+const walHardCapOf = (options: SqliteStateStoreOptions): number => {
+  const cap = options.walHardCapBytes ?? DEFAULT_WAL_HARD_CAP_BYTES;
+  if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+    throw new TypeError(`Fabric mesh SQLite walHardCapBytes must be a finite number greater than 0 (got ${String(cap)})`);
+  }
+  return Math.max(1, Math.floor(cap));
+};
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
 // Every key character is below U+007F, so [prefix, prefix + U+007F) is exactly the prefix range.
 const PREFIX_END = "\u007f";
@@ -412,15 +700,27 @@ export class SqliteStateStore {
   readonly #stats: SqliteStateStats = {
     transactions: 0, commits: 0, busyRetries: 0, transientRetries: 0, fifoJoins: 0, maxWaitMs: 0, maxHoldMs: 0,
     totalHoldMs: 0, maxPrepareMs: 0, maxAfterCommitMs: 0, afterCommitReacquired: 0, afterCommitIntervened: 0,
-    checkpoints: { passive: 0, truncate: 0, truncateBusy: 0, emergency: 0, failed: 0, writerYields: 0 }, walBytes: 0, maxWalBytes: 0,
+    checkpoints: { passive: 0, truncate: 0, truncateBusy: 0, emergency: 0, failed: 0, writerYields: 0, walResets: 0, walResetBusy: 0 },
+    walBytes: 0, maxWalBytes: 0,
   };
   #timer: NodeJS.Timeout | undefined;
+  #maintenanceWatcher: fs.FSWatcher | undefined;
+  #maintainer = false;
+  #maintenanceIntervalMs = 1_000;
+  #maintenanceAt = 0;
+  #maintenanceVersion = -1;
+  #maintenanceRetry = false;
   #inTransaction = false;
   #closed = false;
   #dataVersion = -1;
   #lastEmergencyCheck = 0;
   #truncateBudgetMs: number;
   #lastWalBytes = 0;
+  readonly #walResetBytes: number;
+  readonly #walHardCapBytes: number;
+  #walResetting = false;
+  #walResetBusyAt = Number.NEGATIVE_INFINITY;
+  #lastWalResetCheck = 0;
 
   private constructor(readonly root: string, readonly maxEventBytes: number, readonly maxReadEvents: number,
     db: SqliteConnection, file: string, identity: { epoch: number; storeId: string }, options: SqliteStateStoreOptions) {
@@ -440,12 +740,32 @@ export class SqliteStateStore {
     this.#checkpointBusyMs = Math.max(1, Math.min(MAX_TRUNCATE_BUDGET_MS, options.checkpointBusyMs ?? 50));
     this.#truncateBudgetMs = this.#checkpointBusyMs;
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
+    this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
+    this.#walHardCapBytes = walHardCapOf(options);
     if (options.checkpoint === "maintainer") {
-      const interval = Math.max(10, options.checkpointIntervalMs ?? 1_000);
-      this.#timer = setInterval(() => {
-        try { if (this.walBytes() > 0) this.checkpoint(); } catch { this.#stats.checkpoints.failed += 1; }
-      }, interval);
-      this.#timer.unref();
+      this.#maintainer = true;
+      this.#maintenanceIntervalMs = Math.max(10, options.checkpointIntervalMs ?? 1_000);
+      this.#maintenanceVersion = this.dataVersion();
+      // Watch the directory, not a WAL inode: SQLite can remove/recreate it. Never open a
+      // database file with fs (POSIX lock rule). data_version ignores our own checkpoints
+      // and commits, so delayed own-write events cannot create a notification feedback loop.
+      this.#maintenanceWatcher = fs.watch(this.root, { persistent: false }, (_event, name) => {
+        if (name !== null && String(name) !== "state.db" && String(name) !== "state.db-wal") return;
+        if (this.#closed) return;
+        try {
+          const version = this.dataVersion();
+          if (version === this.#maintenanceVersion) return;
+          this.#maintenanceVersion = version;
+          this.#queueMaintenance();
+        } catch { this.#stats.checkpoints.failed += 1; }
+      });
+      this.#maintenanceWatcher.on("error", () => {
+        this.#stats.checkpoints.failed += 1;
+        this.#maintenanceWatcher?.close();
+        this.#maintenanceWatcher = undefined;
+        // Own commits still drive maintenance; client emergency checkpoints remain enabled.
+      });
+      this.#queueMaintenance(); // Existing WAL work at open, not an idle recurring timer.
     }
   }
 
@@ -456,22 +776,39 @@ export class SqliteStateStore {
    */
   static async open(root: string, maxEventBytes: number, maxReadEvents: number,
     options: SqliteStateStoreOptions = {}, initTimeoutMs?: number): Promise<SqliteStateStore> {
+    walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    const requested = initializeOf(options);
+    const initialize = guardBeforeOpen(root, requested);
+    if (initialize !== "create") return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+    // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
+    // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
+    // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
+    return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
+      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
+  }
+
+  static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
+    initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
     // succeeds no connection in this process can have the file open, so closing drops no lock.
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const db = (options.open ?? openNodeSqlite)(file);
+    const validated = assertPrivateStateFiles(file); // an existing state.db, -wal or -shm must be ours (pi-fabric#694 P2-E)
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
       for (;;) {
         options.writeSignal?.throwIfAborted();
         try {
+          const fresh = initialize === "create" && !hasMeta(db);
+          if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
           const identity = initialise(db, options);
+          if (fresh) ensureMovedMarker(root, identity.epoch);
           return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
         } catch (error) {
           if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
@@ -492,15 +829,32 @@ export class SqliteStateStore {
    */
   static openSync(root: string, maxEventBytes: number, maxReadEvents: number,
     options: SqliteStateStoreOptions = {}): SqliteStateStore {
+    walHardCapOf(options); // a bad cap refuses before any side effect
     const refusal = filesystemRefusal(root);
     if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
+    const requested = initializeOf(options);
+    const initialize = guardBeforeOpen(root, requested);
+    if (initialize !== "create") return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+    // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
+    // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
+    return holdMeshFenceSync(root, 0, () =>
+      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
+  }
+
+  static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
+    initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const db = (options.open ?? openNodeSqlite)(file);
+    const validated = assertPrivateStateFiles(file);
+    const db = openPinned(file, options.open ?? openNodeSqlite, validated);
     try {
-      return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, initialise(db, options), options);
+      const fresh = initialize === "create" && !hasMeta(db);
+      if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
+      const identity = initialise(db, options);
+      if (fresh) ensureMovedMarker(root, identity.epoch);
+      return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
     } catch (error) {
       if (db.isTransaction) try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
       try { db.close(); } catch { /* best effort */ }
@@ -571,6 +925,50 @@ export class SqliteStateStore {
       })) : [];
       return { commit, complete, changes };
     });
+  }
+
+  /**
+   * The incremental reader's step (smarty-dev#6477): ONE read transaction gives the live stamp and, when
+   * the change feed still covers every commit after `after`, the current row (or tombstone version)
+   * of each key changed since. Tombstone evictions and an import's tombstones write no change row:
+   * `tombstones(changed)` predicts the reader's tombstone count after applying `changed`, and a
+   * different count returns every tombstone too (at most `maxStateTombstones` rows). A retired or
+   * re-epoched database throws MeshStateRetiredError, as `exportState({ live: true })` does.
+   */
+  readDelta(after: number, tombstones: (changed: readonly SqliteDeltaKey[]) => number): SqliteStateDelta {
+    this.#assertOpen();
+    return this.#readTransaction(() => {
+      const { epoch, commit } = this.#assertLiveMeta(this.#stampMeta());
+      const stamp = `${this.#storeId}:${epoch}:${commit}`;
+      if (after > commit) return { stamp, commit, complete: false, changed: [] };
+      const oldest = after === commit ? undefined : this.#sql.changesOldest.get()?.oldest;
+      if (after < commit && (oldest === null || oldest === undefined || Number(oldest) > after + 1)) {
+        return { stamp, commit, complete: false, changed: [] };
+      }
+      const keys = new Set<string>();
+      if (after < commit) for (const row of this.#sql.changesSince.all(after)) keys.add(String(row.key));
+      const changed: SqliteDeltaKey[] = [];
+      for (const key of keys) {
+        const row = this.#sql.kvGet.get(key);
+        if (row) {
+          const entry = toEntry(row);
+          changed.push({ key, entry, version: entry.version });
+          continue;
+        }
+        const tombstone = this.#sql.tombGet.get(key);
+        changed.push({ key, entry: undefined, version: tombstone ? Number(tombstone.version) : 0 });
+      }
+      const count = Number(this.#sql.tombCount.get()?.n ?? 0);
+      if (count === tombstones(changed)) return { stamp, commit, complete: true, changed };
+      const all: Array<[string, number]> = this.#sql.tombAll.all().map((row) => [String(row.key), Number(row.version)]);
+      return { stamp, commit, complete: true, changed, tombstones: all };
+    });
+  }
+
+  /** `exportState({ live: true })` with the live `stateStamp()` of that same read transaction. */
+  exportLive(): { stamp: string; state: SqliteStateExport } {
+    const state = this.exportState({ live: true });
+    return { stamp: `${this.#storeId}:${state.epoch}:${state.commit}`, state };
   }
 
   /**
@@ -758,6 +1156,7 @@ export class SqliteStateStore {
    * or another store, fails with MeshStateRetiredError. Never rename or delete the files while open.
    */
   async retire(): Promise<number> {
+    // Exempt from the WAL cap: retiring is the roll-back the cap's refusal advises (a few meta rows).
     return this.#write((tx) => {
       const epoch = this.#epoch + 1;
       // data_version does not move for this connection's own commits: drop the cached value so the
@@ -767,7 +1166,7 @@ export class SqliteStateStore {
       this.#sql.metaSet.run(epoch, "epoch");
       tx.changes.length = 0;
       return epoch;
-    });
+    }, this.#lockTimeoutMs, true);
   }
 
   /** One-time import of a file-store snapshot into an empty database (lane L4 drives migration). */
@@ -818,6 +1217,29 @@ export class SqliteStateStore {
 
   // ---------------------------------------------------------------- maintenance
 
+  #queueMaintenance(retry = false): void {
+    if (this.#closed) return;
+    if (!retry) this.#maintenanceRetry = false;
+    if (this.#timer) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#closed) return;
+      this.#maintenanceAt = Date.now();
+      try {
+        this.assertLive(); // A rollback/retirement is never checkpointed by the maintainer.
+        if (this.walBytes() === 0) return;
+        const result = this.checkpoint();
+        // One retry belongs to unfinished checkpoint work, not to an idle WAL-size poll.
+        // A long-lived pinned reader exhausts this retry; the next commit tries again.
+        if (!this.#maintenanceRetry && (result.busy > 0 || result.checkpointed < result.log)) {
+          this.#maintenanceRetry = true;
+          this.#queueMaintenance(true);
+        }
+      } catch { this.#stats.checkpoints.failed += 1; }
+    }, Math.max(0, this.#maintenanceAt + this.#maintenanceIntervalMs - Date.now()));
+    this.#timer.unref?.();
+  }
+
   /** `<state.db>-wal` size by stat only (never an fd on the database files). */
   walBytes(): number {
     const size = fs.statSync(`${this.file}-wal`, { throwIfNoEntry: false })?.size ?? 0;
@@ -847,8 +1269,7 @@ export class SqliteStateStore {
       // Writers yield to the flag, so the writer lock is free within one short hold; the busy budget
       // then only waits for readers that started before the checkpoint. It escalates after each
       // busy attempt, so readers that outlast it delay the reset but can never starve it.
-      const flag = path.join(this.root, CHECKPOINT_FLAG);
-      try { fs.writeFileSync(flag, `${process.pid}\n`, { mode: 0o600 }); } catch { /* advisory */ }
+      const flag = raiseCheckpointFlag(this.root, ownerToken());
       this.#db.exec(`PRAGMA busy_timeout = ${this.#truncateBudgetMs}`);
       try {
         const truncate = this.#sql.checkpointTruncate.get() ?? {};
@@ -858,7 +1279,7 @@ export class SqliteStateStore {
         if (!isBusy(error)) throw error;
       } finally {
         this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
-        try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+        lowerCheckpointFlag(flag);
       }
       if (truncated) {
         this.#lastWalBytes = 0;
@@ -899,7 +1320,10 @@ export class SqliteStateStore {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#maintenanceWatcher?.close();
+    this.#maintenanceWatcher = undefined;
     try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* closing anyway */ }
     this.#db.close();
   }
@@ -1018,7 +1442,7 @@ export class SqliteStateStore {
   // Asynchronous, fair acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
-  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs): Promise<T> {
+  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs, walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1033,6 +1457,7 @@ export class SqliteStateStore {
         this.#signal?.throwIfAborted();
         this.#assertOpen();
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
+        if (!walCapExempt) this.#refuseAboveWalCap();
         if (this.#checkpointPending()) this.#stats.checkpoints.writerYields += 1;
         else if (!ticket || ticket.mayContend()) {
           const now = performance.now();
@@ -1069,8 +1494,7 @@ export class SqliteStateStore {
 
   // One stat per attempt: a fresh flag means a TRUNCATE checkpoint wants the writer lock.
   #checkpointPending(): boolean {
-    const flag = fs.statSync(path.join(this.root, CHECKPOINT_FLAG), { throwIfNoEntry: false });
-    return flag !== undefined && Date.now() - flag.mtimeMs < CHECKPOINT_FLAG_STALE_MS;
+    return checkpointFlagRaised(this.root);
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {
@@ -1107,7 +1531,13 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
-      if (committed && changed) this.#emergencyCheckpoint();
+      if (committed && changed) {
+        // data_version does not change for this connection's own commits. Metadata-only
+        // imports also notify, but write-free fences never schedule unnecessary maintenance.
+        if (this.#maintainer) this.#queueMaintenance();
+        this.#emergencyCheckpoint();
+        this.#maybeResetWal();
+      }
     }
   }
 
@@ -1147,9 +1577,339 @@ export class SqliteStateStore {
       this.checkpoint(this.#checkpointBytes);
     } catch { this.#stats.checkpoints.failed += 1; }
   }
+
+  // Admission before EVERY write transaction (pi-fabric#694 P1 1): one stat of the SHARED state.db-wal, so a
+  // fresh or restarted store, and every other store or process on the root, sees the same over-cap WAL (no
+  // per-store latch to arm). Above the cap: ONE non-blocking TRUNCATE (busy_timeout 0), then re-stat; still
+  // above it: refuse. No loop, no timer; the next write re-checks. A write already admitted may land at most
+  // one commit past the cap per store.
+  #refuseAboveWalCap(): void {
+    let size = this.walBytes();
+    if (size > this.#walHardCapBytes && !this.#db.isTransaction) {
+      try {
+        if (this.#tryTruncate()) { this.#stats.checkpoints.walResets += 1; this.#lastWalBytes = 0; }
+        else this.#stats.checkpoints.walResetBusy += 1;
+      } catch { this.#stats.checkpoints.failed += 1; }
+      size = this.walBytes();
+    }
+    if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(walReaderPids(this.file)));
+  }
+
+  // Reader starvation (see the module comment): after a COMMIT, throttled to 4/s, a WAL above
+  // `walResetBytes` starts one asynchronous reset, if this process wins the try-lock.
+  #maybeResetWal(): void {
+    if (this.#walResetBytes <= 0 || this.#walResetting) return;
+    const now = Date.now();
+    if (now - this.#lastWalResetCheck < 250 || now - this.#walResetBusyAt < WAL_RESET_BACKOFF_MS) return;
+    this.#lastWalResetCheck = now;
+    try { if (this.walBytes() <= this.#walResetBytes) return; } catch { return; }
+    const lock = path.join(this.root, WAL_RESET_LOCK);
+    const token = ownerToken();
+    if (!tryLockFile(lock, WAL_RESET_LOCK_STALE_MS, token)) return;
+    this.#walResetting = true;
+    void new Promise<void>((resolve) => setImmediate(resolve)) // after the writer's own continuation
+      .then(() => this.#resetWal())
+      .catch(() => { this.#stats.checkpoints.failed += 1; return false; })
+      .then((reset) => {
+        this.#walResetting = false;
+        if (!reset) this.#walResetBusyAt = Date.now(); // deferred to a later commit, see WAL_RESET_BACKOFF_MS
+        removeOwnedFile(lock, token); // only while this process still owns it
+      });
+  }
+
+  // ONE non-blocking TRUNCATE (pi-fabric#694 P1-B): busy defers to a later commit; nothing retries here.
+  #resetWal(): boolean {
+    try {
+      if (this.#closed) return true;
+      if (this.#inTransaction || this.#db.isTransaction || !this.#tryTruncate()) { this.#stats.checkpoints.walResetBusy += 1; return false; }
+      this.#stats.checkpoints.walResets += 1;
+      this.#lastWalBytes = 0;
+      return true;
+    } finally {
+      if (!this.#closed) this.walBytes();
+    }
+  }
+
+  // One TRUNCATE with no busy handler (busy_timeout 0): true when the WAL was reset.
+  #tryTruncate(): boolean {
+    this.#db.exec("PRAGMA busy_timeout = 0");
+    try {
+      const result = this.#sql.checkpointTruncate.get() ?? {};
+      return Number(result.busy ?? 1) === 0;
+    } catch (error) {
+      if (!isBusy(error)) throw error;
+      return false;
+    } finally {
+      this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
+    }
+  }
 }
 
+// The holder an owner token names (`ownerToken`): its pid and, when recorded, its start ticks. Undefined
+// for an unreadable record. A pre-#694 token (`pid.uuid`) names the pid only.
+const lockHolder = (record: string): { pid: number; started?: string | undefined } | undefined => {
+  const parts = (record.split("\n")[0] ?? "").split(".");
+  if (parts.length < 2 || !/^\d+$/.test(parts[0] ?? "")) return undefined;
+  const pid = Number(parts[0]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  return { pid, started: parts.length >= 3 && /^\d+$/.test(parts[1] ?? "") ? parts[1] : undefined };
+};
+
+// An advisory try-lock file (O_EXCL). It is reclaimed only from a holder proven dead on this host (its pid
+// gone, or alive with other start ticks: the host-lease rule, residentProcessAlive), or, with no readable
+// owner, when it is older than `staleMs` (pi-fabric#694 P2-C: never on age alone from a live owner).
+// A reclaim never moves the shared name aside (pi-fabric#694 P2, smarty-dev#6477). It first takes an exclusive
+// CLAIM named by the dead record (`<file>.reclaim.<hash>`, itself a tryLockFile, so a dead claimer's claim is
+// reclaimed the same way one level down), then re-reads the lock: same inode, mtime and record. From then until
+// its unlink only two parties could vacate the name: the dead holder (it cannot) and the claim's holder (us).
+// The live owner's own release (removeOwnedFile) never runs for a dead owner. So the unlink removes exactly the
+// dead record and no successor can be detached; a lock that changed since it was read is left alone.
+// `hooks` is a test seam for the interleavings.
+export interface LockFileHooks { afterVerdict?: () => void; afterClaim?: () => void }
+export const reclaimClaimPath = (file: string, key: string): string =>
+  `${file}.reclaim.${createHash("sha256").update(key).digest("hex").slice(0, 16)}`;
+export const tryLockFile = (file: string, staleMs: number, token: string, hooks: LockFileHooks = {}): boolean => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(file, "wx", 0o600);
+      try { fs.writeSync(fd, `${token}\n`); } finally { fs.closeSync(fd); }
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+      if (!stat) continue;
+      let record: string;
+      try { record = fs.readFileSync(file, "utf8"); } catch { continue; }
+      const holder = lockHolder(record);
+      const dead = holder ? !residentProcessAlive(holder.pid, holder.started) : Date.now() - stat.mtimeMs > staleMs;
+      if (!dead) return false;
+      hooks.afterVerdict?.();
+      // A record names its holder uniquely; an ownerless file is named by its inode and mtime.
+      const claim = reclaimClaimPath(file, holder ? record : `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${record}`);
+      if (!tryLockFile(claim, staleMs, token)) return false; // another live reclaimer has this dead record
+      try {
+        hooks.afterClaim?.();
+        const current = fs.lstatSync(file, { throwIfNoEntry: false });
+        let currentRecord: string | undefined;
+        try { currentRecord = fs.readFileSync(file, "utf8"); } catch { /* gone: already reclaimed */ }
+        if (current === undefined || current.ino !== stat.ino || current.dev !== stat.dev || current.mtimeMs !== stat.mtimeMs
+          || currentRecord !== record) return false; // already reclaimed, and maybe held by a successor: never touch it
+        try { fs.unlinkSync(file); } catch { return false; }
+      } finally { removeOwnedFile(claim, token); }
+    }
+  }
+  return false;
+};
+
+// The checkpoint flag and the reset lock carry their writer's token, and only that writer removes them:
+// a process never clears a flag or lock that another process raised or reclaimed (pi-fabric#691 review).
+// A flag raised by two processes belongs to the last writer; the first one's next attempt raises it again.
+// `pid.startTicks.uuid` ("-" without /proc): a reclaimer proves the holder dead by pid and start ticks.
+export const ownerToken = (): string => `${process.pid}.${processStartTime(process.pid) ?? "-"}.${randomUUID()}`;
+
+export const ownsFile = (file: string, token: string): boolean => {
+  try { return fs.readFileSync(file, "utf8") === `${token}\n`; } catch { return false; }
+};
+
+// A checkpoint request's own flag: raising it again refreshes its mtime; lowering it removes only it.
+// An empty name means the flag could not be raised (advisory). One readdir and a stat per flag (normally
+// zero or one) per pending check; a crashed request's flag goes stale and is ignored.
+// An existing flag directory is used only when it is private (assertPrivatePath, pi-fabric#694 P2-D);
+// anything else is refused with a clear error and never written through.
+export const raiseCheckpointFlag = (root: string, token: string): string => {
+  const dir = path.join(root, CHECKPOINT_FLAGS);
+  const flag = path.join(dir, token);
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") return ""; }
+  assertPrivatePath(dir, "directory");
+  try {
+    fs.writeFileSync(flag, "", { mode: 0o600 });
+    return flag;
+  } catch { return ""; }
+};
+
+export const lowerCheckpointFlag = (flag: string): void => {
+  if (flag) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
+};
+
+export const checkpointFlagRaised = (root: string): boolean => {
+  const dir = path.join(root, CHECKPOINT_FLAGS);
+  let names: string[];
+  try { assertPrivatePath(dir, "directory"); names = fs.readdirSync(dir); } catch { return false; } // a foreign directory raises nothing
+  const now = Date.now();
+  for (const name of names) {
+    const stat = fs.statSync(path.join(dir, name), { throwIfNoEntry: false });
+    if (stat && now - stat.mtimeMs < CHECKPOINT_FLAG_STALE_MS) return true;
+  }
+  return false;
+};
+
+/**
+ * pi-fabric#694 P2-D/P2-E (+ astra c6076385095): an existing state path (state.db, its -wal/-shm, the flag
+ * directory, the root) is used only when it is ours: lstat, so a symbolic link is never followed; the expected
+ * type; owned by this uid; no group or other write. A state FILE must also be owner-only (0600): mesh state holds
+ * credentials (smarty-dev#6787). An owned file with group/other bits is tightened in place, through an
+ * O_NOFOLLOW descriptor whose dev/ino must match the lstat, then re-checked. Anything else is refused
+ * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits here, so only the
+ * type and symlink checks apply.
+ */
+export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return undefined;
+  const posix = process.platform !== "win32" && typeof process.getuid === "function";
+  const uid = posix ? process.getuid!() : undefined;
+  const why = stat.isSymbolicLink() ? "is a symbolic link"
+    : kind === "directory" && !stat.isDirectory() ? "is not a directory"
+    : kind === "file" && !stat.isFile() ? "is not a regular file"
+    : uid !== undefined && stat.uid !== uid ? `is owned by uid ${stat.uid}, not this process's uid ${uid}`
+    : posix && (stat.mode & 0o022) !== 0 ? `is group or other writable (mode ${(stat.mode & 0o777).toString(8)})`
+    : posix && kind === "file" && (stat.mode & 0o077) !== 0 && !tightenOwnerOnly(file, stat)
+      ? `is group or other readable (mode ${(stat.mode & 0o777).toString(8)}) and could not be made 0600`
+    : undefined;
+  if (why) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it ${why}`);
+  return stat;
+};
+
+// chmod 0600 the very file that was checked: O_NOFOLLOW never follows a swapped-in link, and dev/ino must match.
+const tightenOwnerOnly = (file: string, checked: fs.Stats): boolean => {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const opened = fs.fstatSync(fd);
+    if (opened.dev !== checked.dev || opened.ino !== checked.ino || !opened.isFile()) return false;
+    fs.fchmodSync(fd, 0o600);
+    return (fs.fstatSync(fd).mode & 0o077) === 0;
+  } catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
+/**
+ * smarty-dev#7784 (security-gap; pi-fabric#730 CODE c6085070307, pi-fabric#733 CODE c6085492681): bind the SQLite
+ * connection to the very state.db that assertPrivateStateFiles validated (its lstat is the baseline, not a later one).
+ * node:sqlite has no fd API, but SQLite's unix VFS opens the main file inside the constructor, on a descriptor of its
+ * own even when another connection has the file open. So, before any SQL: snapshot /proc/self/fd, open, and require
+ * exactly one NEW descriptor whose link names this state.db, on the validated dev/ino, with the path still naming it
+ * (or SQLite's reuse of a descriptor parked on that inode, proven below).
+ * A swap (a link to another mesh's database, or a renamed-in file, even one put back at once) gives that descriptor
+ * another link or identity: zero or several candidates, or a mismatch, closes the connection and fails closed, as
+ * does Linux without /proc/self/fd. Other platforms keep only the post-open lstat compare (residual on #7784).
+ */
+const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): SqliteConnection => {
+  const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: ${why}`);
+  const linux = process.platform === "linux";
+  const name = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  const before = linux ? fdSnapshot() : undefined;
+  if (linux && before === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
+  const db = open(file);
+  try {
+    if (before !== undefined) {
+      const after = fdSnapshot();
+      if (after === undefined) throw refuse("/proc/self/fd is unavailable, so the open cannot be bound to the checked file");
+      const link = (fd: string) => { try { return fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { return undefined; } };
+      const target = `${validated.dev}:${validated.ino}`;
+      const added = [...after].filter(([fd, identity]) => before.get(fd) !== identity);
+      const mains = added.filter(([fd]) => [name, `${name} (deleted)`].includes(link(fd) ?? ""));
+      if (mains.length > 1) throw refuse(`the connection's own descriptor on it is ambiguous (${mains.length} new)`);
+      if (mains.length === 1 && mains[0]![1] !== target) throw refuse("the connection opened a different file than the one checked");
+      // Zero new: SQLite's unix VFS took back a descriptor it parked (setPendingFd) when an earlier connection in this
+      // process closed while another one still had the inode open; findReusableFd hands it to the next open of the
+      // inode it stat()s, so it is unproven by itself. It is proven when no regular descriptor appeared at all and
+      // the validated inode is the ONLY inode with a parked descriptor (descriptors on it beyond this module's live
+      // connections): then the reused one can only be that. Residual on #7784: a SQLite connection in this process
+      // that bypasses this module.
+      if (mains.length === 0) {
+        const fds = new Map<string, number>();
+        for (const [, identity] of before) fds.set(identity, (fds.get(identity) ?? 0) + 1);
+        const parked = (identity: string) => (fds.get(identity) ?? 0) - (liveConnections.get(identity) ?? 0);
+        const elsewhere = [...liveConnections.keys()].some(identity => identity !== target && parked(identity) > 0);
+        if (added.length > 0 || parked(target) < 1 || elsewhere) {
+          throw refuse(`the connection's own descriptor on it is not proven (0 new, ${added.length} other, ` +
+            `${Math.max(0, parked(target))} parked here${elsewhere ? ", parked elsewhere" : ""})`);
+        }
+      }
+    }
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
+    return tracked(db, `${validated.dev}:${validated.ino}`);
+  } catch (error) {
+    try { db.close(); } catch { /* best effort */ }
+    throw error;
+  }
+};
+
+// This module's live connections per "dev:ino" (openPinned's reuse proof). Closing a connection releases its count.
+const liveConnections = new Map<string, number>();
+const tracked = (db: SqliteConnection, identity: string): SqliteConnection => {
+  liveConnections.set(identity, (liveConnections.get(identity) ?? 0) + 1);
+  const close = db.close.bind(db);
+  let open = true;
+  db.close = () => {
+    if (open) {
+      open = false;
+      const left = (liveConnections.get(identity) ?? 1) - 1;
+      if (left > 0) liveConnections.set(identity, left); else liveConnections.delete(identity);
+    }
+    close();
+  };
+  return db;
+};
+
+// fd -> "dev:ino" of each open regular file. Compared by identity as well as number: the listing's own directory fd
+// is closed again at once, so SQLite may get that very number.
+const fdSnapshot = (): Map<string, string> | undefined => {
+  let names: string[];
+  try { names = fs.readdirSync("/proc/self/fd"); } catch { return undefined; }
+  const identities = new Map<string, string>();
+  for (const fd of names) {
+    try { const stat = fs.fstatSync(Number(fd)); if (stat.isFile()) identities.set(fd, `${stat.dev}:${stat.ino}`); }
+    catch { /* closed meanwhile (the listing's own fd) */ }
+  }
+  return identities;
+};
+
+// The validated lstat of state.db is returned: openPinned binds the connection to it.
+const assertPrivateStateFiles = (file: string): fs.Stats => {
+  assertPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
+  for (const name of [`${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
+  const stat = assertPrivatePath(file, "file");
+  if (!stat?.isFile()) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it is not a regular file`);
+  return stat;
+};
+
+// The owner's release: check the token, then unlink (pi-fabric#694 P2, smarty-dev#6477). Nothing is moved aside.
+// While this owner lives nobody else vacates its lock: a reclaimer needs a dead holder (tryLockFile), so the
+// file checked here is still ours at the unlink.
+export const removeOwnedFile = (file: string, token: string): void => {
+  if (!ownsFile(file, token)) return; // plainly not ours: never displace it
+  try { fs.unlinkSync(file); } catch { /* already gone */ }
+};
+
 const clampBusy = (value: number | undefined): number => Math.max(0, Math.min(MAX_BUSY_TIMEOUT_MS, Math.floor(value ?? 2)));
+
+// SQLite's default: a PASSIVE checkpoint after the COMMIT that takes the WAL past ~4 MiB (4 KiB pages).
+const WAL_AUTOCHECKPOINT_PAGES = 1000;
+
+const SEEDED_META = ["schema", "backend", "epoch", "store_id", "high_water", "commit_no", "state_bytes", "tombstone_ord"];
+
+// The identity of an initialised database from plain reads (no write lock), or undefined when any seeded
+// row is missing. smarty-dev#6477: a restart on a busy hub must not contend for BEGIN IMMEDIATE.
+const readIdentity = (db: SqliteConnection): { schema: number; backend: string; epoch: number; storeId: string } | undefined => {
+  if (db.prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'changes'").get() === undefined) return undefined;
+  const values = new Map<string, unknown>();
+  for (const row of db.prepare(`SELECT name, value FROM meta WHERE name IN (${SEEDED_META.map(() => "?").join(", ")})`).all(...SEEDED_META)) {
+    values.set(String(row.name), row.value);
+  }
+  if (SEEDED_META.some((name) => values.get(name) === undefined || values.get(name) === null)) return undefined;
+  return { schema: Number(values.get("schema")), backend: String(values.get("backend")), epoch: Number(values.get("epoch")),
+    storeId: String(values.get("store_id")) };
+};
+
+const checkIdentity = (identity: { schema: number; backend: string; epoch: number; storeId: string }): { epoch: number; storeId: string } => {
+  if (identity.schema !== SCHEMA_VERSION) {
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state schema ${identity.schema} is not supported (expected ${SCHEMA_VERSION})`);
+  }
+  if (identity.backend !== "sqlite") throw new MeshStateRetiredError(identity.backend, identity.epoch, identity.epoch);
+  return { epoch: identity.epoch, storeId: identity.storeId };
+};
 
 // Idempotent per-connection setup plus the one-time schema; throws BUSY for the caller to retry.
 const initialise = (db: SqliteConnection, options: SqliteStateStoreOptions): { epoch: number; storeId: string } => {
@@ -1159,9 +1919,12 @@ const initialise = (db: SqliteConnection, options: SqliteStateStoreOptions): { e
     throw new MeshStateUnsupportedError(`Fabric mesh SQLite state could not enter WAL mode (${String(mode?.journal_mode)})`);
   }
   db.exec("PRAGMA synchronous = NORMAL");
-  db.exec("PRAGMA wal_autocheckpoint = 0");
+  db.exec(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
   db.exec(`PRAGMA journal_size_limit = ${Math.max(0, Math.floor(options.journalSizeLimitBytes ?? 16 * 1024 * 1024))}`);
   db.exec("PRAGMA trusted_schema = OFF");
+  // smarty-dev#6477: an initialised database opens with plain reads; only a missing schema takes the write lock.
+  const existing = readIdentity(db);
+  if (existing) return checkIdentity(existing);
   db.exec("BEGIN IMMEDIATE");
   db.exec(SCHEMA);
   const seed = db.prepare("INSERT OR IGNORE INTO meta(name, value) VALUES (?, ?)");

@@ -187,6 +187,19 @@ export async function openFabricSettings(
         rootComponent = component;
         return component;
       },
+      {
+        // Draw the settings screen as an overlay. pi composites overlays over
+        // the transcript and clears the cells beneath them; a plain custom
+        // screen leaves native image placements painted over the panel.
+        overlay: true,
+        overlayOptions: {
+          width: "94%",
+          minWidth: 40,
+          maxHeight: "90%",
+          anchor: "center",
+          margin: 1,
+        },
+      },
     );
   }
 

@@ -14,7 +14,11 @@ const user = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 const other = "S-1-5-21-1111111111-2222222222-3333333333-1002";
 // FileSystemRights values Get-Acl reports for icacls (F), (M), (W), (RX) and GENERIC_ALL.
 const FULL = 2032127, MODIFY = 197055, WRITE = 278, READ_EXECUTE = 1179817, GENERIC_ALL = 268435456;
-const report = (...lines: string[]) => [`user ${user}`, `owner ${user}`, ...lines, "end", ""].join("\r\n");
+// The SDDL access section Get-Acl reports for the private DACL icacls sets.
+const PRIVATE_SDDL = `D:PAI(A;OICI;FA;;;${user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`;
+const reportWith = (sddl: string, ...lines: string[]) =>
+  [`user ${user}`, `owner ${user}`, `dacl ${sddl}`, ...lines, "end", ""].join("\r\n");
+const report = (...lines: string[]) => reportWith(PRIVATE_SDDL, ...lines);
 const ownerOnly = report(`ace Allow ${user} ${FULL}`, `ace Allow S-1-5-18 ${FULL}`, `ace Allow S-1-5-32-544 ${FULL}`);
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -43,7 +47,36 @@ describe("Windows resident requests DACL policy", () => {
   });
 
   it.each([
+    ["D:NO_ACCESS_CONTROL", "NULL DACL"], ["D:PAINO_ACCESS_CONTROL", "NULL DACL"], ["", "no DACL"],
+  ])("refuses a NULL or missing DACL (SDDL %j), which grants everyone access but lists no rules", async (sddl, label) => {
+    const acl = parseWindowsAclReport(reportWith(sddl));
+    expect(acl.aces).toEqual([]);
+    expect(windowsRequestsAclViolations(acl)).toEqual([`S-1-1-0 (${label})`]);
+    await expect(assertWindowsRequestsDirectoryPrivate("C:\\r\\requests", async () => acl))
+      .rejects.toThrow(new RegExp(`^Refusing to serve resident requests: .*writable by other accounts \\(S-1-1-0 \\(${label}\\)\\)`));
+  });
+
+  it("simulated win32 refuses a NULL-DACL residency directory before creating anything", async () => {
+    const directory = path.join(tempRoot(), "requests");
+    let restricted = false;
+    await expect(prepareResidentRequestsDirectory(directory, "win32", {
+      readAcl: async target => parseWindowsAclReport(target === path.dirname(directory) ? reportWith("D:NO_ACCESS_CONTROL") : ownerOnly),
+      restrict: async () => { restricted = true; },
+    })).rejects.toThrow(/^Refusing to serve resident requests: the residency directory .*\(S-1-1-0 \(NULL DACL\)\)/);
+    expect(restricted).toBe(false);
+    expect(fs.readdirSync(path.dirname(directory))).toEqual([]);
+  });
+
+  it.each([
     ["empty", ""],
+    ["no DACL line", [`user ${user}`, `owner ${user}`, `ace Allow ${user} ${FULL}`, "end"].join("\n")],
+    ["two DACL lines", report(`dacl ${PRIVATE_SDDL}`, `ace Allow ${user} ${FULL}`)],
+    ["an empty DACL", reportWith("D:P")],
+    ["a non-DACL SDDL section", reportWith("O:BAG:SY", `ace Allow ${user} ${FULL}`)],
+    ["unknown DACL flags", reportWith("D:XY(A;;FA;;;SY)", `ace Allow S-1-5-18 ${FULL}`)],
+    ["unbalanced ACEs", reportWith("D:(A;;FA;;;SY", `ace Allow S-1-5-18 ${FULL}`)],
+    ["text after the ACEs", reportWith("D:(A;;FA;;;SY)S:(AU;;FA;;;WD)", `ace Allow S-1-5-18 ${FULL}`)],
+    ["a non-empty DACL with no listed rules", reportWith(PRIVATE_SDDL)],
     ["truncated (no end marker)", `user ${user}\nowner ${user}\nace Allow ${user} ${FULL}`],
     ["an account name instead of a SID", report(`ace Allow BUILTIN\\Users ${WRITE}`)],
     ["an unknown access type", report(`ace Audit ${other} ${WRITE}`)],
@@ -219,6 +252,7 @@ describe.skipIf(process.platform !== "win32")("Windows resident requests DACL (r
     await prepareResidentRequestsDirectory(directory);
     const acl = await readWindowsDirectoryAcl(directory);
     expect(windowsRequestsAclViolations(acl)).toEqual([]);
+    expect(acl.dacl).toBe("present");
     expect(acl.aces.every(ace => [acl.user, "S-1-5-18", "S-1-5-32-544"].includes(ace.sid))).toBe(true);
     // A second ACE for a well-known group with write, as another local account would need.
     await promisify(execFile)(windowsSystemExecutable("icacls.exe"), [directory, "/grant", "*S-1-5-32-545:(OI)(CI)(W)"], { windowsHide: true });

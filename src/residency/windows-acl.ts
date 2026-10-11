@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 
 export const WINDOWS_SYSTEM_SID = "S-1-5-18";
 export const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
+export const WINDOWS_EVERYONE_SID = "S-1-1-0";
 const sidPattern = /^S-1-\d+(-\d+)+$/;
 
 /**
@@ -20,7 +21,14 @@ const sidPattern = /^S-1-\d+(-\d+)+$/;
 export const WINDOWS_WRITE_CLASS_RIGHTS = 0x2 | 0x4 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
 
 export interface WindowsDirectoryAce { type: "Allow" | "Deny"; sid: string; rights: number }
-export interface WindowsDirectoryAcl { user: string; owner: string; aces: WindowsDirectoryAce[] }
+/**
+ * "present": the descriptor carries a DACL with at least one ACE. "null": a NULL
+ * DACL (SDDL `D:NO_ACCESS_CONTROL`), which grants everyone full access while
+ * GetAccessRules returns no entries. "absent": no DACL at all, which Windows
+ * treats like a NULL DACL. Only "present" can be private.
+ */
+export type WindowsDaclState = "present" | "null" | "absent";
+export interface WindowsDirectoryAcl { user: string; owner: string; dacl: WindowsDaclState; aces: WindowsDirectoryAce[] }
 
 export function windowsSystemExecutable(...segments: string[]): string {
   return path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", ...segments);
@@ -39,9 +47,37 @@ const aclReportScript = [
   "$acl = Get-Acl -LiteralPath $env:FABRIC_ACL_PATH",
   "[Console]::Out.WriteLine('user ' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)",
   "[Console]::Out.WriteLine('owner ' + $acl.GetOwner($sid).Value)",
+  // The raw DACL in SDDL: empty when absent, D:NO_ACCESS_CONTROL when NULL. GetAccessRules hides both.
+  "[Console]::Out.WriteLine('dacl ' + $acl.GetSecurityDescriptorSddlForm('Access'))",
   "foreach ($r in $acl.GetAccessRules($true, $true, $sid)) { [Console]::Out.WriteLine('ace ' + $r.AccessControlType.ToString() + ' ' + $r.IdentityReference.Value + ' ' + [string][int64]$r.FileSystemRights.value__) }",
   "[Console]::Out.WriteLine('end')",
 ].join("; ");
+
+const sddlDaclFlags = /^(?:P|AI|AR|NO_ACCESS_CONTROL)*$/;
+
+/**
+ * Classify the access (DACL) section of an SDDL string. An empty DACL, a missing
+ * `D:` prefix or anything else unexpected throws, so callers fail closed.
+ */
+export function windowsDaclStateFromSddl(sddl: string): WindowsDaclState {
+  if (sddl === "") return "absent";
+  if (!sddl.startsWith("D:")) throw new Error(`unparseable DACL SDDL: ${sddl.slice(0, 120)}`);
+  const body = sddl.slice(2);
+  const open = body.indexOf("(");
+  const flags = open === -1 ? body : body.slice(0, open);
+  if (!sddlDaclFlags.test(flags)) throw new Error(`unparseable DACL SDDL flags: ${flags.slice(0, 120)}`);
+  if (flags.includes("NO_ACCESS_CONTROL")) return "null";
+  let depth = 0;
+  let aces = 0;
+  for (const char of open === -1 ? "" : body.slice(open)) {
+    if (char === "(") { if (depth++ === 0) aces++; }
+    else if (char === ")") { if (--depth < 0) break; }
+    else if (depth === 0) { depth = -1; break; }
+  }
+  if (depth !== 0) throw new Error(`unparseable DACL SDDL ACEs: ${sddl.slice(0, 120)}`);
+  if (aces === 0) throw new Error("the DACL has no entries");
+  return "present";
+}
 
 /** Parse the Get-Acl report. Anything unexpected throws, so callers fail closed. */
 export function parseWindowsAclReport(output: string): WindowsDirectoryAcl {
@@ -49,18 +85,24 @@ export function parseWindowsAclReport(output: string): WindowsDirectoryAcl {
   if (lines.at(-1) !== "end") throw new Error("truncated DACL report");
   let user: string | undefined;
   let owner: string | undefined;
+  let dacl: WindowsDaclState | undefined;
   const aces: WindowsDirectoryAce[] = [];
   for (const line of lines.slice(0, -1)) {
     const fields = line.split(" ");
     if (fields[0] === "user" && fields.length === 2 && user === undefined && sidPattern.test(fields[1]!)) user = fields[1];
     else if (fields[0] === "owner" && fields.length === 2 && owner === undefined && sidPattern.test(fields[1]!)) owner = fields[1];
-    else if (fields[0] === "ace" && fields.length === 4 && (fields[1] === "Allow" || fields[1] === "Deny") &&
+    else if (fields[0] === "dacl" && dacl === undefined && (line === "dacl" || line.startsWith("dacl "))) {
+      dacl = windowsDaclStateFromSddl(line.slice(5));
+    } else if (fields[0] === "ace" && fields.length === 4 && (fields[1] === "Allow" || fields[1] === "Deny") &&
       sidPattern.test(fields[2]!) && /^-?\d+$/.test(fields[3]!)) {
       aces.push({ type: fields[1], sid: fields[2]!, rights: Number(fields[3]) });
     } else throw new Error(`unparseable DACL report line: ${line.slice(0, 120)}`);
   }
   if (!user || !owner) throw new Error("DACL report lacks the user or owner SID");
-  return { user, owner, aces };
+  if (dacl === undefined) throw new Error("DACL report lacks the DACL SDDL");
+  // A real DACL whose entries GetAccessRules did not list cannot be judged from the list.
+  if (dacl === "present" && aces.length === 0) throw new Error("DACL report lists no access rules for a non-empty DACL");
+  return { user, owner, dacl, aces };
 }
 
 /** SIDs other than this user, SYSTEM and Administrators that own or may write the directory. */
@@ -69,6 +111,9 @@ export function windowsRequestsAclViolations(acl: WindowsDirectoryAcl): string[]
   const extra = new Set<string>();
   // The owner can always rewrite the DACL, whatever it currently says.
   if (!trusted.has(acl.owner)) extra.add(`${acl.owner} (owner)`);
+  // A NULL or missing DACL grants everyone (S-1-1-0) full access and lists no entries.
+  if (acl.dacl === "null") extra.add(`${WINDOWS_EVERYONE_SID} (NULL DACL)`);
+  else if (acl.dacl !== "present") extra.add(`${WINDOWS_EVERYONE_SID} (no DACL)`);
   for (const ace of acl.aces) {
     // Deny entries only narrow access; any allowed write-class bit is a grant.
     if (ace.type === "Allow" && !trusted.has(ace.sid) && (ace.rights & WINDOWS_WRITE_CLASS_RIGHTS) !== 0) extra.add(ace.sid);

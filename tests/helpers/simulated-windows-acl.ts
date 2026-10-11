@@ -13,7 +13,7 @@ const userSid = "S-1-5-21-1000000001-1000000002-1000000003-1001";
 export const installSimulatedWindowsRequestsAcl = (): void => {
   if (nativePlatform === "win32" || vi.isMockFunction(windowsRequestsAclAdapters.readAcl)) return;
   vi.spyOn(windowsRequestsAclAdapters, "readAcl").mockResolvedValue({
-    user: userSid, owner: userSid,
+    user: userSid, owner: userSid, dacl: "present",
     aces: [userSid, "S-1-5-18", "S-1-5-32-544"].map(sid => ({ type: "Allow" as const, sid, rights: 2032127 })),
   });
   vi.spyOn(windowsRequestsAclAdapters, "restrict").mockResolvedValue(undefined);

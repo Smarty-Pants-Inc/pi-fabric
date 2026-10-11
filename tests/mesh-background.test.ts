@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_OUTAGE_ALARM_AFTER_MS, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshOutageAlarmSink } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 
@@ -142,14 +142,56 @@ describe("background outage alarm (smarty-dev#8825)", () => {
       await vi.advanceTimersByTimeAsync(30_000);
     }
     expect(alarms).toEqual([expect.objectContaining({ label: "poll", state: "outage", durationMs: MESH_OUTAGE_ALARM_AFTER_MS })]);
-    retry.success();
+    // The journal line is written at alarm time, tagged, whatever the mesh does.
+    expect(vi.mocked(console.warn).mock.calls.filter(([line]) => String(line).startsWith(`${MESH_OUTAGE_ALARM_TAG} {`))).toHaveLength(1);
+    for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) { retry.success(); await vi.advanceTimersByTimeAsync(0); }
     expect(alarms.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
     // A new outage shorter than the bound raises nothing; a non-deferred failure never counts as one.
     retry.failure(busy());
     await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS - 1);
     retry.failure(new Error("bug"));
-    retry.success();
+    for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) retry.success();
+    await vi.advanceTimersByTimeAsync(0);
     expect(alarms).toHaveLength(2);
+  });
+
+  it("a flapping success does not restart the window: the alarm still fires 5 min after the outage began", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const alarms: MeshOutageAlarm[] = [];
+    const retry = new MeshBackgroundRetry("poll", 100, 400).alarmsTo((alarm) => { alarms.push(alarm); });
+    for (let elapsed = 0; elapsed <= MESH_OUTAGE_ALARM_AFTER_MS; elapsed += 60_000) {
+      retry.failure(busy());
+      retry.success(); // one write gets through between refusals
+      retry.failure(busy());
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    expect(alarms).toEqual([expect.objectContaining({ state: "outage", durationMs: MESH_OUTAGE_ALARM_AFTER_MS })]);
+  });
+
+  it("a failed alarm publish is flushed before its recovery, and a failed recovery publish is kept and retried, in order", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const accepted: MeshOutageAlarm[] = [];
+    let failures = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(async (alarm) => {
+      if (failures > 0) { failures--; throw busy(); }
+      accepted.push(alarm);
+    });
+    failures = 1; // the alarm's first publish hits the same outage
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(accepted).toEqual([]);
+    // The writes come back; the pending alarm goes first, then the recovery (whose first publish also fails).
+    retry.success(); await vi.advanceTimersByTimeAsync(0);
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage"]);
+    failures = 1;
+    retry.success(); retry.success(); await vi.advanceTimersByTimeAsync(0);
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage"]); // recovery rejected: kept
+    retry.success(); await vi.advanceTimersByTimeAsync(0);
+    expect(accepted.map((alarm) => alarm.state)).toEqual(["outage", "recovered"]);
   });
 
   it("retries the alarm publish when it fails, and publishes a fabric.alarm.mesh-outage event through the owner's mesh", async () => {

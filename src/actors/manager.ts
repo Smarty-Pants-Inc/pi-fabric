@@ -22,7 +22,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -881,6 +881,7 @@ export class ActorManager {
     this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), options.retentionSweepMs ?? RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
+      outageAlarm: meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })),
       cursorPath: options.meshCursorPath,
       canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
@@ -5028,7 +5029,8 @@ export class ActorManager {
     }
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
-      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
+      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs)
+        .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
       this.#presenceRetries.set(id, retry);
     }
     if (retry.waitMs > 0) {

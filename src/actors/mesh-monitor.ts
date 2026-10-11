@@ -1,5 +1,5 @@
 import fs, { type FSWatcher } from "node:fs";
-import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundRetry, type MeshOutageAlarm } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig } from "../config.js";
@@ -18,7 +18,9 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
-  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
+  // The monitor has no identity or publish of its own: its owner supplies the outage sink (smarty-dev#8825).
+  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor")
+    .alarmsTo((alarm) => this.callbacks.outageAlarm?.(alarm));
   #safetyNetTimer: NodeJS.Timeout | undefined;
   #watcher: FSWatcher | undefined;
   #stamp: string | undefined;
@@ -60,6 +62,8 @@ export class ActorMeshMonitor {
       canConsumeMesh?: (() => boolean) | undefined;
       /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
       onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** The owner's MeshBackgroundRetry outage sink (smarty-dev#8825). */
+      outageAlarm?: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
     },
   ) {
     const saved = this.#readCursor();

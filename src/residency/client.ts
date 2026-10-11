@@ -29,7 +29,7 @@ import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
-import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
@@ -178,7 +178,12 @@ export class ResidencyClient {
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
-  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup")
+    .alarmsTo(meshOutageAlarmSink(() => {
+      const self = this.options.participants.self(); // this Main, as the client's other requests name it
+      return { mesh: this.options.mesh, from: { id: self.id, name: self.name, kind: "main",
+        ...(self.sessionId ? { sessionId: self.sessionId } : {}) } };
+    }));
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #startupLauncher: Awaited<ReturnType<typeof spawnDetached>> | undefined;

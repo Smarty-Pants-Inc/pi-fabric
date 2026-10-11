@@ -2,8 +2,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  applyNatsMessage, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsRefusedError, NatsStateBackend,
-  openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
+  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError,
+  MeshStateNatsRefusedError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -62,7 +62,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const backend = await open(server);
     for (let index = 0; index < 5; index++) await backend.put({ key: `p/${index}`, value: index, identity });
     await backend.delete({ key: "p/2" });
-    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", recent: new Map() }, server.messages[0]!, 100);
+    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 }, server.messages[0]!, 100);
     expect(applyNatsMessage(once, server.messages[0]!, 100)).toBe(once);
     const replica = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
     expect(replica.listAll("p/")).toEqual(backend.listAll("p/"));
@@ -83,6 +83,45 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     expect(prepares).toBe(1);
     expect(server.messages.length).toBe(2);
     expect(backend.get("d/count")?.value).toBe(1);
+  });
+
+  it("a lost ack followed by more than 4,096 foreign batches still reconciles exactly: prepare once, no busy, no double apply", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { lockTimeoutMs: 20_000 });
+    await backend.put({ key: "d/count", value: 0, identity });
+    let lose = true;
+    server.beforePublish = () => { if (lose) { lose = false; return "lose-ack"; } };
+    // My batch is stored; then 5,000 other batches commit before my retry reconciles.
+    server.afterStore = () => {
+      delete server.afterStore;
+      for (let index = 0; index < 5_000; index++) server.append(encode({ format: 1, type: "batch", id: `other-${index}`, base: server.messages.length,
+        highWater: 10_000 + index, changes: [{ key: `f/${index % 10}`, put: { value: index, version: 10_000 + index, updatedAt: 1, updatedBy: identity } }] }));
+    };
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(1);
+    expect(server.messages.length).toBe(5_002);
+    expect(backend.get("d/count")?.value).toBe(1);
+    expect(backend.diagnostics().nats?.casRetries).toBe(0);
+  });
+
+  it("a CAS failure after a lost ack whose batch was NOT stored runs prepare again (another writer took the slot)", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server);
+    await backend.put({ key: "d/count", value: 0, identity });
+    let calls = 0;
+    server.beforePublish = () => {
+      if (++calls !== 1) return;
+      // Another writer commits first, then my first attempt gets no answer and is not stored.
+      server.append(encode({ format: 1, type: "batch", id: "other", base: server.messages.length, highWater: 50_000,
+        changes: [{ key: "d/other", put: { value: 1, version: 50_000, updatedAt: 1, updatedBy: identity } }] }));
+      throw Object.assign(new Error("timeout"), { transient: true });
+    };
+    let prepares = 0;
+    await backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "d/count", value: (view.get("d/count")?.value as number) + 1 }]; } });
+    expect(prepares).toBe(2);
+    expect(backend.get("d/count")?.value).toBe(1);
+    expect(server.messages.length).toBe(3);
   });
 
   it("a publish that never gets an answer is an unknown outcome, not a retryable busy error", async () => {
@@ -138,8 +177,32 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     delete server.beforePublish;
     const stale = first.get("c/count")!.version;
     await second.put({ key: "c/count", value: 12, identity });
-    await expect(first.put({ key: "c/count", value: 13, identity, ifVersion: stale })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    await expect(first.put({ key: "c/count", value: 13, identity, ifVersion: stale })).rejects.toThrow(/compare-and-swap failed for c\/count/);
     second.close();
+  });
+
+  it("a single put or delete CAS conflict throws what the file backend throws (a plain Error, the same message); writeBatch keeps MeshBatchConflictError", async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const fs = await import("node:fs");
+    const fileRoot = root();
+    fs.mkdirSync(fileRoot, { recursive: true, mode: 0o700 });
+    const file = new MeshStore(fileRoot, 64 * 1024, 100, { stateBackend: "file" });
+    const backend = await open(fakeJetStream());
+    const failure = async (write: () => Promise<unknown>) => { try { await write(); } catch (error) { return error as Error; } throw new Error("no conflict"); };
+    try {
+      await file.put({ key: "a", value: 1, identity });
+      await backend.put({ key: "a", value: 1, identity });
+      const expected = await failure(() => file.put({ key: "a", value: 2, identity, ifVersion: 0 }));
+      const put = await failure(() => backend.put({ key: "a", value: 2, identity, ifVersion: 0 }));
+      expect(put.constructor).toBe(expected.constructor);
+      expect(put).not.toBeInstanceOf(MeshBatchConflictError);
+      expect(put.message).toBe(expected.message);
+      const expectedDelete = await failure(() => file.delete({ key: "a", ifVersion: 99 }));
+      const deleted = await failure(() => backend.delete({ key: "a", ifVersion: 99 }));
+      expect(deleted.constructor).toBe(expectedDelete.constructor);
+      expect(deleted.message).toBe(expectedDelete.message);
+      await expect(backend.writeBatch({ identity, ops: [{ kind: "put", key: "a", value: 3, ifVersion: 0 }] })).rejects.toBeInstanceOf(MeshBatchConflictError);
+    } finally { file.closeState(); fs.rmSync(fileRoot, { recursive: true, force: true }); }
   });
 
   it("orders state tokens: a token reads its own state after later writes; stamps advance with the stream", async () => {
@@ -196,6 +259,69 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
       expect(() => backend.get("r/a")).toThrow(MeshStateNatsRefusedError);
       await expect(backend.put({ key: "r/b", value: 1, identity })).rejects.toThrow(MeshStateNatsRefusedError);
       await expect(open(server)).rejects.toThrow(/retired/);
+    });
+
+    it("follows the lifecycle table: begin, commit with its epoch, retire; then nothing", async () => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      server.append(encode({ format: 1, type: "import-begin", epoch: 1 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("importing");
+      server.append(encode({ format: 1, type: "import-commit", epoch: 1 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("ready");
+      await backend.put({ key: "l/a", value: 1, identity });
+      server.append(encode({ format: 1, type: "retire", epoch: 2 }));
+      await settle();
+      expect(backend.diagnostics().nats?.status).toBe("retired");
+      expect(backend.diagnostics().nats?.failure).toBeUndefined();
+    });
+
+    it.each([
+      ["import-commit after retire (it would reopen the stream)", [{ type: "retire", epoch: 2 }, { type: "import-commit", epoch: 2 }]],
+      ["import-commit without import-begin", [{ type: "import-commit", epoch: 1 }]],
+      ["import-commit with another epoch", [{ type: "import-begin", epoch: 1 }, { type: "import-commit", epoch: 2 }]],
+      ["import-begin while importing", [{ type: "import-begin", epoch: 1 }, { type: "import-begin", epoch: 2 }]],
+      ["retire with a stale epoch", [{ type: "retire", epoch: 0 }]],
+      ["retire after retire", [{ type: "retire", epoch: 2 }, { type: "retire", epoch: 3 }]],
+      ["import-begin after retire", [{ type: "retire", epoch: 2 }, { type: "import-begin", epoch: 3 }]],
+      ["a batch after retire", [{ type: "retire", epoch: 2 }, { type: "batch", id: "late", base: 1, highWater: 1, changes: [] }]],
+    ])("fails closed on an illegal lifecycle record: %s", async (_name, records) => {
+      const server = fakeJetStream();
+      const backend = await open(server);
+      for (const record of records) server.append(encode({ format: 1, ...record }));
+      await settle(); await settle();
+      expect(backend.diagnostics().nats?.failure).toMatch(/illegal while|after the stream was retired/);
+      expect(() => backend.get("x")).toThrow(MeshStateNatsRefusedError);
+      // A host opening this stream refuses too.
+      await expect(open(server)).rejects.toBeInstanceOf(MeshStateNatsRefusedError);
+    });
+
+    it("refuses plaintext to a non-loopback server or monitoring URL, before connecting; loopback stays plaintext", async () => {
+      // No port: these would load the client and connect; the refusal comes first.
+      for (const servers of [["nats://10.0.0.5:4222"], ["nats.example.com:4222"], ["127.0.0.1:4222", "nats://192.168.1.2:4222"]]) {
+        await expect(openNatsStateBackend({ root: root(), servers })).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+      }
+      await expect(openNatsStateBackend({ root: root(), servers: ["tls://127.0.0.1:4222"], monitoringUrl: "http://10.0.0.5:8222" }))
+        .rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+      expect(() => assertNatsTransportSecure("tls://nats.example.com:4222", "tls:")).not.toThrow();
+      expect(() => assertNatsTransportSecure("https://nats.example.com:8222", "https:")).not.toThrow();
+      for (const loopback of ["nats://127.0.0.1:4222", "127.9.8.7:4222", "nats://localhost:4222", "nats://[::1]:4222"]) {
+        expect(() => assertNatsTransportSecure(loopback, "tls:")).not.toThrow();
+      }
+      expect(() => assertNatsTransportSecure("http://127.0.0.1:8222", "https:")).not.toThrow();
+      // Not loopback: a name that only starts like one.
+      expect(() => assertNatsTransportSecure("nats://127.0.0.1.example.com:4222", "tls:")).toThrow(MeshStateNatsInsecureError);
+    });
+
+    it("derives distinct streams for roots whose old truncated names collided", () => {
+      const oldName = (at: string) => `FABRIC_MESH_${Buffer.from(path.resolve(at)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
+      const tail = "/shared/mesh/root/with/a/long/common/suffix/state";
+      const [left, right] = [`/srv/a1${tail}`, `/srv/b2${tail}`];
+      expect(oldName(left)).toBe(oldName(right));
+      expect(natsStreamName(left)).not.toBe(natsStreamName(right));
+      expect(natsStreamName(left)).toMatch(/^FABRIC_MESH_[0-9a-f]{32}$/);
+      expect(natsStreamName(left)).toBe(natsStreamName(`/srv/a1/x/..${tail}`));
     });
 
     it("refuses writes while the stream is importing", async () => {

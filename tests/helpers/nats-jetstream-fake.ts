@@ -1,4 +1,4 @@
-// An in-process fake of the five JetStream operations the NATS mesh state backend uses (smarty-dev#7504), with the
+// An in-process fake of the JetStream operations the NATS mesh state backend uses (smarty-dev#7504), with the
 // server's semantics: one stream, expected-last-sequence CAS (err 10071 as NatsWrongLastSequenceError), msgID dedupe
 // (a duplicate returns the original sequence), ordered delivery after a sequence, asynchronous like the network.
 import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage } from "../../src/mesh/state-backend-nats.js";
@@ -11,6 +11,8 @@ export interface FakeJetStreamServer {
   syncAlways: boolean | undefined;
   /** Runs before each publish is stored (inject a concurrent writer); return "lose-ack" to store it but fail the ack once. */
   beforePublish?: (data: Uint8Array) => void | "lose-ack";
+  /** Runs after a publish is stored, before its ack (inject writers that commit after it). */
+  afterStore?: (seq: number) => void;
   /** Appends a raw record (a foreign or malformed writer). */
   append(data: Uint8Array): number;
   /** Holds deliveries to consumers (a slow projector) until `resume`. */
@@ -50,6 +52,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         server: async () => { calls.push("server"); return { version: server.version, syncAlways: server.syncAlways }; },
         ensureStream: async () => { calls.push("ensureStream"); return { lastSeq: messages.length }; },
         lastSequence: async () => { calls.push("lastSequence"); return messages.length; },
+        getMessage: async (_stream, seq) => { calls.push("getMessage"); return messages[seq - 1]; },
         publish: async (_subject, data, { expectLastSequence, msgID }) => {
           calls.push("publish");
           if (!open) throw new Error("connection closed");
@@ -62,6 +65,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
           const seq = store(data);
           ids.set(msgID, seq);
+          server.afterStore?.(seq);
           if (verdict === "lose-ack") throw Object.assign(new Error("timeout: no ack"), { name: "TimeoutError", transient: true });
           return { seq, duplicate: false };
         },

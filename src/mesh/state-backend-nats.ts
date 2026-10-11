@@ -7,7 +7,8 @@
 // `openNatsStateBackend` at first use, so the startup graph is unchanged. The selector's factory is synchronous, so a
 // host prepares the backend first (`openNatsStateBackend`, async: connect, refuse, replay) and the factory then
 // returns the prepared backend for that root, or refuses. `nats` never falls back to `file`.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { captureStorageDelete, captureStoragePut, storageRevision } from "../verified/storage.js";
 import type { MeshIdentity } from "./event-log.js";
@@ -27,6 +28,8 @@ import { MeshLockTimeoutError } from "../core/atomic-write.js";
 /** A JetStream publish refused because the stream's last sequence was not the expected one (NATS err_code 10071). */
 export class NatsWrongLastSequenceError extends Error {
   readonly code = "FABRIC_MESH_NATS_WRONG_LAST_SEQUENCE";
+  /** Set by the backend: an earlier attempt of this same publish got no answer (it may be stored). */
+  afterLostAck = false;
   constructor(readonly expected: number, detail = "") {
     super(`JetStream wrong last sequence (expected ${expected})${detail ? `: ${detail}` : ""}`);
     this.name = "NatsWrongLastSequenceError";
@@ -37,7 +40,7 @@ export class NatsWrongLastSequenceError extends Error {
 export interface NatsStreamMessage { seq: number; data: Uint8Array }
 
 /**
- * The five JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client
+ * The JetStream operations this backend uses. The real implementation wraps the official nats.js v3 client
  * (state-backend-nats-client.ts); tests use an in-process fake with the same semantics.
  */
 export interface JetStreamPort {
@@ -47,6 +50,8 @@ export interface JetStreamPort {
   ensureStream(stream: string, subject: string): Promise<{ lastSeq: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
+  /** One stored message by sequence, or undefined when there is none. */
+  getMessage(stream: string, seq: number): Promise<NatsStreamMessage | undefined>;
   /**
    * Publishes with `expect.lastSequence` and `msgID`. A wrong last sequence throws `NatsWrongLastSequenceError`; no
    * answer (a timeout, no responders, a dropped connection: the ack may be lost) throws an error with `transient: true`;
@@ -93,12 +98,33 @@ interface NatsSnapshot {
   readonly tombstones: readonly string[];
   readonly highWater: number;
   readonly status: "ready" | "importing" | "retired";
-  /** The ids of the most recent batches and their sequences (bounded): did MY batch commit after an uncertain ack? */
-  readonly recent: ReadonlyMap<string, number>;
+  /** The epoch of the last lifecycle record (import-begin, import-commit, retire); 0 before any. */
+  readonly epoch: number;
 }
 
-const RECENT_IDS = 4_096;
-const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", recent: new Map() };
+const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 };
+
+type NatsStatus = NatsSnapshot["status"];
+type LifecycleRecord = Extract<NatsRecord, { epoch: number }>;
+/**
+ * The stream's lifecycle, the only legal transitions (docs/mesh-backends.md, Migration). A batch is legal while
+ * ready or importing (the importer writes). Retired is terminal. Any other record in any state is a protocol
+ * violation: the projector fails closed.
+ */
+const LIFECYCLE: Record<LifecycleRecord["type"], { from: readonly NatsStatus[]; epoch: "newer" | "same"; to: NatsStatus }> = {
+  "import-begin": { from: ["ready"], epoch: "newer", to: "importing" },
+  "import-commit": { from: ["importing"], epoch: "same", to: "ready" },
+  retire: { from: ["ready", "importing"], epoch: "newer", to: "retired" },
+};
+const lifecycle = (snapshot: NatsSnapshot, record: LifecycleRecord, seq: number): NatsSnapshot => {
+  const rule = LIFECYCLE[record.type];
+  const epochOk = Number.isSafeInteger(record.epoch) &&
+    (rule.epoch === "same" ? record.epoch === snapshot.epoch : record.epoch > snapshot.epoch);
+  if (!rule.from.includes(snapshot.status) || !epochOk) {
+    throw new MeshStateNatsRefusedError(`stream message ${seq} (${record.type}, epoch ${String(record.epoch)}) is illegal while ${snapshot.status} at epoch ${snapshot.epoch}`);
+  }
+  return { ...snapshot, seq, status: rule.to, epoch: record.epoch };
+};
 
 /** Thrown by reads and writes once the stream is retired (rolled back to sqlite or file), or while it is importing. */
 export class MeshStateNatsRefusedError extends Error {
@@ -136,9 +162,8 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
 export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMessage, maxTombstones: number): NatsSnapshot => {
   if (message.seq <= snapshot.seq) return snapshot;
   const record = decode(message.data);
-  if (record.type === "retire") return { ...snapshot, seq: message.seq, status: "retired" };
-  if (record.type === "import-begin") return { ...snapshot, seq: message.seq, status: "importing" };
-  if (record.type === "import-commit") return { ...snapshot, seq: message.seq, status: "ready" };
+  if (record.type !== "batch") return lifecycle(snapshot, record, message.seq);
+  if (snapshot.status === "retired") throw new MeshStateNatsRefusedError(`stream message ${message.seq} is a batch after the stream was retired`);
   if (record.base !== snapshot.seq) {
     throw new MeshStateNatsRefusedError(`stream message ${message.seq} was committed on sequence ${record.base}, not ${snapshot.seq}`);
   }
@@ -162,11 +187,8 @@ export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMess
     const forgotten = tombstones.shift()!;
     if (!entries.has(forgotten)) versions.delete(forgotten);
   }
-  const recent = new Map(snapshot.recent);
-  if (typeof record.id === "string") recent.set(record.id, message.seq);
-  if (recent.size > RECENT_IDS) recent.delete(recent.keys().next().value!);
   return { seq: message.seq, entries, versions, tombstones, highWater: Math.max(snapshot.highWater, storageRevision(record.highWater)),
-    status: snapshot.status, recent };
+    status: snapshot.status, epoch: snapshot.epoch };
 };
 
 const sortedKeys = (keys: Iterable<string>): string[] => [...keys].sort((left, right) => left.localeCompare(right));
@@ -191,6 +213,14 @@ export interface NatsStateBackendOptions {
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
+
+/**
+ * A single put or delete fails its CAS with the verified storage kernel's plain Error, as on file and sqlite
+ * (verified/storage.ts); only writeBatch throws MeshBatchConflictError. Same message on every backend.
+ */
+const singleWriteContract = <T>(write: Promise<T>): Promise<T> => write.catch((error: unknown) => {
+  throw error instanceof MeshBatchConflictError ? new Error(error.message) : error;
+});
 
 export class NatsStateBackend implements StateBackend {
   readonly kind = "nats" as const;
@@ -285,16 +315,16 @@ export class NatsStateBackend implements StateBackend {
   cachedStateStamp(): string | undefined { return this.stateStamp(); }
 
   async put(input: StateBackendPutInput): Promise<MeshStateEntry> {
-    await this.writeBatch({ identity: input.identity, ops: [{ kind: "put", key: input.key, value: input.value,
-      ...(input.ifVersion === undefined ? {} : { ifVersion: input.ifVersion }) }] });
+    await singleWriteContract(this.writeBatch({ identity: input.identity, ops: [{ kind: "put", key: input.key, value: input.value,
+      ...(input.ifVersion === undefined ? {} : { ifVersion: input.ifVersion }) }] }));
     const entry = this.get(input.key);
     if (!entry) throw new Error(`Fabric mesh NATS put of ${input.key} did not apply`);
     return entry;
   }
 
   async delete(input: StateBackendDeleteInput): Promise<{ deleted: boolean; version?: number }> {
-    const [result] = await this.writeBatch({ identity: { id: "fabric", name: "fabric", kind: "agent" },
-      ops: [{ kind: "delete", key: input.key, ...(input.ifVersion === undefined ? {} : { ifVersion: input.ifVersion }) }] });
+    const [result] = await singleWriteContract(this.writeBatch({ identity: { id: "fabric", name: "fabric", kind: "agent" },
+      ops: [{ kind: "delete", key: input.key, ...(input.ifVersion === undefined ? {} : { ifVersion: input.ifVersion }) }] }));
     return result?.applied ? { deleted: true, version: result.version } : { deleted: false };
   }
 
@@ -333,12 +363,12 @@ export class NatsStateBackend implements StateBackend {
         seq = await this.#publish(data, snapshot.seq, id, deadline);
       } catch (error) {
         if (!(error instanceof NatsWrongLastSequenceError)) throw error;
-        // Catch up to the stream's head. The server checks the expected sequence before the duplicate window, so a
-        // retry of MY stored batch (its ack was lost) also fails this way: it is then in the stream under its id.
+        // The server checks the expected sequence before the duplicate window, so a retry of MY stored batch (its ack
+        // was lost) also fails this way. The CAS stored it, if at all, at exactly base + 1: read that one message.
+        const committed = error.afterLostAck ? await this.#committedAt(snapshot.seq + 1, id) : undefined;
         const last = await this.#options.port.lastSequence(this.#options.stream);
         this.#knownSeq = Math.max(this.#knownSeq, last);
         await this.#appliedThrough(last);
-        const committed = this.#snapshot.recent.get(id);
         if (committed === undefined) {
           // Another writer won: run the batch again on the new model.
           this.#casRetries++;
@@ -364,13 +394,27 @@ export class NatsStateBackend implements StateBackend {
    * the outcome is unknown: that is not a retryable busy error, the caller must re-read.
    */
   async #publish(data: Uint8Array, base: number, msgID: string, deadline: number): Promise<number> {
+    let lostAck = false;
     for (;;) {
       try { return (await this.#options.port.publish(this.#options.subject, data, { expectLastSequence: base, msgID })).seq; }
       catch (error) {
-        if (error instanceof NatsWrongLastSequenceError || this.#closed || (error as { transient?: unknown })?.transient !== true) throw error;
+        if (error instanceof NatsWrongLastSequenceError) { error.afterLostAck = lostAck; throw error; }
+        lostAck = true;
+        if (this.#closed || (error as { transient?: unknown })?.transient !== true) throw error;
         if (performance.now() >= deadline) throw new MeshStateNatsOutcomeUnknownError(msgID, (error as Error).message);
       }
     }
+  }
+
+  /**
+   * Did batch `id` commit at `seq`? Exact, from the stream itself (no bounded memory of ids): the message at `seq` is
+   * that batch (its sequence) or not (undefined). A message that is gone cannot tell: the outcome is unknown.
+   */
+  async #committedAt(seq: number, id: string): Promise<number | undefined> {
+    const message = await this.#options.port.getMessage(this.#options.stream, seq);
+    if (!message) throw new MeshStateNatsOutcomeUnknownError(id, `stream message ${seq} is gone`);
+    const record = decode(message.data);
+    return record.type === "batch" && record.id === id ? seq : undefined;
   }
 
   #outbox(input: StateBackendBatchInput, results: MeshBatchResult[], changed: string[], snapshot: NatsSnapshot): void {
@@ -494,11 +538,45 @@ export interface OpenNatsStateBackendOptions {
   lockTimeoutMs?: number;
   /** Host-only: the operator accepts a server that does not fsync every write (`sync_always: false`). */
   acceptPeriodicSync?: boolean;
+  /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
+  tls?: NatsTlsFiles;
 }
 
-/** The stream name for a mesh root: stable, NATS-safe. */
-export const natsStreamName = (root: string): string =>
-  `FABRIC_MESH_${Buffer.from(path.resolve(root)).toString("base64url").replace(/[^A-Za-z0-9_]/g, "_").slice(-48)}`;
+export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: string }
+
+/** A non-loopback server or monitoring URL without TLS: state (and the sync-policy check) would cross the network in clear. */
+export class MeshStateNatsInsecureError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_INSECURE";
+  constructor(readonly url: string) {
+    super(`FABRIC_MESH_STATE_NATS_INSECURE: ${url} is not loopback and not TLS; use tls:// (servers) or https:// (monitoring)`);
+    this.name = "MeshStateNatsInsecureError";
+  }
+}
+
+const isLoopback = (host: string): boolean => {
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "localhost" || bare === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare);
+};
+/**
+ * Refuses a plaintext URL to a non-loopback host, before any connection. Loopback (127.0.0.0/8, ::1, localhost)
+ * stays plaintext: tests and single-host use. A server without a scheme is `nats://` (plaintext), as the client reads it.
+ */
+export const assertNatsTransportSecure = (url: string, secureScheme: "tls:" | "https:"): void => {
+  let parsed: URL;
+  try { parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `nats://${url}`); }
+  catch { throw new MeshStateNatsInsecureError(url); }
+  if (parsed.protocol !== secureScheme && !isLoopback(parsed.hostname)) throw new MeshStateNatsInsecureError(url);
+};
+
+/**
+ * The stream name for a mesh root: a fixed prefix and 32 hex characters (128 bits) of the SHA-256 of the full
+ * canonical root (its realpath when it exists), so distinct roots never share a stream.
+ */
+export const natsStreamName = (root: string): string => {
+  let canonical = path.resolve(root);
+  try { canonical = fs.realpathSync.native(canonical); } catch { /* not created yet: the resolved path */ }
+  return `FABRIC_MESH_${createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 32)}`;
+};
 
 /**
  * Opens (and registers for the selector) the NATS state backend of a mesh root. Refuses, never falls back:
@@ -507,8 +585,14 @@ export const natsStreamName = (root: string): string =>
  */
 export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
   const root = path.resolve(options.root);
-  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [],
-    options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl });
+  for (const server of options.servers ?? []) assertNatsTransportSecure(server, "tls:");
+  if (options.monitoringUrl !== undefined) assertNatsTransportSecure(options.monitoringUrl, "https:");
+  // A tls:// server makes the client REQUIRE TLS on every connection (a server not offering it fails the connect),
+  // whatever the client does with the scheme itself.
+  const tls = options.tls ?? ((options.servers ?? []).some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
+  const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [], {
+    ...(options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl }),
+    ...(tls === undefined ? {} : { tls }) });
   try {
     const server = await port.server();
     if (!versionAtLeast(server.version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${server.version} is older than ${MIN_SERVER.join(".")}`);

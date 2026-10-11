@@ -5,7 +5,7 @@ import { connect } from "@nats-io/transport-node";
 import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
-import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage } from "./state-backend-nats.js";
+import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles } from "./state-backend-nats.js";
 
 /** NATS JetStream API error codes used here. */
 const WRONG_LAST_SEQUENCE = 10071;
@@ -19,11 +19,13 @@ const apiCode = (error: unknown): number | undefined => {
 export interface ConnectJetStreamOptions {
   /** `http(s)://host:8222`: read `/varz` for `sync_always`. Host-provided only. */
   monitoringUrl?: string;
+  /** Set: every connection must be TLS (these files, or the system CAs for `{}`). */
+  tls?: NatsTlsFiles;
 }
 
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
-  const nc = await connect({ servers });
+  const nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) });
   const js = jetstream(nc);
   const jsm = await jetstreamManager(nc);
   return {
@@ -43,6 +45,10 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       return { lastSeq: created.state.last_seq };
     },
     lastSequence: async (stream) => (await jsm.streams.info(stream)).state.last_seq,
+    getMessage: async (stream, seq) => {
+      const message = await jsm.streams.getMessage(stream, { seq });
+      return message ? { seq: message.seq, data: message.data } : undefined;
+    },
     publish: async (subject, data, { expectLastSequence, msgID }) => {
       try {
         const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });

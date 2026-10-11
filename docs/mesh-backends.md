@@ -29,6 +29,15 @@ replays the stream. The factory then returns that prepared backend.
 - **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
 `acceptPeriodicSync`; a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
 (busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
+`retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
+protocol violation: the projector fails closed.
+- **Transport:** a non-loopback server must be `tls://` (the client then requires TLS; `tls` passes CA and client
+files) and a non-loopback monitoring URL `https://`; plaintext refuses before connecting
+(`FABRIC_MESH_STATE_NATS_INSECURE`). Loopback (127.0.0.0/8, ::1, localhost) may be plaintext.
+- **Streams:** one per mesh root, `FABRIC_MESH_` plus 32 hex characters of the SHA-256 of the root's realpath.
+- **A lost ack:** the CAS stored the batch, if at all, at exactly its base sequence plus 1. After a retry fails the
+CAS, the backend reads that one message and compares the batch id, so the batch is never run twice.
 - **The read model:** in memory, rebuilt by replaying the stream at open. Persisting it in the `state.db` schema, the
 cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must

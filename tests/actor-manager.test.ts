@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ACTOR_FAILURE_NOTICE_AFTER, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
+  activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -3307,7 +3308,8 @@ describe("ActorManager", () => {
       const actor = await block(manager);
       clock.skew = 2 * HOUR + 1_000;
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
-      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlocked!.since, owner: s.identity.id });
+      // Two hours on, the transient block's backoff has ended (smarty-dev#8487); the episode still re-alarms.
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlockExpired!.since, owner: s.identity.id });
       await manager.close();
       manager = persistentManager(s);
       clock.skew += 6 * HOUR - 60_000;
@@ -3328,7 +3330,7 @@ describe("ActorManager", () => {
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
       owns.a = false; owns.b = true;
       a.listOwned(); b.listOwned();
-      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      await waitFor(() => b.status(actor.id).activationBlockExpired !== undefined);
       clock.skew += 6 * HOUR - 60_000;
       await settle();
       expect(repeats(s.mesh, actor.id)).toHaveLength(1);
@@ -3394,7 +3396,7 @@ describe("ActorManager", () => {
       await waitFor(() => gated.calls === 1);
       owns.a = false; owns.b = true;                         // A's publish is still pending
       a.listOwned(); b.listOwned();
-      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
+      await waitFor(() => b.status(actor.id).activationBlockExpired !== undefined);
       await settle();
       expect(gated.calls).toBe(1);
       gated.release();
@@ -3412,7 +3414,7 @@ describe("ActorManager", () => {
       // A dies mid-publish: never closed, nothing saved after the claim. Its restart takes over.
       owns.a = false;
       const restarted = persistentManager(s, "a", { canManageActor: () => true });
-      expect(restarted.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      expect(restarted.status(actor.id).activationBlockExpired?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
       await settle();
       expect(gated.calls).toBe(1);
       gated.release();
@@ -3571,6 +3573,175 @@ describe("ActorManager", () => {
     await waitFor(() => alarms().length === 2);
     expect(manager.status(actor.id).activationBlocked?.count).toBe(3);
   }, 60_000);
+
+  // smarty-dev#8487: ONE transient failure blocked a persistent actor until a run completed, and the
+  // factory router never gave it that run: a 1-minute gateway outage idled review routes for 13-22 h.
+  describe("transient activation block expiry (smarty-dev#8487)", () => {
+    const OUTAGE = "Error: provider stream failed: 502 Bad Gateway";
+    // A fake wall clock: set(t) makes Date.now() read t from now on (it keeps advancing in real time).
+    const clock = () => {
+      const realNow = Date.now.bind(Date);
+      let skew = 0;
+      vi.spyOn(Date, "now").mockImplementation(() => realNow() + skew);
+      return { set: (at: number) => { skew = at - realNow(); } };
+    };
+    // Real timers keep running; the wake is captured so the test can fire it at the faked expiry.
+    const captureWakes = () => {
+      const wakes: Array<{ ms: number; fire: () => void }> = [];
+      const real = globalThis.setTimeout;
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+        if (typeof ms === "number" && ms >= ACTOR_TRANSIENT_BLOCK_BACKOFF_MS) wakes.push({ ms, fire: fn });
+        return real(fn, ms, ...args);
+      }) as unknown as typeof setTimeout);
+      return wakes;
+    };
+    const failOnce = async (manager: ActorManager, agents: AgentManager, id: string, error = OUTAGE) => {
+      vi.spyOn(agents, "run").mockRejectedValueOnce(new Error(error));
+      await expect(manager.ask(id, "activate")).rejects.toThrow(error);
+      await waitFor(() => !manager.status(id).inFlightRun && !manager.status(id).preparing);
+    };
+    const restart = async (s: ReturnType<typeof setup>, manager: ActorManager) => {
+      await manager.close();
+      const next = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true,
+      });
+      actorManagers.push(next);
+      return next;
+    };
+
+    it("stops reporting a transient block after its backoff; the next queued event runs and clears it", async () => {
+      const s = setup(true);
+      const time = clock();
+      const actor = await s.actors.create({ name: "review-route", instructions: "Respond.", responseMode: "text" });
+      const wakes = captureWakes();
+      await failOnce(s.actors, s.agents, actor.id);
+      const blocked = s.actors.status(actor.id).activationBlocked!;
+      expect(blocked).toMatchObject({ code: "unknown", count: 1, reason: OUTAGE, retryAt: blocked.since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      const presence = () => s.mesh.get(`actors/test/${actor.id}`)?.value as Record<string, unknown> | undefined;
+      await waitFor(() => presence()?.activationBlocked !== undefined);
+      const wake = wakes.filter(entry => entry.ms === ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
+      expect(wake).toHaveLength(1);                            // one wake per blocked actor
+
+      time.set(blocked.retryAt! - 1_000);                       // before the backoff: still blocked
+      expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "unknown", count: 1 } });
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+
+      time.set(blocked.retryAt! + 1_000);                       // after it: no longer reported blocked
+      const expired = { lastBlockedReason: OUTAGE, code: "unknown", since: blocked.since, count: 1, expiredAt: blocked.retryAt };
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlocked");
+      expect(s.actors.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: expired });
+      expect(s.actors.listOwned().find(row => row.id === actor.id)).toMatchObject({ activationBlockExpired: expired });
+      expect(s.actors.listOwned().find(row => row.id === actor.id)).not.toHaveProperty("activationBlocked");
+      // The wake republishes the actor record routers read (mesh actors/ presence).
+      wake[0]!.fire();
+      await waitFor(() => presence()?.activationBlocked === undefined);
+      expect(presence()).toMatchObject({ activationBlockExpired: expired });
+
+      const runs = vi.spyOn(s.agents, "run");                  // the spy failOnce installed
+      const before = runs.mock.calls.length;
+      s.actors.tell(actor.id, "next review event");
+      await waitFor(() => s.actors.status(actor.id).status === "idle" && s.actors.status(actor.id).queued === 0 &&
+        !s.actors.status(actor.id).activationBlockExpired);
+      expect(runs.mock.calls.length - before).toBe(1);
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlocked");
+      expect(s.actors.messages(actor.id).filter(message => message.direction === "out").at(-1)).not.toHaveProperty("error");
+      await waitFor(() => presence() !== undefined && presence()!.activationBlockExpired === undefined);
+      expect(presence()).not.toHaveProperty("activationBlocked");
+    }, 60_000);
+
+    it("doubles the backoff on each further failure, up to the cap, across a restart", async () => {
+      const s = setup(true);
+      const time = clock();
+      const actor = await s.actors.create({ name: "flaky-route", instructions: "Respond.", responseMode: "text" });
+      await failOnce(s.actors, s.agents, actor.id);
+      const since = s.actors.status(actor.id).activationBlocked!.since;
+      let manager = await restart(s, s.actors);              // retryAt is durable
+      expect(manager.status(actor.id).activationBlocked).toMatchObject({ count: 1, since, retryAt: since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      time.set(since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS + 1_000);
+      expect(manager.status(actor.id).activationBlockExpired).toMatchObject({ count: 1 });
+
+      // The next run fails again: blocked once more, count 2, backoff doubled from this failure.
+      await failOnce(manager, s.agents, actor.id);
+      const second = manager.status(actor.id).activationBlocked!;
+      expect(second).toMatchObject({ code: "unknown", count: 2, since });
+      expect(manager.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+      const secondFailedAt = second.retryAt! - 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS;
+      expect(secondFailedAt).toBeGreaterThanOrEqual(since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
+      time.set(secondFailedAt + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS + 1_000); // the first backoff is not enough now
+      expect(manager.status(actor.id).activationBlocked).toMatchObject({ count: 2 });
+      time.set(second.retryAt! + 1_000);
+      expect(manager.status(actor.id).activationBlockExpired).toMatchObject({ count: 2, expiredAt: second.retryAt });
+
+      // The third failure reaches the owner-notice threshold: failed while blocked, routable again after.
+      manager = await restart(s, manager);
+      await failOnce(manager, s.agents, actor.id);
+      const third = manager.status(actor.id);
+      expect(third).toMatchObject({ status: "failed", activationBlocked: { count: 3, since } });
+      const thirdFailedAt = third.activationBlocked!.retryAt! - 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS;
+      expect(thirdFailedAt).toBeGreaterThanOrEqual(second.retryAt!);
+      time.set(thirdFailedAt + 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS + 1_000);       // the second backoff is not enough now
+      expect(manager.status(actor.id).status).toBe("failed");
+      time.set(third.activationBlocked!.retryAt! + 1_000);
+      expect(manager.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { count: 3 } });
+
+      expect([1, 2, 3, 4, 5, 6, 40].map(activationBlockBackoffMs)).toEqual([
+        ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS,
+        8 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
+        ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
+      ]);
+      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MS).toBe(5 * 60 * 1000);
+      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS).toBe(60 * 60 * 1000);
+    }, 60_000);
+
+    it("never expires a context-overflow block", async () => {
+      const s = setup(true);
+      const time = clock();
+      const actor = await s.actors.create({ name: "overflowed", instructions: "Respond.", responseMode: "text" });
+      const wakes = captureWakes();
+      await failOnce(s.actors, s.agents, actor.id, "Error: Context exceeds window: 100 > 80");
+      const blocked = s.actors.status(actor.id).activationBlocked!;
+      expect(blocked).toMatchObject({ code: "context-overflow", count: 1 });
+      expect(blocked).not.toHaveProperty("retryAt");
+      expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
+        entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
+      time.set(blocked.since + 30 * 24 * 60 * 60 * 1000);
+      expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow", count: 1 } });
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+      const restored = await restart(s, s.actors);
+      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code: "context-overflow" } });
+      expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+    }, 60_000);
+
+    it("expires a stuck transient block written before retryAt, and keeps failing-preparation blocked", async () => {
+      const s = setup(true);
+      const stuck = await s.actors.create({ name: "stuck-13h", instructions: "Respond.", responseMode: "text" });
+      const preparing = await s.actors.create({ name: "bad-preparation", instructions: "Respond.", responseMode: "text" });
+      await s.actors.close();
+      const file = path.join(s.root, "actors", "actors.json");
+      const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+      const since = Date.now() - 13 * 60 * 60 * 1000;
+      for (const row of registry.actors as Array<Record<string, unknown>>) {
+        // The pre-#8487 writer persisted exactly these four fields.
+        row.activationBlocked = { reason: OUTAGE, code: row.id === stuck.id ? "activation-window-lost" : "failing-preparation", since, count: 1 };
+        row.failureStreak = { count: 3, notified: true };
+      }
+      fs.writeFileSync(file, JSON.stringify(registry));
+      const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+        actorRoot: path.join(s.root, "actors"), persistent: true,
+      });
+      actorManagers.push(restored);
+      expect(restored.status(stuck.id)).toMatchObject({ status: "idle",
+        activationBlockExpired: { lastBlockedReason: OUTAGE, code: "activation-window-lost", since, count: 1,
+          expiredAt: since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS } });
+      expect(restored.status(stuck.id)).not.toHaveProperty("activationBlocked");
+      expect(restored.status(preparing.id)).toMatchObject({ status: "failing-preparation", activationBlocked: { code: "failing-preparation", since } });
+      expect(restored.status(preparing.id)).not.toHaveProperty("activationBlockExpired");
+      await waitFor(() => (s.mesh.get(`actors/test/${stuck.id}`)?.value as { activationBlockExpired?: unknown } | undefined)
+        ?.activationBlockExpired !== undefined, 10_000);           // the restored-registry presence republish
+      expect(s.mesh.get(`actors/test/${stuck.id}`)?.value).not.toHaveProperty("activationBlocked");
+      expect(s.mesh.get(`actors/test/${preparing.id}`)?.value).toMatchObject({ activationBlocked: { code: "failing-preparation" } });
+    }, 60_000);
+  });
 
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice
   // may start a turn while the halt holds.

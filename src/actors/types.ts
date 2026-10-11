@@ -388,8 +388,14 @@ export interface FabricActorInfo {
   requirements?: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * A transient code (unknown, activation-window-lost, child-exit-before-admission) carries
+   * retryAt: from then on the block no longer gates routing and is reported as
+   * activationBlockExpired instead (smarty-dev#8487). */
+  activationBlocked?: { reason: string; code: string; since: number; count: number; retryAt?: number };
+  /** History of a transient block whose backoff ended; the next activation runs normally.
+   * Another failure blocks again with a doubled backoff; a completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; since: number; count: number; expiredAt: number };
   validWhile?: FabricActorValidWhileSource;
   /** Host-maintained, bounded records topic projection for validWhile. */
   records?: FabricActorRecordsOptions;

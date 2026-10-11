@@ -112,7 +112,10 @@ export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file" | "n
 export type MeshBackendStep =
   | "import-read" | "import-commit" | "import-verify"
   | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
-  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag";
+  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag"
+  // file <-> nats (backend-migration-nats.ts, smarty-dev#9670)
+  | "nats-import-begin" | "nats-import-chunk" | "nats-import-verify" | "nats-copy" | "nats-marker" | "nats-import-commit"
+  | "nats-retire" | "nats-export-temp" | "nats-replace";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
 /** Provided by the census lane (writer-census.ts): the writers it attributed and the evidence it could not. */
@@ -296,7 +299,7 @@ type FencedFile = MeshStateFile & { backendEpoch?: number; backendDigest?: strin
 
 // ------------------------------------------------------------------ digest
 
-interface NormalizedState {
+export interface NormalizedState {
   entries: MeshStateEntry[];
   tombstones: Array<{ key: string; version: number }>;
   highWater: number;
@@ -310,7 +313,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * The file store's own validation (state-file.ts stateSlot) and tombstone order
  * (compactStateTombstones: tombstoneOrder first occurrence, then the remaining versions keys).
  */
-const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
+export const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
   if (!isRecord(state) || !isRecord(state.entries)) throw new Error("Invalid Fabric mesh state envelope");
   if (state.versions !== undefined && !isRecord(state.versions)) throw new Error("Invalid Fabric mesh revision table");
   if (state.tombstoneOrder !== undefined && !Array.isArray(state.tombstoneOrder)) throw new Error("Invalid Fabric mesh tombstone order");

@@ -950,6 +950,29 @@ describe.skipIf(process.platform === "win32")("the one gate for every state.db o
     return root;
   };
 
+  // pi-fabric#846 SEC P2: the root is checked before state.db is created, and a refusal raises the operator alarm.
+  it("a refused root gets no state.db from the import or a creating store open", async () => {
+    const root = tempRoot("gate-no-create");
+    await seedFileRoot(root);
+    fs.chmodSync(root, 0o770);
+    await expect(importMeshState(root)).rejects.toThrow(/is group or other writable/);
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    const fresh = tempRoot("gate-no-create-store"); // empty: a creating open passes the import-first guard
+    fs.chmodSync(fresh, 0o770);
+    await expect(SqliteStateStore.open(fresh, 64 * 1024, 1_000, { initialize: "create" })).rejects.toThrow(/is group or other writable/);
+    expect(fs.existsSync(path.join(fresh, "state.db"))).toBe(false);
+  });
+
+  it("a FenceDb refusal raises onAlarm before it is rethrown", async () => {
+    const root = await rolledBack("gate-alarm");
+    fs.chmodSync(root, 0o770);
+    const alarms: MeshBackendAlarm[] = [];
+    expect(() => resolveMeshStateSource(root, { onAlarm: (alarm) => alarms.push(alarm) })).toThrow(/is group or other writable/);
+    await expect(meshBackendStatus(root, { onAlarm: (alarm) => alarms.push(alarm) })).rejects.toThrow(/is group or other writable/);
+    expect(alarms).toEqual([expect.objectContaining({ code: "FABRIC_MESH_BACKEND_FENCE", root, message: expect.stringMatching(/group or other writable/) }),
+      expect.objectContaining({ code: "FABRIC_MESH_BACKEND_FENCE", root })]);
+  });
+
   it("FenceDb and the fence meta read refuse a group-writable root", async () => {
     const root = await rolledBack("gate-shared");
     fs.chmodSync(root, 0o770);

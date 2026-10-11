@@ -95,7 +95,7 @@ export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return undefined;
   // ponytail: Windows keeps main's behavior (type and symlink checks only, no ACL check); failing closed would break
-  // Windows mesh users. The ACL check was cut from smarty-dev#7548 to its own issue, linked there.
+  // Windows mesh users. The ACL check was cut from smarty-dev#7548 to smarty-dev#8920.
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   const uid = posix ? process.getuid!() : undefined;
   const why = stat.isSymbolicLink() ? "is a symbolic link"
@@ -222,11 +222,16 @@ const fdSnapshot = (): Map<string, string> | undefined => {
  * ancestors, a private root and state files, and a connection bound to the checked inode (openPinned, #7784).
  */
 export const openPrivateStateDb = (file: string, open: SqliteOpener): SqliteConnection => {
-  const root = path.dirname(file);
+  assertPrivateStateRoot(path.dirname(file));
+  return openPinned(file, open, assertPrivateStateFiles(file));
+};
+
+/** The root half of the gate: run it before creating state.db too, so a refused root gets no file (#846 SEC P2). */
+export const assertPrivateStateRoot = (root: string): void => {
   const refusal = filesystemRefusal(root);
   if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
   assertPrivateAncestors(root);
-  return openPinned(file, open, assertPrivateStateFiles(file));
+  assertPrivatePath(root, "directory");
 };
 
 // StrictModes (smarty-dev#7548): every ancestor of the root, on the lexical and the real chain, is owned by this
@@ -234,7 +239,7 @@ export const openPrivateStateDb = (file: string, open: SqliteOpener): SqliteConn
 // another user could swap the root out from under the checks.
 const assertPrivateAncestors = (root: string): void => {
   // ponytail: no ancestor walk on Windows (none existed on main; no uid or mode bits here). The Windows ACL check was
-  // cut from smarty-dev#7548 to its own issue, linked there; it covers the ancestors too.
+  // cut from smarty-dev#7548 to smarty-dev#8920; it covers the ancestors too.
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
   const uid = process.getuid();
   const above = (dir: string): string[] => {

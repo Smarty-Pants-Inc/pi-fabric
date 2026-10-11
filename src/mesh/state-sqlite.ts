@@ -95,7 +95,7 @@ import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, 
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
 import { formatWalReaders, walReaderPids } from "./wal-readers.js";
-import { assertPrivatePath, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
+import { assertPrivatePath, assertPrivateStateRoot, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -724,6 +724,7 @@ export class SqliteStateStore {
     initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
+    assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
     // Create mode 0600 before SQLite opens it (its -wal/-shm inherit the mode). O_EXCL: when this
     // succeeds no connection in this process can have the file open, so closing drops no lock.
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
@@ -775,6 +776,7 @@ export class SqliteStateStore {
     initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const file = path.join(root, "state.db");
+    assertPrivateStateRoot(root);
     try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const db = openPrivateStateDb(file, options.open ?? openNodeSqlite);

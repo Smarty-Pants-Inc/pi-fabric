@@ -395,7 +395,25 @@ export interface ExclusiveLockOptions {
 /** Synchronous claim locks use no process probe until actual acquisition. */
 const exclusiveLockProcessAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); return true; } catch (error) {
+    // EPERM (or an unknown probe failure) is not evidence of a dead owner (upstream file-lock).
+    return (error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH";
+  }
+};
+
+// Upstream file-lock reaping, ported onto our sync lock: damaged metadata must not strand the
+// lock forever (fall back to the directory mtime), and an owner in another PID namespace is
+// judged by its identity/heartbeat, where "unknown" is never death.
+const exclusiveLockOwnerCanBeReaped = (owner: string, mtimeMs: number, staleMs: number): boolean => {
+  const [, pid, created, identity] = owner.split("\n");
+  const timestamp = Number(created);
+  const since = created?.trim() && Number.isSafeInteger(timestamp) && timestamp >= 0 && timestamp <= Date.now()
+    ? timestamp
+    : mtimeMs;
+  return Date.now() - since > staleMs && lockOwnerLiveness(Number(pid), since, identity, {
+    legacyAlive: exclusiveLockProcessAlive,
+    maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, staleMs),
+  }) === "dead";
 };
 
 // Stale-lock recovery must be an exclusive claim. Stat-then-delete is
@@ -444,7 +462,8 @@ export const withExclusiveFileLock = <T>(
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
       try {
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
+        // The identity line is additive: older readers only consume the first three.
+        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
           encoding: "utf-8",
           mode: 0o600,
         });
@@ -458,17 +477,14 @@ export const withExclusiveFileLock = <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = fs.readFileSync(ownerPath, "utf8");
-        const [, pidText, createdText] = firstOwner.trim().split("\n");
-        const stale = Date.now() - Number(createdText) > staleMs;
-        if (stale && !exclusiveLockProcessAlive(Number(pidText))) {
+        if (exclusiveLockOwnerCanBeReaped(firstOwner, fs.statSync(lock).mtimeMs, staleMs)) {
           const secondOwner = fs.readFileSync(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
             reapStaleLock(lock, (claimed) => {
               try {
                 const owner = fs.readFileSync(path.join(claimed, "owner"), "utf8");
-                const [, pid, created] = owner.trim().split("\n");
-                return Date.now() - Number(created) > staleMs && !exclusiveLockProcessAlive(Number(pid));
+                return owner === firstOwner && exclusiveLockOwnerCanBeReaped(owner, fs.statSync(claimed).mtimeMs, staleMs);
               } catch {
                 return false;
               }

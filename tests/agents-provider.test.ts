@@ -6378,13 +6378,15 @@ describe("own-root resident setters and authoritative status", () => {
 
 describe("external spawn router hook (#2890)", () => {
   const pick = { model: "provider/model-b", thinking: "high", reason: "policy:task/normal", policyVersion: "v1" };
-  const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {}) => {
+  // `configured` is the persisted agents.model/thinking; pass {} for a host with no configured default.
+  const routerSetup = (mode: "off" | "shadow" | "enforce", body?: string, agentsConfig: Partial<FabricAgentConfig> = {},
+    configured: Partial<FabricAgentConfig> = { model: "provider/model-a", thinking: "medium" }) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "provider-spawn-router-")); roots.push(dir);
     const inputPath = path.join(dir, "requests.jsonl");
     const command = [process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
       require('node:fs').appendFileSync(process.argv[1], input); ${body ?? `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`}
     });`, inputPath];
-    const state = setup([], [], undefined, { agentsConfig: { model: "provider/model-a", thinking: "medium", ...agentsConfig,
+    const state = setup([], [], undefined, { agentsConfig: { ...configured, ...agentsConfig,
       router: { command, mode, timeoutMs: 400 } } });
     const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
@@ -6449,15 +6451,37 @@ describe("external spawn router hook (#2890)", () => {
       expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
     }
   });
-  it("uses inherited model/thinking as the static default but does not mistake inheritance for explicit", async () => {
-    const state = routerSetup("shadow");
+  const inheritedSpawn = async (state: ReturnType<typeof routerSetup>) => {
     const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
     const provider = new AgentsProvider(state.agents, state.actors, state.globalActors, state.mainAgent, state.participants, undefined, state.lifecycle,
       undefined, undefined, true, undefined, () => "max");
     const child = await provider.invoke("spawn", { task: "inherited" }, inherited) as AgentHandleInfo;
-    expect(child).toMatchObject({ model: "provider/session", thinking: "max" }); await state.agents.wait(child.id);
+    await state.agents.wait(child.id);
+    return child;
+  };
+  // Without a configured agents.model the caller's inherited binding is the static default (#699 keeps this).
+  it("uses inherited model/thinking as the static default but does not mistake inheritance for explicit", async () => {
+    const state = routerSetup("shadow", undefined, {}, {});
+    const child = await inheritedSpawn(state);
+    expect(child).toMatchObject({ model: "provider/session", thinking: "max" });
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
-    expect(state.logs()[0]).toMatchObject({ pick, actual: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "default", pick, actual: { model: "provider/session", thinking: "max" }, error: null })]);
+  });
+  it("lets an enforce pick override the inherited static default", async () => {
+    const state = routerSetup("enforce", undefined, {}, {});
+    const child = await inheritedSpawn(state);
+    expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: "enforce", pick, actual: { model: pick.model, thinking: pick.thinking }, error: null })]);
+  });
+  // #699: a configured agents.model wins over the inherited binding as the static default; the router still runs.
+  it.each(["shadow", "enforce"] as const)("%s: a configured agents.model wins over the inherited model as the router's static default", async mode => {
+    const state = routerSetup(mode);
+    const child = await inheritedSpawn(state);
+    const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
+    expect(child).toMatchObject(actual);
+    expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/model-a", thinking: "medium" } });
+    expect(state.logs()).toEqual([expect.objectContaining({ decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null })]);
   });
   it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
     const state = routerSetup("enforce");

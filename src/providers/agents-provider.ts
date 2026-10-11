@@ -11,6 +11,7 @@ import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAg
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
+import { normalizeActorRecords } from "../actors/records.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
@@ -266,6 +267,7 @@ const actorRequest = (
       )
     : undefined;
   const topics = stringArray(args.topics);
+  const records = normalizeActorRecords(args.records);
   const tools = stringArray(args.tools);
   const requires = Array.isArray(args.requires)
     ? args.requires.reduce<Array<string | FabricCapabilityRequirement>>(
@@ -376,6 +378,7 @@ const actorRequest = (
     ...(args.inferenceContext !== undefined ? { inferenceContext: args.inferenceContext } : {}),
     ...(requires ? { requires } : {}),
     ...(validWhile ? { validWhile } : {}),
+    ...(records ? { records } : {}),
   };
 };
 

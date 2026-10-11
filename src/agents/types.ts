@@ -200,6 +200,8 @@ export interface AgentRunRecord {
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
   toolCalls: number;
+  /** Durable ordinary-task answer boundary; native execution custody is separate. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
   /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
@@ -254,6 +256,7 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];

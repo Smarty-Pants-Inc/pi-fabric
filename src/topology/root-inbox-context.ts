@@ -1,4 +1,4 @@
-import { ROOT_INBOX_CUSTOM_TYPE } from "./root-inbox.js";
+import { ROOT_INBOX_CUSTOM_TYPE } from "./root-inbox-shared.js";
 
 /**
  * The model sees each root inbox event once (smarty-dev#8962). The inbox acks an event as soon as

@@ -1,14 +1,15 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
-import { filterRootInboxContext, rootInboxCompactedCopies } from "./topology/root-inbox-context.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
+  ContextEvent,
+  ContextEventResult,
   ExtensionAPI,
   ExtensionContext,
   MessageUpdateEvent,
@@ -1138,7 +1139,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         : DEFAULT_FABRIC_CONFIG.compaction.tokenThresholds[modelKey],
   });
 
-  pi.on("context", (event, context) => {
+  // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
+  // an inbox message, not at startup; without one it has nothing to cut. Once loaded it runs on
+  // every request, synchronously.
+  let inboxContext: typeof import("./topology/root-inbox-context.js") | undefined;
+  const projectContext = (event: ContextEvent, context: ExtensionContext): ContextEventResult | undefined => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
       ? state.prewalk.pendingContinuationMessage(sessionId)
@@ -1158,16 +1163,17 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     );
     // Each root inbox event reaches the model once (smarty-dev#8962), including copies Pi queued
     // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
-    const inbox = filterRootInboxContext(planning.messages, {
+    const filter = inboxContext;
+    const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
       acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
       compactedCopies: () => {
         try {
-          return rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
         } catch {
           return new Map();
         }
       },
-    });
+    }) : { messages: planning.messages, changed: false };
     let changed = continuation.changed || planning.changed || inbox.changed;
     const messages = inbox.messages.map((message) => {
       if (message.role !== "user") return message;
@@ -1189,6 +1195,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       return messageChanged ? { ...message, content } : message;
     });
     return changed ? { messages } : undefined;
+  };
+  pi.on("context", (event, context) => {
+    // Nothing is projected before the load, so the request is projected once, after it.
+    if (inboxContext || !event.messages.some((message) => (message as { customType?: unknown }).customType === ROOT_INBOX_CUSTOM_TYPE)) {
+      return projectContext(event, context);
+    }
+    return import("./topology/root-inbox-context.js").then((module) => {
+      inboxContext = module;
+      return projectContext(event, context);
+    });
   });
 
   pi.on("before_agent_start", async (event, context) => {

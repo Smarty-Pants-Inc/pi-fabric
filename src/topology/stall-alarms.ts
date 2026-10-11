@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { SessionReceiptManager } from "../core/session-receipts.js";
-import { confirmedMainInboxIds } from "./root-inbox.js";
+import { confirmedMainInboxIds } from "./root-inbox-shared.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";

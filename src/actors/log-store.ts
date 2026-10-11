@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
-import { closeDirectory, mkdirPrivate } from "../storage/private-dir.js";
+import { closeDirectory, openPrivateDir, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
 
 /** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
@@ -12,14 +12,6 @@ import type { FabricActorMessage } from "./types.js";
 const closeDirectories = (directory: string, depth = 0): void => {
   if (depth > 64 || !closeDirectory(directory)) return;
   for (const name of fs.readdirSync(directory)) closeDirectories(path.join(directory, name), depth + 1);
-};
-/** Every directory from `directory` up to `root` is ours and not group- or other-writable (lstat, no link). */
-const privateChain = (directory: string, root: string): boolean => {
-  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
-    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
-    if (!stat?.isDirectory() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0) return false;
-    if (current === path.resolve(root) || path.dirname(current) === current) return true;
-  }
 };
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
@@ -102,37 +94,44 @@ export class ActorLogStore {
   async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
-    mkdirPrivate(dest);
-    const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
-    if (fs.existsSync(receipt)) {
-      const archivedReceipt = path.join(dest, "route-dispatch-receipt.json");
-      const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-      const source = readRouteDispatchReceipt(receipt);
-      if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-      // Durable archive confirmation precedes source cleanup (F2 custody).
-      writeJsonAtomic(archivedReceipt, source, { durable: true });
+    // pi-fabric#875 round 2 P1-b: the archive destination is created or validated BEFORE anything is copied, by the
+    // trusted descriptor walk (private-dir.ts), and every copy goes through the held descriptor's path. A symlinked,
+    // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
+    // source is untouched) and one line says why.
+    let held: PrivateDirectory;
+    try { held = openPrivateDir(dest); }
+    catch (error) {
+      console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
+      return;
     }
-    for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
-      const src = path.join(runDirectory, file);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));
-    }
-    const nested = path.join(runDirectory, "nested");
-    if (fs.existsSync(nested)) {
-      try {
-        fs.cpSync(nested, path.join(dest, "nested"), { recursive: true });
-        // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
-        // the archive itself (smarty-dev#9016). Files keep their modes.
-        // ponytail: a writable-by-others ancestor would let another uid swap a path while we walk it, so the tree is
-        // changed only when the whole chain from the archive up to the actor's log root is ours and closed. Otherwise
-        // it is left as copied; retention keeps refusing it (the safe side), and one line says why.
-        if (process.platform !== "win32") {
-          if (privateChain(dest, path.dirname(actor.sessionFile))) closeDirectories(path.join(dest, "nested"));
-          else console.warn(`[pi-fabric] archive ${dest}: an ancestor up to the actor log root is not our private directory; nested directories keep their copied modes`);
-        }
-      } catch {
-        /* best-effort recursive run retention */
+    try {
+      const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
+      if (fs.existsSync(receipt)) {
+        const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+        const source = readRouteDispatchReceipt(receipt);
+        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+        // Durable archive confirmation precedes source cleanup (F2 custody). Its directory barriers need the real path,
+        // so the path must still name the held directory.
+        const named = fs.statSync(dest), opened = fs.statSync(held.path);
+        if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
+        writeJsonAtomic(path.join(dest, "route-dispatch-receipt.json"), source, { durable: true });
       }
-    }
+      for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+        const src = path.join(runDirectory, file);
+        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(held.path, file));
+      }
+      const nested = path.join(runDirectory, "nested");
+      if (fs.existsSync(nested)) {
+        try {
+          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
+          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
+          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
+          if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
+        } catch {
+          /* best-effort recursive run retention */
+        }
+      }
+    } finally { held.close(); }
     this.pruneRuns(actor);
   }
 

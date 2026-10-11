@@ -87,15 +87,17 @@ it.skipIf(process.platform === "win32")("does not follow a symlink swapped in at
   fs.mkdirSync(outside); fs.chmodSync(outside, 0o755);
   let swapped = false;
   const swap = () => { if (swapped) return; swapped = true; fs.rmSync(child, { recursive: true, force: true }); fs.symlinkSync(outside, child); };
-  // The swap lands at the walk's first look at the copied child, by lstat (a path walk) or by open (an fd walk).
+  // The swap lands at the walk's first look at the copied child, by lstat (a path walk) or by open (an fd walk, which
+  // may reach it through /proc/self/fd/<archive fd>/nested/child).
+  const tail = `${path.sep}nested${path.sep}child`;
   const lstat = fs.lstatSync, open = fs.openSync;
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
     const result = (lstat as (...args: unknown[]) => unknown)(file, ...rest);
-    if (String(file) === child) swap();
+    if (String(file).endsWith(tail)) swap();
     return result;
   }) as typeof fs.lstatSync);
   vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
-    if (String(file) === child) swap();
+    if (String(file).endsWith(tail)) swap();
     return (open as (...args: unknown[]) => unknown)(file, ...rest);
   }) as typeof fs.openSync);
   await store.retainRun({ sessionFile }, "run-1", source);
@@ -104,15 +106,64 @@ it.skipIf(process.platform === "win32")("does not follow a symlink swapped in at
   expect(mode(outside)).toBe(0o755);
 });
 
-it.skipIf(process.platform === "win32")("leaves the copied tree as is when an ancestor up to the actor log root is group-writable", async () => {
-  const { root, source, sessionFile, store, child } = archiveFixture();
+// pi-fabric#875 round 2 P1-b: the destination chain is validated BEFORE any copy. An unsafe chain refuses the archive.
+it.skipIf(process.platform === "win32")("does not archive below a group-writable ancestor, and warns", async () => {
+  const { root, source, sessionFile, store } = archiveFixture();
   fs.chmodSync(path.dirname(sessionFile), 0o775);
-  fs.chmodSync(path.join(source, "nested", "child"), 0o755);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   await store.retainRun({ sessionFile }, "run-1", source);
-  expect(mode(child)).toBe(0o755);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not our private directory/));
-  expect(fs.existsSync(path.join(root, "actor", "runs", "run-1", "status.json"))).toBe(true);
+  expect(fs.existsSync(path.join(root, "actor", "runs"))).toBe(false);
+  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*writable by group or others/));
+  expect(fs.existsSync(path.join(source, "status.json"))).toBe(true);
+});
+
+it.skipIf(process.platform === "win32")("does not archive through a symlinked destination, and warns", async () => {
+  const { root, source, sessionFile, store } = archiveFixture();
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(outside, { mode: 0o700 });
+  fs.mkdirSync(path.join(root, "actor", "runs"), { mode: 0o700 });
+  fs.symlinkSync(outside, path.join(root, "actor", "runs", "run-1"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  await store.retainRun({ sessionFile }, "run-1", source);
+  expect(fs.readdirSync(outside)).toEqual([]);
+  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/not archived: .*symbolic link/));
+});
+
+// pi-fabric#875 round 2 P1-a: existing ancestors and a competing creator are validated, never skipped.
+it.skipIf(process.platform === "win32")("mkdirPrivate refuses a symlinked existing ancestor and writes nothing through it", async () => {
+  const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-link-");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(outside, { mode: 0o700 });
+  fs.symlinkSync(outside, path.join(root, "link"));
+  expect(() => mkdirPrivate(path.join(root, "link", "run"))).toThrow(/symbolic link/);
+  expect(fs.readdirSync(outside)).toEqual([]);
+});
+
+it.skipIf(process.platform === "win32")("mkdirPrivate refuses an existing group-writable ancestor", async () => {
+  const { mkdirPrivate } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-open-");
+  fs.mkdirSync(path.join(root, "shared"));
+  fs.chmodSync(path.join(root, "shared"), 0o775);
+  expect(() => mkdirPrivate(path.join(root, "shared", "run"))).toThrow(/writable by group or others/);
+  expect(fs.readdirSync(path.join(root, "shared"))).toEqual([]);
+});
+
+it.skipIf(process.platform === "win32").each(["a group-writable directory", "a symlink"])("mkdirPrivate refuses a competing creator that made %s at the component it was creating", async kind => {
+  const { mkdirPrivate, privateDirTestHooks } = await import("../src/storage/private-dir.js");
+  const root = tmp("fabric-private-race-");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(outside, { mode: 0o700 });
+  const contested = path.join(root, "run");
+  privateDirTestHooks.beforeCreate = directory => {
+    if (directory !== contested) return;
+    if (kind === "a symlink") fs.symlinkSync(outside, contested);
+    else { fs.mkdirSync(contested); fs.chmodSync(contested, 0o777); }
+  };
+  try { expect(() => mkdirPrivate(path.join(contested, "inner"))).toThrow(/symbolic link|changed while it was created|writable by group or others/); }
+  finally { delete privateDirTestHooks.beforeCreate; }
+  expect(fs.readdirSync(outside)).toEqual([]);
+  if (kind !== "a symlink") expect(fs.readdirSync(contested)).toEqual([]);
 });
 
 it.skipIf(process.platform === "win32")("archives an actor run's nested tree with 0700 directories", async () => {

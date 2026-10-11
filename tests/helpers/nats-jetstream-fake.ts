@@ -17,6 +17,11 @@ export interface FakeJetStreamServer {
   port(): FakePort;
   version: string;
   syncAlways: boolean | undefined;
+  /** The server INFO fields the backend checks. */
+  maxPayload: number | undefined;
+  authRequired: boolean;
+  /** The stream's max_msg_size: set by the first ensureStream (like a created stream); preset it for an existing one (-1: none). */
+  streamMaxMsgSize: number | undefined;
   /** Runs before each publish is stored (inject a concurrent writer); return "lose-ack" to store it but fail the ack once. */
   beforePublish?: (data: Uint8Array) => void | "lose-ack";
   /** Runs after a publish is stored, before its ack (inject writers that commit after it). */
@@ -54,7 +59,8 @@ export const fakeJetStream = (): FakeJetStreamServer => {
     return message.seq;
   };
   const server: FakeJetStreamServer = {
-    messages, version: "2.14.7", syncAlways: true, hidden: new Set<number>(),
+    messages, version: "2.14.7", syncAlways: true, hidden: new Set<number>(), maxPayload: 1024 * 1024, authRequired: false,
+    streamMaxMsgSize: undefined,
     get firstSeq() { return firstSeq; },
     append: (data, subject) => store(data, subject),
     pause: () => { paused ??= []; },
@@ -69,8 +75,16 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         calls,
         pause: () => { held ??= []; },
         resume: () => { const queued = held ?? []; held = undefined; for (const run of queued) setImmediate(run); },
-        server: async () => { calls.push("server"); return { version: server.version, syncAlways: server.syncAlways }; },
-        ensureStream: async () => { calls.push("ensureStream"); return { lastSeq: messages.length }; },
+        server: async () => {
+          calls.push("server");
+          return { version: server.version, syncAlways: server.syncAlways, authRequired: server.authRequired,
+            ...(server.maxPayload === undefined ? {} : { maxPayload: server.maxPayload }) };
+        },
+        ensureStream: async (_stream, _subjects, { maxMsgSize }) => {
+          calls.push("ensureStream");
+          server.streamMaxMsgSize ??= maxMsgSize;
+          return { lastSeq: messages.length, maxMsgSize: server.streamMaxMsgSize };
+        },
         lastSequence: async () => { calls.push("lastSequence"); return messages.length; },
         firstSequence: async () => { calls.push("firstSequence"); return firstSeq; },
         getMessage: async (_stream, seq) => {
@@ -96,6 +110,9 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         publish: async (subject, data, { expectLastSequence, msgID }) => {
           calls.push("publish");
           if (!open) throw new Error("connection closed");
+          if (server.streamMaxMsgSize !== undefined && server.streamMaxMsgSize > 0 && data.byteLength > server.streamMaxMsgSize) {
+            throw new Error("message size exceeds maximum allowed"); // the server's own refusal: final, not transient
+          }
           await new Promise<void>(resolve => setImmediate(resolve));
           // nats-server 2.14 checks the expected last sequence BEFORE the duplicate window (measured on the real server).
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);

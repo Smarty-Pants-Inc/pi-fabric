@@ -61,6 +61,41 @@ cross-writer write fence, the migration flag and the conformance suite against a
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must
 also refuse (throw), never return a reason, for the same reason.
 
+### Required nats-server configuration (pi-fabric#907)
+
+No fleet NATS server is deployed (the backend is opt-in). Any server that hosts a mesh state stream MUST be configured
+as below. The stream is `FABRIC_MESH_<32 hex>` (`natsStreamName`); its subjects are `<stream>.state` and
+`<stream>.snapshot`.
+
+```
+max_payload: 1MB                    # 1048576; the adapter refuses a server whose max_payload is larger
+jetstream { sync_interval: always } # the adapter refuses a server without sync_always (unless accepted)
+authorization {                     # or an account; the adapter refuses a NON-loopback server without auth
+  users = [
+    { user: fleet, password: $FLEET_NATS_PASSWORD, permissions: {
+        publish: { allow: [
+          "FABRIC_MESH_*.state", "FABRIC_MESH_*.snapshot",
+          "$JS.API.INFO", "$JS.API.STREAM.INFO.FABRIC_MESH_*", "$JS.API.STREAM.CREATE.FABRIC_MESH_*",
+          "$JS.API.STREAM.UPDATE.FABRIC_MESH_*", "$JS.API.STREAM.MSG.GET.FABRIC_MESH_*",
+          "$JS.API.STREAM.PURGE.FABRIC_MESH_*", "$JS.API.CONSUMER.CREATE.FABRIC_MESH_*",
+          "$JS.API.CONSUMER.CREATE.FABRIC_MESH_*.>", "$JS.API.CONSUMER.MSG.NEXT.FABRIC_MESH_*.>",
+          "$JS.API.CONSUMER.DELETE.FABRIC_MESH_*.>", "$JS.API.CONSUMER.INFO.FABRIC_MESH_*.>", "$JS.FC.FABRIC_MESH_*.>",
+          "$JS.ACK.FABRIC_MESH_*.>" ] }
+        subscribe: { allow: [ "_INBOX.>" ] } } }
+    # Every other user: no publish on FABRIC_MESH_* and no $JS.API.STREAM.PURGE / DELETE / UPDATE on them.
+  ]
+}
+```
+
+- **Only the fleet user** may publish to the state subjects or purge the stream; every other user is denied (the
+  default once `permissions` exist). `DELETE` of the stream is granted to nobody.
+- The stream's `max_msg_size` is set to 1048576 when the adapter creates it, and a stream with no limit or a larger one
+  is refused (`FABRIC_MESH_STATE_NATS_LIMIT`).
+- **What the adapter can and cannot check:** it reads the server's INFO, and refuses a non-loopback server whose INFO
+  does not say `auth_required`, a `max_payload` over 1 MiB, a server older than 2.11 and one without `sync_always`. It
+  CANNOT see other users' permissions (NATS exposes no client API for them), so the publish and purge rules above are
+  an operator requirement, checked when the server is deployed (phase 2's CI job uses this exact config).
+
 ## What the selector and migration need from fabric-v2: option (c)
 
 `StateBackend` writes are already async (`put`, `delete`, `writeBatch` return promises). The parts

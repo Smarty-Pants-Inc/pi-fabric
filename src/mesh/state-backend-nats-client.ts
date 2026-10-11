@@ -36,19 +36,22 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
         const varz = await response.json() as { jetstream?: { config?: { sync_always?: unknown } } };
         syncAlways = typeof varz.jetstream?.config?.sync_always === "boolean" ? varz.jetstream.config.sync_always : undefined;
       }
-      return { version: nc.info?.version ?? "0.0.0", syncAlways };
+      return { version: nc.info?.version ?? "0.0.0", syncAlways,
+        ...(typeof nc.info?.max_payload === "number" ? { maxPayload: nc.info.max_payload } : {}),
+        authRequired: nc.info?.auth_required === true };
     },
-    ensureStream: async (stream, subjects) => {
+    ensureStream: async (stream, subjects, { maxMsgSize }) => {
       let info;
       try { info = await jsm.streams.info(stream); }
       catch (error) { if (apiCode(error) !== STREAM_NOT_FOUND) throw error; }
       if (!info) {
-        const created = await jsm.streams.add({ name: stream, subjects, storage: StorageType.File, num_replicas: 1 });
-        return { lastSeq: created.state.last_seq };
+        // The stream itself refuses a larger message (pi-fabric#907): the server enforces the cap, not only the client.
+        const created = await jsm.streams.add({ name: stream, subjects, storage: StorageType.File, num_replicas: 1, max_msg_size: maxMsgSize });
+        return { lastSeq: created.state.last_seq, maxMsgSize: created.config.max_msg_size };
       }
       const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
       if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
-      return { lastSeq: info.state.last_seq };
+      return { lastSeq: info.state.last_seq, maxMsgSize: info.config.max_msg_size };
     },
     lastSequence: async (stream) => (await jsm.streams.info(stream)).state.last_seq,
     firstSequence: async (stream) => (await jsm.streams.info(stream)).state.first_seq,

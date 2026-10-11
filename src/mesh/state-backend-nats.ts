@@ -45,9 +45,9 @@ export interface NatsStreamMessage { seq: number; data: Uint8Array }
  */
 export interface JetStreamPort {
   /** Server facts for the refusals: its version and whether it fsyncs every write (`/varz` sync_always). */
-  server(): Promise<{ version: string; syncAlways: boolean | undefined }>;
+  server(): Promise<{ version: string; syncAlways: boolean | undefined; maxPayload?: number; authRequired?: boolean }>;
   /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence. */
-  ensureStream(stream: string, subjects: string[]): Promise<{ lastSeq: number }>;
+  ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
   /** The stream's first stored sequence now (above 1 after a purge). */
@@ -140,11 +140,48 @@ const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), t
  * replica serializes the same state to the same bytes whatever its map insertion order. `parseModel` is its inverse.
  */
 const byKey = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
-const serializeModel = (snapshot: NatsSnapshot): string => JSON.stringify({
-  entries: [...snapshot.entries.keys()].sort(byKey).map(key => snapshot.entries.get(key)),
-  versions: [...snapshot.versions.keys()].sort(byKey).map(key => [key, snapshot.versions.get(key)]),
-  tombstones: snapshot.tombstones, highWater: snapshot.highWater, status: snapshot.status, epoch: snapshot.epoch,
-});
+/**
+ * The canonical body, built piece by piece and counted as it grows (pi-fabric#907 round 2): past `maxBytes` it stops
+ * and returns undefined, so an over-bound state is refused without ever building its whole string. The bytes equal
+ * `JSON.stringify({ entries, versions, tombstones, highWater, status, epoch })` exactly.
+ */
+const serializeModelBounded = (snapshot: NatsSnapshot, maxBytes: number): string | undefined => {
+  const pieces: string[] = [];
+  let bytes = 0;
+  const push = (piece: string): boolean => {
+    bytes += Buffer.byteLength(piece, "utf8");
+    if (bytes > maxBytes) return false;
+    pieces.push(piece);
+    return true;
+  };
+  if (!push('{"entries":[')) return undefined;
+  let first = true;
+  for (const key of [...snapshot.entries.keys()].sort(byKey)) {
+    if (!push(`${first ? "" : ","}${JSON.stringify(snapshot.entries.get(key))}`)) return undefined;
+    first = false;
+  }
+  if (!push('],"versions":[')) return undefined;
+  first = true;
+  for (const key of [...snapshot.versions.keys()].sort(byKey)) {
+    if (!push(`${first ? "" : ","}${JSON.stringify([key, snapshot.versions.get(key)])}`)) return undefined;
+    first = false;
+  }
+  if (!push(`],"tombstones":${JSON.stringify(snapshot.tombstones)},"highWater":${JSON.stringify(snapshot.highWater)},` +
+    `"status":${JSON.stringify(snapshot.status)},"epoch":${JSON.stringify(snapshot.epoch)}}`)) return undefined;
+  return pieces.join("");
+};
+const serializeModel = (snapshot: NatsSnapshot): string => serializeModelBounded(snapshot, Number.POSITIVE_INFINITY)!;
+
+/**
+ * The snapshot digest (pi-fabric#907 round 2): ONE canonical encoding of everything the end record states (the
+ * snapshot id, its base, its end sequence, its chunk count, the previous digest, the lifecycle, the size) followed by
+ * the body. Nothing in the header can be altered without the digest changing, so a first-time opener uses `base` and
+ * `prev` only after this verifies.
+ */
+const snapshotDigest = (fields: { snapshot: string; base: number; end: number; chunks: number; prev: string; status: string;
+  epoch: number; bytes: number; entries: number }, body: string): string =>
+  createHash("sha256").update(JSON.stringify(["fabric-mesh-nats-snapshot", 1, fields.snapshot, fields.base, fields.end, fields.chunks,
+    fields.prev, fields.status, fields.epoch, fields.bytes, fields.entries]), "utf8").update("\n").update(body, "utf8").digest("hex");
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 const parseModel = (body: string, seq: number): NatsSnapshot => {
   const value = JSON.parse(body) as { entries: MeshStateEntry[]; versions: [string, number][]; tombstones: string[]; highWater: number;
@@ -189,13 +226,18 @@ export class MeshStateNatsUnavailableError extends Error {
 }
 
 /** The bounds a snapshot load and an open replay are checked against BEFORE anything is fetched or joined. */
-export interface NatsSnapshotLimits { maxBytes: number; maxEntries: number; maxChunks: number; maxReplay: number }
+export interface NatsSnapshotLimits { maxBytes: number; maxEntries: number; maxChunks: number; maxReplay: number; maxMessageBytes: number }
 
-/** A model's header: what a snapshot of it commits to. */
-const headerOf = (snapshot: NatsSnapshot, body: string): SnapshotHeader => ({
-  digest: sha256(body), prev: snapshot.snapshotDigest, bytes: Buffer.byteLength(body, "utf8"), entries: snapshot.entries.size,
-  status: snapshot.status, epoch: snapshot.epoch,
-});
+/** A model's header: what a snapshot of it at `snapshot.seq`, in `chunks` chunks, commits to. */
+const headerOf = (snapshot: NatsSnapshot, body: string, id: string, chunks: number): SnapshotHeader => {
+  const fields = { prev: snapshot.snapshotDigest, bytes: Buffer.byteLength(body, "utf8"), entries: snapshot.entries.size,
+    status: snapshot.status, epoch: snapshot.epoch };
+  return { ...fields, digest: snapshotDigest({ ...fields, snapshot: id, base: snapshot.seq, end: snapshot.seq + chunks + 1, chunks }, body) };
+};
+/** The digest an end record at `end` must carry for this body. */
+const expectedDigest = (record: { snapshot: string; base: number; chunks: number; header: SnapshotHeader }, end: number, body: string): string =>
+  snapshotDigest({ snapshot: record.snapshot, base: record.base, end, chunks: record.chunks, prev: record.header.prev,
+    status: record.header.status, epoch: record.header.epoch, bytes: record.header.bytes, entries: record.header.entries }, body);
 
 const isHeader = (value: unknown): value is SnapshotHeader => {
   const header = value as Partial<SnapshotHeader> | undefined;
@@ -271,8 +313,13 @@ export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMess
     // Every replica checks a published snapshot against its OWN model (the chunks between change no state), and
     // that it continues this stream's snapshot chain: a snapshot that misstates the stream fails closed here too.
     const header = record.header;
-    if (!isHeader(header) || header.prev !== snapshot.snapshotDigest || header.status !== snapshot.status ||
-        header.epoch !== snapshot.epoch || header.entries !== snapshot.entries.size || header.digest !== sha256(serializeModel(snapshot))) {
+    // Our own body, bounded by the size the header claims: a larger model cannot match it.
+    const body = isHeader(header) ? serializeModelBounded(snapshot, header.bytes) : undefined;
+    // The sequence fields are checked against where this end record actually is, and they are inside the digest.
+    if (!isHeader(header) || body === undefined || !Number.isSafeInteger(record.chunks) || record.chunks < 1 ||
+        !Number.isSafeInteger(record.base) || record.first !== record.base + 1 || record.base + record.chunks + 1 !== message.seq ||
+        header.prev !== snapshot.snapshotDigest || header.status !== snapshot.status || header.epoch !== snapshot.epoch ||
+        header.entries !== snapshot.entries.size || header.digest !== expectedDigest(record, message.seq, body)) {
       throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} (end record ${message.seq}) does not match the stream it covers`);
     }
     return { ...snapshot, seq: message.seq, snapshotEnd: message.seq, snapshotDigest: header.digest };
@@ -341,6 +388,12 @@ const DEFAULT_MAX_REPLAY = 100_000;
 const RESYNC_ATTEMPTS = 3;
 /** Characters of the model's JSON per snapshot chunk: at most 6 bytes each once escaped, far under the 1 MiB payload. */
 const SNAPSHOT_CHUNK = 64 * 1024;
+/** The largest stream message (pi-fabric#907): the stream's max_msg_size and the server's max_payload must not exceed it. */
+export const MAX_MESSAGE_BYTES = 1024 * 1024;
+/** A chunk record's raw bound: 64 Ki characters at most 6 bytes each once JSON-escaped, plus its envelope. */
+const MAX_CHUNK_RECORD_BYTES = SNAPSHOT_CHUNK * 6 + 4_096;
+/** An end record's raw bound: ids, integers and two digests. */
+const MAX_END_RECORD_BYTES = 4_096;
 /** The smallest serialized entry (`{"key":"a","value":0,...}` with its version pair) is well over 32 bytes. */
 const MIN_ENTRY_BYTES = 32;
 
@@ -348,7 +401,10 @@ const MIN_ENTRY_BYTES = 32;
 export const natsSnapshotLimits = (options: Pick<NatsStateBackendOptions, "maxStateBytes" | "maxReplay">): NatsSnapshotLimits => {
   const maxBytes = Math.max(1, Math.floor(options.maxStateBytes ?? DEFAULT_MAX_STATE_BYTES));
   return { maxBytes, maxEntries: Math.ceil(maxBytes / MIN_ENTRY_BYTES), maxChunks: Math.ceil(maxBytes / SNAPSHOT_CHUNK),
-    maxReplay: Math.max(1, Math.floor(options.maxReplay ?? DEFAULT_MAX_REPLAY)) };
+    maxReplay: Math.max(1, Math.floor(options.maxReplay ?? DEFAULT_MAX_REPLAY)),
+    // One stream message (a batch, a snapshot chunk, an end record): NATS's default max_payload. A chunk record is at
+    // most MAX_CHUNK_RECORD_BYTES (~390 KiB), well under it.
+    maxMessageBytes: MAX_MESSAGE_BYTES };
 };
 
 /**
@@ -389,20 +445,34 @@ export class NatsStateBackend implements StateBackend {
   /** Loads the latest snapshot, connects the projector after it and replays up to the stream's current last sequence. */
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
-    const { lastSeq } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject]);
+    const { lastSeq, maxMsgSize } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject],
+      { maxMsgSize: backend.#limits.maxMessageBytes });
+    // The server enforces the message cap too (pi-fabric#907): a stream with no limit, or a larger one, is refused.
+    if (maxMsgSize === undefined || maxMsgSize <= 0 || maxMsgSize > backend.#limits.maxMessageBytes) {
+      throw new MeshStateNatsLimitError(`the stream ${options.stream} allows messages of ${maxMsgSize === undefined || maxMsgSize <= 0 ? "any size" : `${maxMsgSize} bytes`} (limit ${backend.#limits.maxMessageBytes}); set its max_msg_size`);
+    }
     backend.#knownSeq = lastSeq;
-    await backend.#startProjector(lastSeq);
-    await backend.#appliedThrough(lastSeq);
+    await backend.#startProjector();
+    await backend.#appliedThrough(backend.#knownSeq);
     return backend;
   }
 
-  /** (Re)starts the projector: from the latest complete snapshot when it is ahead of the model, else from the model. */
-  async #startProjector(replayTo?: number): Promise<void> {
-    const loaded = await this.#loadSnapshot();
-    if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
-    // P1-2: the replay after the snapshot is bounded too, checked before the consumer starts.
-    if (replayTo !== undefined && replayTo - this.#snapshot.seq > this.#limits.maxReplay) {
-      throw new MeshStateNatsLimitError(`opening would replay ${replayTo - this.#snapshot.seq} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
+  /**
+   * (Re)starts the projector: from the latest complete snapshot when it is ahead of the model, else from the model.
+   * The replay after it is bounded (pi-fabric#907): the stream's last sequence is read AFTER the snapshot load (writes
+   * during the load count), and a backlog over `maxReplay` loads a newer snapshot once, then refuses (LIMIT).
+   */
+  async #startProjector(): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      const loaded = await this.#loadSnapshot();
+      if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+      const last = await this.#options.port.lastSequence(this.#options.stream);
+      this.#knownSeq = Math.max(this.#knownSeq, last);
+      const backlog = last - this.#snapshot.seq;
+      if (backlog <= this.#limits.maxReplay) break;
+      if (attempt >= 2) {
+        throw new MeshStateNatsLimitError(`the projector would replay ${backlog} messages after sequence ${this.#snapshot.seq} (limit ${this.#limits.maxReplay})`);
+      }
     }
     const generation = ++this.#generation;
     this.#consumer = await this.#options.port.consume(this.#options.stream, this.#snapshot.seq,
@@ -422,6 +492,26 @@ export class NatsStateBackend implements StateBackend {
         if (await port.firstSequence(stream) > 1) throw new MeshStateNatsRefusedError(`the stream ${stream} was purged without a snapshot`);
         return undefined;
       }
+      const verified = await this.#verifiedSnapshot(end);
+      if (verified !== "gone") return verified;
+      // A newer snapshot's purge took the chunks: retry with it. Still the latest end record: a chunk was dropped.
+      const latest = await port.lastBySubject(stream, snapshotSubject);
+      if (latest?.seq === end.seq) throw new MeshStateNatsSnapshotIntegrityError(`a chunk of the snapshot ending at ${end.seq} is missing`);
+    }
+    throw new MeshStateNatsBusyError(`newer snapshots kept replacing the one being read`);
+  }
+
+  /**
+   * Reads and verifies the snapshot whose end record is `end`: the record's shape, the bounds (before any chunk is
+   * fetched), the chunk chain, then the digest over the canonical header encoding plus the body, then the model's
+   * own lifecycle and size. Returns the model at its base (BEFORE the end record), or "gone" when a chunk is no
+   * longer stored. Used by the loader and by `compact()` before it purges (pi-fabric#907 round 2).
+   */
+  async #verifiedSnapshot(end: NatsStreamMessage): Promise<NatsSnapshot | "gone"> {
+    const { port, stream } = this.#options;
+    {
+      // The RAW size is bounded before anything is decoded (pi-fabric#907 round 2).
+      if (end.data.byteLength > MAX_END_RECORD_BYTES) throw new MeshStateNatsLimitError(`the snapshot end record ${end.seq} is ${end.data.byteLength} bytes (limit ${MAX_END_RECORD_BYTES})`);
       const record = decode(end.data);
       if (record.type !== "snapshot-end" || !Number.isSafeInteger(record.base) || record.base < 0 || !Number.isSafeInteger(record.chunks) ||
           record.chunks < 1 || record.first !== record.base + 1 || end.seq !== record.first + record.chunks || !isHeader(record.header)) {
@@ -437,6 +527,9 @@ export class NatsStateBackend implements StateBackend {
       for (let index = 0; index < record.chunks; index++) {
         const message = await port.getMessage(stream, record.first + index);
         if (!message) break; // purged by a newer snapshot meanwhile
+        if (message.data.byteLength > MAX_CHUNK_RECORD_BYTES) {
+          throw new MeshStateNatsLimitError(`chunk ${index} of snapshot ${record.snapshot} is ${message.data.byteLength} bytes before decoding (limit ${MAX_CHUNK_RECORD_BYTES})`);
+        }
         const chunk = decode(message.data);
         if (chunk.type !== "snapshot-chunk" || chunk.snapshot !== record.snapshot || chunk.index !== index || typeof chunk.part !== "string") {
           throw new MeshStateNatsSnapshotIntegrityError(`stream message ${message.seq} is not chunk ${index} of snapshot ${record.snapshot}`);
@@ -446,14 +539,11 @@ export class NatsStateBackend implements StateBackend {
         if (bytes > header.bytes) throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} is longer than its header's ${header.bytes} bytes`);
         parts.push(chunk.part);
       }
-      if (parts.length !== record.chunks) {
-        // A newer snapshot's purge took the chunks: retry with it. Still the latest end record: a chunk was dropped.
-        const latest = await port.lastBySubject(stream, snapshotSubject);
-        if (latest?.seq === end.seq) throw new MeshStateNatsSnapshotIntegrityError(`chunk ${parts.length} of snapshot ${record.snapshot} is missing`);
-        continue;
-      }
+      if (parts.length !== record.chunks) return "gone";
       const body = parts.join("");
-      if (bytes !== header.bytes || sha256(body) !== header.digest) {
+      // The digest binds the whole header (base, end sequence, chunks, prev, lifecycle, size) to the body: nothing in
+      // the end record is trusted before this verifies.
+      if (bytes !== header.bytes || expectedDigest(record, end.seq, body) !== header.digest) {
         throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} does not match its digest (a chunk is altered, missing or foreign)`);
       }
       let model: NatsSnapshot;
@@ -461,14 +551,13 @@ export class NatsStateBackend implements StateBackend {
       catch (error) { throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} is not a model: ${(error as Error).message}`); }
       // The lifecycle and the size it commits to must be the model's own (and the body re-serializes to itself).
       if (model.status !== header.status || model.epoch !== header.epoch || model.entries.size !== header.entries ||
-          serializeModel(model) !== body) {
+          serializeModelBounded(model, header.bytes) !== body) {
         throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} does not match its header (status, epoch or entries)`);
       }
       // The model stands at `base`, BEFORE the end record: the consumer starts after `base` and applies the chunks and
       // the end record, which re-checks the digest and then sets `snapshotDigest` (so the chain carries `prev` here).
       return { ...model, snapshotDigest: header.prev };
     }
-    throw new MeshStateNatsBusyError(`newer snapshots kept replacing the one being read`);
   }
 
   /**
@@ -513,13 +602,15 @@ export class NatsStateBackend implements StateBackend {
     const model = this.#readable();
     if (model.status !== "ready" || model.seq === 0) return false;
     const { port, stream, snapshotSubject } = this.#options;
-    const body = serializeModel(model);
-    const header = headerOf(model, body);
-    // Never publish a snapshot no host could load (P1-2): the state itself is over the bound.
-    if (header.bytes > this.#limits.maxBytes || header.entries > this.#limits.maxEntries) return false;
+    // Never publish a snapshot no host could load (P1-2): an over-bound state is refused while it is serialized,
+    // before its whole string exists (round 2).
+    if (model.entries.size > this.#limits.maxEntries) return false;
+    const body = serializeModelBounded(model, this.#limits.maxBytes);
+    if (body === undefined) return false;
     const parts: string[] = [];
     for (let offset = 0; offset < body.length; offset += SNAPSHOT_CHUNK) parts.push(body.slice(offset, offset + SNAPSHOT_CHUNK));
     const snapshot = randomUUID();
+    const header = headerOf(model, body, snapshot, parts.length);
     const records: NatsRecord[] = [
       ...parts.map((part, index): NatsRecord => ({ format: 1, type: "snapshot-chunk", snapshot, index, part })),
       { format: 1, type: "snapshot-end", snapshot, base: model.seq, first: model.seq + 1, chunks: parts.length, header },
@@ -531,6 +622,16 @@ export class NatsStateBackend implements StateBackend {
       try { await port.publish(subject, encode(record), { expectLastSequence: model.seq + index, msgID: `${snapshot}:${index}` }); }
       catch { return false; } // another commit came first, or no answer: abandon (nothing names these chunks)
     }
+    // Verify what the stream now STORES before anything is purged (pi-fabric#907 round 2): re-read the end record and
+    // its chunks and check the digest, the chain position and the model. A corrupt publish leaves the stream unpurged,
+    // so the history it would have replaced stays.
+    const endSeq = model.seq + parts.length + 1;
+    try {
+      const stored = await port.getMessage(stream, endSeq);
+      const verified = stored ? await this.#verifiedSnapshot(stored) : "gone";
+      if (verified === "gone" || verified.seq !== model.seq || (decode(stored!.data) as { header?: SnapshotHeader }).header?.digest !== header.digest ||
+          header.prev !== model.snapshotDigest) return false;
+    } catch { return false; }
     await port.purge(stream, model.seq + 1);
     this.#snapshots++;
     return true;
@@ -656,6 +757,9 @@ export class NatsStateBackend implements StateBackend {
       const data = encode(record);
       if (data.byteLength > this.#options.maxEventBytes * Math.max(1, planned.changes.length) + 64 * 1024) {
         throw new Error("Fabric mesh NATS batch exceeds its size bound");
+      }
+      if (data.byteLength > this.#limits.maxMessageBytes) {
+        throw new MeshStateNatsLimitError(`a batch of ${data.byteLength} bytes is over the stream's message limit (${this.#limits.maxMessageBytes})`);
       }
       let seq: number;
       try {
@@ -906,6 +1010,18 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     if (!versionAtLeast(server.version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${server.version} is older than ${MIN_SERVER.join(".")}`);
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
+    }
+    // pi-fabric#907: the server's own payload cap must not exceed ours (it then refuses oversized messages itself).
+    if (server.maxPayload !== undefined && server.maxPayload > MAX_MESSAGE_BYTES) {
+      throw new MeshStateNatsRefusedError(`nats-server max_payload is ${server.maxPayload} bytes (limit ${MAX_MESSAGE_BYTES}); set max_payload (docs/mesh-backends.md)`);
+    }
+    // What a client CAN see of the server's access control is whether it requires authentication at all (INFO
+    // auth_required). A non-loopback server that does not lets anyone on the network publish to or purge the stream:
+    // refuse. Per-user publish/purge permissions are not visible to a client; docs/mesh-backends.md states the
+    // required server configuration.
+    const remote = (options.servers ?? []).some(url => { try { assertNatsTransportSecure(url.replace(/^tls:/i, "nats:"), "tls:"); return false; } catch { return true; } });
+    if (remote && server.authRequired !== true) {
+      throw new MeshStateNatsRefusedError("a non-loopback nats-server that does not require authentication: anyone who can reach it could write or purge the state stream (docs/mesh-backends.md)");
     }
     const stream = options.stream ?? natsStreamName(root);
     const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,

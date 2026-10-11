@@ -205,7 +205,7 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     const unknownLines = () => warn.mock.calls.filter(([line]) => String(line).includes("a queue file is unreadable")).length;
     const alarms = () => mesh.read({ after: 0, limit: 1_000 })
       .filter(event => event.topic === "ops.owner" && (event.data as { reason?: string } | undefined)?.reason === "enodev-queue-unknown");
-    for (let start = 1; start <= 3; start++) {
+    for (let start = 1; start <= 4; start++) { // the fourth start: the count stays at 3, no second alarm
       const agents = start === 1 ? second : restart();
       vi.spyOn(agents, "spawn").mockRejectedValue(new Error("launched a rerun"));
       const after = actors(agents, "session:adopter");
@@ -213,8 +213,9 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
         await vi.waitFor(() => expect(unknownLines()).toBe(start), { timeout: 10_000, interval: 20 });
         expect(vetoed(directory)).toBe(true);
         expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("running");
-        expect(JSON.parse(fs.readFileSync(path.join(directory, "unresolved-worker.json"), "utf8")).unknownStarts).toBe(start);
+        expect(JSON.parse(fs.readFileSync(path.join(directory, "unresolved-worker.json"), "utf8")).unknownStarts).toBe(Math.min(start, 3));
         if (start < 3) expect(alarms()).toHaveLength(0);
+        else if (start === 4) { await new Promise(resolve => setTimeout(resolve, 200)); expect(alarms()).toHaveLength(1); }
         else await vi.waitFor(() => expect(alarms()).toMatchObject([{ to: "session:adopter", kind: "actor.alarm",
           data: { actorId: actor.id, starts: 3 } }]), { timeout: 10_000, interval: 20 });
       } finally {
@@ -289,6 +290,54 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 90_000);
 
+  // pi-fabric#912 round 5: the output publish is idempotent across a crash after it and before the queue ack.
+  it("crash after the output publish, before the queue ack: the restart replays it, and the topic holds one event", async () => {
+    const { actor, id, directory, actorRoot, actors, second, restart, mesh } = await interruptedRun();
+    const queueFile = path.join(actorRoot, actor.id, fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!);
+    const beforeAck = fs.readFileSync(queueFile, "utf8");
+    const outputs = () => mesh.read({ after: 0, limit: 1_000 })
+      .filter(event => event.topic === "fabric.actor.output" && event.from.id === actor.id && event.text === "SAVED_ANSWER");
+    const commit = vi.spyOn(second, "commitEnodevRecovery").mockReturnValue(false);
+    const first = actors(second);
+    try {
+      await vi.waitFor(() => expect(commit).toHaveBeenCalledWith(id), { timeout: 15_000, interval: 20 });
+      await vi.waitFor(() => expect(outputs()).toHaveLength(1), { timeout: 10_000, interval: 20 });
+    } finally {
+      await first.close();
+      await second.close();
+    }
+    fs.writeFileSync(queueFile, beforeAck); // the crash: the queue ack never reached the disk
+    const next = restart();
+    const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const owner = actors(next);
+    try {
+      await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 15_000, interval: 20 });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(outputs()).toHaveLength(1);
+      expect(relaunched).not.toHaveBeenCalled();
+    } finally {
+      await owner.close();
+      await next.close();
+    }
+  }, 90_000);
+
+  it("a delivery receipt that cannot be written delivers nothing and keeps the activation pending", async () => {
+    const { actor, directory, actors, second, mesh } = await interruptedRun();
+    const receipt = vi.spyOn(second, "noteEnodevDelivered").mockImplementation(() => { throw new Error("EIO"); });
+    const after = actors(second);
+    try {
+      await vi.waitFor(() => expect(receipt).toHaveBeenCalled(), { timeout: 15_000, interval: 20 });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(mesh.read({ after: 0, limit: 1_000 }).filter(event => event.topic === "fabric.actor.output" && event.from.id === actor.id)).toHaveLength(0);
+      expect(vetoed(directory)).toBe(true);
+    } finally {
+      await after.close();
+      await second.close();
+    }
+    const queue = fs.readdirSync(path.join(path.dirname(path.dirname(directory)), "actors", actor.id)).find(name => /^queue-/.test(name))!;
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(path.dirname(directory)), "actors", actor.id, queue), "utf8")).items).toHaveLength(1);
+  }, 60_000);
+
   it("crash after delivery, before the queue ack: the restart recovers the answer again, with no rerun", async () => {
     const { actor, id, directory, actorRoot, actors, second, restart } = await interruptedRun();
     const queueFile = path.join(actorRoot, actor.id, fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!);
@@ -340,7 +389,7 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
     const saved = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id,
       fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!), "utf8"));
-    expect(saved.items[0].ownershipRefusals).toBeGreaterThanOrEqual(3);
+    expect(saved.items[0].ownershipRefusals).toBe(3); // saturated at the cap after 4+ refusals
   }, 90_000);
 
   it("an unreadable queue parent directory is unknown, not absent: nothing settles", async () => {
@@ -370,7 +419,7 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     fs.chmodSync(directory, 0o500); // the marker stays readable; its atomic rewrite fails
     try {
-      expect(countUnknownEnodevStarts([directory], ACTOR, true)).toBe(UNKNOWN_STARTS_ALARM);
+      expect(countUnknownEnodevStarts([directory], ACTOR, true)).toEqual({ starts: UNKNOWN_STARTS_ALARM, alarm: true });
     } finally { fs.chmodSync(directory, 0o700); }
     expect(warn.mock.calls.some(([line]) => String(line).includes("could not save unknownStarts 1"))).toBe(true);
   });

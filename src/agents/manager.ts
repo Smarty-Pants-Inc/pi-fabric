@@ -2405,7 +2405,9 @@ export class AgentManager {
       const result = peekEnodevRun(directory, request.actorId, request.activationId);
       if (!result) continue;
       this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
-      return { ...result, enodevRecovered: true };
+      // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
+      const replay = enodevDelivered(directory, result.id, request.activationId);
+      return { ...result, enodevRecovered: true, ...(replay ? { enodevReplay: true } : {}) };
     }
     return undefined;
   }
@@ -2455,8 +2457,8 @@ export class AgentManager {
   }
 
   /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
-  countUnknownEnodevStarts(actorId: string, unknown: boolean): number {
-    if (process.platform !== "linux") return 0;
+  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+    if (process.platform !== "linux") return { starts: 0, alarm: false };
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
   }

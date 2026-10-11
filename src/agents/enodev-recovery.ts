@@ -62,26 +62,30 @@ export const enodevUnresolvedRuns = (runRoot: string): string[] => {
  */
 /** From this many consecutive unknown starts the actor's owner is alarmed (ActorManager, ops.owner). */
 export const UNKNOWN_STARTS_ALARM = 3;
-export const countUnknownEnodevStarts = (directories: readonly string[], actorId: string, unknown: boolean): number => {
+export const countUnknownEnodevStarts = (directories: readonly string[], actorId: string, unknown: boolean):
+  { starts: number; alarm: boolean } => {
   let highest = 0;
+  let alarm = false;
   for (const directory of directories) {
     const file = path.join(directory, UNRESOLVED_WORKER_FILE);
     const marker = readJson(file);
     if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON) ||
       readJson(path.join(directory, "status.json"))?.actorId !== actorId) continue;
     const prior = typeof marker.unknownStarts === "number" ? marker.unknownStarts : 0;
-    const next = unknown ? prior + 1 : 0;
+    // Saturates at the alarm threshold (round 5 P2): the one alarm goes out when a marker reaches it.
+    const next = unknown ? Math.min(prior + 1, UNKNOWN_STARTS_ALARM) : 0;
+    if (unknown && prior < UNKNOWN_STARTS_ALARM && next === UNKNOWN_STARTS_ALARM) alarm = true;
     // The observed count escalates even when it cannot be saved (round 3 P2): a count that cannot persist would
     // never reach the third start, so an unknown start whose count is not saved escalates at once.
     highest = Math.max(highest, next);
     if (next !== prior) {
       try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch (error) {
         console.warn(`[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
-        if (unknown) highest = Math.max(highest, UNKNOWN_STARTS_ALARM);
+        if (unknown) { highest = Math.max(highest, UNKNOWN_STARTS_ALARM); alarm = true; }
       }
     }
   }
-  return highest;
+  return { starts: highest, alarm };
 };
 
 /** The actor activation a run served: the top-level `id` of the item JSON its task carries (ActorManager#runRequest). */

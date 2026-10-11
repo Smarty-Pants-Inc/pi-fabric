@@ -258,6 +258,8 @@ export interface AgentRunResult extends AgentRunRecord {
   via?: string;
   /** smarty-dev#8935: an ENODEV-unconfirmed run's saved answer, not yet settled; the actor commits it after delivery. */
   enodevRecovered?: boolean;
+  /** Its delivery receipt already exists: a crash came after a delivery attempt; the actor replays idempotently. */
+  enodevReplay?: boolean;
   /** Canonical launch selection when via is present; may differ from the observed model. */
   selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.

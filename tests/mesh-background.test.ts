@@ -1,9 +1,10 @@
 import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
 
 const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
+import { parse9729 } from "./helpers/alarm-contract.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
@@ -222,16 +223,15 @@ describe("background outage alarm (smarty-dev#8825)", () => {
   });
 
   // pi-fabric#893 round 4 (owner decision, fabric-store): exactly two forms; anything else is refused.
-  it("accepts only session:<uuid> or topic:fabric.alarm.<name>, and falls back to a session-form SMARTY_LEAD_SESSION", () => {
+  it("accepts only session:<uuid>, refuses the topic form and every other value, and falls back to a session-form lead", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const lead = "session:11111111-2222-4333-8444-555555555555";
-    expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: CHIEF })).toEqual({ to: CHIEF });
-    expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: "topic:fabric.alarm.mesh-ops" })).toEqual({ topic: "fabric.alarm.mesh-ops" });
-    for (const value of ["org", "org-kate", "fabric-store", "*", ` ${CHIEF}`, `${CHIEF}\n`, CHIEF.toUpperCase(),
-      "session:not-a-uuid", "topic:fabric.alarm.", "topic:fabric.alarm.Mesh", "topic:ops.owner", "fabric.alarm.mesh-ops"]) {
+    expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: CHIEF })).toBe(CHIEF);
+    for (const value of ["topic:fabric.alarm.mesh-ops", "topic:fabric.alarm.mesh-outage", "org", "org-kate", "fabric-store", "*",
+      ` ${CHIEF}`, `${CHIEF}\n`, CHIEF.toUpperCase(), "session:not-a-uuid", "topic:ops.owner", "fabric.alarm.mesh-ops"]) {
       expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value }), value).toBeUndefined();
-      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: lead }), value).toEqual({ to: lead });
-      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: "org" }), value).toBeUndefined();
+      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: lead }), value).toBe(lead);
+      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: "topic:fabric.alarm.x" }), value).toBeUndefined();
     }
     const refusals = warn.mock.calls.filter(([line]) => String(line).includes("PI_FABRIC_MESH_ALARM_TO refused"));
     expect(refusals.length).toBeGreaterThan(0);
@@ -239,21 +239,43 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     expect(meshAlarmRecipient({})).toBeUndefined();
   });
 
-  it("publishes a topic-form alarm on that topic, with no recipient field", async () => {
+  // pi-fabric#893 round 5: undelivered alarm events are bounded in count and in retries; a drop leaves one journal line.
+  it("keeps at most 32 queued events, dropping the oldest, with one fabric-alarm journal line", async () => {
     vi.useFakeTimers();
-    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "topic:fabric.alarm.mesh-ops");
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    const published: Array<Record<string, unknown>> = [];
-    const mesh = { publish: async (input: Record<string, unknown>) => { published.push(input); return input; } };
-    const retry = new MeshBackgroundRetry("inbox", 100, 400)
-      .alarmsTo(meshOutageAlarmSink(() => ({ mesh: mesh as never, from: { id: "session:x", name: "main", kind: "main" } })));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // A publish that never settles (a hung mesh): nothing is delivered or retried, so only the cap bounds the queue.
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => new Promise(() => {}));
+    for (let outage = 0; outage < 20; outage++) { // 20 outages: 40 events (alarm and recovery), none delivered
+      retry.failure(busy());
+      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      retry.failure(busy());
+      retry.success(true);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(retry.idle).toBe(false);
+    const lines = warn.mock.calls.map(([line]) => String(line));
+    // Every stderr alarm line, the outage and recovery lines included, is in the #9729 contract.
+    for (const line of lines.filter((line) => line.startsWith(`${MESH_JOURNAL_ALARM_TAG} `))) expect(parse9729(line), line).toBeDefined();
+    const journal = lines.map(parse9729).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toMatchObject({ label: "inbox", state: "outage", droppedOverflow: 1, droppedAfterRetries: 0, queued: 32 });
+  });
+
+  it("drops an event after 8 failed attempts with one final journal line, and the queue empties", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let attempts = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(async () => { attempts++; throw busy(); });
     retry.failure(busy());
     await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
-    retry.failure(busy());
-    await vi.advanceTimersByTimeAsync(0);
-    expect(published).toEqual([expect.objectContaining({ topic: "fabric.alarm.mesh-ops", kind: "mesh-outage" })]);
-    expect(published[0]).not.toHaveProperty("to");
-    vi.unstubAllEnvs();
+    retry.failure(busy()); // the alarm: attempt 1
+    for (let i = 0; i < 20; i++) { await vi.advanceTimersByTimeAsync(1_000); await retry.flushAlarms(); }
+    expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS);
+    const journal = warn.mock.calls.map(([line]) => parse9729(String(line))).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toMatchObject({ label: "inbox", state: "outage", droppedOverflow: 0, droppedAfterRetries: 1, queued: 0 });
+    for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) retry.success(true);
+    await retry.flushAlarms();
   });
 
   // pi-fabric#893 round 3 (R-org-delegate): an alarm goes to one recipient, never to the whole shared mesh.
@@ -271,7 +293,8 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     retry.failure(busy());
     await vi.advanceTimersByTimeAsync(0);
     expect(publish).not.toHaveBeenCalled();
-    expect(warn.mock.calls.some(([line]) => String(line).startsWith(`${MESH_OUTAGE_ALARM_TAG} {`))).toBe(true);
+    // The stderr-only fallback line is in the #9729 contract.
+    expect(warn.mock.calls.some(([line]) => parse9729(String(line))?.state === "outage")).toBe(true);
     vi.unstubAllEnvs();
   });
 

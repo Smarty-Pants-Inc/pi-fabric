@@ -1826,7 +1826,7 @@ describe("mesh-outage alarms across the bridge (pi-fabric#893)", () => {
     expect(on(hub, topic).map((event) => [event.kind, event.to])).toEqual([["mesh-outage", CHIEF], ["mesh-recovered", CHIEF]]);
     expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "org" })).toBe(false); // a bare name is not a target
     expect(isBridgedTopic({ topic, kind: "mesh-outage" })).toBe(false);
-    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "topic:fabric.alarm.mesh-ops" })).toBe(true);
+    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "topic:fabric.alarm.mesh-ops" })).toBe(false); // round 5: session only
     expect(() => checkBridgePublish({ topic, kind: "ask", from: spoke.identity, to: CHIEF, data: { bridge: { from: "forge", id: "x" } } }))
       .toThrow(/topic is not allowed/);
   });

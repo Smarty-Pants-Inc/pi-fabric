@@ -6,6 +6,7 @@ import { STATE_BACKEND_FACTORIES } from "../src/mesh/state-backend.js";
 import { StateFile } from "../src/mesh/state-file.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { MESH_WAL_CAP_ALARM_TOPIC, MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { parse9729 } from "./helpers/alarm-contract.js";
 
 // smarty-dev#7451 item 6: a write the SQLite WAL cap refuses raises an in-product alarm, not only a bridge log line.
 const roots: string[] = [];
@@ -50,6 +51,9 @@ describe("mesh WAL-cap alarm (smarty-dev#7451 item 6)", () => {
     expect(alarms()[0]).toMatchObject({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from: identity,
       data: { walBytes: 120 * 1024 * 1024, capBytes: 96 * 1024 * 1024, readerCount: 1, writer: identity.id } });
     expect(warn.mock.calls.filter(([line]) => String(line).includes("WAL cap"))).toHaveLength(1);
+    // The WAL-cap journal line is in smarty-dev#9729's contract.
+    const line = warn.mock.calls.map(([entry]) => String(entry)).find((entry) => entry.includes("WAL cap"))!;
+    expect(parse9729(line)).toMatchObject({ label: "mesh state writes", state: "outage", readerCount: 1 });
     // smarty-dev#9513: a count, never the pinning reader's pid or command line, in the event or the log line.
     expect(JSON.stringify(alarms()[0])).not.toMatch(/4242|secret-tool/);
     expect(warn.mock.calls.map(([line]) => String(line)).join("\n")).not.toMatch(/4242|secret-tool/);

@@ -702,6 +702,19 @@ export const MESH_OUTAGE_ALARM_AFTER_MS = 5 * 60 * 1_000;
 export const MESH_OUTAGE_RECOVERY_SUCCESSES = 3;
 /** The structured stderr tag of the outage alarm: the journal keeps it even when the mesh never accepts the event. */
 export const MESH_OUTAGE_ALARM_TAG = "fabric.alarm.mesh-outage";
+/** Bounds of a path's undelivered alarm events (pi-fabric#893 round 5): the queue keeps the newest 32; an event is
+ * tried at most 8 times or for 30 min, whichever comes first. A drop writes one journal alarm line (reason
+ * mesh-alarm-undeliverable) with the counts. */
+export const MESH_ALARM_QUEUE_MAX = 32;
+export const MESH_ALARM_MAX_ATTEMPTS = 8;
+export const MESH_ALARM_MAX_AGE_MS = 30 * 60 * 1_000;
+/** Every stderr alarm line is `fabric.alarm.mesh-outage {json}`, the one shape smarty-dev#9729's factory reader pages
+ * on: label (string), state ("outage" | "recovered"), sinceMs (epoch ms, int), optional durationMs (int) and reason
+ * (string); extra fields are allowed. */
+export const MESH_JOURNAL_ALARM_TAG = MESH_OUTAGE_ALARM_TAG;
+export const meshJournalAlarmLine = (alarm: { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs?: number;
+  reason?: string; [extra: string]: unknown }): string =>
+  `${MESH_JOURNAL_ALARM_TAG} ${JSON.stringify(alarm)}`;
 export interface MeshOutageAlarm { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs: number; reason?: string }
 
 /** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
@@ -723,8 +736,11 @@ export class MeshBackgroundRetry {
   #outageSuccesses = 0;
   // Events not yet accepted by the sink, in order (the alarm, then its recovery). The publish can hit the same
   // outage: a rejected or throwing publish keeps its event, and the next failure() or success() retries it.
-  readonly #pendingAlarms: MeshOutageAlarm[] = [];
+  readonly #pendingAlarms: Array<{ alarm: MeshOutageAlarm; attempts: number; firstAt: number }> = [];
   #flushing = false;
+  #droppedOverflow = 0;
+  #droppedExhausted = 0;
+  #undeliverableReported = false;
   #alarm: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
   #alarmAfterMs = MESH_OUTAGE_ALARM_AFTER_MS;
   /** Where this path's outage alarm goes (the owner's mesh publish). The stderr line is written regardless.
@@ -740,17 +756,40 @@ export class MeshBackgroundRetry {
   flushAlarms(): Promise<void> { return this.#flushAlarms(); }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
-    console.warn(`${MESH_OUTAGE_ALARM_TAG} ${JSON.stringify(alarm)}`);
-    if (this.#alarm) this.#pendingAlarms.push(alarm);
+    console.warn(meshJournalAlarmLine({ ...alarm }));
+    if (this.#alarm) {
+      this.#pendingAlarms.push({ alarm, attempts: 0, firstAt: performance.now() });
+      while (this.#pendingAlarms.length > MESH_ALARM_QUEUE_MAX) { this.#pendingAlarms.shift(); this.#droppedOverflow++; this.#reportUndeliverable(); }
+    }
     void this.#flushAlarms();
+  }
+  // One owner-visible journal line per run of drops (until an event is delivered again), with the running counts.
+  #reportUndeliverable(): void {
+    if (this.#undeliverableReported) return;
+    this.#undeliverableReported = true;
+    console.warn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
+      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }));
   }
   async #flushAlarms(): Promise<void> {
     if (this.#flushing) return;
     this.#flushing = true;
     try {
       while (this.#pendingAlarms.length && this.#alarm) {
-        try { await this.#alarm(this.#pendingAlarms[0]!); } catch { return; } // kept: retried on the next call
+        const head = this.#pendingAlarms[0]!;
+        head.attempts++;
+        try { await this.#alarm(head.alarm); }
+        catch {
+          // Kept for the next call, until its attempts or age run out: then dropped, and reported once.
+          if (head.attempts >= MESH_ALARM_MAX_ATTEMPTS || performance.now() - head.firstAt >= MESH_ALARM_MAX_AGE_MS) {
+            this.#pendingAlarms.shift();
+            this.#droppedExhausted++;
+            this.#reportUndeliverable();
+            continue;
+          }
+          return;
+        }
         this.#pendingAlarms.shift();
+        this.#undeliverableReported = false;
       }
     } finally { this.#flushing = false; }
   }

@@ -111,7 +111,7 @@ export const isWorkTopic = (topic: unknown): topic is string => {
 };
 
 /** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
- * mesh-outage alarm and its recovery, only when addressed to a canonical alarm target (pi-fabric#893 round 4). */
+ * mesh-outage alarm and its recovery, only when addressed to one `session:<uuid>` (pi-fabric#893 rounds 4-5). */
 export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||

@@ -136,7 +136,7 @@ export const processIncarnation = (pid: number, timeoutMs?: number): Promise<str
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
 
 /** Why the last stale check left a holder alone (smarty-dev#9569): its namespace is foreign or unprovable. */
-export interface StaleLockNote { verdict?: "foreign" | "unproven"; namespace?: string }
+export interface StaleLockNote { verdict?: "foreign" | "unproven"; namespace?: string; token?: string }
 
 export interface AtomicWriteOptions {
   // File mode for the committed file (default 0o600) and for mkdir -p of its
@@ -680,14 +680,33 @@ export class MeshLockTimeoutError extends Error {
  */
 export class MeshLockForeignHolderError extends MeshLockTimeoutError {
   readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
+  /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
+  readonly recovery: string;
   constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
-    readonly holderNamespace: string) {
+    readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
     super(holder, attempts, maxGapMs);
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
-    this.message = `${this.foreignCode}: ${this.message}; its holder is in ${verdict === "foreign" ? `another PID namespace (${holderNamespace})` : "a PID namespace this process cannot prove"}, so it is never reclaimed on pid evidence. Recover it from that namespace, or with the labelled unsafe override once the holder is stopped`;
+    const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
+    this.recovery = `fabric-mesh-backend lock-recover --root ${JSON.stringify(path.dirname(lockPath))} --lock ${kind} --holder ${holderToken}`;
+    const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
+      : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
+    this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
+      `Recover it from inside the holder's namespace with: ${this.recovery} ; or, once the holder is STOPPED, add --unsafe-holder-stopped`;
     this.name = "MeshLockForeignHolderError";
   }
 }
+
+const alarmedHolders = new Set<string>();
+/**
+ * The lock-timeout alarm line for a holder this process may not reclaim, once per holder per process (the same
+ * `[pi-fabric] ALARM` path as custody-unrecoverable). A mesh publish cannot carry it: publishing takes the stuck lock.
+ */
+export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
+  const key = `${error.lockPath}\n${error.holderToken}`;
+  if (alarmedHolders.has(key)) return;
+  alarmedHolders.add(key);
+  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+};
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>

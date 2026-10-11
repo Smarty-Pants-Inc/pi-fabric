@@ -13,8 +13,10 @@
 // rename the directory to the same retained `.dead.<hash>` fence the automatic recovery uses.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { ownPidNamespace, pidNamespaceVerdict, type PidNamespaceVerdict } from "../core/pid-namespace.js";
+import { readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
+import { ownPidNamespace, pidNamespaceVerdict, previousBootTrusted, type PidNamespaceVerdict } from "../core/pid-namespace.js";
 import { MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 
 export class MeshLockRecoverRefusedError extends Error {
@@ -45,7 +47,26 @@ export interface MeshLockRecoverResult {
   verdict: PidNamespaceVerdict;
   /** Set for the unsafe override: what the operator accepted. */
   warning?: string;
+  /** Who recovered it (pi-fabric#923); also appended to `<root>/lock-recoveries.jsonl`. */
+  audit: LockRecoverAudit;
 }
+
+export interface LockRecoverAudit {
+  at: string; root: string; lock: string; mode: "safe" | "unsafe"; holder: string; holderPid: number; holderNamespace: string | null;
+  verdict: PidNamespaceVerdict; operator: { uid: number | null; user: string; pid: number; ppid: number; parentCommand: string; host: string };
+}
+
+/** The parent process's command line: who ran the recovery (Linux /proc; elsewhere unknown, never guessed). */
+const parentCommand = (): string => {
+  try { return fs.readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" "); }
+  catch { return "unknown"; }
+};
+const operator = (): LockRecoverAudit["operator"] => {
+  let user = "unknown";
+  try { user = os.userInfo().username; } catch { /* no passwd entry */ }
+  return { uid: typeof process.getuid === "function" ? process.getuid() : null, user, pid: process.pid, ppid: process.ppid,
+    parentCommand: parentCommand(), host: os.hostname() };
+};
 
 const alive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
@@ -73,7 +94,17 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
     throw new MeshLockRecoverRefusedError(`${lock} does not hold a complete owner record`);
   }
   if (fields[0] !== options.holder) throw new MeshLockRecoverRefusedError(`${lock} is held by ${fields[0]}, not ${options.holder}`);
-  const verdict = pidNamespaceVerdict(namespace, await ownPidNamespace());
+  // pi-fabric#923: a record without a namespace is UNPROVEN (its pid may name nothing here although it is alive in
+  // another namespace), except a host-qualified custody record whose machine id is ours and whose boot ended.
+  let verdict: PidNamespaceVerdict;
+  if (namespace === null) {
+    const physical = options.lock === "custody" && fields.length === 7 ? readPhysicalHostIdentity() : undefined;
+    const machine = physical?.machineId ?? (options.lock === "custody" && fields.length === 7 ? readPhysicalMachineId() : undefined);
+    verdict = physical !== undefined && !!machine && fields[4] === machine && validBootId(fields[5]) && fields[5] !== physical.bootId
+      ? "previous-boot" : "unproven";
+  } else verdict = pidNamespaceVerdict(namespace, await ownPidNamespace());
+  // Previous-boot ids come from the owner file: honored only if nobody else could have written it.
+  if (verdict === "previous-boot" && !previousBootTrusted(lock)) verdict = "unproven";
   const provenDead = verdict === "previous-boot" || (verdict === "pid" && !(options.alive ?? alive)(pid));
   if (!provenDead && options.unsafeHolderStopped !== true) {
     throw new MeshLockRecoverRefusedError(verdict === "pid"
@@ -87,8 +118,13 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   if (!current?.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || again !== owner) {
     throw new MeshLockRecoverRefusedError(`${lock} changed while it was checked; nothing was done`);
   }
+  const mode = provenDead ? "safe" : "unsafe";
+  const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, holder: options.holder, holderPid: pid,
+    holderNamespace: namespace, verdict, operator: operator() };
+  // The audit is written BEFORE the rename: a recovery that happened is always on record.
+  fs.appendFileSync(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, { mode: 0o600 });
   const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
   fs.renameSync(lock, fence);
-  return { recovered: true, mode: provenDead ? "safe" : "unsafe", lock, fence, holderPid: pid, holderNamespace: namespace, verdict,
-    ...(provenDead ? {} : { warning: `UNSAFE override: ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
+  return { recovered: true, mode, lock, fence, holderPid: pid, holderNamespace: namespace, verdict, audit,
+    ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent "${audit.operator.parentCommand}", host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
 };

@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
+  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, type StaleLockNote,
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 
@@ -327,7 +327,12 @@ export class MeshLock {
           if (await this.#clearStaleLock(ownerPath, deadline, blocked)) continue;
           if (Date.now() >= deadline) {
             // The holder was not reclaimed because its namespace is not ours (or unprovable): say so, typed.
-            if (blocked.verdict) throw new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict, blocked.namespace ?? "");
+            if (blocked.verdict) {
+              const refused = new MeshLockForeignHolderError(describeLockHolder(ownerPath), attempts, maxGapMs, blocked.verdict,
+                blocked.namespace ?? "", this.#lockPath, blocked.token ?? "");
+              alarmForeignHolder(refused);
+              throw refused;
+            }
             throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
           }
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
@@ -380,7 +385,7 @@ export class MeshLock {
   // smarty-dev#9569: a protocol-3 record names its holder's PID namespace; pid evidence (ESRCH, another incarnation)
   // is used only for a holder of OUR namespace. A foreign or unprovable one is never reclaimed here (`note` says why).
   async #clearStaleLock(ownerPath: string, deadline: number, note: StaleLockNote = {}): Promise<boolean> {
-    delete note.verdict; delete note.namespace; // describes the CURRENT holder only
+    delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
     try {
       const stat = fs.lstatSync(this.#lockPath);
       if (!stat.isDirectory()) return false;
@@ -417,11 +422,20 @@ export class MeshLock {
       if (!validOwner) return false;
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
       let previousBoot = false;
+      // pi-fabric#923 (fabric-store decision): under protocol 3 a record without a namespace (a v1/v2 holder) is
+      // UNPROVEN: its pid may name nothing here although it is alive in another namespace. A mesh record from before
+      // protocol 3 carries no machine or boot id, so no previous-boot proof exists for it: operator recovery only.
+      if (recordNamespace === null && this.#lockProtocol === 3) {
+        note.verdict = "unproven"; note.namespace = ""; note.token = token!;
+        return false;
+      }
       if (recordNamespace !== null) {
         const namespaces = await import("../core/pid-namespace.js");
         const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
-        const verdict = namespaces.pidNamespaceVerdict(recordNamespace, own);
-        if (verdict === "foreign" || verdict === "unproven") { note.verdict = verdict; note.namespace = recordNamespace; return false; }
+        let verdict = namespaces.pidNamespaceVerdict(recordNamespace, own);
+        // The previous-boot ids come from the owner file: honored only if nobody else could have written it.
+        if (verdict === "previous-boot" && !namespaces.previousBootTrusted(this.#lockPath)) verdict = "unproven";
+        if (verdict === "foreign" || verdict === "unproven") { note.verdict = verdict; note.namespace = recordNamespace; note.token = token!; return false; }
         previousBoot = verdict === "previous-boot"; // an earlier boot of this machine: dead, whatever its pid names now
       }
       if (!previousBoot && processAlive(pid)) {

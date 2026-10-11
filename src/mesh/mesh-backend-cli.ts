@@ -528,7 +528,8 @@ export const main = async (argv: string[], io: {
       try {
         const recovered = await recoverMeshLock(options.root, { lock: options.lock!, holder: options.holder!,
           ...(options.unsafeHolderStopped ? { unsafeHolderStopped: true } : {}) });
-        if (recovered.warning) warn(`fabric-mesh-backend: ${recovered.warning}\n`);
+        // pi-fabric#923: every recovery prints its audit line (who, from where); the unsafe one is an ALARM.
+        warn(`fabric-mesh-backend: ${recovered.warning ? `ALARM ${recovered.warning}` : `recovered ${recovered.lock}`}; audit ${JSON.stringify(recovered.audit)}\n`);
         write(`${options.json ? JSON.stringify({ command: "lock-recover", ok: true, ...recovered }, null, 2)
           : `lock-recover done (${recovered.mode}): ${recovered.lock} -> ${recovered.fence}`}\n`);
         return 0;

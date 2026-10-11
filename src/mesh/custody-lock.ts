@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import {
-  MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
+  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
 } from "../core/atomic-write.js";
 
@@ -117,7 +117,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       fs.rmSync(staging, { recursive: true, force: true });
     }
     try {
-      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked)) continue;
+      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
         try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
@@ -128,7 +128,11 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
       const pid = owner?.split("\n")[1];
       const holder = ` (custody lock ${lock}${pid ? `, held by pid ${pid}` : ""})`;
-      if (blocked.verdict) throw new MeshLockForeignHolderError(holder, attempts, maxGapMs, blocked.verdict, blocked.namespace ?? "");
+      if (blocked.verdict) {
+        const refused = new MeshLockForeignHolderError(holder, attempts, maxGapMs, blocked.verdict, blocked.namespace ?? "", lock, blocked.token ?? "");
+        alarmForeignHolder(refused);
+        throw refused;
+      }
       throw new MeshLockTimeoutError(holder, attempts, maxGapMs);
     }
     await delay(Math.min(Math.max(0, deadline - Date.now()), 5 + Math.floor(Math.random() * 20)));
@@ -176,8 +180,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
 // second recoverer cannot rename a successor onto the same nonempty fence.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
-  ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}): Promise<boolean> => {
-  delete note.verdict; delete note.namespace; // describes the CURRENT holder only
+  ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1): Promise<boolean> => {
+  delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
   try {
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
@@ -205,10 +209,20 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     // smarty-dev#9569: a protocol-3 record names its holder's PID namespace. Before EVERY branch below (the plain one,
     // and hostQualified with known, previous or unknown boot): pid evidence only for our namespace.
     const recordNamespace = hostQualified ? (fields.length === 8 ? fields[6]! : null) : (fields.length === 6 ? fields[4]! : null);
-    if (recordNamespace !== null) {
+    if (recordNamespace !== null || lockProtocol === 3) {
       const namespaces = await import("../core/pid-namespace.js");
-      const verdict = namespaces.pidNamespaceVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false));
-      if (verdict === "foreign" || verdict === "unproven") { note.verdict = verdict; note.namespace = recordNamespace; return false; }
+      let verdict: "pid" | "previous-boot" | "foreign" | "unproven";
+      if (recordNamespace === null) {
+        // pi-fabric#923 (fabric-store decision): under protocol 3 a record without a namespace is UNPROVEN, except a
+        // host-qualified one whose machine id is ours and whose boot id proves its boot ended (exception (a)).
+        verdict = previousBoot ? "previous-boot" : "unproven";
+      } else verdict = namespaces.pidNamespaceVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false));
+      // Previous-boot ids come from the owner file: honored only if nobody else could have written it.
+      if (verdict === "previous-boot" && !namespaces.previousBootTrusted(lock)) verdict = "unproven";
+      if (verdict === "foreign" || verdict === "unproven") {
+        note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
+        return false;
+      }
       if (verdict === "previous-boot") previousBoot = true;
     }
     if (hostQualified && !bootKnown && !previousBoot) {

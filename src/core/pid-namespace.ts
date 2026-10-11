@@ -138,5 +138,21 @@ export const pidNamespaceVerdict = (recordNs: string | null, ownNs: string | und
   return "foreign";
 };
 
+/**
+ * May a previous-boot verdict be honored for this lock (pi-fabric#923)? It trusts machine and boot ids written in the
+ * owner file, so the lock root and the owner file must be OURS (our uid) and writable by nobody else (no group or
+ * world write bit). Otherwise anyone who can write there could forge an "earlier boot" and have a live lock reclaimed:
+ * the verdict is then unproven. Without POSIX ownership (Windows) it cannot be checked: unproven, fail closed.
+ */
+export const previousBootTrusted = (lock: string): boolean => {
+  if (typeof process.getuid !== "function" || process.platform === "win32") return false;
+  const uid = process.getuid();
+  const mine = (stat: fs.Stats | undefined): boolean => stat !== undefined && stat.uid === uid && (stat.mode & 0o022) === 0;
+  try {
+    return mine(fs.lstatSync(path.dirname(lock), { throwIfNoEntry: false })) && mine(fs.lstatSync(lock, { throwIfNoEntry: false })) &&
+      mine(fs.lstatSync(path.join(lock, "owner"), { throwIfNoEntry: false }));
+  } catch { return false; }
+};
+
 /** The lock code's lazy handle on this module (a stable lazy entry point, scripts/build.mjs). */
 export type PidNamespaceModule = typeof import("./pid-namespace.js");

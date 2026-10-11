@@ -133,7 +133,7 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     } finally { holder.kill(); }
   });
 
-  it("reclaims a dead holder of OUR namespace at once (the counter-case), and a dead legacy one as today", async () => {
+  it("reclaims a dead holder of OUR namespace at once (the counter-case); a dead legacy one only under protocol 1/2", async () => {
     const own = ns();
     pidNamespaceTestHooks.set(own);
     const root = tempRoot();
@@ -141,7 +141,47 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     await expect(contend(root)).resolves.toBe("entered");
     const legacy = tempRoot();
     plant(path.join(legacy, ".lock"), meshRecord(deadPid(), null));
-    await expect(contend(legacy)).resolves.toBe("entered");
+    await expect(contend(legacy, 2)).resolves.toBe("entered");
+  });
+
+  it("pi-fabric#923: under protocol 3 a LIVE legacy holder that looks dead is NOT reclaimed, automatically or by the safe lock-recover; the unsafe override reclaims it with an audit line", async () => {
+    pidNamespaceTestHooks.set(ns());
+    const root = tempRoot();
+    const holder = childProcess.spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const record = meshRecord(holder.pid!, null);
+      plant(path.join(root, ".lock"), record);
+      looksDead(holder.pid!);
+      const refused = await contend(root).catch((error: unknown) => error) as MeshLockForeignHolderError;
+      expect(refused.foreignCode).toBe("FABRIC_MESH_LOCK_UNPROVEN_HOLDER");
+      // The error and the ALARM line name the lock and the exact recovery command.
+      const token = record.split("\n")[0]!;
+      expect(refused.recovery).toBe(`fabric-mesh-backend lock-recover --root ${JSON.stringify(root)} --lock mesh --holder ${token}`);
+      expect(refused.message).toContain(path.join(root, ".lock"));
+      expect(warn.mock.calls.flat().join("\n")).toMatch(/\[pi-fabric\] ALARM FABRIC_MESH_LOCK_UNPROVEN_HOLDER: .*lock-recover/);
+      expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
+      const { recoverMeshLock, MeshLockRecoverRefusedError } = await import("../src/mesh/lock-recover.js");
+      await expect(recoverMeshLock(root, { lock: "mesh", holder: token, alive: () => false })).rejects.toBeInstanceOf(MeshLockRecoverRefusedError);
+      expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
+      const forced = await recoverMeshLock(root, { lock: "mesh", holder: token, unsafeHolderStopped: true });
+      expect(forced).toMatchObject({ mode: "unsafe", verdict: "unproven" });
+      const audit = JSON.parse(fs.readFileSync(path.join(root, "lock-recoveries.jsonl"), "utf8").trim()) as { mode: string; holder: string; operator: Record<string, unknown> };
+      expect(audit).toMatchObject({ mode: "unsafe", holder: token, operator: { pid: process.pid, ppid: process.ppid, host: os.hostname() } });
+      expect(audit.operator.user).toEqual(expect.any(String));
+      expect(audit.operator.parentCommand).toEqual(expect.any(String));
+    } finally { holder.kill(); }
+  });
+
+  it("pi-fabric#923: a previous-boot verdict is not honored when the lock root is writable by others (forgeable)", async () => {
+    const own = ns("33333333-3333-4333-8333-333333333333");
+    pidNamespaceTestHooks.set(own);
+    const root = tempRoot();
+    plant(path.join(root, ".lock"), meshRecord(process.pid, ns("44444444-4444-4444-8444-444444444444")));
+    fs.chmodSync(root, 0o777);
+    await expect(contend(root)).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+    fs.chmodSync(root, 0o700);
+    await expect(contend(root)).resolves.toBe("entered"); // the counter-case: our private root
   });
 
   it("never reclaims a dead holder of another namespace: an operator recovers it", async () => {
@@ -179,6 +219,30 @@ describe("custody.lock under protocol 3 (smarty-dev#9569): plain and host-qualif
   const custodyRecord = (pid: number, namespace: string, hostQualified: boolean, created = Date.now()) => hostQualified
     ? `${randomUUID()}\n${pid}\n${created}\n\n${readPhysicalMachineId() ?? ""}\n\n${namespace}\n`
     : `${randomUUID()}\n${pid}\n${created}\n\n${namespace}\n`;
+
+  it("pi-fabric#923 exception (a): a legacy host-qualified holder from an earlier boot of THIS machine is reclaimed under protocol 3; a plain legacy one is not", async () => {
+    const { readPhysicalHostIdentity } = await import("../src/core/atomic-write.js");
+    const physical = readPhysicalHostIdentity();
+    if (!physical?.machineId) return; // needs this host's machine and boot ids
+    pidNamespaceTestHooks.set(ns());
+    const earlierBoot = randomUUID();
+    const legacyHostQualified = `${randomUUID()}\n${process.pid}\n${Date.now()}\n\n${physical.machineId}\n${earlierBoot}\n`; // 7 fields, v2
+    const root = tempRoot();
+    plant(path.join(root, MESH_CUSTODY_LOCK_NAME), legacyHostQualified);
+    const release = await acquireMeshCustodyLock(root, 1_000, { lockProtocol: 3, hostQualified: true, ownIncarnation: undefined });
+    release();
+    // The same proof in a root others can write is forgeable: refused.
+    const open = tempRoot();
+    plant(path.join(open, MESH_CUSTODY_LOCK_NAME), legacyHostQualified);
+    fs.chmodSync(open, 0o777);
+    await expect(acquireMeshCustodyLock(open, 300, { lockProtocol: 3, hostQualified: true, ownIncarnation: undefined }))
+      .rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+    fs.chmodSync(open, 0o700);
+    // A plain legacy record (no machine or boot id) under protocol 3: unproven, even with a dead pid.
+    const plain = tempRoot();
+    plant(path.join(plain, MESH_CUSTODY_LOCK_NAME), `${randomUUID()}\n${deadPid()}\n${Date.now()}\n`);
+    await expect(acquireMeshCustodyLock(plain, 300, { lockProtocol: 3, ownIncarnation: undefined })).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+  });
 
   it("writes the namespace line in both shapes (6 and 8 fields)", async () => {
     const own = ns();
@@ -250,7 +314,7 @@ describe("fabric-mesh-backend lock-recover (smarty-dev#9569 D2): safe form, labe
     const forced = await cli(["lock-recover", "--root", root, "--lock", "custody", "--holder", tokenOf(record), "--unsafe-holder-stopped", "--json"]);
     expect(forced.code).toBe(0);
     expect(JSON.parse(forced.out)).toMatchObject({ mode: "unsafe", verdict: "foreign" });
-    expect(forced.err).toMatch(/UNSAFE override: .* two writers can run/);
+    expect(forced.err).toMatch(/ALARM UNSAFE override by .* two writers can run.*; audit \{/s); // the parent command line may hold newlines
   });
 
   it("never recovers a holder that is running here, even with our namespace", async () => {

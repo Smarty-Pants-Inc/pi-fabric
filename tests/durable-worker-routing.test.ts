@@ -72,6 +72,7 @@ describe("durable Pi worker routing", () => {
     const capture = path.join(root, "capture.mjs");
     fs.writeFileSync(capture, `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(root, "argv.json"))}, JSON.stringify(process.argv));\nawait import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-worker.mjs")).href)});`);
     const preparePiModel = vi.fn(async () => "provider/fallback");
+    vi.stubEnv("PI_FABRIC_AGENT_DIR", ""); // the fleet test isolation sets the export root first
     const manager = new AgentManager(root, {
       ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi-durable", model: "provider/default", timeoutMs: 5000,
       childQuestions: "route", sessionExport: true, sessionExportDir: path.join(root, "exports"),
@@ -120,7 +121,15 @@ describe("real worker durable process protocol", () => {
     fixture = temporary();
     worker = path.join(fixture, "worker.mjs");
     fs.symlinkSync(path.resolve("node_modules"), path.join(fixture, "node_modules"), process.platform === "win32" ? "junction" : "dir");
-    await build({ entryPoints: [path.resolve("src/worker.ts")], outfile: worker, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent" });
+    // Fork: the worker loads its hooks and lazy profile from sibling files (as in dist/).
+    const siblings = ["worker/retry-profile", "worker/activation-window", "worker/principal-delivery", "worker/session-id",
+      "worker/reply-tool", "worker/task-entry", "worker/release-entry", "guards/actor-bash-hook", "guards/model-route-hook", "agents/write-guard"];
+    await build({
+      entryPoints: Object.fromEntries([["worker", path.resolve("src/worker.ts")], ...siblings.map(entry => [entry, path.resolve(`src/${entry}.ts`)])]),
+      outdir: fixture, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
+    });
+    fs.writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ type: "module" }));
+    worker = path.join(fixture, "worker.js");
     fs.mkdirSync(path.join(fixture, "durable"));
     fs.writeFileSync(path.join(fixture, "durable", "worker.js"), `
       process.stdout.write(JSON.stringify({type: 'launch_probe', execPath: process.execPath, argv: process.argv.slice(2), kernel: process.env.PI_FABRIC_KERNEL}) + '\\n');

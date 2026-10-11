@@ -444,7 +444,9 @@ const main = async (): Promise<void> => {
   // Opaque launchers have no supplied native discovery API. Fail closed on
   // auto-discovery rather than reintroducing an unvalidated Fabric generation.
   // Explicit task hooks still load; native launchers retain all other resources.
-  if (!options.extensions || (options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
+  // The release fence is for the pi CLI launcher; the durable host is Fabric's own
+  // pinned SDK and keeps native discovery (upstream pi-durable).
+  if (!options.extensions || (options.runner === "pi" && options.fabricExtensionPath && !piReleaseSdk)) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -1755,7 +1757,9 @@ const main = async (): Promise<void> => {
     if (event.type === "agent_start") {
       nativeActivity = true;
       deferredFollowUpSettle = false;
-      if (options.runner === "pi" && replayAfterStart) {
+      // Both Pi runners gate steer/control reads on a live native turn (pi-durable included,
+      // or its steer channel, follow-ups and routed child answers would never be read).
+      if (isPi && replayAfterStart) {
         replayAfterStart = false;
         piControlLive = true;
         const retained = retainedPiQueues;

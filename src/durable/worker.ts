@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import module from "node:module";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDurableWorkerOptions } from "./worker-options.js";
 
@@ -37,6 +39,19 @@ try {
         return nextResolve(specifier, context);
       },
     });
+    // Fabric's tool capture patches the ExtensionRunner class of the package named by
+    // PI_PACKAGE_DIR. Name the pinned SDK, or capture patches the host copy the durable
+    // runtime never instantiates and mutating pi.* tools stay fenced (no tool hooks).
+    for (let directory = path.dirname(fileURLToPath(sdkEntry)); directory !== path.dirname(directory); directory = path.dirname(directory)) {
+      const manifest = path.join(directory, "package.json");
+      if (!fs.existsSync(manifest)) continue;
+      try {
+        if ((JSON.parse(fs.readFileSync(manifest, "utf8")) as { name?: unknown }).name === sdkName) {
+          process.env.PI_PACKAGE_DIR = directory;
+          break;
+        }
+      } catch { /* unreadable manifest: keep searching */ }
+    }
     const { runDurableWorker } = await import("./worker-host.js");
     await runDurableWorker(options);
   }

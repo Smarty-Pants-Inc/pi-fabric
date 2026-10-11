@@ -1028,7 +1028,8 @@ export class AgentManager {
     timeoutMs?: number,
   ): Promise<string | undefined> {
     this.assertModelAllowed(model, runner);
-    if (runner === "pi") {
+    // Upstream: the durable Pi worker resolves models through the same Pi registry.
+    if (runner === "pi" || runner === "pi-durable") {
       const prepared = await this.#prepareModel(model, requiredPin, signal, timeoutMs);
       this.assertModelAllowed(prepared, runner);
       return prepared;

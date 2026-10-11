@@ -109,11 +109,12 @@ describe("durable Pi actors", () => {
     expect(run.mock.calls[0]?.[0].systemPrompt).not.toContain("This Claude runner");
   });
 
-  it("defaults new templates to durable Pi and preserves runner and kernel through rehydration and import", async () => {
+  // Fork: templates default to "pi" like agents.runner; pi-durable is explicit.
+  it("defaults new templates to Pi and preserves durable runner and kernel through rehydration and import", async () => {
     const { root, actors } = fixture();
     const registry = new GlobalActorRegistry(root, 64 * 1024);
-    const durable = registry.create({ name: "template", instructions: "Review", kernel: "typescript" });
-    const legacy = registry.create({ name: "legacy template", instructions: "Review", runner: "pi" });
+    const durable = registry.create({ name: "template", instructions: "Review", kernel: "typescript", runner: "pi-durable" });
+    const legacy = registry.create({ name: "legacy template", instructions: "Review" });
     expect(durable.runner).toBe("pi-durable");
     const restored = new GlobalActorRegistry(root, 64 * 1024);
     expect(restored.resolve(legacy.id)?.runner).toBe("pi");

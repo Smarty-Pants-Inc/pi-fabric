@@ -31,7 +31,8 @@ describe("built durable Fabric host", () => {
     vi.stubEnv("PI_OFFLINE", "1");
     vi.stubEnv("DURABLE_TEST_FAUX_MODULE", import.meta.resolve("@earendil-works/pi-ai/providers/faux"));
     vi.stubEnv("DURABLE_TEST_FABRIC_CODE", 'const child = await agents.run({ task: "recursive leaf", tools: [], extensions: true, thinking: "off" }); return { runner: child.runner, status: child.status, text: child.text };');
-    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, maxDepth: 3, timeoutMs: 30000 }, {
+    // Fork default runner is "pi"; this probe is the durable host, so select it.
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi-durable", maxDepth: 3, timeoutMs: 30000 }, {
       workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve("dist/index.js"),
       fullCodeMode: true, runRoot: path.join(cwd, "runs"), piBinary: path.join(cwd, "forbidden-native-fallback"),
     }); managers.push(manager);

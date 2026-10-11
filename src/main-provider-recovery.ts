@@ -1,11 +1,14 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
+import { classifyProviderError } from "./provider-error-class.js";
 
 /** Final settlement is after Pi's own retry/overflow recovery, unlike agent_end (#4012). */
 export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
   halted(): boolean;
   report(message: string, context: ExtensionContext): Promise<unknown>;
+  /** Main's drain owns a non-retryable error: compaction once, then alarm (smarty-dev#8742). */
+  ownsNonRetryable?(): boolean;
 }): void => {
   let retried = false;
   let reported = false;
@@ -39,6 +42,8 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     }
     if (!last || last.stopReason === "aborted") return;
     if (last.stopReason !== "error") { reset(); return; }
+    // A blind retry of a request the provider rejects as non-retryable fails the same way.
+    if (classifyProviderError(last)?.retryable === false && options.ownsNonRetryable?.() === true) { reset(); return; }
     const current = generation;
     // Optional provider utilities must not enter registration's eager graph.
     const { isContextOverflow } = await import("@earendil-works/pi-ai/compat");

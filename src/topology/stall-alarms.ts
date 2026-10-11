@@ -142,6 +142,34 @@ export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity
   }
 };
 
+/** The held messages a provider-dead alarm names one by one; the age pass covers the rest. */
+const PROVIDER_DEAD_MESSAGE_ALARMS = 50;
+
+/**
+ * smarty-dev#8742: a Main whose provider rejects every request as non-retryable reaches ops at
+ * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to each held
+ * message's sender, deduplicated per address. Each held message's alarm IS its inbox.age.alarm,
+ * under the same dedupe key, fired now instead of after mesh.undeliveredAlarmMs, so it crosses the
+ * existing mesh bridge to remote senders and the age pass never repeats it.
+ */
+export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  event: { error: string; since: string; cause: string; held: ReadonlyArray<{ id: string; from: string; sentAt: number }> },
+  ownerIdentityId?: string): Promise<void> => {
+  const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];
+  const reason = `provider-dead (non-retryable: ${event.error})`;
+  for (const to of owners) await mesh.publish({
+    topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
+    dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
+    text: `Main ${rootId} ${reason}: ${event.cause}; ${event.held.length} held message(s) unread`,
+    data: { rootId, ...event, held: event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS), heldCount: event.held.length } });
+  for (const item of event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS)) {
+    for (const to of new Set([item.from, ...owners])) await mesh.publish({
+      topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to,
+      dedupeKey: `inbox-age:${item.id}:${to}`, text: `Undelivered Main message ${item.id} to ${rootId}: ${reason}`,
+      data: { messageId: item.id, rootId, sentAt: item.sentAt, reason: "provider-dead", error: event.error } });
+  }
+};
+
 export class MainInboxMaintenance {
   readonly #receipts = new Map<string, SessionReceiptManager>();
   constructor(readonly mesh: MeshStore, readonly identity: MeshIdentity, readonly participants: FabricParticipantSource,

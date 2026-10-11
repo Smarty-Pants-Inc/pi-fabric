@@ -9,7 +9,8 @@ import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive,
-  rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor } from "../src/topology/stall-alarms.js";
+  rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms } from "../src/topology/stall-alarms.js";
+import { isBridgedTopic } from "../src/mesh/bridge.js";
 import { DEFAULT_FABRIC_CONFIG, loadFabricConfig } from "../src/config.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
@@ -403,4 +404,26 @@ it.skipIf(process.platform === "win32")("SIGKILL between successor admission and
   expect(recovered.sent).toHaveLength(1); expect(recovered.sent[0].message.details.id).toBe(packet.messageId);
   await new MainInboxMaintenance(mesh, C, source([]), recovered.controller, options).run();
   expect(recovered.sent).toHaveLength(1); expect(mesh.read({ topic: "fleet.work.inbox-receipts" })).toHaveLength(1);
+});
+
+// smarty-dev#8742: a provider-dead Main reaches ops at once, on the inbox-age alarm's addressing and bridge.
+it("publishes provider-dead alarms on ops.owner, firing each held message's inbox-age alarm early under its own dedupe key", async () => {
+  const { mesh } = setup();
+  const event = { error: "409 invalid_request_error: compaction_affinity_missing", since: "2026-10-11T08:00:00.000Z",
+    cause: "compaction-failed", held: [{ id: "m1", from: "session:lead", sentAt: 1 }] };
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");     // deduplicated per address
+  const alarms = mesh.read({ topic: "ops.owner", after: 0, limit: 100 });
+  expect(alarms.map(alarm => `${alarm.kind}>${alarm.to}`).sort()).toEqual([
+    "fabric.main.provider-dead>session:A", "fabric.main.provider-dead>session:owner",
+    "inbox.age.alarm>session:A", "inbox.age.alarm>session:lead", "inbox.age.alarm>session:owner",
+  ]);
+  const age = alarms.find(alarm => alarm.kind === "inbox.age.alarm" && alarm.to === "session:lead")!;
+  expect(age).toMatchObject({ dedupeKey: "inbox-age:m1:session:lead",
+    data: { messageId: "m1", rootId: A.id, reason: "provider-dead", error: event.error } });
+  expect(age.text).toContain("provider-dead (non-retryable: 409 invalid_request_error: compaction_affinity_missing)");
+  expect(isBridgedTopic(age)).toBe(true);
+  // The later age pass reuses the key, so it never repeats this alarm.
+  await mesh.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: A, to: "session:lead", dedupeKey: "inbox-age:m1:session:lead", data: {} });
+  expect(mesh.read({ topic: "ops.owner", after: 0, limit: 100 })).toHaveLength(5);
 });

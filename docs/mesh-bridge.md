@@ -8,10 +8,21 @@ existing events and mirrors root presence. There is no new store or protocol.
 
 - `fabric.control.command` and `fabric.control.ack`, `fleet.work.*`, and `ops.owner` with kind
   `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
-- From the remote to the hub only: `fleet.work.*` and the allow-listed `ops.owner` kinds addressed
-  to the hub factory's role, the exact string `to: "factory"` (smarty-dev#9352). The factory on the
-  hub reads these by topic; the event lands on the hub's mesh on the same topic with `to` unchanged.
-  No other recipient name, no other topic, and nothing from the hub to the remote is widened.
+- From the remote to the hub only: a work topic of the exact form `fleet.work.<repo>.<n>` (a
+  non-empty repo of `[A-Za-z0-9._-]`, not `.` or `..`, and a decimal number with no sign or leading
+  zero) and the allow-listed `ops.owner` kinds, addressed to the hub factory's role, the exact
+  string `to: "factory"` (smarty-dev#9352). The factory on the hub reads these by topic; the event
+  lands on the hub's mesh on the same topic with `to` unchanged. `fleet.work.`, `fleet.work.<repo>`,
+  `fleet.work.inbox-receipts`, `factory-lead`, `factory` with a NUL or space, and a non-string `to`
+  do not cross. No other recipient name, no other topic, and nothing from the hub to the remote is
+  widened.
+- These factory-addressed events are rate bound per link: a token bucket of 30 events a minute,
+  burst 60 (`--factory-rate PER_MINUTE`, `--factory-burst N`). Events to a hub-native recipient
+  spend no token. Over the bound nothing is dropped: the inbound drain stops at that event with the
+  cursor before it (the link's later inbound events wait behind it, in order), no pass rereads the
+  remote until the next token is due, and one timer then retries it. A line at most once a minute
+  reports it: `toLocal: factory rate bound (30/min, burst 60): N deferrals; waiting at <topic> <id>,
+  retry in N ms; nothing dropped`.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
   lease retains the source's expiry, capped at 15 s from the mirror commit. A slow pass can shift
@@ -54,7 +65,8 @@ existing events and mirrors root presence. There is no new store or protocol.
   - its sender is a live native participant or host identity of the remote;
   - no hub record, live or not, uses that id;
   - its recipient is native to the hub, or it is a `fleet.work.*` or allow-listed `ops.owner`
-    event addressed exactly to `factory` (the sender checks above, the commit-time ownership
+    event addressed exactly to `factory`, with a parsed `fleet.work.<repo>.<n>` topic (the sender
+    checks above, the per-link factory rate bound, the commit-time ownership
     fence and the frame budget still apply to it).
 - A remote identity is bound to the one link that mirrored it first (the `remoteHost` on its record).
   Each link reserves every id it did not mirror: native records (live or not) and other links'
@@ -87,7 +99,8 @@ existing events and mirrors root presence. There is no new store or protocol.
   (SIGTERM, then SIGKILL after 2 s).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
   not forwarded. Each one is a debug line (`--log-level debug`), and the bridge logs at most one
-  count line a minute, `bridge: N events not addressed across (topics: ...; toRemote N, toLocal N)`.
+  count line a minute, `bridge: N events not addressed across (topics: ...; toRemote N, toLocal N (to
+  factory N))`, where `to factory` counts remote events addressed to `factory` that did not cross.
   The line is event-driven: the next such drop or forward after the minute emits it; no timer runs.
 - A read page stays under 8 MiB of events, so it always fits one 16 MiB frame. An event that alone
   is over the budget is skipped and logged with its id and sequence, and the cursor moves on.

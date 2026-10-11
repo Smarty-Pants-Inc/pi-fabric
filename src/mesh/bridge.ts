@@ -94,16 +94,63 @@ export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolea
 /**
  * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
  * owner wakes by topic, addressed to this literal name rather than to a participant id, so no hub
- * record answers to it. Only from the remote to the hub, only this exact name, and only on
- * `fleet.work.*` and the allow-listed `ops.owner` kinds is it an address across; every other
- * check (allow-list, sender identity, reserved ids, live sender at commit, frame budget) still holds.
+ * record answers to it. Only from the remote to the hub, only this exact name, and only on a
+ * parsed `fleet.work.<repo>.<n>` topic (parseWorkTopic) or the allow-listed `ops.owner` kinds is it
+ * an address across; every other check (allow-list, sender identity, reserved ids, live sender at
+ * commit, frame budget) still holds, and the link's factory rate bound (factoryRate) applies.
  */
 export const HUB_FACTORY_RECIPIENT = "factory";
 
-/** Whether a remote event is addressed to the hub factory's role (see HUB_FACTORY_RECIPIENT). */
+/** A mesh topic is at most this long (the event log's topic pattern); the parser reads no further. */
+const MAX_TOPIC_LENGTH = 128;
+const WORK_TOPIC_PREFIX = "fleet.work.";
+const WORK_REPO = /^[A-Za-z0-9._-]+$/;
+const WORK_NUMBER = /^[1-9][0-9]{0,15}$/;
+
+/**
+ * A work topic as work-host Mains name it, `fleet.work.<repo>.<n>` (pi-fabric#876 review, P1-1): a
+ * non-empty repo segment of [A-Za-z0-9._-] (never `.` or `..`, which name no repo) and a decimal
+ * issue or PR number without a sign or leading zero. The number is the segment after the last
+ * dot, so a dotted repo name still parses. Linear in the topic: an untrusted remote's string
+ * meets no backtracking pattern. Anything else (`fleet.work.`, `fleet.work.<repo>`,
+ * `fleet.work.inbox-receipts`, `fleet.work..1`, `fleet.work.a:b.1`) is undefined.
+ */
+export const parseWorkTopic = (topic: unknown): { repo: string; number: number } | undefined => {
+  if (typeof topic !== "string" || topic.length > MAX_TOPIC_LENGTH || !topic.startsWith(WORK_TOPIC_PREFIX)) return undefined;
+  const rest = topic.slice(WORK_TOPIC_PREFIX.length);
+  const dot = rest.lastIndexOf(".");
+  if (dot <= 0) return undefined;
+  const repo = rest.slice(0, dot);
+  const digits = rest.slice(dot + 1);
+  if (!WORK_REPO.test(repo) || repo === "." || repo === ".." || !WORK_NUMBER.test(digits)) return undefined;
+  const number = Number(digits);
+  return Number.isSafeInteger(number) ? { repo, number } : undefined;
+};
+
+/**
+ * Whether a remote event is addressed to the hub factory's role (see HUB_FACTORY_RECIPIENT): `to`
+ * is exactly `factory`, and the topic is a parsed `fleet.work.<repo>.<n>` or `ops.owner` with an
+ * allow-listed kind.
+ */
 export const isHubFactoryEvent = (event: Pick<MeshEvent, "topic" | "kind" | "to">): boolean =>
-  event.to === HUB_FACTORY_RECIPIENT && typeof event.topic === "string" &&
-  (event.topic.startsWith("fleet.work.") || event.topic === "ops.owner") && isBridgedTopic(event);
+  event.to === HUB_FACTORY_RECIPIENT &&
+  (parseWorkTopic(event.topic) !== undefined || (event.topic === "ops.owner" && isBridgedTopic(event)));
+
+/** A per-link token bucket: `perMinute` tokens refill each minute, up to `burst` held. */
+export interface FactoryRate {
+  perMinute: number;
+  burst: number;
+}
+
+/**
+ * The default per-link bound on the factory exception (pi-fabric#876 review, P1-2): 30 events a
+ * minute, burst 60. Only events that cross because they are addressed to the factory's role spend
+ * a token; events to a hub-native recipient do not.
+ */
+export const DEFAULT_FACTORY_RATE: Readonly<FactoryRate> = Object.freeze({ perMinute: 30, burst: 60 });
+
+/** At most one factory-rate deferral line per this interval. */
+const FACTORY_RATE_LOG_MS = 60_000;
 
 /** At most one "not addressed across" count line per this interval (smarty-dev#9352). */
 const UNADDRESSED_LOG_MS = 60_000;
@@ -1130,7 +1177,13 @@ export interface MeshBridgeOptions {
   log?: (message: string) => void;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
-  /** The clock the once-a-minute "not addressed across" count line reads (Date.now by default; tests inject it). */
+  /**
+   * The per-link bound on remote events that cross only as addressed to the hub factory's role
+   * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
+   * before it, and resumes when its token is due: the event waits, it is never dropped.
+   */
+  factoryRate?: FactoryRate;
+  /** The clock of the once-a-minute log lines and the factory rate bound (Date.now by default; tests inject it). */
   clock?: () => number;
 }
 
@@ -1251,14 +1304,68 @@ export class MeshBridge {
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
   #running: Promise<void> = Promise.resolve();
   /** Events not addressed across since the last count line (smarty-dev#9352). */
-  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, topics: new Set<string>(), more: false };
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  /** The factory exception's token bucket (pi-fabric#876 review, P1-2). */
+  readonly #factoryRate: FactoryRate;
+  #factoryTokens: number;
+  #factoryRefilledAt = Number.NEGATIVE_INFINITY;
+  /** A deferred factory event holds the inbound drain until this time (this bridge's clock). */
+  #factoryWaiting = false;
+  #factoryRetryAt = Number.NEGATIVE_INFINITY;
+  #factoryDeferrals = 0;
+  #factoryLoggedAt = Number.NEGATIVE_INFINITY;
 
   constructor(readonly options: MeshBridgeOptions) {
     for (const name of [options.localName, options.remoteName]) {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    const rate = options.factoryRate ?? DEFAULT_FACTORY_RATE;
+    if (!(Number.isFinite(rate.perMinute) && rate.perMinute > 0) || !(Number.isSafeInteger(rate.burst) && rate.burst > 0)) {
+      throw new Error("factoryRate needs a positive perMinute and a positive integer burst");
+    }
+    this.#factoryRate = { perMinute: rate.perMinute, burst: rate.burst };
+    this.#factoryTokens = rate.burst;
+  }
+
+  #now(): number {
+    return (this.options.clock ?? Date.now)();
+  }
+
+  /** The factory bucket's tokens now, refilled for the time since the last look. */
+  #factoryTokensNow(): number {
+    const now = this.#now();
+    if (now > this.#factoryRefilledAt) {
+      const { perMinute, burst } = this.#factoryRate;
+      this.#factoryTokens = Math.min(burst, this.#factoryTokens + (now - this.#factoryRefilledAt) * perMinute / 60_000);
+      this.#factoryRefilledAt = now;
+    }
+    return this.#factoryTokens;
+  }
+
+  /** Whether a remote event crosses only through the factory exception, so it spends a token. */
+  #viaFactory(event: MeshEvent, rules: { recipients: Set<string> }, direction: "toRemote" | "toLocal"): boolean {
+    return direction === "toLocal" && !(typeof event.to === "string" && rules.recipients.has(event.to)) && isHubFactoryEvent(event);
+  }
+
+  /**
+   * Over the factory rate: the inbound drain stops at this event, unforwarded, with the cursor
+   * before it, and retries when its token is due (run() arms one timer for that; no notification is
+   * needed and nothing polls). At most one line a minute reports the deferrals.
+   */
+  #deferFactory(event: MeshEvent): void {
+    const now = this.#now();
+    const { perMinute, burst } = this.#factoryRate;
+    const waitMs = Math.max(1, Math.ceil((1 - this.#factoryTokens) * 60_000 / perMinute));
+    this.#factoryWaiting = true;
+    this.#factoryRetryAt = now + waitMs;
+    this.#factoryDeferrals += 1;
+    if (now - this.#factoryLoggedAt < FACTORY_RATE_LOG_MS) return;
+    this.#factoryLoggedAt = now;
+    this.#log(`toLocal: factory rate bound (${perMinute}/min, burst ${burst}): ${this.#factoryDeferrals} deferrals; ` +
+      `waiting at ${event.topic} ${event.id}, retry in ${waitMs} ms; nothing dropped`);
+    this.#factoryDeferrals = 0;
   }
 
   #log(message: string): void {
@@ -1273,6 +1380,8 @@ export class MeshBridge {
     const unaddressed = this.#unaddressed;
     unaddressed.count += 1;
     unaddressed[direction] += 1;
+    // A remote event to the factory's role that did not cross (pi-fabric#876 post-install gate).
+    if (direction === "toLocal" && event.to === HUB_FACTORY_RECIPIENT) unaddressed.factory += 1;
     if (!unaddressed.topics.has(event.topic)) {
       if (unaddressed.topics.size < UNADDRESSED_TOPICS) unaddressed.topics.add(event.topic);
       else unaddressed.more = true;
@@ -1289,12 +1398,12 @@ export class MeshBridge {
   #reportUnaddressed(): void {
     const unaddressed = this.#unaddressed;
     if (unaddressed.count === 0) return;
-    const now = (this.options.clock ?? Date.now)();
+    const now = this.#now();
     if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
     this.#unaddressedLoggedAt = now;
-    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, topics: new Set<string>(), more: false };
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
     this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
-      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal})`);
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}))`);
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
@@ -1427,6 +1536,12 @@ export class MeshBridge {
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    if (direction === "toLocal" && this.#factoryWaiting) {
+      // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
+      // until then a pass does not even reread the page.
+      if (this.#now() < this.#factoryRetryAt) return { forwarded, dropped };
+      this.#factoryWaiting = false;
+    }
     while (true) {
       const start = cursor.after;
       const startOffset = cursor.offset;
@@ -1454,10 +1569,16 @@ export class MeshBridge {
           }
           if (this.#stopped) return { forwarded, dropped };
           const candidates: Array<{ event: BridgePublish; held: string[] }> = [];
+          // Which candidates spend a factory token; the batch ends at the first one over the rate,
+          // and the single-event path below defers it.
+          const spends: boolean[] = [];
+          let spending = 0;
           let bytes = 0;
           for (const candidate of page.events.slice(index, index + 256)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
+            const spend = this.#viaFactory(candidate, rules, direction);
+            if (spend && spending + 1 > this.#factoryTokensNow()) break;
             const data = isObject(candidate.data) ? candidate.data : {};
             const item = {
               event: {
@@ -1472,6 +1593,8 @@ export class MeshBridge {
             bytes += Buffer.byteLength(JSON.stringify(item.event), "utf8") + 1;
             if (bytes > BRIDGE_PAGE_BYTES - 1024) break;
             candidates.push(item);
+            spends.push(spend);
+            if (spend) spending += 1;
           }
           if (candidates.length > 1) {
             let committed: Array<{ sequence: number }> | undefined;
@@ -1485,6 +1608,7 @@ export class MeshBridge {
                   committed.some(result => !Number.isSafeInteger(result?.sequence) || result.sequence <= 0)) {
                 throw new Error("Invalid bridge batch receipt");
               }
+              this.#factoryTokens -= spends.slice(0, committed.length).filter(Boolean).length;
               const ids = page.events.slice(index, index + committed.length).map(item => item.id);
               for (const id of ids) seen.add(id);
               cursor.mark = Math.max(cursor.mark, ...committed.map(result => result.sequence));
@@ -1529,6 +1653,17 @@ export class MeshBridge {
           // existing one-refresh commit refusal path, never an idle renewal timer.
           if (this.#presenceDue()) await this.syncPresence();
           if (this.#stopped) return { forwarded, dropped };
+          if (this.#viaFactory(event, rules, direction)) {
+            if (this.#factoryTokensNow() < 1) {
+              // Defer, never drop (pi-fabric#876 review, P1-2): this event and all after it stay
+              // unread. The cursor stays before it (offset at this page's start; a reread skips
+              // by sequence), so a restart or the next drain resumes exactly here.
+              this.#deferFactory(event);
+              if (cursor.after > start) this.#save();
+              return { forwarded, dropped };
+            }
+            this.#factoryTokens -= 1;
+          }
           const data = isObject(event.data) ? event.data : {};
           try {
             // Revalidated for each event after the awaits before it: an inbound event commits only
@@ -1608,8 +1743,9 @@ export class MeshBridge {
 
   #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
-    // The hub (local) side is the factory's: a remote work event or owner wake addressed to its role
-    // crosses to the hub on the same topic, `to` unchanged (smarty-dev#9352). Never hub to remote.
+    // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
+    // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
+    // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
     if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && isHubFactoryEvent(event)))) {
       return "not addressed across";
     }
@@ -1694,6 +1830,8 @@ export class MeshBridge {
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
+          // A factory-rate deferral retries when its token is due: one timer, no notification needed.
+          if (this.#factoryWaiting) delay = Math.min(delay ?? Infinity, Math.max(0, this.#factoryRetryAt - this.#now()));
         } catch (error) {
           if (this.#stopped) return;
           if (!isMeshRetryableBusy(error)) throw error;

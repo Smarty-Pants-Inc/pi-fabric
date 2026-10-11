@@ -422,22 +422,24 @@ export class MeshStore {
   // smarty-dev#7451 item 6: a write the SQLite WAL cap refused (a reader pins the WAL) raises one log line and one
   // MESH_WAL_CAP_ALARM_TOPIC event per store at most every MESH_WAL_CAP_ALARM_MS. The event goes to events.jsonl,
   // which the cap does not gate. The refusal itself is rethrown unchanged (callers retry it, item 8).
+  // smarty-dev#9513: the event names the refused operation's own writer (a delete has none: the store's process), and
+  // carries a reader COUNT, never reader pids or command lines (those stay in the error for the local operator).
   #walCapAlarmAt = Number.NEGATIVE_INFINITY;
-  #walCapIdentity: MeshIdentity | undefined;
   #alarmWalCap<T>(write: Promise<T>, identity?: MeshIdentity): Promise<T> {
-    if (identity) this.#walCapIdentity = identity;
     return write.catch((error: unknown) => {
       const now = Date.now();
       if (isMeshStateWalCap(error) && now - this.#walCapAlarmAt >= MESH_WAL_CAP_ALARM_MS) {
         this.#walCapAlarmAt = now;
-        const { walBytes, capBytes, readers } = error as { walBytes?: number; capBytes?: number; readers?: string };
-        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes)${readers ? `; ${readers}` : ""}`;
+        const { walBytes, capBytes, readerCount } = error as { walBytes?: number; capBytes?: number; readerCount?: number };
+        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
+          + `${readerCount ?? 0} WAL reader(s))`;
         console.warn(`[pi-fabric] ${text} at ${this.root}`);
-        const from = this.#walCapIdentity;
+        const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.
         try {
-          if (from) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
-            data: { root: this.root, walBytes, capBytes, readers } }).catch(() => undefined);
+          void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
+            data: { root: this.root, walBytes, capBytes, readerCount: readerCount ?? 0, writer: identity ? identity.id : null } })
+            .catch(() => undefined);
         } catch { /* the alarm is best effort */ }
       }
       throw error;

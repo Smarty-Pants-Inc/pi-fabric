@@ -381,9 +381,11 @@ export class MeshLock {
       // elsewhere is unknown, never dead (an invisible PID is not ESRCH proof). An owner from
       // an earlier boot of this host is dead. Untagged (older) owners keep the plain probe.
       // An owner on this host with an unknown PID namespace stays foreign, but its creation
-      // time is the heartbeat: past the hold ceiling it is dead and recovers here (PR #864 P1).
+      // time is the heartbeat: past the hold ceiling it is dead and recovers here (PR #864 P1),
+      // unless our procfs still shows its PID (with the recorded start, when there is one).
       const locality = lockTokenLocality(token);
-      const heartbeat = unknownNamespaceLockLiveness(token, Number(createdText), { staleMs: this.#staleLockMs });
+      const heartbeat = unknownNamespaceLockLiveness(token, Number(createdText),
+        { staleMs: this.#staleLockMs, pid, start: recordedStart });
       if (locality === "foreign" && heartbeat !== "dead") return false;
       if (heartbeat !== "dead" && locality !== "previous-boot" && processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
@@ -406,12 +408,17 @@ export class MeshLock {
         } finally { clearTimeout(timer); }
         if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
+      // The judged directory (dev/ino) and the complete owner record, token included, are re-read
+      // just before the rename; any change fails closed.
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
         return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
       };
       if (!unchanged()) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
+      // The fence name is a function of the judged identity, so recovery is serialized: of two
+      // recoverers that judged this owner, only one rename succeeds; the other meets the
+      // nonempty fence (or a successor's directory under the canonical name) and fails closed.
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
       // it, or recursively deleting the canonical name after a re-read, reopens that race.

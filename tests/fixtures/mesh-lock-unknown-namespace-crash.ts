@@ -1,12 +1,12 @@
-// PR #864 P1 crash probe. "hold": acquire the mesh lock with an unknown PID namespace and
-// die holding it (SIGKILL). "acquire <offsetMs>": a new process tries the lock with its clock
-// moved forward by offsetMs, and prints ACQUIRED or REFUSED <code>.
+// PR #864 P1 crash probe. "hold [lockTimeoutMs]": acquire the mesh lock with an unknown PID
+// namespace and die holding it (SIGKILL). "acquire <offsetMs>": a new process tries the lock with
+// its clock moved forward by offsetMs, and prints ACQUIRED or REFUSED <code>.
 import fs from "node:fs";
 import path from "node:path";
 import { MeshStore } from "../../src/mesh/store.js";
 
 const [root, mode, offsetText] = process.argv.slice(2);
-if (!root || !mode) throw new Error("usage: <root> hold|acquire [offsetMs]");
+if (!root || !mode) throw new Error("usage: <root> hold [lockTimeoutMs] | acquire [offsetMs]");
 const print = (line: string): void => { fs.writeSync(1, `${line}\n`); };
 
 if (mode === "hold") {
@@ -16,7 +16,7 @@ if (mode === "hold") {
     if (String(target) === "/proc/self/ns/pid") throw Object.assign(new Error("denied"), { code: "EACCES" });
     return (readlink as (...args: unknown[]) => unknown)(target, ...rest);
   }) as typeof fs.readlinkSync;
-  const store = new MeshStore(root, 64 * 1024, 100, {});
+  const store = new MeshStore(root, 64 * 1024, 100, offsetText ? { lockTimeoutMs: Number(offsetText) } : {});
   await store.exclusive(() => {
     print(`HELD ${JSON.stringify(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8"))}`);
     process.kill(process.pid, "SIGKILL");

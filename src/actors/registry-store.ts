@@ -483,14 +483,19 @@ export class ActorRegistryStore {
           // An owner on this host with an unknown PID namespace stays foreign, but its creation
           // time is the heartbeat (never ESRCH): past the hold ceiling it is dead (PR #864 P1).
           const locality = lockTokenLocality(holder);
+          // Positive evidence outranks age: our procfs still showing the PID (with the recorded
+          // start, when there is one) keeps an unknown-namespace owner alive however old.
           const heartbeat = validOwner
-            ? unknownNamespaceLockLiveness(holder, Number(createdText), { staleMs: ACTOR_REGISTRY_STALE_LOCK_MS })
+            ? unknownNamespaceLockLiveness(holder, Number(createdText),
+              { staleMs: ACTOR_REGISTRY_STALE_LOCK_MS, pid, start: recordedStart })
             : undefined;
           const alive = heartbeat === undefined && validPid && locality !== "previous-boot" && processAlive(pid);
           const actualStart = alive && recordedStart ? processStartTime(pid) : undefined;
           const dead = heartbeat === "dead" || (locality !== "foreign" && (alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
             validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS));
           if (dead) {
+            // Re-read the judged directory (dev/ino) and the complete owner record, token
+            // included, just before the rename; the identity-bound fence serializes recoverers.
             const current = fs.lstatSync(lockPath);
             if (current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&
               fs.readFileSync(ownerPath, "utf8") === firstOwner) {

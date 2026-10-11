@@ -9,6 +9,8 @@ import {
   localityLockToken,
   lockTokenLocality,
   ownerLocalityTag,
+  procfsShowsOwner,
+  procfsStartTicks,
   readPhysicalHostIdentity,
   SHORT_LOCK_MAX_HOLD_MS,
   unknownNamespaceLockLiveness,
@@ -99,6 +101,180 @@ describe("unknown-namespace lock heartbeat (PR #864 P1)", () => {
     expect(unknownNamespaceLockLiveness("legacy", 0)).toBeUndefined();
     expect(at(Number.NaN, noNamespace, withBoot)).toBeUndefined();
   });
+
+  it("keeps a stale owner alive while our procfs shows its PID with the recorded start (PR #864)", () => {
+    const noNamespace = { hostname: "node-a", bootId: "boot-a" };
+    const reader = ownerLocalityTag({ hostname: "node-a", pidNamespace: "pid:[1]", bootId: "boot-a" });
+    const token = `${uuid}-${ownerLocalityTag(noNamespace)}`;
+    const now = 1_700_000_000_000;
+    const stale = now - SHORT_LOCK_MAX_HOLD_MS - 1;
+    const judge = (procfs: string | undefined, start?: string, created = stale) =>
+      unknownNamespaceLockLiveness(token, created, { now, pid: 4242, start, procfsStart: () => procfs }, reader);
+    // Visible with the recorded start, or visible and the record carries none: alive.
+    expect(judge("777", "777")).toBe("alive");
+    expect(judge("777")).toBe("alive");
+    expect(judge("777", "")).toBe("alive");
+    // Visible but its start is unreadable here: cannot be excluded, alive.
+    expect(judge("", "777")).toBe("alive");
+    // Another start under the same PID is a stranger; not visible at all: the age decides.
+    expect(judge("778", "777")).toBe("dead");
+    expect(judge(undefined, "777")).toBe("dead");
+    expect(judge(undefined)).toBe("dead");
+    // Fresh stays alive without consulting procfs.
+    expect(unknownNamespaceLockLiveness(token, now - 1_000, { now, pid: 4242, procfsStart: () => { throw new Error("probed"); } }, reader)).toBe("alive");
+    // procfsShowsOwner on the real procfs: this process is visible with its own start.
+    if (process.platform === "linux") {
+      expect(procfsStartTicks(process.pid)).toBe(ownStartTicks());
+      expect(procfsShowsOwner(process.pid, ownStartTicks())).toBe(true);
+      expect(procfsShowsOwner(process.pid, "1")).toBe(false);
+      expect(procfsShowsOwner(deadPid(), undefined)).toBe(false);
+    }
+  });
+});
+
+// PR #864: the unknown-namespace reap path keeps every protection a live owner had. Recovery
+// runs only under the identity-bound rename fence after re-reading the judged inode and owner
+// record, and positive procfs evidence outranks the creation-time heartbeat.
+const ownStartTicks = (): string => {
+  const stat = fs.readFileSync("/proc/self/stat", "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
+};
+const staleAt = (): number => Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000;
+
+describe("unknown-namespace recovery keeps live owners protected (PR #864)", () => {
+  const holdMesh = (store: MeshStore, owner: string): string => {
+    const lockPath = path.join(store.root, ".lock");
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), owner);
+    return lockPath;
+  };
+  const meshFences = (store: MeshStore): string[] => fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."));
+  const registry = () => {
+    const actorRoot = path.join(temp("pi-fabric-recovery-registry-"), "actors");
+    const lockPath = path.join(actorRoot, "actors.json.lock");
+    fs.mkdirSync(lockPath, { recursive: true });
+    return { store: new ActorRegistryStore(actorRoot), lockPath, actorRoot };
+  };
+  const registryFences = (actorRoot: string): string[] =>
+    fs.readdirSync(actorRoot).filter(name => name.startsWith("actors.json.lock.dead."));
+
+  it.each([1, 2] as const)("mesh protocol %s never reaps a known-foreign-namespace owner (fresh or stale) or a fresh unknown-namespace owner", async (lockProtocol) => {
+    const store = new MeshStore(temp("pi-fabric-recovery-mesh-"), 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 150 });
+    for (const [token, created] of [[foreignNamespace(), Date.now() - 1_000], [foreignNamespace(), staleAt()],
+      [unknownNamespace(), Date.now() - 1_000]] as const) {
+      const owner = `${token}\n${deadPid()}\n${created}\n`;
+      const lock = holdMesh(store, owner);
+      esrch();
+      const operation = vi.fn();
+      await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(operation).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(meshFences(store)).toEqual([]);
+      vi.restoreAllMocks();
+      fs.rmSync(lock, { recursive: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux").each([1, 2] as const)("mesh protocol %s never reaps a stale unknown-namespace owner our procfs shows with its recorded start", async (lockProtocol) => {
+    const store = new MeshStore(temp("pi-fabric-recovery-mesh-"), 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 150 });
+    for (const owner of [
+      `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n${ownStartTicks()}\n`,
+      // No recorded start (protocol 1 wire): visibility alone keeps it.
+      `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n`,
+    ]) {
+      const lock = holdMesh(store, owner);
+      const operation = vi.fn();
+      await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(operation).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(meshFences(store)).toEqual([]);
+      fs.rmSync(lock, { recursive: true });
+    }
+    // Control: the same visible PID with another recorded start is a stranger; the heartbeat reaps.
+    holdMesh(store, `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n1\n`);
+    const reaper = new MeshStore(store.root, 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 1_000 });
+    await expect(reaper.exclusive(() => "reaped")).resolves.toBe("reaped");
+    expect(meshFences(store)).toHaveLength(1);
+  });
+
+  it("actor registry never reaps a known-foreign-namespace owner (fresh or stale) or a fresh unknown-namespace owner", async () => {
+    for (const [token, created] of [[foreignNamespace(), Date.now() - 1_000], [foreignNamespace(), staleAt()],
+      [unknownNamespace(), Date.now() - 1_000]] as const) {
+      const { store, lockPath, actorRoot } = registry();
+      const owner = `${token}\n${deadPid()}\n${created}\n`;
+      fs.writeFileSync(path.join(lockPath, "owner"), owner);
+      const old = new Date(Date.now() - 120_000);
+      fs.utimesSync(lockPath, old, old);
+      esrch();
+      const operation = vi.fn();
+      await expect(store.withLock(operation, 100)).rejects.toThrow();
+      expect(operation).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(owner);
+      expect(registryFences(actorRoot)).toEqual([]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("actor registry never reaps a stale unknown-namespace owner our procfs shows with its recorded start", async () => {
+    for (const owner of [
+      `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n${ownStartTicks()}\n`,
+      `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n`,
+    ]) {
+      const { store, lockPath, actorRoot } = registry();
+      fs.writeFileSync(path.join(lockPath, "owner"), owner);
+      const operation = vi.fn();
+      await expect(store.withLock(operation, 100)).rejects.toThrow();
+      expect(operation).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(owner);
+      expect(registryFences(actorRoot)).toEqual([]);
+    }
+    const control = registry();
+    fs.writeFileSync(path.join(control.lockPath, "owner"), `${unknownNamespace()}\n${process.pid}\n${staleAt()}\n1\n`);
+    await expect(control.store.withLock(() => "reaped", 1_000)).resolves.toBe("reaped");
+    expect(registryFences(control.actorRoot)).toHaveLength(1);
+  });
+
+  it("actor registry: two concurrent recoverers of one stale unknown-namespace owner reap it once", async () => {
+    const { store: first, lockPath, actorRoot } = registry();
+    const second = new ActorRegistryStore(actorRoot);
+    const stale = `${unknownNamespace()}\n${deadPid()}\n${staleAt()}\n`;
+    fs.writeFileSync(path.join(lockPath, "owner"), stale);
+    const rename = fs.renameSync;
+    let paused = false;
+    let pausedError: NodeJS.ErrnoException | undefined;
+    let successor: string | undefined;
+    let releaseSecond: (() => void) | undefined;
+    let secondHeld: Promise<void> | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (!paused && String(from) === lockPath) {
+        // The first recoverer judged the stale owner and passed its inode/owner re-read. Paused at
+        // the rename, a second recoverer reaps the same owner and takes the lock (synchronously,
+        // up to its critical section).
+        paused = true;
+        secondHeld = second.withLock(() => new Promise<void>((resolve) => { releaseSecond = resolve; }), 1_000);
+        successor = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
+        try { rename(from, to); } catch (error) { pausedError = error as NodeJS.ErrnoException; throw error; }
+        return;
+      }
+      rename(from, to);
+    });
+    const firstRun = first.withLock(() => "first", 3_000);
+    expect(paused).toBe(true);
+    // The paused rename met the identity-bound fence and failed closed; the successor kept its lock.
+    expect(["ENOTEMPTY", "EEXIST"]).toContain(pausedError?.code);
+    expect(successor).not.toBe(stale);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(successor);
+    const fences = registryFences(actorRoot);
+    expect(fences).toHaveLength(1);
+    expect(fs.readFileSync(path.join(actorRoot, fences[0]!, "owner"), "utf8")).toBe(stale);
+    // The first recoverer waits for the live successor, then acquires normally.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(successor);
+    releaseSecond!();
+    await secondHeld;
+    await expect(firstRun).resolves.toBe("first");
+    expect(registryFences(actorRoot)).toHaveLength(1);
+  });
 });
 
 describe("mesh lock recovery across PID namespaces", () => {
@@ -127,7 +303,8 @@ describe("mesh lock recovery across PID namespaces", () => {
 
   it.each([1, 2] as const)("protocol %s reaps an unknown-namespace owner whose heartbeat is stale, never by ESRCH", async (lockProtocol) => {
     const store = new MeshStore(temp("pi-fabric-locality-mesh-"), 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 1_000 });
-    const pid = 123456;
+    // A PID our procfs does not show: positive evidence cannot keep it alive.
+    const pid = deadPid();
     const owner = `${unknownNamespace()}\n${pid}\n${Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000}\n`;
     holdLock(store, owner);
     const kill = vi.spyOn(process, "kill").mockImplementation((target) => {
@@ -181,7 +358,7 @@ describe("actor registry lock recovery across PID namespaces", () => {
 
   it("reaps an unknown-namespace owner whose heartbeat is stale, and the registry recovers", async () => {
     const { store, lockPath } = setup();
-    const owner = `${unknownNamespace()}\n123456\n${Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000}\n`;
+    const owner = `${unknownNamespace()}\n${deadPid()}\n${Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000}\n`;
     fs.writeFileSync(path.join(lockPath, "owner"), owner);
     esrch();
     await expect(store.withLock(() => "recovered", 1_000)).resolves.toBe("recovered");

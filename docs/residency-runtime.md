@@ -136,6 +136,12 @@ judges an owner as follows:
   is alive; a stale one or none is `unknown`, because a paused owner holds no
   fencing token and may resume. On the same host, a different boot id with no
   heartbeat is dead, since no process outlives its boot.
+- Same host, but the PID namespace is unknown on either side (`/proc/self/ns/pid`
+  unreadable): the heartbeat is the authority, never `ESRCH`. A fresh heartbeat
+  is alive. A stale one is dead, unless this process's `/proc` still shows the
+  owner's PID with the recorded start time (field 22 of `/proc/<pid>/stat`), or
+  shows the PID at all when the record carries no start time. That owner is alive
+  however old its heartbeat. A different known boot id is still dead.
 - Records without identity fields keep the earlier signal-probe behaviour.
 
 `unknown` is never treated as death. A lock whose owner might be alive is not
@@ -147,13 +153,56 @@ heartbeat refreshes every 10 s, and a heartbeat older than 45 s is stale. The
 Schema commit lock heartbeats the same way while a transaction runs. File and
 actor-binding locks carry an identity line only. Across namespaces, their
 creation time serves as the heartbeat, with a 10-minute hold ceiling (or the
-lock's stale window, if longer); past it the owner is `unknown`, not dead.
+lock's stale window, if longer); past it the owner is `unknown`, not dead
+(dead only under the unknown-namespace rule above).
 Mesh, custody and actor-registry locks keep their line wire and name the
 writer's host, PID namespace and boot in the owner token instead; an owner from
 another host or namespace is never recovered on a local `ESRCH`, and one from
 an earlier boot of the same host is dead. Scratch markers record
 identity and no heartbeat, so the sweeper leaves a foreign owner's scratch
 alone.
+
+### Recovering a lock whose owner's PID namespace is unknown
+
+A token whose namespace digest is `------` (for example
+`<uuid>-a1b2c3------d4e5f6`), or a reader whose own namespace is unknown, means
+the writer's PID cannot be probed from here. One crash of such a holder must not
+wedge the lock, so the mesh lock (`<mesh>/.lock/owner`) and the actor registry
+lock (`<actor root>/actors.json.lock/owner`) recover it automatically:
+
+- **Threshold.** The owner record is `token`, `pid`, creation time in ms and,
+  when known, the start time. The creation time is the heartbeat. The lock is
+  reaped once it is older than 10 minutes (`SHORT_LOCK_MAX_HOLD_MS`, or the
+  lock's own stale window if longer; both locks use 30 s, so 10 minutes applies).
+  Heartbeat owners (`owner.json`, the Schema commit lock) use their 45 s
+  heartbeat TTL instead, and file and actor-binding locks use their 10-minute
+  hold ceiling.
+- **Never while there is evidence of life.** On Linux, a PID that this process's
+  `/proc` shows with the recorded start time, or at all when the record has no
+  start time (mesh protocol 1 records none), keeps the lock held however old it
+  is. A token from another host, or from a known other namespace, is never
+  reaped; a token from an earlier boot of this host is reaped at once.
+- **Once.** The recoverer re-reads the lock directory's inode and the complete
+  owner record (token included) just before it acts, and renames the directory
+  to `.lock.dead.<sha256(dev:ino:owner)>` (`actors.json.lock.dead.<…>`), which is
+  kept. Two recoverers that judged the same owner race for the same nonempty
+  name: one rename succeeds, the other fails closed and never touches a
+  successor's lock.
+
+No CLI command forces this: `pi-fabric` has no unlock, reap or recover command,
+and none should be added for it. If a lock must be released before the
+threshold, or a stranger now holds the recorded PID number so evidence of life
+never goes away, release it by hand:
+
+1. Read the owner: `cat <mesh>/.lock/owner` (or `actors.json.lock/owner`).
+2. Confirm in the place it ran (its container or host) that the recorded PID is
+   gone, or that `/proc/<pid>/stat` field 22 there differs from the recorded
+   start. If you cannot confirm it, wait for the threshold instead.
+3. Stop the Fabric processes that use this root, or at least re-read `owner`
+   immediately before the next step and check that the bytes are unchanged.
+4. Rename the directory, never delete it:
+   `mv <mesh>/.lock <mesh>/.lock.dead.manual-$(date +%s)`. The next acquirer
+   creates a fresh lock. Keep the renamed directory as the receipt.
 
 Hosts and containers that share `.pi/fabric` need clocks that agree within the
 heartbeat TTL.

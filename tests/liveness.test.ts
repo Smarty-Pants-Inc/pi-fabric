@@ -90,7 +90,8 @@ describe("ownerLiveness", () => {
   it("unknown namespace, same host: a heartbeat stale past the TTL is dead, never judged by ESRCH (PR #864 P1)", () => {
     const { pidNamespace: _ownerNamespace, ...owner } = local;
     const { pidNamespace: _selfNamespace, ...selfWithout } = self;
-    const { signal: _signal, ...injected } = probes({ self: () => selfWithout });
+    // Our procfs does not show the PID: only the heartbeat can decide.
+    const { signal: _signal, ...injected } = probes({ self: () => selfWithout, processVisible: () => false });
     const kill = vi.spyOn(process, "kill").mockImplementation(() => {
       throw Object.assign(new Error("not visible here"), { code: "ESRCH" });
     });
@@ -112,6 +113,41 @@ describe("ownerLiveness", () => {
     expect(lockOwnerLiveness(42, NOW - 61_000, line, options)).toBe("dead");
     expect(lockOwnerLiveness(42, NOW - 30_000, line, options)).toBe("alive");
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("unknown namespace, same host: a PID our procfs shows with its recorded start is alive however stale (PR #864)", () => {
+    const { pidNamespace: _ownerNamespace, ...owner } = local;
+    const { pidNamespace: _selfNamespace, ...selfWithout } = self;
+    const stale = { heartbeatAt: NOW - OWNER_HEARTBEAT_TTL_MS - 60_000 };
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("not visible here"), { code: "ESRCH" });
+    });
+    const seen = (startedAt: number | undefined, visible = true) => {
+      const { signal: _signal, ...rest } = probes({ self: () => selfWithout, processVisible: () => visible, processStartedAt: () => startedAt });
+      return rest;
+    };
+    // Visible with the recorded start (within the btime rounding tolerance): alive, never reaped.
+    expect(ownerLiveness(owner, { ...stale, probes: seen(owner.startedAt) })).toBe("alive");
+    expect(ownerLiveness(owner, { ...stale, probes: seen(owner.startedAt + 1_500) })).toBe("alive");
+    // Visible but unreadable start: cannot be excluded, alive.
+    expect(ownerLiveness(owner, { ...stale, probes: seen(undefined) })).toBe("alive");
+    // Visible with another start: a stranger reuses the PID; the stale heartbeat decides.
+    expect(ownerLiveness(owner, { ...stale, probes: seen(owner.startedAt + 30_000) })).toBe("dead");
+    // Not visible: the stale heartbeat decides.
+    expect(ownerLiveness(owner, { ...stale, probes: seen(owner.startedAt, false) })).toBe("dead");
+    // A record without a procfs start (no boot id) needs only visibility.
+    const { bootId: _boot, ...noStart } = owner;
+    expect(ownerLiveness(noStart, { ...stale, probes: seen(undefined) })).toBe("alive");
+    expect(ownerLiveness(noStart, { ...stale, probes: seen(undefined, false) })).toBe("dead");
+    // A recorded boot id that differs from ours is dead even when the PID is visible.
+    expect(ownerLiveness({ ...owner, bootId: "boot-b" }, { ...stale, probes: seen(owner.startedAt) })).toBe("dead");
+    // Another host is never judged by our procfs.
+    expect(ownerLiveness({ ...owner, hostname: "node-b" }, { ...stale, probes: seen(owner.startedAt) })).toBe("unknown");
+    expect(kill).not.toHaveBeenCalled();
+    // Line-oriented locks inherit it through their creation-time heartbeat.
+    const line = JSON.stringify({ ...owner, pid: undefined });
+    expect(lockOwnerLiveness(42, NOW - 61_000, line, { probes: seen(owner.startedAt), maxHoldMs: 60_000 })).toBe("alive");
+    expect(lockOwnerLiveness(42, NOW - 61_000, line, { probes: seen(owner.startedAt, false), maxHoldMs: 60_000 })).toBe("dead");
   });
 
   it("detects PID reuse from a different process start time", () => {

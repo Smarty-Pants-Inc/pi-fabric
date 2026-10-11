@@ -927,6 +927,8 @@ export interface LivenessProbes {
   signal?: (pid: number) => OwnerLiveness;
   /** Wall-clock start of `pid` when the platform reports it (Linux procfs). */
   processStartedAt?: (pid: number) => number | undefined;
+  /** Whether `pid` is visible in this process's procfs (Linux `/proc/<pid>/stat`). */
+  processVisible?: (pid: number) => boolean;
   now?: () => number;
 }
 
@@ -970,6 +972,53 @@ const procStartedAt = (pid: number | "self"): number | undefined => {
   const boot = readBootTimeSeconds();
   const stat = readTrimmed(`/proc/${pid}/stat`);
   return boot === undefined || stat === undefined ? undefined : parseProcStartedAt(stat, boot);
+};
+
+/**
+ * Linux: field 22 (starttime, clock ticks since boot) of `/proc/<pid>/stat` in THIS process's
+ * procfs. undefined: the PID is not visible here (or no procfs); "": visible, start unreadable.
+ */
+export const procfsStartTicks = (pid: number): string | undefined => {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  let stat: string;
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    const code = errorCode(error);
+    // Gone or never here. Anything else (hidepid, EACCES) still shows the PID exists.
+    return code === "ENOENT" || code === "ESRCH" ? undefined : "";
+  }
+  const start = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+  return start && /^\d+$/.test(start) ? start : "";
+};
+
+/**
+ * Positive evidence of life for an owner whose PID namespace is unknown (PR #864 P1): our
+ * procfs shows its PID and, when the record carries a start time (field 22 ticks), the same
+ * start. A visible PID with an unreadable start cannot be excluded either. Only ever evidence
+ * of life, never of death: callers fall back to heartbeat age when this is false.
+ */
+export const procfsShowsOwner = (
+  pid: number,
+  recordedStart: string | undefined,
+  read: (pid: number) => string | undefined = procfsStartTicks,
+): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  const actual = read(pid);
+  if (actual === undefined) return false;
+  const recorded = recordedStart !== undefined && /^\d+$/.test(recordedStart) ? recordedStart : undefined;
+  return recorded === undefined || actual === "" || actual === recorded;
+};
+
+const procfsVisible = (pid: number): boolean => procfsStartTicks(pid) !== undefined;
+
+/** Same evidence for a JSON owner record: only a start recorded with a boot id is procfs-derived. */
+const unknownNamespaceOwnerVisible = (record: OwnerRecord, probes: LivenessProbes): boolean => {
+  if (!Number.isSafeInteger(record.pid) || record.pid <= 0) return false;
+  if (!(probes.processVisible ?? procfsVisible)(record.pid)) return false;
+  if (record.bootId === undefined || record.startedAt === undefined) return true;
+  const actual = (probes.processStartedAt ?? procStartedAt)(record.pid);
+  return actual === undefined || Math.abs(actual - record.startedAt) <= PID_START_TOLERANCE_MS;
 };
 
 const signalProbe = (pid: number): OwnerLiveness => {
@@ -1070,14 +1119,22 @@ export const lockTokenLocality = (token: string | undefined, self = ownerLocalit
  * probe (ESRCH) proves nothing and is never consulted. As in lockOwnerLiveness, the creation
  * time is the heartbeat, with the same hold ceiling (SHORT_LOCK_MAX_HOLD_MS, or the caller's
  * longer stale bound as in exclusive locks): within it the owner is alive, past it dead and
- * reapable by the caller's dead-owner path (PR #864 P1). Any other token, including an earlier
- * boot of this host, another host, or a known namespace, returns undefined: the caller keeps its
- * locality path.
+ * reapable by the caller's dead-owner path (PR #864 P1). Positive evidence outranks age: with
+ * `pid` given, an owner our procfs still shows (with its recorded `start`, when the record
+ * carries one) stays alive however old (procfsShowsOwner). Any other token, including an
+ * earlier boot of this host, another host, or a known namespace, returns undefined: the caller
+ * keeps its locality path.
  */
 export const unknownNamespaceLockLiveness = (
   token: string | undefined,
   createdAt: number,
-  options: { staleMs?: number; now?: number } = {},
+  options: {
+    staleMs?: number;
+    now?: number;
+    pid?: number;
+    start?: string | undefined;
+    procfsStart?: (pid: number) => string | undefined;
+  } = {},
   self = ownerLocalityTag(),
 ): "alive" | "dead" | undefined => {
   const owner = token === undefined ? null : LOCALITY_TOKEN.exec(token);
@@ -1086,7 +1143,9 @@ export const unknownNamespaceLockLiveness = (
   if (owner[2] !== LOCALITY_UNKNOWN && own[2] !== LOCALITY_UNKNOWN) return undefined;
   if (lockTokenLocality(token, self) !== "foreign" || !Number.isFinite(createdAt)) return undefined;
   const maxHoldMs = Math.max(SHORT_LOCK_MAX_HOLD_MS, options.staleMs ?? 0);
-  return (options.now ?? Date.now()) - createdAt > maxHoldMs ? "dead" : "alive";
+  if ((options.now ?? Date.now()) - createdAt <= maxHoldMs) return "alive";
+  if (options.pid !== undefined && procfsShowsOwner(options.pid, options.start, options.procfsStart)) return "alive";
+  return "dead";
 };
 
 const boundedString = (value: unknown, max: number): value is string =>
@@ -1208,7 +1267,13 @@ export const ownerLiveness = (
     // On this host with an unknown PID namespace (either side) the heartbeat is the authority:
     // stale beyond the same TTL is dead and reapable, never judged by ESRCH. Otherwise a single
     // crash would leave the owner unknown and wedge its lock forever (PR #864 P1).
-    if (sameHost && (record.pidNamespace === undefined || self.pidNamespace === undefined)) return "dead";
+    if (sameHost && (record.pidNamespace === undefined || self.pidNamespace === undefined)) {
+      // No process outlives its kernel boot: a known other boot stays dead.
+      if (record.bootId !== undefined && self.bootId !== undefined && record.bootId !== self.bootId) return "dead";
+      // Positive evidence outranks heartbeat age: our procfs still shows the PID, with the
+      // recorded start when the record carries one. Such an owner is alive, never reaped.
+      return unknownNamespaceOwnerVisible(record, probes) ? "alive" : "dead";
+    }
     // Another host or known namespace: a missed heartbeat is only absence of evidence, never
     // confirmed death: a paused owner holds no fencing token and may resume and write again.
     return "unknown";

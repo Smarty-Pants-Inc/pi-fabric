@@ -149,9 +149,10 @@ describe("SQLite busy never escapes raw (defect 2)", () => {
 });
 
 describe("WAL stays bounded without a maintainer (defect 1)", () => {
-  it("SQLite's built-in autocheckpoint is on and keeps a client-only WAL near 4 MiB", async () => {
+  // smarty-dev#6100 round 2: the default is 4,000 pages (~16 MiB, fewer WAL restarts); 1,000 here keeps this test short.
+  it("SQLite's built-in autocheckpoint is on and keeps a client-only WAL near its threshold (1,000 pages, ~4 MiB)", async () => {
     const root = tempRoot("wal");
-    const store = await openStore(root);
+    const store = await openStore(root, { walAutocheckpointPages: 1_000 });
     let max = 0;
     for (let n = 0; n < 1_500; n += 1) { // ~9 MB of commits, no maintainer, below the 64 MiB emergency threshold
       await store.put({ key: `k${n % 50}`, value: { n, pad }, identity });

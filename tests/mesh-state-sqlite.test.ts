@@ -185,7 +185,7 @@ describe("SqliteStateStore", () => {
     const store = await open(root, { open: recording, busyTimeoutMs: 10_000 });
     await store.put({ key: "a/1", value: 1, identity });
     expect(executed).toEqual(expect.arrayContaining([
-      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 1000", "BEGIN IMMEDIATE", "COMMIT",
+      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 4000", "PRAGMA journal_size_limit = 25165824", "BEGIN IMMEDIATE", "COMMIT",
     ]));
     const observer = raw(root);
     expect(observer.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });

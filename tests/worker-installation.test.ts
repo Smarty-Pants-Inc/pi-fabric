@@ -75,13 +75,15 @@ describe("standalone worker without Pi host peers", () => {
     if (status === "failed") expect(record?.error).toContain("Structured agent output was invalid");
   });
 
+  // Fork: the standalone worker bundle inlines its option parser; its first
+  // on-disk startup module for a persistent Pi task is the retry profile.
   it("persists failures even before the worker's normal status context exists", async () => {
     const { root, run } = installation();
-    fs.rmSync(path.join(root, "dist/worker/options.js"));
+    fs.rmSync(path.join(root, "dist/worker/retry-profile.js"));
     const { child, record } = await run();
     expect(child.exitCode).toBe(1);
     expect(record, child.stderr).toMatchObject({ status: "failed", turns: 0, toolCalls: 0 });
-    expect(record?.error).toContain("options.js");
+    expect(record?.error).toContain("retry-profile.js");
   });
 
   it("reports unsupported Node before loading optional worker modules", async () => {
@@ -104,7 +106,19 @@ describe("standalone worker without Pi host peers", () => {
     expect(record?.error).toContain("cross-spawn");
   });
 
-  it.skipIf(!tmuxAvailable)("boots and reports early failures through an isolated real tmux server", async () => {
+  // Fork (smarty-dev#2566): tmux is refused until detached execution custody is
+  // confirmed, so the worker never boots there.
+  it("refuses the tmux transport before booting a worker", async () => {
+    const { root, worker, piBinary } = installation();
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 12000, sessionExport: false }, {
+      workerPath: worker, piBinary, runRoot: path.join(root, "runs"), fullCodeMode: false,
+    });
+    managers.push(manager);
+    await expect(manager.run({ task: "offline tmux probe", transport: "tmux", extensions: false }))
+      .rejects.toThrow(/transport tmux is disabled: detached execution custody is not confirmed/);
+  });
+
+  it.skip("boots and reports early failures through an isolated real tmux server (upstream; tmux refused in the fork)", async () => {
     const { root, worker, piBinary } = installation();
     const binary = execFileSync("which", ["tmux"], { encoding: "utf8" }).trim();
     const socket = `fabric-install-${process.pid}-${path.basename(root)}`;
@@ -132,14 +146,14 @@ describe("standalone worker without Pi host peers", () => {
 
   it("propagates bootstrap failure through the real process transport", async () => {
     const { root, worker, piBinary } = installation();
-    fs.rmSync(path.join(root, "dist/worker/options.js"));
+    fs.rmSync(path.join(root, "dist/worker/retry-profile.js"));
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 12000, sessionExport: false }, {
       workerPath: worker, piBinary, runRoot: path.join(root, "runs"), fullCodeMode: false,
     });
     managers.push(manager);
     const result = await manager.run({ task: "offline probe", transport: "process", extensions: false });
     expect(result.status).toBe("failed");
-    expect(result.error).toContain("options.js");
+    expect(result.error).toContain("retry-profile.js");
     expect(result.error).not.toContain("transport exited without a result");
   });
 });

@@ -276,7 +276,8 @@ let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
 const writeCrashStatus = (error: unknown): void => {
   flushRunLog?.();
-  if (!crashContext || !runRecordHelpers || terminalWritten) return;
+  // Without a run context yet, upstream's startup writer still persists the failure.
+  if (terminalWritten) return;
   try {
     if (crashContext && runRecordHelpers) {
       runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);

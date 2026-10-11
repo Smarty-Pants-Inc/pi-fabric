@@ -60,6 +60,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
+export type FabricPowerShellPolicy = "refuse" | "allow";
+
 interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
@@ -82,6 +85,11 @@ interface FabricExecutorConfig {
   shellHangMs: number;
   /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
   landlock: LandlockSettings;
+  /** pi.powershell and every captured or extension powershell override are
+   * refused unless the host profile sets "allow" (smarty-dev#9826). No guard
+   * judges PowerShell grammar, so "allow" accepts that gap. Host-only: the
+   * project layer cannot opt in. */
+  powershell: FabricPowerShellPolicy;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -552,6 +560,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     hostCallTimeouts: {},
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     landlock: { mode: "off", disabled: false },
+    powershell: "refuse",
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -1086,6 +1095,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         disabled: landlock.disabled === true,
         ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
+      // Fail closed: anything but the exact opt-in refuses PowerShell (smarty-dev#9826).
+      powershell: executor.powershell === "allow" ? "allow" : "refuse",
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -1872,6 +1883,8 @@ const resolveFabricConfig = (
       delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
+      // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
+      delete executor.powershell;
       document.executor = executor;
     }
     merged = mergeObjects(merged, document);

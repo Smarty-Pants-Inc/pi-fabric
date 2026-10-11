@@ -19,6 +19,7 @@ import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registr
 import { NESTED_TOOL_CALL_ID_PREFIX } from "../src/core/action-registry.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
+import { POWERSHELL_REFUSED_MESSAGE } from "../src/providers/shell-preflight.js";
 
 const baseContext = {
   cwd: process.cwd(),
@@ -858,6 +859,7 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
     const marker = path.join(root, "executed");
     const command = `git stash list > '${marker}'`;
     type Event = { toolName: string; toolCallId: string; input: Record<string, unknown> };
+    // smarty-dev#9826: these cases run only because the profile opted in.
     const providerFor = (hook: (event: Event) => unknown, captured = false) => {
       const events: Event[] = [];
       const runner = makeRunner({
@@ -874,7 +876,9 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
         definition: { ...createBashToolDefinition(root), name: "powershell", label: "powershell" } as RegisteredTool["definition"],
         sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override/index.ts", { source: "test" }),
       }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
-      const provider = new PiToolsProvider(root, catalog, captured ? new CapturedToolsProvider(catalog) : undefined, { powerShellToolDefinitionFactory });
+      const getPowerShellPolicy = () => "allow" as const;
+      const provider = new PiToolsProvider(root, catalog, captured ? new CapturedToolsProvider(catalog, { getPowerShellPolicy }) : undefined,
+        { powerShellToolDefinitionFactory, getPowerShellPolicy });
       return { provider, events };
     };
     // A bash-only guard, like the fleet bash guard: it ignores every other toolName.
@@ -905,6 +909,58 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
       await expect(late.provider.invoke("powershell", { command: "Write-Output ok" }, context))
         .rejects.toThrow("a tool_call hook rewrote the command after the bash guard judged it");
       expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it("refuses pi.powershell unless the profile opts in, built-in and captured override alike (smarty-dev#9826)", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-powershell-optin-")));
+    const marker = path.join(root, "executed");
+    const command = `printf ran > '${marker}'`;
+    type Event = { toolName: string; toolCallId: string; input: Record<string, unknown> };
+    const providerFor = (captured: boolean, policy: "allow" | "refuse" | undefined) => {
+      const events: Event[] = [];
+      const runner = makeRunner({
+        createContext: () => ({ cwd: root, sessionManager: baseContext.extensionContext.sessionManager }),
+        emitToolCall: vi.fn(async (event: Event) => { events.push({ ...event, input: { ...event.input } }); return undefined; }),
+      });
+      const catalog = new CapturedToolCatalog();
+      catalog.replace(captured ? [{
+        // An extension-owned powershell override backed by bash, so a missed refusal creates the marker.
+        definition: { ...createBashToolDefinition(root), name: "powershell", label: "powershell" } as RegisteredTool["definition"],
+        sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override/index.ts", { source: "test" }),
+      }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const getPowerShellPolicy = policy ? () => policy : undefined;
+      const capturedTools = captured ? new CapturedToolsProvider(catalog, { getPowerShellPolicy }) : undefined;
+      const provider = new PiToolsProvider(root, catalog, capturedTools, { powerShellToolDefinitionFactory, getPowerShellPolicy });
+      return { provider, capturedTools, events };
+    };
+    const context = { ...baseContext, cwd: root };
+    try {
+      // Default (no policy wired, or the default "refuse"): refused before any hook or execution.
+      for (const captured of [true, false]) {
+        for (const policy of [undefined, "refuse"] as const) {
+          const { provider, capturedTools, events } = providerFor(captured, policy);
+          await expect(provider.invoke("powershell", { command }, context)).rejects.toThrow(POWERSHELL_REFUSED_MESSAGE);
+          await expect(provider.invoke("powershell", { command }, context)).rejects.toThrow("smarty-dev#9826");
+          if (capturedTools) {
+            // A direct extensions.powershell call is refused too.
+            await expect(capturedTools.invoke("powershell", { command }, context)).rejects.toThrow("smarty-dev#9826");
+          }
+          expect(events).toEqual([]);
+        }
+      }
+      expect(fs.existsSync(marker)).toBe(false);
+      // The default unhooked provider (no runner, test-only allowUnhookedTools) refuses as well.
+      const unhooked = new PiToolsProvider(root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true });
+      await expect(unhooked.invoke("powershell", { command }, context)).rejects.toThrow("smarty-dev#9826");
+      // Opted in: the captured override runs, after the bash-named and then the powershell-named preflight.
+      const optedIn = providerFor(true, "allow");
+      await optedIn.provider.invoke("powershell", { command }, context);
+      expect(fs.readFileSync(marker, "utf8")).toBe("ran");
+      expect(optedIn.events.map((event) => event.toolName)).toEqual(["bash", "powershell"]);
+      expect(optedIn.events[0]).toMatchObject({ input: { command, shell: "powershell" } });
+      expect(optedIn.events[1]).toMatchObject({ input: { command } });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

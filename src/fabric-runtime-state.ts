@@ -634,6 +634,8 @@ export class FabricRuntimeState {
       // F2: the host kill switch is re-read per call, never a cached value.
       getLandlockSettings: () => liveLandlockSettings(
         this.#config?.executor.landlock ?? { mode: "off", disabled: false }, resolveAgentDir()),
+      // smarty-dev#9826: read per call; anything but the host opt-in refuses PowerShell.
+      getPowerShellPolicy: () => this.#config?.executor.powershell ?? "refuse",
     });
     if (!this.#managedHost && (this.#config.fullCodeMode || enforceSchema)) {
       this.#shellInbox = new ShellEventInbox(this.pi, context, this.shellJobs);

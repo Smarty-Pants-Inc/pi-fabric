@@ -490,6 +490,50 @@ describe("CapturedToolsProvider", () => {
     }
   });
 
+  // smarty-dev#9826: a bash-only guard is not a PowerShell safety mechanism, so
+  // an extension's powershell override fails closed unless the profile opts in.
+  it("refuses a captured powershell override by default and runs it through both preflights when opted in (#9826)", async () => {
+    const runs: unknown[] = [];
+    const definition = defineTool({
+      name: "powershell",
+      label: "powershell (override)",
+      description: "Extension-owned powershell override",
+      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()) }),
+      async execute(_id, params) {
+        runs.push(params.command);
+        return { content: [{ type: "text" as const, text: `ran ${params.command}` }], details: {} };
+      },
+    });
+    const toolNames: string[] = [];
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }),
+      getActiveTools: () => [],
+      emit: vi.fn(async () => {}),
+      emitToolCall: vi.fn(async (event: { toolName: string }) => { toolNames.push(event.toolName); return undefined; }),
+      emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{
+      definition,
+      sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override.ts", { source: "test" }),
+    }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const args = { command: "Write-Output ok" };
+    for (const provider of [new CapturedToolsProvider(catalog), new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse" })]) {
+      await expect(provider.invoke("powershell", { ...args }, context)).rejects.toThrow("smarty-dev#9826");
+      // Through pi.powershell too: a provider without the opt-in refuses before delegating.
+      await expect(new PiToolsProvider(process.cwd(), catalog, provider).invoke("powershell", { ...args }, context))
+        .rejects.toThrow("smarty-dev#9826");
+    }
+    expect(runs).toEqual([]);
+    expect(toolNames).toEqual([]);
+    expect(runner.emit).not.toHaveBeenCalled();
+    const optedIn = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "allow" });
+    const result = await optedIn.invoke("powershell", { ...args }, context);
+    expect(result.text).toBe("ran Write-Output ok");
+    expect(runs).toEqual(["Write-Output ok"]);
+    expect(toolNames).toEqual(["bash", "powershell"]);
+  });
+
   it("releases scheduler barriers after an aborted non-cooperative tool", async () => {
     const hangingExecute = vi.fn(async () => new Promise<never>(() => undefined));
     const hanging = defineTool({

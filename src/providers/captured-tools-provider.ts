@@ -5,7 +5,8 @@ import type { AgentToolResult, ExtensionRunner, SourceInfo } from "@earendil-wor
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
-import { preflightShellCall } from "./shell-preflight.js";
+import { assertShellToolPermitted, preflightShellCall } from "./shell-preflight.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -98,7 +99,15 @@ export class CapturedToolsProvider implements FabricProvider {
   readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
-  constructor(readonly catalog: CapturedToolCatalog) {}
+  readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
+
+  /** Without getPowerShellPolicy a captured powershell override is refused (smarty-dev#9826). */
+  constructor(
+    readonly catalog: CapturedToolCatalog,
+    options: { getPowerShellPolicy?: (() => FabricPowerShellPolicy) | undefined } = {},
+  ) {
+    this.#getPowerShellPolicy = options.getPowerShellPolicy;
+  }
 
   async close(): Promise<void> {
     this.#lifetime.abort(new Error("Captured extension tool session closed"));
@@ -144,6 +153,8 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<CapturedToolInvocationResult> {
     this.#assertAllowed(actionName);
+    // smarty-dev#9826: refuse a powershell override before its lifecycle starts.
+    assertShellToolPermitted(actionName, this.#getPowerShellPolicy?.());
     // Include provider custody even for host-direct calls without a turn signal.
     // Queued work and non-cooperative late results cannot use a retired runner.
     context = { ...context, signal: shareCancellationEffects(AbortSignal.any([
@@ -203,6 +214,7 @@ export class CapturedToolsProvider implements FabricProvider {
           signal: context.signal,
           blocked: `Captured tool ${entry.name} was blocked`,
           onBlock: () => context.updateArguments?.(args),
+          powershell: this.#getPowerShellPolicy?.(),
         });
         context.updateArguments?.(args);
         const requestedCwd = args.cwd;

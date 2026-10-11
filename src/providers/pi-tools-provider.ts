@@ -50,7 +50,8 @@ import type {
 } from "../protocol.js";
 import { countContentLines } from "../ui/preview-lines.js";
 import { CapturedToolsProvider } from "./captured-tools-provider.js";
-import { preflightShellCall } from "./shell-preflight.js";
+import { assertShellToolPermitted, preflightShellCall } from "./shell-preflight.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import { normalizePiArguments } from "../core/pi-arguments.js";
 import { validationMessage } from "../core/action-arguments.js";
 import {
@@ -104,6 +105,8 @@ interface PiToolsProviderHostCapabilities {
    */
   allowUnhookedTools?: boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
+  /** Live executor.powershell; absent means pi.powershell is refused (smarty-dev#9826). */
+  getPowerShellPolicy?: (() => FabricPowerShellPolicy) | undefined;
   getShellHangMs?: () => number;
   getLandlockSettings?: (() => LandlockSettings) | undefined;
   shellJobs?: FabricShellJobStore;
@@ -264,6 +267,7 @@ export class PiToolsProvider implements FabricProvider {
   readonly #ownsShellJobs: boolean;
   readonly #getShellHangMs: (() => number) | undefined;
   readonly #getLandlockSettings: (() => LandlockSettings) | undefined;
+  readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
   #landlock: LandlockBashConfinement | undefined;
 
   constructor(
@@ -295,6 +299,7 @@ export class PiToolsProvider implements FabricProvider {
     this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
     this.#getLandlockSettings = hostCapabilities.getLandlockSettings;
+    this.#getPowerShellPolicy = hostCapabilities.getPowerShellPolicy;
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -634,6 +639,9 @@ export class PiToolsProvider implements FabricProvider {
     const name = actionName as PiCoreToolName;
     this.#assertAllowed(name);
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
+    // smarty-dev#9826: PowerShell (built-in or a captured override) fails closed
+    // before any other path unless the profile opted in.
+    assertShellToolPermitted(name, this.#getPowerShellPolicy?.());
     // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
     const middleware = this.#bashMiddleware(name);
     const runner = this.#catalog?.runner;
@@ -686,7 +694,7 @@ export class PiToolsProvider implements FabricProvider {
     if (this.#catalog?.get(name) && !middleware) {
       if (isPiShellToolName(name) && args.monitor !== undefined) throw new Error("Shell monitors are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
       // CapturedToolsProvider runs every shell call through preflightShellCall,
-      // including the bash-guard view of a non-bash shell.
+      // including the bash-guard view of an opted-in powershell override.
       const result = await this.#capturedTools!.invoke(name, args, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
@@ -741,6 +749,7 @@ export class PiToolsProvider implements FabricProvider {
           runner,
           signal: context.signal,
           onBlock: () => context.updateArguments?.(args),
+          powershell: this.#getPowerShellPolicy?.(),
         })
       : await this.#emitGenericToolCall(name, args, context, runner);
     // Carry the hook's accepted rewrites back onto the caller's args.

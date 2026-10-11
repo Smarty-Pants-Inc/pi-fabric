@@ -1,6 +1,7 @@
 import type { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { runAbortable } from "../async-settlement.js";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import type { PiShellToolName } from "../core/pi-tools.js";
 import type { FabricInvocationContext } from "../protocol.js";
 
@@ -11,6 +12,23 @@ const SHELL_CWD_KEY = "cwd";
 const shellQuote = (value: string): string => "'" + value.replaceAll("'", "'\\''") + "'";
 
 type ToolCallRunner = Pick<ExtensionRunner, "emitToolCall">;
+
+/**
+ * smarty-dev#9826: no guard judges PowerShell grammar. The fleet's command
+ * guards are bash-only, and showing them PowerShell source as a bash call is
+ * not a safety mechanism (PowerShell-only spellings parse differently). So
+ * pi.powershell and every captured or extension powershell override are
+ * refused unless the host Fabric profile opts in, accepting that gap.
+ */
+export const POWERSHELL_REFUSED_MESSAGE =
+  'pi.powershell is refused (smarty-dev#9826): no Fabric guard judges PowerShell grammar, and bash command guards cannot judge PowerShell source, ' +
+  'so the built-in powershell tool and every extension powershell override stay off. ' +
+  'To accept that gap, the host Fabric profile must set executor.powershell to "allow" in its fabric.json.';
+
+/** Throws the #9826 refusal unless the shell is not PowerShell or the profile opted in. */
+export const assertShellToolPermitted = (name: string, powershell: FabricPowerShellPolicy | undefined): void => {
+  if (name === "powershell" && powershell !== "allow") throw new Error(POWERSHELL_REFUSED_MESSAGE);
+};
 
 /** Emit one tool_call event; reports whether a hook replaced event.input. */
 const emitToolCall = async (
@@ -43,6 +61,8 @@ export interface ShellCallPreflight {
   onBlock?: () => void;
   /** bash only: refuse any change to the judged input with this text (no rewrites at all). */
   frozen?: string;
+  /** The profile's executor.powershell; absent means refused (smarty-dev#9826). */
+  powershell?: FabricPowerShellPolicy | undefined;
 }
 
 /**
@@ -56,14 +76,18 @@ export interface ShellCallPreflight {
  * or otherwise moves it is refused, as is one that drops the judged cd. A
  * command-only rewrite is returned for execution.
  *
- * Other shells: command guards judge only toolName "bash", so the call is
- * first shown to them as a bash tool_call (behind the same leading cd, with
- * input.shell naming the real shell), then to hooks under its real name. A
- * bash rewrite cannot carry over to another shell's syntax, so any change to
+ * PowerShell is refused before any hook runs unless the profile opted in
+ * (call.powershell === "allow", smarty-dev#9826). The bash preflight below is
+ * not what makes it safe: a bash guard reads PowerShell source by bash rules.
+ * With the opt-in, command guards (which judge only toolName "bash") are
+ * first shown the call as a bash tool_call (behind the same leading cd, with
+ * input.shell naming the real shell), then hooks see it under its real name.
+ * A bash rewrite cannot carry over to another shell's syntax, so any change to
  * either judged input is refused; the call runs exactly as judged.
  */
 export const preflightShellCall = async (call: ShellCallPreflight): Promise<Record<string, unknown>> => {
   const { name, args, sessionCwd, toolCallId, runner, signal } = call;
+  assertShellToolPermitted(name, call.powershell);
   const refuse = (reason: string | undefined): Error => {
     call.onBlock?.();
     return new Error(reason || call.blocked || `Pi tool ${name} was blocked`);

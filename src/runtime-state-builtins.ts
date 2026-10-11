@@ -39,7 +39,11 @@ export class RuntimeStateBuiltins {
     cwd: string,
     config: FabricConfig,
     capturedTools: CapturedToolCatalog,
-    shell: { jobs: FabricShellJobStore; getHangMs: () => number; getLandlockSettings?: () => FabricConfig["executor"]["landlock"] },
+    shell: {
+      jobs: FabricShellJobStore; getHangMs: () => number; getLandlockSettings?: () => FabricConfig["executor"]["landlock"];
+      /** Live executor.powershell; absent refuses PowerShell (smarty-dev#9826). */
+      getPowerShellPolicy?: () => FabricConfig["executor"]["powershell"];
+    },
   ): Promise<void> {
     let mcpProvider: McpProvider | undefined;
     const enforceSchema = config.schema.mode === "enforce";
@@ -50,7 +54,7 @@ export class RuntimeStateBuiltins {
     // namespace in enforce mode.
     const capturedToolsProvider =
       effectiveFullCodeMode && (config.capture.enabled || enforceSchema)
-        ? new CapturedToolsProvider(capturedTools)
+        ? new CapturedToolsProvider(capturedTools, { getPowerShellPolicy: shell.getPowerShellPolicy })
         : undefined;
     if (effectiveFullCodeMode) {
       await this.install(createProviderComponent({
@@ -61,9 +65,10 @@ export class RuntimeStateBuiltins {
           capturedTools,
           capturedToolsProvider,
           this.managedHost
-            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined, getLandlockSettings: shell.getLandlockSettings}
+            ? {requireCapturedOverrides: true, powerShellToolDefinitionFactory: undefined, getLandlockSettings: shell.getLandlockSettings,
+                getPowerShellPolicy: shell.getPowerShellPolicy}
             : {
-                powerShellToolDefinitionFactory,
+                powerShellToolDefinitionFactory, getPowerShellPolicy: shell.getPowerShellPolicy,
                 shellJobs: shell.jobs, getShellHangMs: shell.getHangMs,
                 getLandlockSettings: shell.getLandlockSettings,
               },

@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
   activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { classifyActivationFailure } from "../src/actors/activation-failure.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -3308,8 +3309,7 @@ describe("ActorManager", () => {
       const actor = await block(manager);
       clock.skew = 2 * HOUR + 1_000;
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
-      // Two hours on, the transient block's backoff has ended (smarty-dev#8487); the episode still re-alarms.
-      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlockExpired!.since, owner: s.identity.id });
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, since: manager.status(actor.id).activationBlocked!.since, owner: s.identity.id });
       await manager.close();
       manager = persistentManager(s);
       clock.skew += 6 * HOUR - 60_000;
@@ -3330,7 +3330,7 @@ describe("ActorManager", () => {
       await waitFor(() => repeats(s.mesh, actor.id).length === 1);
       owns.a = false; owns.b = true;
       a.listOwned(); b.listOwned();
-      await waitFor(() => b.status(actor.id).activationBlockExpired !== undefined);
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
       clock.skew += 6 * HOUR - 60_000;
       await settle();
       expect(repeats(s.mesh, actor.id)).toHaveLength(1);
@@ -3396,7 +3396,7 @@ describe("ActorManager", () => {
       await waitFor(() => gated.calls === 1);
       owns.a = false; owns.b = true;                         // A's publish is still pending
       a.listOwned(); b.listOwned();
-      await waitFor(() => b.status(actor.id).activationBlockExpired !== undefined);
+      await waitFor(() => b.status(actor.id).activationBlocked !== undefined);
       await settle();
       expect(gated.calls).toBe(1);
       gated.release();
@@ -3414,7 +3414,7 @@ describe("ActorManager", () => {
       // A dies mid-publish: never closed, nothing saved after the claim. Its restart takes over.
       owns.a = false;
       const restarted = persistentManager(s, "a", { canManageActor: () => true });
-      expect(restarted.status(actor.id).activationBlockExpired?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      expect(restarted.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
       await settle();
       expect(gated.calls).toBe(1);
       gated.release();
@@ -3616,18 +3616,20 @@ describe("ActorManager", () => {
       const wakes = captureWakes();
       await failOnce(s.actors, s.agents, actor.id);
       const blocked = s.actors.status(actor.id).activationBlocked!;
-      expect(blocked).toMatchObject({ code: "unknown", count: 1, reason: OUTAGE, retryAt: blocked.since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      expect(blocked).toMatchObject({ code: "provider-transient", count: 1, reason: OUTAGE, retryAt: blocked.since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS,
+        classification: 'transient: provider 5xx or overload (matched ": 502")' });
       const presence = () => s.mesh.get(`actors/test/${actor.id}`)?.value as Record<string, unknown> | undefined;
       await waitFor(() => presence()?.activationBlocked !== undefined);
       const wake = wakes.filter(entry => entry.ms === ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
       expect(wake).toHaveLength(1);                            // one wake per blocked actor
 
       time.set(blocked.retryAt! - 1_000);                       // before the backoff: still blocked
-      expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "unknown", count: 1 } });
+      expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "provider-transient", count: 1 } });
       expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
 
       time.set(blocked.retryAt! + 1_000);                       // after it: no longer reported blocked
-      const expired = { lastBlockedReason: OUTAGE, code: "unknown", since: blocked.since, count: 1, expiredAt: blocked.retryAt };
+      const expired = { lastBlockedReason: OUTAGE, code: "provider-transient", classification: blocked.classification,
+        since: blocked.since, count: 1, expiredAt: blocked.retryAt };
       expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlocked");
       expect(s.actors.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: expired });
       expect(s.actors.listOwned().find(row => row.id === actor.id)).toMatchObject({ activationBlockExpired: expired });
@@ -3663,7 +3665,7 @@ describe("ActorManager", () => {
       // The next run fails again: blocked once more, count 2, backoff doubled from this failure.
       await failOnce(manager, s.agents, actor.id);
       const second = manager.status(actor.id).activationBlocked!;
-      expect(second).toMatchObject({ code: "unknown", count: 2, since });
+      expect(second).toMatchObject({ code: "provider-transient", count: 2, since });
       expect(manager.status(actor.id)).not.toHaveProperty("activationBlockExpired");
       const secondFailedAt = second.retryAt! - 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS;
       expect(secondFailedAt).toBeGreaterThanOrEqual(since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
@@ -3693,6 +3695,84 @@ describe("ActorManager", () => {
       expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS).toBe(60 * 60 * 1000);
     }, 60_000);
 
+    // Code review P1 (#842 round 2): an unmatched failure is not transient. Permanent, security
+    // and unrecognised causes stay blocked until a run completes; nothing re-admits them.
+    it.each([
+      ["Error: 401 Unauthorized: invalid x-api-key", "auth", /^permanent: credential or authentication failure/],
+      ["Error: No API key found for provider anthropic", "auth", /^permanent: credential or authentication failure/],
+      ["Error: 403 Forbidden: organization has no access", "permission", /^permanent: permission denied/],
+      ["Error: Refused by the fleet bash guard (#2754)", "security-policy", /^permanent: refused by a security or content policy/],
+      ["Error: 400 invalid_request_error: tools.0.name: String should match pattern", "invalid-request", /^permanent: request rejected by the provider/],
+      ["Error: 429 insufficient_quota: You exceeded your current quota", "quota", /^permanent: account quota or billing limit/],
+      ["Error: 503 Service Unavailable but the API key is unauthorized", "auth", /^permanent: credential/],
+      ["Error: Structured agent output was invalid: must have required property 'action' (output: upstream 502 timeout)", "unknown", /^fail-closed: no transient cause recognised$/],
+      ["Error: something nobody has classified", "unknown", /^fail-closed: no transient cause recognised$/],
+    ])("keeps %s blocked (fail closed)", async (error, code, classification) => {
+      const s = setup(true);
+      const time = clock();
+      const actor = await s.actors.create({ name: "stays-blocked", instructions: "Respond.", responseMode: "text" });
+      const wakes = captureWakes();
+      await failOnce(s.actors, s.agents, actor.id, error);
+      const blocked = s.actors.status(actor.id).activationBlocked!;
+      expect(blocked).toMatchObject({ code, count: 1 });
+      expect(blocked.classification).toMatch(classification);
+      expect(blocked).not.toHaveProperty("retryAt");
+      expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
+        entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
+      time.set(blocked.since + 30 * 24 * 60 * 60 * 1000);
+      expect(s.actors.status(actor.id)).toMatchObject({ activationBlocked: { code, count: 1, classification: blocked.classification } });
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+      const restored = await restart(s, s.actors);
+      expect(restored.status(actor.id)).toMatchObject({ activationBlocked: { code, classification: blocked.classification } });
+      expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+    }, 60_000);
+
+    it("records the classification on the owner alarm", async () => {
+      const s = setup(true);
+      const actor = await s.actors.create({ name: "alarmed", instructions: "Respond.", responseMode: "text" });
+      for (let run = 0; run < ACTOR_FAILURE_NOTICE_AFTER; run++) await failOnce(s.actors, s.agents, actor.id);
+      await waitFor(() => s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
+      expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({
+        code: "provider-transient", classification: 'transient: provider 5xx or overload (matched ": 502")' });
+    }, 60_000);
+
+    it.each([
+      // Clearly transient causes expire.
+      [{ lastError: "Error: provider stream failed: 502 Bad Gateway" }, "provider-transient", /^transient: provider 5xx or overload/],
+      [{ lastError: "Error: HTTP/1.1 529 site overloaded" }, "provider-transient", /^transient: provider 5xx or overload/],
+      [{ lastError: "Error: 429 Too Many Requests: rate_limit_error" }, "provider-transient", /^transient: provider throttling \(429\)/],
+      [{ lastError: "openai-codex/gpt-test: fetch failed · WebSocket error" }, "provider-transient", /^transient: model stream disconnect/],
+      [{ lastError: "Error: stream disconnected before completion" }, "provider-transient", /^transient: model stream disconnect/],
+      [{ lastError: "TypeError: terminated" }, "provider-transient", /^transient: model stream disconnect/],
+      [{ lastError: "Error: read ECONNRESET" }, "provider-transient", /^transient: network failure/],
+      [{ lastError: "Agent timed out after 600000ms" }, "provider-transient", /^transient: timeout/],
+      [{ lastError: "Error: Activation window lost current activation messages" }, "activation-window-lost", /^transient: activation window lost/],
+      [{ lastError: "Child Pi exited before requested model admission completed; task was not sent" }, "child-exit-before-admission", /^transient: child Pi exited/],
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call",
+        evidence: ["Pi provider recovery: same-session resume 1/3 scheduled after 5000ms"] }, "provider-transient",
+        /^transient: directive reply missing after a provider recovery/],
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call",
+        error: "Error: 503 Service Unavailable\nDirective reply missing: the run ended without a fabric_reply call" }, "provider-transient",
+        /^transient: directive reply missing after a provider 5xx or overload/],
+      // Permanent, security and unrecognised causes stay blocked; permanent wins over transient text.
+      [{ lastError: "Child Pi exited before requested model admission completed; task was not sent: Error: No API key found for anthropic" }, "auth", /^permanent: credential/],
+      [{ lastError: "Error: 401 Unauthorized after 3 retries (timeout)" }, "auth", /^permanent: credential/],
+      [{ lastError: "Error: Context exceeds window: 100 > 80" }, "context-overflow", /^permanent: context window exceeded/],
+      [{ lastError: "Error: maximum context length is 200000 tokens" }, "invalid-request", /^permanent: request rejected/],
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call (final text: the upstream returned 502 Bad Gateway)" }, "unknown",
+        /^fail-closed: directive reply missing without a provider or stream error$/],
+      [{ lastError: "Directive reply missing: the run ended without a fabric_reply call",
+        evidence: ["Pi provider recovery: same-session resume 1/3", "Error: 403 Forbidden"] }, "unknown",
+        /^fail-closed: directive reply missing after a non-transient error \(permanent: permission denied/],
+      [{ lastError: "Error: worker retried after 500 ms and gave up" }, "unknown", /^fail-closed: no transient cause recognised$/],
+      [{ lastError: "Unknown activation failure" }, "unknown", /^fail-closed: no transient cause recognised$/],
+      [{ lastError: "Error: 502 Bad Gateway", preparation: true }, "failing-preparation", /^permanent: activation preparation/],
+    ])("classifies %j as %s", (input, code, classification) => {
+      const result = classifyActivationFailure(input);
+      expect(result).toMatchObject({ code, transient: classification.source.startsWith("^transient") });
+      expect(result.classification).toMatch(classification);
+    });
+
     it("never expires a context-overflow block", async () => {
       const s = setup(true);
       const time = clock();
@@ -3712,17 +3792,25 @@ describe("ActorManager", () => {
       expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
     }, 60_000);
 
-    it("expires a stuck transient block written before retryAt, and keeps failing-preparation blocked", async () => {
+    it("re-derives an older record's class from its stored reason: a provider outage expires, auth and preparation stay blocked", async () => {
       const s = setup(true);
       const stuck = await s.actors.create({ name: "stuck-13h", instructions: "Respond.", responseMode: "text" });
+      const window = await s.actors.create({ name: "window-lost", instructions: "Respond.", responseMode: "text" });
+      const denied = await s.actors.create({ name: "bad-key", instructions: "Respond.", responseMode: "text" });
       const preparing = await s.actors.create({ name: "bad-preparation", instructions: "Respond.", responseMode: "text" });
       await s.actors.close();
       const file = path.join(s.root, "actors", "actors.json");
       const registry = JSON.parse(fs.readFileSync(file, "utf8"));
       const since = Date.now() - 13 * 60 * 60 * 1000;
+      const AUTH = "Error: 401 Unauthorized: invalid api key";
+      const WINDOW = "Error: Activation window lost current activation messages";
+      // The pre-#8487 writer persisted exactly these four fields; provider outages landed in "unknown".
+      const legacy: Record<string, { reason: string; code: string }> = {
+        [stuck.id]: { reason: OUTAGE, code: "unknown" }, [window.id]: { reason: WINDOW, code: "activation-window-lost" },
+        [denied.id]: { reason: AUTH, code: "unknown" }, [preparing.id]: { reason: OUTAGE, code: "failing-preparation" },
+      };
       for (const row of registry.actors as Array<Record<string, unknown>>) {
-        // The pre-#8487 writer persisted exactly these four fields.
-        row.activationBlocked = { reason: OUTAGE, code: row.id === stuck.id ? "activation-window-lost" : "failing-preparation", since, count: 1 };
+        row.activationBlocked = { ...legacy[row.id as string]!, since, count: 1 };
         row.failureStreak = { count: 3, notified: true };
       }
       fs.writeFileSync(file, JSON.stringify(registry));
@@ -3731,10 +3819,18 @@ describe("ActorManager", () => {
       });
       actorManagers.push(restored);
       expect(restored.status(stuck.id)).toMatchObject({ status: "idle",
-        activationBlockExpired: { lastBlockedReason: OUTAGE, code: "activation-window-lost", since, count: 1,
+        activationBlockExpired: { lastBlockedReason: OUTAGE, code: "provider-transient", since, count: 1,
+          classification: expect.stringMatching(/^transient: provider 5xx or overload .*\(re-derived from an older record's stored reason\)$/),
           expiredAt: since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS } });
       expect(restored.status(stuck.id)).not.toHaveProperty("activationBlocked");
-      expect(restored.status(preparing.id)).toMatchObject({ status: "failing-preparation", activationBlocked: { code: "failing-preparation", since } });
+      expect(restored.status(window.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "activation-window-lost" } });
+      expect(restored.status(denied.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", since,
+        classification: expect.stringMatching(/^permanent: credential or authentication failure/) } });
+      expect(restored.status(denied.id).activationBlocked).not.toHaveProperty("retryAt");
+      expect(restored.status(denied.id)).not.toHaveProperty("activationBlockExpired");
+      const preparation = classifyActivationFailure({ lastError: OUTAGE, preparation: true }).classification;
+      expect(restored.status(preparing.id)).toMatchObject({ status: "failing-preparation", activationBlocked: { code: "failing-preparation", since,
+        classification: `${preparation} (re-derived from an older record's stored reason)` } });
       expect(restored.status(preparing.id)).not.toHaveProperty("activationBlockExpired");
       await waitFor(() => (s.mesh.get(`actors/test/${stuck.id}`)?.value as { activationBlockExpired?: unknown } | undefined)
         ?.activationBlockExpired !== undefined, 10_000);           // the restored-registry presence republish

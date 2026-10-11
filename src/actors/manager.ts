@@ -72,6 +72,7 @@ import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
+import { classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
@@ -190,7 +191,7 @@ interface ManagedActor {
   requirements: FabricCapabilityRequirement[];
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  activationBlocked?: { reason: string; code: string; since: number; count: number; retryAt?: number };
+  activationBlocked?: ActivationBlock;
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
   validWhile?: FabricActorValidWhileSource;
@@ -435,11 +436,11 @@ export const ACTOR_BLOCK_REALARM_AFTER_MS = 2 * 60 * 60 * 1000;
 export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 /** smarty-dev#8487: a transient activation failure blocks routing only for a bounded
  * backoff, doubling with each consecutive failure up to the cap; a later run that
- * completes still clears it. Other codes (context overflow, failing preparation) need
- * an operator or a completed run, as before. */
+ * completes still clears it. Only explicitly transient causes expire (see
+ * ./activation-failure.ts); permanent, security and unrecognised failures need an
+ * operator or a completed run, as before. */
 export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MS = 5 * 60 * 1000;
 export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS = 60 * 60 * 1000;
-const TRANSIENT_ACTIVATION_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "activation-window-lost", "child-exit-before-admission"]);
 export const activationBlockBackoffMs = (count: number): number => Math.min(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
   ACTOR_TRANSIENT_BLOCK_BACKOFF_MS * 2 ** Math.min(16, Math.max(0, Math.floor(count) - 1)));
 /** When a transient block stops gating routing; undefined for a block only a completed run clears.
@@ -449,6 +450,19 @@ const activationBlockExpiresAt = (blocked: { code: string; since: number; count:
 const activationBlockExpired = (blocked: Parameters<typeof activationBlockExpiresAt>[0] | undefined, now = Date.now()): boolean => {
   const at = blocked ? activationBlockExpiresAt(blocked) : undefined;
   return at !== undefined && now >= at;
+};
+type ActivationBlock = { reason: string; code: string; since: number; count: number; retryAt?: number; classification: string };
+/** A stored block without a classification comes from an older writer: re-derive its class from
+ * its stored reason with today's rules, so only a recognisably transient one can expire. */
+const restoredActivationBlock = (stored: { reason: string; code: string; since: number; count: number;
+  retryAt?: unknown; classification?: unknown }): ActivationBlock => {
+  const derived = typeof stored.classification === "string"
+    ? { code: stored.code, classification: stored.classification }
+    : (({ code, classification }) => ({ code, classification: `${classification} (re-derived from an older record's stored reason)` }))(
+      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" }));
+  return { reason: stored.reason, code: derived.code, since: stored.since, count: stored.count, classification: derived.classification,
+    ...(TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code) && typeof stored.retryAt === "number" && Number.isFinite(stored.retryAt)
+      ? { retryAt: stored.retryAt } : {}) };
 };
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
@@ -3467,7 +3481,7 @@ export class ActorManager {
               };
               this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped);
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false, result.warnings);
               continue;
             }
             throw new Error(result.error || `Actor run ${result.status}`);
@@ -3681,7 +3695,8 @@ export class ActorManager {
 
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false,
+    evidence?: readonly string[]): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3698,19 +3713,16 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
-    const code = preparation ? "failing-preparation"
-      : /Activation window lost current activation messages/i.test(lastError) ? "activation-window-lost"
-      : /Context exceeds window/i.test(lastError) ? "context-overflow"
-      : /Child Pi exited before requested model admission completed/i.test(lastError) ? "child-exit-before-admission"
-      : "unknown";
+    // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
+    const { code, transient, classification } = classifyActivationFailure({ lastError, error, evidence, preparation });
     const reason = lastError.slice(0, 300);
     const previous = actor.activationBlocked;
     const now = Date.now();
     const count = previous?.code === code ? previous.count + 1 : 1;
     actor.activationBlocked = {
-      reason, code, since: previous?.code === code ? previous.since : now, count,
+      reason, code, since: previous?.code === code ? previous.since : now, count, classification,
       // A transient failure (smarty-dev#8487) gates routing for a doubling backoff, not forever.
-      ...(TRANSIENT_ACTIVATION_BLOCK_CODES.has(code) ? { retryAt: now + activationBlockBackoffMs(count) } : {}),
+      ...(transient ? { retryAt: now + activationBlockBackoffMs(count) } : {}),
     };
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
@@ -3738,7 +3750,7 @@ export class ActorManager {
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code, classification,
         since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
         routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
@@ -4533,7 +4545,7 @@ export class ActorManager {
     };
     if (covers(this.mesh.get(key))) return;
     const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
-      since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
       pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
     void (async () => {
       // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
@@ -5373,9 +5385,7 @@ export class ActorManager {
           : {}),
         ...(typeof record.activationBlocked?.reason === "string" && typeof record.activationBlocked?.code === "string" &&
           typeof record.activationBlocked?.since === "number" && typeof record.activationBlocked?.count === "number"
-          ? { activationBlocked: { reason: record.activationBlocked.reason, code: record.activationBlocked.code, since: record.activationBlocked.since, count: record.activationBlocked.count,
-            ...(typeof record.activationBlocked.retryAt === "number" && Number.isFinite(record.activationBlocked.retryAt)
-              ? { retryAt: record.activationBlocked.retryAt } : {}) } }
+          ? { activationBlocked: restoredActivationBlock(record.activationBlocked) }
           : {}),
         ...(Number.isSafeInteger(record.failureStreak?.count) && (record.failureStreak?.count ?? 0) > 0 &&
           typeof record.failureStreak?.notified === "boolean"
@@ -6038,7 +6048,7 @@ export class ActorManager {
         : {}),
       ...(actor.activationBlocked ? blockExpired
         ? { activationBlockExpired: { lastBlockedReason: actor.activationBlocked.reason, code: actor.activationBlocked.code,
-          since: actor.activationBlocked.since, count: actor.activationBlocked.count,
+          classification: actor.activationBlocked.classification, since: actor.activationBlocked.since, count: actor.activationBlocked.count,
           expiredAt: activationBlockExpiresAt(actor.activationBlocked)! } }
         : { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),

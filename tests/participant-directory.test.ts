@@ -12,7 +12,7 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import type { FabricActorInfo } from "../src/actors/types.js";
-import { LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, LIVENESS_POLICY_KEY, readHostLeases, removeHostLease, STATE_LEASE_RENEW_MS, writeHostLease } from "../src/topology/host-leases.js";
 import { MainAgentController } from "../src/main-agent.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -113,12 +113,21 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
     // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
-    const read = vi.spyOn(directory.mesh, "withTryLock");
+    // smarty-dev#7651: withStateFence passes the budget LEFT (deadline - Date.now()), which drops to
+    // 1999 when a millisecond ticks between computing the deadline and the try. Bound it by the clock
+    // time that elapsed around the call instead of demanding the exact constant.
+    const tryLock = directory.mesh.withTryLock.bind(directory.mesh);
+    let triedAt = 0;
+    const read = vi.spyOn(directory.mesh, "withTryLock").mockImplementation((operation, timeout) => {
+      triedAt ||= Date.now(); return tryLock(operation, timeout);
+    });
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
+    const calledAt = Date.now();
     await directory.refreshRoutingView();
     expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBe(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeGreaterThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS - (triedAt - calledAt));
     expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
@@ -768,8 +777,7 @@ describe("ParticipantDirectory host leases", () => {
         // A legacy reader has no host-file fallback: its fixed 15 s TTL must never lapse.
         expect(now - mesh.get("sessions/idle", { fresh: true })!.updatedAt).toBeLessThan(15_000);
         // Read the canonical file here; fake wall-clock jumps do not change filesystem clocks.
-        const leaseFile = fs.readdirSync(path.join(mesh.root, "host-leases"))[0]!;
-        const lease = JSON.parse(fs.readFileSync(path.join(mesh.root, "host-leases", leaseFile), "utf8"));
+        const lease = JSON.parse(fs.readFileSync(hostLeasePath(mesh.root, identity.id), "utf8"));
         expect(lease.expiresAt).toBe(now + 15_000);
         expect(observer.get(identity.id, now, { fresh: true })?.stale).toBe(false);
       }

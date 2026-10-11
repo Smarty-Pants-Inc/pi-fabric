@@ -120,35 +120,17 @@ export const parseStructuredResult = (text: string): unknown => {
 
 export function validateAgentResult<T extends { status: string; text: string; value?: unknown; error?: string }>(record: T, schema?: Record<string, unknown>): T {
   if (record.status !== "completed" || !schema) return record;
-  let parsed = false;
   try {
     const value = record.value ?? parseStructuredResult(record.text);
-    parsed = true;
     if (!Value.Check(schema, value)) {
       const errors = [...Value.Errors(schema, value)].slice(0, 5).map((error) => error.message).join("; ");
       throw new Error(errors || "value does not match schema");
     }
     record.value = value;
   } catch (error) {
-    // Directive-mode actors (schema's action enum contains "silent") prefer
-    // silence over chatter, so a model that ignored the JSON contract and
-    // answered in prose produced advice, not a protocol failure. Coerce the
-    // prose into the nearest valid action instead of failing the whole run.
-    // The coerced value must itself validate against the schema, so schemas
-    // that do not actually accept a message action still fail loudly.
-    const actionSchema = (schema as { properties?: { action?: { enum?: unknown[] } } }).properties?.action;
-    const prose = record.text.trim();
-    // Invalid JSON/schema values are protocol failures, not advice. Only plain
-    // unstructured prose (or silence) is eligible for the directive fallback.
-    const plainProse = !/^[{[\"]|```/.test(prose);
-    if (!parsed && error instanceof SyntaxError && plainProse &&
-        Array.isArray(actionSchema?.enum) && actionSchema.enum.includes("silent")) {
-      const coerced = prose ? { action: "message", message: prose.slice(0, 2400) } : { action: "silent" };
-      if (Value.Check(schema, coerced)) {
-        record.value = coerced;
-        return record;
-      }
-    }
+    // Fork (smarty-dev#576): a structured reply must end with one JSON value, so
+    // directive-mode prose fails loudly. Upstream's prose-to-action coercion
+    // (004d0475) is deliberately not adopted; see resolutions.md.
     record.status = "failed";
     const reason = error instanceof Error ? error.message : String(error);
     const output = record.text.trim();

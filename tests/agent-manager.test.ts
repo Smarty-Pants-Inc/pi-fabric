@@ -940,7 +940,7 @@ describe("AgentManager", () => {
     );
     expect(resolveParticipantGuidance).toHaveBeenCalledWith({
       model: "deepseek/deepseek-chat",
-      runner: "pi-durable",
+      runner: "pi",
     });
 
     const secondDirect = await manager.run({
@@ -2846,8 +2846,8 @@ describe("AgentManager", () => {
       const totalTokens = detail.entries.reduce((sum, entry) => sum + entry.tokens, 0);
       expect(totalTokens).toBe(23);
       expect(totalCost).toBeCloseTo(0.0015);
-      expect(detail.byRunner["pi-durable"]?.tokens).toBe(23);
-      expect(detail.byRunner["pi-durable"]?.cost).toBeCloseTo(0.0015);
+      expect(detail.byRunner.pi?.tokens).toBe(23);
+      expect(detail.byRunner.pi?.cost).toBeCloseTo(0.0015);
       expect(detail.byActor["actor-test"]?.tokens).toBe(23);
     } finally {
       clearOwnedBudgetEnv();

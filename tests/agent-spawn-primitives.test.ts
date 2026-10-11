@@ -291,6 +291,8 @@ const now = Date.now();
 fs.writeFileSync(statusFile, JSON.stringify({
   id: args.get("id"), name: args.get("name"), task, status: "completed",
   runner: args.get("runner"), transport: args.get("transport"), cwd: process.cwd(),
+  // Fork custody: explicit cleanup needs the saved root process identity.
+  ...(args.get("transport") === "process" ? { sessionId: String(process.pid) } : {}),
   startedAt: now, updatedAt: now, finishedAt: now, turns: 1, toolCalls: 0, text, exitCode: 0,
   usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
 }));
@@ -462,7 +464,9 @@ describe("worker child environment contract", () => {
     expect(readAgentLineage(report.lineage)).toMatchObject({ rootSessionId: "root-session", runId: result.id, depth: 1 });
     expect(JSON.parse(report.writePolicy)).toEqual({ readOnly: false, writableRoots: [root], shell: "deny" });
     expect(report.args).toContain("--no-extensions");
-    const guard = report.args[report.args.indexOf("-e") + 1];
+    // The fork loads its own worker hooks (principal delivery, reply tool) with -e too.
+    const loaded = report.args.flatMap((arg, index) => arg === "-e" ? [report.args[index + 1]!] : []);
+    const guard = loaded.find(entry => entry === path.resolve(guardPath!));
     expect(guard).toBe(path.resolve(guardPath!));
     expect(fs.existsSync(guard!)).toBe(true);
   }, 30_000);
@@ -477,6 +481,9 @@ describe("agents provider seeds and confinement", () => {
       resolvePythonRuntime: () => "monty",
       resolveCwd: (cwd: string) => cwd,
       childThinkingBounds: () => ({}),
+      // Fork model-policy hooks the provider consults before admission.
+      assertModelAllowed() {},
+      defaultModel: () => undefined,
       detachSignal() {},
       spawn: async (request: AgentRunRequest) => {
         requests.push(request);
@@ -502,6 +509,11 @@ describe("agents provider seeds and confinement", () => {
     cwd: "/", signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested",
     extensionContext: {
       model: { provider: "anthropic", id: "caller" },
+      // Fork: an inherited Pi model must be visible to the session (#2490).
+      modelRegistry: {
+        getAvailable: () => [{ provider: "anthropic", id: "caller" }], refresh: async () => {},
+        find: (provider: string, id: string) => provider === "anthropic" && id === "caller" ? { provider, id } : undefined,
+      },
       ...(branch
         ? {
             sessionManager: {

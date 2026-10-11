@@ -12,31 +12,29 @@ const directive = {
   },
 };
 
+// Fork (smarty-dev#576): upstream coerces directive-mode prose into an action;
+// the fork keeps the one-final-JSON-value contract, so prose fails loudly.
 describe("validateAgentResult directive prose coercion", () => {
-  it("coerces prose from a directive-mode actor into a message action", () => {
+  it("keeps prose from a directive-mode actor a contract failure (fork)", () => {
     const record = validateAgentResult(
       rec("Gate 2 wording: the merge is fine, but watch the PDC."),
       directive,
     );
-    expect(record.status).toBe("completed");
-    expect(record.value).toEqual({
-      action: "message",
-      message: "Gate 2 wording: the merge is fine, but watch the PDC.",
-    });
-    expect(record.error).toBeUndefined();
+    expect(record.status).toBe("failed");
+    expect(record.error).toMatch(/^Structured agent output was invalid: the reply must end with one JSON value/);
+    expect(record).not.toHaveProperty("value");
   });
 
-  it("coerces empty output from a directive-mode actor into a silent action", () => {
+  it("keeps empty output from a directive-mode actor a contract failure (fork)", () => {
     const record = validateAgentResult(rec("   "), directive);
-    expect(record.status).toBe("completed");
-    expect(record.value).toEqual({ action: "silent" });
+    expect(record.status).toBe("failed");
+    expect(record).not.toHaveProperty("value");
   });
 
-  it("caps coerced prose so a runaway monologue cannot flood the status record", () => {
+  it("bounds the failure snippet so a runaway monologue cannot flood the status record", () => {
     const record = validateAgentResult(rec("x".repeat(5000)), directive);
-    expect(record.status).toBe("completed");
-    const value = record.value as { message: string };
-    expect(value.message).toHaveLength(2400);
+    expect(record.status).toBe("failed");
+    expect(record.error!.length).toBeLessThan(600);
   });
 
   it("still fails non-directive schemas loudly", () => {

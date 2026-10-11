@@ -3348,7 +3348,9 @@ export class AgentManager {
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // An unrelated retained tree fences shared budget/root deletion, not an
     // independently joined tracked run with its full outcome durably archived.
-    if (!this.config.retainRuns) {
+    // Nested run artifacts belong to the enclosing run (upstream lineage): its
+    // owner removes them on cleanup/retention/root shutdown, not this child.
+    if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
         .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
     }

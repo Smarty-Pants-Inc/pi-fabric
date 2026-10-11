@@ -186,24 +186,29 @@ const takeOwner = (lock: string, ownerPath: string): string | undefined => {
 let releaseLeftWarned = false;
 /**
  * rmdir the released `<lock>` (unpinned path). On Windows the unlinked owner can stay delete-pending, or another
- * process can still hold a handle, for a moment: rmdir then fails ENOTEMPTY, EPERM or EBUSY (pi-fabric#889 CI). Retry
- * a bounded 10 times over ~500 ms, but never once a successor's record is in it: rmdir only ever removes an EMPTY
- * directory, so it can never remove a recorded successor. Still failing: log once and leave the empty directory
- * (the earlier behaviour); the ownerless-lock recovery reclaims it after its grace.
+ * process can still hold a handle, for a moment: rmdir then fails ENOTEMPTY, EPERM or EBUSY (pi-fabric#889 CI).
+ * ponytail: the retry stays synchronous and short, 5 attempts 20 ms apart (~80 ms of event-loop block at worst):
+ * the callers release synchronously (holdMeshFenceSync, the custody release `() => void`, MeshLock's finally),
+ * and a longer block would stall every other fiber on this loop for a cosmetic cleanup.
+ * Race with a successor: between attempts a successor can only publish into THIS directory (a resumed protocol-1
+ * `wx` owner write; mkdir and the protocol-2 rename both fail while the name exists). Safety does not rest on the
+ * owner check below: rmdir removes only an EMPTY directory, so once a successor's owner is in it every later
+ * attempt fails ENOTEMPTY; the check only stops retrying early. Still failing: log once and leave the empty
+ * directory (the earlier behaviour); the ownerless-lock recovery reclaims it after its grace.
  */
 const removeReleasedLock = (lock: string): void => {
   for (let attempt = 1; ; attempt++) {
     try { fs.rmdirSync(lock); return; } catch (error) {
       const code = codeOf(error);
       if (!(code === "ENOTEMPTY" || code === "EPERM" || code === "EBUSY") || fs.existsSync(path.join(lock, "owner"))) return;
-      if (attempt >= 10) {
+      if (attempt >= 5) {
         if (!releaseLeftWarned) {
           releaseLeftWarned = true;
           try { console.warn(`[pi-fabric] mesh lock ${lock} released but its empty directory stays (${code}); stale-lock recovery reclaims it`); } catch { /* never mask a release */ }
         }
         return;
       }
-      sleepSync(50);
+      sleepSync(20);
     }
   }
 };

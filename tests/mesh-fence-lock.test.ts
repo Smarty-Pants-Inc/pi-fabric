@@ -83,7 +83,25 @@ describe("the unpinned release removes its lock through transient Windows rmdir 
     expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(4);
   });
 
-  it("stops at once when a successor's record is in it, and gives up after a bounded ~500 ms", () => {
+  it("a successor's owner published between two attempts survives: rmdir only removes an empty directory", () => {
+    const lock = lockIn();
+    hold(lock, "A\n");
+    const rmdir = fs.rmdirSync.bind(fs);
+    let calls = 0;
+    vi.spyOn(fs, "rmdirSync").mockImplementation((file: fs.PathLike) => {
+      if (String(file) !== lock) return rmdir(file);
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error("EPERM: rmdir"), { code: "EPERM" }); // a transient Windows refusal
+      // The owner check after attempt 1 found none; a resumed protocol-1 writer publishes before attempt 2.
+      fs.writeFileSync(path.join(lock, "owner"), "B\n", { flag: "wx" });
+      return rmdir(file); // the real rmdir: ENOTEMPTY
+    });
+    releaseFenceLock(lock, "A\n", {}, undefined);
+    expect(owner(lock)).toBe("B\n");
+    expect(calls).toBe(2); // ENOTEMPTY plus the successor's owner: it stops
+  });
+
+  it("stops at once when a successor's record is in it, and gives up after a bounded ~100 ms", () => {
     const lock = lockIn();
     hold(lock, "A\n");
     let rmdir = failing(lock, ["ENOTEMPTY"]);
@@ -93,12 +111,12 @@ describe("the unpinned release removes its lock through transient Windows rmdir 
     vi.restoreAllMocks();
     fs.rmSync(path.join(lock, "owner"));
     fs.writeFileSync(path.join(lock, "owner"), "C\n");
-    rmdir = failing(lock, Array.from({ length: 20 }, () => "EPERM"));
+    rmdir = failing(lock, Array.from({ length: 10 }, () => "EPERM"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const started = Date.now();
     releaseFenceLock(lock, "C\n", {}, undefined);
-    expect(Date.now() - started).toBeLessThan(2_000);
-    expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(10);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(5);
     expect(fs.existsSync(lock)).toBe(true); // left empty for the ownerless-lock recovery
     expect(fs.readdirSync(lock)).toEqual([]);
     expect(warn.mock.calls.length).toBeLessThanOrEqual(1);

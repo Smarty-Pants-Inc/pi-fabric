@@ -336,6 +336,10 @@ export class FabricState {
   async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
     await this.#current()?.consumeRootInbox(ids, receipts);
   }
+  /** Whether the root inbox acked this event (smarty-dev#8962): the context hook shows it once. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#current()?.rootInboxAcked(id, sequence) ?? false;
+  }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
     this.#recordsWake = wake;

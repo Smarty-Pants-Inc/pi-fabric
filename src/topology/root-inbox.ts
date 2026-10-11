@@ -345,6 +345,16 @@ export class RootInbox {
   }
 
   /**
+   * Whether an event was acknowledged (smarty-dev#8962): its id is in the acked set, or its
+   * sequence is at or below the high-water mark. Reads the cached state only, never the mesh, so the
+   * context hook can ask on every request; before the first load nothing counts as acked.
+   */
+  acked(id: string, sequence?: number): boolean {
+    if (!this.#state) return false;
+    return this.#acks.has(id) || (sequence !== undefined && sequence <= this.#mark());
+  }
+
+  /**
    * Set the start boundary now (review F3): a root with no saved cursor starts at the present
    * when it becomes available, not at its first read, so an event sent between the two counts.
    */

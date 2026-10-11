@@ -2,6 +2,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
+import { filterRootInboxContext, rootInboxCompactedCopies } from "./topology/root-inbox-context.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
@@ -1155,8 +1156,20 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       continuation.messages,
       state.initialized && state.prewalk.isArmed(sessionId),
     );
-    let changed = continuation.changed || planning.changed;
-    const messages = planning.messages.map((message) => {
+    // Each root inbox event reaches the model once (smarty-dev#8962), including copies Pi queued
+    // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
+    const inbox = filterRootInboxContext(planning.messages, {
+      acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
+      compactedCopies: () => {
+        try {
+          return rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+        } catch {
+          return new Map();
+        }
+      },
+    });
+    let changed = continuation.changed || planning.changed || inbox.changed;
+    const messages = inbox.messages.map((message) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
         const content = expandSkillDirMarkersInSkillBlock(message.content);

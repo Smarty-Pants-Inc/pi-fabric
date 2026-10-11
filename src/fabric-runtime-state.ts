@@ -384,6 +384,11 @@ export class FabricRuntimeState {
     await this.#rootInbox?.consume(ids, receipts);
   }
 
+  /** Whether the root inbox acked this event (smarty-dev#8962); synchronous, for the context hook. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#rootInbox?.acked(id, sequence) ?? false;
+  }
+
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
   recordsWake: (() => Promise<void>) | undefined;
 

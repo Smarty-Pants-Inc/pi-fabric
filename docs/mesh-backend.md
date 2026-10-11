@@ -66,7 +66,8 @@ The gate decides from an inventory, never from what readers chose to register:
    of these files (pi-fabric#881), so every open by name in that window but the probe's own is foreign and
    refuses. Closes are never netted and nothing is subtracted: inotify merges an event with an identical one
    at the queue tail, whoever opened. The verdict stands for the checks before each commit. An inode opened through
-   another name (a hard link), a moved file, lost events (queue overflow), a `state-shadow/` that appeared, a watched
+   another name (a hard link), a moved file, a removed file name (a hard link elsewhere can keep its inode open;
+   pi-fabric#881), a mode, owner or link-count change (IN_ATTRIB) on a watched file or directory (smarty-dev#9473), lost events (queue overflow), a `state-shadow/` that appeared, a watched
    directory or file inode deleted, moved or dropped by inotify (its replacement would be unwatched),
    or a helper that does not report within 10 s is never ready (`holder@lease:<file>` or
    `holder@lease-probe`). On Linux a probe that cannot run is `holder@lease-probe` even when no SQLite file

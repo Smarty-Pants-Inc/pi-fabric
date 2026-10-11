@@ -427,14 +427,19 @@ export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions 
         // every open but the probe's own is foreign. No close is netted and nothing is subtracted: inotify merges an
         // event with an identical one at the queue tail, whoever opened. Fail closed.
         const opens = /^opens (\d+) (\d+) (.+)$/.exec(line);
-        const flag = /^(alias|moved) (.+)$/.exec(line);
+        const flag = /^(alias|moved|deleted|attrib) (.+)$/.exec(line);
         if (opens && files.includes(opens[3]!)) {
           const others = Number(opens[1]) - Number(opens[2]);
           if (others > 0) hold(opens[3]!, `${others} open(s) since the lease probe`);
         } else if (flag && files.includes(flag[2]!)) {
-          hold(flag[2]!, flag[1] === "alias" ? "opened through another name (a hard link) since the lease probe" : "moved since the lease probe");
+          // smarty-dev#9473: a mode, owner or link-count change fails closed like an open; pi-fabric#881 round 4: so does a
+          // removed name (a hard link elsewhere can keep its inode open, uncounted).
+          hold(flag[2]!, flag[1] === "alias" ? "opened through another name (a hard link) since the lease probe"
+            : flag[1] === "deleted" ? "its name was removed since the lease probe (a hard link may keep the inode open)"
+            : flag[1] === "attrib" ? "its mode, owner or link count changed since the lease probe" : "moved since the lease probe");
         } else return leaseUnavailable(`the lease watch reported ${line === "overflow" ? "lost events (inotify queue overflow)" : line === "newdir" ? "a new state-shadow directory"
-          : line === "invalidated" ? "a watched directory or file moved, deleted or replaced" : `"${line}"`} (${WATCH_DOC})`);
+          : line === "invalidated" ? "a watched directory or file moved, deleted or replaced"
+            : line === "attribdir" ? "a watched directory's mode, owner or link count changed" : `"${line}"`} (${WATCH_DOC})`);
       }
       return result;
     };

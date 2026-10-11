@@ -623,6 +623,66 @@ foreign.kill(); child.kill()`;
     });
   }
 
+  // smarty-dev#9473: a mode, owner or link-count change (IN_ATTRIB) on a watched component fails closed like an open.
+  const attribCases = [
+    { name: "a chmod of state.db", change: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o640),
+      undo: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o600) },
+    // Only the inode watch sees this: the new name is in a directory nobody watches.
+    { name: "a hard link to state.db in an unwatched directory", change: (root: string) => fs.linkSync(path.join(root, "state.db"), path.join(root, "..", `${path.basename(root)}-link`)),
+      undo: (root: string) => fs.rmSync(path.join(root, "..", `${path.basename(root)}-link`), { force: true }) },
+  ] as const;
+  for (const attrib of attribCases) {
+    it.skipIf(leaseSkip !== "")(`refuses ${attrib.name} after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const mode = fs.statSync(path.join(root, "state.db")).mode & 0o777;
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          leaseProbe: { beforeReport: () => attrib.change(root) } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (its mode, owner or link count changed since the lease probe; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { attrib.undo(root); fs.chmodSync(path.join(root, "state.db"), mode); }
+      // Without the change the same switch is ready.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+    });
+  }
+
+  // pi-fabric#881 Astra round 4 (P1): a hard link out, the original name unlinked, then the retained link opened before
+  // the final report. The inode stays alive with no IN_DELETE_SELF; the removed name must not end counting silently.
+  it.skipIf(leaseSkip !== "")(`refuses a state.db whose name is unlinked while a hard link elsewhere is opened (pi-fabric#881 round 4)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const db = path.join(root, "state.db");
+    const link = path.join(root, "..", `${path.basename(root)}-retained`);
+    let fd: number | undefined;
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => { fs.linkSync(db, link); fs.unlinkSync(db); fd = fs.openSync(link, "r+"); } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${db} (its name was removed since the lease probe (a hard link may keep the inode open); smarty-dev#8116))`);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      fs.rmSync(link, { force: true });
+    }
+    // Refused, never committed: the switch record ends in a refused outcome. (The old store lived on only through the
+    // retained link: exactly the detached store the rule refuses to switch away from. The ready path is the tests above.)
+    expect(records(root).at(-1)).toMatchObject({ phase: "outcome", ok: false, refused: true });
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses a chmod of a watched state-shadow/ after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => fs.chmodSync(shadow, 0o750) } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a watched directory's mode, owner or link count changed (smarty-dev#8116)");
+    expect(await backendOf(root)).toBe("importing");
+    fs.chmodSync(shadow, 0o700);
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
   // smarty-dev#8116 review round 1 (SEC P1): a watched directory swapped for a new one during the window. The new
   // state-shadow/ (and any SQLite file in it) is unwatched, so the counts are void: refuse.
   it.skipIf(leaseSkip !== "")(`refuses when a watched state-shadow/ is moved away and replaced after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {

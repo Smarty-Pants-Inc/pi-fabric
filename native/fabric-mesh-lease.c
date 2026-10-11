@@ -20,9 +20,11 @@
  * is a new entry (two foreign opens may merge with each other, but one is enough to refuse). Test only:
  * FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK=DIR pauses once there; FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN=1
  * makes the probe never see its own IN_OPEN (the fail-closed path). Both are inert unless set;
- * "alias FILE" (its inode opened through another name: a hard link), "moved FILE", then "overflow" (lost
- * events), "newdir" (a missing directory appeared) and "invalidated" (a watched directory or file inode was
- * deleted, moved or its watch dropped, so a replacement would go unwatched) when they apply, and "end N".
+ * "alias FILE" (its inode opened through another name: a hard link), "moved FILE", "deleted FILE" (its name was
+ * removed: a hard link elsewhere can keep the inode open, unwatched by name), "attrib FILE" (its mode, owner,
+ * link count or other metadata changed), then "overflow" (lost events), "newdir" (a missing directory appeared),
+ * "invalidated" (a watched directory or file inode was deleted, moved or its watch dropped, so a replacement would
+ * go unwatched) and "attribdir" (a watched directory's metadata changed) when they apply, and "end N".
  * It dies with PARENTPID (PR_SET_PDEATHSIG, then a getppid check).
  */
 #include <asm/unistd.h>
@@ -68,14 +70,16 @@ static long slash(const char *p) { long at = -1; for (long i = 0; p[i]; i++) if 
 
 #define MAXF 8
 #define SELF_EVENTS (IN_DELETE_SELF | IN_MOVE_SELF)
-#define FILE_EVENTS (IN_OPEN | IN_CLOSE | SELF_EVENTS | IN_DONT_FOLLOW)
-#define DIR_EVENTS (IN_OPEN | IN_CLOSE | IN_CREATE | IN_DELETE | IN_MOVE | SELF_EVENTS | IN_ONLYDIR | IN_DONT_FOLLOW)
-static struct target { char *path; long dir, wd; unsigned long opens, closes, inode, seen; int gen, alias, moved, probed; } T[MAXF];
+/* IN_ATTRIB (smarty-dev#9473): a mode, owner, link-count or other metadata change on a watched component fails
+ * closed like an open: on a file it holds that file ("attrib FILE"), on a watched directory it voids the counts. */
+#define FILE_EVENTS (IN_OPEN | IN_CLOSE | IN_ATTRIB | SELF_EVENTS | IN_DONT_FOLLOW)
+#define DIR_EVENTS (IN_OPEN | IN_CLOSE | IN_ATTRIB | IN_CREATE | IN_DELETE | IN_MOVE | SELF_EVENTS | IN_ONLYDIR | IN_DONT_FOLLOW)
+static struct target { char *path; long dir, wd; unsigned long opens, closes, inode, seen; int gen, alias, moved, deleted, attrib, probed; } T[MAXF];
 static long parent;
 static int opened;
 static char dirs[MAXF][4096];
 static long D[MAXF], nfiles, ndirs, inotify;
-static int overflow, newdir, invalidated;
+static int overflow, newdir, invalidated, attribdir;
 static struct target *probing;
 static int probeSeen, ignoreProbe;
 static long controlWd = -1;
@@ -98,10 +102,13 @@ static void report(unsigned long seq) {
         out("opens "); number(t->opens); out(" "); number(t->probed); out(" "); out(t->path); out("\n");
         if (t->alias) { out("alias "); out(t->path); out("\n"); }
         if (t->moved) { out("moved "); out(t->path); out("\n"); }
+        if (t->deleted) { out("deleted "); out(t->path); out("\n"); }
+        if (t->attrib) { out("attrib "); out(t->path); out("\n"); }
     }
     if (overflow) out("overflow\n");
     if (newdir) out("newdir\n");
     if (invalidated) out("invalidated\n");
+    if (attribdir) out("attribdir\n");
     out("end "); number(seq); out("\n");
 }
 
@@ -115,6 +122,7 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
         for (long i = 0; i < nfiles; i++) if (T[i].wd == e->wd) invalidated = 1;
     }
     for (long d = 0; d < ndirs; d++) {
+        if (D[d] == e->wd && !e->len && (e->mask & IN_ATTRIB)) attribdir = 1; // the watched directory itself
         if (D[d] != e->wd || !e->len) continue;
         // A missing watched directory's name that appears by create or rename, as a directory, a symlink or
         // anything else, is unwatched: refuse (pi-fabric#881 review round 2). A file name that appears by
@@ -128,10 +136,16 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
             if (e->mask & IN_OPEN) { t->opens++; if (t->gen) t->seen++; if (t == probing && !ignoreProbe) probeSeen = 1; }
             if (e->mask & IN_CLOSE) t->closes++;
             if (e->mask & IN_MOVE) t->moved = 1;
+            if (e->mask & IN_ATTRIB) t->attrib = 1;
+            // pi-fabric#881 Astra round 4 (P1): a removed name never ends counting silently. A hard link elsewhere keeps
+            // the inode (and any holder of it) alive with no IN_DELETE_SELF, and later opens through it would go uncounted.
+            if (e->mask & IN_DELETE) t->deleted = 1;
             if (e->mask & (IN_CREATE | IN_DELETE)) { endgen(t); if (e->mask & IN_CREATE) watch(t); }
         }
     }
     for (long i = 0; i < nfiles; i++) if (T[i].gen && T[i].wd == e->wd && (e->mask & IN_OPEN)) T[i].inode++;
+    // The inode watch also sees a change made through another name (a new hard link: the link count).
+    for (long i = 0; i < nfiles; i++) if (T[i].gen && T[i].wd == e->wd && (e->mask & IN_ATTRIB)) T[i].attrib = 1;
 }
 
 /* One read of the inotify queue, every event processed; the bytes read, or a negative errno (EAGAIN when empty). */

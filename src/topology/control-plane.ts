@@ -92,6 +92,15 @@ export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "ca
 const detachedControlOperation = (operation: FabricControlOperation): boolean =>
   operation === "ask";
 
+/**
+ * Dormant wake (#774): the only commands a retained predecessor epoch may deliver, i.e. the
+ * messages a dormant wake exists for. Control (stop, cancel, setModel, setThinking and any
+ * future operation) and interrupting steers always need this activation's own epoch.
+ */
+const retainedEpochDelivery = (command: FabricControlCommand): boolean =>
+  (command.operation === "steer" || command.operation === "followUp" || command.operation === "ask") &&
+  command.priority === undefined;
+
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
   principal?: FabricPrincipal | undefined;
@@ -309,10 +318,12 @@ export interface FabricControlPlaneOptions {
   ownerIncarnation?: string;
   /**
    * Dormant wake (#774): the predecessor epoch named by one target's retained dormant
-   * route, inherited by this successor activation. Only that target's commands addressed
-   * to exactly that epoch are admitted, claimed and ACKed under it; all others stay fenced.
+   * route, inherited by this successor activation for the command event at `sequence`.
+   * Only message deliveries (steer, followUp, ask) to that target addressed to exactly that
+   * epoch are admitted, claimed and ACKed under it; control operations and all other
+   * epochs stay fenced. The owner returns undefined once the exception is consumed.
    */
-  retainedOwnerIncarnation?: (targetId: string) => string | undefined;
+  retainedOwnerIncarnation?: (targetId: string, sequence: number) => string | undefined;
   enabled: boolean;
   hostId: string;
   pollMs?: number;
@@ -1156,7 +1167,7 @@ export class FabricControlPlane {
       return;
     }
     // Explicit epochs fence stale owners; see #admittingIncarnation for the only exceptions.
-    const admittedIncarnation = this.#admittingIncarnation(command);
+    const admittedIncarnation = this.#admittingIncarnation(command, event.sequence);
     if (command.operation === "cancel") {
       if (admittedIncarnation !== undefined) this.#acceptCancellation(command, event.from);
       return;
@@ -1324,7 +1335,7 @@ export class FabricControlPlane {
   }
 
   /** The epoch this activation admits a command under, or undefined when it is fenced. */
-  #admittingIncarnation(command: FabricControlCommand): string | undefined {
+  #admittingIncarnation(command: FabricControlCommand, sequence: number): string | undefined {
     if (command.ownerIncarnation === this.incarnation) return this.incarnation;
     // Explicit epochs always fence stale owners. Omission remains compatible only
     // during warn-mode rollout; timestamps cannot substitute for an epoch in enforce.
@@ -1332,8 +1343,10 @@ export class FabricControlPlane {
       return this.options.controlIncarnationFence !== "enforce" ? this.incarnation : undefined;
     }
     // A dormant actor's retained route (#774) still names its sleeping predecessor's
-    // epoch. This successor inherits admission for that exact target and epoch only.
-    return this.options.retainedOwnerIncarnation?.(command.targetId) === command.ownerIncarnation
+    // epoch. This successor inherits it for message delivery to that exact target and
+    // epoch only, never for control: a queued predecessor stop stays fenced (#709).
+    if (!retainedEpochDelivery(command)) return undefined;
+    return this.options.retainedOwnerIncarnation?.(command.targetId, sequence) === command.ownerIncarnation
       ? command.ownerIncarnation : undefined;
   }
 

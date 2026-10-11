@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { FabricActorInfo } from "../actors/types.js";
 import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
 import type { MeshEvent } from "../mesh/event-log.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
@@ -39,6 +41,16 @@ export const canonicalResidentWakeConfig = (value: unknown): string => {
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, field]) => [key, sort(field)])) : json;
   return JSON.stringify(sort(JSON.parse(JSON.stringify(value))));
 };
+/** Actor config a dormant generation sleeps under (#774); status, queue, run and clock fields are not config. */
+const DORMANT_ACTOR_CONFIG_FIELDS = [
+  "id", "scope", "name", "rootId", "supervisorFor", "ownershipToken", "project", "instructionsDigest", "runner", "kernel",
+  "pythonRuntime", "events", "topics", "delivery", "responseMode", "triggerTurn", "coalesce", "coalesceKey", "dedupeKey",
+  "residency", "routeClass", "protected", "projectDefaults", "tools", "timeoutMs", "nice", "extensions", "inferenceContext",
+  "activation", "activationFilter", "activationFilterExpiresAt", "requirements", "validWhile", "records",
+] as const satisfies readonly (keyof FabricActorInfo)[];
+export const dormantActorConfigDigest = (actor: FabricActorInfo): string =>
+  createHash("sha256").update(canonicalResidentWakeConfig(Object.fromEntries(
+    DORMANT_ACTOR_CONFIG_FIELDS.map(field => [field, actor[field]])))).digest("hex");
 export const residentWakeConfigMatches = (saved: unknown, expected: unknown): boolean => {
   if (!saved || typeof saved !== "object" || Array.isArray(saved) ||
       !expected || typeof expected !== "object" || Array.isArray(expected)) return false;

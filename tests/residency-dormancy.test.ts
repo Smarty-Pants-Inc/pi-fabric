@@ -11,13 +11,13 @@ import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ARCHIVE_PENDING_FILE } from "../src/agents/archive-custody.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
-import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors } from "../src/residency/wake.js";
+import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors, type ResidentWakeRoutes } from "../src/residency/wake.js";
 import { superviseWake } from "../src/residency/launcher.js";
 import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable } from "../src/residency/wake-index.js";
 import { requestResidentWake, ResidentWakeConfigMismatch } from "../src/residency/wake.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { CONTROL_STALE_INCARNATION, FabricControlPlane } from "../src/topology/control-plane.js";
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Attribute the timer to its direct caller, not an ancestor that causes an existing
@@ -971,4 +971,106 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(processStartTime(process.pid)).toBeDefined();
     } finally { finish(); await active; fs.rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+// #774 review round: a woken successor inherits its dormant actor's retained route epoch only
+// for message delivery, only for the dormant generation and config it slept under, and only
+// for the backlog published before the successor's own fresh route.
+describe("retained dormant route epoch", () => {
+  const stale = { name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION };
+  const dormantRoute = async () => {
+    const f = fixture();
+    await f.host.start();
+    const actor = await f.host.actors.create({ name: "retained-route", instructions: "process", residency: "durable" });
+    await until(() => f.host.actors.status(actor.id).status === "dormant");
+    f.host.actors.pauseForRelease(); await f.host.actors.checkpointForRelease(); await f.host.close();
+    const routeFile = path.join(f.config.residencyRoot, "wake-routes.json");
+    const entry = () => readWakeJson<ResidentWakeRoutes>(routeFile)!.actors.find(row => row.id === actor.id)!;
+    const participant = entry().participant!;
+    const mesh = new MeshStore(f.config.meshRoot, f.config.mesh.maxEventBytes, f.config.mesh.maxReadEvents);
+    const identity = { id: "session:sender", name: "sender", kind: "main" as const };
+    const sender = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 10_000 });
+    sender.start(async () => ({ accepted: false, error: "sender does not own actors" }));
+    // This test starts the successor itself, so publication never launches one.
+    const wake = await import("../src/residency/wake.js");
+    vi.spyOn(wake, "wakeResidentActors").mockResolvedValue(undefined);
+    const { AgentManager } = await import("../src/agents/manager.js");
+    const seen: string[] = [];
+    vi.spyOn(AgentManager.prototype, "run").mockImplementation(async (request, _signal, onSpawned) => {
+      const id = "1".repeat(32); onSpawned?.({ id } as never); seen.push(request.task);
+      return { id, status: "completed", text: "done", toolCalls: 0, startedAt: Date.now(), finishedAt: Date.now() } as never;
+    });
+    let sent = 0;
+    const send = (operation: "followUp" | "stop", ownerIncarnation: string, message: string) =>
+      sender.request(participant.ownerHostId, actor.id, operation, { message, ownerIncarnation }, participant.ownerIdentityId,
+        { idempotencyKey: `retained-${++sent}` }).catch((error: unknown) => error);
+    const commands = () => mesh.read({ topic: "fabric.control.command", limit: 1_000 });
+    let successor: ResidentHost | undefined;
+    const wakeSuccessor = async (config = f.config) => { successor = new ResidentHost(config, () => {}); await successor.start(); return successor; };
+    const cleanup = async () => {
+      vi.restoreAllMocks(); await sender.close(); await f.host.close(); await successor?.close(); mesh.closeState();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    };
+    return { ...f, actor, epoch: participant.ownerIncarnation!, entry, send, commands, seen, wakeSuccessor, cleanup };
+  };
+
+  it.each(["host config", "actor config"] as const)("refuses a stale route's epoch after a %s change while dormant", async change => {
+    const route = await dormantRoute();
+    try {
+      const pending = route.send("followUp", route.epoch, "addressed to the stale route");
+      await until(() => route.commands().length === 1);
+      let config = route.config;
+      if (change === "host config") {
+        // The stale wake-routes.json (and its configJson) stays; the restart config does not.
+        config = { ...route.config, piBinary: "pi-changed" };
+        fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+      } else {
+        const registry = new ActorRegistryStore(route.config.actorRoot);
+        registry.write(registry.records().map(row => row.id === route.actor.id ? { ...row, instructions: "process differently" } : row));
+      }
+      const successor = await route.wakeSuccessor(config);
+      expect(await pending).toMatchObject(stale);
+      await sleep(100);
+      expect(route.seen).toEqual([]);
+      expect(successor.actors.status(route.actor.id).status).not.toBe("stopped");
+    } finally { await route.cleanup(); }
+  }, 20_000);
+
+  it("refuses a queued predecessor stop under the retained epoch while delivering a followUp under it", async () => {
+    const route = await dormantRoute();
+    try {
+      const stop = route.send("stop", route.epoch, "stop the dormant predecessor");
+      const followUp = route.send("followUp", route.epoch, "deliver to the woken actor");
+      await until(() => route.commands().length === 2);
+      // The dormant generation the route names is the epoch the stop addresses.
+      expect(route.entry().dormancy?.ownerIncarnation ?? route.epoch).toBe(route.epoch);
+      const successor = await route.wakeSuccessor();
+      expect(await stop).toMatchObject(stale);
+      expect(await followUp).toMatchObject({ acknowledged: true });
+      await until(() => route.seen.length === 1);
+      expect(route.seen[0]).toContain("deliver to the woken actor");
+      expect(successor.actors.status(route.actor.id).status).not.toBe("stopped");
+    } finally { await route.cleanup(); }
+  }, 20_000);
+
+  it("drops the retained epoch once the woken host publishes its fresh route", async () => {
+    const route = await dormantRoute();
+    try {
+      const backlog = route.send("followUp", route.epoch, "dormant backlog");
+      await until(() => route.commands().length === 1);
+      await route.wakeSuccessor();
+      expect(await backlog).toMatchObject({ acknowledged: true });
+      const fresh = route.entry().participant?.ownerIncarnation;
+      expect(fresh).toBeTruthy();
+      expect(fresh).not.toBe(route.epoch);
+      // The fresh route no longer names the consumed generation (only, if it re-armed, its own).
+      expect(route.entry().dormancy?.ownerIncarnation).not.toBe(route.epoch);
+      expect(await route.send("followUp", route.epoch, "late, to the consumed epoch")).toMatchObject(stale);
+      expect(await route.send("followUp", fresh!, "to the fresh route")).toMatchObject({ acknowledged: true });
+      await until(() => route.seen.length === 2);
+      expect(route.seen.join("\n")).not.toContain("late, to the consumed epoch");
+      expect(route.seen[0]).toContain("dormant backlog");
+      expect(route.seen[1]).toContain("to the fresh route");
+    } finally { await route.cleanup(); }
+  }, 20_000);
 });

@@ -133,6 +133,41 @@ describe("dormant-route successor (#774)", () => {
       .resolves.toMatchObject({ acknowledged: true });
     expect(handler).toHaveBeenCalledTimes(2);
   });
+
+  it("admits the retained epoch only for message delivery, never for control, and only within the owner's bound", async () => {
+    const mesh = store(temp());
+    const previous = plane(mesh, "session:owner"); previous.start(() => ({ accepted: true })); previous.pause();
+    const sender = plane(mesh, "session:sender"); sender.start(() => ({ accepted: false }));
+    const epoch = previous.incarnation;
+    const send = (operation: "steer" | "followUp" | "stop" | "setModel" | "setThinking", key: string, extra: { priority?: "interrupt" } = {}) =>
+      sender.request("session:owner", "actor:dormant", operation, { message: "queued for the dormant route", ownerIncarnation: epoch, ...extra },
+        "session:owner", { idempotencyKey: key }).catch(error => error);
+    const control = (["stop", "setModel", "setThinking"] as const).map(operation => send(operation, operation));
+    const interrupt = send("steer", "interrupt", { priority: "interrupt" });
+    const delivered = [send("steer", "steer"), send("followUp", "followUp")];
+    await vi.waitFor(() => expect(commands(mesh)).toHaveLength(6)); await previous.close();
+    const consulted: number[] = [];
+    let until = Number.MAX_SAFE_INTEGER;
+    const successor = new FabricControlPlane(mesh, identity("session:owner"), { enabled: true, hostId: "session:owner", pollMs: 20,
+      acknowledgementTimeoutMs: 1_000, controlIncarnationFence: "enforce",
+      retainedOwnerIncarnation: (targetId, sequence) => {
+        consulted.push(sequence); return targetId === "actor:dormant" && !(sequence > until) ? epoch : undefined;
+      } });
+    planes.push(successor);
+    const handler = vi.fn((_command: { operation: string }) => ({ accepted: true, messageId: "woken" })); successor.start(handler);
+    for (const pending of [...control, interrupt]) {
+      expect(await pending).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+    }
+    for (const pending of delivered) expect(await pending).toMatchObject({ acknowledged: true, messageId: "woken" });
+    expect(handler.mock.calls.map(([command]) => command.operation)).toEqual(["steer", "followUp"]);
+    // Control and interrupts never consult the retained epoch; deliveries pass their event sequence.
+    expect(consulted).toEqual(commands(mesh).filter(event => ["steer", "followUp"].includes(event.kind) &&
+      (event.data as { priority?: string }).priority === undefined).map(event => event.sequence));
+    // Past the owner's bound (its fresh route), the same retained epoch is refused.
+    until = mesh.latestSequence();
+    expect(await send("followUp", "late")).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("owner incarnation admission and durable receipts", () => {

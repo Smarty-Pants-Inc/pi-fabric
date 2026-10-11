@@ -63,6 +63,7 @@ export const agentParticipantRecords = (
       startedAt: run?.startedAt ?? observedAt,
       updatedAt: run?.updatedAt ?? observedAt,
       ...(run?.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
+      ...(run?.finalAnswerReceipt ? { finalAnswerReceiptId: run.finalAnswerReceipt.id } : {}),
       ...(run?.currentTool ? { currentTool: run.currentTool } : {}),
       ...(run ? { turns: run.turns, toolCalls: run.toolCalls, usage: { ...run.usage } } : {}),
       controlProtocol: "v1",

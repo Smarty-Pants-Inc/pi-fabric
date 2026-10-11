@@ -315,4 +315,38 @@ describe("compact actor registry payloads (#3752, #4383)", () => {
     expect(store.instructions(store.records()[0]!)).toBe(actor.instructions);
     expect(store.messages(store.records()[0]!)).toEqual(actor.messages.slice(-100));
   });
+
+  it("reuses the committed head for an unchanged loaded ring without re-reading history (smarty-dev#6829)", async () => {
+    const { store, id, log } = setup();
+    const ring = messages(100);
+    const row = { id, instructions: "i".repeat(20_000), status: "idle", messages: ring, registryMessageAppend: [] };
+    await store.update(() => ({ actors: [{ ...row, registryMessageAppend: ring }], value: true }));
+    // One slow save of the loaded ring records its committed digest.
+    await store.update(() => ({ actors: [{ ...row, status: "running" }], value: true }));
+    const head = store.records()[0]!.messageHistory;
+    const archive = fs.readFileSync(log, "utf8");
+    const reads = vi.spyOn(fs, "openSync");
+    await store.update(() => ({ actors: [{ ...row, status: "idle", messages: structuredClone(ring) }], value: true }));
+    expect(reads.mock.calls.filter(([file]) => String(file) === log)).toEqual([]);
+    expect(store.records()[0]).toMatchObject({ status: "idle", messageHistory: head, messages: [] });
+    reads.mockRestore();
+    // Counterexample: an in-place edit without an append marker misses the digest and is archived.
+    const edited = structuredClone(ring);
+    edited[99]!.text = "edited";
+    await store.update(() => ({ actors: [{ ...row, messages: edited }], value: true }));
+    expect(store.records()[0]!.messageHistory).not.toEqual(head);
+    expect(fs.readFileSync(log, "utf8").length).toBeGreaterThan(archive.length);
+    expect(new ActorRegistryStore(path.dirname(path.dirname(path.dirname(log)))).messages(store.records()[0]!)).toEqual(edited);
+  });
+
+  it("forgets a removed actor's committed ring at the next save (smarty-dev#8533)", async () => {
+    const { store, id } = setup();
+    const other = "b".repeat(32), ring = messages(3);
+    const row = (actorId: string) => ({ id: actorId, instructions: "i", status: "idle", messages: ring, registryMessageAppend: [] });
+    await store.update(() => ({ actors: [{ ...row(id), registryMessageAppend: ring }, { ...row(other), registryMessageAppend: ring }], value: true }));
+    await store.update(() => ({ actors: [{ ...row(id), status: "running" }, { ...row(other), status: "running" }], value: true }));
+    expect(store.committedRingIds().sort()).toEqual([other, id].sort());
+    await store.update(() => ({ actors: [{ ...row(id), status: "idle" }], value: true }));
+    expect(store.committedRingIds()).toEqual([id]);
+  });
 });

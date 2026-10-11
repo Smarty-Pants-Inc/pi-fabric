@@ -241,16 +241,27 @@ setInterval(() => {}, 1000);
     } finally { f.close(); }
   });
 
-  it("a child that left an incomplete record before a SIGKILL: the launcher keeps that exit in error.json and says why", { timeout: 30_000 }, async () => {
+  it("a child that left an incomplete record before a SIGKILL: the launcher's diagnostic goes to its generation file; a successor's error.json is byte-identical", { timeout: 30_000 }, async () => {
     const f = setup("partial");
     try {
       await waitFor(() => f.owner() !== undefined && f.records().length === 1);
+      const child = f.owner()!.pid;
       await new Promise(resolve => setTimeout(resolve, 500));
-      process.kill(f.owner()!.pid, "SIGKILL");
+      process.kill(f.launcher.pid!, "SIGSTOP");
+      process.kill(child, "SIGKILL");
+      await waitFor(() => state(child) === "Z");
+      // A successor claims the root and writes its own diagnostic before the predecessor's launcher runs again.
+      fs.writeFileSync(path.join(f.root, "owner.json"), JSON.stringify({ pid: process.pid, processStartTime: startTime(process.pid), token: randomUUID() }));
+      fs.writeFileSync(path.join(f.root, "error.json"), JSON.stringify({ error: "successor diagnostic" }));
+      const before = tree(f.root);
+      process.kill(f.launcher.pid!, "SIGCONT");
       await f.exited;
-      expect(f.records()).toEqual([`${f.generation}.exit.json`]);
-      expect(JSON.parse(fs.readFileSync(path.join(f.root, "error.json"), "utf8")).error)
-        .toMatch(new RegExp(`Resident generation ${f.generation} exited \\(SIGKILL\\); its exit record is invalid: the existing record is unreadable: .*JSON`));
+      const after = tree(f.root);
+      const name = path.join("generations", `${f.generation}.launcher-exit.json`);
+      expect(Object.keys(after).filter(file => !(file in before))).toEqual([name]);
+      for (const [file, bytes] of Object.entries(before)) expect(after[file], file).toBe(bytes);
+      expect(JSON.parse(after[name]!)).toMatchObject({ generation: f.generation, writer: "launcher", reason: "unreported", pid: child,
+        signal: "SIGKILL", diagnostic: expect.stringContaining("the existing record is unreadable") });
     } finally { f.close(); }
   });
 });

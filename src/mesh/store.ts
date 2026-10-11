@@ -353,12 +353,19 @@ export class MeshStore {
    * (fsync of events.jsonl and its namespace after `.lock`); SQLite state uses the PASSIVE
    * checkpoint barrier (smarty-dev#6100: no copy or fsync under SQLite's writer lock); file state
    * fsyncs state.json and its namespace. A caller must not advance its external record on a throw.
+   *
+   * It resolves with `through`, the highest event sequence committed to the log (a complete line)
+   * before this barrier's fsync, so every event at or below it that is still live is now on disk.
+   * Callers must advance an event cursor only to `through`, never to latestSequence(): that
+   * includes the reservation counter, which a publisher advances under `.lock` before it appends,
+   * so a cursor past `through` could skip an event appended after the barrier (pi-fabric#894).
    */
-  async sync(budgetMs = 1_000): Promise<void> {
+  async sync(budgetMs = 1_000): Promise<{ through: number }> {
     if (!Number.isFinite(budgetMs) || budgetMs < 0) throw new Error("Mesh sync budgetMs must be a finite number >= 0");
     const deadline = Date.now() + budgetMs;
+    let through: number;
     for (;;) {
-      try { await this.#events.sync(); break; }
+      try { through = await this.#events.sync(); break; }
       catch (error) {
         // A compaction renamed the live log during the namespace check; the next barrier covers it.
         if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
@@ -366,6 +373,7 @@ export class MeshStore {
       }
     }
     await this.#state.sync(Math.max(0, deadline - Date.now()));
+    return { through };
   }
 
   nextEventAfter(after: number): MeshEvent | undefined {

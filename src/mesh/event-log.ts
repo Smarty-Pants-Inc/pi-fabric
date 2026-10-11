@@ -133,6 +133,22 @@ interface AfterUnlock {
 // later append enqueues a new barrier, even while an earlier one is running (pi-fabric#550).
 const eventBarriers = new Map<string, Promise<void>>();
 
+/**
+ * Test-only (smarty-dev#9313), off unless PI_FABRIC_TEST_PAUSE_AFTER_RESERVE names a file: a
+ * publisher that has reserved its sequence writes `<file>.reserved` (the sequence) and then blocks,
+ * still under `.lock` and before its append, until `<file>.go` exists (30 s at most). Production
+ * never sets it; it opens the reservation-to-append window for a cross-process race test.
+ */
+const pauseAfterReserveForTest = (file: string, sequence: number): void => {
+  fs.writeFileSync(`${file}.reserved`, String(sequence));
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 30_000;
+  while (!fs.existsSync(`${file}.go`)) {
+    if (Date.now() > deadline) throw new Error("PI_FABRIC_TEST_PAUSE_AFTER_RESERVE timed out");
+    Atomics.wait(sleeper, 0, 0, 5);
+  }
+};
+
 export class MeshDedupeRecoveryError extends Error {
   readonly retryable = true;
   constructor(message: string, options?: { cause?: unknown }) {
@@ -249,10 +265,20 @@ export class EventLog {
    * barrier a durable publish uses: one fsync of events.jsonl and its namespace, outside `.lock`
    * (a queued barrier that has not started yet covers this call too). Archived events need nothing
    * more: each archive line is fdatasynced before its event goes live. No live log, no event.
+   *
+   * Resolves with `through`: the highest sequence COMMITTED to the live log (on a complete line)
+   * when the barrier was requested, read before its fsync starts, so the fsync covers that line and
+   * every line before it. Never the reservation counter (latestSequence): a publisher advances that
+   * under `.lock` before it appends, so a reserved sequence may not be in the log yet
+   * (pi-fabric#894). Zero when the live log holds no complete event.
    */
-  async sync(): Promise<void> {
-    if (!fs.existsSync(this.#eventsPath)) return;
+  async sync(): Promise<number> {
+    if (!fs.existsSync(this.#eventsPath)) return 0;
+    // Sample first, then queue the barrier: a queued barrier has not started (it runs in a later
+    // setImmediate), so its fsync begins after this read in every case.
+    const through = this.#readCommittedSequence();
     await this.#confirmEventsAfterRelease();
+    return through;
   }
 
   /** The live barrier stays after release. Receipt installation/removal reacquires .lock
@@ -633,6 +659,7 @@ export class EventLog {
         // burst of 160 publishes held other writers up to 1.3 s at 5x the fleet rate. If the
         // lock's held share matters (#816), sync after unlocking so concurrent syncs share a commit.
         atomicWrite(this.#counterPath, sequence);
+        if (process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE) pauseAfterReserveForTest(process.env.PI_FABRIC_TEST_PAUSE_AFTER_RESERVE, sequence);
         let liveOffset = 0;
         try { liveOffset = fs.statSync(this.#eventsPath).size; }
         catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
@@ -1384,6 +1411,32 @@ export class EventLog {
         if (found !== undefined) return found;
       }
       return this.#lastSequenceIn(descriptor, size, window, true) ?? 0;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return 0;
+      throw error;
+    } finally {
+      if (descriptor !== undefined) fs.closeSync(descriptor);
+    }
+  }
+
+  /**
+   * The highest committed sequence: the last parsable line that ends in a newline. A line without
+   * its newline is an append in progress (or one a crash cut, which repair truncates), and the
+   * reservation counter is never read. Zero without a complete event line (smarty-dev#9313).
+   */
+  #readCommittedSequence(): number {
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(this.#eventsPath, "r");
+      const size = fs.fstatSync(descriptor).size;
+      if (size === 0) return 0;
+      const window = Math.min(size, this.maxEventBytes + 1);
+      const tail = Buffer.allocUnsafe(window);
+      fs.readSync(descriptor, tail, 0, window, size - window);
+      const newline = tail.lastIndexOf(0x0a);
+      if (newline < 0) return 0;
+      const complete = size - window + newline + 1;
+      return this.#lastSequenceIn(descriptor, complete, Math.min(complete, this.maxEventBytes + 2), true) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;

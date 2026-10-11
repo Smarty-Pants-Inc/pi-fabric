@@ -241,7 +241,8 @@ hostDescriptors.push({
 hostDescriptors.push({
   name: "sync",
   description: "Durability barrier: resolve once every mesh event and state write made before the call is on disk; " +
-    "await it before fsyncing an external cursor or delivered mark that covers them",
+    "await it before fsyncing an external cursor or delivered mark that covers them. Returns { synced, through }: " +
+    "advance an event cursor only to through, the highest sequence committed to the log that the barrier made durable",
   inputSchema: {
     type: "object",
     properties: { budgetMs: { type: "number", minimum: 0, maximum: MAX_SYNC_BUDGET_MS, description: "SQLite state checkpoint budget, default 1000" } },
@@ -370,9 +371,9 @@ export class MeshProvider implements FabricProvider {
       case "sync": {
         assertPublishArguments(actionName, args, context);
         context.signal?.throwIfAborted();
-        // Every event through this sequence (and every state write) committed before the call.
-        const through = this.store.latestSequence();
-        await this.store.sync(typeof args.budgetMs === "number" ? args.budgetMs : undefined);
+        // `through` is the highest sequence committed to the log before the barrier's fsync, never the
+        // reservation counter (latestSequence), which runs ahead of an append (pi-fabric#894).
+        const { through } = await this.store.sync(typeof args.budgetMs === "number" ? args.budgetMs : undefined);
         return { synced: true, through };
       }
       case "read":

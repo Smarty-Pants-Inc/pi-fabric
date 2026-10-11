@@ -82,8 +82,13 @@ SQLite state commits with `synchronous=NORMAL`. The barrier is:
   trust class as `dedupeKey` and `publishBatch`: declare `mesh.sync` in
   `requires`; public catalogs, QuickJS guests and forged contexts get
   `MeshHostPublishError` (`FABRIC_MESH_HOST_PUBLISH_REQUIRED`). It returns
-  `{ synced: true, through }`, where `through` is the latest sequence before
-  the barrier.
+  `{ synced: true, through }`; `MeshStore.sync()` resolves with `{ through }`.
+- `through` is the highest sequence committed to the log (a complete line)
+  before the barrier's fsync, so every live event at or below it is on disk.
+  Advance an event cursor only to `through`. It is never `latestSequence()`:
+  that includes the reservation counter, which a publisher advances under
+  `.lock` before its append, so a cursor fsynced past `through` could skip an
+  event after a crash (pi-fabric#894).
 
 ```ts host
 await context.call("mesh.publish", { topic: "github.delivery", data });

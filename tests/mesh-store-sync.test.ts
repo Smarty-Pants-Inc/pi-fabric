@@ -3,8 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MeshStore } from "../src/mesh/store.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { withFabricHostCaller } from "../src/fabric-provenance.js";
+import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+import { MeshProvider } from "../src/providers/mesh-provider.js";
+import type { FabricParticipantSource } from "../src/topology/types.js";
 
 // smarty-dev#9313: MeshStore.sync() is the barrier a trusted producer awaits before it fsyncs its
 // own cursor or delivered mark. A SIGKILL cannot drop the page cache, so the two-process test also
@@ -107,6 +112,72 @@ describe.each(["file", "sqlite"] as const)("MeshStore.sync durability barrier (%
       await expect(store.sync(-1)).rejects.toThrow("budgetMs");
     } finally { store.closeState(); }
   });
+});
+
+describe("MeshStore.sync through (pi-fabric#894)", () => {
+  // Process A reserves sequence n (the counter) and pauses under .lock before its append; process B
+  // (this test) calls mesh.sync. B's through must stay below n until A appends: a producer that
+  // fsyncs its cursor through a reserved-but-unappended n would skip n after a crash.
+  it("never reports a reserved but unappended sequence across processes", async () => {
+    const root = tempRoot("mesh-sync-race-"), out = tempRoot("mesh-sync-race-out-");
+    const pause = path.join(out, "pause");
+    const identity = { id: "sync-race-b", name: "sync-race-b", kind: "agent" as const };
+    const store = new MeshStore(root, 64 * 1024, 100, { stateBackend: "file" });
+    const participants: FabricParticipantSource = {
+      list: () => [], get: () => undefined, self: () => { throw new Error("unused"); },
+      peers: () => [], async refresh() {}, scheduleRefresh() {},
+    };
+    const provider = new MeshProvider(store, identity, participants);
+    const host = withFabricHostCaller({
+      cwd: process.cwd(), signal: undefined, extensionContext: {} as ExtensionContext,
+      parentToolCallId: "sync-race", nestedToolCallId: "sync-race", update() {},
+    } satisfies FabricInvocationContext, "fabric-github.forwarder");
+    const sync = async (): Promise<number> => ((await provider.invoke("sync", {}, host)) as { through: number }).through;
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      await store.publish({ topic: "ops.sync", from: identity });
+      const committed = await store.publish({ topic: "ops.sync", from: identity });
+      expect(await sync()).toBe(committed.sequence);
+
+      child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-sync-reserve-pause.mjs"), root], {
+        cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PI_FABRIC_TEST_PAUSE_AFTER_RESERVE: pause },
+      });
+      let stdout = "", stderr = "";
+      child.stdout!.on("data", chunk => { stdout += String(chunk); });
+      child.stderr!.on("data", chunk => { stderr += String(chunk); });
+      const exited = new Promise<number | null>(resolve => child!.once("close", code => resolve(code)));
+      const deadline = Date.now() + 20_000;
+      while (!fs.existsSync(`${pause}.reserved`)) {
+        if (child.exitCode !== null) throw new Error(`publisher A exited early: ${stderr}`);
+        if (Date.now() > deadline) throw new Error(`publisher A never reserved: ${stderr}`);
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      const n = Number(fs.readFileSync(`${pause}.reserved`, "utf8"));
+      expect(n).toBe(committed.sequence + 1);
+      // The race: the counter already says n, the log does not hold n yet.
+      expect(store.latestSequence()).toBe(n);
+      expect(store.read({ after: committed.sequence })).toEqual([]);
+      for (let round = 0; round < 3; round += 1) {
+        const through = await sync();
+        expect(through, "B's barrier while A holds a reservation").toBeLessThan(n);
+        expect(through).toBe(committed.sequence);
+        expect((await store.sync()).through).toBe(committed.sequence);
+      }
+      expect(child.exitCode, "A is still paused under .lock").toBeNull();
+
+      fs.writeFileSync(`${pause}.go`, "");
+      expect(await exited, stderr).toBe(0);
+      const appended = JSON.parse(stdout) as MeshEvent;
+      expect(appended.sequence).toBe(n);
+      const through = await sync();
+      expect(through).toBeGreaterThanOrEqual(n);
+      expect(store.read({ after: committed.sequence }).map(event => event.id)).toEqual([appended.id]);
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      store.closeState();
+    }
+  }, 30_000);
 });
 
 describe("MeshStore.sync failure", () => {

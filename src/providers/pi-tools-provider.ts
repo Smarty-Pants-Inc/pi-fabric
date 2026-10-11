@@ -25,6 +25,7 @@ import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
   type PiCoreToolName,
+  type PiShellToolName,
 } from "../core/pi-tools.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
 import {
@@ -684,6 +685,9 @@ export class PiToolsProvider implements FabricProvider {
     // CapturedToolsProvider, so delegate to it unchanged.
     if (this.#catalog?.get(name) && !middleware) {
       if (isPiShellToolName(name) && args.monitor !== undefined) throw new Error("Shell monitors are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
+      if (name !== "bash" && isPiShellToolName(name)) {
+        await this.#emitBashGuardPreflight(name, args, context, this.#catalog.get(name)!.runner);
+      }
       const result = await this.#capturedTools!.invoke(name, args, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
@@ -713,6 +717,35 @@ export class PiToolsProvider implements FabricProvider {
     return this.#invokeWithEvents(name, tool, args, context, runner, middleware, preflightEmitted);
   }
 
+  // smarty-dev#8606 (P1-A): command guards such as the fleet bash guard judge
+  // only toolName "bash", so a model-supplied pi.powershell command would run
+  // with no guard reading it. Every non-bash shell call is first shown to
+  // guards as a bash tool_call with the same command text (behind the leading
+  // cd of a non-session cwd) and input.shell naming the real shell. A block
+  // refuses the call. A bash guard's rewrite cannot carry over to another
+  // shell's syntax, so any change to that input refuses the call too.
+  async #emitBashGuardPreflight(
+    name: PiShellToolName,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runner: ExtensionRunner,
+  ): Promise<void> {
+    const command = args.command;
+    if (typeof command !== "string") {
+      throw new Error(`Pi tool ${name} was blocked: it has no command text for the bash guard to judge`);
+    }
+    const cwd = args[PI_BASH_CWD_KEY];
+    const preface = typeof cwd === "string" && cwd !== this.#cwd ? `cd ${shellQuote(cwd)} && ` : "";
+    const input: Record<string, unknown> = { ...args, command: preface + command, shell: name };
+    const judged = JSON.stringify(input);
+    const event = { type: "tool_call" as const, toolName: "bash" as string, toolCallId: `${context.nestedToolCallId}:bash-guard`, input };
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall(event));
+    if (preflight?.block) throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
+    if (event.input !== input || JSON.stringify(input) !== judged) {
+      throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the ${name} command it judged as bash; it runs only exactly as judged`);
+    }
+  }
+
   // Emit the tool_call preflight for a nested pi.* call and enforce a block.
   // Shared by #invokeWithEvents and the git-worktree-add intercept so both obey
   // the same extension policy through one code path (no duplicated enforcement).
@@ -722,6 +755,24 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
+    if (name !== "bash" && isPiShellToolName(name)) {
+      await this.#emitBashGuardPreflight(name, args, context, runner);
+      // Guards for the real tool name still see the call, but nothing may
+      // change the command after the bash view judged it.
+      const input: Record<string, unknown> = { ...args };
+      const judged = JSON.stringify(input);
+      const event = { type: "tool_call" as const, toolName: name as string, toolCallId: context.nestedToolCallId, input };
+      const preflight = await runAbortable(context.signal, () => runner.emitToolCall(event));
+      if (preflight?.block) {
+        context.updateArguments?.(args);
+        throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
+      }
+      if (event.input !== input || JSON.stringify(input) !== judged) {
+        throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the command after the bash guard judged it`);
+      }
+      context.updateArguments?.(args);
+      return;
+    }
     // smarty-dev#8606: a native bash call runs in the session cwd, and guards
     // judge its command against ctx.cwd. pi.bash's cwd argument moves execution
     // elsewhere, so the guard sees the same leading cd a native call would need.

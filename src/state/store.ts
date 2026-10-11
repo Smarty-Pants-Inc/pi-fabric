@@ -1172,8 +1172,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
-    /** Guard preflight for the shell command; may rewrite it or throw a refusal (#8606). */
-    prepareCommand?: (command: string, index: number) => Promise<string>;
+    /** Guard preflight for the shell command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
   }): Promise<{
     passed: boolean;
     output: string;
@@ -1183,8 +1183,9 @@ export class StateStore {
     const entry = this.store.get(GOAL_KEY);
     if (!entry) throw new Error("No goal set");
     const goal = entry.value as StateGoal;
-    const command = input.prepareCommand ? await input.prepareCommand(goal.check, 0) : goal.check;
-    const result = await runCommand(command, {
+    // The command that runs is always the one the goal records and digests.
+    await input.preflightCommand?.(goal.check, 0);
+    const result = await runCommand(goal.check, {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs ?? 30_000,
       ...(input.signal ? { signal: input.signal } : {}),
@@ -1297,8 +1298,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
-    /** Guard preflight for each evidence command; may rewrite it or throw a refusal (#8606). */
-    prepareCommand?: (command: string, index: number) => Promise<string>;
+    /** Guard preflight for each evidence command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
   }): Promise<VerificationReport> {
     const verificationHead = this.getHead();
     const boundedHeadLabel = verificationHead
@@ -1388,6 +1389,8 @@ export class StateStore {
         });
       }
       for (const command of evidence) {
+        // The command that runs is always the one the result and certificate record.
+        if (!input.signal?.aborted) await input.preflightCommand?.(command, commandIndex++);
         const result: CommandResult = input.signal?.aborted
           ? {
               status: "error",
@@ -1398,7 +1401,7 @@ export class StateStore {
               outputDigest: digest(""),
               error: "aborted before execution",
             }
-          : await runCommand(input.prepareCommand ? await input.prepareCommand(command, commandIndex++) : command, {
+          : await runCommand(command, {
               cwd: input.cwd,
               timeoutMs: input.timeoutMs ?? 30_000,
               ...(input.signal ? { signal: input.signal } : {}),

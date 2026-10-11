@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   createBashToolDefinition,
+  createSyntheticSourceInfo,
   type ExtensionContext,
   type ExtensionRunner,
   type RegisteredTool,
@@ -791,6 +792,65 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
         .rejects.toThrow("guard refused git stash");
       expect(fs.existsSync(marker)).toBe(false);
       expect(runner.emitToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: "bash" }));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows pi.powershell to bash guards and refuses what they refuse (#8606 P1-A)", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-powershell-guard-")));
+    const nested = path.join(root, "linked");
+    fs.mkdirSync(nested);
+    const marker = path.join(root, "executed");
+    const command = `git stash list > '${marker}'`;
+    type Event = { toolName: string; toolCallId: string; input: Record<string, unknown> };
+    const providerFor = (hook: (event: Event) => unknown, captured = false) => {
+      const events: Event[] = [];
+      const runner = makeRunner({
+        createContext: () => ({ cwd: root, sessionManager: baseContext.extensionContext.sessionManager }),
+        emitToolCall: vi.fn(async (event: Event) => {
+          events.push({ ...event, input: { ...event.input } });
+          return hook(event);
+        }),
+      });
+      const catalog = new CapturedToolCatalog();
+      catalog.replace(captured ? [{
+        // An extension-owned powershell override. It runs through bash here, so
+        // a missed refusal would create the marker.
+        definition: { ...createBashToolDefinition(root), name: "powershell", label: "powershell" } as RegisteredTool["definition"],
+        sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override/index.ts", { source: "test" }),
+      }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const provider = new PiToolsProvider(root, catalog, captured ? new CapturedToolsProvider(catalog) : undefined, { powerShellToolDefinitionFactory });
+      return { provider, events };
+    };
+    // A bash-only guard, like the fleet bash guard: it ignores every other toolName.
+    const bashOnly = (event: Event) => event.toolName === "bash" && String(event.input.command).includes("git stash")
+      ? { block: true, reason: "guard refused git stash" } : undefined;
+    const context = { ...baseContext, cwd: root };
+    try {
+      for (const captured of [true, false]) {
+        const { provider, events } = providerFor(bashOnly, captured);
+        await expect(provider.invoke("powershell", { command }, context)).rejects.toThrow("guard refused git stash");
+        expect(events[0]).toMatchObject({ toolName: "bash", input: { command, shell: "powershell" } });
+      }
+      expect(fs.existsSync(marker)).toBe(false);
+      // The bash view carries a non-session cwd as the leading cd a native call needs.
+      const withCwd = providerFor(bashOnly);
+      await expect(withCwd.provider.invoke("powershell", { command: "git stash list", cwd: nested }, context))
+        .rejects.toThrow("guard refused git stash");
+      expect(withCwd.events[0]?.input.command).toBe(`cd '${nested}' && git stash list`);
+      // A bash guard's rewrite cannot carry over to PowerShell syntax, so it refuses the call.
+      const rewrite = providerFor((event) => { if (event.toolName === "bash") event.input.command = "echo safe"; });
+      await expect(rewrite.provider.invoke("powershell", { command }, context))
+        .rejects.toThrow("a tool_call hook rewrote the powershell command it judged as bash");
+      // Guards for the real tool name still run after the bash view; they cannot rewrite the judged command.
+      const named = providerFor((event) => event.toolName === "powershell" ? { block: true, reason: "powershell guard" } : undefined);
+      await expect(named.provider.invoke("powershell", { command: "Write-Output ok" }, context)).rejects.toThrow("powershell guard");
+      expect(named.events.map((event) => event.toolName)).toEqual(["bash", "powershell"]);
+      const late = providerFor((event) => { if (event.toolName === "powershell") event.input.command = command; });
+      await expect(late.provider.invoke("powershell", { command: "Write-Output ok" }, context))
+        .rejects.toThrow("a tool_call hook rewrote the command after the bash guard judged it");
+      expect(fs.existsSync(marker)).toBe(false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

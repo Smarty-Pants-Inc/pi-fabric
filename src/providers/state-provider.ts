@@ -226,7 +226,7 @@ export class StateProvider implements FabricProvider {
     this.#allowUnhookedTools = shell.allowUnhookedTools === true;
   }
 
-  #prepareCommand(action: string, context: FabricInvocationContext): ((command: string, index: number) => Promise<string>) | undefined {
+  #preflightCommand(action: string, context: FabricInvocationContext): ((command: string, index: number) => Promise<void>) | undefined {
     if (this.#shellPreflight) {
       const preflight = this.#shellPreflight;
       return (command, index) => preflight(command, context, `state.${action}`, index);
@@ -354,7 +354,7 @@ export class StateProvider implements FabricProvider {
           : undefined;
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
         const includeArchived = args.includeArchived === true;
-        const prepareCommand = this.#prepareCommand("verify", context);
+        const preflightCommand = this.#preflightCommand("verify", context);
         context.activity?.({
           type: "entity",
           id: STATE_ENTITY_ID,
@@ -362,7 +362,7 @@ export class StateProvider implements FabricProvider {
           name: "verify",
         });
         const result = await this.#store.verify({
-          ...(prepareCommand ? { prepareCommand } : {}),
+          ...(preflightCommand ? { preflightCommand } : {}),
           ...(labels ? { labels } : {}),
           includeArchived,
           cwd: context.cwd,
@@ -396,9 +396,9 @@ export class StateProvider implements FabricProvider {
       }
       case "checkGoal": {
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
-        const prepareCommand = this.#prepareCommand("checkGoal", context);
+        const preflightCommand = this.#preflightCommand("checkGoal", context);
         const result = await this.#store.checkGoal({
-          ...(prepareCommand ? { prepareCommand } : {}),
+          ...(preflightCommand ? { preflightCommand } : {}),
           cwd: context.cwd,
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(context.signal ? { signal: context.signal } : {}),

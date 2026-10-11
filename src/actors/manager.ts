@@ -5268,6 +5268,14 @@ export class ActorManager {
           ...(typeof binding.model === "string" ? { model: binding.model } : {}),
           ...(typeof binding.modelReason === "string" ? { modelReason: binding.modelReason } : {}),
           ...(isFabricThinking(binding.thinking) ? { thinking: binding.thinking } : {}),
+        } } : typeof record.model === "string" && record.model ? { resolvedBinding: {
+          // smarty-dev#8487: a row without a run binding (written before #7682 or
+          // rebuilt by an older runtime) republishes its persisted model/thinking
+          // after a restart, as create does; idle presence must not be unknown
+          // until a run. Never a reader overlay; a row without a model stays unknown.
+          model: record.model,
+          ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
+          thinking: isFabricThinking(record.thinking) ? record.thinking : this.agents.config.thinking,
         } } : {}),
         ...(typeof record.routeClass === "string" ? { routeClass: record.routeClass as "status-groom" } : {}),
         ...(typeof record.protected === "boolean" ? { protected: record.protected } : {}),

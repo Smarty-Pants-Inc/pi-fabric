@@ -245,11 +245,12 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     actorManagers.push(restored);
     expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project", ...defaults });
     expect(restored.resolveBinding(actor.id)).toEqual(defaults);
-    // An old save may lose knowledge of the last run, never the defaults.
-    expect(restored.listOwned(true)[0]?.model).toBeUndefined();
+    // An old save may lose knowledge of the last run, never the defaults. The
+    // shared view then republishes the persisted binding, not unknown (#8487).
+    expect(restored.listOwned(true)[0]).toMatchObject(defaults);
   });
 
-  it.each([false, true])("round 2 keeps legacy shared views unknown with project defaults=%s and reader overlays", async hasDefaults => {
+  it.each([false, true])("round 2 keeps reader overlays out of legacy shared views with project defaults=%s", async hasDefaults => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "legacy-reader", instructions: "Observe.",
       ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
@@ -271,20 +272,26 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       actorManagers.push(reader);
       const before = fs.readFileSync(file, "utf8");
       expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
+      // A legacy row's persisted model/thinking (#8487), else unknown: never this reader's overlay.
+      const persisted = hasDefaults ? { model: "provider/project", thinking: "medium" } : { model: undefined, thinking: undefined };
       const shared = reader.listOwned(true)[0]!;
-      expect(shared.model).toBeUndefined();
-      expect(shared.thinking).toBeUndefined();
+      expect(shared.model).toBe(persisted.model);
+      expect(shared.thinking).toBe(persisted.thinking);
       expect(shared.binding).toBeUndefined();
       const member = actorParticipantRecord(shared, `session:${sessionId}`, "host", `session:${sessionId}`, `session:${sessionId}`);
-      expect(member.model).toBeUndefined();
-      expect(member.thinking).toBeUndefined();
+      expect(member.model).toBe(persisted.model);
+      expect(member.thinking).toBe(persisted.thinking);
       expect(fs.readFileSync(file, "utf8")).toBe(before);
       // A binding-only presence publication also must not stamp the overlay
       // into either shared presence or the registry.
       await reader.setModel(actor.id, `provider/${sessionId}-new`);
-      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
-      expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
-      expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+      const presence = state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value as Record<string, unknown> | undefined;
+      expect(presence?.model).toBe(persisted.model);
+      expect(presence?.thinking).toBe(persisted.thinking);
+      // A prior reader's close may persist the restored binding: the row's own value, never an overlay.
+      const saved = row(state.root, actor.id).resolvedBinding;
+      if (hasDefaults && saved !== undefined) expect(saved).toEqual(persisted);
+      else expect(saved).toBeUndefined();
       expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
       expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
       await reader.close();
@@ -303,6 +310,72 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project" });
     expect(restored.resolveBinding(actor.id)).toEqual({});
   });
+
+  // smarty-dev#8487: the factory router serves a review pair only when its idle
+  // presence names (model, thinking). A resident restart must republish the last
+  // persisted binding at once, not an unknown binding until the actor runs again.
+  const restart = (state: ReturnType<typeof setup>) => {
+    const restarted = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restarted);
+    return restarted;
+  };
+
+  it("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "restart-binding", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+    await state.actors.setThinking(actor.id, "xhigh");
+    await state.actors.ask(actor.id, "first");
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    const key = `actors/test/${actor.id}`;
+    expect(state.mesh.get(key)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    await state.actors.close();
+    // Only the restarted host may write the entry the router reads.
+    await state.mesh.delete({ key });
+    const runs = state.agents.list().length;
+    const restarted = restart(state);
+    // The resident host publishes through its heartbeat batch; a plain session through the retry timer.
+    const batched = restarted.presenceBatch(true).ops.find(op => op.kind === "put" && op.key === key);
+    expect(batched && "value" in batched ? batched.value : undefined).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    await waitFor(() => state.mesh.get(key)?.value !== undefined, 10_000);
+    expect(state.mesh.get(key)?.value).toMatchObject({ status: "idle", model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh",
+      projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+    expect(state.agents.list()).toHaveLength(runs);
+  }, 20_000);
+
+  it.each<[string, { model?: string; modelReason?: string; thinking?: "high" }]>([
+    ["model and thinking", { model: "provider/review", modelReason: "review pair", thinking: "high" }],
+    ["model only", { model: "provider/review" }],
+    ["no model", { thinking: "high" }],
+  ])("restores a row without a persisted run binding from its persisted fields: %s (#8487)", async (_case, persisted) => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "legacy-restart", instructions: "Observe.", ...persisted });
+    await state.actors.close();
+    // A pre-#7682 row, or one an old-runtime writer rebuilt from its known fields.
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const key = `actors/test/${actor.id}`;
+    await state.mesh.delete({ key });
+    const restarted = restart(state);
+    await waitFor(() => state.mesh.get(key)?.value !== undefined, 10_000);
+    const value = state.mesh.get(key)!.value as Record<string, unknown>;
+    expect(value.status).toBe("idle");
+    // A run without an overlay uses the configured thinking when the row has none, as create records.
+    if (persisted.model) expect(value).toMatchObject({ ...persisted, thinking: persisted.thinking ?? state.agents.config.thinking });
+    else {
+      // No persisted model: unknown, exactly as before.
+      expect(value).not.toHaveProperty("model");
+      expect(value).not.toHaveProperty("thinking");
+    }
+    expect(restarted.status(actor.id).projectDefaults).toEqual({ scope: "project", ...persisted });
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
 
   it("records a known configuration binding at create without pinning project defaults", async () => {
     const state = setup(true, undefined, undefined, {

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { mkdirPrivate } from "../storage/private-dir.js";
 import type {
   AgentRunRecord,
   AgentRunRouteMetadata,
@@ -96,7 +97,8 @@ export const createRunningRecord = (
 });
 
 export const writeRunRecord = (filePath: string, record: AgentRunRecord): void => {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // smarty-dev#9016: 0700 under any umask; the run root (the record's run directory's parent) is the Fabric anchor.
+  mkdirPrivate(path.dirname(filePath), path.dirname(path.dirname(filePath)));
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify(record, null, 2), {
     encoding: "utf8",

@@ -359,7 +359,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     // The steer that carried work key "steered" reached the session, as Main's deliverAgent writes it.
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("Only published.");
@@ -444,7 +444,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     faux.setResponses([fauxAssistantMessage("should not run")]);
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("For everyone.", null);

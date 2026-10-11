@@ -337,6 +337,10 @@ export class FabricState {
   ): Promise<RootInboxBatch | undefined> {
     return this.#current()?.nextRootInbox(session, idle, options, hint);
   }
+  /** Mark injected inbox events consumed, so no later turn injects them again (R-token-waste). */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    await this.#current()?.consumeRootInbox(ids, receipts);
+  }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
     this.#recordsWake = wake;

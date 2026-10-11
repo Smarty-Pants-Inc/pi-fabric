@@ -200,10 +200,38 @@ describe("event-driven mesh observers", () => {
     await vi.advanceTimersByTimeAsync(59_999); expect(deliver).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(5 * 60_000); await flush(); expect(deliver).not.toHaveBeenCalled();
     watches[0]!.notify("change", "events.jsonl"); await flush(); expect(deliver).toHaveBeenCalledOnce();
+    // #792 P1-B: an append while the watch is lost is drained once the bounded reattach holds.
+    watches[0]!.emitter.emit("error", new Error("lost watch")); await flush();
+    await publish(mesh); await vi.advanceTimersByTimeAsync(99); await flush(); expect(deliver).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1); await flush(); expect(watches).toHaveLength(2); expect(deliver).toHaveBeenCalledTimes(2);
     const lists = vi.spyOn(mesh, "listAll");
-    watches[0]!.emitter.emit("error", new Error("lost watch")); await flush(); lists.mockClear();
-    await vi.advanceTimersByTimeAsync(59_999); expect(lists).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1); expect(watches).toHaveLength(2); expect(lists).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); expect(lists).not.toHaveBeenCalled(); expect(watches).toHaveLength(2);
+  });
+
+  it("retries a synchronously failed control/lifecycle attach on a bounded backoff, then drains missed work once", async () => {
+    vi.useFakeTimers(); const watches = mockWatch(); const mesh = store(); const deliver = vi.fn();
+    const attach = vi.mocked(fs.watch).getMockImplementation()!; let failing = true;
+    vi.mocked(fs.watch).mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      if (failing) throw Object.assign(new Error("inotify watch limit"), { code: "ENOSPC" });
+      return attach(...args);
+    }) as typeof fs.watch);
+    const broker = await lifecycle(mesh, deliver); broker.start();
+    const handler = vi.fn(() => ({ accepted: true }));
+    const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
+    closers.push(() => control.close()); control.start(handler); await vi.advanceTimersByTimeAsync(0); await flush();
+    expect(watches).toHaveLength(0);
+    // Durable work lands while nothing observes; the attach then becomes possible again.
+    await publish(mesh);
+    await mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
+      data: { version: 1, commandId: "unobserved", targetId: "target", operation: "steer", replyTo: "sender", ownerIncarnation: control.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+    failing = false;
+    await vi.advanceTimersByTimeAsync(99); await flush(); expect(deliver).not.toHaveBeenCalled(); expect(handler).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); await flush(); expect(watches).toHaveLength(2);
+    // The claim/receipt writes settle with real I/O; nothing else would ever wake these drains.
+    await vi.waitFor(() => { expect(deliver).toHaveBeenCalledOnce(); expect(handler).toHaveBeenCalledOnce(); });
+    const tail = vi.spyOn(mesh, "tail"), lists = vi.spyOn(mesh, "listAll");
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await flush();
+    expect(tail).not.toHaveBeenCalled(); expect(lists).not.toHaveBeenCalled(); expect(watches).toHaveLength(2);
   });
 
   it("retains a null-filename notification arriving during awaited lifecycle delivery", async () => {

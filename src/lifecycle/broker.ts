@@ -7,7 +7,7 @@ const OBSERVED_FILES = ["events.jsonl", "generation", "state.json", "participant
 const OBSERVED_DIRECTORIES = ["participants", "host-leases"];
 const IDLE_SAFETY_MS = 60_000;
 const WINDOWS_SAFETY_MS = 5_000;
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, ObserverAttachRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
@@ -43,6 +43,11 @@ const subscriptionKey = (id: string): string =>
 export class LifecycleBroker {
   readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
   readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
+  // A lost or failed watch reattaches on a bounded backoff, then drains once.
+  readonly #attachRetry = new ObserverAttachRetry(() => {
+    this.#attachWatcher(true);
+    return this.#closed || this.#watcher !== undefined;
+  }, () => this.#schedulePoll());
 
   publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {
     return this.#backgroundPublish.enqueue(() => this.publish(request));
@@ -218,6 +223,7 @@ export class LifecycleBroker {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#attachRetry.close();
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     if (this.#retryTimer) clearTimeout(this.#retryTimer);
@@ -251,7 +257,7 @@ export class LifecycleBroker {
         this.#directoryWatchers.set(directory, watcher);
         watcher.on("error", () => {
           if (this.#closed || this.#directoryWatchers.get(directory) !== watcher) return;
-          watcher.close(); this.#directoryWatchers.delete(directory); this.#schedulePoll();
+          watcher.close(); this.#directoryWatchers.delete(directory); this.#attachRetry.fault();
         });
       } catch { /* The safety witness also retries directory attachment. */ }
     }
@@ -274,14 +280,14 @@ export class LifecycleBroker {
         if (stamp !== undefined && stamp === this.#failedStamp) return;
         this.#schedulePoll();
       }, this.options.platform);
-      if (!watcher) return;
+      if (!watcher) return this.#attachRetry.fault();
       this.#watcher = watcher;
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;
         watcher.close(); this.#watcher = undefined;
-        this.#schedulePoll();
+        this.#attachRetry.fault();
       });
-    } catch { /* The fixed-file safety witness covers unavailable watches. */ }
+    } catch { this.#attachRetry.fault(); }
   }
 
   #schedulePoll(retry = false): void {

@@ -16,7 +16,7 @@ const WINDOWS_SAFETY_MS = 5_000;
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, ObserverAttachRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
 
@@ -459,6 +459,10 @@ export class FabricControlPlane {
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #attachRetry = new ObserverAttachRetry(() => {
+    this.#attachWatcher();
+    return this.#closed || this.#paused || this.#watcher !== undefined;
+  }, () => this.#wake());
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
@@ -1028,6 +1032,7 @@ export class FabricControlPlane {
   /** Reload: leave commands queued; the next activation fences execution-bound addresses. */
   pause(): void {
     this.#paused = true;
+    this.#attachRetry.close();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
@@ -1071,6 +1076,7 @@ export class FabricControlPlane {
   }
 
   async #teardown(): Promise<void> {
+    this.#attachRetry.close();
     if (this.#seenExpiryTimer) clearTimeout(this.#seenExpiryTimer);
     this.#seenExpiryTimer = undefined;
     for (const cancel of this.#resendWaits) cancel();
@@ -1134,14 +1140,14 @@ export class FabricControlPlane {
         if (filename !== null && !OBSERVED_FILES.includes(path.basename(filename.toString()))) return;
         this.#wake();
       }, this.options.platform);
-      if (!watcher) return;
+      if (!watcher) return this.#attachRetry.fault();
       this.#watcher = watcher;
       watcher.on("error", () => {
         if (this.#watcher !== watcher || this.#closed) return;
         watcher.close(); this.#watcher = undefined;
         this.#wake();
       });
-    } catch { /* Reattach at the safety deadline; no fast idle fallback. */ }
+    } catch { this.#attachRetry.fault(); } // Bounded reattach, then one catch-up drain.
   }
 
   #wake(): void {

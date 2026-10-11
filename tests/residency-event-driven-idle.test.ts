@@ -337,8 +337,8 @@ describe("ResidencyClient event-driven idle", () => {
     const live = () => events.watches.filter(watch => watch.dir === h.meshRoot && !watch.watcher.close.mock.calls.length);
     const lost = live()[0]!; lost.watcher.emit("error", new Error("lost watch")); await settled();
     expect(lost.watcher.close).toHaveBeenCalled(); expect(live()).toHaveLength(0);
-    // Lost at t=20: reattachment is due at t=1020 and is not an idle poll.
-    await vi.advanceTimersByTimeAsync(999); expect(live()).toHaveLength(0);
+    // Lost at t=20: reattachment is due at t=120 (100 ms doubling backoff) and is not an idle poll.
+    await vi.advanceTimersByTimeAsync(99); expect(live()).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1); await settled(); expect(live()).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(5_000); await settled(); expect(vi.getTimerCount()).toBe(0);
     live()[0]!.watcher.emit("error", new Error("lost again")); await settled();
@@ -542,7 +542,7 @@ describe("ResidencyClient event-driven idle", () => {
     await h.client.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("repairs watch attachment at the non-waking safety boundary, but never discovers missed work there", async () => {
+  it("repairs watch attachment at the non-waking safety boundary without discovery; a lost watch catches up once", async () => {
     const h = fixture(), events = fakeWatches();
     await h.mesh.put({ key: "topology/heartbeats/other", identity: { id: "other", name: "other", kind: "main" }, value: { at: 1 } });
     vi.useFakeTimers();
@@ -558,14 +558,36 @@ describe("ResidencyClient event-driven idle", () => {
     const active = events.watches.find(watch => watch.dir === h.meshRoot)!; active.watcher.emit("error", new Error("lost watch")); await settled();
     // Join the watcher-error pass (real async I/O) so the omitted-event write cannot race into it.
     expect(drain).toHaveBeenCalledTimes(2); await drain.mock.results.at(-1)!.value; await settled();
-    saveCompletion(h.meshRoot, h.recipient, h.result(1)); // Deliberately omit its event.
-    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
-    expect(h.complete).not.toHaveBeenCalled();
+    saveCompletion(h.meshRoot, h.recipient, h.result(1)); // While the watch is lost: no event.
     expect(drain).toHaveBeenCalledTimes(2); // Startup and the real watcher error only.
-    events.fire(path.join(h.meshRoot, "agent-completions"), null); await settled();
+    // #792 P1-B: the bounded reattach (100 ms) holds, then exactly one catch-up pass finds it.
+    await vi.advanceTimersByTimeAsync(100); await settled();
     await vi.waitFor(() => expect(drain).toHaveBeenCalledTimes(3));
     await drain.mock.results.at(-1)!.value; await settled();
     expect(h.complete).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(drain).toHaveBeenCalledTimes(3); expect(h.complete).toHaveBeenCalledOnce();
+    await h.client.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retries a synchronously failed watch attach on a bounded backoff, then catches up missed work once (#792 P1-B)", async () => {
+    const h = fixture(), events = fakeWatches();
+    const attach = vi.mocked(fs.watch).getMockImplementation()!; let failing = true;
+    vi.mocked(fs.watch).mockImplementation(((...args: Parameters<typeof fs.watch>) => {
+      if (failing) throw Object.assign(new Error("inotify watch limit"), { code: "ENOSPC" });
+      return attach(...args);
+    }) as typeof fs.watch);
+    vi.useFakeTimers();
+    const drain = vi.spyOn(CompletionJournal.prototype, "drainChanged");
+    h.client.start(); await vi.advanceTimersByTimeAsync(20); await drain.mock.results[0]!.value; await settled();
+    expect(events.watches).toHaveLength(0);
+    saveCompletion(h.meshRoot, h.recipient, h.result(1)); failing = false; // Never observed.
+    await vi.advanceTimersByTimeAsync(80); await settled();
+    await vi.waitFor(() => expect(drain).toHaveBeenCalledTimes(2));
+    await drain.mock.results.at(-1)!.value; await settled();
+    expect(events.watches.length).toBeGreaterThan(0); expect(h.complete).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5 * 60_000); await settled();
+    expect(drain).toHaveBeenCalledTimes(2); expect(h.complete).toHaveBeenCalledOnce();
     await h.client.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -28,7 +28,7 @@ export class RecordsWatchdog {
     lagMs?: number;
     intervalMs?: number;
     /** Main's idle safety check is read-only: no relay flush, alarm, or turn delivery, except
-     * the documented own-root wake when this process holds no relay (no committed nudge, F9). */
+     * the documented own-root wake for this root's own lag (a commit may publish no nudge, F9). */
     periodicObservationOnly?: boolean;
     /** Minimum time between two alarms for one consumer. */
     realarmMs?: number;
@@ -70,10 +70,11 @@ export class RecordsWatchdog {
     signal?.throwIfAborted();
     if (observationOnly) {
       const lagging = await this.lagging();
-      // A relay process's committed appends publish their nudges, which wake Main by event.
-      // Without the relay credential nothing publishes one (F9): keep the documented own-root
-      // wake on this same tick, for this root's own lag only, through the host's idle gate.
-      if (relay || !this.options.wake || !lagging.some(lag => lag.consumer === this.options.self)) {
+      // A relay process's own appends publish their nudges, which wake Main by event. A peer's
+      // commit (no relay credential, or a bare client) publishes none, and this tick flushes
+      // nothing (F9): keep the documented own-root wake on this same tick, with or without a
+      // relay, for this root's own lag only, through the host's idle gate.
+      if (!this.options.wake || !lagging.some(lag => lag.consumer === this.options.self)) {
         return { lagging, woke: false, alarmed: [] };
       }
       signal?.throwIfAborted();

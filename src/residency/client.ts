@@ -31,7 +31,7 @@ import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
-import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundRetry, ObserverAttachRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
@@ -241,6 +241,8 @@ export class ResidencyClient {
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
   readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
+  // A lost or failed watch reattaches on a bounded backoff, then runs one trusted catch-up pass.
+  readonly #attachRetry = new ObserverAttachRetry(() => this.#closed || this.#refreshWatchers(), () => this.#safetyDrain());
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #startupLauncher: Awaited<ReturnType<typeof spawnDetached>> | undefined;
@@ -299,16 +301,7 @@ export class ResidencyClient {
       this.#windowsSafetyTimer = setInterval(() => {
         if (this.#closed) return;
         this.#refreshWatchers();
-        this.#meshDirty = this.#journalDirty = this.#journalSafetyDirty = true;
-        // Exact authenticated completion sources may change without mesh bytes.
-        // Rechecking their fences never re-admits unrelated failed actor messages.
-        for (const keys of this.#completionDeliveries.values()) {
-          for (const key of keys) this.#receiptDeliveries.add(key);
-        }
-        // A safety observation does not reset an outstanding storage backoff.
-        // Its dirty flags remain owned by the already-armed fault retry.
-        if (this.#backgroundDelivery.waitMs === 0) this.#requestDrain(false);
-        this.#scheduleWatchdog(0);
+        this.#safetyDrain();
       }, WINDOWS_SAFETY_MS);
       this.#windowsSafetyTimer.unref();
     }
@@ -321,8 +314,23 @@ export class ResidencyClient {
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
   }
 
+  /** The trusted discovery/receipt pass: Windows' 5 s safety drain, and a repaired watch's catch-up. */
+  #safetyDrain(): void {
+    this.#meshDirty = this.#journalDirty = this.#journalSafetyDirty = true;
+    // Exact authenticated completion sources may change without mesh bytes.
+    // Rechecking their fences never re-admits unrelated failed actor messages.
+    for (const keys of this.#completionDeliveries.values()) {
+      for (const key of keys) this.#receiptDeliveries.add(key);
+    }
+    // A safety observation does not reset an outstanding storage backoff.
+    // Its dirty flags remain owned by the already-armed fault retry.
+    if (this.#backgroundDelivery.waitMs === 0) this.#requestDrain(false);
+    this.#scheduleWatchdog(0);
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
+    this.#attachRetry.close();
     // Disposing a runtime during native reload/shutdown ends its authority even
     // while the OS process remains alive. Never invalidate a newer runtime.
     if (this.#generationRecorded) {
@@ -1344,8 +1352,10 @@ export class ResidencyClient {
       ...this.#completionSources.keys(), config.actorRoot, actors];
   }
 
-  #refreshWatchers(): void {
-    if (this.#closed) return;
+  /** False when an attach failed; that failure owns a bounded retry. */
+  #refreshWatchers(): boolean {
+    if (this.#closed) return true;
+    let attached = true;
     const windows = (this.options.platform ?? process.platform) === "win32";
     const needed = new Set<string>();
     // On Windows, hold only stable parent handles, never mesh/journal/run paths.
@@ -1392,14 +1402,13 @@ export class ResidencyClient {
           if (this.#watchers.get(dir)?.watcher === watcher) this.#watchers.delete(dir);
           if (this.#closed) return;
           this.#fileChanged(dir, null);
-          // A lost watch is an observed fault obligation: reattach with bounded backoff,
-          // never a fast or permanent idle poll.
-          this.#faultObligationState();
-          this.#scheduleFaultRetry();
+          // A lost watch reattaches with bounded backoff, never a fast or permanent idle poll.
+          this.#attachRetry.fault();
         });
         this.#watchers.set(dir, { watcher, identity: this.#watchIdentity(dir) });
-      } catch { /* Safety discovery still works when native observation is unavailable. */ }
+      } catch { attached = false; this.#attachRetry.fault(); }
     }
+    return attached;
   }
 
   #watchIdentity(dir: string): string {

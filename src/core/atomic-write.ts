@@ -805,6 +805,28 @@ export class MeshBackgroundRetry {
   }
 }
 
+/** A failed or lost native observer attach (#792): retry the attach on MeshBackgroundRetry's
+ * backoff shape, 100 ms doubling to the 60 s idle safety heartbeat, and once it holds run exactly
+ * one catch-up drain through the owner's fenced path, since work may have arrived unobserved.
+ * A healthy observer arms nothing; close() disarms a pending retry. */
+export class ObserverAttachRetry {
+  #timer: NodeJS.Timeout | undefined;
+  #delayMs = 0;
+  constructor(readonly attach: () => boolean, readonly drain: () => void, readonly maxMs = 60_000) {}
+  fault(): void {
+    if (this.#timer) return;
+    this.#delayMs = Math.min(this.maxMs, Math.max(100, this.#delayMs * 2));
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (!this.attach()) return this.fault();
+      this.#delayMs = 0;
+      this.drain();
+    }, this.#delayMs);
+    this.#timer.unref();
+  }
+  close(): void { clearTimeout(this.#timer); this.#timer = undefined; this.#delayMs = 0; }
+}
+
 /** One-shot notifications have no natural next tick. An owned serial queue retains them;
  * only a typed acquisition timeout retries (no write occurred). Idle costs no timer.
  * Awaiting enqueue waits for the first attempt, never an indefinitely locked mesh.

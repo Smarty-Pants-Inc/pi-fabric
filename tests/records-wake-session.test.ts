@@ -131,12 +131,13 @@ describe.skipIf(!canRun)("records wake a Main only through the idle gate (F21)",
     const { session, faux, recordMessages, ask, peer } = await start(1_000, true);
     faux.setResponses([fauxAssistantMessage("got it")]);
     await ask("idle", "Please review.");
-    const deadline = Date.now() + 15_000;
+    // The peer's bare append publishes no nudge: Main's minute observation tick wakes it (#792 P1-A).
+    const deadline = Date.now() + 75_000;
     while (recordMessages().length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
     expect(recordMessages()).toHaveLength(1);
     while (session.isStreaming && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
     await new Promise((resolve) => setTimeout(resolve, 1_500));
     expect(recordMessages()).toHaveLength(1);
     peer.close();
-  }, 60_000);
+  }, 120_000);
 });

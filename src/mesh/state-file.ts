@@ -6,7 +6,8 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
-import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
+import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary, isNamespaceRace,
+  syncPathNamespace } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
 import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, meshStateMovedError, readMeshStateMovedMarker, type MeshStateMovedMarker } from "./backend-fence.js";
@@ -1157,6 +1158,29 @@ export class StateFile implements StateBackend {
   /** R20 write fence: every state.json writer takes `.lock`, which the caller holds. */
   withWriteFence<T>(operation: () => T): T {
     return operation();
+  }
+
+  /**
+   * Durability barrier (smarty-dev#9313): state.json is renamed into place without an fsync, so this
+   * fsyncs the file the path names now and its namespace, outside `.lock`. A commit made before the
+   * call is that file or an older one it replaced, and the directory barrier persists the rename. A
+   * concurrent rename during the namespace check is retried within the budget; an I/O error is not.
+   */
+  async sync(budgetMs: number): Promise<void> {
+    const deadline = Date.now() + Math.max(0, budgetMs);
+    for (;;) {
+      let fd: number;
+      try { fd = fs.openSync(this.#statePath, process.platform === "win32" ? "r+" : "r"); }
+      catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
+      try {
+        fs.fsyncSync(fd);
+        syncPathNamespace(this.#statePath, fs.fstatSync(fd));
+        return;
+      } catch (error) {
+        if (!isNamespaceRace(error) || Date.now() >= deadline) throw error;
+      } finally { fs.closeSync(fd); }
+      await delay(1 + Math.random() * 3);
+    }
   }
 
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

@@ -326,6 +326,14 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
     throw new Error("Namespace changed during durability barriers");
   }
 };
+/**
+ * A namespace barrier refused because a path it confirms was replaced meanwhile (a concurrent
+ * rename: compaction, a state commit). The fsyncs themselves succeeded, so a new barrier may run.
+ * Never true for an I/O error: a failed fsync is not retried (its dirty pages may be dropped).
+ */
+export const isNamespaceRace = (error: unknown): boolean => error instanceof Error &&
+  /^(Namespace (changed|directory changed|link changed)|Session receipt inode changed)/.test(error.message);
+
 /** Existence is not a receipt; retry every required directory barrier without a cache. */
 export const syncDirectoryChain = (directory: string): void => {
   if (process.platform !== "win32") syncPathNamespace(directory);

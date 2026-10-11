@@ -14,11 +14,11 @@
   "expected": {
     "x86_64": {
       "fabric-landlock": "feb223824e44d02fcc4735d85ae0a91f2a29394197007c11b893c8b8ea02772a",
-      "fabric-mesh-lease": "a5e84c739f121d90cf76f3cb4c2c74865942bb05fbea5f0badfd7e6e938e1041"
+      "fabric-mesh-lease": "f21ef515d2e2f55dbe5e2a9f18effdb33b65221713978d7b959c985d7505e09f"
     },
     "aarch64": {
       "fabric-landlock": "0c2b786f8de2d49cf240b1afe69d83e7443666671df07b6a47e88e393c725978",
-      "fabric-mesh-lease": "f86c7cb288c9bc25d63f2204c5f042d1990d7e27b4726655a133b85da0f956b4"
+      "fabric-mesh-lease": "cf1c1fba685c36676cf1b375c9a6884e65707281bdaaa82a5f8981ec400aa320"
     }
   }
 }

@@ -299,6 +299,17 @@ setInterval(() => {}, 1000);`;
 });
 
 describe("agents provider message routing service boundaries", () => {
+  it.each(["main", "session:owner"])("an actor's steer to %s still reaches its owning Main", async (target) => {
+    const ports = routing();
+    const actor = { ...ports.actors, identity: { id: "actor", name: "Review", kind: "actor" as const } };
+    const main = { ...ports.main, id: "session:owner", matches: (id: string) => id === "main" || id === "session:owner" };
+    const router = new AgentMessageRouter(ports.agents, actor, main, ports.participants, ports.control, (binding) => binding);
+    await router.routeMessage(target, "Steer Main", undefined, "steer");
+    expect(main.deliverAgent).toHaveBeenCalledOnce();
+    expect(main.deliverAgent).toHaveBeenCalledWith(expect.objectContaining({ message: "Steer Main", delivery: "steer", from: actor.identity }));
+    expect(actor.tell).not.toHaveBeenCalled();
+  });
+
   it("F4 never ensures a missing durable participant without a kernel fence", async () => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: "main" } as ReturnType<Ports[1]["status"]>);

@@ -175,7 +175,7 @@ export const renameAtomic = (
   }
 };
 
-type Inode = Pick<fs.Stats, "dev" | "ino">;
+type Inode = Pick<fs.Stats, "dev" | "ino"> | Pick<fs.BigIntStats, "dev" | "ino">;
 const sameInode = (left: Inode, right: Inode): boolean => left.dev === right.dev && left.ino === right.ino;
 
 /** Confirm the complete reopenable namespace, not just realpath's collapsed endpoint.
@@ -235,7 +235,10 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     }
     const endpoint = fs.lstatSync(current);
     record(current, endpoint);
-    if (receipt && !sameInode(receipt, endpoint)) throw new Error("Session receipt inode changed during namespace confirmation");
+    // Archive receipts on Windows carry exact 64-bit file IDs. Do not round them
+    // back to Number when binding the reopened endpoint; numeric callers are unchanged.
+    const identity = typeof receipt?.ino === "bigint" ? fs.lstatSync(current, { bigint: true }) : endpoint;
+    if (receipt && !sameInode(receipt, identity)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
     return { entries, directories, parents };
 };

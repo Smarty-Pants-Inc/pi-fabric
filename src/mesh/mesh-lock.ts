@@ -6,7 +6,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { lockTokenLocality, localityLockToken, ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { lockTokenLocality, localityLockToken, ownProcessIncarnation, processIncarnation, unknownNamespaceLockLiveness, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -380,9 +380,12 @@ export class MeshLock {
       // The local signal probe answers only for this host, PID namespace and boot: an owner
       // elsewhere is unknown, never dead (an invisible PID is not ESRCH proof). An owner from
       // an earlier boot of this host is dead. Untagged (older) owners keep the plain probe.
+      // An owner on this host with an unknown PID namespace stays foreign, but its creation
+      // time is the heartbeat: past the hold ceiling it is dead and recovers here (PR #864 P1).
       const locality = lockTokenLocality(token);
-      if (locality === "foreign") return false;
-      if (locality !== "previous-boot" && processAlive(pid)) {
+      const heartbeat = unknownNamespaceLockLiveness(token, Number(createdText), { staleMs: this.#staleLockMs });
+      if (locality === "foreign" && heartbeat !== "dead") return false;
+      if (heartbeat !== "dead" && locality !== "previous-boot" && processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         // Registry-fenced publication cannot start even a bounded native read.
         // Fail closed; the ordinary outside-custody admission lane obtains fresh

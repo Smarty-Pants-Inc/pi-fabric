@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { AtomicFileWriter, localityLockToken, lockTokenLocality, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, localityLockToken, lockTokenLocality, renameAtomic, syncDirectoryChain, unknownNamespaceLockLiveness, writeFileAtomic } from "../core/atomic-write.js";
 import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
@@ -480,11 +480,16 @@ export class ActorRegistryStore {
           // The local probe answers only for this host, PID namespace and boot: an owner
           // elsewhere is unknown and never reaped (an invisible PID is not proof of death).
           // An owner from an earlier boot of this host is dead; untagged owners keep the probe.
+          // An owner on this host with an unknown PID namespace stays foreign, but its creation
+          // time is the heartbeat (never ESRCH): past the hold ceiling it is dead (PR #864 P1).
           const locality = lockTokenLocality(holder);
-          const alive = validPid && locality !== "previous-boot" && processAlive(pid);
+          const heartbeat = validOwner
+            ? unknownNamespaceLockLiveness(holder, Number(createdText), { staleMs: ACTOR_REGISTRY_STALE_LOCK_MS })
+            : undefined;
+          const alive = heartbeat === undefined && validPid && locality !== "previous-boot" && processAlive(pid);
           const actualStart = alive && recordedStart ? processStartTime(pid) : undefined;
-          const dead = locality !== "foreign" && (alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
-            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS);
+          const dead = heartbeat === "dead" || (locality !== "foreign" && (alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
+            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS));
           if (dead) {
             const current = fs.lstatSync(lockPath);
             if (current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&

@@ -87,6 +87,33 @@ describe("ownerLiveness", () => {
     expect(lockTokenLocality(token, ownerLocalityTag(selfWithout))).toBe("foreign");
   });
 
+  it("unknown namespace, same host: a heartbeat stale past the TTL is dead, never judged by ESRCH (PR #864 P1)", () => {
+    const { pidNamespace: _ownerNamespace, ...owner } = local;
+    const { pidNamespace: _selfNamespace, ...selfWithout } = self;
+    const { signal: _signal, ...injected } = probes({ self: () => selfWithout });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("not visible here"), { code: "ESRCH" });
+    });
+    // Stale beyond the existing heartbeat TTL: dead and reapable.
+    expect(ownerLiveness(owner, { heartbeatAt: NOW - OWNER_HEARTBEAT_TTL_MS - 1, probes: injected })).toBe("dead");
+    // Fresh: alive despite ESRCH; at the TTL boundary still alive.
+    expect(ownerLiveness(owner, { heartbeatAt: NOW - 1_000, probes: injected })).toBe("alive");
+    expect(ownerLiveness(owner, { heartbeatAt: NOW - OWNER_HEARTBEAT_TTL_MS, probes: injected })).toBe("alive");
+    // Unknown on one side only is the same rule.
+    expect(ownerLiveness(local, { heartbeatAt: NOW - 120_000, probes: { ...injected } })).toBe("dead");
+    expect(ownerLiveness(owner, { heartbeatAt: NOW - 120_000, probes: { ...injected, self: () => self } })).toBe("dead");
+    // No heartbeat at all is still only unknown; another host stays unknown.
+    expect(ownerLiveness(owner, { probes: injected })).toBe("unknown");
+    expect(ownerLiveness({ ...owner, hostname: "node-b" }, { heartbeatAt: NOW - 120_000, probes: injected })).toBe("unknown");
+    expect(kill).not.toHaveBeenCalled();
+    // A short lock's creation time is its heartbeat, with the same hold ceiling.
+    const line = JSON.stringify({ ...owner, pid: undefined });
+    const options = { probes: injected, maxHoldMs: 60_000 };
+    expect(lockOwnerLiveness(42, NOW - 61_000, line, options)).toBe("dead");
+    expect(lockOwnerLiveness(42, NOW - 30_000, line, options)).toBe("alive");
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("detects PID reuse from a different process start time", () => {
     const reused = probes({ processStartedAt: () => local.startedAt + 30_000 });
     expect(ownerLiveness(local, { probes: reused })).toBe("dead");

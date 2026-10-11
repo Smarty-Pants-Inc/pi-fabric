@@ -10,6 +10,8 @@ import {
   lockTokenLocality,
   ownerLocalityTag,
   readPhysicalHostIdentity,
+  SHORT_LOCK_MAX_HOLD_MS,
+  unknownNamespaceLockLiveness,
 } from "../src/core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -73,6 +75,32 @@ describe("lock token locality", () => {
   });
 });
 
+describe("unknown-namespace lock heartbeat (PR #864 P1)", () => {
+  it("judges a same-host unknown-namespace token by its creation time and the short-lock hold ceiling", () => {
+    const withBoot = { hostname: "node-a", pidNamespace: "pid:[1]", bootId: "boot-a" };
+    const noNamespace = { hostname: "node-a", bootId: "boot-a" };
+    const now = 1_700_000_000_000;
+    const at = (created: number, owner: object, reader: object, staleMs?: number) =>
+      unknownNamespaceLockLiveness(`${uuid}-${ownerLocalityTag(owner as typeof withBoot)}`, created,
+        { now, ...(staleMs === undefined ? {} : { staleMs }) }, ownerLocalityTag(reader as typeof withBoot));
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS - 1, noNamespace, withBoot)).toBe("dead");
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS - 1, withBoot, noNamespace)).toBe("dead");
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS - 1, noNamespace, noNamespace)).toBe("dead");
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS, noNamespace, withBoot)).toBe("alive");
+    expect(at(now - 60_000, noNamespace, withBoot)).toBe("alive");
+    // A caller's longer stale bound only extends the ceiling, never shortens it.
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS - 1, noNamespace, withBoot, SHORT_LOCK_MAX_HOLD_MS * 2)).toBe("alive");
+    expect(at(now - SHORT_LOCK_MAX_HOLD_MS - 1, noNamespace, withBoot, 100)).toBe("dead");
+    // Not this rule: another host, a known other namespace, local, previous boot, untagged.
+    expect(at(0, { ...noNamespace, hostname: "node-b" }, withBoot)).toBeUndefined();
+    expect(at(0, { ...withBoot, pidNamespace: "pid:[2]" }, withBoot)).toBeUndefined();
+    expect(at(0, withBoot, withBoot)).toBeUndefined();
+    expect(at(0, { ...noNamespace, bootId: "boot-b" }, withBoot)).toBeUndefined();
+    expect(unknownNamespaceLockLiveness("legacy", 0)).toBeUndefined();
+    expect(at(Number.NaN, noNamespace, withBoot)).toBeUndefined();
+  });
+});
+
 describe("mesh lock recovery across PID namespaces", () => {
   const holdLock = (store: MeshStore, owner: string): string => {
     const lockPath = path.join(store.root, ".lock");
@@ -95,6 +123,22 @@ describe("mesh lock recovery across PID namespaces", () => {
       expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toEqual([]);
       fs.rmSync(lock, { recursive: true });
     }
+  });
+
+  it.each([1, 2] as const)("protocol %s reaps an unknown-namespace owner whose heartbeat is stale, never by ESRCH", async (lockProtocol) => {
+    const store = new MeshStore(temp("pi-fabric-locality-mesh-"), 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 1_000 });
+    const pid = 123456;
+    const owner = `${unknownNamespace()}\n${pid}\n${Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000}\n`;
+    holdLock(store, owner);
+    const kill = vi.spyOn(process, "kill").mockImplementation((target) => {
+      if (target === pid) throw Object.assign(new Error("not visible here"), { code: "ESRCH" });
+      return true;
+    });
+    await expect(store.exclusive(() => "recovered")).resolves.toBe("recovered");
+    // The heartbeat decided: the owner's PID was never probed.
+    expect(kill.mock.calls.filter(([target]) => target === pid)).toEqual([]);
+    expect(fs.readdirSync(store.root).filter(name => name.startsWith(".lock.dead."))).toHaveLength(1);
+    expect(fs.existsSync(path.join(store.root, ".lock"))).toBe(false);
   });
 
   it("still recovers a confirmed-dead local owner and an owner from an earlier boot of this host", async () => {
@@ -133,6 +177,18 @@ describe("actor registry lock recovery across PID namespaces", () => {
       expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(owner);
       vi.restoreAllMocks();
     }
+  });
+
+  it("reaps an unknown-namespace owner whose heartbeat is stale, and the registry recovers", async () => {
+    const { store, lockPath } = setup();
+    const owner = `${unknownNamespace()}\n123456\n${Date.now() - SHORT_LOCK_MAX_HOLD_MS - 5_000}\n`;
+    fs.writeFileSync(path.join(lockPath, "owner"), owner);
+    esrch();
+    await expect(store.withLock(() => "recovered", 1_000)).resolves.toBe("recovered");
+    expect(fs.readdirSync(path.dirname(lockPath)).filter(name => name.startsWith("actors.json.lock.dead."))).toHaveLength(1);
+    // The recovered lock is released and usable again.
+    expect(fs.existsSync(lockPath)).toBe(false);
+    await expect(store.withLock(() => "again", 1_000)).resolves.toBe("again");
   });
 
   it("still recovers a confirmed-dead local owner and keeps same-namespace PID-reuse recovery", async () => {

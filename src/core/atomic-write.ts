@@ -1064,6 +1064,31 @@ export const lockTokenLocality = (token: string | undefined, self = ownerLocalit
   return "foreign";
 };
 
+/**
+ * Liveness of a short line-oriented lock (no heartbeat) whose token comes from this host with
+ * an unknown PID namespace on either side. Its locality stays `foreign`, so the local signal
+ * probe (ESRCH) proves nothing and is never consulted. As in lockOwnerLiveness, the creation
+ * time is the heartbeat, with the same hold ceiling (SHORT_LOCK_MAX_HOLD_MS, or the caller's
+ * longer stale bound as in exclusive locks): within it the owner is alive, past it dead and
+ * reapable by the caller's dead-owner path (PR #864 P1). Any other token, including an earlier
+ * boot of this host, another host, or a known namespace, returns undefined: the caller keeps its
+ * locality path.
+ */
+export const unknownNamespaceLockLiveness = (
+  token: string | undefined,
+  createdAt: number,
+  options: { staleMs?: number; now?: number } = {},
+  self = ownerLocalityTag(),
+): "alive" | "dead" | undefined => {
+  const owner = token === undefined ? null : LOCALITY_TOKEN.exec(token);
+  const own = LOCALITY_TAG.exec(self);
+  if (!owner || !own || owner[1] !== own[1]) return undefined;
+  if (owner[2] !== LOCALITY_UNKNOWN && own[2] !== LOCALITY_UNKNOWN) return undefined;
+  if (lockTokenLocality(token, self) !== "foreign" || !Number.isFinite(createdAt)) return undefined;
+  const maxHoldMs = Math.max(SHORT_LOCK_MAX_HOLD_MS, options.staleMs ?? 0);
+  return (options.now ?? Date.now()) - createdAt > maxHoldMs ? "dead" : "alive";
+};
+
 const boundedString = (value: unknown, max: number): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= max;
 
@@ -1177,13 +1202,16 @@ export const ownerLiveness = (
   }
   // Another or unknown namespace, another host, or another boot: the signal answer means
   // nothing here, so a fresh heartbeat is the only evidence of life.
-  // A missed heartbeat is only absence of evidence, never confirmed death:
-  // a paused owner holds no fencing token and may resume and write again.
   if (options.heartbeatAt !== undefined) {
     const now = (probes.now ?? Date.now)();
-    return now - options.heartbeatAt <= (options.heartbeatTtlMs ?? OWNER_HEARTBEAT_TTL_MS)
-      ? "alive"
-      : "unknown";
+    if (now - options.heartbeatAt <= (options.heartbeatTtlMs ?? OWNER_HEARTBEAT_TTL_MS)) return "alive";
+    // On this host with an unknown PID namespace (either side) the heartbeat is the authority:
+    // stale beyond the same TTL is dead and reapable, never judged by ESRCH. Otherwise a single
+    // crash would leave the owner unknown and wedge its lock forever (PR #864 P1).
+    if (sameHost && (record.pidNamespace === undefined || self.pidNamespace === undefined)) return "dead";
+    // Another host or known namespace: a missed heartbeat is only absence of evidence, never
+    // confirmed death: a paused owner holds no fencing token and may resume and write again.
+    return "unknown";
   }
   // No process outlives its kernel boot (containers share the host's boot id).
   if (

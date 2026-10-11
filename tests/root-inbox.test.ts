@@ -141,8 +141,8 @@ describe("RootInbox", () => {
     expect(message.customType).toBe("pi-fabric-inbox");
     expect(message.content).toContain('ref="Smarty-Pants-Inc/pi-fabric#1"');
     expect(message.content).toContain("ETA ~09:30Z &lt;PR&gt;");
-    expect(message.content).toContain("[cut at 8192 bytes; read the whole event with mesh.read(");
-    expect(message.content.length).toBeLessThan(12_000);
+    expect(message.content).toContain("[cut at 4096 bytes; read the whole event with mesh.read(");
+    expect(message.content.length).toBeLessThan(6_000);
   });
 
   it("recognises split per-sender receipts and does not return the pending aggregate", async () => {

@@ -47,6 +47,14 @@ const RECEIPT_VALUE_FRACTION = 0.75;
 const MAX_BATCH_TEXT_BYTES = 32 * 1024;
 const MAX_EVENT_TEXT_BYTES = 8 * 1024;
 /**
+ * One injection (R-token-waste): at most this many events are rendered in full, with at most this
+ * much event text in total and per event; every further event of the batch is summarized in one
+ * line. A 20-event batch was ~15k tokens per turn; the budget keeps one injection near 3k.
+ */
+export const INBOX_INJECT_MAX_EVENTS = 8;
+export const INBOX_INJECT_MAX_TEXT_BYTES = 12 * 1024;
+export const INBOX_INJECT_EVENT_TEXT_BYTES = 4 * 1024;
+/**
  * Every idle wake is a model turn (smarty-dev#1579), so an idle root wakes at most this often,
  * unless the batch holds an urgent event. PI_FABRIC_INBOX_WAKE_COOLDOWN_MS overrides it.
  */
@@ -113,6 +121,16 @@ const workReceipts = (fromId: string, data: unknown): string[] => {
   return key ? [receipt(fromId, "key", key)] : ref ? [receipt(fromId, "ref", ref)] : [];
 };
 const eventReceipt = (id: string): string => receipt("", "event", id);
+/**
+ * Receipts that a native carrier records for the same identity under its other kind: a shadow's
+ * messageId is often the control commandId the follow-up arrived with (recorded as "delivery"),
+ * and a shadow's deliveryId can be the carrier id (recorded as "id"). Matching only, never stored.
+ */
+const crossIdentityReceipts = (fromId: string, data: unknown): string[] => {
+  const identity = deliveryIdentity(data);
+  if (!identity) return [];
+  return [receipt(fromId, identity.kind === "delivery" ? "id" : "delivery", identity.value)];
+};
 const eventReceipts = (event: MeshEvent): string[] => [
   eventReceipt(event.id), receipt(event.from.id, "id", event.id),
   // Host-only publication keys are mesh-wide, even when a different maintenance owner
@@ -249,6 +267,19 @@ export class RootInbox {
   }
 
   /**
+   * Record injected events as consumed (R-token-waste): once a batch message entered a turn, its
+   * events are never injected again, even if the canonical session file does not (yet) confirm the
+   * message. Their receipts join the durable delivered set, so the pending batch commits at the
+   * next reconcile and a later shadow of the same work is suppressed too.
+   */
+  async consume(ids: readonly string[], receipts: readonly string[] = []): Promise<void> {
+    this.#load();
+    this.#trimReceipts();
+    const changed = this.#remember([...ids.map(eventReceipt), ...receipts]);
+    await this.#save(changed);
+  }
+
+  /**
    * Set the start boundary now (review F3): a root with no saved cursor starts at the present
    * when it becomes available, not at its first read, so an event sent between the two counts.
    */
@@ -303,9 +334,15 @@ export class RootInbox {
   // Positive delivery evidence only, qualified by sender and this recipient's state key.
   // Before Pi records a native message, its shadow remains recoverable (at least once).
   #steered(event: MeshEvent, session: RootInboxSession): boolean {
-    const key = deliveryIdentity(event.data) ? undefined : workKey(event.data);
-    return eventReceipts(event).some((id) => this.#delivered.has(id) || session.delivered?.has(id)) ||
-      (key !== undefined && session.holdsSteer(event.from.id, key));
+    const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
+    if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has)) return true;
+    const key = workKey(event.data);
+    if (key === undefined) return false;
+    // A shadow that carries its own messageId/deliveryId still matches a follow-up or steer that
+    // carried the same work key and no identity of its own: that carrier claimed the whole key.
+    // A carrier with a different identity is distinct work (its key receipt is never recorded).
+    if (deliveryIdentity(event.data)) return has(receipt(event.from.id, "key", key));
+    return session.holdsSteer(event.from.id, key);
   }
 
   #remember(ids: Iterable<string>, times?: ReadonlyMap<string, number>): boolean {
@@ -567,9 +604,31 @@ const escapeXml = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 const bounded = (text: string, sequence: number): string => {
-  if (Buffer.byteLength(text) <= MAX_EVENT_TEXT_BYTES) return text;
-  const cut = Buffer.from(text).subarray(0, MAX_EVENT_TEXT_BYTES).toString("utf8").replace(/\uFFFD$/u, "");
-  return `${cut}\n[cut at ${MAX_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
+  if (Buffer.byteLength(text) <= INBOX_INJECT_EVENT_TEXT_BYTES) return text;
+  const cut = Buffer.from(text).subarray(0, INBOX_INJECT_EVENT_TEXT_BYTES).toString("utf8").replace(/\uFFFD$/u, "");
+  return `${cut}\n[cut at ${INBOX_INJECT_EVENT_TEXT_BYTES} bytes; read the whole event with mesh.read({ after: ${sequence - 1}, limit: 1 })]`;
+};
+
+/** Split one injection into the events rendered in full and the overflow summarized in one line. */
+export const rootInboxBudget = (events: readonly MeshEvent[]): { shown: MeshEvent[]; overflow: MeshEvent[] } => {
+  const shown: MeshEvent[] = [];
+  let bytes = 0;
+  for (const event of events) {
+    const size = Math.min(Buffer.byteLength(event.text ?? ""), INBOX_INJECT_EVENT_TEXT_BYTES);
+    if (shown.length >= INBOX_INJECT_MAX_EVENTS || (shown.length > 0 && bytes + size > INBOX_INJECT_MAX_TEXT_BYTES)) break;
+    shown.push(event);
+    bytes += size;
+  }
+  return { shown, overflow: events.slice(shown.length) };
+};
+
+const overflowLine = (events: readonly MeshEvent[]): string => {
+  const sequences = events.map((event) => event.sequence);
+  const first = Math.min(...sequences), last = Math.max(...sequences);
+  const senders = [...new Set(events.map((event) => event.from.name || event.from.id))];
+  const from = senders.slice(0, 3).map((name) => JSON.stringify(name)).join(", ") + (senders.length > 3 ? ` and ${senders.length - 3} more` : "");
+  return `<overflow count="${events.length}">+${events.length} more addressed event(s) not shown (sequence ${first}-${last}, from ${escapeXml(from)}); ` +
+    `they count as delivered and will not be injected again; read them with mesh.read({ after: ${first - 1}, limit: ${last - first + 1} }) if you need them.</overflow>`;
 };
 
 /** A single passive summary, never stale event bodies or a batch of work to act on. */
@@ -579,11 +638,17 @@ export const rootInboxSummary = (batch: RootInboxBatch) => ({
   display: true,
   details: { skippedStale: batch.skippedStale ?? 0, horizonMs: batch.horizonMs ?? INBOX_HORIZON_MS },
 });
-/** The one message that brings a batch into the session. */
-export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
+/**
+ * The one message that brings a batch into the session. Without an explicit `overflow`, the batch
+ * is cut to the injection budget itself; every event id (shown or summarized) is in details.
+ */
+export const rootInboxMessage = (batch: readonly MeshEvent[], overflow?: readonly MeshEvent[]) => {
+  const { shown: events, overflow: rest } = overflow === undefined ? rootInboxBudget(batch) : { shown: [...batch], overflow: [...overflow] };
+  const all = [...events, ...rest];
+  return {
   customType: ROOT_INBOX_CUSTOM_TYPE,
   content: [
-    `<fabric-inbox count="${events.length}">`,
+    `<fabric-inbox count="${all.length}"${rest.length ? ` shown="${events.length}"` : ""}>`,
     "Work events addressed to you that no steer or follow-up delivered (a shadow copy can repeat a message you already saw):",
     ...events.map((event) => {
       const data = (event.data && typeof event.data === "object" ? event.data : {}) as { ref?: unknown; key?: unknown };
@@ -596,8 +661,10 @@ export const rootInboxMessage = (events: readonly MeshEvent[]) => ({
       ];
       return `<event ${attributes.join(" ")}>${escapeXml(bounded(event.text ?? "", event.sequence))}</event>`;
     }),
+    ...(rest.length ? [overflowLine(rest)] : []),
     "</fabric-inbox>",
   ].join("\n"),
   display: true,
-  details: { ids: events.map((event) => event.id), receipts: events.flatMap(eventReceipts) },
-});
+  details: { ids: all.map((event) => event.id), receipts: all.flatMap(eventReceipts) },
+  };
+};

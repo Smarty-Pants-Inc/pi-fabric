@@ -680,6 +680,18 @@ export const isMeshLockTimeout = (error: unknown): error is Error & { code: type
 export const isMeshWriteDeferred = (error: unknown): error is Error =>
   isMeshLockTimeout(error) || (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
 
+/** A permission or read-only refusal (EACCES/EPERM/EROFS, also as a cause): an immediate
+ * retry fails the same way, so a background owner must back off, never re-arm at once. */
+const PERMANENT_FS_RETRY_MAX_MS = 1_000;
+const isPermanentFsRefusal = (error: unknown): boolean => {
+  for (let cause = error, depth = 0; cause && typeof cause === "object" && depth < 4; depth++) {
+    const code = (cause as { code?: unknown }).code;
+    if (code === "EACCES" || code === "EPERM" || code === "EROFS") return true;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return false;
+};
+
 /** Best-effort protocol writes may swallow conflicts, but not a retryable lock wait. */
 export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   if (isMeshLockTimeout(error)) throw error;
@@ -725,6 +737,15 @@ export class MeshBackgroundRetry {
   }
   failure(error: unknown): boolean {
     const transient = isMeshWriteDeferred(error);
+    if (!transient && isPermanentFsRefusal(error)) {
+      // Still a failure, never lock recovery admission. But event-driven owners (#792) re-wake
+      // on events, and a failed attempt's own side effects are events (a refresh that cannot
+      // take a read-only registry lock still renews its watched host-lease file). Resetting
+      // here would re-arm that loop at once; back off on the shared #809 window instead,
+      // capped at 1 s so a restored directory (or a Windows sharing-violation EPERM) recovers promptly.
+      this.#backoff(error, "filesystem access refused; retrying", "filesystem access recovered", PERMANENT_FS_RETRY_MAX_MS);
+      return false;
+    }
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
@@ -743,12 +764,13 @@ export class MeshBackgroundRetry {
    * for unrelated operation errors. The owner retains its obligation and attempt cap. */
   fault(error: unknown): void { this.#backoff(error, "observed fault; retrying", "observed fault recovered"); }
 
-  #backoff(error: unknown, reason: string, recovered: string): void {
+  #backoff(error: unknown, reason: string, recovered: string, capMs = this.maxMs): void {
     this.#recovered = recovered;
-    this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
+    const ceiling = Math.max(this.minMs, Math.min(this.maxMs, capMs));
+    this.#delay = Math.min(ceiling, Math.max(this.minMs, this.#delay * 2));
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.
-    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, this.maxMs));
+    const delayMs = Math.max(1, retryDelayMs(0, this.#delay, ceiling));
     const now = Date.now();
     this.#retryAt = now + delayMs;
     const elapsedMs = this.#lastReportedAt === undefined ? Infinity : now - this.#lastReportedAt;

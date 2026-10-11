@@ -233,6 +233,40 @@ describe("background mesh retry warning rate limit", () => {
     ]);
   });
 
+  // #792 hang: a read-only actor root made every participant refresh fail with EACCES at once,
+  // and that failed attempt's own host-lease renewal re-woke the event-driven lifecycle broker,
+  // whose canConsumeMesh gate re-ran the refresh: 84k-131k warnings at 100% CPU instead of 497.
+  it("backs off a permission/read-only refusal instead of re-arming it at once", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const retry = new MeshBackgroundRetry("refresh");
+    const refusal = (code: string) => Object.assign(new Error(`${code}: permission denied, mkdir 'actors.json.lock'`), { code });
+    let attempts = 0;
+    const refused = () => { attempts++; throw refusal("EACCES"); };
+    expect(await retry.run(refused)).toBe("failed"); // still a failure, never lock-retry admission
+    expect(retry.waitMs).toBeGreaterThan(0);
+    // A re-wake caused by the failed attempt itself is skipped, not re-run.
+    for (let i = 0; i < 1_000; i++) expect(await retry.run(refused)).toBe("skipped");
+    expect(attempts).toBe(1);
+    // Capped at 1 s, so a restored directory (or a transient Windows EPERM) recovers promptly.
+    for (const error of [refusal("EROFS"), refusal("EPERM"), new Error("wrapped", { cause: refusal("EACCES") }),
+      refusal("EACCES"), refusal("EACCES")]) {
+      vi.advanceTimersByTime(1_000);
+      expect(retry.waitMs).toBe(0);
+      expect(await retry.run(() => { throw error; })).toBe("failed");
+      expect(retry.waitMs).toBeGreaterThan(0);
+      expect(retry.waitMs).toBeLessThanOrEqual(1_000);
+    }
+    // One line per #809 window, carrying the cause; recovery is summarized once the window passes.
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]![0]).toMatch(/^\[pi-fabric\] refresh: filesystem access refused; retrying in \d+ ms: EACCES: permission denied/);
+    vi.setSystemTime(61_000);
+    expect(await retry.run(() => undefined)).toBe("done");
+    expect(retry.waitMs).toBe(0);
+    expect(warn.mock.calls[1]![0]).toBe("[pi-fabric] refresh: filesystem access recovered (5 similar retries suppressed in the last 61s)");
+  });
+
   it("reads the window from PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS, defaulting to 60 s", () => {
     for (const [value, expected] of [[undefined, 60_000], ["", 60_000], [" ", 60_000], ["abc", 60_000], ["0", 60_000],
       ["-5", 60_000], ["Infinity", 60_000], ["1500", 1_500], ["2.9", 2]] as const) {

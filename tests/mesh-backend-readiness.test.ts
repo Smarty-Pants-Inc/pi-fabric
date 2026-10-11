@@ -142,9 +142,65 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(lockOwner.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 9 unknown lock-owner .lock)");
     expect(await backendOf(root)).toBe("none");
     // --accept-unready is the override, recorded in the intent before the switch.
-    const accepted = await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { writers: [{ pid: 8, release: "unknown", mode: "sqlite" }] });
+    const accepted = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "fabric@unknown"], { writers: [{ pid: 8, release: "unknown", mode: "sqlite" }] });
     expect(accepted.code, accepted.err).toBe(0);
     expect(records(root)[0]).toMatchObject({ phase: "intent", acceptedUnready: [{ name: "fabric@unknown" }] });
+  });
+
+  // smarty-dev#9436: an accepted override alarms its owner and the chief-of-staff copy, addressed, never a broadcast.
+  const ownerAlarms = async (root: string) => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const store = new MeshStore(root, 256 * 1024, 500);
+    try { return store.read({ topic: "ops.owner" }).filter(event => event.kind === "mesh-backend.accepted-unready"); }
+    finally { store.closeState(); }
+  };
+  const anonymousWriter = { writers: [{ pid: 8, release: "unknown", mode: "sqlite" }] };
+
+  it("refuses --accept-unready without --alarm-owner and --alarm-cc: an override always names who is alarmed (smarty-dev#9436)", async () => {
+    const root = await fileRoot();
+    for (const extra of [[], ["--alarm-owner", "session:owner"], ["--alarm-cc", "session:chief"]]) {
+      const refused = await run(["cutover", "--root", root, ...extra, "--accept-unready", "fabric@unknown"], anonymousWriter);
+      expect(refused.code).toBe(2);
+      expect(refused.err).toContain("--accept-unready needs --alarm-owner ROOT and --alarm-cc ROOT");
+    }
+    expect(await backendOf(root)).toBe("none");
+    expect(records(root)).toEqual([]);
+  });
+
+  it("an accepted override alarms the owner and the chief-of-staff copy before the switch, and records it (smarty-dev#9436)", async () => {
+    const root = await fileRoot();
+    const accepted = await run(["cutover", "--root", root, "--json", "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+      "--accept-unready", "fabric@unknown"], anonymousWriter);
+    expect(accepted.code, accepted.err).toBe(0);
+    const alarms = await ownerAlarms(root);
+    expect(alarms.map(event => event.to)).toEqual(["session:owner", "session:chief"]); // each addressed: no broadcast
+    expect(alarms[0]).toMatchObject({ topic: "ops.owner", data: { phase: "before the switch", accepted: [{ name: "fabric@unknown" }],
+      owner: "session:owner", cc: "session:chief" } });
+    expect(alarms[0]!.text).toContain("accepted unready reader(s) by --accept-unready");
+    const overrideAlarm = { owner: "session:owner", cc: "session:chief", accepted: ["fabric@unknown"], events: alarms.map(event => event.id) };
+    expect(JSON.parse(accepted.out)).toMatchObject({ ok: true, overrideAlarm });
+    const [intent, outcome] = records(root);
+    expect(intent).toMatchObject({ phase: "intent", overrideAlarm });
+    expect(outcome).toMatchObject({ phase: "outcome", ok: true, overrideAlarm });
+  });
+
+  it("refuses the switch when the override alarm cannot be raised, and alarms nothing when nothing was accepted (smarty-dev#9436)", async () => {
+    const root = await fileRoot();
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const publish = vi.spyOn(MeshStore.prototype, "publish").mockRejectedValue(new Error("event log unwritable"));
+    const refused = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+      "--accept-unready", "fabric@unknown"], anonymousWriter);
+    publish.mockRestore();
+    expect(refused.code).toBe(3);
+    expect(refused.err).toContain("the accepted-override alarm to session:owner and session:chief could not be raised: event log unwritable");
+    expect(await backendOf(root)).toBe("none");
+    expect(records(root)).toEqual([]);
+    // The flags without an unready reader to accept: the switch is ready on its own and alarms nobody.
+    expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0);
+    const ready = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief",
+      "--accept-unready", "fabric@unknown"]);
+    expect(ready.code, ready.err).toBe(0);
+    expect(await ownerAlarms(root)).toEqual([]);
   });
 
   it("lets reader-proof prove only this Fabric release, and install only non-Fabric proofs", async () => {
@@ -185,7 +241,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     fs.chmodSync(path.join(root, "readers", "factory.json"), 0o666);
     expect(readerReadiness(root, "sqlite", required, { fromEpoch: 0, toEpoch: 1 }).unready[0]!.reason).toMatch(/proof file is group\/other-writable/);
     fs.chmodSync(path.join(root, "readers"), 0o777);
-    const result = await run(["cutover", "--root", root, "--accept-unready", "factory"], { builtins: [{ name: "factory", installRoot: factory }] });
+    const result = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory"], { builtins: [{ name: "factory", installRoot: factory }] });
     expect(result.code).toBe(3);
     expect(result.err).toContain("is group/other-writable (mode 777)");
     expect(await backendOf(root)).toBe("none");
@@ -412,7 +468,7 @@ sys.stdin.readline()`;
         expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (a write lease was refused: another process has it open; smarty-dev#7936))`);
         expect(await backendOf(root)).toBe("importing");
         // Accept-only, by name.
-        expect((await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { procScan: { listPids: () => [] } })).code).toBe(3);
+        expect((await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "fabric@unknown"], { procScan: { listPids: () => [] } })).code).toBe(3);
       } finally { await holder.release(); }
     });
   }
@@ -449,7 +505,7 @@ sys.stdin.readline()`;
   it.skipIf(binSkip !== "")(`end to end: a lock-free opener between the probe's F_UNLCK and its close is refused${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const pause = tempDir("pause");
-    const child = spawn(process.execPath, [BIN, "cutover", "--root", root, "--accept-unready", "factory,fabric@unknown"], {
+    const child = spawn(process.execPath, [BIN, "cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory,fabric@unknown"], {
       env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "", FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK: pause }, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr!.on("data", (data: Buffer) => { stderr += String(data); });
@@ -486,11 +542,11 @@ sys.stdin.readline()`;
       env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "" } });
     const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
     try {
-      const refused = cli("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown");
+      const refused = cli("cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory,fabric@unknown");
       expect(refused.status).toBe(3);
       expect(refused.stderr).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db`);
     } finally { await holder.release(); }
-    const ready = cli("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown");
+    const ready = cli("cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory,fabric@unknown");
     expect(ready.status, ready.stderr).toBe(0);
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
@@ -824,7 +880,7 @@ exec sleep 30
     expect(missing.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): helper ${path.join(root, "no-helper")} is missing (bun run build))`);
     expect(probeStateDbLeases(root, { leasesEnable: "0" })[0]!.reason).toContain("/proc/sys/fs/leases-enable is 0");
     expect(probeStateDbLeases(root, { platform: "darwin" })[0]!.reason).toContain("not Linux");
-    const accepted = await run(["cutover", "--root", root, "--accept-unready", "holder@lease-probe"],
+    const accepted = await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "holder@lease-probe"],
       { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });
     expect(accepted.code, accepted.err).toBe(0);
   });
@@ -849,8 +905,8 @@ exec sleep 30
     expect(refused.code).toBe(3);
     expect(refused.err).toContain(`holder@${other} (ambiguous state.db holder: pid ${other} `);
     expect(refused.err).toContain("/proc/locks unusable (EACCES: /proc/locks)");
-    expect((await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { procScan })).code).toBe(3);
-    expect((await run(["cutover", "--root", root, "--accept-unready", `holder@${other}`], { procScan })).code).toBe(0);
+    expect((await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "fabric@unknown"], { procScan })).code).toBe(3);
+    expect((await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", `holder@${other}`], { procScan })).code).toBe(0);
     // An unparsable /proc/locks fails closed the same way.
     const garbled = await fileRoot();
     const result = await run(["cutover", "--root", garbled], { procScan: { ...procScan, readLocks: () => "not a lock line\n" } });
@@ -878,7 +934,7 @@ exec sleep 30
     const refused = await run(["cutover", "--root", root], { unknown, procScan: { platform: "darwin" } });
     expect(refused.code).toBe(3);
     expect(refused.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 0 unknown state-database");
-    expect((await run(["cutover", "--root", root, "--accept-unready", "fabric@unknown"], { unknown, procScan: { platform: "darwin" } })).code).toBe(0);
+    expect((await run(["cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "fabric@unknown"], { unknown, procScan: { platform: "darwin" } })).code).toBe(0);
     // On Linux the same census evidence is resolved by the holder scan instead (here: nobody else).
     const linux = await fileRoot();
     expect((await run(["cutover", "--root", linux], { unknown, procScan: { platform: "linux", listPids: () => [] } })).code).toBe(0);
@@ -972,7 +1028,7 @@ describe("fabric-mesh-backend readiness gate: proofs that cannot be trusted", ()
       expect((await run(["reader-proof", "--root", root, "--name", "factory", "--proof-file", file])).code).toBe(1);
       const everyName = "factory,fabric@unknown,fabric@fabric-rel-a,holder@1,holder@-1";
       for (const [mesh, command] of [[root, "cutover"], [root, "import"], [withProof, "cutover"], [unsafe, "cutover"], [unsafe, "import"]] as const) {
-        const refused = await run([command, "--root", mesh, "--accept-unready", everyName],
+        const refused = await run([command, "--root", mesh, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", everyName],
           { builtins, writers: [{ pid: 9, release: "fabric-rel-a", mode: "sqlite" }], unknown: [{ pid: 0, release: "unknown", mode: "unknown lock-owner" }] });
         expect(refused.code).toBe(3);
         expect(refused.err).toContain("the readiness gate cannot verify reader proofs on this platform (no POSIX owner; Windows ACL checks: smarty-dev#7548)");

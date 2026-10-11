@@ -106,7 +106,11 @@ POSIX owner (no `process.geteuid`), so nothing can be verified there and the gat
 `reader-proof` refuses to write, and `cutover` and `import` refuse whether or not `readers/` exists;
 no `--accept-unready` lifts it (until Windows ACL checks exist: smarty-dev#7548).
 
-`--accept-unready NAME,...` is the only override.
+`--accept-unready NAME,...` is the only override. It requires `--alarm-owner ROOT` and `--alarm-cc ROOT` (the
+chief-of-staff copy; Fabric has no resolver for it): when the gate accepts an unready reader, the CLI publishes one
+`ops.owner` event of kind `mesh-backend.accepted-unready` addressed to each root, never a broadcast, BEFORE the switch,
+and refuses the switch if it cannot. A reader first accepted under the fence is alarmed after the switch. The roots,
+the accepted readers and the event ids are in the switch records and the JSON result (`overrideAlarm`; smarty-dev#9436).
 
 Order of a switch (crash reruns included):
 

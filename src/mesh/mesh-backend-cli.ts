@@ -16,7 +16,8 @@ const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-ro
 type Command = typeof COMMANDS[number];
 
 const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback|abort-rollback> --root DIR [--json]
-                          [--lock-protocol 1|2] [--lock-timeout-ms N] [--accept-unready NAME,...]
+                          [--lock-protocol 1|2] [--lock-timeout-ms N]
+                          [--accept-unready NAME,... --alarm-owner ROOT --alarm-cc ROOT]
                           [--require-reader NAME=INSTALL_ROOT]...
        fabric-mesh-backend import --scratch-proof-from STATE_JSON [--scratch-parent DIR] [--json]
        fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
@@ -41,7 +42,9 @@ Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refus
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
 release. Required: each distinct release of a live Fabric writer (host leases and process records),
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
-only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
+only override. It needs --alarm-owner ROOT and --alarm-cc ROOT (the chief-of-staff copy): an accepted override
+alarms both (mesh ops.owner, addressed to each root, never a broadcast) before the switch, else it refuses
+(smarty-dev#9436). The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
@@ -89,6 +92,8 @@ interface Options {
   acceptUnready: string[]; requireReaders: InstalledReader[]; name?: string; backend?: ReaderBackend; readerVersion?: string; proofFile?: string;
   /** smarty-dev#9404: import a fresh scratch copy of this state.json, gate skipped; `root` is then unset until made. */
   scratchProofFrom?: string; scratchParent?: string;
+  /** smarty-dev#9436: the roots an accepted override alarms: its owner and the chief-of-staff copy. */
+  alarmOwner?: string; alarmCc?: string;
 }
 
 class UsageError extends Error {}
@@ -108,6 +113,12 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let proofFile: string | undefined;
   let scratchProofFrom: string | undefined;
   let scratchParent: string | undefined;
+  let alarmOwner: string | undefined;
+  let alarmCc: string | undefined;
+  const alarmRoot = (flag: string, value: string): string => {
+    if (!/^[^\s]{1,256}$/.test(value)) throw new UsageError(`Bad ${flag} ${value} (a participant or root id, no spaces)`);
+    return value;
+  };
   const requireReaders: InstalledReader[] = [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
@@ -133,6 +144,8 @@ const parseArgs = (argv: string[]): Options | "help" => {
     else if (flag === "--proof-file") proofFile = value;
     else if (flag === "--scratch-proof-from") scratchProofFrom = value;
     else if (flag === "--scratch-parent") scratchParent = value;
+    else if (flag === "--alarm-owner") alarmOwner = alarmRoot(flag, value);
+    else if (flag === "--alarm-cc") alarmCc = alarmRoot(flag, value);
     else if (flag === "--require-reader") {
       const [readerName, installRoot] = [value.slice(0, value.indexOf("=")), value.slice(value.indexOf("=") + 1)];
       // Flags only ADD readers: a built-in's trusted root can never be replaced from the command line.
@@ -155,11 +168,16 @@ const parseArgs = (argv: string[]): Options | "help" => {
       ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) };
   }
   if (!root) throw new UsageError("--root DIR is required");
+  // smarty-dev#9436: an override is never silent: it names who is alarmed when it is accepted.
+  if (acceptUnready.length > 0 && (alarmOwner === undefined || alarmCc === undefined)) {
+    throw new UsageError("--accept-unready needs --alarm-owner ROOT and --alarm-cc ROOT (the chief-of-staff copy): an accepted override alarms both");
+  }
   if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
     throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
   }
   return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
     ...(proofFile === undefined ? {} : { proofFile }),
+    ...(alarmOwner === undefined ? {} : { alarmOwner }), ...(alarmCc === undefined ? {} : { alarmCc }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
     ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }) };
 };
@@ -353,7 +371,36 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
   }
 };
 
-interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
+interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[];
+  overrideAlarm?: OverrideAlarm }
+
+/** smarty-dev#9436: what an accepted override alarmed: the roots, the readers, the published event ids. */
+interface OverrideAlarm { owner: string; cc: string; accepted: string[]; events: string[]; failed?: string }
+
+export const OVERRIDE_ALARM_KIND = "mesh-backend.accepted-unready";
+
+/**
+ * Raises the accepted-override alarm (smarty-dev#9436): one ops.owner event addressed to the owner and one to the
+ * chief-of-staff copy, never a broadcast. Event log only, outside the fence; the store is closed at once, so this
+ * process's census record never joins the gate's inventory.
+ */
+const raiseOverrideAlarm = async (options: Options, accepted: ReaderReadiness["unready"], phase: string): Promise<string[]> => {
+  const { MeshStore } = await import("./store.js");
+  const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol });
+  try {
+    const text = `fabric-mesh-backend ${options.command} on ${options.root} accepted unready reader(s) by --accept-unready (${phase}): `
+      + `${accepted.map(reader => `${reader.name} (${reader.reason})`).join("; ")} (smarty-dev#9436)`;
+    const events: string[] = [];
+    for (const to of [options.alarmOwner!, options.alarmCc!]) {
+      const event = await store.publish({ topic: "ops.owner", kind: OVERRIDE_ALARM_KIND, to, text,
+        from: { id: "fabric-mesh-backend", name: "fabric-mesh-backend", kind: "agent" },
+        data: { root: options.root, command: options.command, phase, accepted: accepted.map(reader => ({ name: reader.name, reason: reader.reason })),
+          owner: options.alarmOwner, cc: options.alarmCc } });
+      events.push(event.id);
+    }
+    return events;
+  } finally { store.closeState(); }
+};
 
 /**
  * The readiness gate of a switch to sqlite (smarty-dev#7815). The required readers come from the
@@ -419,9 +466,21 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   }
   const readiness = evaluate(window, "", required);
   const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [], stop: () => fencedWatch?.stop() };
+  // smarty-dev#9436: every unready reader that passed `evaluate` was accepted by --accept-unready: alarm its owner and
+  // the chief-of-staff copy BEFORE the switch, or refuse it (an accepted override is never silent).
+  if (readiness.unready.length > 0) {
+    try {
+      gate.overrideAlarm = { owner: options.alarmOwner!, cc: options.alarmCc!, accepted: readiness.unready.map(reader => reader.name),
+        events: await raiseOverrideAlarm(options, readiness.unready, "before the switch") };
+    } catch (error) {
+      throw new MeshBackendRefusedError(`the accepted-override alarm to ${options.alarmOwner} and ${options.alarmCc} could not be raised: `
+        + `${(error as Error).message} (an accepted --accept-unready is never silent; smarty-dev#9436)`);
+    }
+  }
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
-      required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
+      required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready,
+      ...(gate.overrideAlarm ? { overrideAlarm: gate.overrideAlarm } : {}) });
   } catch (error) {
     throw new MeshBackendRefusedError(`cannot write the switch record ${options.root}/backend-switches.jsonl: ${(error as Error).message}`);
   }
@@ -536,9 +595,23 @@ export const main = async (argv: string[], io: {
           : abortMeshRollback(options.root, library))) };
     if (gate) {
       const final = gate.final ?? gate.readiness;
+      // A reader first accepted under the fence (after the alarm above) alarms now, after the fence is released.
+      const late = final.unready.filter(reader => !(gate!.overrideAlarm?.accepted ?? []).includes(reader.name));
+      if (late.length > 0) {
+        const alarm: OverrideAlarm = gate.overrideAlarm ?? { owner: options.alarmOwner!, cc: options.alarmCc!, accepted: [], events: [] };
+        try { alarm.events.push(...await raiseOverrideAlarm(options, late, "under the fence")); }
+        catch (error) {
+          alarm.failed = (error as Error).message;
+          warn(`fabric-mesh-backend: ALARM accepted-override alarm failed after the switch: ${alarm.failed} (smarty-dev#9436)\n`);
+        }
+        alarm.accepted.push(...late.map(reader => reader.name));
+        gate.overrideAlarm = alarm;
+      }
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
+      if (gate.overrideAlarm) result.overrideAlarm = gate.overrideAlarm;
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
-        checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
+        checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready,
+        ...(gate.overrideAlarm ? { overrideAlarm: gate.overrideAlarm } : {}) });
     }
     write(`${options.json ? JSON.stringify({ command: options.command, ok: true, ...result, alarms }, null, 2) : formatResult(options.command, result)}\n`);
     return 0;

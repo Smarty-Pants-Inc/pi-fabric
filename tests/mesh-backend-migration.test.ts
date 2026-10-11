@@ -429,7 +429,7 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     let err = "";
     // ponytail: off Linux there is no state.db holder scan, so the gate's own state.db connection stays
     // fabric@unknown under the fence (fail closed, smarty-dev#7936): accept it there.
-    const code = await main(["cutover", "--root", other, ...(process.platform === "linux" ? [] : ["--accept-unready", "fabric@unknown"])], {
+    const code = await main(["cutover", "--root", other, ...(process.platform === "linux" ? [] : ["--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "fabric@unknown"])], {
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
@@ -917,11 +917,11 @@ describe("fabric-mesh-backend CLI", () => {
     // The census itself never blocks (smarty-dev#6982), but the reader readiness gate (smarty-dev#7815)
     // requires unattributable live evidence as fabric@unknown: refused unless accepted explicitly.
     expect((await run("cutover", "--root", root, "--assume-no-writers")).code).toBe(2);
-    const gated = await run("cutover", "--root", root, "--accept-unready", "factory");
+    const gated = await run("cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory");
     expect(gated.code).toBe(3);
     expect(gated.err).toContain("fabric@unknown (live writer evidence without an attributable release: pid 0 unknown process-record torn.json");
     expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
-    const cutover = await run("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown", "--json");
+    const cutover = await run("cutover", "--root", root, "--alarm-owner", "session:owner", "--alarm-cc", "session:chief", "--accept-unready", "factory,fabric@unknown", "--json");
     expect(cutover.code, cutover.err).toBe(0);
     expect(cutover.err).toMatch(/fabric-mesh-backend: advisory: 0 writers, 1 unknown/);
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1 });

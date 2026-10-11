@@ -167,8 +167,14 @@ checks the schema and writes it under the fence:
 
 1. `release = basename(realpath(<its release root>/current))` of the running install.
 2. `provedEpoch` = `epoch` from `fabric-mesh-backend status --root <mesh> --json`.
-3. Copy `<mesh>/state.json` into an empty scratch directory and run
-   `fabric-mesh-backend import --root <scratch>` there.
+3. Create an empty private scratch directory (`mkdir -m 700`), copy `<mesh>/state.json` into it and run
+   `fabric-mesh-backend import --root <scratch> --scratch-proof --json` there. Check that the output has
+   `"ok": true` and `"scratchProof": true`. `--scratch-proof` skips the readiness gate, because the reader being
+   proved has no proof yet. It runs only on a provably private copy: a real directory owned by you, mode 0700,
+   holding nothing but the copied `state.json`. Anything else (`readers/`, a writer census,
+   `backend-switches.jsonl`, `actors/`, a `state.db`) is refused (exit 3), so it can never switch a live mesh.
+   No `--accept-unready` is needed. A refused or failed import removes the `state.db` files it created, so the
+   scratch directory is left as it was.
 4. Read every entry from `<scratch>` with its own SQLite read path; fail on any error or a count
    other than the import's `entries`.
 5. Write the proof JSON (format above) to a private temp file and run

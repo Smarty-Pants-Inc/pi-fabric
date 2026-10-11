@@ -36,7 +36,7 @@ it.runIf(process.env.FABRIC_4313_REAL_PI === "1")("installed Pi: native new/resu
     });
     client.onEvent(event => events[name]!.push(event)); clients.push(client); return client;
   };
-  let hold: Promise<void> | undefined;
+  let hold: Promise<unknown> | undefined;
   const identities: Record<string, unknown> = {};
   let outcome: unknown;
   try {

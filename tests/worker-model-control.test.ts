@@ -11,7 +11,7 @@ const setup = (
   admission: "strict" | "permissive" = "strict",
 ) => {
   const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
-  const control = new PiModelControl("run", selector, thinking, io, admission);
+  const control = new PiModelControl("run", selector, thinking, io, false, false, false, admission);
   const reply = (data?: unknown, success = true) => {
     const sent = io.send.mock.calls.at(-1)![0];
     control.observe({ type: "response", id: sent.id, command: sent.type, success, data, error: success ? undefined : "denied" });

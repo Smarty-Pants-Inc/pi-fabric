@@ -148,14 +148,14 @@ describe("headless approvals", () => {
     const policies = { read: "allow", write: "ask", execute: "ask", network: "ask", agent: "ask" } as const;
     const headless = vi.fn(async () => true);
     const noUi = { hasUI: false } as ExtensionContext;
-    await expect(new ApprovalController(policies, noUi, undefined, undefined, undefined, undefined, headless).approve(action))
+    await expect(new ApprovalController(policies, noUi, undefined, undefined, undefined, undefined, false, headless).approve(action))
       .rejects.toThrow(/no interactive UI/);
     expect(headless).not.toHaveBeenCalled();
     const decisionPolicies = { ...policies, headless: "decision" as const };
-    await new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, headless).approve(action);
+    await new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, false, headless).approve(action);
     expect(headless).toHaveBeenCalledWith(action, undefined);
     const denying = vi.fn(async () => false);
-    await expect(new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, denying).approve(action))
+    await expect(new ApprovalController(decisionPolicies, noUi, undefined, undefined, undefined, undefined, false, denying).approve(action))
       .rejects.toThrow(/denied, cancelled, or expired/);
     // No handler wired: still fail closed.
     await expect(new ApprovalController(decisionPolicies, noUi).approve(action)).rejects.toThrow(/no interactive UI/);

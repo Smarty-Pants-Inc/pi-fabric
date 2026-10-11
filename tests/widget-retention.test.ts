@@ -29,7 +29,7 @@ describe("widget display-only completion retention", () => {
     current.agents = [{ ...agent("finished", 10_000), status }];
     const stored = structuredClone(current);
     const retention = new FabricWidgetRetention();
-    const widget = new FabricWidget(theme, () => current, 10, undefined, retention);
+    const widget = new FabricWidget(theme, () => current, 10, undefined, false, retention);
     expect(widget.render(160)).toHaveLength(2);
     vi.setSystemTime(39_999); current = { ...current, now: Date.now() };
     expect(widget.render(160).join("\n")).toContain("finished");
@@ -106,7 +106,7 @@ describe("widget display-only completion retention", () => {
     current.agents.push({ ...agent("resident", 1), status: "idle", residency: "durable" });
     current.now = 100_000;
     expect(shouldShowFabricWidget(current, "auto", retention)).toBe(true);
-    expect(new FabricWidget(theme, () => current, 8, undefined, retention).render(160).join("\n")).toContain("resident");
+    expect(new FabricWidget(theme, () => current, 8, undefined, false, retention).render(160).join("\n")).toContain("resident");
     current.agents = [];
     current.actors = [{ id: "actor", name: "actor", status: "idle", worker: agent("worker", 1) } as FabricDashboardSnapshot["actors"][number]];
     const lines = new FabricWidget(theme, () => current, 8).render(160);

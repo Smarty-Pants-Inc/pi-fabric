@@ -9,6 +9,8 @@ const scanControl = vi.hoisted(() => ({
   calls: 0,
   files: [] as string[][],
   resolvers: [] as Array<() => void>,
+  // Upstream retry tests need scans to complete without a manual release.
+  autoResolve: false,
   signals: [] as Array<AbortSignal | undefined>,
 }));
 
@@ -26,6 +28,7 @@ vi.mock("../src/entropy/sessions.js", async (importOriginal) => {
       scanControl.calls += 1;
       scanControl.files.push([...files]);
       scanControl.signals.push(options.signal);
+      if (scanControl.autoResolve) return actual.sessionWindowEvidenceAsync(files, options);
       return new Promise<void>((resolve) => scanControl.resolvers.push(resolve))
         .then(() => actual.sessionWindowEvidenceAsync(files, options));
     },
@@ -78,6 +81,7 @@ const tempRoots: string[] = [];
 afterEach(() => {
   scanControl.calls = 0;
   scanControl.files.length = 0;
+  scanControl.autoResolve = false;
   activeSurface.clearActiveCompiledSurface();
   scanControl.resolvers.length = 0;
   scanControl.signals.length = 0;
@@ -125,7 +129,7 @@ const retryHarness = async () => {
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
   const file = path.join(root, "session.jsonl");
   fs.writeFileSync(file, "");
-  scanControl.files = [file];
+  scanControl.autoResolve = true;
   const harness = createHarness();
   await piFabric(harness.pi);
   const context = {

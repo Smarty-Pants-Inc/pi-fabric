@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import crypto, { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -101,6 +101,41 @@ describe("the unpinned release removes its lock through transient Windows rmdir 
     expect(rmdir.mock.calls.filter(([file]) => String(file) === lock)).toHaveLength(10);
     expect(fs.existsSync(lock)).toBe(true); // left empty for the ownerless-lock recovery
     expect(fs.readdirSync(lock)).toEqual([]);
+    expect(warn.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+});
+
+// pi-fabric#889 review: the unpinned release's short random name can collide; the move must never replace it.
+describe("the unpinned release never replaces an entry at its random name", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  it.each(["file", "symlink"] as const)("a pre-created %s at the first name survives, and the release completes under the next", kind => {
+    const lock = lockIn();
+    hold(lock, "A\n");
+    const victim = path.join(path.dirname(lock), "victim");
+    fs.writeFileSync(victim, "victim\n");
+    const planted = path.join(lock, "r.aaaaaaaa");
+    if (kind === "file") fs.writeFileSync(planted, "planted\n");
+    else fs.symlinkSync(victim, planted);
+    const names = [Buffer.from("aaaaaaaa", "hex"), Buffer.from("bbbbbbbb", "hex")];
+    vi.spyOn(crypto, "randomBytes").mockImplementation((() => names.shift() ?? Buffer.from("cccccccc", "hex")) as typeof crypto.randomBytes);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    releaseFenceLock(lock, "A\n", {}, undefined);
+    expect(fs.readFileSync(victim, "utf8")).toBe("victim\n");
+    if (kind === "file") expect(fs.readFileSync(planted, "utf8")).toBe("planted\n");
+    else expect(fs.readlinkSync(planted)).toBe(victim);
+    // Released under r.bbbbbbbb: our owner is gone; the planted entry keeps <lock> non-empty (never ours to remove).
+    expect(fs.readdirSync(lock)).toEqual(["r.aaaaaaaa"]);
+  });
+
+  it("fails closed after 5 collisions: the owner stays in place", () => {
+    const lock = lockIn();
+    hold(lock, "A\n");
+    fs.writeFileSync(path.join(lock, "r.aaaaaaaa"), "planted\n");
+    vi.spyOn(crypto, "randomBytes").mockImplementation((() => Buffer.from("aaaaaaaa", "hex")) as typeof crypto.randomBytes);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    releaseFenceLock(lock, "A\n", {}, undefined);
+    expect(owner(lock)).toBe("A\n");
+    expect(fs.readFileSync(path.join(lock, "r.aaaaaaaa"), "utf8")).toBe("planted\n");
     expect(warn.mock.calls.length).toBeLessThanOrEqual(1);
   });
 });

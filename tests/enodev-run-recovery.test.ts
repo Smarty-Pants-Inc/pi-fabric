@@ -3,7 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ActorManager } from "../src/actors/manager.js";
 import { settleEnodevRun, settleLostEnodevRun } from "../src/agents/enodev-recovery.js";
+import { MeshStore } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
@@ -93,6 +95,45 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     expect(settleEnodevRun(mismatched, ACTOR, "item-1")).toBeUndefined();
     for (const directory of [other, nested, missing, mismatched]) expect(vetoed(directory)).toBe(true);
   });
+
+  // Through the real ActorManager restore: the restored in-flight item asks for a run with its activationId, and the
+  // earlier ENODEV-unconfirmed run's saved answer completes it. Only the process launch is stubbed.
+  it("a restarted actor gets its interrupted activation's saved answer once, with no new launch", async () => {
+    const root = tempRoot();
+    const runRoot = path.join(root, "runs");
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const actors = (agents: AgentManager) => new ActorManager("reload", { id: "session:reload", name: "main", kind: "main", sessionId: "reload" },
+      mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, meshCursorPath: path.join(root, "actors", "mesh-cursor.json") });
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true };
+    const first = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
+    const before = actors(first);
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS interrupted" });
+    await vi.waitFor(() => expect(before.status(actor.id).status).toBe("running"), { timeout: 10_000, interval: 20 });
+    const id = fs.readdirSync(runRoot).find(name => /^[a-f0-9]{32}$/.test(name))!;
+    await before.close();
+    await first.close();
+    // The pre-#849 outcome: the worker completed and saved its answer, but its exit stayed unconfirmed (ENODEV).
+    const directory = path.join(runRoot, id);
+    const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...status, status: "running", sessionId: String(deadPid()), transport: "process" }));
+    fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
+    fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "SAVED_ANSWER" }));
+    const second = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
+    const launched = vi.spyOn(second, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const after = actors(second);
+    try {
+      await vi.waitFor(() => expect(after.status(actor.id)).toMatchObject({ lastRunId: id }), { timeout: 15_000, interval: 20 });
+      await vi.waitFor(() => expect(after.status(actor.id).status).toBe("idle"), { timeout: 10_000, interval: 20 });
+      expect(launched).not.toHaveBeenCalled();
+      expect(vetoed(directory)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "SAVED_ANSWER" });
+    } finally {
+      await after.close();
+      await second.close();
+    }
+  }, 60_000);
 
   it("settles a run as lost when its activation is no longer pending, and logs it once", () => {
     const runRoot = tempRoot();

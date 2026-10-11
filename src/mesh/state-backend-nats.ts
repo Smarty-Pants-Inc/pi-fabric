@@ -155,6 +155,20 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
 }
 
 /**
+ * `sync()` on a backend opened with `acceptPeriodicSync` (the server does not fsync every write): an acked commit
+ * is on disk only after the server's sync interval, so durability cannot be confirmed. Not retryable: the caller must
+ * not advance an external cursor or delivered mark on it (smarty-dev#9313).
+ */
+export class MeshStateNatsNotDurableError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_NOT_DURABLE";
+  readonly retryable = false;
+  constructor(readonly syncAlways: boolean | undefined) {
+    super(`FABRIC_MESH_STATE_NATS_NOT_DURABLE: Fabric mesh state durability is not confirmed: nats-server reported sync_always ${String(syncAlways)} at open and the backend was opened with acceptPeriodicSync, so an acked commit may not survive a power loss until the server's sync interval; not durable`);
+    this.name = "MeshStateNatsNotDurableError";
+  }
+}
+
+/**
  * Applies one stream message to a snapshot. Deterministic and idempotent: a message at or below the snapshot's
  * sequence is ignored; a batch whose `base` is not the snapshot's sequence cannot have passed the publish CAS, so
  * it is a protocol violation and refuses (the model never guesses).
@@ -210,6 +224,11 @@ export interface NatsStateBackendOptions {
   maxStateTombstones?: number;
   /** The budget of one write's CAS retries, then `MeshStateNatsBusyError`. Default 5 s. */
   lockTimeoutMs?: number;
+  /**
+   * The server's `/varz` sync_always as read at open. Only `true` lets `sync()` resolve; anything else (a server
+   * accepted through `acceptPeriodicSync`, or not stated) makes it reject with `MeshStateNatsNotDurableError`.
+   */
+  syncAlways?: boolean | undefined;
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
@@ -490,12 +509,15 @@ export class NatsStateBackend implements StateBackend {
   }
 
   /**
-   * Durability barrier (smarty-dev#9313): a no-op. Nothing is buffered client side: every commit, by this process or
-   * any other on the stream, returned only after JetStream acked its publish, and the ack follows the server's fsync
-   * because `openNatsStateBackend` refuses a server without `sync_always`. When the operator accepted periodic sync
-   * (`acceptPeriodicSync`), the client has no flush to request: durability is the server's sync interval by that choice.
+   * Durability barrier (smarty-dev#9313). Nothing is buffered client side: every commit, by this process or any other
+   * on the stream, returned only after JetStream acked its publish. On a server that reported `sync_always` at open
+   * the ack follows the server's fsync, so this resolves at once (no JetStream call). On a server accepted through
+   * `acceptPeriodicSync` the ack does not mean disk and the client has no flush to request, so this rejects with
+   * `MeshStateNatsNotDurableError`: a caller must never claim durability the server does not give.
    */
-  async sync(_budgetMs: number): Promise<void> { /* every acked commit is already on the server's disk */ }
+  async sync(_budgetMs: number): Promise<void> {
+    if (this.#options.syncAlways !== true) throw new MeshStateNatsNotDurableError(this.#options.syncAlways);
+  }
 
   dropCache(): void { /* the model is the stream's projection: nothing to drop */ }
 
@@ -610,7 +632,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     const stream = options.stream ?? natsStreamName(root);
     const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, maxEventBytes: options.maxEventBytes ?? 1024 * 1024,
       ...(options.maxStateTombstones === undefined ? {} : { maxStateTombstones: options.maxStateTombstones }),
-      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
+      ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }), syncAlways: server.syncAlways });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }
     prepared.get(root)?.close();
     prepared.set(root, backend);

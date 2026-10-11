@@ -27,7 +27,7 @@ Phase 1 (smarty-dev#7504, single host) implements option (c) below.
 (`@nats-io/transport-node`, `@nats-io/jetstream`; a lazy entry point, never in the startup graph), refuses and
 replays the stream. The factory then returns that prepared backend.
 - **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
-`acceptPeriodicSync`; a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
+`acceptPeriodicSync` (then `sync()`, the #9313 barrier, rejects with `MeshStateNatsNotDurableError`: not durable); a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
 (busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
 - **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
 `retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a

@@ -231,8 +231,9 @@ export interface StateBackend {
    * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
    * any process on this root, is on disk, or throws (within about `budgetMs` for sqlite). Never
    * holds a writer lock while it syncs. file: fsync of state.json and its namespace. sqlite: the
-   * store's PASSIVE checkpoint barrier. shadow: its authority, state.json. nats: a no-op, since a commit
-   * resolves only on the server's publish ack and the backend buffers nothing (see NatsStateBackend.sync).
+   * store's PASSIVE checkpoint barrier. shadow: its authority, state.json. nats: resolves at once on a
+   * server with sync_always (a commit resolves only on the server's publish ack and the backend buffers
+   * nothing); rejects with MeshStateNatsNotDurableError when opened with acceptPeriodicSync (see NatsStateBackend.sync).
    */
   sync(budgetMs: number): Promise<void>;
   /** Drops parsed caches (called after a failed operation under the mesh lock). */

@@ -3,7 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError,
-  MeshStateNatsRefusedError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
+  MeshStateNatsNotDurableError, MeshStateNatsRefusedError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -224,6 +224,56 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const calls = port.calls.length;
     await expect(backend.sync(0)).resolves.toBeUndefined();
     expect(port.calls.length).toBe(calls);
+  });
+
+  it.each([false, undefined])("sync rejects as not durable when acceptPeriodicSync opened a server with sync_always %s", async syncAlways => {
+    const server = fakeJetStream();
+    server.syncAlways = syncAlways;
+    const backend = await open(server, { acceptPeriodicSync: true });
+    await backend.put({ key: "ns/a", value: 1, identity });
+    const error = await backend.sync(1_000).then(() => undefined, (failure: unknown) => failure);
+    expect(error).toBeInstanceOf(MeshStateNatsNotDurableError);
+    expect(error).toMatchObject({ code: "FABRIC_MESH_STATE_NATS_NOT_DURABLE", retryable: false, syncAlways });
+    expect((error as Error).message).toMatch(/durability is not confirmed.*acceptPeriodicSync.*not durable/);
+    // A later sync_always change at the server does not upgrade a backend opened without it: open records the fact.
+    server.syncAlways = true;
+    await expect(backend.sync(0)).rejects.toBeInstanceOf(MeshStateNatsNotDurableError);
+    // The backend itself stays usable: only the durability claim is refused.
+    expect(backend.get("ns/a")?.value).toBe(1);
+  });
+
+  it("mesh.sync reports not durable on a periodic-sync server, and synced on a sync_always one", async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const { MeshProvider } = await import("../src/providers/mesh-provider.js");
+    const { withFabricHostCaller } = await import("../src/fabric-provenance.js");
+    const fs = await import("node:fs");
+    const host = withFabricHostCaller({
+      cwd: process.cwd(), signal: undefined, extensionContext: {} as never,
+      parentToolCallId: "nats-sync", nestedToolCallId: "nats-sync", update() {},
+    }, "fabric-github.forwarder");
+    const participants = { list: () => [], get: () => undefined, self: () => { throw new Error("unused"); },
+      peers: () => [], async refresh() {}, scheduleRefresh() {} };
+    for (const syncAlways of [false, true]) {
+      const meshRoot = root();
+      fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
+      const server = fakeJetStream();
+      server.syncAlways = syncAlways;
+      await openNatsStateBackend({ root: meshRoot, port: server.port(), stream: "M", acceptPeriodicSync: !syncAlways });
+      const store = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
+      try {
+        const provider = new MeshProvider(store, identity, participants as never);
+        await store.put({ key: "shared/a", value: 1, identity });
+        const event = await store.publish({ topic: "ops.sync", from: identity });
+        if (syncAlways) {
+          await expect(store.sync()).resolves.toEqual({ through: event.sequence });
+          await expect(provider.invoke("sync", {}, host)).resolves.toEqual({ synced: true, through: event.sequence });
+        } else {
+          await expect(store.sync()).rejects.toBeInstanceOf(MeshStateNatsNotDurableError);
+          await expect(provider.invoke("sync", {}, host)).rejects.toMatchObject({
+            code: "FABRIC_MESH_STATE_NATS_NOT_DURABLE", message: expect.stringContaining("not durable") });
+        }
+      } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+    }
   });
 
   it("a fresh read refuses (busy, retryable) while the projector lags the stream", async () => {

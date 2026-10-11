@@ -1,10 +1,11 @@
 import path from "node:path";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
-import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionRunner, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
+import { preflightShellCall } from "./shell-preflight.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -186,21 +187,39 @@ export class CapturedToolsProvider implements FabricProvider {
     let settled = false;
     const retired = (): boolean => settled || context.signal?.aborted === true;
     try {
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-        type: "tool_call",
-        toolName: entry.name,
-        toolCallId,
-        input: args,
-      }));
-      context.updateArguments?.(args);
-      if (preflight?.block) {
-        throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+      let executionContext: ReturnType<ExtensionRunner["createContext"]> | undefined;
+      if (isPiShellToolName(entry.name)) {
+        // smarty-dev#8606: a shell override takes the same preflight as pi.bash
+        // and pi.powershell. The hook sees a copy; the cwd it was judged in
+        // (args.cwd, or the runner's session cwd) cannot move after it, and
+        // only the arguments the helper accepted are executed.
+        const sessionContext = runner.createContext();
+        args = await preflightShellCall({
+          name: entry.name,
+          args,
+          sessionCwd: sessionContext.cwd,
+          toolCallId,
+          runner,
+          signal: context.signal,
+          blocked: `Captured tool ${entry.name} was blocked`,
+          onBlock: () => context.updateArguments?.(args),
+        });
+        context.updateArguments?.(args);
+        const requestedCwd = args.cwd;
+        if (typeof requestedCwd === "string") executionContext = { ...sessionContext, cwd: requestedCwd };
+      } else {
+        const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+          type: "tool_call",
+          toolName: entry.name,
+          toolCallId,
+          input: args,
+        }));
+        context.updateArguments?.(args);
+        if (preflight?.block) {
+          throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+        }
       }
       executionStarted = true;
-      const requestedCwd = args.cwd;
-      const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? { ...runner.createContext(), cwd: requestedCwd }
-        : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
         if (retired()) return;

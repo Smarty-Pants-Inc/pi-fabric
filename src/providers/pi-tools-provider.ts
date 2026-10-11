@@ -50,6 +50,7 @@ import type {
 } from "../protocol.js";
 import { countContentLines } from "../ui/preview-lines.js";
 import { CapturedToolsProvider } from "./captured-tools-provider.js";
+import { preflightShellCall } from "./shell-preflight.js";
 import { normalizePiArguments } from "../core/pi-arguments.js";
 import { validationMessage } from "../core/action-arguments.js";
 import {
@@ -173,7 +174,6 @@ const writeTools = new Set<PiCoreToolName>(["edit", "write"]);
 // The content array every pi core tool returns: text and/or image blocks.
 type ToolContent = AgentToolResult<unknown>["content"];
 
-const shellQuote = (value: string): string => "'" + value.replaceAll("'", "'\\''") + "'";
 
 const riskForTool = (name: PiCoreToolName): FabricRisk => {
   if (readTools.has(name)) return "read";
@@ -685,9 +685,8 @@ export class PiToolsProvider implements FabricProvider {
     // CapturedToolsProvider, so delegate to it unchanged.
     if (this.#catalog?.get(name) && !middleware) {
       if (isPiShellToolName(name) && args.monitor !== undefined) throw new Error("Shell monitors are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
-      if (name !== "bash" && isPiShellToolName(name)) {
-        await this.#emitBashGuardPreflight(name, args, context, this.#catalog.get(name)!.runner);
-      }
+      // CapturedToolsProvider runs every shell call through preflightShellCall,
+      // including the bash-guard view of a non-bash shell.
       const result = await this.#capturedTools!.invoke(name, args, context);
       this.#attachReadMedia(name, result, context);
       this.#attachReadNote(name, result, context);
@@ -717,74 +716,47 @@ export class PiToolsProvider implements FabricProvider {
     return this.#invokeWithEvents(name, tool, args, context, runner, middleware, preflightEmitted);
   }
 
-  // smarty-dev#8606 (P1-A): command guards such as the fleet bash guard judge
-  // only toolName "bash", so a model-supplied pi.powershell command would run
-  // with no guard reading it. Every non-bash shell call is first shown to
-  // guards as a bash tool_call with the same command text (behind the leading
-  // cd of a non-session cwd) and input.shell naming the real shell. A block
-  // refuses the call. A bash guard's rewrite cannot carry over to another
-  // shell's syntax, so any change to that input refuses the call too.
-  async #emitBashGuardPreflight(
-    name: PiShellToolName,
-    args: Record<string, unknown>,
-    context: FabricInvocationContext,
-    runner: ExtensionRunner,
-  ): Promise<void> {
-    const command = args.command;
-    if (typeof command !== "string") {
-      throw new Error(`Pi tool ${name} was blocked: it has no command text for the bash guard to judge`);
-    }
-    const cwd = args[PI_BASH_CWD_KEY];
-    const preface = typeof cwd === "string" && cwd !== this.#cwd ? `cd ${shellQuote(cwd)} && ` : "";
-    const input: Record<string, unknown> = { ...args, command: preface + command, shell: name };
-    const judged = JSON.stringify(input);
-    const event = { type: "tool_call" as const, toolName: "bash" as string, toolCallId: `${context.nestedToolCallId}:bash-guard`, input };
-    const preflight = await runAbortable(context.signal, () => runner.emitToolCall(event));
-    if (preflight?.block) throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
-    if (event.input !== input || JSON.stringify(input) !== judged) {
-      throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the ${name} command it judged as bash; it runs only exactly as judged`);
-    }
-  }
-
   // Emit the tool_call preflight for a nested pi.* call and enforce a block.
   // Shared by #invokeWithEvents and the git-worktree-add intercept so both obey
   // the same extension policy through one code path (no duplicated enforcement).
+  // Every shell call (bash, powershell) is judged by preflightShellCall, the
+  // single helper the captured-override path uses too (smarty-dev#8606): the
+  // hook sees a copy, the effective cwd is snapshotted and a post-hook move is
+  // refused, and a non-session cwd is shown as the leading cd it judged.
   async #emitToolCallPreflight(
     name: PiCoreToolName,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
-    if (name !== "bash" && isPiShellToolName(name)) {
-      await this.#emitBashGuardPreflight(name, args, context, runner);
-      // Guards for the real tool name still see the call, but nothing may
-      // change the command after the bash view judged it.
-      const input: Record<string, unknown> = { ...args };
-      const judged = JSON.stringify(input);
-      const event = { type: "tool_call" as const, toolName: name as string, toolCallId: context.nestedToolCallId, input };
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall(event));
-      if (preflight?.block) {
-        context.updateArguments?.(args);
-        throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
-      }
-      if (event.input !== input || JSON.stringify(input) !== judged) {
-        throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the command after the bash guard judged it`);
-      }
-      context.updateArguments?.(args);
-      return;
-    }
-    // smarty-dev#8606: a native bash call runs in the session cwd, and guards
-    // judge its command against ctx.cwd. pi.bash's cwd argument moves execution
-    // elsewhere, so the guard sees the same leading cd a native call would need.
-    const cwd = args[PI_BASH_CWD_KEY];
-    const preface = name === "bash" && typeof cwd === "string" && typeof args.command === "string" && cwd !== this.#cwd
-      ? `cd ${shellQuote(cwd)} && ` : undefined;
-    // The hook sees a copy, never the caller's args: a hook may rewrite the
-    // command, but every bash preflight snapshots the effective cwd it was
-    // judged in (args.cwd, or the session cwd when absent), and a hook that
-    // adds, changes or otherwise moves that cwd is refused below.
-    const judgedCwd = name === "bash" ? this.#effectiveBashCwd(args, context) : undefined;
-    const input: Record<string, unknown> = preface ? { ...args, command: preface + (args.command as string) } : { ...args };
+    const input = isPiShellToolName(name)
+      ? await preflightShellCall({
+          name,
+          args,
+          sessionCwd: this.#cwd,
+          // Without a cwd argument the call runs in the cwd its execution
+          // context carries (see #executionContextFor).
+          defaultCwd: context.extensionContext?.cwd ?? this.#cwd,
+          toolCallId: context.nestedToolCallId,
+          runner,
+          signal: context.signal,
+          onBlock: () => context.updateArguments?.(args),
+        })
+      : await this.#emitGenericToolCall(name, args, context, runner);
+    // Carry the hook's accepted rewrites back onto the caller's args.
+    for (const key of Object.keys(args)) if (!Object.hasOwn(input, key)) delete args[key];
+    Object.assign(args, input);
+    context.updateArguments?.(args);
+  }
+
+  // A non-shell tool's hook sees a copy; its rewrites are carried back.
+  async #emitGenericToolCall(
+    name: PiCoreToolName,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runner: ExtensionRunner,
+  ): Promise<Record<string, unknown>> {
+    const input: Record<string, unknown> = { ...args };
     const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
       type: "tool_call",
       toolName: name,
@@ -795,29 +767,7 @@ export class PiToolsProvider implements FabricProvider {
       context.updateArguments?.(args);
       throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
     }
-    if (name === "bash" && this.#effectiveBashCwd(input, context) !== judgedCwd) {
-      throw new Error(`Pi tool ${name} was blocked: a tool_call hook moved the cwd its command was judged in; a hook may not move execution`);
-    }
-    if (preface) {
-      // Carry hook rewrites back, but only through the cd it judged.
-      if (typeof input.command !== "string" || !input.command.startsWith(preface) || input[PI_BASH_CWD_KEY] !== cwd) {
-        throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the cwd it judged; run the command without cwd`);
-      }
-      input.command = input.command.slice(preface.length);
-    }
-    // Carry the hook's accepted rewrites back onto the caller's args.
-    for (const key of Object.keys(args)) if (!Object.hasOwn(input, key)) delete args[key];
-    Object.assign(args, input);
-    context.updateArguments?.(args);
-  }
-
-  // The directory a pi.bash call executes in: its cwd argument when present,
-  // otherwise the session cwd its execution context carries (see
-  // #executionContextFor). Compared by value, so a hook that rewrites the cwd
-  // into any other form is treated as moving execution.
-  #effectiveBashCwd(args: Record<string, unknown>, context: FabricInvocationContext): unknown {
-    const cwd = args[PI_BASH_CWD_KEY];
-    return cwd !== undefined ? cwd : (context.extensionContext?.cwd ?? this.#cwd);
+    return input;
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so

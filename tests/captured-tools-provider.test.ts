@@ -8,6 +8,9 @@ import {
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
@@ -408,6 +411,83 @@ describe("CapturedToolsProvider", () => {
     await expect(registry.invoke("pi.grep", { pattern: "CreateUser" }, context)).resolves.toBe(
       "fovea grep CreateUser",
     );
+  });
+
+  // CODE_REVIEW P1 on d2a0012b: the captured bash override path handed the
+  // tool_call hook the caller's args and read args.cwd afterwards, so a hook
+  // could move execution away from the cwd the guard judged.
+  it("refuses a tool_call hook that moves a captured bash override's cwd (#8606)", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-captured-cwd-")));
+    const session = path.join(root, "repo");
+    const linked = path.join(root, "linked");
+    fs.mkdirSync(session);
+    fs.mkdirSync(linked);
+    const runs: Array<{ command: unknown; cwd: unknown }> = [];
+    const definition = defineTool({
+      name: "bash",
+      label: "bash (override)",
+      description: "Extension-owned bash override",
+      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()) }),
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        runs.push({ command: params.command, cwd: ctx.cwd });
+        return { content: [{ type: "text" as const, text: `ran ${params.command}` }], details: {} };
+      },
+    });
+    const seen: Array<Record<string, unknown>> = [];
+    const run = async (args: Record<string, unknown>, hook: (input: Record<string, unknown>) => unknown, viaPi: boolean) => {
+      const runner = {
+        createContext: () => ({ cwd: session }),
+        getActiveTools: () => [],
+        emit: vi.fn(async () => {}),
+        emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => {
+          seen.push({ ...event.input });
+          return hook(event.input);
+        }),
+        emitToolResult: vi.fn(async () => undefined),
+      } as unknown as ExtensionRunner;
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([{
+        definition,
+        sourceInfo: createSyntheticSourceInfo("/extensions/bash-override.ts", { source: "test" }),
+      }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const captured = new CapturedToolsProvider(catalog);
+      const invocation = { ...context, cwd: session, extensionContext: { cwd: session } as ExtensionContext };
+      return viaPi
+        ? new PiToolsProvider(session, catalog, captured).invoke("bash", args, invocation)
+        : captured.invoke("bash", args, invocation);
+    };
+    try {
+      // Both entry points: pi.bash delegating to the override, and extensions.bash directly.
+      for (const viaPi of [true, false]) {
+        runs.length = 0;
+        // A hook that ADDS cwd to a call judged in the session cwd is refused.
+        await expect(run({ command: "printf ran > ran.txt" }, (input) => { input.cwd = linked; }, viaPi))
+          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+        // A hook that CHANGES cwd is refused, with or without a leading-cd preface.
+        await expect(run({ command: "printf ran > ran.txt", cwd: session }, (input) => { input.cwd = linked; }, viaPi))
+          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+        await expect(run({ command: "printf ran > ran.txt", cwd: linked }, (input) => { input.cwd = session; }, viaPi))
+          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+        // A hook that drops the leading cd it judged is refused.
+        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = "ls"; }, viaPi))
+          .rejects.toThrow("a tool_call hook rewrote the cwd it judged");
+        expect(runs).toEqual([]);
+        // A command-only rewrite still runs, in the session cwd.
+        await run({ command: "printf original" }, (input) => { input.command = "printf rewritten"; }, viaPi);
+        expect(runs.at(-1)).toEqual({ command: "printf rewritten", cwd: session });
+        // A non-session cwd is judged as the leading cd; a rewrite behind it runs in that cwd.
+        await run({ command: "ls", cwd: linked }, (input) => { input.command = `${String(input.command)} -la`; }, viaPi);
+        expect(seen.at(-1)?.command).toBe(`cd '${linked}' && ls`);
+        expect(runs.at(-1)).toEqual({ command: "ls -la", cwd: linked });
+        // A block still refuses before anything runs.
+        const before = runs.length;
+        await expect(run({ command: "git stash list" }, () => ({ block: true, reason: "guard refused git stash" }), viaPi))
+          .rejects.toThrow("guard refused git stash");
+        expect(runs.length).toBe(before);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("releases scheduler barriers after an aborted non-cooperative tool", async () => {

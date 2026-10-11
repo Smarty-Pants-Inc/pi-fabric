@@ -124,6 +124,35 @@ const settle = (directory: string, run: EnodevRun, terminal: Record<string, unkn
 };
 
 /**
+ * smarty-dev#9855 part A: a launch of THIS manager whose exit is ENODEV-unconfirmed, proven gone (the ENODEV marker,
+ * its own process record, its worker gone, pid-reuse safe). No actor or activation fact: the caller owns the run
+ * (it holds its admission permit). Settles it: a terminal record that has one keeps it; otherwise completed with the
+ * saved answer, else failed lost. Marker removed last. Undefined keeps the veto (and the caller keeps the permit).
+ */
+export const settleGoneEnodevLaunch = (directory: string): AgentRunResult | undefined => {
+  const id = path.basename(directory);
+  const markerFile = path.join(directory, UNRESOLVED_WORKER_FILE);
+  const marker = readJson(markerFile);
+  const statusFile = path.join(directory, "status.json");
+  // Already settled by #912's own recovery (delivered or lost): its proof stands; nothing more to write.
+  if (marker === undefined && !fs.existsSync(markerFile)) {
+    const done = readJson(statusFile);
+    return done?.id === id && (done.enodevDelivered === true || done.settledLost === true) ? done as unknown as AgentRunResult : undefined;
+  }
+  if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
+  const record = readJson(statusFile);
+  if (!record || record.id !== id || record.transport !== "process" || !enodevWorkerGone(record)) return undefined;
+  const settlement = readJson(path.join(directory, "settlement.json"));
+  const text = settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
+    typeof settlement.text === "string" ? settlement.text : undefined;
+  const run: EnodevRun = { id, statusFile, record, activationId: "", ...(text === undefined ? {} : { text }) };
+  const terminal = record.status !== "running" && record.status !== "queued" ? {}
+    : text !== undefined ? { status: "completed", text }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
+  return settle(directory, run, terminal);
+};
+
+/**
  * The saved answer for this restored actor activation when every fact above holds, WITHOUT settling: the marker and
  * the record stay until the actor delivered it and commits (settleEnodevRun), so a delivery its ownership check
  * refuses keeps both for the next owner (pi-fabric#912 round 3).

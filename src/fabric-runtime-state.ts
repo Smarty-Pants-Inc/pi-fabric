@@ -1020,6 +1020,15 @@ export class FabricRuntimeState {
           triggerTurn: false, idempotencyKey: `terminal-refusal:${notice.targetId}:${notice.messageId}`,
         });
       },
+      // smarty-dev#9855: held admission permits at half of maxConcurrent. The fabric.alarm envelope, routed to the
+      // owner identity as the provider-dead alarm is (PI_FABRIC_OWNER_IDENTITY_ID).
+      onAdmissionAlarm: (alarm) => {
+        if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
+        const mesh = this.#mesh, from = this.#identity;
+        const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: "fabric.alarm.agent-admission", kind: "agent-admission-held",
+          from, ...(owner ? { to: owner } : {}), text: alarm.message, data: { ...alarm } })).catch(() => undefined);
+      },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
           { deliverAs: "steer", triggerTurn: false });

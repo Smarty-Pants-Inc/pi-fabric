@@ -18,7 +18,7 @@ import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/a
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleLostEnodevRun } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -72,7 +72,7 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
-import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
@@ -148,6 +148,13 @@ import {
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
+/** smarty-dev#9855: a standing held-permit alarm repeats this often. */
+const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
+/** The first call runs `release`; later calls do nothing (a permit is released at most once). */
+const once = (release: () => void): (() => void) => {
+  let done = false;
+  return () => { if (!done) { done = true; release(); } };
+};
 // These adapters conflate CLI/socket errors with absent sessions and have no
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
@@ -313,6 +320,8 @@ export const awaitAgentCwd = async (
 };
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
+  /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
   id: string;
   name: string;
   task: string;
@@ -412,6 +421,8 @@ interface QueuedAgent {
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
+  /** smarty-dev#9855: the admission permit an unknown-outcome launch holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
   info: AgentHandleInfo;
   task: string;
   enqueuedAt: number;
@@ -734,6 +745,8 @@ export class AgentManager {
   readonly #foregroundDelivered = new Set<string>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
+  readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
+  #admissionAlarmAt: number | undefined;
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
@@ -812,6 +825,8 @@ export class AgentManager {
       onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       onFollowUpAlarm?: (alarm: AgentFollowUpAlarm) => void;
+      /** smarty-dev#9855: held permits reached half of maxConcurrent (again every 6 h while they stay there). */
+      onAdmissionAlarm?: (alarm: AgentAdmissionAlarm) => void;
       onTerminalNotice?: (notice: AgentTerminalNotice) => Promise<void> | void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
@@ -843,6 +858,7 @@ export class AgentManager {
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
     this.#onFollowUpAlarm = options.onFollowUpAlarm;
+    this.#onAdmissionAlarm = options.onAdmissionAlarm;
     this.#terminalNoticeOutbox = new TerminalNoticeOutbox(options.onTerminalNotice);
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
@@ -1080,6 +1096,8 @@ export class AgentManager {
    */
   spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
+    this.#releaseProvenGone();
     const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1614,6 +1632,7 @@ export class AgentManager {
             this.#queued.set(id, queued);
           }
           queued.cleanupPending = obligation.message;
+          queued.heldPermit ??= once(release);
           queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
           try {
             markUnresolvedWorker(runDirectory, obligation.message, {
@@ -1623,6 +1642,7 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           // No exact handle means no safe retry or exit receipt. Preserve the
           // permit and actor/queue join rather than rejecting into another writer.
+          this.#checkHeldPermits();
           return this.#queuedInfo(queued);
         }
         release();
@@ -1700,6 +1720,8 @@ export class AgentManager {
       } catch (error) {
         if (queued.cleanupPending || (error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
           queued.cleanupPending ??= error instanceof Error ? error.message : String(error);
+          if (release) queued.heldPermit ??= once(release);
+          this.#checkHeldPermits();
           return;
         }
         release?.();
@@ -1715,8 +1737,73 @@ export class AgentManager {
 
   #queuedInfo(queued: QueuedAgent): AgentHandleInfo {
     const waiting = [...this.#queued.values()].filter((run) => !run.terminal && !run.preparing);
+    const held = this.heldPermits();
     return structuredClone({ ...queued.info,
-      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
+      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}),
+      // smarty-dev#9855: why a spawn waits: unknown-outcome launches still holding a permit.
+      ...(!queued.terminal && held > 0 ? { heldPermits: held } : {}) });
+  }
+
+  /** smarty-dev#9855: admission permits held by unknown-outcome or lost-contact launches not yet proven gone. */
+  heldPermits(): number {
+    return [...this.#queued.values()].filter(queued => queued.heldPermit).length +
+      [...this.#runs.values()].filter(managed => managed.heldPermit).length;
+  }
+
+  /**
+   * smarty-dev#9855 part A: a held permit whose run is now proven gone (ENODEV-unconfirmed exit, worker gone, pid-reuse
+   * safe; settleGoneEnodevLaunch) is released in the same step as the settle, exactly once (the permit is taken off the
+   * entry before it is called; the settle removes the marker, so a second pass finds nothing). Anything not proven
+   * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
+   */
+  #releaseProvenGone(): number {
+    if (process.platform !== "linux") return 0;
+    let released = 0;
+    for (const queued of this.#queued.values()) {
+      if (!queued.heldPermit) continue;
+      const settled = settleGoneEnodevLaunch(path.join(this.#runRoot, queued.info.id));
+      if (!settled) continue;
+      const permit = queued.heldPermit;
+      delete queued.heldPermit;
+      delete queued.cleanupPending;
+      this.#retentionRevision++;
+      if (!queued.terminal) {
+        queued.terminal = settled;
+        this.#saveQueuedRouteOutcome(queued);
+        queued.resolve(settled);
+        this.#emitLifecycle(queued.info, `run.${settled.status}`, Date.now(), { status: settled.status });
+        this.#notifyQueuedComplete(queued);
+      }
+      permit();
+      released++;
+    }
+    for (const managed of this.#runs.values()) {
+      if (!managed.heldPermit || !managed.settled) continue;
+      if (!settleGoneEnodevLaunch(managed.runDirectory)) continue;
+      const permit = managed.heldPermit;
+      delete managed.heldPermit;
+      delete managed.lostContact;
+      managed.executionExited = true;
+      this.#retentionRevision++;
+      permit();
+      released++;
+    }
+    if (released) this.#invalidateUiList();
+    if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined; // the episode ended
+    return released;
+  }
+
+  /** One alarm when held permits reach half of maxConcurrent, again every 6 h while they stay there. */
+  #checkHeldPermits(now = Date.now()): void {
+    const held = this.heldPermits();
+    if (held * 2 < this.config.maxConcurrent) { this.#admissionAlarmAt = undefined; return; }
+    if (this.#admissionAlarmAt !== undefined && now - this.#admissionAlarmAt < ADMISSION_REALARM_MS) return;
+    this.#admissionAlarmAt = now;
+    const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
+      message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
+        "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
+    console.warn(`[pi-fabric] ${alarm.message}`);
+    try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
@@ -2430,6 +2517,7 @@ export class AgentManager {
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
     this.#previousRuns.set(result.id, structuredClone(result));
     this.#retentionRevision++;
+    this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
     return true;
   }
 
@@ -2454,6 +2542,7 @@ export class AgentManager {
       console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
+    this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
   }
 
   /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
@@ -3737,7 +3826,10 @@ export class AgentManager {
     if (managed.transport.kind === "process" && managed.lostContact) {
       // Reporting a terminal result is allowed; releasing native admission is not.
       // An uncertain Windows tree can still contain untracked native descendants.
+      // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.
+      managed.heldPermit ??= once(managed.release);
       managed.release = () => {};
+      this.#checkHeldPermits();
     }
     if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
         managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {

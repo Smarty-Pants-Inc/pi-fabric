@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { formatAge } from "../residency/protocol.js";
@@ -128,6 +129,7 @@ interface ActorQueueItem {
 
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
+import { isMainSupervisorRequest } from "../interrupt-authority.js";
 
 interface SettledWindow {
   acceptedAt: number;
@@ -142,6 +144,7 @@ interface ManagedActor {
   id: string;
   name: string;
   rootId: string;
+  supervisorFor?: string;
   // Fencing token written when a host adopts this lineage: a lineage adopted
   // this recently still has an adopter finding its footing — do not adopt
   // over it until ORPHAN_ADOPTION_RETRY_MS has elapsed.
@@ -839,8 +842,10 @@ export class ActorManager {
    */
   async create(
     request: FabricActorRequest,
-    { asRegistryOwner = false, beforeCommit, checkActive, onCommit }: {
+    { asRegistryOwner = false, beforeCommit, checkActive, onCommit, supervisorOwner = this.identity }: {
       asRegistryOwner?: boolean;
+      /** Host-only: verified resident creator, never request fields. */
+      supervisorOwner?: MeshIdentity;
       beforeCommit?: (id: string) => void | Promise<void>;
       checkActive?: () => void;
       /** Synchronous receipt registration, before the first creation effect; no await follows before insertion. */
@@ -929,6 +934,8 @@ export class ActorManager {
       id,
       name,
       rootId: this.#rootId,
+      ...(supervisorOwner.kind === "main" && supervisorOwner.id === this.#rootId && isMainSupervisorRequest(request)
+        ? { supervisorFor: this.#rootId } : {}),
       ...(this.#project ? { project: this.#project } : {}),
       instructions: request.instructions,
       status: "idle",
@@ -4501,7 +4508,7 @@ export class ActorManager {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
       if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { detached: true, stdio: "ignore", windowsHide: true });
+      const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
       if (child.pid) {
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
@@ -4832,6 +4839,7 @@ export class ActorManager {
       id: actor.id,
       name: actor.name,
       rootId: actor.rootId,
+      ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}),
       ...(actor.adoptedAt !== undefined ? { adoptedAt: actor.adoptedAt } : {}),
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
       ...(actor.project ? { project: actor.project } : {}),
@@ -5282,6 +5290,8 @@ export class ActorManager {
         id: record.id,
         name: record.name,
         rootId: typeof record.rootId === "string" ? record.rootId : this.#rootId,
+        ...(typeof record.supervisorFor === "string" && record.supervisorFor === record.rootId
+          ? { supervisorFor: record.supervisorFor } : {}),
         ...(typeof record.project === "string" ? { project: record.project } : {}),
         ...(typeof record.adoptedAt === "number" ? { adoptedAt: record.adoptedAt } : {}),
         ...(Array.isArray(record.adoptedFrom)
@@ -5956,6 +5966,7 @@ export class ActorManager {
       scope: this.#actorScope,
       name: actor.name,
       rootId: actor.rootId,
+      ...(actor.supervisorFor === actor.rootId ? { supervisorFor: actor.supervisorFor } : {}),
       ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,

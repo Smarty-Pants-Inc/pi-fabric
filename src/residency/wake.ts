@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { MeshEvent, MeshStore } from "../mesh/store.js";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { childProcessEnvironment, writeJsonAtomic } from "../core/atomic-write.js";
 import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../mesh/archive.js";
 import { lockFile } from "./file-lock.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
@@ -270,7 +270,7 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
     ["--config", configPath, "--wake"]);
   assertResidentWakeConfig(root, config); // the async runtime lookup may have yielded to a config rewrite
   const child = spawn(runtime!, args, { cwd: config.cwd, detached: process.platform !== "win32",
-    stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    env: childProcessEnvironment(), stdio: ["ignore", "ignore", "ignore", "ipc"] });
   try {
     await waitResidentChange(root, () => residentStartupReady(root), 90_000,
       "Resident wake startup pending", child);

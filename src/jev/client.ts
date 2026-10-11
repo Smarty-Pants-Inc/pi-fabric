@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { terminatePosixGroup } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
@@ -67,7 +68,7 @@ export class JevCredentials {
         // execFile does NOT support detached. spawn an argv command (no shell)
         // in its own POSIX group so stopping descendants cannot hit the host.
         child = spawn(file, args, {
-          detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+          env: childProcessEnvironment(), detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
         });
       } catch {
         reject(new Error("Jev credential resolver failed"));

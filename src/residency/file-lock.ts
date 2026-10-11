@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
@@ -6,7 +7,7 @@ let fenceAvailable: boolean | undefined;
 export const kernelFenceAvailable = (): boolean => {
   if (process.platform !== "linux") return false;
   return fenceAvailable ??= spawnSync("setpriv", ["--pdeathsig", "KILL", "flock", "--version"],
-    { stdio: "ignore", timeout: 1_000 }).status === 0;
+    { env: childProcessEnvironment(), stdio: "ignore", timeout: 1_000 }).status === 0;
 };
 
 export class FileLockBusy extends Error {}
@@ -34,7 +35,7 @@ export const lockFile = async (file: string, waitSeconds = 120, requireParentDea
     const { spawn } = await import("node:child_process");
     const flock = waitSeconds === 0 ? ["flock", "-x", "-n", "3"] : ["flock", "-x", "-w", String(waitSeconds), "3"];
     const run = (argv: string[]) => new Promise<number | null>((resolve, reject) => {
-      const child = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "ignore", "inherit", fd] });
+      const child = spawn(argv[0]!, argv.slice(1), { env: childProcessEnvironment(), stdio: ["ignore", "ignore", "inherit", fd] });
       child.on("error", reject);
       child.on("exit", (status) => resolve(status));
     });

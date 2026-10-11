@@ -16,6 +16,10 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import {
   type BridgeSide,
   BRIDGE_LEASE_MS,
+  BridgeOwnershipError,
+  checkBridgePublish,
+  DEFAULT_FACTORY_RATE,
+  isBridgedTopic,
   MeshBridge,
   RemoteBridgeSide,
   serveBridgeAgent,
@@ -100,7 +104,7 @@ interface SetupOptions {
   walCapRetryMinMs?: number;
   /** The clock of the bridge's once-a-minute log lines and its factory rate bound. */
   clock?: () => number;
-  factoryRate?: { perMinute: number; burst: number };
+  factoryRate?: { perMinute: number; burst: number; bytesPerMinute?: number; byteBurst?: number };
 }
 
 const setup = (cursorPath?: string, options: SetupOptions = {}) => {
@@ -1745,6 +1749,9 @@ describe("mesh bridge", () => {
       [{ ...base, "factory-rate": "fast" }, /--factory-rate must be a positive number/],
       [{ ...base, "factory-burst": "1.5" }, /--factory-burst must be a positive integer/],
       [{ ...base, "factory-burst": "0" }, /--factory-burst must be a positive integer/],
+      [{ ...base, "factory-bytes": "0" }, /--factory-bytes must be a positive integer/],
+      [{ ...base, "factory-bytes": "1.5" }, /--factory-bytes must be a positive integer/],
+      [{ ...base, "factory-byte-burst": "x" }, /--factory-byte-burst must be a positive integer/],
     ];
     for (const [flags, error] of cases) {
       const spawned: Array<number | undefined> = [];
@@ -1952,10 +1959,13 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     await bridge.start();
     await bridge.step();
     const send = (topic: string, to: string, text = `${topic} ${to}`) => far.publish({ topic, kind: "ask", from: spoke.identity, to, text });
-    const malformed = ["fleet.work.", "fleet.work.smarty-dev", "fleet.work.smarty-dev.", "fleet.work..1", "fleet.work...1",
-      "fleet.work.smarty-dev.0", "fleet.work.smarty-dev.01", "fleet.work.smarty-dev.1a", "fleet.work.smarty-dev.-1",
-      "fleet.work.smarty:dev.1", "fleet.work.smarty/dev.1", "fleet.work.inbox-receipts"];
-    for (const topic of malformed) await send(topic, "factory");
+    // Not work topics at all (isWorkTopic): this spoke's own agent never reads them out (round 3; the
+    // hostile-remote case is in the security pass group below).
+    const notWork = ["fleet.work.", "fleet.work.smarty-dev.", "fleet.work..1", "fleet.work...1", "fleet.work.smarty:dev.1", "fleet.work.smarty/dev.1"];
+    // Work topics, but not fleet.work.<repo>.<n>: read, and not addressed across.
+    const malformed = ["fleet.work.smarty-dev", "fleet.work.smarty-dev.0", "fleet.work.smarty-dev.01", "fleet.work.smarty-dev.1a",
+      "fleet.work.smarty-dev.-1", "fleet.work.inbox-receipts"];
+    for (const topic of [...notWork, ...malformed]) await send(topic, "factory");
     await send("fleet.work.smarty-dev.2", "factory-lead");
     await send("fleet.work.smarty-dev.3", "factory\u0000");
     await send("fleet.work.smarty-dev.4", "factory", "array");
@@ -1976,11 +1986,11 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
     // The INFO count names drops addressed to the factory (the post-install revert trigger reads it).
     const counts = (): string[] => logs.filter((line) => line.includes("not addressed across"));
-    expect(counts()).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.; toRemote 0, toLocal 1 (to factory 1))"]);
+    expect(counts()).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev; toRemote 0, toLocal 1 (to factory 1))"]);
     now += 60_000;
     await send("fleet.work.smarty-dev.5", "nobody");
     await bridge.step();
-    expect(counts().at(-1)).toMatch(/^bridge: 15 events not addressed across \(topics: .*, \.\.\.; toRemote 0, toLocal 15 \(to factory 11\)\)$/);
+    expect(counts().at(-1)).toMatch(/^bridge: 9 events not addressed across \(topics: .*; toRemote 0, toLocal 9 \(to factory 5\)\)$/);
   });
 
   // pi-fabric#876 review, P1-2: a work host cannot flood the factory; over the bound, work waits.
@@ -2009,7 +2019,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(crossed()).toEqual(Array.from({ length: 60 }, (_, index) => `w${index + 1}`));
     expect(savedAfter()).toBe(sequenceOf("w60")); // durable, and not past the first deferred event
     expect(rateLines()).toEqual([expect.stringMatching(
-      /^toLocal: factory rate bound \(30\/min, burst 60\): 1 deferrals; waiting at fleet\.work\.smarty-dev\.61 \S+, retry in 2000 ms; nothing dropped$/)]);
+      /^toLocal: factory rate bound \(30\/min, burst 60; 524288 bytes\/min, burst 1048576\): 1 deferrals; waiting at fleet\.work\.smarty-dev\.61 \S+, retry in 2000 ms; nothing dropped$/)]);
 
     // Before the token is due a pass does not even reread the page: no busy loop.
     tail.mockClear();
@@ -2047,7 +2057,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     const rateLines = (): string[] => logs.filter((line) => line.includes("factory rate bound"));
     const delivered = (): number => hub.read({ after: 0, limit: 200 }).filter((event) => event.topic.startsWith("fleet.work.rate.")).length;
     expect(await bridge.step()).toMatchObject({ toLocal: 2 }); // the burst
-    expect(rateLines()).toEqual([expect.stringMatching(/\(6\/min, burst 2\): 1 deferrals; waiting at fleet\.work\.rate\.3 .*retry in 10000 ms/)]);
+    expect(rateLines()).toEqual([expect.stringMatching(/\(6\/min, burst 2; 524288 bytes\/min, burst 1048576\): 1 deferrals; waiting at fleet\.work\.rate\.3 .*retry in 10000 ms/)]);
     for (let second = 10; second <= 50; second += 10) {
       now += 10_000;
       expect(await bridge.step()).toMatchObject({ toLocal: 1 });
@@ -2092,3 +2102,228 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
   });
 });
 
+// pi-fabric#876, review-fleet-2's security pass on 4c62ce08: (a) a strict work-topic grammar on the
+// allow-list itself, (b) inbound identity from the presence record, (c) a byte budget beside the
+// event bucket, (d) RED-first cases for each.
+describe("pi-fabric#876 security pass (round 3)", () => {
+  /** mesh_answers' topic filter, setup/factory/factory_host.py:185, applied with TOPIC.fullmatch. */
+  const MESH_ANSWERS_TOPIC = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
+  const lookalike = "fleet.work.r\u0435po.1"; // Cyrillic e in the repo
+  /** An untrusted remote can send any JSON: it rewrites each carrier event (text `smuggle:<i>`) with `rewrite(i)`. */
+  const hostile = (rewrite: (index: number) => Partial<MeshEvent>) => (remote: RemoteBridgeSide): BridgeSide => ({
+    latestSequence: () => remote.latestSequence(),
+    read: async (after) => {
+      const page = await remote.read(after);
+      return { ...page, events: page.events.map((event) => {
+        const match = /^smuggle:(\d+)$/.exec(event.text ?? "");
+        return match ? { ...event, ...rewrite(Number(match[1])) } : event;
+      }) };
+    },
+    publish: (event) => remote.publish(event),
+    mirror: (presence) => remote.mirror(presence),
+    bridgedIds: (after) => remote.bridgedIds(after),
+    close: (error) => remote.close(error),
+    presence: () => remote.presence(),
+  });
+
+  // (a): the allow-list's fleet.work arm (bridge.ts:88-92 on 4c62ce08) parses too, on every recipient.
+  it("allows only well-formed fleet.work topics on the allow-list, and refuses them at commit too", () => {
+    const wellFormed = ["fleet.work.inbox-receipts", "fleet.work.task", "fleet.work.smarty-dev.2045", "fleet.work.pi.fabric.876",
+      "fleet.work..github.7", "fleet.work.A_b-9.1", `fleet.work.${"a".repeat(115)}.1`];
+    for (const topic of wellFormed) expect(isBridgedTopic({ topic, kind: "ask" }), topic).toBe(true);
+    const malformed: unknown[] = ["fleet.work.", "fleet.work..1", "fleet.work...1", "fleet.work..", "fleet.work.a..b.1", "fleet.work.repo.",
+      "fleet.work.repo..", "fleet.work.re\u0000po.1", "fleet.work.repo.1\u0000", "fleet.work.repo.1\n", lookalike, "fleet.work.repo.\uff11",
+      "fle\u0435t.work.repo.1", "fleet\u2024work.repo.1", "fleet.work.repo\u30021", "fleet.work.a b.1", "fleet.work.a:b.1", "fleet.work.a/b.1",
+      `fleet.work.${"a".repeat(116)}.1`, `fleet.work.${"a".repeat(200)}`, undefined, 7, ["fleet.work.a.1"]];
+    for (const topic of malformed) expect(isBridgedTopic({ topic, kind: "ask" } as never), JSON.stringify(topic)).toBe(false);
+    // Smuggling past the factory parser: a trailing segment, an empty repo, a lookalike, a full-width digit.
+    for (const topic of ["fleet.work.repo.1.extra", "fleet.work..1", lookalike, "fleet.work.repo.\uff11", "fleet.work.repo.1\u0000"]) {
+      expect(parseWorkTopic(topic), topic).toBeUndefined();
+      expect(isHubFactoryEvent({ topic, kind: "ask", to: "factory" }), topic).toBe(false);
+    }
+    // The commit side applies the same grammar to whatever the bridge asks it to publish.
+    const stamp = { bridge: { from: "forge", id: "e" } };
+    const from = { id: sid("forge-main"), name: "main", kind: "main" as const };
+    for (const topic of ["fleet.work..1", lookalike, "fleet.work.repo.1\u0000"]) {
+      expect(() => checkBridgePublish({ topic, kind: "ask", from, to: "factory", data: stamp }), topic).toThrow(/topic is not allowed/);
+    }
+    expect(checkBridgePublish({ topic: "fleet.work.inbox-receipts", kind: "rerouted", from, to: "x", data: stamp }).topic).toBe("fleet.work.inbox-receipts");
+  });
+
+  // (d): an event that passes the bridge but that the consumer's TOPIC regex rejects must not exist.
+  it("passes nothing that mesh_answers' TOPIC regex rejects (consumer near-miss)", () => {
+    const edge = `fleet.work.${"a".repeat(115)}.1`; // 128 characters, the mesh topic limit
+    expect(edge).toHaveLength(128);
+    const corpus = [edge, `fleet.work.${"a".repeat(116)}.1`, `fleet.work.${"a".repeat(200)}`, "fleet.work.repo.1\n", "fleet.work.a b.1",
+      "fleet.work.\u00e4.1", lookalike, "fleet.work.repo.1\u0000", "fleet.work.a:b.1", "fleet.work.a/b.1", "fleet.work.", "fleet.work..1",
+      "fleet.work.repo.1.extra", "fleet.work.smarty-dev.9352", "fleet.work..github.7", "fleet.work.inbox-receipts", "ops.owner"];
+    let factory = 0;
+    for (const topic of corpus) {
+      if (isBridgedTopic({ topic, kind: "pr.wake" })) expect(MESH_ANSWERS_TOPIC.test(topic), JSON.stringify(topic)).toBe(true);
+      if (isHubFactoryEvent({ topic, kind: "pr.wake", to: "factory" })) {
+        factory += 1;
+        expect(MESH_ANSWERS_TOPIC.test(topic), JSON.stringify(topic)).toBe(true);
+      }
+    }
+    expect(factory).toBe(4); // the 128-character topic, smarty-dev.9352, .github.7, ops.owner
+    expect(isHubFactoryEvent({ topic: edge, kind: "ask", to: "factory" })).toBe(true);
+  });
+
+  it("offers the hub no event that mesh_answers' TOPIC regex would reject (consumer near-miss, end to end)", async () => {
+    // Each passes the old fleet.work. prefix check; the hub mesh and mesh_answers both reject it.
+    const nearMisses = [`fleet.work.${"x".repeat(200)}`, "fleet.work.a b.1", "fleet.work.\u00e4.1", "fleet.work.repo.1\n", `fleet.work.${"a".repeat(116)}.1`];
+    let laneId = "";
+    const { hub, far, bridge, logs } = setup(undefined, {
+      wrapRemote: hostile((index) => ({ topic: nearMisses[index >> 1]!, to: index % 2 ? "factory" : laneId })),
+    });
+    const lane = await addRoot(hub, "lane");
+    laneId = lane.identity.id;
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const offered: string[] = [];
+    const local = bridge.options.local as StoreBridgeSide;
+    const publish = local.publish.bind(local);
+    const publishBatch = local.publishBatch.bind(local);
+    vi.spyOn(local, "publish").mockImplementation((event, held) => { offered.push(event.topic); return publish(event, held); });
+    vi.spyOn(local, "publishBatch").mockImplementation((events) => { offered.push(...events.map(({ event }) => event.topic)); return publishBatch(events); });
+    for (let index = 0; index < nearMisses.length * 2; index++) {
+      await far.publish({ topic: "fleet.work.carrier.1", kind: "ask", from: spoke.identity, to: "factory", text: `smuggle:${index}` });
+    }
+    await far.publish({ topic: "fleet.work.inbox-receipts", kind: "rerouted", from: spoke.identity, to: lane.identity.id, text: "control" });
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: nearMisses.length * 2 });
+    // The bridge offers the hub only what the consumer's regex accepts; the rest is refused at admission.
+    expect(offered).toEqual(["fleet.work.inbox-receipts"]);
+    for (const topic of offered) expect(MESH_ANSWERS_TOPIC.test(topic), topic).toBe(true);
+    expect(logs.filter((line) => line.endsWith(": not allowed"))).toHaveLength(nearMisses.length * 2);
+    expect(hub.read({ after: 0, limit: 200 }).filter((event) => event.topic.startsWith("fleet.work")).map((event) => event.text)).toEqual(["control"]);
+  });
+
+  it("refuses topics a hostile remote smuggles past its own filter, on every recipient", async () => {
+    const smuggled: Array<[string, "lane" | "factory"]> = [
+      ["fleet.work..1", "lane"], ["fleet.work.", "lane"], ["fleet.work.a..b.1", "lane"], ["fleet.work.repo.", "lane"],
+      ["fleet.work.re\u0000po.1", "lane"], [lookalike, "lane"], [`fleet.work.${"a".repeat(200)}`, "lane"],
+      ["fleet.work..1", "factory"], ["fleet.work.repo.1\u0000", "factory"], [lookalike, "factory"], ["fleet.work.repo.\uff11", "factory"],
+      ["fle\u0435t.work.repo.1", "factory"], ["fleet\u2024work.repo.1", "factory"],
+    ];
+    // Well formed, but not fleet.work.<repo>.<n>: allowed to a hub native, never to the factory.
+    const outside: Array<[string, "lane" | "factory"]> = [["fleet.work.repo.1.extra", "factory"], ["fleet.work.repo", "factory"]];
+    const carried: Array<[string, "lane" | "factory"]> = [["fleet.work.inbox-receipts", "lane"], ["fleet.work..github.7", "factory"],
+      ["fleet.work.repo.1.extra", "lane"]];
+    const all = [...smuggled, ...outside, ...carried];
+    let laneId = "";
+    const { hub, far, bridge, logs, debugs } = setup(undefined, {
+      wrapRemote: hostile((index) => ({ topic: all[index]![0], to: all[index]![1] === "lane" ? laneId : "factory" })),
+    });
+    const lane = await addRoot(hub, "lane");
+    laneId = lane.identity.id;
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const ids: string[] = [];
+    for (let index = 0; index < all.length; index++) {
+      ids.push((await far.publish({ topic: "fleet.work.carrier.1", kind: "ask", from: spoke.identity, to: "factory", text: `smuggle:${index}` })).id);
+    }
+    expect(await bridge.step()).toMatchObject({ toLocal: carried.length, dropped: smuggled.length });
+    expect(hub.read({ after: 0, limit: 200 }).filter((event) => (event.data as { bridge?: unknown } | undefined)?.bridge)
+      .map((event) => [event.topic, event.to])).toEqual(carried.map(([topic, to]) => [topic, to === "lane" ? laneId : "factory"]));
+    smuggled.forEach(([topic], index) => {
+      expect(logs).toContain(`toLocal: dropped ${topic} ${ids[index]} from ${spoke.identity.id}: not allowed`);
+    });
+    expect(debugs.map((line) => line.replace(/ \S+ from \S+ to /, " -> "))).toEqual(outside.map(([topic]) => `toLocal: not addressed across: ${topic} -> factory`));
+  });
+
+  // (c): the factory exception is bound in bytes as well as events per window; over it, work waits.
+  it("bounds factory bytes per link beside the event bucket, deferring in order and never dropping", async () => {
+    let now = 9_000_000;
+    const cursorPath = path.join(scratch(), "cursor.json");
+    const { hub, far, bridge, logs } = setup(cursorPath, {
+      clock: () => now, factoryRate: { perMinute: 600, burst: 100, bytesPerMinute: 6_000, byteBurst: 6_000 },
+    });
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    for (let n = 1; n <= 8; n++) {
+      await far.publish({ topic: `fleet.work.bytes.${n}`, kind: "ask", from: spoke.identity, to: "factory", text: `b${n}:${"x".repeat(1_000)}` });
+    }
+    // Native-addressed work spends no bytes either.
+    await far.publish({ topic: "fleet.work.native.1", kind: "ask", from: spoke.identity, to: lane.identity.id, text: `native:${"y".repeat(20_000)}` });
+    const crossed = (): string[] => hub.read({ after: 0, limit: 200 })
+      .filter((event) => event.topic.startsWith("fleet.work.")).map((event) => (event.text ?? "").split(":")[0]!);
+    const rateLines = (): string[] => logs.filter((line) => line.includes("factory rate bound"));
+    const first = await bridge.step();
+    // About 1.3 KB each against a 6000-byte bucket: four cross, the event bucket (100) is far from empty.
+    expect(first.toLocal).toBeGreaterThanOrEqual(3);
+    expect(first.toLocal).toBeLessThanOrEqual(5);
+    expect(first.dropped).toBe(0);
+    expect(crossed()).toEqual(Array.from({ length: first.toLocal }, (_, index) => `b${index + 1}`));
+    expect(rateLines()).toEqual([expect.stringMatching(new RegExp(
+      `^toLocal: factory rate bound \\(600/min, burst 100; 6000 bytes/min, burst 6000\\): 1 deferrals; waiting at fleet\\.work\\.bytes\\.${first.toLocal + 1} \\S+, retry in \\d+ ms; nothing dropped$`))]);
+    for (let pass = 0; pass < 10 && crossed().length < 9; pass++) {
+      now += 60_000;
+      expect(await bridge.step()).toMatchObject({ dropped: 0 });
+    }
+    expect(crossed()).toEqual([...Array.from({ length: 8 }, (_, index) => `b${index + 1}`), "native"]);
+
+    // One event bigger than the byte burst still crosses once the bucket is full (it is never stuck),
+    // and the next waits for the debt it leaves.
+    now += 60_000;
+    await far.publish({ topic: "fleet.work.bytes.9", kind: "ask", from: spoke.identity, to: "factory", text: `big:${"z".repeat(10_000)}` });
+    await far.publish({ topic: "fleet.work.bytes.10", kind: "ask", from: spoke.identity, to: "factory", text: "after:small" });
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(crossed().at(-1)).toBe("big");
+    now += 30_000; // the debt (about 4 KB past an empty bucket) is not repaid yet
+    expect(await bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    now += 60_000;
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(crossed().slice(-2)).toEqual(["big", "after"]);
+    expect(logs.some((line) => /: (dropped|refused) /.test(line))).toBe(false);
+    // The default: 512 KiB a minute, burst 1 MiB, beside 30 events a minute, burst 60.
+    expect(DEFAULT_FACTORY_RATE).toEqual({ perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024 });
+  });
+
+  // (b): a live sender id must not carry a forged name, kind or session onto the hub.
+  it("takes every inbound sender's name, kind and session from its presence record, never from the event body", async () => {
+    const { hub, far, bridge } = setup();
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const forged: MeshIdentity = { id: spoke.identity.id, name: "factory", kind: "agent", sessionId: "lane" };
+    // Three in a row (the batch path), then single events, to a hub native and to the factory.
+    await far.publish({ topic: "fleet.work.x.1", kind: "ask", from: forged, to: lane.identity.id, text: "f1" });
+    await far.publish({ topic: "fleet.work.x.2", kind: "ask", from: { id: spoke.identity.id, name: "lane", kind: "actor" }, to: lane.identity.id, text: "f2" });
+    await far.publish({ topic: "fleet.work.smarty-dev.3", kind: "wait", from: forged, to: "factory", text: "f3" });
+    await far.publish({ topic: "ops.owner", kind: "pr.wake", from: { ...forged, name: "owner" }, to: "factory", data: { rootId: spoke.identity.id } });
+    await far.publish({ topic: "fabric.control.ack", kind: "ack", from: forged, to: lane.identity.id,
+      data: { version: 1, commandId: "c", targetId: spoke.identity.id, accepted: true } });
+    expect(await bridge.step()).toMatchObject({ toLocal: 5, dropped: 0 });
+    const inbound = hub.read({ after: 0, limit: 100 }).filter((event) => (event.data as { bridge?: unknown } | undefined)?.bridge);
+    expect(inbound).toHaveLength(5);
+    for (const event of inbound) expect(event.from, event.topic).toEqual({ ...spoke.identity, verified: "bridge" });
+    // A single event on its own takes the single-event path.
+    await far.publish({ topic: "fleet.work.x.4", kind: "ask", from: forged, to: lane.identity.id, text: "f4" });
+    expect(await bridge.step()).toMatchObject({ toLocal: 1, dropped: 0 });
+    expect(on(hub, "fleet.work.x.4")[0]!.from).toEqual({ ...spoke.identity, verified: "bridge" });
+  });
+
+  it("refuses at commit an inbound event whose identity differs from its sender's mirrored record", async () => {
+    const { hub, far, bridge } = setup();
+    const lane = await addRoot(hub, "lane");
+    const spoke = await addRoot(far, "forge-main");
+    await bridge.start();
+    await bridge.step();
+    const side = new StoreBridgeSide(hub, "forge");
+    const event = (from: MeshIdentity, id: string) => ({ topic: "fleet.work.x.1", kind: "ask", from, to: lane.identity.id, data: { bridge: { from: "forge", id } } });
+    const forgeries: MeshIdentity[] = [{ ...spoke.identity, name: "factory" }, { ...spoke.identity, kind: "agent" }, { ...spoke.identity, sessionId: "lane" },
+      { id: spoke.identity.id, name: "main", kind: "main" }];
+    for (const [index, from] of forgeries.entries()) {
+      await expect(side.publish(event(from, `e${index}`), [spoke.identity.id]), JSON.stringify(from)).rejects.toThrow(BridgeOwnershipError);
+      await expect(side.publishBatch([{ event: event(from, `b${index}`), held: [spoke.identity.id] }])).rejects.toThrow(BridgeOwnershipError);
+    }
+    expect(on(hub, "fleet.work.x.1")).toEqual([]);
+    await expect(side.publish(event(spoke.identity, "ok"), [spoke.identity.id])).resolves.toMatchObject({ sequence: expect.any(Number) });
+    expect(on(hub, "fleet.work.x.1").map((item) => item.from)).toEqual([{ ...spoke.identity, verified: "bridge" }]);
+  });
+});

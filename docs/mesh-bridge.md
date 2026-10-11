@@ -6,8 +6,13 @@ existing events and mirrors root presence. There is no new store or protocol.
 
 ## What crosses
 
-- `fabric.control.command` and `fabric.control.ack`, `fleet.work.*`, and `ops.owner` with kind
-  `pr.wake`, when the recipient (`to`) is a live root or host native to the other side.
+- `fabric.control.command` and `fabric.control.ack`, well-formed `fleet.work.<name>` topics, and
+  `ops.owner` with kind `pr.wake`, when the recipient (`to`) is a live root or host native to the
+  other side. A well-formed work topic is at most 128 characters of dot-separated, non-empty ASCII
+  segments of `[A-Za-z0-9_-]` (a dot-led repo such as `.github` is the one exception), so every
+  work topic that crosses also passes the mesh's and `mesh_answers`' topic pattern. `fleet.work.`,
+  `fleet.work..1`, `fleet.work.a..b.1`, a trailing dot, NUL, space, lookalike or other non-ASCII
+  character does not cross to anyone.
 - From the remote to the hub only: a work topic of the exact form `fleet.work.<repo>.<n>` (a
   non-empty repo of `[A-Za-z0-9._-]`, not `.` or `..`, and a decimal number with no sign or leading
   zero) and the allow-listed `ops.owner` kinds, addressed to the hub factory's role, the exact
@@ -16,13 +21,15 @@ existing events and mirrors root presence. There is no new store or protocol.
   `fleet.work.inbox-receipts`, `factory-lead`, `factory` with a NUL or space, and a non-string `to`
   do not cross. No other recipient name, no other topic, and nothing from the hub to the remote is
   widened.
-- These factory-addressed events are rate bound per link: a token bucket of 30 events a minute,
-  burst 60 (`--factory-rate PER_MINUTE`, `--factory-burst N`). Events to a hub-native recipient
-  spend no token. Over the bound nothing is dropped: the inbound drain stops at that event with the
+- These factory-addressed events are rate bound per link, in events and in bytes: a token bucket
+  of 30 events a minute, burst 60 (`--factory-rate PER_MINUTE`, `--factory-burst N`), and one of
+  512 KiB a minute, burst 1 MiB, of the events as published (`--factory-bytes BYTES_PER_MINUTE`,
+  `--factory-byte-burst BYTES`). An event bigger than the byte burst waits for a full bucket and
+  leaves a debt, so it is never stuck. Events to a hub-native recipient spend from neither. Over the bound nothing is dropped: the inbound drain stops at that event with the
   cursor before it (the link's later inbound events wait behind it, in order), no pass rereads the
   remote until the next token is due, and one timer then retries it. A line at most once a minute
-  reports it: `toLocal: factory rate bound (30/min, burst 60): N deferrals; waiting at <topic> <id>,
-  retry in N ms; nothing dropped`.
+  reports it: `toLocal: factory rate bound (30/min, burst 60; 524288 bytes/min, burst 1048576): N
+  deferrals; waiting at <topic> <id>, retry in N ms; nothing dropped`.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
   lease retains the source's expiry, capped at 15 s from the mirror commit. A slow pass can shift
@@ -40,7 +47,10 @@ existing events and mirrors root presence. There is no new store or protocol.
 
 ## Rules
 
-- Each bridged event keeps its `from`, `to`, `kind` and `text`. It carries
+- Each bridged event keeps its `to`, `kind` and `text`. An event from the hub keeps its `from`. An
+  event from the remote carries, as `from`, its sender's identity (name, kind, session id) from
+  the presence record this link admitted it by, never the one its body claims; under the commit
+  lock the hub also refuses one whose identity is not that sender's mirrored record (pi-fabric#876). It carries
   `data.bridge = {from: <side>, id: <original event id>}`, and an event with a `bridge` field is
   never forwarded again.
 - Per direction the cursor records the last handled source sequence plus a generation-tagged

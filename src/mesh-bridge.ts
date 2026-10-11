@@ -16,7 +16,7 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]`;
 
 const parseArgs = (argv: string[]): { mode: string; flags: Map<string, string>; command: string[] } => {
@@ -106,13 +106,18 @@ export const runBridge = async (
   const cursorPath = required(flags, "cursor");
   const logLevel = flags.get("log-level") ?? "info";
   if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
-  // The per-link bound on events crossing only as addressed to the hub factory (default 30/min, burst 60).
+  // The per-link bound on events crossing only as addressed to the hub factory (default 30/min,
+  // burst 60, and 512 KiB/min, burst 1 MiB).
   const factoryRate = {
     perMinute: Number(flags.get("factory-rate") ?? DEFAULT_FACTORY_RATE.perMinute),
     burst: Number(flags.get("factory-burst") ?? DEFAULT_FACTORY_RATE.burst),
+    bytesPerMinute: Number(flags.get("factory-bytes") ?? DEFAULT_FACTORY_RATE.bytesPerMinute),
+    byteBurst: Number(flags.get("factory-byte-burst") ?? DEFAULT_FACTORY_RATE.byteBurst),
   };
   if (!(Number.isFinite(factoryRate.perMinute) && factoryRate.perMinute > 0)) throw new Error("--factory-rate must be a positive number of events a minute");
   if (!(Number.isSafeInteger(factoryRate.burst) && factoryRate.burst > 0)) throw new Error("--factory-burst must be a positive integer");
+  if (!(Number.isSafeInteger(factoryRate.bytesPerMinute) && factoryRate.bytesPerMinute > 0)) throw new Error("--factory-bytes must be a positive integer of bytes a minute");
+  if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
   const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
   const argv = transportCommand(flags, command);
   if (signal.aborted) return 0;

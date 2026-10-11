@@ -527,6 +527,24 @@ for (let i = 0; ; i++) {
       reason: expect.stringContaining(`is outside the install root ${fs.realpathSync(pkg)}`) });
   });
 
+  // pi-fabric#880 review round 2: above the install root up to the first root-owned, root-only (or sticky) ancestor.
+  it.skipIf(leaseSkip !== "")(`fails closed on a group-writable, non-sticky parent of the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const parent = tempDir("parent");
+    const pkg = path.join(parent, "pkg");
+    fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+    const helper = path.join(pkg, "dist/native/fabric-mesh-lease");
+    fs.copyFileSync(leaseHelperPath(), helper);
+    fs.chmodSync(helper, 0o700);
+    const real = fs.realpathSync(parent);
+    fs.chmodSync(real, 0o770);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })[0]).toMatchObject({ name: "holder@lease-probe",
+      reason: expect.stringContaining(`helper integrity: ${real} is group/other-writable (mode 770)`) });
+    // A 0755 parent passes, and so do the test directory's own ancestors (/tmp is root-owned and sticky).
+    fs.chmodSync(real, 0o755);
+    expect(probeStateDbLeases(root, { helper, trustRoot: pkg })).toEqual([]);
+  });
+
   it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const pkg = tempDir("bundle");

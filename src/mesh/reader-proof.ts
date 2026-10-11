@@ -280,6 +280,7 @@ const unsafeChain = (file: string, root: string, fd?: number): string | undefine
   const inside = path.relative(top, real);
   if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
   const euid = process.geteuid?.();
+  let above = false;
   for (let at = real; ; at = path.dirname(at)) {
     let stat: fs.Stats;
     try { stat = fs.lstatSync(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
@@ -287,9 +288,15 @@ const unsafeChain = (file: string, root: string, fd?: number): string | undefine
       const opened = fs.fstatSync(fd);
       if (opened.dev !== stat.dev || opened.ino !== stat.ino) return `${file} changed while it was checked`;
     }
+    // Above the install root (pi-fabric#880 review round 2): another user who can write a parent can rename
+    // the whole package away and put another in place. The chain ends at the first root-owned ancestor that
+    // only root can change. ponytail: a root-owned STICKY one (/tmp) also ends it: there only an entry's
+    // owner (us, as checked below it) can rename that entry.
+    if (above && stat.uid === 0 && stat.isDirectory() && ((stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0)) return undefined;
     const why = stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid);
     if (why) return `${at} is ${why}`;
-    if (at === top) return undefined;
+    if (at === top) above = true;
+    if (at === path.dirname(at)) return undefined;
   }
 };
 

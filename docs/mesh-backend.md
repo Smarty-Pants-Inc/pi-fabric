@@ -60,7 +60,9 @@ The gate decides from an inventory, never from what readers chose to register:
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
    The helper and the gate's own bundle, and every directory on their real paths up to the install root
    (the package directory), must be owned by this user (or root), not group- or other-writable, and
-   inside that root (no symlink out of it), checked at each probe; otherwise it is
+   inside that root (no symlink out of it), checked at each probe. Above the root, every ancestor up to
+   the first root-owned one that only root can change (or a root-owned sticky one, such as `/tmp`)
+   must be ours (or root) and not group- or other-writable. Otherwise it is
    `holder@lease-probe` (smarty-dev#8145). The build strips group/other write from `dist/`, and the
    build check refuses any such entry or symlink in `dist/`. A same-user in-place write between the hash and the exec
    remains the accepted smarty-dev#7800 class: Node has no `memfd_create` to exec a sealed copy.

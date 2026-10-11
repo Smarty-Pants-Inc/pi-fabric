@@ -28,6 +28,43 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 `agents.wait({id})` waits for a spawned agent; `agents.join({id})` is an alias with identical arguments, result, progress, and notification behavior. A wait is bounded by `timeoutMs`: 5 minutes by default, and a larger value is clamped to 5 minutes, the limit of the foreground bash guard, because a wait holds its session in the foreground (smarty-dev#854). A child that is still running at the bound keeps running, the wait throws, and the child's result arrives as a completion message after the turn. In an interactive Main (TUI or RPC; not a task agent, actor, or print/JSON run), the bound is 60 seconds and reaching it is not an error: the wait returns the child's live status record (`status: "running"`) with `waitTimedOut: true`, so Main is back at a tool boundary where held followUps land (smarty-dev#2119). Use `wait` as the canonical spelling. The hosted `AgentService` and `AgentServiceClient` expose both methods too. [Jev programs](jev.md) follow the same `wait`/`join` naming.
 
+### Native Pi task final-answer boundary
+
+An ordinary native Pi process task ends when its final assistant answer is durably
+recorded in `final-answer.json`. The immutable receipt fences input immediately.
+Fabric then reads the worker's associated validated terminal snapshot and releases
+`agents.wait`/`run` once, **before native process/tree close**. Run/result/handle
+records expose `finalAnswerReceipt: { id, recordedAt }`. Structured replies retain
+`replyVia`, `value`, and schema failures; the answer receipt cannot promote a failed
+reply to success. Intermediate prose and tool turns remain steerable. Actor
+activations retain their continuation semantics. Claude and external placement
+completion rules are unchanged.
+
+Later `steer` and `followUp` calls reject with `FabricTargetTerminalError`, carrying
+`code: "FABRIC_TARGET_TERMINAL"`, `targetId`, and `finalAnswerReceiptId`, including
+across owner-control ACKs and TypeScript guest catches. Queued but unconsumed
+messages produce an asynchronous typed notice for **each original sender** and
+original message ID. Attribution comes from the manager-admitted native control
+journal, not final prose, message data, or a worker-selected notification address.
+Already consumed non-final controls receive no refusal.
+
+Pending refusal notices stay durable in the owned run directory. Main and resident
+owners use their existing sender route/mailbox paths; failed routes retry on status,
+archive recovery, and retention-sweep wakes. A host restart can reconstruct an
+outbox from the final receipt and original control journal. An unavailable sender
+remains delivery debt, not a successful notification. A retained `.delivered`
+notice marks an acknowledged route or durable mailbox handoff, **not sender
+consumption**, and suppresses duplicate recovery. Collection requires those route
+receipts for refused/unread controls; pending, malformed, or identity-mismatched
+artifacts veto deletion. Python kernels currently stringify host exceptions rather
+than exposing these TypeScript custom error fields; typed notice data is unchanged.
+
+A final answer or a completed wait is **not native custody release**. Fabric retains
+the transport PID, admission permit, run files, and execution-tree obligation until
+the existing owned-tree close confirms exit. Stop acknowledgment alone does not
+confirm exit. Consume the result and separately verify native terminal state before
+reclaiming a child's exclusive source scope.
+
 ### Main display names
 
 An interactive local Main publishes its valid Pi session name, or its Herdr agent name when
@@ -1092,7 +1129,7 @@ that Main can use without seeing the image. Do not answer the user's broader cod
 
 `validWhile` removes input activations without images before a model run. Ordinary text prompts use no vision-agent inference. The actor persists. Dispatch stays asynchronous. Main never waits for the visual description during its current inference. Subscribe to `before_agent_start` when the actor needs Pi's expanded prompt or system context. A subscription to both events creates two activations for one user prompt.
 
-`validWhile` supplies a programmable freshness guard for persistent actors. Fabric serializes the source of its pure synchronous function. It checks the function before starting queued work and before delivering completed work. Fabric also stores it with project actors and global templates. The immutable `activation` fact describes a `hostEvent`, `direct`, or `mesh` activation. The `current` object contains `latestActivationSequence`, `mainRevision`, `taskRevision`, `idle`, and `now`. When host-only `agents.wakeText` hydrated the triggering GitHub comment or review text, the facts also carry `wakeText` (`author`, `authorAssociation`, `body`, bounded to 2,000 characters; untrusted data), and activation filter paths can read `wakeText.*`. Main revisions increase after completed tools and lifecycle events. A tool-error review can become stale after Main recovers. Return `false` or `{ valid: false, reason? }` to discard stale work. Fabric records invalidated fire-and-forget work as a silent stale outbox entry. An invalidated `agents.ask()` rejects. Predicates must be synchronous. They cannot call tools or use closures because their source must run after restoration.
+`validWhile` supplies a programmable freshness guard for persistent actors. Fabric serializes the source of its pure synchronous function. It checks the function before starting queued work and before delivering completed work. Fabric also stores it with project actors and global templates. The immutable `activation` fact describes a `hostEvent`, `direct`, or `mesh` activation. The `current` object contains `latestActivationSequence`, `mainRevision`, `taskRevision`, `idle`, and `now`. Actors created with `records: { topic, maxEntries?, maxAgeMs? }` also see `current.records`, a frozen get-only view of that topic's host-maintained records map; actors without the option have no `records` field. Mesh activations expose the immutable triggering event's `data` as `activation.data`. When host-only `agents.wakeText` hydrated the triggering GitHub comment or review text, the facts also carry `wakeText` (`author`, `authorAssociation`, `body`, bounded to 2,000 characters; untrusted data), and activation filter paths can read `wakeText.*`. Main revisions increase after completed tools and lifecycle events. A tool-error review can become stale after Main recovers. Return `false` or `{ valid: false, reason? }` to discard stale work. Fabric records invalidated fire-and-forget work as a silent stale outbox entry. An invalidated `agents.ask()` rejects. Predicates must be synchronous. They cannot call tools or use closures because their source must run after restoration.
 
 ```ts
 return agents.create({
@@ -1116,6 +1153,35 @@ return agents.create({
   },
 });
 ```
+
+### Records-backed queued-work freshness
+
+Use a dedicated mesh records topic to invalidate work whose item became held, WAITed, or answered after queueing. `records` subscribes the host projection, not the model: records events alone do not activate the actor unless that topic is also in `topics`. The publisher sends `data: { key: string, state: "held" | "waited" | "answered" | "open" }`. Malformed payloads are ignored; the latest verifiable mesh sequence wins. The host keeps each entry's event creation time and mesh sequence. Each exposed value is frozen `{ state, at, fresh: boolean }`, with `at` the event creation time in ISO format. Only verifiable, unexpired entries are exposed (`fresh: true`). `records.get(key)` returns `undefined` for unknown, expired, unverifiable, or evicted keys and exposes no setters, iteration, or other topics. An update without a usable event time or sequence makes its key unknown; it does not preserve an older terminal value. Future event times are also unknown.
+
+The bounded LRU uses valid writes as recency (predicate reads are pure): updating a key moves it to the newest position. `maxEntries` defaults to 512, is a positive integer, and is capped at 4096. `maxAgeMs` is a positive safe integer, defaults to 21,600,000 ms (six hours), and measures age from the mesh event time, not arrival or predicate-read time. At age **greater than or equal to** `maxAgeMs`, the host expires the entry from the projection before the validity check. The existing start and delivery guards read only an in-memory snapshot: no file reads, exec, polling, or host-tool calls occur in the predicate. Updates come from the existing mesh event stream. Only the actor option is stored with its definition; the map itself is never persisted. On creation/restoration the host replays the topic's available retained events by sequence (including the retained archive when available). Replay clears prior values; records absent from or preceding that projection's replay window remain unknown, even if an older event arrives later. A store without a retained-event `read` API starts empty. Expiry requires no newer event to arrive.
+
+```ts
+return agents.create({
+  name: "org-supervisor",
+  instructions: "Act only on ready, unanswered work; respect all owner holds.",
+  topics: ["org.work.v1"],
+  records: { topic: "org.records.v1", maxEntries: 512, maxAgeMs: 6 * 60 * 60 * 1000 },
+  coalesce: false,
+  validWhile: ({ activation, current }) => {
+    if (activation.kind !== "mesh" || typeof activation.data?.key !== "string") return true;
+    const record = current.records?.get(activation.data.key);
+    // Unknown means RUN the work: fail-open is the safe default here.
+    if (record?.fresh !== true) return true;
+    return record.state !== "held" && record.state !== "waited" && record.state !== "answered";
+  },
+});
+```
+
+The factory-lead owner must wire the smarty-dev#7679 publisher to the same records topic and configure the org supervisor's `validWhile`; this API does not publish organization state itself. This predicate drops work **only** on a fresh held/waited/answered record. Unknown state runs the work (fail-open), including stale terminal state or missing replay; it must never be treated as a hold.
+
+**Post-wiring acceptance gate (factory-lead):** show one org-supervisor run whose item was answered in the last six hours being dropped **at start**, with that run/activation's `invalidated` outcome in the actor's `runs/`, and show one unrelated run still executing. Record the actor ID, item keys, event times/sequences, run/activation IDs, exact outcome paths, and execution evidence. A stale outbox message alone, a passing unit test, or a delivery-stage discard does not satisfy this gate. Keep wiring unaccepted until both post-wiring cases have this evidence.
+
+**Revert:** if a valid run is dropped, factory-lead removes the `validWhile` wiring; fabric-v2 pins back to the recorded pre-wiring known-good runtime pin. Preserve the invalidation evidence and verify the valid work executes again before re-enabling.
 
 Pi actors keep model context in a Fabric-owned Pi session file. Claude actors keep the session ID returned by the official CLI and use `--resume <id>` after the first message. Every activation reapplies tools, permissions, schema, and system-prompt flags. Fabric also stores a runner-neutral stream transcript. `thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` and uses the precedence described above. In the dashboard, `e` changes this session and `E` changes the project default. The persisted `tools` array is an allowlist. Set it during creation, replace it with `agents.setTools({ id, tools })`, or press `o` in the dashboard. An empty array disables optional tools. Pi actors keep the host-required `fabric_exec` capability for mailbox and mesh coordination unless you create them with `extensions: false`. This setting removes Fabric from a Pi actor. Its activation then runs without `fabric_exec`, `agents.*`, or `mesh.*`. The host continues to manage its mailbox and delivery. The setting alone does not make the actor read-only because `tools` still defaults to `agents.defaultTools`. Also set `tools: ["read", "grep", "find", "ls"]` for a read-only persistent actor. Use `tools: []` for an actor without tools.
 
@@ -1257,6 +1323,10 @@ return rlm.query({
 `rlm.query()` calls `agents.run({ runner: "pi", recursive: true })` with Fabric enabled in the child; it accepts `cwd?: string` and `worktree?: boolean`, just like one-shot agent runs. Recursive spawning means Fabric agent composition, not recursive filesystem traversal. Fabric rejects Claude runners for recursive use. It also rejects recursion at `agents.maxDepth`. This setting accepts any non-negative safe integer, and `0` disables child spawning. Approval for the initial recursive call delegates only the `agent` risk capability to recursive children. It does not delegate approvals for network access, execution, or writes. Each Fabric process applies its own configured concurrency and timeout limits. When `agents.budgetUsd` is set, a shared append-only cost ledger limits total spending across the recursion tree. Each node writes the cost of its children to one ledger file that it receives through the environment. A node rejects a new child when accumulated spending reaches the budget. This check is best effort. Concurrent children can pass the check before another child records cost, so the tree can exceed the limit slightly. Use `agents.maxPerExecution` as the race-free ceiling. Results and live status for each recursive child include a `budget` summary with `limit`, `spent`, `remaining`, and `tokens`. Fabric keeps the latest bounded nested-agent status tree in memory. Completed recursive leaves remain visible in **Topology · Run** after the child process deletes its temporary nested run directories. Fabric releases the snapshot when the parent run is cleaned up or the Fabric session shuts down.
 
 `agents.nice` (0-19, default `0`) lowers the CPU priority of every child agent, and its IO priority on Linux (`ionice -c2 -n7`). The child's bash tools inherit it. A per-call `nice` on `agents.run`/`agents.spawn`, `agents.create({ nice })` or `agents.setNice({ id, nice })` for an actor can only raise it above the configured value, never lower it; it is clamped to 19. Details: [configuration](configuration.md).
+
+Every Pi run that Fabric's worker launches (process task agents and actors, never a Main) gives its bash calls two defaults (smarty-dev#6137). A total cap of 600 s for a call without its own `timeout` (an actor's `bashTimeoutSeconds` overrides it; an explicit per-call `timeout` wins). An idle limit for every blocking call: after 180 s with no stdout or stderr output, Fabric sends SIGTERM to the command's dedicated process group and Linux `/proc`-discovered descendants, waits a bounded 5 s grace, then sends SIGKILL. Output or shell exit during grace cannot cancel escalation. The call fails with exit code 124 and `[pi-fabric] bash idle timeout: no output for 180 s; killed; rerun with a bounded range or a command that prints progress`. An explicit `timeout` does not turn the idle limit off, because models pass one on their own. `bashIdleSeconds` on `agents.run`/`agents.spawn` changes the idle limit for that child; `0` turns it off. fabric_exec `pi.bash` `background` and `monitor` jobs do not get the idle limit. Pi's bash tool has only a total timeout, so the idle limit runs the original shell command under a small `node -e` watchdog with a detached execution envelope as its process-group leader. IPC disconnect kills that detached group if Pi aborts or total-times-out the outer watchdog. Wrapping is recorded in hook-set metadata on the actual call args, never inferred from a public command marker. Windows gets only the total cap: it has no POSIX process groups/setsid or group TERM/KILL signaling, so Fabric does not wrap its commands in the idle watchdog. A Windows idle-limit implementation is a platform limit tracked by smarty-dev#6137.
+
+Cleanup does not depend on `ps`. On Linux, descendant PID/start-time identities are retained across TERM and reparenting as a second net for setsid children. This lightweight hook has no reachable per-command delegated cgroup-v2 launch: a double-forked setsid daemon that leaves the group before discovery is not covered (tracked by smarty-dev#7934).
 
 `agents.maxTokensPerChild` limits cumulative token use for each child. Its default value, `0`, disables the limit. The wall-clock `timeoutMs` limits time, and `budgetUsd` limits cost. This limit caps the context of one runaway child before the host session compacts. Fabric stops the child with the same `timed_out` status and a `token limit` error. See [`/skill:fabric-rlm`](../skillsets/typescript/fabric-rlm/SKILL.md).
 

@@ -5,6 +5,9 @@ import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-te
 const temp = isolatedTestTemp("pi-fabric-vitest-");
 Object.assign(process.env, temp);
 const fleet = isolateTestFleetEnvironment();
+// smarty-dev#7554: fixtures assert 0644/0755 modes; an agent shell's umask 0077 must not decide them.
+// Forked workers inherit it. POSIX-only: Windows has no meaningful umask.
+if (process.platform !== "win32") process.umask(0o022);
 
 // GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
 const ci = process.env.CI === "true";

@@ -70,6 +70,15 @@ export interface FabricStateOptions {
   entryIdentity?: FabricLoadedFileIdentity;
 }
 
+// Survives extension generations (reload, session replacement) in this Pi process.
+// A shared mesh is not a session scope: unrelated cwds must not inherit a Main's re-arm hint.
+const PUBLISHED_MAIN_SCOPES = Symbol.for("pi-fabric.published-main-scopes.v1");
+const publishedMainScopes = (): Set<string> => {
+  const holder = globalThis as Record<symbol, Set<string> | undefined>;
+  return holder[PUBLISHED_MAIN_SCOPES] ??= new Set<string>();
+};
+const mainPresenceScope = (meshRoot: string, cwd: string): string => JSON.stringify([meshRoot, path.resolve(cwd)]);
+
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
 type ActivationFailureHook = () => void | Promise<void>;
 
@@ -280,11 +289,11 @@ export class FabricState {
     // Publish this Main in the shared participant directory at startup, so
     // peers can find and steer an idle session before it first uses Fabric.
     if (this.config.mesh.announce) return true;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ??
-      (this.config.mesh.root
-        ? path.resolve(projectRoot, this.config.mesh.root)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    const meshRoot = this.#meshRoot(context);
+    // Re-arm on session_start (smarty-dev#5962/#4313): a Main this process already published
+    // keeps its presence across /reload and session replacement. Its old heartbeat retired with
+    // the old ctx; waiting for first tool use let the lease lapse and the Main vanish silently.
+    if (publishedMainScopes().has(mainPresenceScope(meshRoot, context.cwd))) return true;
     const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const actorRoots = [
       path.join(meshRoot, "actors"),
@@ -308,6 +317,14 @@ export class FabricState {
         return false;
       }
     });
+  }
+
+  #meshRoot(context: ExtensionContext): string {
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    return process.env.PI_FABRIC_MESH_ROOT ??
+      (this.config.mesh.root
+        ? path.resolve(projectRoot, this.config.mesh.root)
+        : path.join(projectRoot, ".pi", "fabric", "mesh"));
   }
 
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
@@ -588,6 +605,12 @@ export class FabricState {
         this.#runtime = candidate;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
+        try {
+          if (config.mesh.enabled && context.isProjectTrusted() &&
+            resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {
+            publishedMainScopes().add(mainPresenceScope(this.#meshRoot(context), context.cwd));
+          }
+        } catch { /* best-effort re-arm hint; the next first use still activates */ }
         return candidate;
       } catch (error) {
         try {

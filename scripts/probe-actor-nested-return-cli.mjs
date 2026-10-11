@@ -11,7 +11,16 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Write only into a fresh run directory created by mkdtemp (mode 0700, never pre-existing), so a planted
 // symlink at a fixed output name cannot redirect a write outside it (review P3, pi-fabric#459).
 const outParent = path.resolve(process.argv[2] ?? process.env.TASK_OUT);
-fs.mkdirSync(outParent, { recursive: true });
+fs.mkdirSync(outParent, { recursive: true, mode: 0o700 });
+// Refuse an output parent another user could rename entries in (review P2, pi-fabric#459): it must be a real
+// directory (not a symlink) owned by us, and not group/other-writable unless it is sticky.
+{
+  const st = fs.lstatSync(outParent);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  const sticky = (st.mode & 0o1000) !== 0;
+  if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || ((st.mode & 0o022) !== 0 && !sticky))
+    throw new Error(`refusing output parent ${outParent}: it must be a directory owned by this user and not writable by others`);
+}
 const out = fs.mkdtempSync(path.join(outParent, 'nested-return-'));
 console.error(`proof output: ${out}`);
 const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), 'native-nested-return-'));

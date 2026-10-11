@@ -224,6 +224,16 @@ const numberField = (value: unknown): number => (typeof value === "number" ? val
 const stringField = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
 
+/** smarty-dev#3238 round 3: why a silently overflowed answer ("stop"/"length" over the window) is withheld. */
+const silentOverflowError = (message: Record<string, unknown>, contextWindow: number): string => {
+  const usage = typeof message.usage === "object" && message.usage !== null && !Array.isArray(message.usage)
+    ? message.usage as Record<string, unknown> : {};
+  const count = (value: unknown): number => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const input = count(usage.input) + count(usage.cacheRead);
+  return `Context overflow: the provider ended the turn with stopReason "${String(message.stopReason)}" with ${input} input tokens ` +
+    `against a ${contextWindow}-token window; its answer is unchecked and was not delivered`;
+};
+
 const assistantError = (message: Record<string, unknown>): string => {
   const details: string[] = [];
   const direct = stringField(message.errorMessage) ?? stringField(message.error);
@@ -303,6 +313,8 @@ const main = async (): Promise<void> => {
   runRecordHelpers = loadedRunRecordHelpers;
   const {
     applyUsage,
+    assistantContextTokens,
+    piWindowRefusal,
     createRunningRecord,
     emptyUsage,
     extractUsageDelta,
@@ -779,6 +791,10 @@ const main = async (): Promise<void> => {
   let producedFinalAnswer = false;
   let finalAnswerReceipt: FinalAnswerReceipt | undefined;
   let lastUsageMessageTimestamp: number | undefined;
+  // smarty-dev#3238: the child's model window, from its own get_state, for an actor's contextUsage.
+  let childContextWindow: number | undefined;
+  // smarty-dev#3238 round 2: set only from a structured overflow signal; stamps errorCode on failure.
+  let contextOverflowSignal = false;
   let finalTurnCompleted = false;
   let attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
   let completedToolInTurn = false;
@@ -957,9 +973,12 @@ const main = async (): Promise<void> => {
   let activationWindowReady = false;
   let residentProbeReady = false;
   // Optional worker-only edge: never load native estimation in Main registration.
-  const admissionModule = options.runner === "pi" && options.actorId && !activationWindow
+  const actorPiModule = options.runner === "pi" && options.actorId
     ? await import(import.meta.url.endsWith(".ts") ? "./worker/context-admission.ts" : "./worker/context-admission.js") as typeof import("./worker/context-admission.js")
     : undefined;
+  const admissionModule = activationWindow ? undefined : actorPiModule;
+  // smarty-dev#3238 round 2: Pi's provider-overflow classifier, for an actor run's typed overflow code.
+  const piContextOverflow = actorPiModule ? await actorPiModule.loadPiContextOverflow(options.piBinary) : undefined;
   const estimateActorInput = admissionModule
     ? await admissionModule.loadActorInputEstimator(options.piBinary) : undefined;
   if (admissionModule && !estimateActorInput) appendLog(`${JSON.stringify({ type: "fabric_context_admission", mode: "launcher", reason: "native_estimator_unavailable" })}\n`);
@@ -1600,12 +1619,22 @@ const main = async (): Promise<void> => {
       } else modelControl.fail("activation window readiness does not match the selected run/policy/hook");
       return;
     }
+    // smarty-dev#3238 round 2: the activation window's own window refusal, typed by its bound frame.
+    if (activationWindow && event.type === "fabric_activation_window_refusal") {
+      if (event.runId === options.id && event.nonce === activationNonce && event.protocol === 1 &&
+          event.hook === activationHookPath && event.code === "context-overflow") contextOverflowSignal = true;
+      return;
+    }
     if (residentProbeNonce && event.type === "fabric_resident_extension_ready") {
       if (event.runId === options.id && event.nonce === residentProbeNonce &&
           event.protocol === 1 && event.extension === options.fabricExtensionPath && !residentProbeReady) {
         residentProbeReady = true;
       } else modelControl.fail("resident readiness does not match the selected run/extension/nonce");
       return;
+    }
+    if (event.type === "response" && event.command === "get_state" && event.success === true) {
+      const window = (event.data as { model?: { contextWindow?: unknown } } | null | undefined)?.model?.contextWindow;
+      if (typeof window === "number" && Number.isFinite(window) && window > 0) childContextWindow = window;
     }
     if (modelControl.observe(event)) return;
     if (contextAdmission?.observe(event)) return;
@@ -1616,18 +1645,17 @@ const main = async (): Promise<void> => {
       }
     }
     // Context refusal is deterministic for an actor's admitted input. Native
-    // retries cannot make it fit; stop at the first structured failure, also
-    // for full-history actors or a preflight extension that reports an error.
+    // retries cannot make it fit; stop at Pi's own structured refusal (smarty-dev#3238
+    // round 2: the whole refusal message on its assistant message, never free text).
     const eventMessage = event.type === "message_end" && typeof event.message === "object" && event.message !== null
       ? event.message as Record<string, unknown> : undefined;
-    const contextError = eventMessage?.stopReason === "error" ? stringField(eventMessage.errorMessage)
-      : event.type === "extension_error" || (event.type === "response" && event.success === false) ? stringField(event.error)
-      : event.type === "auto_retry_start" ? stringField(event.errorMessage) : undefined;
-    if (options.actorId && !terminalStatus && contextError && /Context exceeds window:/i.test(contextError)) {
+    if (options.actorId && !terminalStatus && eventMessage && piWindowRefusal(eventMessage)) {
+      const contextError = stringField(eventMessage.errorMessage) ?? "Context exceeds window";
       terminalStatus = "failed";
       terminalError = contextError;
       record.error = contextError;
       sawAgentError = true;
+      contextOverflowSignal = true;
       update();
       killChild();
       return;
@@ -1799,35 +1827,51 @@ const main = async (): Promise<void> => {
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
       }
-      hasFinalText = Boolean(text) && messageRecord.stopReason !== "error" &&
-        messageRecord.stopReason !== "aborted" && messageRecord.stopReason !== "toolUse";
+      // smarty-dev#3238 round 3: the run's latest model turn, judged by Pi's own classifier whatever
+      // its stopReason. A provider that answers "stop" (or "length") with usage above the window has
+      // overflowed silently (pi-ai isContextOverflow case 2/3): Pi keeps that answer without
+      // retrying, so it is unchecked. Such a turn fails like an error turn and is never final. A
+      // later turn that fits (Pi's own recovery) supersedes it, as it supersedes an error turn.
+      const overflowTurn = Boolean(options.actorId && piContextOverflow &&
+        piContextOverflow(messageRecord, childContextWindow ?? 0));
+      if (options.actorId) contextOverflowSignal = overflowTurn;
+      const failedTurn = messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted" || overflowTurn;
+      hasFinalText = Boolean(text) && !failedTurn && messageRecord.stopReason !== "toolUse";
       producedFinalAnswer ||= hasFinalText;
       if (text) {
         record.text = latestRunText(text);
-        if (messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
+        if (failedTurn) {
           record.partialText = record.text;
         } else {
           record.lastCompleteText = record.text;
         }
         process.stdout.write(`\n${text}\n`);
       }
-      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+      if (!failedTurn) {
         delete record.partialText;
       }
       const usageDelta = extractUsageDelta(messageRecord);
       lastUsageMessageTimestamp = typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : undefined;
       applyUsage(record, messageRecord);
+      const contextTokens = assistantContextTokens(messageRecord);
+      if (options.actorId && childContextWindow && contextTokens > 0) {
+        record.contextUsage = { tokens: contextTokens, contextWindow: childContextWindow };
+      }
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),
       }, messageRecord);
       modelControl.observeAssistant(messageRecord);
       enforceTokenLimit();
-      if ((messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") && !terminalStatus) {
+      if (failedTurn && !terminalStatus) {
         sawAgentError = true;
         providerAborted ||= messageRecord.stopReason === "aborted";
-        terminalError = assistantError(messageRecord);
-        recoveryWatchdog.arm(terminalError);
+        const silentOverflow = overflowTurn && messageRecord.stopReason !== "error";
+        terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
+        // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
+        // recovery is pending; any other failed turn may still be recovered by Pi.
+        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();
         sawAgentError = false;
@@ -2448,6 +2492,8 @@ const main = async (): Promise<void> => {
       (options.runner === "veda" && vedaParsed !== undefined));
   record.status = terminalStatus ?? (childCompleted ? "completed" : "failed");
   if (terminalError) record.error = terminalError;
+  // smarty-dev#3238 round 2: the manager retries and reports overflow only on this typed code.
+  if (record.status === "failed" && contextOverflowSignal && !record.errorCode) record.errorCode = "CONTEXT_OVERFLOW";
   if (record.status === "failed" && !record.error) {
     record.error =
       stderr.trim() ||

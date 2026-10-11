@@ -362,6 +362,40 @@ describe("final pre-delete check fences", () => {
     expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
   });
 
+  // pi-fabric#850 round 3 (CODE c6106235901, SEC c6106236419): a session directory vanishes during a re-walk (skipped
+  // as vanished), is still absent when the watch list is rebuilt, then reappears under the same name with an
+  // actors.json that references the run. Its references must be read before the delete.
+  it.skipIf(process.platform !== "linux")("--apply keeps a run a session directory references after it vanished during a re-walk and reappeared", async () => {
+    const mesh = deadRootMesh();
+    write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    const flicker = path.join(mesh.root, "actors", "01a118ab-flicker-session");
+    write(path.join(flicker, "actors.json"), JSON.stringify({ actors: [] }));
+    const away = path.join(tmp("fabric-flicker-away-"), "session");
+    let armed = false, moved = false, restored = false;
+    // A new session forces a re-walk at mesh.old's final check.
+    const injected = onStatusRead(mesh.old, () => { write(path.join(mesh.root, "actors", "01a118ab-new-session", "actors.json"), JSON.stringify({ actors: [] })); armed = true; });
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      // The re-walk's lstat of the flicker directory: it vanishes right then.
+      if (armed && !moved && file === flicker) { moved = true; fs.renameSync(flicker, away); }
+      return (lstat as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.lstatSync);
+    const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
+    verifiedRemoveTestHooks.beforeOpen = target => {
+      // After the re-walk and the watch rebuild, before the delete: it reappears with a reference to the run.
+      if (target !== mesh.old || !moved || restored) return;
+      restored = true;
+      fs.renameSync(away, flicker);
+      write(path.join(flicker, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
+    };
+    try {
+      const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
+      expect([injected(), moved, restored]).toEqual([true, true, true]);
+      expect(applied.removedRuns).not.toContain(mesh.old);
+      expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
+    } finally { delete verifiedRemoveTestHooks.beforeOpen; }
+  });
+
   it("stops every later delete when the registry tree becomes uncertain after discovery", async () => {
     const mesh = deadRootMesh();
     const elsewhere = tmp("fabric-linked-registry-");

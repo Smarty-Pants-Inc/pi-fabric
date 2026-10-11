@@ -222,18 +222,28 @@ const sweep = async (meshRoot: string, options: {
   // check, so a reference it holds keeps the run; a vanished root leaves (its actors and their runs went with it).
   // The live dry run on Ryzen 1 (05:39Z) showed why: a new Main session appears within any 2-minute sweep, and the
   // former sticky stop refused every later candidate (0 bytes freed). Only an uncertain walk still stops the sweep.
-  const names = (): string => { try { return fs.readdirSync(actorsRoot).sort().join("\0"); } catch { return "\0unreadable"; } };
-  const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
-    .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
-  let listing = names();
-  let watch = unregistered();
+  const list = (): string[] | undefined => { try { return fs.readdirSync(actorsRoot).sort(); } catch { return undefined; } };
+  const key = (names: string[] | undefined): string => names ? names.join("\0") : "\0unreadable";
+  // Watched BY NAME, from the same listing the change test compares against (pi-fabric#850 round 3): every listed name
+  // that is not a registry, whether or not it exists right now. A session directory that vanished during a walk and
+  // reappears under the same name with an actors.json trips the probe; it is never silently out of view.
+  const unregistered = (names: string[] | undefined): string[] =>
+    [actorsRoot, ...(names ?? []).map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory));
+  const hasRegistry = (directory: string): boolean => {
+    try { return fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOTDIR"; } // a listed file: no registry; else unknown
+  };
+  const initial = list();
+  let listing = key(initial);
+  let watch = unregistered(initial);
   let rootsChanged = false;
   const registryRootsChanged = (): boolean => {
     if (rootsChanged) return true;
-    const appeared = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined);
-    if (!appeared && names() === listing) return false;
-    // The listing is taken before the walk: a name added during it differs again at the next check.
-    const before = names();
+    const appeared = watch.some(hasRegistry);
+    if (!appeared && key(list()) === listing) return false;
+    // The listing is taken before the walk: a name added during it differs again at the next check, and a name that
+    // vanishes during it stays watched.
+    const before = list();
     const found: string[] = [];
     try { discover(actorsRoot, 0, found); }
     catch (error) {
@@ -242,7 +252,7 @@ const sweep = async (meshRoot: string, options: {
       return true;
     }
     registries.splice(0, registries.length, ...found);
-    listing = before; watch = unregistered(); registryRewalks++;
+    listing = key(before); watch = unregistered(before); registryRewalks++;
     return false;
   };
   // The dead host's flock fence on one residency root: claimed, re-proven and released around

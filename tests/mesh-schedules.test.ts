@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
+import { localityLockToken } from "../src/core/atomic-write.js";
 import { MeshStore, MESH_MAX_PENDING_SCHEDULES, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider, meshScheduleDueAt } from "../src/providers/mesh-provider.js";
@@ -104,6 +105,30 @@ describe("mesh schedules", () => {
     expect(Object.fromEntries(released.map(event => [event.text, event.principal]))).toEqual({
       kept: principal, none: undefined, damaged: undefined,
     });
+  });
+
+  it.each(["store", "provider"] as const)("a %s schedule cancelled while waiting for the mesh lock is never committed (#864)", async (level) => {
+    const store = new MeshStore(meshRoot(), 64 * 1024, 100, { lockTimeoutMs: 5_000 });
+    // A live local holder: this process, without an incarnation, so recovery never takes it.
+    const lock = path.join(store.root, ".lock");
+    fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(lock, "owner"), `${localityLockToken()}\n${process.pid}\n${Date.now()}\n`);
+    const abort = new AbortController();
+    const provider = new MeshProvider(store, identity, participants);
+    const pending = (level === "store"
+      ? store.schedule({ topic: "jobs", from: identity, data: { n: 1 }, dueAt: Date.now() + 60_000, key: "cancelled", signal: abort.signal })
+      : provider.invoke("publish", { topic: "jobs", data: { n: 1 }, afterMs: 60_000, key: "cancelled" }, { signal: abort.signal } as FabricInvocationContext)
+    ).catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    abort.abort(new Error("caller cancelled"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fs.rmSync(lock, { recursive: true, force: true });
+    expect(await pending).toMatchObject({ message: "caller cancelled" });
+    expect(store.scheduled()).toEqual([]);
+    // A non-aborted scheduled publish still commits.
+    await expect(provider.invoke("publish", { topic: "jobs", data: { n: 2 }, afterMs: 60_000, key: "kept" }, { signal: new AbortController().signal } as FabricInvocationContext))
+      .resolves.toMatchObject({ scheduled: true, key: "kept" });
+    expect(store.scheduled().map((entry) => entry.key)).toEqual(["kept"]);
   });
 
   it("enforces bounds and fails closed on damaged schedule state", async () => {

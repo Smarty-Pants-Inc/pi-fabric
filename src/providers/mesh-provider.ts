@@ -438,7 +438,7 @@ export class MeshProvider implements FabricProvider {
             ...(args.data !== undefined ? { data: args.data } : {}),
           };
           if (dueAt !== undefined) {
-            return this.store.schedule({ ...message, dueAt, ...(typeof args.key === "string" ? { key: args.key } : {}) })
+            return this.store.schedule({ ...message, signal: context.signal, dueAt, ...(typeof args.key === "string" ? { key: args.key } : {}) })
               .then(schedule => ({ scheduled: true as const, ...schedule }));
           }
           return this.store.publish({ ...message, signal: context.signal, ...(dedupeKey === undefined ? {} : { dedupeKey }) });

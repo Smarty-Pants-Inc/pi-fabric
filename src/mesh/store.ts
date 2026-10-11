@@ -462,7 +462,10 @@ export class MeshStore {
     key?: string;
     /** Runtime-captured originating principal (host-only), as for publish. */
     principal?: FabricPrincipal | undefined;
+    /** Checked under the lock before the schedule is written, as for publish. */
+    signal?: AbortSignal | undefined;
   }, now = Date.now()): Promise<MeshSchedule> {
+    input.signal?.throwIfAborted();
     validateMeshTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
     if (input.key !== undefined && !SCHEDULE_KEY_PATTERN.test(input.key)) {
@@ -503,6 +506,9 @@ export class MeshStore {
       throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
     return this.#lock.withLock(() => {
+      // A caller cancelled while this waited for the lock must not commit: the provider's
+      // abortable race rejects the caller but cannot stop this promise.
+      input.signal?.throwIfAborted();
       const file = this.#readSchedules(false);
       const pending = file.schedules.filter((entry) => input.key === undefined || entry.key !== input.key);
       if (pending.length >= MESH_MAX_PENDING_SCHEDULES) {

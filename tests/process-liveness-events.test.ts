@@ -343,7 +343,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   let scopeDirectory: string | undefined;
   let liveCgroup: string | undefined;
   let populated = initialPopulated;
-  let scopeRemoved = false;
+  let scopeRemoved: string | undefined;
   const eventsFd = 700_000_010;
   const order: string[] = [];
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
@@ -403,7 +403,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     if (args[0] !== eventsFd) return (nativeReadSync as (...values: unknown[]) => number)(...args);
     order.push("read");
     if (failure === "read" || (failure === "read-after-arm" && ++eventReads > 1)) throw new Error("events unreadable");
-    if (scopeRemoved) throw Object.assign(new Error("ENODEV: no such device, read"), { code: "ENODEV" });
+    if (scopeRemoved) throw Object.assign(new Error(`${scopeRemoved}: read failed`), { code: scopeRemoved });
     const text = `populated ${populated}\nfrozen 0\n`;
     (args[1] as Buffer).write(text);
     return Buffer.byteLength(text);
@@ -452,7 +452,7 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     handle, transport, census, kill, timeout, unconfirmed, watcher, admissionWatcher, opened, readEvents, closeEvents, order,
     emptyScope: () => { populated = "0"; watcher.emit("change"); },
     // systemd collects an empty scope (processSlice): the retained events fd then reads ENODEV.
-    removeScope: () => { scopeRemoved = true; watcher.emit("change"); },
+    removeScope: (code = "ENODEV") => { scopeRemoved = code; watcher.emit("change"); },
     depart: () => { descendantAlive = false; },
     close: async () => {
       primaryAlive = false;
@@ -513,6 +513,17 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     expect(f.unconfirmed).not.toHaveBeenCalled();
     expect(f.handle.lostContact()).toBeUndefined();
     expect(await f.handle.isAlive()).toBe(false);
+  });
+
+  // Only removal (ENODEV) proves an empty scope; any other read error keeps custody.
+  it.each(["ENOENT", "EACCES", "EIO"])("retains custody when the events read fails with %s after exit", async code => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true);
+    f.depart();
+    await f.close();
+    f.removeScope(code);
+    await expect(f.handle.treeClosed).rejects.toMatchObject({ code });
+    expect(f.unconfirmed).toHaveBeenCalledOnce();
+    expect(f.handle.lostContact()).toContain("Owned scope observation failed");
   });
 
   it("rejects and retains custody if an admitted watcher later fails", async () => {

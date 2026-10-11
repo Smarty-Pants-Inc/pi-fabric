@@ -548,9 +548,9 @@ export const spawnDetached = async (
     try { size = fs.readSync(scopeEventsFd, buffer, 0, buffer.length, 0); }
     catch (error) {
       // ponytail: cgroup v2 refuses to remove a cgroup that still has processes (EBUSY), so a removed
-      // scope (systemd collects it on empty: ENODEV on the retained fd, smarty-dev#6829) proves populated 0.
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENODEV" || code === "ENOENT") return true;
+      // scope (systemd collects it on empty: kernfs answers ENODEV on the retained fd, smarty-dev#6829) proves
+      // populated 0. Only removal: every other read error (EACCES, EIO, ...) still fails closed.
+      if ((error as NodeJS.ErrnoException).code === "ENODEV") return true;
       throw error;
     }
     const populated = buffer.toString("utf8", 0, size).match(/^populated ([01])$/m)?.[1];

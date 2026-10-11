@@ -302,7 +302,8 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
  * sequence is ignored; a batch whose `base` is not the snapshot's sequence cannot have passed the publish CAS, so
  * it is a protocol violation and refuses (the model never guesses).
  */
-export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMessage, maxTombstones: number): NatsSnapshot => {
+export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMessage, maxTombstones: number,
+  limits: Pick<NatsSnapshotLimits, "maxBytes" | "maxEntries" | "maxChunks"> = natsSnapshotLimits({})): NatsSnapshot => {
   if (message.seq <= snapshot.seq) return snapshot;
   const record = decode(message.data);
   if (record.type === "retire" || record.type === "import-begin" || record.type === "import-commit") return lifecycle(snapshot, record, message.seq);
@@ -313,15 +314,20 @@ export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMess
     // Every replica checks a published snapshot against its OWN model (the chunks between change no state), and
     // that it continues this stream's snapshot chain: a snapshot that misstates the stream fails closed here too.
     const header = record.header;
-    // Our own body, bounded by the size the header claims: a larger model cannot match it.
-    const body = isHeader(header) ? serializeModelBounded(snapshot, header.bytes) : undefined;
-    // The sequence fields are checked against where this end record actually is, and they are inside the digest.
-    if (!isHeader(header) || body === undefined || !Number.isSafeInteger(record.chunks) || record.chunks < 1 ||
-        !Number.isSafeInteger(record.base) || record.first !== record.base + 1 || record.base + record.chunks + 1 !== message.seq ||
-        header.prev !== snapshot.snapshotDigest || header.status !== snapshot.status || header.epoch !== snapshot.epoch ||
-        header.entries !== snapshot.entries.size || header.digest !== expectedDigest(record, message.seq, body)) {
-      throw new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} (end record ${message.seq}) does not match the stream it covers`);
+    const mismatch = () => new MeshStateNatsSnapshotIntegrityError(`snapshot ${record.snapshot} (end record ${message.seq}) does not match the stream it covers`);
+    if (!isHeader(header)) throw mismatch();
+    // pi-fabric#907 round 4: the CONFIGURED bounds first (the loader's checks), before anything is serialized, so an
+    // untrusted `header.bytes` never sizes the work.
+    if (header.bytes > limits.maxBytes || header.entries > limits.maxEntries || !Number.isSafeInteger(record.chunks) || record.chunks > limits.maxChunks) {
+      throw new MeshStateNatsLimitError(`snapshot ${record.snapshot} (end record ${message.seq}) claims ${header.bytes} bytes, ${header.entries} entries, ${String(record.chunks)} chunks (limits ${limits.maxBytes}, ${limits.maxEntries}, ${limits.maxChunks})`);
     }
+    // The cheap fields next; the sequence fields against where this end record actually is (they are in the digest too).
+    if (record.chunks < 1 || !Number.isSafeInteger(record.base) || record.first !== record.base + 1 || record.base + record.chunks + 1 !== message.seq ||
+        header.prev !== snapshot.snapshotDigest || header.status !== snapshot.status || header.epoch !== snapshot.epoch ||
+        header.entries !== snapshot.entries.size) throw mismatch();
+    // Our own body, capped at the smaller of the header's size and the configured bound: a larger model cannot match.
+    const body = serializeModelBounded(snapshot, Math.min(header.bytes, limits.maxBytes));
+    if (body === undefined || header.digest !== expectedDigest(record, message.seq, body)) throw mismatch();
     return { ...snapshot, seq: message.seq, snapshotEnd: message.seq, snapshotDigest: header.digest };
   }
   if (record.base !== snapshot.seq) {
@@ -662,7 +668,7 @@ export class NatsStateBackend implements StateBackend {
     this.#knownSeq = Math.max(this.#knownSeq, message.seq);
     // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
     if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
-    try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES); }
+    try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES, this.#limits); }
     catch (error) { this.#fail(error); return; }
     this.#settle();
   }

@@ -712,6 +712,21 @@ describe("NATS state snapshots: review round 2 (pi-fabric#907)", () => {
     expect(() => backend.get("v/0")).toThrow(MeshStateNatsSnapshotIntegrityError);
   });
 
+  it("a live end record claiming 2^52 bytes is refused against the configured bound, before any entry is serialized", async () => {
+    const { server, backend, end } = await snapshotted();
+    const forged = json(server, end);
+    (forged.header as { bytes: number }).bytes = 2 ** 52;
+    const stringify = vi.spyOn(JSON, "stringify");
+    server.append(new Uint8Array(Buffer.from(JSON.stringify(forged))), "S.snapshot");
+    const before = stringify.mock.calls.length;
+    await settle(); await settle();
+    // No entry of the model was serialized for it (an entry is an object with a `key`).
+    expect(stringify.mock.calls.slice(before).filter(([value]) => typeof (value as { key?: unknown })?.key === "string")).toHaveLength(0);
+    stringify.mockRestore();
+    expect(() => backend.get("v/0")).toThrow(MeshStateNatsLimitError);
+    expect(backend.diagnostics().nats?.failure).toMatch(/claims 4503599627370496 bytes/);
+  });
+
   it("compact() verifies what the stream stored before it purges: a corrupt publish leaves the stream unpurged", async () => {
     const server = fakeJetStream();
     const backend = await open(server, { snapshotEvery: 0 });

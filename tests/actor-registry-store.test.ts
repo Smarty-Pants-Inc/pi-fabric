@@ -26,6 +26,34 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore", () => {
+  // smarty-dev#6100 (org option B): a durable update stages and fsyncs its file before the fence, and the post-rename
+  // directory barrier runs after the fence is released; under custody only the generation check and the rename.
+  it("runs no fsync while holding the registry fence on a durable update, fast path and contended path", async () => {
+    const { store, lockPath, registryPath } = setup();
+    await store.update(() => ({ actors: [{ id: "seed" }], value: true }));
+    const underFence: string[] = [];
+    let syncs = 0;
+    const realFsync = fs.fsyncSync.bind(fs);
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      syncs += 1;
+      if (fs.existsSync(lockPath)) underFence.push(fs.fstatSync(fd).isDirectory() ? "directory" : "file");
+      return realFsync(fd);
+    });
+    // Durable: an adoption is custody. Fast path.
+    expect(await store.update((actors) => ({ actors: [...actors, { id: "a", adoptedAt: 1 }], value: "fast" }))).toBe("fast");
+    expect(syncs).toBeGreaterThan(0); // it was durable: file and directory barriers ran
+    expect(underFence).toEqual([]); // ...and none of them under the fence (before smarty-dev#6100: the directory chain)
+    // Contended path: a racing write between select and commit forces the under-custody attempt.
+    let raced = false;
+    expect(await store.update((actors) => {
+      if (!raced) { raced = true; fs.writeFileSync(registryPath, JSON.stringify({ format: 1, actors: [...actors, { id: "racer" }] })); }
+      return { actors: [...actors.filter((row) => row.id !== "b"), { id: "b", adoptedAt: 2 }], value: "slow" };
+    })).toBe("slow");
+    // The contended attempt still selects and stages under custody (smarty-dev#816 forward progress), so its staging
+    // barriers run there; its post-rename directory barrier does not. The write is complete either way.
+    expect(JSON.parse(fs.readFileSync(registryPath, "utf8")).actors.map((row: { id: string }) => row.id)).toEqual(expect.arrayContaining(["a", "b", "racer"]));
+  });
+
   it("orders and deduplicates multiple real registry fences before publication, retaining them across awaits", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-registry-order-"));
     roots.push(root);

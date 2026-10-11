@@ -174,23 +174,16 @@ const sweep = async (meshRoot: string, options: {
   const residents = new Map<string, string>();
   const ambiguous = new Set<string>();
   const registries: string[] = [];
-  // Only a directory can hold a registry. A link (it could alias a registry directory) or a directory that is not ours
-  // is uncertain. An entry that vanished between the listing and its lstat (an atomic write's temp file) and a
-  // non-directory (a hard-linked or foreign file) cannot be a registry root, so they are not uncertainty
-  // (pi-fabric#850: the live dry run on 0d506b18 stopped every delete on one such entry). actors.json itself is
-  // checked by registryReferences, which refuses a link, a hard link or a foreign file.
+  // Strict (pi-fabric#850 round 4): any entry that is not ours, a link, hard-linked, or gone between the listing and its
+  // lstat makes the registry roots uncertain. Tolerating such entries on a live mesh is smarty-dev#9058.
   const discover = (root: string, depth = 0, found = registries): void => {
     if (absent(root)) return;
     if (depth > 4 || !ownedStat(root)?.isDirectory()) throw new Error(`Actor references are uncertain: ${root}`);
     if (!absent(path.join(root, "actors.json"))) found.push(root);
     for (const name of fs.readdirSync(root)) {
       if (["runs", "handoff-session", "child-completions"].includes(name)) continue;
-      const child = path.join(root, name);
-      const stat = fs.lstatSync(child, { throwIfNoEntry: false });
-      if (!stat) continue;
-      if (stat.isSymbolicLink() || (stat.isDirectory() && process.getuid && stat.uid !== process.getuid())) {
-        throw new Error(`Actor references are uncertain: ${child}`);
-      }
+      const child = path.join(root, name); const stat = ownedStat(child);
+      if (!stat) throw new Error(`Actor references are uncertain: ${child}`);
       if (stat.isDirectory()) discover(child, depth + 1, found);
     }
   };
@@ -210,6 +203,8 @@ const sweep = async (meshRoot: string, options: {
   // pi-fabric#645 review round 4: every final pre-delete check re-discovers the registry roots. A root
   // created (or removed) since discovery may hold a cross-root reference the reread of `registries`
   // cannot see: every later delete fails closed and the sweep reports it. Sticky once changed.
+  // pi-fabric#850 round 4: strict again. Any change in the registry roots, an actors.json appearing in a watched
+  // directory, or an uncertain walk stops every later delete of this sweep. Continuing on a live mesh is smarty-dev#9058.
   // ponytail: the per-delete check relies on one invariant: an actor registry lives only at actors/actors.json (the
   // project registry) or actors/<session>/actors.json (a session registry). Enforced where every registry is created:
   // fabric-runtime-state.ts `actorRoots` ({ project: <mesh>/actors, session: <mesh>/actors/<session id> }) feeds
@@ -217,43 +212,34 @@ const sweep = async (meshRoot: string, options: {
   // actors/ or an actors.json appearing in actors/ or in one of its directories that had none. The check lists actors/
   // (one readdir) and probes actors.json in those directories (one lstat each); it never stats the ~10k actor homes
   // below, which cost minutes per sweep on Ryzen 1 (smarty-dev#7916). Names, not mtimes: within one coarse clock tick
-  // a directory's mtime need not change. A change re-walks the whole tree (pi-fabric#645 round 4) and, since
-  // pi-fabric#850, replaces the registry list in place: a new root joins and refs.fresh() parses it in the same final
-  // check, so a reference it holds keeps the run; a vanished root leaves (its actors and their runs went with it).
-  // The live dry run on Ryzen 1 (05:39Z) showed why: a new Main session appears within any 2-minute sweep, and the
-  // former sticky stop refused every later candidate (0 bytes freed). Only an uncertain walk still stops the sweep.
-  const list = (): string[] | undefined => { try { return fs.readdirSync(actorsRoot).sort(); } catch { return undefined; } };
-  const key = (names: string[] | undefined): string => names ? names.join("\0") : "\0unreadable";
-  // Watched BY NAME, from the same listing the change test compares against (pi-fabric#850 round 3): every listed name
-  // that is not a registry, whether or not it exists right now. A session directory that vanished during a walk and
-  // reappears under the same name with an actors.json trips the probe; it is never silently out of view.
-  const unregistered = (names: string[] | undefined): string[] =>
-    [actorsRoot, ...(names ?? []).map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory));
-  const hasRegistry = (directory: string): boolean => {
-    try { return fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined; }
-    catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOTDIR"; } // a listed file: no registry; else unknown
-  };
-  const initial = list();
-  let listing = key(initial);
-  let watch = unregistered(initial);
+  // a directory's mtime need not change. A changed listing re-walks the whole tree, as before (pi-fabric#645 round 4).
+  const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
+  const discovered = rootSet(registries);
+  const names = (): string => { try { return fs.readdirSync(actorsRoot).sort().join("\0"); } catch { return "\0unreadable"; } };
+  const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
+    .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
+  let listing = names();
+  let watch = unregistered();
   let rootsChanged = false;
   const registryRootsChanged = (): boolean => {
     if (rootsChanged) return true;
-    const appeared = watch.some(hasRegistry);
-    if (!appeared && key(list()) === listing) return false;
-    // The listing is taken before the walk: a name added during it differs again at the next check, and a name that
-    // vanishes during it stays watched.
-    const before = list();
-    const found: string[] = [];
-    try { discover(actorsRoot, 0, found); }
-    catch (error) {
-      rootsChanged = true;
-      skipped.push({ path: actorsRoot, reason: `actor registry roots are uncertain (${(error as Error).message}); no further run is deleted` });
-      return true;
+    let changed: string | undefined = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined)
+      ? "an actors.json appeared" : undefined;
+    if (!changed && names() !== listing) {
+      // A name came or went: re-walk, and accept it only when the registry roots are exactly the discovered ones.
+      // The listing is taken before the walk: a name added during it differs again at the next check.
+      const before = names();
+      try {
+        const found: string[] = []; discover(actorsRoot, 0, found);
+        if (rootSet(found) !== discovered) changed = "a registry root came or went";
+      } catch (error) { changed = `uncertain: ${(error as Error).message}`; }
+      if (!changed) { listing = before; watch = unregistered(); registryRewalks++; }
     }
-    registries.splice(0, registries.length, ...found);
-    listing = key(before); watch = unregistered(before); registryRewalks++;
-    return false;
+    if (changed) {
+      rootsChanged = true;
+      skipped.push({ path: actorsRoot, reason: `actor registry roots changed during the sweep (${changed}); no further run is deleted` });
+    }
+    return rootsChanged;
   };
   // The dead host's flock fence on one residency root: claimed, re-proven and released around
   // that root's own work only (smarty-dev#7766). Holding every idle root's host.lock for the

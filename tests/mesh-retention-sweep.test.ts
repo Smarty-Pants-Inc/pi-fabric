@@ -317,31 +317,31 @@ describe("final pre-delete check fences", () => {
     return other;
   };
 
-  // pi-fabric#850: a registry root created after discovery joins the sweep and is read at the same final check. Its
-  // reference keeps the run; without one the run is still collected (the live fleet always gains a session mid-sweep).
+  // pi-fabric#850 round 4: strict. Any registry-root change, a new actors.json in a watched directory, or an uncertain
+  // walk stops every later delete of the sweep (fail closed). Continuing on a live mesh is smarty-dev#9058.
+  const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
   it("keeps a run when a registry root with a cross-root reference is created after discovery", async () => {
     const mesh = deadRootMesh();
     const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, [{ id: "adopter", status: "running", inFlightRun: { id: "old", startedAt: NOW, ageS: 0 } }]));
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(mesh.old);
-    expect(applied.removedRuns).toContain(mesh.orphan);
     expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
-    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
-  it("still collects an unreferenced run when an unrelated registry root is created after discovery", async () => {
+  it("stops every later delete when an unrelated registry root is created after discovery", async () => {
     const mesh = deadRootMesh();
     const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, []));
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(injected()).toBe(true);
-    expect(applied.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
-    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
-  // pi-fabric#850 round 2 (the live dry run on 0d506b18): a re-walk met an entry that vanished between the listing and
-  // its lstat, or a hard-linked file, and stopped every later delete. Neither can be a registry root.
-  it.each(["an entry that vanishes during the re-walk", "a hard-linked file"])("keeps collecting when a re-walk meets %s", async kind => {
+  // Race shape of round 2: a re-walk meets an entry that vanished between the listing and its lstat, or a hard-linked
+  // file. Strict: the walk is uncertain and every later delete stops.
+  it.each(["an entry that vanishes during the re-walk", "a hard-linked file"])("stops every later delete when a re-walk meets %s", async kind => {
     const mesh = deadRootMesh();
     const session = path.join(mesh.root, "actors", "01a118ab-new-session");
     const injected = onStatusRead(mesh.old, () => {
@@ -357,14 +357,13 @@ describe("final pre-delete check fences", () => {
     }
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(injected()).toBe(true);
-    expect(applied.skipped).toEqual([]);
-    expect(applied.removedRuns.sort()).toEqual([mesh.old, mesh.orphan].sort());
-    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
-  // pi-fabric#850 round 3 (CODE c6106235901, SEC c6106236419): a session directory vanishes during a re-walk (skipped
-  // as vanished), is still absent when the watch list is rebuilt, then reappears under the same name with an
-  // actors.json that references the run. Its references must be read before the delete.
+  // Race shape of round 3 (CODE c6106235901, SEC c6106236419): a session directory vanishes during a re-walk, then
+  // reappears under the same name with an actors.json that references the run. Strict: the vanished entry makes the
+  // walk uncertain, so every later delete stops before the reappearance can matter.
   it.skipIf(process.platform !== "linux")("--apply keeps a run a session directory references after it vanished during a re-walk and reappeared", async () => {
     const mesh = deadRootMesh();
     write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
@@ -390,9 +389,10 @@ describe("final pre-delete check fences", () => {
     };
     try {
       const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-      expect([injected(), moved, restored]).toEqual([true, true, true]);
+      expect([injected(), moved]).toEqual([true, true]);
       expect(applied.removedRuns).not.toContain(mesh.old);
       expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
+      expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/uncertain/) });
     } finally { delete verifiedRemoveTestHooks.beforeOpen; }
   });
 
@@ -408,17 +408,19 @@ describe("final pre-delete check fences", () => {
 
   // smarty-dev#7916 (ASK 2 condition a): the per-delete check stats only actors/ and its non-registry children. A new
   // registry at actors/<session>/actors.json that references the run stops the --apply delete, whether its session
-  // directory is new, already existed without a registry, or appears after the move into the graveyard.
-  for (const when of ["new session directory", "existing session directory", "after the graveyard move"] as const) {
+  // directory is new, already existed without a registry, or appears after the move into the graveyard. The last is
+  // the race shape of round 4 (CODE c6106402825): a listed non-registry directory gains actors.json after the check's
+  // probe; the helper's second check (proceed) probes again, stops the sweep and moves the run back.
+  for (const when of ["new session directory", "existing session directory", "after the graveyard move", "existing session directory, after the graveyard move"] as const) {
     it.skipIf(process.platform !== "linux")(`--apply keeps a run a new actors/<session>/actors.json references (${when})`, async () => {
       const mesh = deadRootMesh();
       write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
       const session = path.join(mesh.root, "actors", "01a118ab-new-session");
-      if (when === "existing session directory") fs.mkdirSync(session, { recursive: true });
+      if (when.startsWith("existing session directory")) fs.mkdirSync(session, { recursive: true });
       const rows = [{ id: "adopter", status: "idle", lastRunId: "old" }];
       const create = () => write(path.join(session, "actors.json"), JSON.stringify({ actors: rows }));
       let injected: () => boolean;
-      if (when === "after the graveyard move") {
+      if (when.endsWith("after the graveyard move")) {
         const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
         let done = false;
         verifiedRemoveTestHooks.beforeOpen = target => { if (target === mesh.old && !done) { done = true; create(); } };
@@ -429,9 +431,7 @@ describe("final pre-delete check fences", () => {
         expect(injected()).toBe(true);
         expect(applied.removedRuns).not.toContain(mesh.old);
         expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
-        expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
-        // The unreferenced expired run of a removed actor is still collected.
-        expect(applied.removedRuns).toContain(mesh.orphan);
+        expect(applied.skipped).toContainEqual(stopped(mesh.root));
       } finally {
         const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
         delete verifiedRemoveTestHooks.beforeOpen;
@@ -446,7 +446,7 @@ describe("final pre-delete check fences", () => {
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(resident);
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
-    expect(applied.summary.registries.rootRewalks).toBeGreaterThan(0);
+    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
   it("keeps a run another registry references during the size scan", async () => {

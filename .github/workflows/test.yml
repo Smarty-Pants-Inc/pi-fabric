@@ -58,6 +58,17 @@ jobs:
       - name: Fetch the pinned native toolchain
         if: runner.os == 'Linux'
         run: node scripts/native-toolchain.mjs fetch
+      # smarty-dev#7858: the Windows verified-removal helper is built here by the pinned Windows zig (native/toolchain.json
+      # zig.x86_64-windows); the build requires its bytes to equal expected.windows, the same as the Linux cross-build.
+      - name: Fetch the pinned zig for the Windows helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest -Uri 'https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne '68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e') { throw 'zig zip sha256 mismatch' }
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $env:RUNNER_TEMP
+          "FABRIC_WIN_ZIG=$(Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.16.0\zig.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
         env:

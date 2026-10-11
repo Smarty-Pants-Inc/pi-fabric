@@ -85,6 +85,13 @@ const initRepository = (directory: string): void => {
   git(directory, "commit", "-qm", "initial");
 };
 
+// A dormant actor keeps identity, subscriptions and routable presence and wakes on delivery;
+// reopened #774, pi-fabric#897. Exactly these two statuses count as routable idle.
+const ROUTABLE_IDLE_STATUSES: readonly unknown[] = ["idle", "dormant"];
+const expectRoutableIdle = (status: unknown): void => {
+  expect(ROUTABLE_IDLE_STATUSES, `status ${String(status)} is not routable idle`).toContain(status);
+};
+
 const waitFor = async (predicate: () => boolean, timeoutMs = 7_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -1723,7 +1730,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
       const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
       await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
-      await waitFor(() => ["idle", "dormant"].includes(participant()?.status ?? "") && Boolean(passive.status(actor.id).lastRunId));
+      await waitFor(() => ROUTABLE_IDLE_STATUSES.includes(participant()?.status) && Boolean(passive.status(actor.id).lastRunId));
       const baseline = passive.status(actor.id);
       expect(passive.owns(actor.id)).toBe(false);
       const definition = passive.definition(actor.id);
@@ -1753,12 +1760,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(passive.definition(actor.id)).toEqual(definition);
       // The real worker cannot finish FIRST until both provider reads above agree.
       fs.writeFileSync(releasePath, "release\n");
-      await waitFor(() => ["idle", "dormant"].includes(participant()?.status ?? "") && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
+      await waitFor(() => ROUTABLE_IDLE_STATUSES.includes(participant()?.status) && participant()?.actorQueued === 0 && participant()?.actorRun === undefined);
       const idleSingle = await provider.invoke("actorStatus", { id: actor.id }, context) as { inFlightRun?: unknown; lastRunId?: string };
       const idleListed = (await provider.invoke("actors", {}, context) as Array<{ id: string; inFlightRun?: unknown }>).find(row => row.id === actor.id)!;
       for (const view of [idleSingle, idleListed]) {
         // The two independent reads may straddle the idle -> dormant event.
-        expect(["idle", "dormant"]).toContain((view as { status?: string }).status);
+        expectRoutableIdle((view as { status?: string }).status);
         expect(view).toMatchObject({ queued: 0, messages: participant()!.actorMessages });
         expect(view.inFlightRun).toBeUndefined();
       }
@@ -2672,6 +2679,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(row(bound.id).resolvedBinding).toMatchObject({ model: "provider/visible", thinking: "high" });
       const before = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
       const runsBefore = runs();
+      const lastRunIdsBefore = { bound: presence(bound.id)?.lastRunId, forged: presence(forged.id)?.lastRunId };
 
       // Real SIGTERM of the resident host process; wait for the process itself to exit.
       await stopResident(state.config);
@@ -2695,13 +2703,18 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(after.pid).not.toBe(before.pid);
       await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
       // A restarted idle durable actor may already be dormant: it still accepts deliveries and wakes.
-      expect(["idle", "dormant"]).toContain(presence(bound.id)?.status);
+      expectRoutableIdle(presence(bound.id)?.status);
+      // Idle or dormant, the restart started no run and moved no lastRunId.
+      expect(presence(bound.id)).not.toHaveProperty("inFlightRun");
+      expect(presence(bound.id)?.lastRunId).toBe(lastRunIdsBefore.bound);
       expect(presence(bound.id)).toMatchObject({ id: bound.id, model: "provider/visible",
         modelReason: "review pair", thinking: "high" });
       await waitFor(() => presence(forged.id) !== undefined, 20_000);
       // The resident resolver refuses the forged selector; give it time to settle, then prove unknown.
       await delay(1_500);
-      expect(["idle", "dormant"]).toContain(presence(forged.id)?.status);
+      expectRoutableIdle(presence(forged.id)?.status);
+      expect(presence(forged.id)).not.toHaveProperty("inFlightRun");
+      expect(presence(forged.id)?.lastRunId).toBe(lastRunIdsBefore.forged);
       expect(presence(forged.id)).not.toHaveProperty("model");
       expect(presence(forged.id)).not.toHaveProperty("thinking");
       // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.

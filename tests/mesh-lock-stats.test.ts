@@ -1,10 +1,11 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
+  captureLockStatsWriter, createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_WRITER_MAX_CHARS, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
@@ -375,6 +376,56 @@ describe("mesh lock stats recorder", () => {
     expect(second.createLockStats("1")).toBe(stats);
     expect(second.createLockStats("0")).toBe(stats);
   });
+
+  it("records its writer once at first acquisition, immutable across env changes, flushes and reloads (smarty-dev#8305)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const root = temp();
+    for (const name of ["PI_FABRIC_AGENT_NAME", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ROLE", "SMARTY_ROLE"]) vi.stubEnv(name, "");
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "before-create");
+    const stats = createLockStats("1")!;
+    // Captured at first use, not at creation, and not per acquisition.
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "worker-7");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "actor-0123456789");
+    vi.stubEnv("SMARTY_ROLE", "task-agent@0123456789ab");
+    stats.acquired(root, "publish", 1, 2);
+    vi.stubEnv("PI_FABRIC_AGENT_NAME", "changed");
+    vi.stubEnv("PI_FABRIC_ROLE", "org");
+    registry[lockKey]!.flush();
+    const expected = { argv1: path.basename(process.argv[1]!), agentName: "worker-7", actorId: "actor-0123456789",
+      smartyRole: "task-agent@0123456789ab", ppid: process.ppid };
+    expect(read(root).writer).toEqual(expected);
+    vi.resetModules();
+    const reloaded = await import("../src/mesh/commit-stats.js");
+    const again = reloaded.createLockStats("1")!;
+    expect(again).toBe(stats);
+    vi.setSystemTime(T0 + 60_000);
+    again.acquired(root, "custody", 1, 2); // the next minute's flush rewrites the file
+    expect(read(root).minutes).toHaveLength(2);
+    expect(read(root).writer).toEqual(expected);
+  });
+
+  it("captures only set, bounded, separate source facts", () => {
+    const writer = captureLockStatsWriter({ PI_FABRIC_AGENT_NAME: "  ", PI_FABRIC_ROLE: "r".repeat(500), PI_FABRIC_ACTOR_NAME: "Ada" },
+      "/opt/pi/dist/bridge-worker.js", 42);
+    expect(writer).toEqual({ argv1: "bridge-worker.js", actorName: "Ada", role: "r".repeat(LOCK_STATS_WRITER_MAX_CHARS), ppid: 42 });
+    expect(Object.isFrozen(writer)).toBe(true);
+    expect(captureLockStatsWriter({}, "", -1)).toEqual({});
+  });
+
+  it("keeps an exited child writer attributable from its file", () => {
+    const root = temp();
+    const env = { ...process.env, PI_FABRIC_AGENT_NAME: "child-writer", PI_FABRIC_ACTOR_ID: "", PI_FABRIC_ACTOR_NAME: "",
+      PI_FABRIC_ROLE: "", SMARTY_ROLE: "task-agent" };
+    const child = spawnSync(process.execPath, [path.resolve("tests/fixtures/lock-stats-writer.mjs"),
+      path.resolve("src/mesh/commit-stats.ts"), root], { env, encoding: "utf8", timeout: 30_000 });
+    expect(child.stderr).toBe("");
+    expect(child.status).toBe(0);
+    const file = JSON.parse(fs.readFileSync(path.join(root, "lock-stats", `${lockStatsHost()}-${child.pid}.json`), "utf8")) as LockStatsFile;
+    expect(file.writer).toEqual({ argv1: "lock-stats-writer.mjs", agentName: "child-writer", smartyRole: "task-agent", ppid: process.pid });
+    const summary = summarizeLockStats(root, readLockStats(root), { minutes: 1, now: file.updatedAt + 60_000 });
+    expect(summary.pids[0]!.writer).toEqual(file.writer);
+  });
 });
 
 describe("fleet summary and fabric-mesh-lock-stats", () => {
@@ -482,6 +533,44 @@ describe("fleet summary and fabric-mesh-lock-stats", () => {
     expect(out).toContain("timeouts 0");
     // Without a gate the view prints and exits 0; the warnings stay on stderr.
     expect(main(["--mesh", root, "--minutes", "2"], io)).toBe(0);
+  });
+
+  it("carries optional writer facts through read, summary, JSON and table; old files stay valid; a bad writer fails the gate", () => {
+    const root = temp();
+    const now = (MINUTE0 + 2) * 60_000 + 5_000;
+    const minutes = (holdMs: number): LockStatsFile["minutes"] => [{ minute: MINUTE0, classes: { publish: bucket({ n: 1, holdMs }) } }];
+    const write = (name: string, body: unknown): void => fs.writeFileSync(path.join(root, "lock-stats", name), JSON.stringify(body));
+    fixture(root, "ryzen1", 100, minutes(30)); // pre-#8305 file: no writer
+    write("ryzen1-200.json", { version: 1, host: "ryzen1", pid: 200, root, startedAt: T0, updatedAt: T0, minutes: minutes(20),
+      writer: { argv1: "cli.js", agentName: "lane\u001b[2J", smartyRole: "task-agent@abc", ppid: 7, future: "dropped" } });
+    const bad = [{ argv1: 5 }, ["cli.js"], "cli.js", { ppid: -1 }, { agentName: "x".repeat(LOCK_STATS_WRITER_MAX_CHARS + 1) }, null];
+    bad.forEach((writer, index) => write(`evil-${index}.json`,
+      { version: 1, host: "evil", pid: index, root, startedAt: T0, updatedAt: T0, minutes: minutes(1), writer }));
+    const problems: string[] = [];
+    const files = readLockStats(root, problems);
+    expect(files.map(file => file.pid).sort()).toEqual([100, 200]);
+    expect(problems.sort()).toEqual(bad.map((_, index) => `evil-${index}.json: bad writer`));
+    const summary = summarizeLockStats(root, files, { minutes: 2, now });
+    expect(summary.pids.map(row => [row.pid, row.writer])).toEqual([
+      [100, undefined],
+      [200, { argv1: "cli.js", agentName: "lane\u001b[2J", smartyRole: "task-agent@abc", ppid: 7 }],
+    ]);
+    expect("writer" in summary.pids[0]!).toBe(false);
+    let out = "";
+    let err = "";
+    const io = { stdout: (text: string) => { out += text; }, stderr: (text: string) => { err += text; }, now };
+    expect(main(["--mesh", root, "--minutes", "2", "--max-busy", "90"], io)).toBe(3);
+    expect(err).toContain("ignored evil-0.json: bad writer");
+    expect(out).toMatch(/top class\s+writer\n/);
+    expect(out).toMatch(/ryzen1-100\s.*publish\s+-\n/);
+    expect(out).toContain("cli.js lane\\u001b[2J task-agent ppid=7");
+    expect(out).not.toContain("\u001b");
+    for (let index = 0; index < bad.length; index++) fs.rmSync(path.join(root, "lock-stats", `evil-${index}.json`));
+    out = "";
+    expect(main(["--mesh", root, "--minutes", "2", "--json", "--max-busy", "90"], io)).toBe(0);
+    const json = JSON.parse(out) as { pids: Array<{ pid: number; writer?: unknown }> };
+    expect(json.pids.find(row => row.pid === 200)!.writer).toEqual(summary.pids[1]!.writer);
+    expect(json.pids.find(row => row.pid === 100)!.writer).toBeUndefined();
   });
 
   it("escapes control characters in printed host labels", () => {

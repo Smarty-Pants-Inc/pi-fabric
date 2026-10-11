@@ -1,4 +1,6 @@
 import { boundAgentSpawner } from "../agents/spawner.js";
+import { terminalRejectionFields } from "../agents/terminal-target.js";
+import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
@@ -576,9 +578,24 @@ export class AgentMessageRouter {
 
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
-    const remoteAgent = this.#get(id);
+    let remoteAgent = this.#get(id);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
-      if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
+      if (terminalAgentStatuses.has(remoteAgent.status) && remoteAgent.stale) throw new FabricRouteAuthorityError(remoteAgent.id);
+      const nativeTerminalTask = remoteAgent.runner === "pi" && remoteAgent.transport === "process" &&
+        terminalAgentStatuses.has(remoteAgent.status) && Boolean(remoteAgent.finalAnswerReceiptId);
+      if (nativeTerminalTask) {
+        // Terminal tasks advertise no ingress capability. Their still-live exact
+        // owner must nevertheless answer with the typed final receipt refusal.
+        // Revalidate authority; stale/withdrawn/replaced owners never gain a route.
+        const fresh = this.#directoryRead(() => this.participants.get(remoteAgent!.id, undefined, { fresh: true }));
+        if (!fresh || fresh.stale || fresh.kind !== "agent" || fresh.runner !== "pi" || fresh.transport !== "process" ||
+            !terminalAgentStatuses.has(fresh.status) || fresh.finalAnswerReceiptId !== remoteAgent.finalAnswerReceiptId ||
+            fresh.startedAt !== remoteAgent.startedAt || fresh.ownerHostId !== remoteAgent.ownerHostId ||
+            fresh.ownerIdentityId !== remoteAgent.ownerIdentityId || fresh.rootId !== remoteAgent.rootId ||
+            fresh.remoteHost !== remoteAgent.remoteHost) throw new FabricRouteAuthorityError(remoteAgent.id);
+        remoteAgent = fresh;
+      }
+      if (!nativeTerminalTask && !remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
       if (!this.control) throw new Error("Fabric control plane is unavailable");
       context?.activity?.({ type: "entity", id: remoteAgent.id, kind: "agent", name: remoteAgent.name });
       return this.control.request(
@@ -769,7 +786,8 @@ export class AgentMessageRouter {
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+        return { accepted: false, error: error instanceof Error ? error.message : String(error),
+          ...terminalRejectionFields(error) };
       }
     }
     try {

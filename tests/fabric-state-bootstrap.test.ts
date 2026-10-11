@@ -325,6 +325,44 @@ describe("FabricState lazy bootstrap", () => {
     vi.unstubAllEnvs();
   });
 
+  it("re-arms a published Main only in its cwd, not an unrelated damaged-config session on the same mesh", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, ui: { toolDisplay: "full" } });
+    const other = project();
+    const harness = runtimeHarness();
+    const first = createState(harness.loader);
+    const replacement = createState(harness.loader);
+    const unrelated = createState(harness.loader);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", path.join(cwd, "shared-mesh"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    try {
+      const context = contextAt(cwd, "published-main");
+      await first.bootstrap(context);
+      expect(first.shouldEagerlyActivate(context)).toBe(false);
+      await first.ensure(context);
+      await first.shutdown("reload");
+
+      // Both a reload and /new in the same cwd retain the published heartbeat.
+      for (const sessionId of ["published-main", "replacement-main"]) {
+        const next = contextAt(cwd, sessionId);
+        await replacement.bootstrap(next);
+        expect(replacement.shouldEagerlyActivate(next)).toBe(true);
+      }
+
+      // The same process and mesh do not make another cwd a published Main.
+      fs.writeFileSync(path.join(other, ".pi", "fabric.json"), "{ damaged config");
+      const next = contextAt(other, "unrelated-main");
+      await unrelated.bootstrap(next);
+      expect(unrelated.config.ui.toolDisplay).toBe("compact");
+      expect(unrelated.shouldEagerlyActivate(next)).toBe(false);
+      expect(harness.loader).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([first.shutdown(), replacement.shutdown(), unrelated.shutdown()]);
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
   it("announces a trusted Main at startup only when mesh.announce is set", async () => {
     const quiet = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true } });
     const quietState = createState(runtimeHarness().loader);

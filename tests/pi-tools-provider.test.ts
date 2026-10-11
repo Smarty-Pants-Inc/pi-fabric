@@ -742,6 +742,9 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
     const nested = path.join(root, "it's nested");
     fs.mkdirSync(nested);
     const prefix = `cd '${nested.replaceAll("'", "'\\''")}' && `;
+    // Print the cwd through Node, not `pwd`: Git Bash on Windows reports
+    // POSIX mount paths (/tmp/...) rather than the host path the test made.
+    const probe = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`;
     try {
       const seen: string[] = [];
       const run = async (hook: (input: { command: string; cwd?: string }) => unknown) => {
@@ -754,13 +757,13 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
         const registry = new ActionRegistry();
         registry.register(new PiToolsProvider(root, catalog, undefined));
         try {
-          return await registry.invoke("pi.bash", { command: "pwd", cwd: nested }, { ...baseContext, cwd: root, audits: [] }) as { output: string };
+          return await registry.invoke("pi.bash", { command: probe, cwd: nested }, { ...baseContext, cwd: root, audits: [] }) as { output: string };
         } finally { await registry.close(); }
       };
       // The guard judges the cd target; execution still runs the original command in cwd.
       const plain = await run(() => undefined);
-      expect(seen.at(-1)).toBe(`${prefix}pwd`);
-      expect(plain.output.trim()).toBe(nested);
+      expect(seen.at(-1)).toBe(`${prefix}${probe}`);
+      expect(fs.realpathSync.native(plain.output.trim())).toBe(fs.realpathSync.native(nested));
       await expect(run((input) => input.command.startsWith(prefix) ? { block: true, reason: "guard judged the cd" } : undefined))
         .rejects.toThrow("guard judged the cd");
       // A rewrite inside the judged cd is carried to execution.

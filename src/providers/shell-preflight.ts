@@ -11,6 +11,16 @@ const SHELL_CWD_KEY = "cwd";
 
 const shellQuote = (value: string): string => "'" + value.replaceAll("'", "'\\''") + "'";
 
+/** The refusal for any tool_call hook change to a judged shell call (smarty-dev#8606). */
+export const SHELL_REWRITE_REFUSED = "a tool_call hook rewrote a shell command; Fabric runs only the command the guards judged";
+
+// Equal to the key in guards/actor-bash-timeout.ts, not imported so this module's
+// import graph stays light. Fabric's own run-defaults hook (total timeout cap,
+// idle watchdog) sees this holder on the copy and, instead of rewriting it,
+// leaves the transform here; it is applied to the judged pi.bash arguments.
+const RUN_BASH_DEFAULTS = Symbol.for("pi-fabric.bash-defaults.deferred");
+type DeferredRunDefaults = { apply?: (target: Record<string, unknown>) => void };
+
 type ToolCallRunner = Pick<ExtensionRunner, "emitToolCall">;
 
 /**
@@ -30,7 +40,10 @@ export const assertShellToolPermitted = (name: string, powershell: FabricPowerSh
   if (name === "powershell" && powershell !== "allow") throw new Error(POWERSHELL_REFUSED_MESSAGE);
 };
 
-/** Emit one tool_call event; reports whether a hook replaced event.input. */
+/**
+ * Emit one tool_call event; reports whether any hook replaced event.input or
+ * changed any of its values (compared by value, nested objects included).
+ */
 const emitToolCall = async (
   runner: ToolCallRunner,
   signal: AbortSignal | undefined,
@@ -38,9 +51,10 @@ const emitToolCall = async (
   toolCallId: string,
   input: Record<string, unknown>,
 ) => {
+  const judged = JSON.stringify(input);
   const event = { type: "tool_call" as const, toolName, toolCallId, input };
   const preflight = await runAbortable(signal, () => runner.emitToolCall(event));
-  return { preflight, replaced: event.input !== input };
+  return { preflight, rewritten: event.input !== input || JSON.stringify(input) !== judged };
 };
 
 export interface ShellCallPreflight {
@@ -50,8 +64,6 @@ export interface ShellCallPreflight {
   args: Record<string, unknown>;
   /** The cwd guards judge commands in; any other cwd is shown as a leading cd. */
   sessionCwd: string;
-  /** Where the call runs without a cwd argument (defaults to sessionCwd). */
-  defaultCwd?: unknown;
   toolCallId: string;
   runner: ToolCallRunner;
   signal?: AbortSignal | undefined;
@@ -59,22 +71,24 @@ export interface ShellCallPreflight {
   blocked?: string;
   /** Runs before a hook's block is thrown. */
   onBlock?: () => void;
-  /** bash only: refuse any change to the judged input with this text (no rewrites at all). */
-  frozen?: string;
   /** The profile's executor.powershell; absent means refused (smarty-dev#9826). */
   powershell?: FabricPowerShellPolicy | undefined;
 }
 
 /**
  * The single tool_call preflight for every shell call Fabric runs: pi.bash,
- * pi.powershell, and a captured extension override of either (smarty-dev#8606).
- * Resolves to the arguments to execute; throws a hook's refusal.
+ * pi.powershell, a captured extension override of either, and state commands
+ * (smarty-dev#8606). Resolves to the arguments to execute; throws a hook's
+ * refusal.
  *
- * bash: the hook sees a copy of the args, with a non-session cwd shown as the
- * leading cd a native call needs. The effective cwd (args.cwd, or defaultCwd
- * when absent) is snapshotted before the hook runs; a hook that adds, changes
- * or otherwise moves it is refused, as is one that drops the judged cd. A
- * command-only rewrite is returned for execution.
+ * Hooks see a copy; a non-session cwd is shown as the leading cd a native call
+ * needs. The call runs only exactly as the guards judged it: a hook that
+ * replaces the input or changes any value of it (command, cwd, env, timeout,
+ * shell, background, monitor or any other argument) refuses the call. With
+ * several hooks, a later one could otherwise turn a command an earlier guard
+ * allowed into one it refuses. The only post-judgment change is Fabric's own
+ * run defaults for pi.bash (total timeout cap, idle watchdog), handed back by
+ * its hook through the RUN_BASH_DEFAULTS holder instead of a rewrite.
  *
  * PowerShell is refused before any hook runs unless the profile opted in
  * (call.powershell === "allow", smarty-dev#9826). The bash preflight below is
@@ -82,66 +96,36 @@ export interface ShellCallPreflight {
  * With the opt-in, command guards (which judge only toolName "bash") are
  * first shown the call as a bash tool_call (behind the same leading cd, with
  * input.shell naming the real shell), then hooks see it under its real name.
- * A bash rewrite cannot carry over to another shell's syntax, so any change to
- * either judged input is refused; the call runs exactly as judged.
  */
 export const preflightShellCall = async (call: ShellCallPreflight): Promise<Record<string, unknown>> => {
   const { name, args, sessionCwd, toolCallId, runner, signal } = call;
   assertShellToolPermitted(name, call.powershell);
-  const refuse = (reason: string | undefined): Error => {
-    call.onBlock?.();
-    return new Error(reason || call.blocked || `Pi tool ${name} was blocked`);
+  const blocked = call.blocked || `Pi tool ${name} was blocked`;
+  const judge = async (toolName: string, id: string, input: Record<string, unknown>): Promise<void> => {
+    const { preflight, rewritten } = await emitToolCall(runner, signal, toolName, id, input);
+    if (preflight?.block) {
+      call.onBlock?.();
+      throw new Error(preflight.reason || blocked);
+    }
+    if (rewritten) throw new Error(`${blocked}: ${SHELL_REWRITE_REFUSED}`);
   };
   const command = args.command;
+  if (name !== "bash" && typeof command !== "string") {
+    throw new Error(`Pi tool ${name} was blocked: it has no command text for the bash guard to judge`);
+  }
   const cwd = args[SHELL_CWD_KEY];
   const preface = typeof cwd === "string" && typeof command === "string" && cwd !== sessionCwd
     ? `cd ${shellQuote(cwd)} && ` : undefined;
-
-  if (name !== "bash") {
-    if (typeof command !== "string") {
-      throw new Error(`Pi tool ${name} was blocked: it has no command text for the bash guard to judge`);
-    }
-    const view: Record<string, unknown> = { ...args, command: (preface ?? "") + command, shell: name };
-    const judgedView = JSON.stringify(view);
-    const guard = await emitToolCall(runner, signal, "bash", `${toolCallId}:bash-guard`, view);
-    if (guard.preflight?.block) throw refuse(guard.preflight.reason);
-    if (guard.replaced || JSON.stringify(view) !== judgedView) {
-      throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the ${name} command it judged as bash; it runs only exactly as judged`);
-    }
-    // Guards for the real tool name still see the call, but nothing may
-    // change it after the bash view judged it.
-    const input: Record<string, unknown> = { ...args };
-    const judged = JSON.stringify(input);
-    const named = await emitToolCall(runner, signal, name, toolCallId, input);
-    if (named.preflight?.block) throw refuse(named.preflight.reason);
-    if (named.replaced || JSON.stringify(input) !== judged) {
-      throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the command after the bash guard judged it`);
-    }
-    return input;
-  }
-
-  const effectiveCwd = (value: Record<string, unknown>): unknown => {
-    const requested = value[SHELL_CWD_KEY];
-    return requested !== undefined ? requested : (call.defaultCwd ?? sessionCwd);
-  };
-  const judgedCwd = effectiveCwd(args);
-  const input: Record<string, unknown> = preface ? { ...args, command: preface + (command as string) } : { ...args };
-  const judged = JSON.stringify(input);
-  const { preflight, replaced } = await emitToolCall(runner, signal, name, toolCallId, input);
-  if (preflight?.block) throw refuse(preflight.reason);
-  if (call.frozen !== undefined && (replaced || JSON.stringify(input) !== judged)) throw new Error(call.frozen);
-  // Compared by value: a hook that rewrites the cwd into any other form is
-  // treated as moving execution.
-  if (effectiveCwd(input) !== judgedCwd) {
-    throw new Error(`Pi tool ${name} was blocked: a tool_call hook moved the cwd its command was judged in; a hook may not move execution`);
-  }
-  if (preface) {
-    // Carry hook rewrites back, but only through the cd it judged.
-    if (typeof input.command !== "string" || !input.command.startsWith(preface) || input[SHELL_CWD_KEY] !== cwd) {
-      throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the cwd it judged; run the command without cwd`);
-    }
-    input.command = input.command.slice(preface.length);
-  }
+  const view: Record<string, unknown> = { ...args };
+  if (preface) view.command = preface + (command as string);
+  if (name !== "bash") view.shell = name;
+  const defaults: DeferredRunDefaults = {};
+  Object.defineProperty(view, RUN_BASH_DEFAULTS, { value: defaults });
+  await judge("bash", name === "bash" ? toolCallId : `${toolCallId}:bash-guard`, view);
+  // Guards for the real tool name still see the call, but nothing may change it.
+  if (name !== "bash") await judge(name, toolCallId, { ...args });
+  const input: Record<string, unknown> = { ...args };
+  if (name === "bash") defaults.apply?.(input);
   return input;
 };
 
@@ -153,9 +137,9 @@ export const preflightShellCall = async (call: ShellCallPreflight): Promise<Reco
  * nothing could refuse the command, so it fails closed (smarty-dev#8606).
  *
  * State commands are operator evidence whose text is recorded and digested,
- * so a hook may approve or refuse one but never rewrite it: a rewrite would
- * run a command other than the one the goal or certificate names. Any change
- * to the judged input is a refusal.
+ * so a hook may approve or refuse one but never rewrite it: like every shell
+ * preflight, any change to the judged input is a refusal, and the run defaults
+ * that pi.bash gets after judgment are not applied to a state command.
  */
 export type ShellCommandPreflight = (
   command: string,
@@ -171,7 +155,7 @@ export const createShellCommandPreflight = (catalog: CapturedToolCatalog): Shell
       throw new Error(`${source} is unavailable until extension tool hooks initialize; retry once tools are ready`);
     }
     // State commands run in the invocation cwd with no cwd argument, so the
-    // guard judges them there; the shared helper still snapshots that cwd.
+    // guard judges them there.
     await preflightShellCall({
       name: "bash",
       args: { command },
@@ -180,6 +164,5 @@ export const createShellCommandPreflight = (catalog: CapturedToolCatalog): Shell
       runner,
       signal: context.signal,
       blocked: `${source} command was blocked`,
-      frozen: `${source} command was blocked: a tool_call hook rewrote it, and state commands run only as declared because the goal or certificate records them`,
     });
   };

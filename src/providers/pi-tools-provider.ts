@@ -729,8 +729,8 @@ export class PiToolsProvider implements FabricProvider {
   // the same extension policy through one code path (no duplicated enforcement).
   // Every shell call (bash, powershell) is judged by preflightShellCall, the
   // single helper the captured-override path uses too (smarty-dev#8606): the
-  // hook sees a copy, the effective cwd is snapshotted and a post-hook move is
-  // refused, and a non-session cwd is shown as the leading cd it judged.
+  // hook sees a copy, a non-session cwd is shown as the leading cd it judged,
+  // and any hook change to the judged call refuses it.
   async #emitToolCallPreflight(
     name: PiCoreToolName,
     args: Record<string, unknown>,
@@ -742,9 +742,6 @@ export class PiToolsProvider implements FabricProvider {
           name,
           args,
           sessionCwd: this.#cwd,
-          // Without a cwd argument the call runs in the cwd its execution
-          // context carries (see #executionContextFor).
-          defaultCwd: context.extensionContext?.cwd ?? this.#cwd,
           toolCallId: context.nestedToolCallId,
           runner,
           signal: context.signal,
@@ -752,7 +749,8 @@ export class PiToolsProvider implements FabricProvider {
           powershell: this.#getPowerShellPolicy?.(),
         })
       : await this.#emitGenericToolCall(name, args, context, runner);
-    // Carry the hook's accepted rewrites back onto the caller's args.
+    // Carry the result back onto the caller's args: a non-shell hook's rewrites,
+    // or for pi.bash only Fabric's own run defaults (a shell rewrite is refused).
     for (const key of Object.keys(args)) if (!Object.hasOwn(input, key)) delete args[key];
     Object.assign(args, input);
     context.updateArguments?.(args);

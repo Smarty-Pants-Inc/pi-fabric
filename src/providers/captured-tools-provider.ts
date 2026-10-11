@@ -201,9 +201,8 @@ export class CapturedToolsProvider implements FabricProvider {
       let executionContext: ReturnType<ExtensionRunner["createContext"]> | undefined;
       if (isPiShellToolName(entry.name)) {
         // smarty-dev#8606: a shell override takes the same preflight as pi.bash
-        // and pi.powershell. The hook sees a copy; the cwd it was judged in
-        // (args.cwd, or the runner's session cwd) cannot move after it, and
-        // only the arguments the helper accepted are executed.
+        // and pi.powershell. The hook sees a copy, and any hook change to the
+        // judged call (command, cwd or any other argument) refuses it.
         const sessionContext = runner.createContext();
         args = await preflightShellCall({
           name: entry.name,

@@ -54,7 +54,16 @@ const WRAPPED = Symbol.for("pi-fabric.bash-idle.wrapped");
 const WRAP_STATE = Symbol.for("pi-fabric.bash-idle.wrap-state");
 const host = globalThis as typeof globalThis & { [WRAP_STATE]?: { nonce: string } };
 const wrapNonce = (host[WRAP_STATE] ??= { nonce: randomBytes(24).toString("hex") }).nonce;
-type BashInput = { command?: unknown; timeout?: unknown; background?: unknown; monitor?: unknown; [WRAPPED]?: string };
+// smarty-dev#8606: Fabric's shell preflight runs only the input its tool_call hooks judged; any
+// rewrite refuses the call. It shows hooks a copy carrying this holder (key equal to
+// RUN_BASH_DEFAULTS in providers/shell-preflight.ts), and this hook then leaves the copy unchanged
+// and hands back the transform, which the preflight applies to the judged pi.bash arguments.
+const DEFERRED = Symbol.for("pi-fabric.bash-defaults.deferred");
+type DeferredRunDefaults = { apply?: (target: BashInput) => void };
+type BashInput = {
+  command?: unknown; timeout?: unknown; background?: unknown; monitor?: unknown;
+  [WRAPPED]?: string; [DEFERRED]?: DeferredRunDefaults;
+};
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
 
@@ -102,6 +111,11 @@ export const applyRunBashDefaults = (
   env: Env, input: BashInput,
   platform: NodeJS.Platform = process.platform,
 ): void => {
+  const deferred = input[DEFERRED];
+  if (deferred !== null && typeof deferred === "object") {
+    deferred.apply = (target) => applyRunBashDefaults(env, target, platform);
+    return;
+  }
   const total = actorBashTimeout(env, input.timeout);
   if (total !== undefined) input.timeout = total;
   // ponytail: Windows has no POSIX process groups/setsid or group TERM/KILL signaling.

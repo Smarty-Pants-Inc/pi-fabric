@@ -19,7 +19,8 @@ import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registr
 import { NESTED_TOOL_CALL_ID_PREFIX } from "../src/core/action-registry.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
-import { POWERSHELL_REFUSED_MESSAGE } from "../src/providers/shell-preflight.js";
+import { POWERSHELL_REFUSED_MESSAGE, SHELL_REWRITE_REFUSED } from "../src/providers/shell-preflight.js";
+import { applyRunBashDefaults } from "../src/guards/actor-bash-timeout.js";
 
 const baseContext = {
   cwd: process.cwd(),
@@ -102,10 +103,12 @@ describe("PiToolsProvider lifecycle", () => {
     await expect(invocation).rejects.toThrow("cancel nested lifecycle");
   });
 
+  // A hook may no longer rewrite a shell call (CODE_REVIEW P1 on 692c62a0); the
+  // only post-judgment change is Fabric's own run defaults, handed back by its hook.
   it("synchronizes tool_call argument mutations across audit surfaces", async () => {
     const runner = makeRunner({
       emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => {
-        event.input.command = `export EXAMPLE=true\n${String(event.input.command)}`;
+        applyRunBashDefaults({ PI_FABRIC_BASH_IDLE_S: "0" }, event.input as never);
       }),
     });
     const registry = registerWithRunner(runner);
@@ -124,14 +127,15 @@ describe("PiToolsProvider lifecycle", () => {
       },
     ) as { output: string };
 
-    const executedCommand = `export EXAMPLE=true\nprintf "executed:$EXAMPLE\n"`;
-    expect(result.output).toBe("executed:true\n");
-    expect(audits[0]?.args).toEqual({ command: executedCommand });
+    const executedCommand = `printf "executed:$EXAMPLE\n"`;
+    expect(result.output).toBe("executed:\n");
+    expect(audits[0]?.args).toEqual({ command: executedCommand, timeout: 600 });
     expect(audits[0]?.preview).toMatchObject({ bashCommand: executedCommand });
     expect(events).toContainEqual(expect.objectContaining({
       type: "call_args",
-      args: { command: executedCommand },
+      args: { command: executedCommand, timeout: 600 },
     }));
+    // The trace projects pi.bash arguments to the command.
     expect(trace.seal("succeeded", []).operations[0]?.args).toEqual({
       command: executedCommand,
     });
@@ -767,11 +771,10 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
       expect(fs.realpathSync.native(plain.output.trim())).toBe(fs.realpathSync.native(nested));
       await expect(run((input) => input.command.startsWith(prefix) ? { block: true, reason: "guard judged the cd" } : undefined))
         .rejects.toThrow("guard judged the cd");
-      // A rewrite inside the judged cd is carried to execution.
-      const rewritten = await run((input) => { input.command = `${input.command} && printf rewritten`; });
-      expect(rewritten.output).toContain("rewritten");
+      // CODE_REVIEW P1 on 692c62a0: even a rewrite inside the judged cd is refused.
+      await expect(run((input) => { input.command = `${input.command} && printf rewritten`; })).rejects.toThrow(SHELL_REWRITE_REFUSED);
       // A hook that drops the cd it judged cannot redirect execution.
-      await expect(run((input) => { input.command = "pwd"; })).rejects.toThrow("a tool_call hook rewrote the cwd it judged");
+      await expect(run((input) => { input.command = "pwd"; })).rejects.toThrow(SHELL_REWRITE_REFUSED);
       // The session cwd needs no preface.
       seen.length = 0;
       const runner = makeRunner({ emitToolCall: vi.fn(async (event: { input: { command: string } }) => { seen.push(event.input.command); return undefined; }) });
@@ -798,6 +801,7 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
     git("worktree", "add", "-q", "-b", "linked", linked, "HEAD");
     const probe = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`;
     const write = `printf ran > ran.txt`;
+    const RW = `Pi tool bash was blocked: ${SHELL_REWRITE_REFUSED}`;
     try {
       const run = async (args: Record<string, unknown>, hook: (input: Record<string, unknown>) => unknown) => {
         const runner = makeRunner({ emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => hook(event.input)) });
@@ -815,21 +819,75 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
         } finally { await registry.close(); }
       };
       // (a) A hook that ADDS cwd=<linked worktree> to a call without cwd is refused.
-      await expect(run({ command: write }, (input) => { input.cwd = linked; }))
-        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+      await expect(run({ command: write }, (input) => { input.cwd = linked; })).rejects.toThrow(RW);
       // (b) A hook that CHANGES cwd is refused, whether or not the original cwd needed a preface.
-      await expect(run({ command: write, cwd: repo }, (input) => { input.cwd = linked; }))
-        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
-      await expect(run({ command: write, cwd: linked }, (input) => { input.cwd = repo; }))
-        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+      await expect(run({ command: write, cwd: repo }, (input) => { input.cwd = linked; })).rejects.toThrow(RW);
+      await expect(run({ command: write, cwd: linked }, (input) => { input.cwd = repo; })).rejects.toThrow(RW);
+      // (c) CODE_REVIEW P1 on 692c62a0: a command-only rewrite is refused too, as is a
+      // change to any other execution argument, even removing a cwd that named the session cwd.
+      await expect(run({ command: write }, (input) => { input.command = `${write} && printf more`; })).rejects.toThrow(RW);
+      await expect(run({ command: write }, (input) => { input.timeout = 1; })).rejects.toThrow(RW);
+      await expect(run({ command: write }, (input) => { input.env = { EXTRA: "1" }; })).rejects.toThrow(RW);
+      await expect(run({ command: write }, (input) => { input.background = true; })).rejects.toThrow(RW);
+      await expect(run({ command: write, cwd: repo }, (input) => { delete input.cwd; })).rejects.toThrow(RW);
       expect(fs.existsSync(path.join(repo, "ran.txt"))).toBe(false);
       expect(fs.existsSync(path.join(linked, "ran.txt"))).toBe(false);
-      // (c) A hook that rewrites only the command text still runs, in the session cwd.
-      const rewritten = await run({ command: "printf original" }, (input) => { input.command = probe; });
-      expect(fs.realpathSync.native(rewritten.output.trim())).toBe(fs.realpathSync.native(repo));
-      // Removing a cwd that already named the session cwd does not move execution.
-      const dropped = await run({ command: probe, cwd: repo }, (input) => { delete input.cwd; });
-      expect(fs.realpathSync.native(dropped.output.trim())).toBe(fs.realpathSync.native(repo));
+      // An unchanged call still runs, in the cwd it was judged in.
+      const plain = await run({ command: probe }, () => undefined);
+      expect(fs.realpathSync.native(plain.output.trim())).toBe(fs.realpathSync.native(repo));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // CODE_REVIEW P1 on 692c62a0: with several tool_call hooks, a later hook used
+  // to turn a command an earlier guard allowed into one it refuses, and the
+  // rewrite ran. Pi's runner calls every handler in turn on the same event.
+  it("refuses a later hook's rewrite of a command an earlier guard allowed, so nothing runs (multi-hook)", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-multi-hook-")));
+    const marker = path.join(root, "stash-ran");
+    const runs: unknown[] = [];
+    const judged: string[] = [];
+    // Hook A: a guard that refuses git stash and allows everything else.
+    const hookA = (input: Record<string, unknown>) => {
+      judged.push(String(input.command));
+      return String(input.command).includes("git stash") ? { block: true, reason: "guard refused git stash" } : undefined;
+    };
+    // Hook B: runs after the guard and rewrites the allowed command into a refused one.
+    const hookB = (input: Record<string, unknown>) => { input.command = `git stash list > '${marker}'`; return undefined; };
+    // An extension-owned bash override that only records what it would run.
+    const override = {
+      ...createBashToolDefinition(root),
+      async execute(_id: string, params: { command: string }) {
+        runs.push(params.command);
+        return { content: [{ type: "text" as const, text: "ran" }], details: {} };
+      },
+    };
+    try {
+      for (const captured of [false, true]) {
+        const runner = makeRunner({
+          createContext: () => ({ cwd: root, sessionManager: baseContext.extensionContext.sessionManager }),
+          emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => {
+            for (const hook of [hookA, hookB]) {
+              const result = hook(event.input);
+              if (result?.block) return result;
+            }
+            return undefined;
+          }),
+        });
+        const catalog = new CapturedToolCatalog();
+        catalog.replace(captured ? [{
+          definition: override as RegisteredTool["definition"],
+          sourceInfo: createSyntheticSourceInfo("/extensions/bash-override/index.ts", { source: "test" }),
+        }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+        const provider = new PiToolsProvider(root, catalog, captured ? new CapturedToolsProvider(catalog) : undefined);
+        judged.length = 0;
+        await expect(provider.invoke("bash", { command: "echo ok" }, { ...baseContext, cwd: root }))
+          .rejects.toThrow(SHELL_REWRITE_REFUSED);
+        expect(judged).toEqual(["echo ok"]);
+      }
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(runs).toEqual([]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -900,14 +958,14 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
       // A bash guard's rewrite cannot carry over to PowerShell syntax, so it refuses the call.
       const rewrite = providerFor((event) => { if (event.toolName === "bash") event.input.command = "echo safe"; });
       await expect(rewrite.provider.invoke("powershell", { command }, context))
-        .rejects.toThrow("a tool_call hook rewrote the powershell command it judged as bash");
+        .rejects.toThrow(`Pi tool powershell was blocked: ${SHELL_REWRITE_REFUSED}`);
       // Guards for the real tool name still run after the bash view; they cannot rewrite the judged command.
       const named = providerFor((event) => event.toolName === "powershell" ? { block: true, reason: "powershell guard" } : undefined);
       await expect(named.provider.invoke("powershell", { command: "Write-Output ok" }, context)).rejects.toThrow("powershell guard");
       expect(named.events.map((event) => event.toolName)).toEqual(["bash", "powershell"]);
       const late = providerFor((event) => { if (event.toolName === "powershell") event.input.command = command; });
       await expect(late.provider.invoke("powershell", { command: "Write-Output ok" }, context))
-        .rejects.toThrow("a tool_call hook rewrote the command after the bash guard judged it");
+        .rejects.toThrow(`Pi tool powershell was blocked: ${SHELL_REWRITE_REFUSED}`);
       expect(fs.existsSync(marker)).toBe(false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

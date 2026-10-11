@@ -1342,10 +1342,10 @@ describe("StateProvider", () => {
       const provider = new StateProvider(mesh, identity, () => true, { preflight: createShellCommandPreflight(catalog) });
       await provider.invoke("transition", { label: "init", to: "drafted", summary: "draft", evidence: ["true"] }, commandContext);
       await expect(provider.invoke("verify", {}, commandContext))
-        .rejects.toThrow("state.verify command was blocked: a tool_call hook rewrote it");
+        .rejects.toThrow("state.verify command was blocked: a tool_call hook rewrote a shell command; Fabric runs only the command the guards judged");
       await provider.invoke("goal", { check: "true" }, commandContext);
       await expect(provider.invoke("checkGoal", {}, commandContext))
-        .rejects.toThrow("state.checkGoal command was blocked: a tool_call hook rewrote it");
+        .rejects.toThrow("state.checkGoal command was blocked: a tool_call hook rewrote a shell command; Fabric runs only the command the guards judged");
       // The rewritten command never ran, and no certificate or goal event names the original.
       expect(fs.existsSync(marker)).toBe(false);
       expect(mesh.read({ topic: STATE_TOPIC }).filter((event) => event.kind === "state.certified" || event.kind === "state.goal.met"))

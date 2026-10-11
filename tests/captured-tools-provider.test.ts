@@ -21,6 +21,8 @@ import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
+import { applyRunBashDefaults } from "../src/guards/actor-bash-timeout.js";
+import { SHELL_REWRITE_REFUSED } from "../src/providers/shell-preflight.js";
 
 const context = {
   cwd: process.cwd(),
@@ -422,14 +424,14 @@ describe("CapturedToolsProvider", () => {
     const linked = path.join(root, "linked");
     fs.mkdirSync(session);
     fs.mkdirSync(linked);
-    const runs: Array<{ command: unknown; cwd: unknown }> = [];
+    const runs: Array<{ command: unknown; cwd: unknown; timeout?: unknown }> = [];
     const definition = defineTool({
       name: "bash",
       label: "bash (override)",
       description: "Extension-owned bash override",
-      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()) }),
+      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()), timeout: Type.Optional(Type.Number()) }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-        runs.push({ command: params.command, cwd: ctx.cwd });
+        runs.push({ command: params.command, cwd: ctx.cwd, ...(params.timeout !== undefined ? { timeout: params.timeout } : {}) });
         return { content: [{ type: "text" as const, text: `ran ${params.command}` }], details: {} };
       },
     });
@@ -460,25 +462,28 @@ describe("CapturedToolsProvider", () => {
       // Both entry points: pi.bash delegating to the override, and extensions.bash directly.
       for (const viaPi of [true, false]) {
         runs.length = 0;
+        const RW = `Captured tool bash was blocked: ${SHELL_REWRITE_REFUSED}`;
         // A hook that ADDS cwd to a call judged in the session cwd is refused.
-        await expect(run({ command: "printf ran > ran.txt" }, (input) => { input.cwd = linked; }, viaPi))
-          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+        await expect(run({ command: "printf ran > ran.txt" }, (input) => { input.cwd = linked; }, viaPi)).rejects.toThrow(RW);
         // A hook that CHANGES cwd is refused, with or without a leading-cd preface.
-        await expect(run({ command: "printf ran > ran.txt", cwd: session }, (input) => { input.cwd = linked; }, viaPi))
-          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
-        await expect(run({ command: "printf ran > ran.txt", cwd: linked }, (input) => { input.cwd = session; }, viaPi))
-          .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+        await expect(run({ command: "printf ran > ran.txt", cwd: session }, (input) => { input.cwd = linked; }, viaPi)).rejects.toThrow(RW);
+        await expect(run({ command: "printf ran > ran.txt", cwd: linked }, (input) => { input.cwd = session; }, viaPi)).rejects.toThrow(RW);
         // A hook that drops the leading cd it judged is refused.
-        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = "ls"; }, viaPi))
-          .rejects.toThrow("a tool_call hook rewrote the cwd it judged");
-        expect(runs).toEqual([]);
-        // A command-only rewrite still runs, in the session cwd.
-        await run({ command: "printf original" }, (input) => { input.command = "printf rewritten"; }, viaPi);
-        expect(runs.at(-1)).toEqual({ command: "printf rewritten", cwd: session });
-        // A non-session cwd is judged as the leading cd; a rewrite behind it runs in that cwd.
-        await run({ command: "ls", cwd: linked }, (input) => { input.command = `${String(input.command)} -la`; }, viaPi);
+        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = "ls"; }, viaPi)).rejects.toThrow(RW);
+        // CODE_REVIEW P1 on 692c62a0: a command-only rewrite is refused, in the session cwd
+        // and behind the judged leading cd alike, as is a change to any other argument.
+        await expect(run({ command: "printf original" }, (input) => { input.command = "printf rewritten"; }, viaPi)).rejects.toThrow(RW);
+        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = `${String(input.command)} -la`; }, viaPi)).rejects.toThrow(RW);
         expect(seen.at(-1)?.command).toBe(`cd '${linked}' && ls`);
-        expect(runs.at(-1)).toEqual({ command: "ls -la", cwd: linked });
+        await expect(run({ command: "ls" }, (input) => { input.timeout = 5; }, viaPi)).rejects.toThrow(RW);
+        expect(runs).toEqual([]);
+        // An unchanged call runs as judged, in its cwd.
+        await run({ command: "ls", cwd: linked }, () => undefined, viaPi);
+        expect(runs.at(-1)).toEqual({ command: "ls", cwd: linked });
+        // Fabric's own run defaults are not a hook rewrite: its hook hands them back, and
+        // they apply to the judged call after the guards (smarty-dev#2184/#6137 timeout cap).
+        await run({ command: "ls" }, (input) => { applyRunBashDefaults({ PI_FABRIC_BASH_IDLE_S: "0" }, input as never); }, viaPi);
+        expect(runs.at(-1)).toEqual({ command: "ls", cwd: session, timeout: 600 });
         // A block still refuses before anything runs.
         const before = runs.length;
         await expect(run({ command: "git stash list" }, () => ({ block: true, reason: "guard refused git stash" }), viaPi))

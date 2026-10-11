@@ -39,10 +39,13 @@ const privateRealmFabric = (root: string): string => {
   return parent;
 };
 
-type Launch = "shim" | "native" | "native-private-realm" | "shim-cwd-argument";
+type Launch = "shim" | "native" | "native-private-realm" | "shim-cwd-argument" | "shim-allowed";
 
 describe.skipIf(process.platform === "win32")("fabric_exec pi.bash in a real process worker obeys profile tool_call guards (#8606)", () => {
-  it.each(["shim", "native", "native-private-realm", "shim-cwd-argument"] as const)("%s: pi.bash git stash in a linked worktree is refused with the guard's reason", async (launch: Launch) => {
+  // shim-allowed: a command the guard allows still runs in a worker run, where Fabric's own
+  // tool_call hook adds the run defaults (timeout cap, idle watchdog): they are handed back to
+  // the preflight, not a rewrite it refuses (CODE_REVIEW P1 on 692c62a0).
+  it.each(["shim", "native", "native-private-realm", "shim-cwd-argument", "shim-allowed"] as const)("%s: pi.bash git stash in a linked worktree is refused with the guard's reason", async (launch: Launch) => {
     expect(fs.existsSync("dist/worker.js"), "fresh build required").toBe(true);
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-8606-guard-")));
     cleanups.push(() => fs.promises.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
@@ -71,9 +74,11 @@ describe.skipIf(process.platform === "win32")("fabric_exec pi.bash in a real pro
     ].join("\n") + "\n");
     const toolMessages: unknown[] = [];
     let requests = 0;
+    const allowed = path.join(root, "allowed-executed");
     const bash = launch === "shim-cwd-argument"
       ? `{ cmd: ${JSON.stringify("git stash list > " + shellQuote(executed))}, cwd: ${JSON.stringify(linked)} }`
-      : `{ cmd: ${JSON.stringify("git stash list > " + shellQuote(executed))} }`;
+      : launch === "shim-allowed" ? `{ cmd: ${JSON.stringify("printf ok > " + shellQuote(allowed))} }`
+        : `{ cmd: ${JSON.stringify("git stash list > " + shellQuote(executed))} }`;
     const server = http.createServer((request, response) => {
       let body = "";
       request.on("data", (data) => { body += data; });
@@ -120,10 +125,16 @@ describe.skipIf(process.platform === "win32")("fabric_exec pi.bash in a real pro
     const result = await manager.run({ task: "probe8606: run git stash list through fabric_exec pi.bash", model: "proof/offline", transport: "process", extensions: true, tools: ["fabric_exec", "bash"] });
     const log = result.logFile && fs.existsSync(result.logFile) ? fs.readFileSync(result.logFile, "utf8").slice(-6000) : "";
     const evidence = { launch, sessionCwd: path.basename(sessionCwd), status: result.status, error: result.error, text: result.text, requests, toolMessages,
-      stashExecuted: fs.existsSync(executed), guardRefusals: fs.existsSync(refusals) ? fs.readFileSync(refusals, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [] };
+      stashExecuted: fs.existsSync(executed), allowedExecuted: fs.existsSync(allowed), guardRefusals: fs.existsSync(refusals) ? fs.readFileSync(refusals, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [] };
     if (process.env.TASK_OUT) fs.writeFileSync(path.join(process.env.TASK_OUT, "probe8606-" + launch + ".json"), JSON.stringify(evidence, null, 2).replaceAll(root, "<tmp>") + "\n");
     expect(result.status, (result.error ?? "") + "\n" + log).toBe("completed");
     expect(requests, log).toBe(2);
+    if (launch === "shim-allowed") {
+      expect(evidence.allowedExecuted, JSON.stringify(evidence)).toBe(true);
+      expect(JSON.stringify(toolMessages)).not.toContain("rewrote a shell command");
+      expect(evidence.guardRefusals).toEqual([]);
+      return;
+    }
     expect(evidence.stashExecuted, JSON.stringify(evidence)).toBe(false);
     expect(JSON.stringify(toolMessages), JSON.stringify(evidence)).toContain(GUARD_REASON);
     // Exactly one preflight reached the guard: the nested pi.bash call (a native

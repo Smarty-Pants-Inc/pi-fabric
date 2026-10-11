@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readResidentGenerationExit, recordLauncherGenerationExit, recordResidentGenerationExit, residentGenerationExitPath,
   residentGenerationsPath, residentLauncherExitPath, type ResidentGenerationExit } from "../src/residency/generation-exit.js";
 import { processHarness } from "./helpers/process-harness.js";
+import { fixture } from "./helpers/dead-root-fixture.js";
+import { ResidentHost } from "../src/residency/host.js";
 
 // smarty-dev#7950 (pi-fabric#902 review P1-1, P1-2): the record goes only into the verified generations/ dir of the
 // verified residency root, through pinned fds, and is published complete (temp file, fsync, no-replace link); an
@@ -120,6 +122,33 @@ describe.skipIf(process.platform !== "linux")("resident generation exit record",
     expect(g.outcome("host")).toEqual({ outcome: "written" });
     expect(readResidentGenerationExit(g.root, g.generation)).toMatchObject({ writer: "host" });
   });
+
+  it("retention: 40 generations leave the newest 32 generations' records", () => {
+    const f = setup();
+    const generations: string[] = [];
+    const base = Date.now() / 1000 - 1_000;
+    for (let index = 0; index < 40; index++) {
+      const generation = randomUUID();
+      generations.push(generation);
+      expect(recordResidentGenerationExit(f.root, { format: 1, generation, writer: "host", reason: "idle-exit", pid: process.pid, at: Date.now() }))
+        .toEqual({ outcome: "written" });
+      fs.utimesSync(residentGenerationExitPath(f.root, generation), base + index, base + index); // a strict file-time order
+    }
+    expect(f.entries()).toEqual(generations.slice(-32).map(generation => `${generation}.exit.json`).sort());
+  });
+
+  it("a launcher-chosen generation is the host's owner token; a malformed one refuses the start", async () => {
+    const chosen = randomUUID();
+    process.env.PI_FABRIC_RESIDENT_GENERATION = chosen;
+    const f = await fixture();
+    try {
+      expect(process.env.PI_FABRIC_RESIDENT_GENERATION).toBeUndefined(); // consumed: no child inherits it
+      expect(f.host.generation).toBe(chosen);
+      expect(JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "owner.json"), "utf8")).token).toBe(chosen);
+      process.env.PI_FABRIC_RESIDENT_GENERATION = "not-a-uuid";
+      expect(() => new ResidentHost(f.config, () => {})).toThrow("Resident generation from the launcher is malformed");
+    } finally { delete process.env.PI_FABRIC_RESIDENT_GENERATION; await f.close(); }
+  }, 40_000);
 
   it("a host killed between its temp write and the link publishes nothing; the launcher's record goes in", async () => {
     const f = setup();

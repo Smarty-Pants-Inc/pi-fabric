@@ -68,8 +68,10 @@ interface Attempt {
   seenOwner: boolean;
   claimedOwner: boolean;
   ownerToken?: string;
-  /** The owner token the child published while it owned the root (smarty-dev#7950). */
-  generation?: string;
+  /** The generation (owner token) this launcher chose for the child before spawning it (smarty-dev#7950). */
+  generation: string;
+  /** Whether the child's exit may touch the root's shared files (launcher.log, error.json); decided once, at exit. */
+  sharedExit?: boolean;
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
@@ -329,19 +331,22 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
 
     // No shell/string argv. Runtime, entry and binary were resolved in the immutable snapshot.
     const script = NODE_SCRIPT_EXTENSIONS.has(path.extname(launchConfig.piBinary).toLowerCase());
+    const generation = randomUUID();
     const child = crossSpawn(script ? runtime : launchConfig.piBinary, script ? [launchConfig.piBinary, ...args] : args, {
       cwd: launchConfig.cwd, detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe", "ipc"],
       env: childProcessEnvironment({ ...process.env, NODE_OPTIONS: nodeOptions, PI_FABRIC_RESIDENT_CONFIG: snapshot,
         PI_FABRIC_RESIDENT_LAUNCHER: spec ? JSON.stringify(launcher) : "",
         PI_FABRIC_RESIDENT_SPEC_DIGEST: spec?.digest ?? "",
         PI_FABRIC_RESIDENT_ATTEMPT: attemptInfo ? JSON.stringify(attemptInfo) : "",
+        // The owner token the host must publish: the exit handler knows the generation without sampling owner.json.
+        PI_FABRIC_RESIDENT_GENERATION: generation,
         // Per-attempt argument, never shared config another client may rewrite.
         PI_FABRIC_RESIDENT_LAUNCH_TOKEN: process.argv.includes("--launch-token")
           ? process.argv[process.argv.indexOf("--launch-token") + 1] ?? "" : "" }),
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
-    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
+    const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child), generation,
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
     if (process.connected && process.send) {
@@ -362,11 +367,11 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     }
     void attempt.native.exit.then(({ code, signal }) => {
       // #2010: after an owned release this directory may already belong to the
-      // next generation. Do not write its shared files (launcher.log) then. An
-      // owned child's exit goes only to its own generation's record, created
-      // once: the host wrote it at release, else (SIGKILL, a crash) we do.
-      if (attempt.generation) {
-        // The exit record, else a generation-private diagnostic; never the shared error.json (a successor's).
+      // next generation. Do not write its shared files (launcher.log, error.json)
+      // then. An owned child's exit goes only to its own generation's record
+      // (created once: the host wrote it at release, else, SIGKILL or a crash, we
+      // do), under the generation this launcher chose, so no sampling can miss it.
+      if (!sharedExit(attempt)) {
         recordLauncherGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
           reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
         return;
@@ -375,7 +380,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       const idleExit = readResidentIdleExit(root, launchConfig.rootId);
       if (code === 0 && !signal && idleExit?.pid === child.pid &&
           (!attempt.ownerToken || idleExit?.token === attempt.ownerToken)) return;
-      if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
+      trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
@@ -389,10 +394,21 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     current = attempt;
     return attempt;
   };
+  /**
+   * Only a startup failure may write the shared files: the launcher never saw an owner during the attempt, and
+   * owner.json names neither this attempt (its generation or its pid: a host that ignored the chosen token) nor a
+   * live other owner. Decided once, at the child's exit.
+   */
+  const sharedExit = (attempt: Attempt): boolean => {
+    if (attempt.sharedExit !== undefined) return attempt.sharedExit;
+    const owner = readOwner();
+    const ours = owner !== undefined && (owner.token === attempt.generation || owner.pid === attempt.child.pid);
+    const other = owner !== undefined && !ours && residentProcessAlive(owner.pid, owner.processStartTime);
+    return attempt.sharedExit = !attempt.seenOwner && !ours && !other;
+  };
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
-    if (live !== undefined && live === attempt.child.pid && typeof owner?.token === "string") attempt.generation ??= owner.token;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
@@ -617,7 +633,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
         return;
       }
       if (!plan || !inode) {
-        if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
+        if (sharedExit(attempt)) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
         process.exitCode = exit.code ?? 1;
         return;
       }

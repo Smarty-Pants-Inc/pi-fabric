@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 /**
  * Per-generation exit record (smarty-dev#7950): `<residencyRoot>/generations/<token>.exit.json`, where `<token>` is
@@ -74,6 +75,7 @@ export type GenerationExitOutcome = { outcome: "written" | "exists" | "unavailab
  *    no-replace publish. A writer killed before the link publishes nothing; one killed after it published a
  *    complete file. Unlink the temp and fsync the directory.
  * 4. Read the published (or existing) file back through the same handle and validate it.
+ * 5. After a new publish, keep the newest RESIDENT_GENERATION_RECORDS_KEPT generations' records (retention).
  * Linux only (the fd-relative form needs /proc/self/fd); elsewhere it fails closed. One stderr line when
  * unavailable or invalid; never throws (diagnostics never block an exit).
  */
@@ -117,8 +119,14 @@ const publish = (residencyRoot: string, record: ResidentGenerationExit, name: st
     temp = `.${record.generation}.${process.pid}.${randomUUID()}.tmp`;
     fileFd = fs.openSync(at(dirFd, temp), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
     const bytes = Buffer.from(JSON.stringify(record));
-    for (let offset = 0; offset < bytes.length;) {
-      const written = fs.writeSync(fileFd, bytes, offset, bytes.length - offset);
+    for (let offset = 0, interrupted = 0; offset < bytes.length;) {
+      let written: number;
+      try { written = fs.writeSync(fileFd, bytes, offset, bytes.length - offset); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code === "EINTR" || code === "EAGAIN") && ++interrupted <= 3) continue;
+        throw error;
+      }
       if (!(written > 0)) throw new Error(`short write: ${offset} of ${bytes.length} bytes`);
       offset += written;
     }
@@ -138,6 +146,7 @@ const publish = (residencyRoot: string, record: ResidentGenerationExit, name: st
         : invalidRecord(fs.readFileSync(readFd, "utf8"), record.generation);
     } finally { if (readFd !== undefined) fs.closeSync(readFd); }
     if (invalid) return refuse("invalid", `${existed ? "the existing" : "the published"} ${invalid.replace(/^the /, "")}`);
+    if (!existed) pruneGenerationRecords(residencyRoot, dirFd, record.generation, uid);
     return { outcome: existed ? "exists" : "written" };
   } catch (error) {
     return unavailable(error instanceof Error ? error.message : String(error));
@@ -147,6 +156,33 @@ const publish = (residencyRoot: string, record: ResidentGenerationExit, name: st
     if (dirFd !== undefined) { try { fs.closeSync(dirFd); } catch { /* closed */ } }
     if (rootFd !== undefined) { try { fs.closeSync(rootFd); } catch { /* closed */ } }
   }
+};
+
+/** Generation records kept per residency root (smarty-dev#7950): the newest by file time; one generation's records
+ * (`<gen>.exit.json`, `<gen>.launcher-exit.json`) count as one. */
+export const RESIDENT_GENERATION_RECORDS_KEPT = 32;
+const RECORD = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(?:exit|launcher-exit)\.json$/;
+
+/** Retention at write time, through the verified generations/ handle: judged by lstat (a regular file of ours),
+ * removed through verifiedRemove (which re-pins the parent and the judged inode). Never the generation being written. */
+const pruneGenerationRecords = (residencyRoot: string, dirFd: number, current: string, uid: number | undefined): void => {
+  try {
+    const generations = new Map<string, { newest: number; files: Array<[string, fs.Stats]> }>();
+    for (const name of fs.readdirSync(at(dirFd, "."))) {
+      const match = RECORD.exec(name);
+      if (!match) continue;
+      const stat = fs.lstatSync(at(dirFd, name), { throwIfNoEntry: false });
+      if (!stat?.isFile() || stat.uid !== uid) continue;
+      const entry = generations.get(match[1]!) ?? { newest: 0, files: [] };
+      entry.newest = Math.max(entry.newest, stat.mtimeMs); entry.files.push([name, stat]);
+      generations.set(match[1]!, entry);
+    }
+    const older = [...generations].filter(([generation]) => generation !== current)
+      .sort(([, a], [, b]) => b.newest - a.newest).slice(RESIDENT_GENERATION_RECORDS_KEPT - 1);
+    for (const [, { files }] of older) for (const [name, stat] of files) {
+      verifiedRemove(path.join(residentGenerationsPath(residencyRoot), name), stat, { deleter: "residentGenerationRecords" });
+    }
+  } catch { /* retention is best effort; the next write retries */ }
 };
 
 /** Create the generation's exit record, once, complete (see `publish`). "exists" means a complete record for this

@@ -163,6 +163,8 @@ export const createFabricExecTool = (
   pendingHandoffs: Map<string, PendingFabricHandoff>,
   decorateShell: FabricToolShellDecorator = withCodePreviewShell,
   toolDisplay?: FabricToolDisplayController,
+  // Host-owned tools the model keeps in exclusive modes (the run's fabric_reply, smarty-dev#967).
+  hostForeground: () => readonly string[] = () => [],
 ): ToolDefinition<any, any, any> => {
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
@@ -187,7 +189,7 @@ export const createFabricExecTool = (
       return fabricToolLoadout(
         loadout,
         state.config.fullCodeMode || state.config.schema.mode === "enforce",
-        state.foregroundTools(loadout.declared.map((tool) => tool.name)).tools,
+        [...state.foregroundTools(loadout.declared.map((tool) => tool.name)).tools, ...hostForeground()],
       );
     },
     label: "Fabric",

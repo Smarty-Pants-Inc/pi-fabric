@@ -15,7 +15,9 @@ const run = async (command: string, env: Record<string, string> = { PI_FABRIC_BA
   try {
     const result = await createBashTool(process.cwd()).execute("call-1", input, undefined, undefined);
     const part = result.content[0];
-    return { ok: true, seconds: (Date.now() - started) / 1000, text: part?.type === "text" ? part.text : "" };
+    // Pi 1.1 returns a non-zero exit as an isError result instead of throwing.
+    const failed = (result as { isError?: boolean }).isError === true;
+    return { ok: !failed, seconds: (Date.now() - started) / 1000, text: part?.type === "text" ? part.text : "" };
   } catch (error) {
     return { ok: false, seconds: (Date.now() - started) / 1000, text: (error as Error).message };
   }

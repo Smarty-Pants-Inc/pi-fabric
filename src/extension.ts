@@ -417,12 +417,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     return { skillPaths: fabricSkillPaths(FABRIC_SKILLS_DIR, state.config.executor.kernel) };
   });
 
+  // Only the exact worker reply hook can bypass full-code/enforce hiding.
+  const hostForeground = (): readonly string[] => ownsRunReplyTool(pi.getAllTools()) ? [REPLY_TOOL_NAME] : [];
   const fabricTool = createFabricExecTool(
     state,
     codePreviewSettings,
     pendingHandoffs,
     decorateShell,
     toolDisplay,
+    hostForeground,
   );
   const refreshCodePreviewSettings = (): void => {
     Object.assign(codePreviewSettings, state.config.codePreview);
@@ -462,7 +465,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     toolCapture.setPolicy(capturePolicy());
     Object.assign(
       fabricTool,
-      createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay),
+      createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay, hostForeground),
     );
     pi.registerTool(fabricTool);
     toolOwnership.apply(

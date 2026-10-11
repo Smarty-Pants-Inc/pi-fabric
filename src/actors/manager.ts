@@ -32,7 +32,7 @@ import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
-import { claimMeshRetentionSweep, pruneActorSessionBackups } from "../storage/retention.js";
+import { claimMeshRetentionSweep, pruneActorSessionBackups, recordMeshRetentionSweeper } from "../storage/retention.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -273,9 +273,11 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-/** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
-const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
-/** The hourly mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
+/** One mesh-wide run-retention sweep per mesh per day, whichever owner claims it (smarty-dev#3252). Daily, not hourly
+ * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
+ * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
+export const MESH_RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+/** The daily mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
  * verifiedRemove (smarty-dev#7916); the hold, epoch and state.json gates still refuse on doubt. Off Linux the CLI's
  * gate refuses --apply (smarty-dev#7858). Its JSON report is written atomically, never through a link. */
 export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
@@ -4534,8 +4536,9 @@ export class ActorManager {
 
   /**
    * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
-   * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
-   * niced process. It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
+   * #5652). Whichever owner claims the mesh's daily slot starts the retention CLI as a detached,
+   * niced process, and records it in the slot: no next slot is claimed while it provably still runs (single flight).
+   * It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
    * through verifiedRemove, behind the hold, epoch and state.json gates.
    */
   async #startMeshRetentionSweep(): Promise<void> {
@@ -4546,10 +4549,12 @@ export class ActorManager {
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
-      if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
+      const now = Date.now();
+      if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, now)) return;
       const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
       child.on("error", () => undefined);
       if (child.pid) {
+        recordMeshRetentionSweeper(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, child.pid, now);
         try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
       }
       child.unref();

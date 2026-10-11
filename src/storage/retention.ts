@@ -475,29 +475,60 @@ const pruneClosedRunRoot = (
 };
 /** Per-interval claim files of the mesh-wide retention sweep (smarty-dev#3252). */
 export const MESH_RETENTION_SWEEP_PREFIX = ".mesh-retention-sweep-";
+const meshSweepSlot = (name: string): number | undefined => {
+  const match = name.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(name.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
+  return match ? Number(match[1]) : undefined;
+};
+/** Whether a slot file names a sweep that is provably still running: its recorded sweeper pid is alive and its
+ * /proc start time is read and equals the recorded one. Anything else (no sweeper recorded, a torn or foreign file, an
+ * unreadable start time, a reused pid) does not block, so a lost claim can never stop retention for good. */
+const liveMeshSweeper = (file: string): boolean => {
+  const claim = readJson<{ sweeper?: { pid?: unknown; startTime?: unknown } }>(file, 4096);
+  const pid = claim?.sweeper?.pid, startTime = claim?.sweeper?.startTime;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || typeof startTime !== "string") return false;
+  return processAlive(pid) && processStartTime(pid) === startTime;
+};
 /**
  * Claim this interval's mesh-wide sweep. Exactly one process per mesh wins a slot: the claim
  * is an exclusive create of the slot's file, so two owners never both start a sweep in the
- * same interval. Older slot files are dropped once a newer slot is claimed.
+ * same interval. Single flight (smarty-dev#7916, measured on Ryzen 1: a sweep can outlast its interval): no claim
+ * while any other slot file names a provably live sweeper (recordMeshRetentionSweeper). Other slot files, but the
+ * previous one, are dropped once a newer slot is claimed, unless their sweeper still runs.
  */
 export const claimMeshRetentionSweep = (meshRoot: string, intervalMs: number, now = Date.now()): boolean => {
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0 || !ownedStat(meshRoot)?.isDirectory()) return false;
   const slot = Math.floor(now / intervalMs);
   const name = `${MESH_RETENTION_SWEEP_PREFIX}${slot}.json`;
   try {
+    for (const other of fs.readdirSync(meshRoot)) {
+      if (other !== name && meshSweepSlot(other) !== undefined && liveMeshSweeper(path.join(meshRoot, other))) return false;
+    }
+  } catch { /* unlisted: no proof of a live sweep; claim as before */ }
+  try {
     const fd = fs.openSync(path.join(meshRoot, name), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
     try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, claimedAt: now })); } finally { fs.closeSync(fd); }
   } catch { return false; }
   try {
     for (const other of fs.readdirSync(meshRoot)) {
-      const match = other.startsWith(MESH_RETENTION_SWEEP_PREFIX) ? /^(\d+)\.json$/.exec(other.slice(MESH_RETENTION_SWEEP_PREFIX.length)) : null;
-      if (match && Number(match[1]) < slot - 1) {
+      // Also slots of another interval (the former hourly numbering is larger than today's daily slot).
+      const otherSlot = meshSweepSlot(other);
+      if (otherSlot !== undefined && otherSlot !== slot && otherSlot !== slot - 1 && !liveMeshSweeper(path.join(meshRoot, other))) {
         const file = path.join(meshRoot, other);
         verifiedRemove(file, ownedStat(file), { deleter: "claimMeshRetentionSweep", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
       }
     }
   } catch { /* stale slot files are tiny; the next claim retries */ }
   return true;
+};
+/** Record the sweep process this slot's claim started (its pid and /proc start time), so the next slot's claim can
+ * tell whether it still runs. No readable start time: nothing is recorded, and the next claim is not blocked. */
+export const recordMeshRetentionSweeper = (meshRoot: string, intervalMs: number, pid: number, now: number): void => {
+  const startTime = processStartTime(pid);
+  if (startTime === undefined) return;
+  try {
+    writeJsonAtomic(path.join(meshRoot, `${MESH_RETENTION_SWEEP_PREFIX}${Math.floor(now / intervalMs)}.json`),
+      { pid: process.pid, claimedAt: now, sweeper: { pid, startTime } });
+  } catch { /* unrecorded: the next slot is not blocked (today's behaviour) */ }
 };
 /** Host-wide marker of the last temp-root sweep; a dotfile, so the root pattern never matches it. */
 export const RUN_ROOT_SWEEP_MARKER = ".pi-fabric-runs-sweep.json";

@@ -4,7 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, removeUnreferencedRun } from "../src/storage/retention.js";
+import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun } from "../src/storage/retention.js";
+import { MESH_RETENTION_SWEEP_INTERVAL_MS } from "../src/actors/manager.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { appendResidentLog } from "../src/residency/launcher.js";
 
@@ -505,6 +506,50 @@ describe("mesh retention sweep claim", () => {
     expect(fs.readdirSync(root).filter(name => name.startsWith(MESH_RETENTION_SWEEP_PREFIX)).sort())
       .toEqual([`${MESH_RETENTION_SWEEP_PREFIX}13.json`]);
     expect(claimMeshRetentionSweep(path.join(root, "absent"), hour, 13 * hour)).toBe(false);
+  });
+
+  // smarty-dev#7916 (ops-lead, Ryzen 1 2026-10-11): each sweep took 30-35 min at ~0.7 core, hourly. Daily now, and
+  // single flight: no slot is claimed while the previous slot's recorded sweeper provably still runs.
+  const DAY = 24 * 60 * 60 * 1_000;
+  const slotFile = (root: string, day: number) => path.join(root, `${MESH_RETENTION_SWEEP_PREFIX}${day}.json`);
+  it("sweeps once a day: one claim per 24 h slot", () => {
+    expect(MESH_RETENTION_SWEEP_INTERVAL_MS).toBe(DAY);
+    const root = tmp("fabric-mesh-daily-");
+    expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 10 * DAY)).toBe(true);
+    for (const hours of [1, 6, 12, 23]) expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 10 * DAY + hours * 3_600_000)).toBe(false);
+    expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 11 * DAY)).toBe(true);
+  });
+
+  it.skipIf(process.platform !== "linux")("does not claim while the previous slot's sweeper provably still runs", () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    expect(claimMeshRetentionSweep(root, DAY, 10 * DAY)).toBe(true);
+    // This test process stands in for the still-running sweep: alive, with its own /proc start time.
+    recordMeshRetentionSweeper(root, DAY, process.pid, 10 * DAY);
+    expect(JSON.parse(fs.readFileSync(slotFile(root, 10), "utf8")).sweeper).toEqual({ pid: process.pid, startTime: expect.stringMatching(/^\d+$/) });
+    expect(claimMeshRetentionSweep(root, DAY, 11 * DAY)).toBe(false);
+    expect(claimMeshRetentionSweep(root, DAY, 12 * DAY)).toBe(false);
+    expect(fs.existsSync(slotFile(root, 11))).toBe(false);
+    expect(fs.existsSync(slotFile(root, 10))).toBe(true);
+  });
+
+  it.each([
+    ["a dead pid", { pid: 2147483647, startTime: "1" }],
+    ["a reused pid (live, another start time)", { pid: process.pid, startTime: "1" }],
+    ["no recorded sweeper", undefined],
+  ])("claims the next slot when the previous slot names %s", (_name, sweeper) => {
+    const root = tmp("fabric-mesh-single-flight-");
+    expect(claimMeshRetentionSweep(root, DAY, 10 * DAY)).toBe(true);
+    if (sweeper) fs.writeFileSync(slotFile(root, 10), JSON.stringify({ pid: process.pid, claimedAt: 10 * DAY, sweeper }), { mode: 0o600 });
+    expect(claimMeshRetentionSweep(root, DAY, 11 * DAY)).toBe(true);
+  });
+
+  it("claims the next slot when the previous claim is torn, and drops the former hourly slot files", () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    fs.writeFileSync(slotFile(root, 10), '{"pid":1,"sweeper":{"pid":', { mode: 0o600 });
+    fs.writeFileSync(slotFile(root, 492_000), JSON.stringify({ pid: 1, claimedAt: 1 }), { mode: 0o600 }); // an hourly-era slot
+    expect(claimMeshRetentionSweep(root, DAY, 11 * DAY)).toBe(true);
+    expect(fs.readdirSync(root).filter(name => name.startsWith(MESH_RETENTION_SWEEP_PREFIX)).sort())
+      .toEqual([`${MESH_RETENTION_SWEEP_PREFIX}10.json`, `${MESH_RETENTION_SWEEP_PREFIX}11.json`]);
   });
 });
 

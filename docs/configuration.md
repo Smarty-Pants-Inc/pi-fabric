@@ -589,6 +589,8 @@ Run housekeeping begins on actual agent storage use (not manager startup), conti
 
 For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected.
 
+Persistent actor hosts also start this CLI themselves, **once a day per mesh**, with `--apply --runs-older-than <retention.actorRunArchiveMs>`. Whichever host claims the day's slot file (`<mesh>/.mesh-retention-sweep-<day>.json`) runs it as a detached, niced process. While the previous sweep is provably still running (its recorded pid is alive with the same `/proc` start time), no new sweep starts. A claim without that proof never blocks the next one.
+
 ### Temporary output and reader scratch
 
 New model-output spills and shell logs use private directories with a versioned `.fabric-scratch.json` ownership marker. They expire 24 hours after completion; oldest eligible caches may be removed sooner above **128 MiB or 256 items**, pooled across these two classes. Completed output is protected for its first hour. These aggregate limits are **soft** while files are active/recent or cannot be safely attributed. Model-output artifacts remain complete (not truncated). Their links are temporary.

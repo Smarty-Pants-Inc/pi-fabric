@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
-import { leaseHelperPath, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
+import { leaseHelperPath, unsafeChain, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#7815: the switch refuses unless every REQUIRED reader (the inventory: live Fabric releases,
@@ -460,8 +460,10 @@ sys.stdin.readline()`;
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
 
-  // smarty-dev#8145 item 3: the swap race end to end, through the operator's bin on a copy of the built package.
-  it.skipIf(binSkip !== "")(`end to end: a helper swapped at its path in a loop never reports a held state.db free${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+  // smarty-dev#8145 item 3, STRESS coverage: swaps during whole CLI runs through the operator's bin on a copy of the
+  // built package; the probe-window overlap is not asserted. The deterministic proof of the hash-to-exec window is the
+  // unit test "executes the hashed fd: a helper swapped at its path after the hash never runs" (afterHash hook).
+  it.skipIf(binSkip !== "")(`stress: a helper swapped at its path during whole CLI runs never reports a held state.db free${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const pkg = tempDir("pkg");
     fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
@@ -474,7 +476,7 @@ const [helper] = process.argv.slice(1);
 fs.linkSync(helper, helper + ".real");
 fs.writeFileSync(helper + ".fake", '#!/bin/sh\\nfor f in "$@"; do echo "free $f"; done\\n', { mode: 0o700 });
 // Hard links, not rewrites: a swap is two syscalls, so it lands often inside the hash-to-exec window.
-// Every 64 swaps it publishes its count: the barrier that shows the swaps overlapped each probe.
+// Every 64 swaps it publishes its count: it shows swaps went on during a CLI run (not inside the probe window).
 for (let i = 0; ; i++) {
   fs.linkSync(helper + (i % 2 ? ".real" : ".fake"), helper + ".next");
   fs.renameSync(helper + ".next", helper);
@@ -496,10 +498,10 @@ for (let i = 0; ; i++) {
         expect(result.status, result.stderr).toBe(3);
         // Refused by the real verdict, or fail closed (the swapped bytes fail the hash): never "free".
         expect(result.stderr).toMatch(/cutover refused: readers not ready for sqlite: holder@lease(:state\.db \(unidentified holder|-probe \(state\.db lease probe unavailable)/);
-        // The swaps went on during the run: its probe ran while swapped files were going in and out.
+        // Swaps went on during the run (stress: swaps during whole CLI runs; the probe-window overlap is not asserted).
         if (swaps() > before) overlapped++;
       }
-      // Under a loaded host a short run may see no published count; at least one run must have overlapped.
+      // Under a loaded host a short run may see no published count; at least one run must have seen swaps.
       expect(overlapped).toBeGreaterThan(0);
       expect(await backendOf(root)).toBe("importing");
     } finally {
@@ -532,6 +534,43 @@ for (let i = 0; ; i++) {
   });
 
   // pi-fabric#880 review round 2: above the install root up to the first root-owned, root-only (or sticky) ancestor.
+  // pi-fabric#880 review round 7 (SEC P1): the walk above the install root stopped at the FIRST root-owned 0755 dir, so
+  // a writable parent above it could rename it and replace the package. Root ownership cannot be made in a test: the
+  // ancestors above a scratch tree are an injected lstat. Both the bin's shipped check (its <chain-check> text, run
+  // as is) and the bundle's unsafeChain must agree.
+  describe("the chain above the install root walks to / (pi-fabric#880 round 7)", () => {
+    const fake = (uid: number, mode: number): fs.Stats =>
+      ({ uid, mode, dev: 0, ino: 0, isDirectory: () => true, isSymbolicLink: () => false, isFile: () => false }) as unknown as fs.Stats;
+    /** A scratch package; every ancestor above `base` is fake: `first` just above it, `higher` for all others. */
+    const layout = (first: fs.Stats, higher: (at: string) => fs.Stats) => {
+      const base = fs.realpathSync(tempDir("above"));
+      const pkg = path.join(base, "pkg");
+      fs.mkdirSync(path.join(pkg, "dist/native"), { recursive: true, mode: 0o700 });
+      const file = path.join(pkg, "dist/native/fabric-mesh-lease");
+      fs.writeFileSync(file, "x", { mode: 0o700 });
+      const inside = (at: string) => at === base || at.startsWith(`${base}${path.sep}`);
+      const lstat = (at: string): fs.Stats => inside(at) ? fs.lstatSync(at) : at === path.dirname(base) ? first : higher(at);
+      return { pkg, file, lstat, top: path.dirname(path.dirname(base)) };
+    };
+    const source = fs.readFileSync(path.resolve("bin/fabric-mesh-backend"), "utf8");
+    const region = source.slice(source.indexOf("// <chain-check>"), source.indexOf("// </chain-check>"));
+    const shim = new Function("fs", "path", "process", `${region}\nreturn { unsafeAbove };`)(fs, path, process) as
+      { unsafeAbove: (root: string, lstat: (at: string) => fs.Stats, euid?: number) => string | undefined };
+    const bundle = (file: string, pkg: string, lstat: (at: string) => fs.Stats) => unsafeChain(file, pkg, undefined, lstat);
+
+    it.skipIf(process.platform === "win32")("refuses a package under a root-owned 0755 dir whose parent is group/other-writable", () => {
+      const { pkg, file, lstat, top } = layout(fake(0, 0o40755), at => at === top ? fake(0, 0o40777) : fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+      expect(bundle(file, pkg, lstat)).toBe(`${top} is group/other-writable (mode 777)`);
+    });
+
+    it.skipIf(process.platform === "win32")("passes a root-owned sticky dir (like /tmp) with our own entry below it", () => {
+      const { pkg, file, lstat } = layout(fake(0, 0o41777), () => fake(0, 0o40755));
+      expect(shim.unsafeAbove(pkg, lstat)).toBeUndefined();
+      expect(bundle(file, pkg, lstat)).toBeUndefined();
+    });
+  });
+
   it.skipIf(leaseSkip !== "")(`fails closed on a group-writable, non-sticky parent of the install root${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const parent = tempDir("parent");

@@ -273,7 +273,8 @@ export const installRoot = (): string => fileURLToPath(new URL("../..", import.m
  * every directory up to and including the real `root` must be inside `root`, no symlink, owned by this
  * user (or root) and not group/other-writable. With `fd`, the checked file must be the opened one.
  */
-const unsafeChain = (file: string, root: string, fd?: number): string | undefined => {
+export const unsafeChain = (file: string, root: string, fd?: number,
+  /** Tests: an injected lstat (root ownership cannot be made in a test). */ lstat: (at: string) => fs.Stats = at => fs.lstatSync(at)): string | undefined => {
   let real: string, top: string;
   try { real = fs.realpathSync(file); top = fs.realpathSync(root); }
   catch (error) { return `${file} cannot be resolved (${errno(error)})`; }
@@ -293,17 +294,19 @@ const unsafeChain = (file: string, root: string, fd?: number): string | undefine
   let above = false;
   for (let at = real; ; at = path.dirname(at)) {
     let stat: fs.Stats;
-    try { stat = fs.lstatSync(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
+    try { stat = lstat(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
     if (at === real && fd !== undefined) {
       const opened = fs.fstatSync(fd);
       if (opened.dev !== stat.dev || opened.ino !== stat.ino) return `${file} changed while it was checked`;
     }
-    // Above the install root (pi-fabric#880 review round 2): another user who can write a parent can rename
-    // the whole package away and put another in place. The chain ends at the first root-owned ancestor that
-    // only root can change. ponytail: a root-owned STICKY one (/tmp) also ends it: there only an entry's
-    // owner (us, as checked below it) can rename that entry.
-    if (above && stat.uid === 0 && stat.isDirectory() && ((stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0)) return undefined;
-    const why = stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid);
+    // Above the install root (pi-fabric#880 review rounds 2 and 7): another user who can write ANY ancestor can
+    // rename the package away and put another in place, so the walk goes all the way to / and never stops early.
+    // Every ancestor is a real directory, ours or root's, not group/other-writable. ponytail: a root-owned
+    // STICKY one (/tmp) passes: there only an entry's owner can rename it, and the entry below was checked.
+    // The same rule as bin/fabric-mesh-backend (unsafeAbove), duplicated there on purpose.
+    const sticky = above && stat.uid === 0 && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+    const why = sticky ? undefined : stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid)
+      ?? (above && !stat.isDirectory() ? "not a directory" : undefined);
     if (why) return `${at} is ${why}`;
     if (at === top) above = true;
     if (at === path.dirname(at)) return undefined;

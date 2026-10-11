@@ -1808,6 +1808,30 @@ describe("mesh bridge", () => {
   });
 });
 
+// pi-fabric#893 round 4: a work host's mesh-outage alarm reaches its hub recipient; nothing else rides that topic.
+describe("mesh-outage alarms across the bridge (pi-fabric#893)", () => {
+  const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
+  it("carries a remote outage alarm and its recovery to a canonical hub recipient, and refuses any other kind", async () => {
+    const { hub, far, bridge, remote } = setup(undefined, { realPipe: true });
+    await addRoot(hub, "chief", 15_000, { id: CHIEF, sessionId: "chief" });
+    const spoke = await addRoot(far, "forge-main");
+    await remote.hello();
+    await bridge.start();
+    await bridge.step();
+    const topic = "fabric.alarm.mesh-outage";
+    await far.publish({ topic, kind: "mesh-outage", from: spoke.identity, to: CHIEF, data: { label: "inbox", state: "outage" } });
+    await far.publish({ topic, kind: "mesh-recovered", from: spoke.identity, to: CHIEF, data: { label: "inbox", state: "recovered" } });
+    await far.publish({ topic, kind: "ask", from: spoke.identity, to: CHIEF, text: "not an alarm" });
+    await bridge.step();
+    expect(on(hub, topic).map((event) => [event.kind, event.to])).toEqual([["mesh-outage", CHIEF], ["mesh-recovered", CHIEF]]);
+    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "org" })).toBe(false); // a bare name is not a target
+    expect(isBridgedTopic({ topic, kind: "mesh-outage" })).toBe(false);
+    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "topic:fabric.alarm.mesh-ops" })).toBe(true);
+    expect(() => checkBridgePublish({ topic, kind: "ask", from: spoke.identity, to: CHIEF, data: { bridge: { from: "forge", id: "x" } } }))
+      .toThrow(/topic is not allowed/);
+  });
+});
+
 // smarty-dev#9352: work-host Mains address work events to the hub factory's role, `to: "factory"`;
 // the factory on the hub reads them by topic. The bridge dropped them silently.
 describe("work events for the hub factory (smarty-dev#9352)", () => {

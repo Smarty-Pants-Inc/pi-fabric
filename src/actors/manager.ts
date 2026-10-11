@@ -2879,6 +2879,8 @@ export class ActorManager {
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    if (this.#presenceAlarmTimer) clearTimeout(this.#presenceAlarmTimer);
+    this.#presenceAlarmTimer = undefined;
     if (this.#orphanPresenceTimer) clearTimeout(this.#orphanPresenceTimer);
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
@@ -5027,7 +5029,11 @@ export class ActorManager {
       catch (error) {
         // The failed acquisition wrote nothing. The host's next heartbeat carries
         // every pending id, with no per-actor timer, extra retry, or warning storm.
-        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+        // The class or code only: a mesh error's message can carry WAL reader diagnostics (pi-fabric#893 round 4).
+        if (!isMeshLockTimeout(error)) {
+          const code = (error as { code?: unknown } | null)?.code;
+          console.warn(`[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
+        }
       }
       return;
     }
@@ -5037,6 +5043,7 @@ export class ActorManager {
       if (kept.idle) this.#presenceRetries.delete(other);
       else void kept.flushAlarms();
     }
+    this.#schedulePresenceAlarms();
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
       retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs)
@@ -5068,6 +5075,7 @@ export class ActorManager {
       // only once both were accepted; until then later presence passes retry them (above).
       retry.success(true);
       if (retry.idle) this.#presenceRetries.delete(id);
+      else this.#schedulePresenceAlarms();
     } catch (error) {
       if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
         // Someone wrote this entry since it was found orphaned: it is not ours to delete.
@@ -5079,6 +5087,31 @@ export class ActorManager {
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
     }
+  }
+
+  // pi-fabric#893 round 4: a settled presence path whose alarm or recovery publish failed has no further writes to
+  // retry it. One owner timer retries the queued events while any are queued (none: no timer, no polling), backing
+  // off from presenceRetryMs to 60 s; unref'd, cancelled on close. A path is dropped once its events were accepted.
+  #presenceAlarmTimer: NodeJS.Timeout | undefined;
+  #presenceAlarmDelay = 0;
+  #schedulePresenceAlarms(): void {
+    if (this.#presenceAlarmTimer || this.#closing) return;
+    const queued = [...this.#presenceRetries].some(([id, kept]) => !this.#pendingPresence.has(id) && !kept.idle);
+    if (!queued) { this.#presenceAlarmDelay = 0; return; }
+    this.#presenceAlarmDelay = Math.min(60_000, Math.max(this.#presenceRetryMs, this.#presenceAlarmDelay * 2));
+    this.#presenceAlarmTimer = setTimeout(() => {
+      this.#presenceAlarmTimer = undefined;
+      void (async () => {
+        for (const [id, kept] of [...this.#presenceRetries]) {
+          if (this.#closing) return;
+          if (this.#pendingPresence.has(id)) continue;
+          await kept.flushAlarms();
+          if (kept.idle) this.#presenceRetries.delete(id);
+        }
+        this.#schedulePresenceAlarms();
+      })();
+    }, this.#presenceAlarmDelay);
+    this.#presenceAlarmTimer.unref();
   }
 
   #schedulePresenceRetry(): void {

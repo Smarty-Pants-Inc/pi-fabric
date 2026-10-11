@@ -1,7 +1,9 @@
 import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
-import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshOutageAlarmSink } from "../src/mesh/store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
+
+const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
@@ -197,7 +199,7 @@ describe("background outage alarm (smarty-dev#8825)", () => {
 
   it("retries the alarm publish when it fails, and publishes a fabric.alarm.mesh-outage event through the owner's mesh", async () => {
     vi.useFakeTimers();
-    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:chief-of-staff");
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const published: unknown[] = [];
     let fail = true;
@@ -215,7 +217,42 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     retry.failure(busy()); // already sent: not again
     await vi.advanceTimersByTimeAsync(1_000);
     expect(published).toEqual([expect.objectContaining({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, kind: "mesh-outage", from,
-      to: "session:chief-of-staff", data: expect.objectContaining({ label: "inbox", state: "outage", reason: "mesh lock timeout" }) })]);
+      to: CHIEF, data: expect.objectContaining({ label: "inbox", state: "outage", reason: "mesh lock timeout" }) })]);
+    vi.unstubAllEnvs();
+  });
+
+  // pi-fabric#893 round 4 (owner decision, fabric-store): exactly two forms; anything else is refused.
+  it("accepts only session:<uuid> or topic:fabric.alarm.<name>, and falls back to a session-form SMARTY_LEAD_SESSION", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const lead = "session:11111111-2222-4333-8444-555555555555";
+    expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: CHIEF })).toEqual({ to: CHIEF });
+    expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: "topic:fabric.alarm.mesh-ops" })).toEqual({ topic: "fabric.alarm.mesh-ops" });
+    for (const value of ["org", "org-kate", "fabric-store", "*", ` ${CHIEF}`, `${CHIEF}\n`, CHIEF.toUpperCase(),
+      "session:not-a-uuid", "topic:fabric.alarm.", "topic:fabric.alarm.Mesh", "topic:ops.owner", "fabric.alarm.mesh-ops"]) {
+      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value }), value).toBeUndefined();
+      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: lead }), value).toEqual({ to: lead });
+      expect(meshAlarmRecipient({ PI_FABRIC_MESH_ALARM_TO: value, SMARTY_LEAD_SESSION: "org" }), value).toBeUndefined();
+    }
+    const refusals = warn.mock.calls.filter(([line]) => String(line).includes("PI_FABRIC_MESH_ALARM_TO refused"));
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals.length).toBeLessThanOrEqual(12); // one line per refused value, not per alarm
+    expect(meshAlarmRecipient({})).toBeUndefined();
+  });
+
+  it("publishes a topic-form alarm on that topic, with no recipient field", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "topic:fabric.alarm.mesh-ops");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const published: Array<Record<string, unknown>> = [];
+    const mesh = { publish: async (input: Record<string, unknown>) => { published.push(input); return input; } };
+    const retry = new MeshBackgroundRetry("inbox", 100, 400)
+      .alarmsTo(meshOutageAlarmSink(() => ({ mesh: mesh as never, from: { id: "session:x", name: "main", kind: "main" } })));
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(published).toEqual([expect.objectContaining({ topic: "fabric.alarm.mesh-ops", kind: "mesh-outage" })]);
+    expect(published[0]).not.toHaveProperty("to");
     vi.unstubAllEnvs();
   });
 

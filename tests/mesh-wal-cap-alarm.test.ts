@@ -10,7 +10,8 @@ import { MESH_WAL_CAP_ALARM_TOPIC, MeshStore, type MeshIdentity } from "../src/m
 // smarty-dev#7451 item 6: a write the SQLite WAL cap refuses raises an in-product alarm, not only a bridge log line.
 const roots: string[] = [];
 // pi-fabric#893 round 3: an alarm needs an explicit recipient (here a configured one).
-beforeEach(() => { vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:chief-of-staff"); });
+const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
+beforeEach(() => { vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF); });
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.useRealTimers();
@@ -83,7 +84,9 @@ describe("mesh WAL-cap alarm (smarty-dev#7451 item 6)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await expect(store.put({ key: "a/b", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_WAL_CAP" });
     await vi.waitFor(() => expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(1));
-    expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })[0]!.to).toBe("session:chief-of-staff");
+    expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })[0]!.to).toBe(CHIEF);
+    // pi-fabric#893 round 4: the log line names no mesh root path.
+    expect(warn.mock.calls.map(([line]) => String(line)).join("\n")).not.toContain(store.root);
     vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
     vi.stubEnv("SMARTY_LEAD_SESSION", "");
     vi.spyOn(process, "cwd").mockReturnValue(os.tmpdir()); // no .local/lead above it

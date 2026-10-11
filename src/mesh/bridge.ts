@@ -10,7 +10,7 @@ import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
@@ -110,12 +110,15 @@ export const isWorkTopic = (topic: unknown): topic is string => {
   return true;
 };
 
-/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), and owner wakes. */
-export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolean =>
+/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
+ * mesh-outage alarm and its recovery, only when addressed to a canonical alarm target (pi-fabric#893 round 4). */
+export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
   isWorkTopic(event.topic) ||
-  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
+  (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
+    isMeshAlarmTarget(event.to));
 
 /**
  * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
@@ -997,7 +1000,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
   const principal = copyFabricPrincipal(input.principal);
-  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
+  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind, to })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
   if (!isIdentity(from)) throw new Error("Bridge publish has no sender identity");

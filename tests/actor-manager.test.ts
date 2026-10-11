@@ -944,8 +944,9 @@ describe("ActorManager presence under a stalled mesh lock", () => {
   });
 
   // pi-fabric#893 round 3: the presence path's retry is kept until its alarm and recovery were accepted.
+  const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
   it("a presence outage alarm whose publish failed is delivered, then its recovery, once the write lands", async () => {
-    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "session:chief-of-staff");
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF);
     vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const { mesh, make, hold, release } = stalledSetup();
@@ -964,7 +965,35 @@ describe("ActorManager presence under a stalled mesh lock", () => {
       await waitFor(() => mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).length >= 2, 5_000);
       const alarms = mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC });
       expect(alarms.map((event) => event.kind)).toEqual(["mesh-outage", "mesh-recovered"]);
-      expect(alarms.every((event) => event.to === "session:chief-of-staff")).toBe(true);
+      expect(alarms.every((event) => event.to === CHIEF)).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+  }, 30_000);
+
+  // pi-fabric#893 round 4: after the final presence write, a failed alarm publish has no later pass to ride on; the
+  // owner's timer delivers it.
+  it("delivers a queued presence alarm whose publishes failed past the final write, with no new presence pass", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { mesh, make, hold, release } = stalledSetup();
+      const actors = make({ meshOutageAlarmMs: 400 });
+      const publish = mesh.publish.bind(mesh);
+      let failing = true;
+      let rejected = 0;
+      vi.spyOn(mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && failing) { rejected++; throw new Error("mesh unavailable"); }
+        return publish(input);
+      });
+      hold();
+      const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+      await waitFor(() => rejected > 0, 10_000);
+      release();
+      await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+      const attempts = rejected;
+      await waitFor(() => rejected > attempts, 5_000); // the flush after the final write failed too
+      failing = false; // no further presence pass happens for this actor
+      await waitFor(() => mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).length >= 2, 5_000);
+      expect(mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).map((event) => event.kind)).toEqual(["mesh-outage", "mesh-recovered"]);
     } finally { vi.unstubAllEnvs(); }
   }, 30_000);
 

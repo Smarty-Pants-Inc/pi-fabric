@@ -76,7 +76,7 @@ describe("Main provider recovery waiting for settlement compaction", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(sendFabricMessage).toHaveBeenCalledTimes(2); // retry + non-triggering BLOCKED
     expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
-      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: "BLOCKED: provider error: disconnect" }),
+      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: "BLOCKED: provider error: unclassified" }),
       { deliverAs: "followUp", triggerTurn: false });
     expect(h.report).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -115,6 +115,33 @@ describe("Main provider recovery waiting for settlement compaction", () => {
         expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
       expect(h.report).not.toHaveBeenCalled();
     });
+});
+
+describe("Main provider recovery reports only allowlisted fields after a retryable failure (smarty-dev#8742)", () => {
+  const secret = "FAKE-SECRET-8742 echoed prompt hunter2";
+  it.each([
+    ["a 5xx body that echoes a secret", `503 ${JSON.stringify({ type: "error", error: { type: "api_error", message: `upstream echoed Authorization: Bearer ${secret}` } })}`, "503 api_error"],
+    ["a secret as the type and code", `502 ${JSON.stringify({ error: { type: secret, code: secret, message: secret } })}`, "502"],
+    ["a secret on the raw first line", `${secret} connection reset by peer\nprivate diagnostic`, "unclassified"],
+  ])("%s never reaches the UI notice or the report payload", async (_name, errorMessage, short) => {
+    const h = harness({ errorMessage, owns: true });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledExactlyOnceWith(expect.anything(),   // retryable: the one retry
+      expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
+    await h.emit("agent_start");
+    await h.emit("agent_settled");
+    const expected = `BLOCKED: provider error: ${short}`;
+    expect(h.report).toHaveBeenCalledExactlyOnceWith(expected, h.context);
+    expect(h.context.ui.notify).toHaveBeenCalledExactlyOnceWith(expected, "error");
+    expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ customType: "pi-fabric-provider-blocked", content: expected }), { deliverAs: "followUp", triggerTurn: false });
+    const published = JSON.stringify([vi.mocked(sendFabricMessage).mock.calls.map(call => call.slice(1)),
+      vi.mocked(h.context.ui.notify).mock.calls, (h.report.mock.calls as unknown[][]).map(call => call[0])]);
+    expect(published).not.toContain(secret);
+    expect(published).not.toContain("private diagnostic");
+  });
 });
 
 describe("Main provider recovery leaves non-retryable errors to Main's drain (smarty-dev#8742)", () => {

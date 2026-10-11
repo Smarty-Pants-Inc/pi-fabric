@@ -683,8 +683,10 @@ export class MainAgentController implements FabricMainAgentTarget {
         if (replaced) { this.#consumedDirty = true; this.#trySave(); }
         throw new Error(`Main could not record the followUp: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (providerHeld) this.#scheduleProviderWake();
-      else if (this.#context && promptPending(this.#context)) this.#wakeAfterPreflight();
+      if (providerHeld) {
+        this.#scheduleProviderWake();
+        this.#armProviderDeadTimer();                   // a new delivery is an edge too; no-op unless pending
+      } else if (this.#context && promptPending(this.#context)) this.#wakeAfterPreflight();
       else if (this.#context?.isIdle()) {
         const canTrigger = !this.#halted && !this.#providerHeld() && !this.#context?.signal?.aborted;
         this.#release(true);
@@ -1171,6 +1173,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       else if (event.outcome === "error") this.#recordProviderFailure();
       else if (event.outcome === "completed") this.#recoverProvider();
       // Older hosts omit outcome: neither grant recovery nor invent an owner stop.
+      // Every settle is an idle edge for a pending recovery step (smarty-dev#8742: event-driven, no polling).
+      if (this.#providerDead && !this.#halted) this.#armProviderDeadTimer();
     };
     on("agent_before_settle", settleGate);
     on("agent_settled", settleGate);
@@ -1218,6 +1222,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       } else if (!event.aborted && !event.willRetry && !benign) {
         this.#recordProviderFailure(true);
       }
+      // A finished (failed) compaction is an idle edge for a recovery step that found Main compacting.
+      this.#armProviderDeadTimer();
       // Unsuccessful boundaries never wake their queued replay, even for a benign rejection.
       // Later peer deliveries retain permission after a veto; errors await recovery,
       // but only a real owner stop survives reload.
@@ -1246,6 +1252,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       // A run is the attempt (or its settle re-arms recovery); stop waiting for idle.
       this.#stopProviderDeadTimer();
     });
+    // The end of a run, and a finished /tree summary, are idle edges for a pending recovery step.
+    on("agent_end", () => { this.#armProviderDeadTimer(); });
+    on("session_tree", () => { this.#armProviderDeadTimer(); });
     if (!(flushMs > 0) || typeof this.pi.on !== "function") {
       // Drain off: what an earlier drain journalled goes to Pi's own queue, under the same rule.
       // Each stays in the journal until the session holds it (review/astra F4 on pi-fabric#102).
@@ -1450,6 +1459,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       } else if (this.#context?.isIdle()) {
         if (this.#operation === operation) this.#stopOperation();
         this.#held.length ? this.#release(true) : this.#stopWake();
+        this.#armProviderDeadTimer();                      // the operation's idle edge; no-op unless pending
       }
     }, 25);
     this.#wake.unref?.();
@@ -1467,6 +1477,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (ctx && (promptPending(ctx) || !ctx.isIdle())) return;
       if (ctx) this.#release(true); // #send retains owner/provider vetoes.
       else this.#stopWake();
+      this.#armProviderDeadTimer();                        // the preflight's idle edge; no-op unless pending
     }, 25);
     this.#preflightWake.unref?.();
   }
@@ -1594,24 +1605,29 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#armProviderDeadTimer();
   }
 
-  /** At idle: run the one recovery compaction, or the one post-compaction attempt. */
-  #armProviderDeadTimer(delayMs = 0): void {
+  /**
+   * At idle: run the one recovery compaction, or the one post-compaction attempt.
+   *
+   * Event-driven, never polled (smarty-dev#8742 review): one zero-delay tick leaves the emitting hook
+   * (ctx.compact aborts an active run, and a settle may still be running other handlers). If Main is
+   * busy at that tick, the step stays pending with no timer, and the next lifecycle edge re-arms it:
+   * a run's end (agent_end, agent_before_settle, agent_settled), a compaction's end (session_compact,
+   * session_compact_failed, ctx.compact's completion), session_tree, the drain's idle and preflight
+   * waiters, or a newly held peer message. agent_start stops a pending tick; owner input ends the incident.
+   */
+  #armProviderDeadTimer(): void {
     const phase = this.#providerDead?.phase;
     if (this.#providerDeadTimer || (phase !== "recovering" && phase !== "probation")) return;
-    // Leave the emitting hook first: ctx.compact aborts an active run, and a settle may still
-    // be running other handlers. agent_start stops this wait; the run's settle re-arms it.
     this.#providerDeadTimer = setTimeout(() => {
       this.#providerDeadTimer = undefined;
       const dead = this.#providerDead;
       const ctx = this.#context;
       if (!dead || !ctx || !this.#bindingsLive || this.#reloading || this.#halted || ctx.signal?.aborted) return;
-      if (!ctx.isIdle() || promptPending(ctx) || (ctx as { isSettling?: () => boolean }).isSettling?.() === true) {
-        this.#armProviderDeadTimer(100);
-        return;
-      }
+      // Busy: no re-arm here. The edge that ends this busy state calls back in.
+      if (!ctx.isIdle() || promptPending(ctx) || (ctx as { isSettling?: () => boolean }).isSettling?.() === true) return;
       if (dead.phase === "recovering") this.#compactForRecovery(dead, ctx);
       else if (dead.phase === "probation") this.#attemptAfterCompaction();
-    }, delayMs);
+    }, 0);
     this.#providerDeadTimer.unref?.();
   }
 
@@ -1633,7 +1649,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#raiseProviderDead("compaction-failed");
     };
     try {
-      ctx.compact({ onComplete: () => { if (this.#providerDead === dead) this.#providerCompacted(); }, onError: failed });
+      // Pi calls onComplete after its compaction state is cleared: the idle edge for the one attempt.
+      ctx.compact({ onComplete: () => { if (this.#providerDead === dead) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
     } catch {
       failed();
     }

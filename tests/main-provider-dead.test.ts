@@ -165,6 +165,49 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     h.main.closeFollowUpDrain();
   });
 
+  it("waits for idle on lifecycle edges, with no timer running while Main is busy (review P2)", () => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));            // the failed run is still active
+    vi.advanceTimersByTime(0);                          // the one deferred tick samples busy
+    expect(h.compactions).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);                 // nothing polls while Main is busy
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.compactions).toHaveLength(0);
+    h.settleError();                                    // the run's settle is the idle edge
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    // session_compact runs while Pi is still compacting: the attempt waits, again without a timer.
+    h.state.idle = false;
+    h.emit("session_compact", { reason: "manual" });
+    expect(h.main.providerDeadState?.phase).toBe("probation");
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.sent).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    h.state.idle = true;
+    h.compactions[0]!.onComplete?.({});                 // Pi cleared its compaction state: the idle edge
+    vi.advanceTimersByTime(0);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.message.customType).toBe("pi-fabric-provider-retry");
+    expect(h.sent[0]!.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(h.compactions).toHaveLength(1);
+    expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+
+  it.each(["agent_end", "peer delivery"])("re-arms a recovery step that found Main busy on %s (review P2)", (edge) => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    vi.advanceTimersByTime(0);
+    expect(vi.getTimerCount()).toBe(0);
+    h.state.idle = true;                                // e.g. a host whose settle carried no edge
+    if (edge === "agent_end") h.emit("agent_end", { messages: [] });
+    else expect(h.main.deliverAgent({ from: from("lead"), message: "x", delivery: "followUp" }).triggered).toBe(false);
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    h.main.closeFollowUpDrain();
+  });
+
   it("keeps retryable errors on today's exponential backoff, without compaction or alarm", () => {
     const h = setup(flushMs);
     h.state.idle = true;

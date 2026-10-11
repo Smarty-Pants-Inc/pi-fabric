@@ -20,7 +20,7 @@ const cli = process.env.FABRIC_8742_PI_CLI ?? path.join(repo, "node_modules/@ear
 const SECRET = "SECRET-sk-ant-8742 echoed prompt hunter2";
 const POISON = "SIGNED-BLOCK";
 
-type Mode = "non-retryable" | "unclassified";
+type Mode = "non-retryable" | "unclassified" | "retryable";
 
 const run = async (mode: Mode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `fabric-8742-${mode}-`));
@@ -33,8 +33,14 @@ const run = async (mode: Mode) => {
     req.on("end", () => {
       const summarizer = body.includes("context summarization assistant");
       const poisoned = !summarizer && body.includes(POISON);
-      requests.push({ who: summarizer ? "summarizer" : "main", poisoned, status: poisoned ? (mode === "unclassified" ? 0 : 409) : 200 });
+      requests.push({ who: summarizer ? "summarizer" : "main", poisoned, status: poisoned ? (mode === "unclassified" ? 0 : mode === "retryable" ? 503 : 409) : 200 });
       if (poisoned && mode === "unclassified") { req.socket.destroy(); return; }       // no status, no body
+      if (poisoned && mode === "retryable") {
+        // A retryable 5xx whose body echoes the secret: #4012's one retry, then its BLOCKED report.
+        res.writeHead(503, { "content-type": "application/json", "x-should-retry": "false" });
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: `upstream echoed: ${SECRET}` } }));
+        return;
+      }
       if (poisoned) {
         res.writeHead(409, { "content-type": "application/json", "x-should-retry": "false" });
         res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `compaction_affinity_missing: ${SECRET}` } }));
@@ -89,21 +95,22 @@ const run = async (mode: Mode) => {
   try {
     await client.start();
     for (const seed of ["seed one", "seed two"]) await prompt(seed);
-    const dead = /^provider-dead/;
+    // The retryable path never alarms provider-dead; it ends in #4012's one BLOCKED report.
+    const dead = mode === "retryable" ? /^BLOCKED: provider error/ : /^provider-dead/;
     for (let attempt = 0; attempt < 4 && !notices().some(n => dead.test(n)); attempt++) {
       await prompt(`${POISON}: continue the task (attempt ${attempt + 1})`);
       // Let Fabric's idle-boundary recovery (compaction, one attempt, #4012's one retry) finish.
       await wait(() => notices().some(n => dead.test(n)) || events.at(-1)?.type === "agent_settled", "recovery to settle", 30_000)
         .then(() => new Promise(resolve => setTimeout(resolve, 1_500)));
     }
-    await wait(() => notices().some(n => dead.test(n)), "the provider-dead notice");
+    await wait(() => notices().some(n => dead.test(n)), "the provider-dead or BLOCKED notice");
     const mainRequests = requests.filter(r => r.who === "main").length;
     await new Promise(resolve => setTimeout(resolve, 2_000));        // no silent retry loop follows the alarm
     const state = await client.getState();
     const mesh = new MeshStore(meshRoot, 256 * 1024, 1000);
     const read = (topic: string) => mesh.read({ topic, after: 0, limit: 200 });
     // Mesh delivery is best-effort background work; give it a moment.
-    await wait(() => read("ops.owner").some(e => e.kind === "fabric.main.provider-dead"), "the ops.owner alarm", 15_000);
+    if (mode !== "retryable") await wait(() => read("ops.owner").some(e => e.kind === "fabric.main.provider-dead"), "the ops.owner alarm", 15_000);
     const meshFiles = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true })
       .flatMap(d => d.isDirectory() ? meshFiles(path.join(dir, d.name)) : [path.join(dir, d.name)]);
     const sessionFile = (state as { sessionFile?: string }).sessionFile;
@@ -153,6 +160,19 @@ describe.runIf(process.env.FABRIC_8742_REAL_PI === "1")("real Pi + stub provider
     expect(result.mainRequestsAfter).toBe(result.mainRequests);
     expect(result.opsOwner.find(e => e.kind === "fabric.main.provider-dead")!.data)
       .toMatchObject({ kind: "unclassified", cause: "unclassified-repeated", error: "unclassified", failures: 3 });
+    expect(result.meshLeaks).toEqual([]);
+  }, 150_000);
+
+  it("retryable 503 echoing a secret: one retry, then a BLOCKED report with only the status and error type", async () => {
+    const result = await run("retryable");
+    expect(result.notices.filter(n => n.startsWith("BLOCKED: provider error"))).toEqual(["BLOCKED: provider error: 503 api_error"]);
+    expect(result.notices.some(n => n.startsWith("provider-dead") || n.startsWith("Provider rejected"))).toBe(false);
+    expect(result.requests.filter(r => r.who === "main" && r.poisoned).length).toBeGreaterThanOrEqual(2);   // the failure and #4012's retry
+    expect(result.mainRequestsAfter).toBe(result.mainRequests);
+    expect(result.opsOwner.some(e => e.kind === "fabric.main.provider-dead")).toBe(false);
+    // Untrusted provider text: in the local session log only, never in a notice or any mesh file.
+    expect(result.sessionHasSecret).toBe(true);
+    expect(JSON.stringify(result.notices)).not.toContain(SECRET);
     expect(result.meshLeaks).toEqual([]);
   }, 150_000);
 });

@@ -52,7 +52,10 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (retried) {
       if (reported) return;
       reported = true;
-      const message = `BLOCKED: provider error: ${last.errorMessage?.split(/\r?\n/, 1)[0] || "Unknown provider error"}`;
+      // smarty-dev#8742: only the classifier's allowlisted short form (HTTP status, a known error type,
+      // a fixed code) leaves this Main. A provider can echo prompt or secret text in errorMessage; that
+      // text stays in the failed assistant message in the local session log.
+      const message = `BLOCKED: provider error: ${classifyProviderError(last)?.short ?? "unknown provider error"}`;
       // Persist/display without waking the failed lane for a third attempt.
       sendFabricMessage(pi, { customType: "pi-fabric-provider-blocked", content: message, display: true },
         { deliverAs: "followUp", triggerTurn: false });

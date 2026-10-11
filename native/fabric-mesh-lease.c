@@ -6,13 +6,14 @@
  * then the path. Exit: 0 all free or absent, 3 any held, 2 any error. Static, without libc, as
  * fabric-landlock (same build).
  *
- * fabric-mesh-lease --watch CONTROLDIR FILE... (smarty-dev#8116): inotify watches on each FILE's directory
+ * fabric-mesh-lease --watch PARENTPID CONTROLDIR FILE... (smarty-dev#8116): inotify watches on each FILE's directory
  * and on each existing FILE's inode go up BEFORE the same lease probe, so an open after the probe is an
  * event, whatever the opener's dumpability or locks. After the probe lines it prints "watching". Each file
  * created in CONTROLDIR asks for a report: per FILE "net OPENS CLOSES FILE" (by name, in its directory),
  * "alias FILE" (its inode opened through another name: a hard link), "moved FILE", then "overflow" (lost
- * events) and "newdir" (a missing directory appeared) when they apply, and "end N". The caller subtracts
- * its own open fds. It dies with its parent (PR_SET_PDEATHSIG).
+ * events), "newdir" (a missing directory appeared) and "invalidated" (a watched directory or file inode was
+ * deleted, moved or its watch dropped, so a replacement would go unwatched) when they apply, and "end N".
+ * The caller subtracts its own open fds. It dies with PARENTPID (PR_SET_PDEATHSIG, then a getppid check).
  */
 #include <asm/unistd.h>
 #include <linux/fcntl.h>
@@ -56,12 +57,13 @@ static int same(const char *a, const char *b) { while (*a && *a == *b) { a++; b+
 static long slash(const char *p) { long at = -1; for (long i = 0; p[i]; i++) if (p[i] == '/') at = i; return at; }
 
 #define MAXF 8
-#define FILE_EVENTS (IN_OPEN | IN_CLOSE | IN_DONT_FOLLOW)
-#define DIR_EVENTS (IN_OPEN | IN_CLOSE | IN_CREATE | IN_DELETE | IN_MOVE | IN_ONLYDIR | IN_DONT_FOLLOW)
+#define SELF_EVENTS (IN_DELETE_SELF | IN_MOVE_SELF)
+#define FILE_EVENTS (IN_OPEN | IN_CLOSE | SELF_EVENTS | IN_DONT_FOLLOW)
+#define DIR_EVENTS (IN_OPEN | IN_CLOSE | IN_CREATE | IN_DELETE | IN_MOVE | SELF_EVENTS | IN_ONLYDIR | IN_DONT_FOLLOW)
 static struct target { char *path; long dir, wd; unsigned long opens, closes, inode, seen; int gen, alias, moved; } T[MAXF];
 static char dirs[MAXF][4096];
 static long D[MAXF], nfiles, ndirs, inotify;
-static int overflow, newdir;
+static int overflow, newdir, invalidated;
 
 /* An inode watch: its opens (any name) must not exceed the opens by name seen in its generation. */
 static void watch(struct target *t) {
@@ -82,12 +84,19 @@ static void report(unsigned long seq) {
     }
     if (overflow) out("overflow\n");
     if (newdir) out("newdir\n");
+    if (invalidated) out("invalidated\n");
     out("end "); number(seq); out("\n");
 }
 
 static void event(const struct inotify_event *e, long control, unsigned long *seq) {
     if (e->mask & IN_Q_OVERFLOW) overflow = 1;
     if (e->wd == control) { if ((e->mask & IN_CREATE) && e->len) report(++*seq); return; }
+    // A watched directory or file inode that is deleted, moved or loses its watch: its replacement would
+    // go unwatched, so every later count is void (smarty-dev#8116 review, fail closed).
+    if (e->mask & (SELF_EVENTS | IN_IGNORED)) {
+        for (long d = 0; d < ndirs; d++) if (D[d] == e->wd) invalidated = 1;
+        for (long i = 0; i < nfiles; i++) if (T[i].wd == e->wd) invalidated = 1;
+    }
     for (long d = 0; d < ndirs; d++) {
         if (D[d] != e->wd || !e->len) continue;
         if (e->mask & IN_ISDIR) {
@@ -110,13 +119,21 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
 static long probe(char *file);
 
 __attribute__((noreturn)) static void watching(long argc, char **argv) {
-    if (argc < 4 || argc - 3 > MAXF) fail("usage: --watch CONTROLDIR FILE...", -22);
-    SYS(prctl, PR_SET_PDEATHSIG, 9, 0);
+    if (argc < 5 || argc - 4 > MAXF) fail("usage: --watch PARENTPID CONTROLDIR FILE...", -22);
+    long parent = 0;
+    for (const char *p = argv[2]; *p; p++) {
+        if (*p < '0' || *p > '9' || parent > 1L << 40) fail("PARENTPID", -22);
+        parent = parent * 10 + (*p - '0');
+    }
+    long died = SYS(prctl, PR_SET_PDEATHSIG, 9, 0);
+    if (died < 0) fail("prctl PR_SET_PDEATHSIG", died);
+    /* The parent may have died before the prctl: then no signal comes. */
+    if (SYS(getppid, 0, 0, 0) != parent) fail("parent gone", -3);
     inotify = SYS(inotify_init1, IN_CLOEXEC, 0, 0);
     if (inotify < 0) fail("inotify_init1", inotify);
-    long control = SYS(inotify_add_watch, inotify, argv[2], IN_CREATE | IN_ONLYDIR | IN_DONT_FOLLOW);
-    if (control < 0) fail(argv[2], control);
-    for (long i = 3; i < argc; i++) {
+    long control = SYS(inotify_add_watch, inotify, argv[3], IN_CREATE | IN_ONLYDIR | IN_DONT_FOLLOW);
+    if (control < 0) fail(argv[3], control);
+    for (long i = 4; i < argc; i++) {
         struct target *t = &T[nfiles++];
         t->path = argv[i];
         long cut = slash(t->path);
@@ -134,7 +151,7 @@ __attribute__((noreturn)) static void watching(long argc, char **argv) {
         }
         watch(t);
     }
-    for (long i = 3; i < argc; i++) probe(argv[i]);
+    for (long i = 4; i < argc; i++) probe(argv[i]);
     out("watching\n");
     static char buffer[4096] __attribute__((aligned(8)));
     unsigned long seq = 0;

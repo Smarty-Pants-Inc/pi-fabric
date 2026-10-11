@@ -387,7 +387,7 @@ export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions 
   try {
     fs.mkdirSync(control, { mode: 0o700 });
     const out = fs.openSync(output, "wx", 0o600);
-    try { child = spawn("/proc/self/fd/3", ["--watch", control, ...files], { stdio: ["ignore", out, "ignore", fd] }); }
+    try { child = spawn("/proc/self/fd/3", ["--watch", String(process.pid), control, ...files], { stdio: ["ignore", out, "ignore", fd] }); }
     finally { fs.closeSync(out); fs.closeSync(fd); }
     child.on("error", () => undefined);
     const lines = (): string[] => fs.readFileSync(output, "utf8").split("\n");
@@ -434,7 +434,8 @@ export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions 
           if (others > 0) hold(net[3]!, `${others} open(s) since the lease probe that this process does not hold`);
         } else if (flag && files.includes(flag[2]!)) {
           hold(flag[2]!, flag[1] === "alias" ? "opened through another name (a hard link) since the lease probe" : "moved since the lease probe");
-        } else return leaseUnavailable(`the lease watch reported ${line === "overflow" ? "lost events (inotify queue overflow)" : line === "newdir" ? "a new state-shadow directory" : `"${line}"`} (${WATCH_DOC})`);
+        } else return leaseUnavailable(`the lease watch reported ${line === "overflow" ? "lost events (inotify queue overflow)" : line === "newdir" ? "a new state-shadow directory"
+          : line === "invalidated" ? "a watched directory or file moved, deleted or replaced" : `"${line}"`} (${WATCH_DOC})`);
       }
       return result;
     };

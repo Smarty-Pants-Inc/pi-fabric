@@ -64,7 +64,8 @@ The gate decides from an inventory, never from what readers chose to register:
    each existing file's inode) go up BEFORE the lease probe, so an open after the probe is an event,
    whatever the opener's dumpability or locks. Before each commit the gate asks for the counts: opens minus
    closes by name, minus this process's own open fds on those paths, must be zero. An inode opened through
-   another name (a hard link), a moved file, lost events (queue overflow), a `state-shadow/` that appeared,
+   another name (a hard link), a moved file, lost events (queue overflow), a `state-shadow/` that appeared, a watched
+   directory or file inode deleted, moved or dropped by inotify (its replacement would be unwatched),
    or a helper that does not report within 10 s is never ready (`holder@lease:<file>` or
    `holder@lease-probe`). On Linux a probe that cannot run is `holder@lease-probe` even when no SQLite file
    exists yet. Neither simpler option works: any open breaks a held write lease, the switch's own

@@ -521,14 +521,46 @@ sys.stdin.readline()`;
     });
   }
 
+  // smarty-dev#8116 review round 1 (SEC P1): a watched directory swapped for a new one during the window. The new
+  // state-shadow/ (and any SQLite file in it) is unwatched, so the counts are void: refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a watched state-shadow/ is moved away and replaced after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      options: { onStep: (step) => {
+        if (step !== "cutover-marker") return;
+        fs.renameSync(shadow, path.join(root, "state-shadow.old"));
+        fs.mkdirSync(shadow, { mode: 0o700 });
+        fs.writeFileSync(path.join(shadow, "state.db"), "");
+      } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a watched directory or file moved, deleted or replaced (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+    // With the directory left alone the same switch is ready.
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
+  // The real helper: a state-shadow/ that did not exist at the probe appears during the window (unwatched): refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a state-shadow/ appears after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    expect(fs.existsSync(path.join(root, "state-shadow"))).toBe(false);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      options: { onStep: (step) => { if (step === "cutover-marker") fs.mkdirSync(path.join(root, "state-shadow"), { mode: 0o700 }); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+  });
+
   // ponytail: an inotify queue overflow needs root (fs.inotify.max_queued_events); a fake helper with a matching
   // digest stands in for the helper's report, so the gate's handling of it is what this proves.
-  for (const report of ["overflow", "newdir", "silent"] as const) {
+  for (const report of ["overflow", "silent"] as const) {
     it.skipIf(leaseSkip !== "")(`fails closed when the lease watch reports ${report}${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
       const root = await crashedImport();
       const helper = path.join(tempDir("fake"), "fabric-mesh-lease");
       fs.writeFileSync(helper, `#!/bin/sh
-if [ "$1" = --watch ]; then control=$2; shift 2; fi
+if [ "$1" = --watch ]; then control=$3; shift 3; fi
 for f in "$@"; do if [ -e "$f" ]; then echo "free $f"; else echo "absent $f"; fi; done
 [ -n "$control" ] || exit 0
 echo watching
@@ -541,8 +573,7 @@ exec sleep 30
       const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper, expectedDigest } });
       expect(result.code, result.err).toBe(3);
       expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): ${report === "overflow"
-        ? "the lease watch reported lost events (inotify queue overflow)" : report === "newdir" ? "the lease watch reported a new state-shadow directory"
-          : "the lease watch did not report"} (smarty-dev#8116))`);
+        ? "the lease watch reported lost events (inotify queue overflow)" : "the lease watch did not report"} (smarty-dev#8116))`);
       expect(await backendOf(root)).toBe("importing");
       if (report === "silent") expect(Date.now() - started).toBeLessThan(30_000);
     }, 60_000);

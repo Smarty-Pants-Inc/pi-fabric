@@ -37,8 +37,14 @@ files) and a non-loopback monitoring URL `https://`; plaintext refuses before co
 (`FABRIC_MESH_STATE_NATS_INSECURE`). Loopback (127.0.0.0/8, ::1, localhost) may be plaintext.
 - **Streams:** one per mesh root, `FABRIC_MESH_` plus 32 hex characters of the SHA-256 of the root's realpath.
 - **A lost ack:** the CAS stored the batch, if at all, at exactly its base sequence plus 1. After a retry fails the
-CAS, the backend reads that one message and compares the batch id, so the batch is never run twice.
-- **The read model:** in memory, rebuilt by replaying the stream at open. Persisting it in the `state.db` schema, the
+CAS, the backend reads that one message and compares the batch id, so the batch is never run twice. If a purge
+removed that message meanwhile, the outcome is unknown (`FABRIC_MESH_STATE_NATS_OUTCOME_UNKNOWN`), never a rerun.
+- **Bounded replay:** every `snapshotEvery` messages (default 10 000; `compact()` on demand) a writer publishes a
+snapshot of the model, in chunks on the batch subject and one end record on `<stream>.snapshot`, as one CAS chain right
+after the model's sequence. It then purges the stream below the first chunk. Any commit inside the chain abandons the
+snapshot (its chunks are inert). A host opens from the latest end record, and a projector whose delivery skips
+sequences (a purge passed it) reloads from it. A stream purged without a snapshot is refused.
+- **The read model:** in memory, rebuilt at open from the snapshot plus the messages after it. Persisting it in the `state.db` schema, the
 cross-writer write fence, the migration flag and the conformance suite against a real server are phase 2. fabric-v2 plugs in by setting `STATE_BACKEND_FACTORIES.nats`
 to `{ unavailable?, create }`, where `create` returns a `StateBackend`. Its `unavailable` must
 also refuse (throw), never return a reason, for the same reason.

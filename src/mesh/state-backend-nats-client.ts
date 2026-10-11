@@ -38,17 +38,29 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       }
       return { version: nc.info?.version ?? "0.0.0", syncAlways };
     },
-    ensureStream: async (stream, subject) => {
-      try { return { lastSeq: (await jsm.streams.info(stream)).state.last_seq }; }
+    ensureStream: async (stream, subjects) => {
+      let info;
+      try { info = await jsm.streams.info(stream); }
       catch (error) { if (apiCode(error) !== STREAM_NOT_FOUND) throw error; }
-      const created = await jsm.streams.add({ name: stream, subjects: [subject], storage: StorageType.File, num_replicas: 1 });
-      return { lastSeq: created.state.last_seq };
+      if (!info) {
+        const created = await jsm.streams.add({ name: stream, subjects, storage: StorageType.File, num_replicas: 1 });
+        return { lastSeq: created.state.last_seq };
+      }
+      const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
+      if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
+      return { lastSeq: info.state.last_seq };
     },
     lastSequence: async (stream) => (await jsm.streams.info(stream)).state.last_seq,
+    firstSequence: async (stream) => (await jsm.streams.info(stream)).state.first_seq,
     getMessage: async (stream, seq) => {
       const message = await jsm.streams.getMessage(stream, { seq });
       return message ? { seq: message.seq, data: message.data } : undefined;
     },
+    lastBySubject: async (stream, subject) => {
+      const message = await jsm.streams.getMessage(stream, { last_by_subj: subject });
+      return message ? { seq: message.seq, data: message.data } : undefined;
+    },
+    purge: async (stream, beforeSeq) => { await jsm.streams.purge(stream, { seq: beforeSeq }); },
     publish: async (subject, data, { expectLastSequence, msgID }) => {
       try {
         const ack = await js.publish(subject, data, { msgID, expect: { lastSequence: expectLastSequence } });

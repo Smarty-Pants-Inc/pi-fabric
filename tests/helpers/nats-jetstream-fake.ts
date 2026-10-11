@@ -4,7 +4,11 @@
 import { NatsWrongLastSequenceError, type JetStreamPort, type NatsStreamMessage } from "../../src/mesh/state-backend-nats.js";
 
 export interface FakeJetStreamServer {
-  readonly messages: NatsStreamMessage[];
+  /** Every message ever stored, by sequence (index seq - 1), purged ones included; `firstSeq` is the purge floor. */
+  readonly messages: (NatsStreamMessage & { subject: string })[];
+  readonly firstSeq: number;
+  /** Runs before each purge is applied (inject a racing writer). */
+  beforePurge?: () => void;
   /** Ports opened on this server (one per backend, like separate connections). */
   port(): FakePort;
   version: string;
@@ -14,7 +18,7 @@ export interface FakeJetStreamServer {
   /** Runs after a publish is stored, before its ack (inject writers that commit after it). */
   afterStore?: (seq: number) => void;
   /** Appends a raw record (a foreign or malformed writer). */
-  append(data: Uint8Array): number;
+  append(data: Uint8Array, subject?: string): number;
   /** Holds deliveries to consumers (a slow projector) until `resume`. */
   pause(): void;
   resume(): void;
@@ -22,24 +26,33 @@ export interface FakeJetStreamServer {
   breakDelivery(error: Error): void;
 }
 
-export interface FakePort extends JetStreamPort { readonly calls: string[] }
+export interface FakePort extends JetStreamPort {
+  readonly calls: string[];
+  /** Holds this port's deliveries only (one lagging replica) until `resume`. */
+  pause(): void;
+  resume(): void;
+}
 
 export const fakeJetStream = (): FakeJetStreamServer => {
-  const messages: NatsStreamMessage[] = [];
+  const messages: (NatsStreamMessage & { subject: string })[] = [];
+  let firstSeq = 0;
   const ids = new Map<string, number>();
   const listeners = new Set<(message: NatsStreamMessage) => void>();
   const breakers = new Set<(error: Error) => void>();
   let paused: (() => void)[] | undefined;
   const later = (run: () => void) => { if (paused) paused.push(run); else setImmediate(run); };
-  const store = (data: Uint8Array): number => {
-    const message = { seq: messages.length + 1, data: new Uint8Array(data) };
+  const live = (seq: number) => seq >= Math.max(1, firstSeq) ? messages[seq - 1] : undefined;
+  const store = (data: Uint8Array, subject = "state"): number => {
+    const message = { seq: messages.length + 1, data: new Uint8Array(data), subject };
+    if (firstSeq === 0) firstSeq = message.seq;
     messages.push(message);
     for (const listener of listeners) later(() => listener(message));
     return message.seq;
   };
   const server: FakeJetStreamServer = {
     messages, version: "2.14.7", syncAlways: true,
-    append: store,
+    get firstSeq() { return firstSeq; },
+    append: (data, subject) => store(data, subject),
     pause: () => { paused ??= []; },
     resume: () => { const queued = paused ?? []; paused = undefined; for (const run of queued) setImmediate(run); },
     breakDelivery: (error) => { for (const broken of breakers) broken(error); },
@@ -47,13 +60,36 @@ export const fakeJetStream = (): FakeJetStreamServer => {
       const calls: string[] = [];
       let open = true;
       const own = new Set<(message: NatsStreamMessage) => void>();
+      let held: (() => void)[] | undefined;
       const port: FakePort = {
         calls,
+        pause: () => { held ??= []; },
+        resume: () => { const queued = held ?? []; held = undefined; for (const run of queued) setImmediate(run); },
         server: async () => { calls.push("server"); return { version: server.version, syncAlways: server.syncAlways }; },
         ensureStream: async () => { calls.push("ensureStream"); return { lastSeq: messages.length }; },
         lastSequence: async () => { calls.push("lastSequence"); return messages.length; },
-        getMessage: async (_stream, seq) => { calls.push("getMessage"); return messages[seq - 1]; },
-        publish: async (_subject, data, { expectLastSequence, msgID }) => {
+        firstSequence: async () => { calls.push("firstSequence"); return firstSeq; },
+        getMessage: async (_stream, seq) => {
+          calls.push("getMessage");
+          await new Promise<void>(resolve => setImmediate(resolve));
+          const message = live(seq);
+          return message && { seq: message.seq, data: message.data };
+        },
+        lastBySubject: async (_stream, subject) => {
+          calls.push("lastBySubject");
+          for (let seq = messages.length; seq >= Math.max(1, firstSeq); seq--) {
+            const message = messages[seq - 1]!;
+            if (message.subject === subject) return { seq, data: message.data };
+          }
+          return undefined;
+        },
+        purge: async (_stream, beforeSeq) => {
+          calls.push("purge");
+          await new Promise<void>(resolve => setImmediate(resolve));
+          server.beforePurge?.();
+          firstSeq = Math.max(firstSeq, Math.min(beforeSeq, messages.length + 1));
+        },
+        publish: async (subject, data, { expectLastSequence, msgID }) => {
           calls.push("publish");
           if (!open) throw new Error("connection closed");
           await new Promise<void>(resolve => setImmediate(resolve));
@@ -63,7 +99,7 @@ export const fakeJetStream = (): FakeJetStreamServer => {
           if (seen !== undefined) return { seq: seen, duplicate: true };
           const verdict = server.beforePublish?.(data);
           if (expectLastSequence !== messages.length) throw new NatsWrongLastSequenceError(expectLastSequence, `wrong last sequence: ${messages.length}`);
-          const seq = store(data);
+          const seq = store(data, subject);
           ids.set(msgID, seq);
           server.afterStore?.(seq);
           if (verdict === "lose-ack") throw Object.assign(new Error("timeout: no ack"), { name: "TimeoutError", transient: true });
@@ -72,8 +108,13 @@ export const fakeJetStream = (): FakeJetStreamServer => {
         consume: async (_stream, afterSeq, onMessage, onError) => {
           calls.push("consume");
           if (onError) breakers.add(onError);
+          // Like an ordered consumer: in order, from the first message still stored after `afterSeq` (a purge skips).
           let delivered = afterSeq;
-          const listener = (message: NatsStreamMessage) => { if (message.seq === delivered + 1) { delivered = message.seq; onMessage(message); } };
+          const deliver = (message: NatsStreamMessage) => {
+            if (held) { held.push(() => deliver(message)); return; }
+            if (message.seq > delivered && live(message.seq)) { delivered = message.seq; onMessage({ seq: message.seq, data: message.data }); }
+          };
+          const listener = deliver;
           for (const message of messages.slice(afterSeq)) later(() => listener(message));
           listeners.add(listener); own.add(listener);
           return { stop: async () => { listeners.delete(listener); own.delete(listener); } };

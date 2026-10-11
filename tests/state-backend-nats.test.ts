@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError,
+  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MeshStateNatsRefusedError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
@@ -62,9 +62,9 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const backend = await open(server);
     for (let index = 0; index < 5; index++) await backend.put({ key: `p/${index}`, value: index, identity });
     await backend.delete({ key: "p/2" });
-    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 }, server.messages[0]!, 100);
+    const once = applyNatsMessage({ seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0, snapshotEnd: 0 }, server.messages[0]!, 100);
     expect(applyNatsMessage(once, server.messages[0]!, 100)).toBe(once);
-    const replica = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
+    const replica = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
     expect(replica.listAll("p/")).toEqual(backend.listAll("p/"));
     expect(replica.stateStamp()?.split(":").at(-1)).toBe(String(server.messages.length));
     replica.close();
@@ -155,7 +155,7 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
   it("CAS retry: another writer commits between prepare and publish; the batch runs again on the new state", async () => {
     const server = fakeJetStream();
     const first = await open(server);
-    const second = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", maxEventBytes: 1 << 20 });
+    const second = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
     await first.put({ key: "c/count", value: 0, identity });
     await new Promise(resolve => setTimeout(resolve, 5));
     let injected = false;
@@ -378,5 +378,147 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     const port: JetStreamPort = fakeJetStream().port();
     await open({ ...fakeJetStream(), port: () => port } as unknown as FakeJetStreamServer);
     expect(Object.keys(await import("../src/mesh/state-backend-nats.js"))).not.toContain("connectJetStream");
+  });
+});
+
+describe("NATS state snapshots and purge: bounded replay (smarty-dev#7504)", () => {
+  const replicaOf = (server: FakeJetStreamServer) =>
+    NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
+
+  it("a snapshot purges the stream below it; a host opening later replays from it, not from sequence 1", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    for (let index = 0; index < 20; index++) await backend.put({ key: `s/${index % 7}`, value: index, identity });
+    await backend.delete({ key: "s/3" });
+    const versionOf4 = backend.get("s/4")!.version;
+    expect(await backend.compact()).toBe(true);
+    expect(server.firstSeq).toBe(22); // 21 batches purged; the chunk, the end record remain
+    await backend.put({ key: "s/after", value: "x", identity });
+    const port = server.port();
+    const replica = await NatsStateBackend.open({ port, stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
+    expect(replica.listAll("s/")).toEqual(backend.listAll("s/"));
+    expect(replica.diagnostics().nats).toMatchObject({ appliedSeq: server.messages.length, snapshotSeq: 23 });
+    // The tombstone survives the snapshot: a put that expects "never seen" still conflicts.
+    await expect(replica.put({ key: "s/3", value: 1, identity, ifVersion: 0 })).rejects.toThrow(/compare-and-swap failed for s\/3/);
+    await replica.put({ key: "s/4", value: "r", identity, ifVersion: versionOf4 });
+    replica.close();
+  });
+
+  it("a large model spans several chunks and round-trips exactly", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    const big = "\"q\\".repeat(30_000);
+    for (let index = 0; index < 6; index++) await backend.put({ key: `big/${index}`, value: { big, index }, identity });
+    expect(await backend.compact()).toBe(true);
+    const end = JSON.parse(Buffer.from(server.messages.at(-1)!.data).toString()) as { type: string; chunks: number };
+    expect(end).toMatchObject({ type: "snapshot-end" });
+    expect(end.chunks).toBeGreaterThan(3);
+    const replica = await replicaOf(server);
+    expect(replica.listAll("big/")).toEqual(backend.listAll("big/"));
+    replica.close();
+  });
+
+  it("a writer committing inside the snapshot chain abandons the snapshot: no purge, no lost write", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    const other = await replicaOf(server);
+    for (let index = 0; index < 5; index++) await backend.put({ key: `r/${index}`, value: index, identity });
+    expect(await backend.compact()).toBe(true);
+    await backend.put({ key: "r/5", value: 5, identity });
+    let publishes = 0;
+    server.beforePublish = () => {
+      if (++publishes !== 2) return;
+      // The other writer's batch lands after the snapshot's chunk, before its end record.
+      server.append(encode({ format: 1, type: "batch", id: "other", base: server.messages.length, highWater: 10_000,
+        changes: [{ key: "r/other", put: { value: 1, version: 10_000, updatedAt: 1, updatedBy: identity } }] }));
+    };
+    expect(await backend.compact()).toBe(false);
+    delete server.beforePublish;
+    const floor = server.firstSeq;
+    await backend.put({ key: "r/next", value: 1, identity });
+    expect(backend.get("r/other")?.value).toBe(1);
+    // No purge happened; the abandoned chunk is inert: a host opening now replays from the older, complete snapshot.
+    expect(server.firstSeq).toBe(floor);
+    const before = await replicaOf(server);
+    expect(before.listAll("r/")).toEqual(backend.listAll("r/"));
+    before.close();
+    expect(await backend.compact()).toBe(true);
+    const replica = await replicaOf(server);
+    expect(replica.listAll("r/")).toEqual(backend.listAll("r/"));
+    replica.close(); other.close();
+  });
+
+  it("a purge racing a writer loses nothing: the write after the snapshot stays above the purge", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    const writer = await replicaOf(server);
+    for (let index = 0; index < 5; index++) await backend.put({ key: `w/${index}`, value: index, identity });
+    let racing: Promise<unknown> | undefined;
+    server.beforePurge = () => { racing = writer.put({ key: "w/racer", value: "kept", identity }); };
+    expect(await backend.compact()).toBe(true);
+    await racing;
+    await backend.put({ key: "w/last", value: 1, identity });
+    expect(backend.get("w/racer")?.value).toBe("kept");
+    const replica = await replicaOf(server);
+    expect(replica.listAll("w/")).toEqual(backend.listAll("w/"));
+    expect(replica.get("w/racer")?.value).toBe("kept");
+    replica.close(); writer.close();
+  });
+
+  it("a replica that lagged behind a purge reloads from the snapshot and converges", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    await backend.put({ key: "l/0", value: 0, identity });
+    const replicaPort = server.port();
+    const replica = await NatsStateBackend.open({ port: replicaPort, stream: "S", subject: "S.state", snapshotSubject: "S.snapshot", maxEventBytes: 1 << 20 });
+    replicaPort.pause(); // only the replica's deliveries stall
+    for (let index = 1; index < 6; index++) await backend.put({ key: `l/${index}`, value: index, identity });
+    expect(await backend.compact()).toBe(true);
+    await backend.put({ key: "l/after", value: 1, identity });
+    replicaPort.resume(); // its queued messages below the snapshot are gone: a gap
+    for (let tries = 0; tries < 200 && replica.diagnostics().nats!.appliedSeq < server.messages.length; tries++) await settle();
+    expect(replica.diagnostics().nats).toMatchObject({ appliedSeq: server.messages.length, resyncs: 1 });
+    expect(replica.listAll("l/")).toEqual(backend.listAll("l/"));
+    await replica.put({ key: "l/from-replica", value: 1, identity });
+    expect(backend.get("l/from-replica")?.value).toBe(1);
+    replica.close();
+  });
+
+  it("a lost ack whose stored batch was purged before the lookup is an unknown outcome, never a rerun", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    await backend.put({ key: "u/count", value: 0, identity });
+    let lose = true;
+    server.beforePublish = () => { if (lose) { lose = false; return "lose-ack"; } };
+    server.afterStore = seq => {
+      delete server.afterStore;
+      server.append(encode({ format: 1, type: "batch", id: "other", base: server.messages.length, highWater: 90_000, changes: [] }));
+      void server.port().purge("S", seq + 2);
+    };
+    let prepares = 0;
+    await expect(backend.writeBatch({ identity, ops: [], prepare: view => { prepares++; return [{ kind: "put", key: "u/count", value: (view.get("u/count")?.value as number) + 1 }]; } }))
+      .rejects.toBeInstanceOf(MeshStateNatsOutcomeUnknownError);
+    expect(prepares).toBe(1);
+  });
+
+  it("refuses a stream purged without a snapshot (it cannot be replayed)", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    await backend.put({ key: "z/a", value: 1, identity });
+    await backend.put({ key: "z/b", value: 1, identity });
+    await server.port().purge("S", 2);
+    await expect(replicaOf(server)).rejects.toBeInstanceOf(MeshStateNatsRefusedError);
+  });
+
+  it("snapshotEvery takes a snapshot in the background after a write", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 5 });
+    for (let index = 0; index < 6; index++) await backend.put({ key: `e/${index}`, value: index, identity });
+    for (let tries = 0; tries < 50 && backend.diagnostics().nats!.snapshots === 0; tries++) await settle();
+    expect(backend.diagnostics().nats!.snapshots).toBe(1);
+    expect(server.firstSeq).toBeGreaterThan(1);
+    const replica = await replicaOf(server);
+    expect(replica.listAll("e/")).toEqual(backend.listAll("e/"));
+    replica.close();
   });
 });

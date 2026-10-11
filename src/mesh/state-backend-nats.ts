@@ -46,12 +46,18 @@ export interface NatsStreamMessage { seq: number; data: Uint8Array }
 export interface JetStreamPort {
   /** Server facts for the refusals: its version and whether it fsyncs every write (`/varz` sync_always). */
   server(): Promise<{ version: string; syncAlways: boolean | undefined }>;
-  /** Creates the stream if absent (file storage, the subject `subject`); returns its last sequence. */
-  ensureStream(stream: string, subject: string): Promise<{ lastSeq: number }>;
+  /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence. */
+  ensureStream(stream: string, subjects: string[]): Promise<{ lastSeq: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
-  /** One stored message by sequence, or undefined when there is none. */
+  /** The stream's first stored sequence now (above 1 after a purge). */
+  firstSequence(stream: string): Promise<number>;
+  /** One stored message by sequence, or undefined when it is gone (purged) or never existed. */
   getMessage(stream: string, seq: number): Promise<NatsStreamMessage | undefined>;
+  /** The last stored message on one subject, or undefined. */
+  lastBySubject(stream: string, subject: string): Promise<NatsStreamMessage | undefined>;
+  /** Removes every message below `beforeSeq`. */
+  purge(stream: string, beforeSeq: number): Promise<void>;
   /**
    * Publishes with `expect.lastSequence` and `msgID`. A wrong last sequence throws `NatsWrongLastSequenceError`; no
    * answer (a timeout, no responders, a dropped connection: the ack may be lost) throws an error with `transient: true`;
@@ -70,17 +76,26 @@ type NatsChange =
   | { key: string; put: { value: unknown; version: number; updatedAt: number; updatedBy: MeshIdentity } }
   | { key: string; deleted: { version: number } };
 
-/** A stream message. `batch` is a committed writeBatch; `retire` ends the stream's authority (rollback). */
+/**
+ * A stream message. `batch` is a committed writeBatch; `retire` ends the stream's authority (rollback).
+ * `snapshot-chunk` and `snapshot-end` are a snapshot of the model at sequence `base`: its chunks are published as one
+ * CAS chain right after `base` (chunk i expects the sequence before it), then the end record. Any interleaved commit
+ * breaks the chain and the snapshot is abandoned (its chunks are inert). Only a complete chain (an end record) is ever
+ * read; the stream is then purged below its first chunk, and a host opening later replays from it (bounded replay).
+ */
 type NatsRecord =
   | { format: 1; type: "batch"; id: string; base: number; highWater: number; changes: NatsChange[] }
   | { format: 1; type: "retire"; epoch: number }
   | { format: 1; type: "import-begin"; epoch: number }
-  | { format: 1; type: "import-commit"; epoch: number };
+  | { format: 1; type: "import-commit"; epoch: number }
+  | { format: 1; type: "snapshot-chunk"; snapshot: string; index: number; part: string }
+  | { format: 1; type: "snapshot-end"; snapshot: string; base: number; first: number; chunks: number };
 
+const RECORD_TYPES = ["batch", "retire", "import-begin", "import-commit", "snapshot-chunk", "snapshot-end"];
 const encode = (record: NatsRecord): Uint8Array => Buffer.from(JSON.stringify(record), "utf8");
 const decode = (data: Uint8Array): NatsRecord => {
   const record = JSON.parse(Buffer.from(data).toString("utf8")) as NatsRecord;
-  if (record?.format !== 1 || !["batch", "retire", "import-begin", "import-commit"].includes(record.type)) {
+  if (record?.format !== 1 || !RECORD_TYPES.includes(record.type)) {
     throw new Error("Unknown Fabric mesh NATS record");
   }
   return record;
@@ -100,9 +115,31 @@ interface NatsSnapshot {
   readonly status: "ready" | "importing" | "retired";
   /** The epoch of the last lifecycle record (import-begin, import-commit, retire); 0 before any. */
   readonly epoch: number;
+  /** The sequence of the last complete snapshot's end record (0: none). */
+  readonly snapshotEnd: number;
 }
 
-const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0 };
+const EMPTY: NatsSnapshot = { seq: 0, entries: new Map(), versions: new Map(), tombstones: [], highWater: 0, status: "ready", epoch: 0, snapshotEnd: 0 };
+
+/** The model as a snapshot body (JSON); `parseModel` is its inverse. */
+const serializeModel = (snapshot: NatsSnapshot): string => JSON.stringify({
+  entries: [...snapshot.entries.values()], versions: [...snapshot.versions], tombstones: snapshot.tombstones,
+  highWater: snapshot.highWater, status: snapshot.status, epoch: snapshot.epoch,
+});
+const parseModel = (body: string, seq: number): NatsSnapshot => {
+  const value = JSON.parse(body) as { entries: MeshStateEntry[]; versions: [string, number][]; tombstones: string[]; highWater: number;
+    status: NatsSnapshot["status"]; epoch: number };
+  if (!Array.isArray(value.entries) || !Array.isArray(value.versions) || !Array.isArray(value.tombstones) ||
+      !["ready", "importing", "retired"].includes(value.status) || !Number.isSafeInteger(value.epoch)) {
+    throw new MeshStateNatsRefusedError("the snapshot body is not a model");
+  }
+  const entries = new Map<string, MeshStateEntry>();
+  for (const entry of value.entries) { validateMeshStateKey(entry.key); storageRevision(entry.version); entries.set(entry.key, entry); }
+  const versions = new Map<string, number>();
+  for (const [key, version] of value.versions) { validateMeshStateKey(key); versions.set(key, storageRevision(version)); }
+  return { seq, entries, versions, tombstones: value.tombstones.map(String), highWater: storageRevision(value.highWater), status: value.status,
+    epoch: value.epoch, snapshotEnd: seq };
+};
 
 type NatsStatus = NatsSnapshot["status"];
 type LifecycleRecord = Extract<NatsRecord, { epoch: number }>;
@@ -162,8 +199,11 @@ export class MeshStateNatsOutcomeUnknownError extends Error {
 export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMessage, maxTombstones: number): NatsSnapshot => {
   if (message.seq <= snapshot.seq) return snapshot;
   const record = decode(message.data);
-  if (record.type !== "batch") return lifecycle(snapshot, record, message.seq);
-  if (snapshot.status === "retired") throw new MeshStateNatsRefusedError(`stream message ${message.seq} is a batch after the stream was retired`);
+  if (record.type === "retire" || record.type === "import-begin" || record.type === "import-commit") return lifecycle(snapshot, record, message.seq);
+  if (snapshot.status === "retired") throw new MeshStateNatsRefusedError(`stream message ${message.seq} (${record.type}) is after the stream was retired`);
+  // A snapshot's records change no state; a complete one (its end) marks where a later host may start.
+  if (record.type === "snapshot-chunk") return { ...snapshot, seq: message.seq };
+  if (record.type === "snapshot-end") return { ...snapshot, seq: message.seq, snapshotEnd: message.seq };
   if (record.base !== snapshot.seq) {
     throw new MeshStateNatsRefusedError(`stream message ${message.seq} was committed on sequence ${record.base}, not ${snapshot.seq}`);
   }
@@ -188,7 +228,7 @@ export const applyNatsMessage = (snapshot: NatsSnapshot, message: NatsStreamMess
     if (!entries.has(forgotten)) versions.delete(forgotten);
   }
   return { seq: message.seq, entries, versions, tombstones, highWater: Math.max(snapshot.highWater, storageRevision(record.highWater)),
-    status: snapshot.status, epoch: snapshot.epoch };
+    status: snapshot.status, epoch: snapshot.epoch, snapshotEnd: snapshot.snapshotEnd };
 };
 
 const sortedKeys = (keys: Iterable<string>): string[] => [...keys].sort((left, right) => left.localeCompare(right));
@@ -204,15 +244,22 @@ export interface NatsStateBackendOptions {
   port: JetStreamPort;
   /** The stream (one per mesh root). */
   stream: string;
-  /** The subject the stream stores (one subject: the stream's last sequence is the CAS). */
+  /** The subject of the batches. The CAS is on the whole stream's last sequence, whatever the subject. */
   subject: string;
+  /** The subject of the snapshot records (the latest end record is looked up by subject). */
+  snapshotSubject: string;
   maxEventBytes: number;
   maxStateTombstones?: number;
   /** The budget of one write's CAS retries, then `MeshStateNatsBusyError`. Default 5 s. */
   lockTimeoutMs?: number;
+  /** Take a snapshot (and purge below it) once this many messages follow the last one; 0 never. Default 10 000. */
+  snapshotEvery?: number;
 }
 
 const DEFAULT_TOMBSTONES = 2_048;
+const DEFAULT_SNAPSHOT_EVERY = 10_000;
+/** Characters of the model's JSON per snapshot chunk: at most 6 bytes each once escaped, far under the 1 MiB payload. */
+const SNAPSHOT_CHUNK = 64 * 1024;
 
 /**
  * A single put or delete fails its CAS with the verified storage kernel's plain Error, as on file and sqlite
@@ -237,17 +284,129 @@ export class NatsStateBackend implements StateBackend {
   #consumer: { stop(): Promise<void> } | undefined;
   #closed = false;
   #casRetries = 0;
+  /** Bumped per projector start: deliveries of a stopped consumer are ignored. */
+  #generation = 0;
+  #resyncing = false;
+  #compacting: Promise<boolean> | undefined;
+  #snapshots = 0;
+  #resyncs = 0;
 
   private constructor(options: NatsStateBackendOptions) { this.#options = options; }
 
-  /** Connects the projector and replays the stream up to its current last sequence. */
+  /** Loads the latest snapshot, connects the projector after it and replays up to the stream's current last sequence. */
   static async open(options: NatsStateBackendOptions): Promise<NatsStateBackend> {
     const backend = new NatsStateBackend(options);
-    const { lastSeq } = await options.port.ensureStream(options.stream, options.subject);
+    const { lastSeq } = await options.port.ensureStream(options.stream, [options.subject, options.snapshotSubject]);
     backend.#knownSeq = lastSeq;
-    backend.#consumer = await options.port.consume(options.stream, 0, message => backend.#apply(message), error => backend.#fail(error));
+    await backend.#startProjector();
     await backend.#appliedThrough(lastSeq);
     return backend;
+  }
+
+  /** (Re)starts the projector: from the latest complete snapshot when it is ahead of the model, else from the model. */
+  async #startProjector(): Promise<void> {
+    const loaded = await this.#loadSnapshot();
+    if (loaded && loaded.seq > this.#snapshot.seq) { this.#snapshot = loaded; this.#settle(); }
+    const generation = ++this.#generation;
+    this.#consumer = await this.#options.port.consume(this.#options.stream, this.#snapshot.seq,
+      message => { if (generation === this.#generation) this.#apply(message); },
+      error => { if (generation === this.#generation) this.#fail(error); });
+  }
+
+  /**
+   * The latest complete snapshot as a model at its base sequence, or undefined when the stream has none. A stream
+   * purged without one cannot be replayed: refuse. A newer snapshot's purge may remove the chunks being read: retry.
+   */
+  async #loadSnapshot(): Promise<NatsSnapshot | undefined> {
+    const { port, stream, snapshotSubject } = this.#options;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const end = await port.lastBySubject(stream, snapshotSubject);
+      if (!end) {
+        if (await port.firstSequence(stream) > 1) throw new MeshStateNatsRefusedError(`the stream ${stream} was purged without a snapshot`);
+        return undefined;
+      }
+      const record = decode(end.data);
+      if (record.type !== "snapshot-end" || record.first !== record.base + 1 || end.seq !== record.first + record.chunks) {
+        throw new MeshStateNatsRefusedError(`stream message ${end.seq} is not a complete snapshot`);
+      }
+      const parts: string[] = [];
+      for (let index = 0; index < record.chunks; index++) {
+        const message = await port.getMessage(stream, record.first + index);
+        if (!message) break; // purged by a newer snapshot meanwhile
+        const chunk = decode(message.data);
+        if (chunk.type !== "snapshot-chunk" || chunk.snapshot !== record.snapshot || chunk.index !== index) {
+          throw new MeshStateNatsRefusedError(`stream message ${message.seq} is not chunk ${index} of snapshot ${record.snapshot}`);
+        }
+        parts.push(chunk.part);
+      }
+      if (parts.length === record.chunks) return parseModel(parts.join(""), record.base);
+    }
+    throw new MeshStateNatsBusyError(`newer snapshots kept replacing the one being read`);
+  }
+
+  /**
+   * A delivery skipped sequences: a purge removed messages this projector had not applied yet (it lagged behind a
+   * snapshot, or opened before one). Reload from the latest snapshot and continue after it. Reads meanwhile serve
+   * the old, consistent model; `fresh` reads are busy.
+   */
+  #resync(): void {
+    if (this.#resyncing || this.#closed) return;
+    this.#resyncing = true;
+    this.#resyncs++;
+    this.#generation++;
+    const consumer = this.#consumer;
+    void (async () => {
+      await consumer?.stop();
+      await this.#startProjector();
+    })().catch(error => this.#fail(error)).finally(() => { this.#resyncing = false; });
+  }
+
+  /**
+   * Publishes a snapshot of the model, then purges the stream below it. The chunks and the end record are one CAS
+   * chain right after the model's sequence: a commit by any writer in between breaks it, and the snapshot is abandoned
+   * (false; its stored chunks are inert, no end record names them). One at a time per backend.
+   * ponytail: a writer that commits continuously can starve snapshots; the next due write tries again.
+   */
+  compact(): Promise<boolean> {
+    this.#compacting ??= this.#compact().finally(() => { this.#compacting = undefined; });
+    return this.#compacting;
+  }
+
+  async #compact(): Promise<boolean> {
+    const model = this.#readable();
+    if (model.status !== "ready" || model.seq === 0) return false;
+    const { port, stream, snapshotSubject } = this.#options;
+    const body = serializeModel(model);
+    const parts: string[] = [];
+    for (let offset = 0; offset < body.length; offset += SNAPSHOT_CHUNK) parts.push(body.slice(offset, offset + SNAPSHOT_CHUNK));
+    const snapshot = randomUUID();
+    const records: NatsRecord[] = [
+      ...parts.map((part, index): NatsRecord => ({ format: 1, type: "snapshot-chunk", snapshot, index, part })),
+      { format: 1, type: "snapshot-end", snapshot, base: model.seq, first: model.seq + 1, chunks: parts.length },
+    ];
+    // The chunks go on the batch subject: only end records are on the snapshot subject, so its last message is always
+    // the latest complete snapshot, never a chunk of an abandoned one.
+    for (const [index, record] of records.entries()) {
+      const subject = record.type === "snapshot-end" ? snapshotSubject : this.#options.subject;
+      try { await port.publish(subject, encode(record), { expectLastSequence: model.seq + index, msgID: `${snapshot}:${index}` }); }
+      catch { return false; } // another commit came first, or no answer: abandon (nothing names these chunks)
+    }
+    await port.purge(stream, model.seq + 1);
+    this.#snapshots++;
+    return true;
+  }
+
+  /** After a write: take a snapshot when enough messages follow the last one (in the background, never failing the write). */
+  #maybeCompact(): void {
+    const every = this.#options.snapshotEvery ?? DEFAULT_SNAPSHOT_EVERY;
+    if (every <= 0 || this.#snapshot.seq - this.#snapshot.snapshotEnd < every) return;
+    void this.compact().catch(() => undefined);
+  }
+
+  #settle(): void {
+    const ready = this.#waiters.filter(waiter => waiter.seq <= this.#snapshot.seq);
+    this.#waiters = this.#waiters.filter(waiter => waiter.seq > this.#snapshot.seq);
+    for (const waiter of ready) waiter.resolve();
   }
 
   /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
@@ -259,12 +418,12 @@ export class NatsStateBackend implements StateBackend {
 
   #apply(message: NatsStreamMessage): void {
     if (this.#failure !== undefined) return;
+    this.#knownSeq = Math.max(this.#knownSeq, message.seq);
+    // Stream sequences are contiguous until a purge: a gap means a snapshot purged what this model still needed.
+    if (message.seq > this.#snapshot.seq + 1) { this.#resync(); return; }
     try { this.#snapshot = applyNatsMessage(this.#snapshot, message, this.#options.maxStateTombstones ?? DEFAULT_TOMBSTONES); }
     catch (error) { this.#fail(error); return; }
-    this.#knownSeq = Math.max(this.#knownSeq, message.seq);
-    const ready = this.#waiters.filter(waiter => waiter.seq <= this.#snapshot.seq);
-    this.#waiters = this.#waiters.filter(waiter => waiter.seq > this.#snapshot.seq);
-    for (const waiter of ready) waiter.resolve();
+    this.#settle();
   }
 
   /** Resolves once the model has applied `seq`; a projector that does not get there within the write budget is busy. */
@@ -382,6 +541,7 @@ export class NatsStateBackend implements StateBackend {
       const after = this.#snapshot;
       input.afterCommit?.(viewOf(after));
       this.#outbox(input, planned.results, planned.changes.map(change => change.key), after);
+      this.#maybeCompact();
       return planned.results;
     }
   }
@@ -493,12 +653,14 @@ export class NatsStateBackend implements StateBackend {
 
   diagnostics(): StateBackendDiagnostics {
     return { kind: "nats", nats: { stream: this.#options.stream, appliedSeq: this.#snapshot.seq, knownSeq: this.#knownSeq,
-      status: this.#snapshot.status, casRetries: this.#casRetries, ...(this.#failure ? { failure: String(this.#failure) } : {}) } } as StateBackendDiagnostics;
+      status: this.#snapshot.status, casRetries: this.#casRetries, snapshotSeq: this.#snapshot.snapshotEnd, snapshots: this.#snapshots,
+      resyncs: this.#resyncs, ...(this.#failure ? { failure: String(this.#failure) } : {}) } } as StateBackendDiagnostics;
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#generation++;
     const consumer = this.#consumer;
     for (const waiter of this.#waiters.splice(0)) waiter.reject(new Error("Fabric mesh NATS state backend is closed"));
     void (async () => { await consumer?.stop(); await this.#options.port.close(); })().catch(() => undefined);
@@ -536,6 +698,8 @@ export interface OpenNatsStateBackendOptions {
   maxEventBytes?: number;
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
+  /** Messages between snapshots (each followed by a purge below it); 0 never. Default 10 000. */
+  snapshotEvery?: number;
   /** Host-only: the operator accepts a server that does not fsync every write (`sync_always: false`). */
   acceptPeriodicSync?: boolean;
   /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
@@ -600,7 +764,9 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
       throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
     }
     const stream = options.stream ?? natsStreamName(root);
-    const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, maxEventBytes: options.maxEventBytes ?? 1024 * 1024,
+    const backend = await NatsStateBackend.open({ port, stream, subject: `${stream}.state`, snapshotSubject: `${stream}.snapshot`,
+      maxEventBytes: options.maxEventBytes ?? 1024 * 1024,
+      ...(options.snapshotEvery === undefined ? {} : { snapshotEvery: options.snapshotEvery }),
       ...(options.maxStateTombstones === undefined ? {} : { maxStateTombstones: options.maxStateTombstones }),
       ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
     if (backend.diagnostics().nats?.status === "retired") { backend.close(); throw new MeshStateNatsRefusedError(`the stream ${stream} is retired`); }

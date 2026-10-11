@@ -32,7 +32,7 @@ import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
-import { claimMeshRetentionSweep, pruneActorSessionBackups } from "../storage/retention.js";
+import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -275,9 +275,11 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-/** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
-const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
-/** The hourly mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
+/** One mesh-wide run-retention sweep per mesh per day, whichever owner claims it (smarty-dev#3252). Daily, not hourly
+ * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
+ * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
+export const MESH_RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+/** The daily mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
  * verifiedRemove (smarty-dev#7916); the hold, epoch and state.json gates still refuse on doubt. Off Linux the CLI's
  * gate refuses --apply (smarty-dev#7858). Its JSON report is written atomically, never through a link. */
 export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
@@ -440,6 +442,8 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** The mesh retention sweep did not run: its single-flight lock state was uncertain (pi-fabric#883). */
+export const FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC = "fabric.alarm.retention-sweep-lock";
 /** smarty-dev#3238: a carried session at or past this share of its model window resets at the next run boundary. */
 export const ACTOR_CONTEXT_RESET_RATIO = 0.8;
 /** One explicit notice per event that overflowed a fresh session, on the actor's own output path. */
@@ -4736,26 +4740,47 @@ export class ActorManager {
 
   /**
    * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
-   * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
-   * niced process. It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
+   * #5652). Whichever owner claims the mesh's daily slot starts the retention CLI as a detached,
+   * niced process that holds the sweep lock for its whole life (single flight, pi-fabric#883: the kernel releases it
+   * on exit or crash). An uncertain lock state never sweeps: one log line and one mesh alarm, and the next tick
+   * retries. Linux only: off Linux the CLI refuses --apply (smarty-dev#7858), so there is nothing to sweep.
+   * It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
    * through verifiedRemove, behind the hold, epoch and state.json gates.
    */
   async #startMeshRetentionSweep(): Promise<void> {
     const script = this.#meshRetentionSweepPath;
     const meshRoot = this.mesh.root;
     const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
-    if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
+    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
-      if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
-      child.on("error", () => undefined);
-      if (child.pid) {
-        try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
-      }
-      child.unref();
+      if (this.#closing) return;
+      const now = Date.now();
+      const outcome = await startLockedMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, (lock) => {
+        // The sweep inherits the locked descriptor as fd 3 and holds the lock until it exits.
+        const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true,
+          stdio: ["ignore", "ignore", "ignore", lock], windowsHide: true });
+        child.on("error", () => undefined);
+        if (child.pid) {
+          recordMeshRetentionSweeper(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, child.pid, now); // diagnostics only
+          try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
+        }
+        child.unref();
+      }, now);
+      if (typeof outcome === "object") this.#alarmSweepLock(meshRoot, outcome.uncertain);
+      else this.#sweepLockAlarmed = false;
     } catch { /* the next slot retries */ }
+  }
+
+  #sweepLockAlarmed = false;
+  // Fail closed (pi-fabric#883): skipping a daily sweep is safe. One alarm until a lock is taken again.
+  #alarmSweepLock(meshRoot: string, reason: string): void {
+    if (this.#sweepLockAlarmed) return;
+    this.#sweepLockAlarmed = true;
+    console.warn(`[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
+    void this.mesh.publish({ topic: FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, kind: "retention-sweep-lock-uncertain", from: this.identity,
+      data: { meshRoot, reason } }).catch(() => undefined);
   }
 
   // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).

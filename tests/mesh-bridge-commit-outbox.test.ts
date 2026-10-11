@@ -415,7 +415,8 @@ describe("R20 bridge write fence on SQLite (smarty-dev#6477 L2b owner review, P1
     raw.close();
     const published = await publishing;
     expect(published.sequence).toBeGreaterThan(before);
-    expect(checks).toHaveBeenCalledWith(peer.identity.id);
+    // The sender's id, with the identity the event carries (checked against its record, pi-fabric#876).
+    expect(checks).toHaveBeenCalledWith(peer.identity.id, expect.objectContaining({ id: peer.identity.id, name: peer.identity.name, kind: peer.identity.kind }));
   });
 
   it("an event with no held ids takes no state fence", async () => {

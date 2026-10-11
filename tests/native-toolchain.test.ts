@@ -44,6 +44,29 @@ describe.runIf(process.platform === "linux" && ["x64", "arm64"].includes(process
     expect(m.pinnedTarball()).toEqual({ reason: expect.stringContaining("untrusted toolchain cache") });
   });
 
+  it("refuses a group-writable ancestor of ours above a private cache", async () => {
+    const base = privateDir();
+    fs.mkdirSync(path.join(base, "shared"));
+    fs.chmodSync(path.join(base, "shared"), 0o770);
+    fs.mkdirSync(path.join(base, "shared", "cache"), { mode: 0o700 });
+    const m = await toolchain(path.join(base, "shared", "cache"));
+    expect(m.untrustedCache()).toContain(`${path.join(base, "shared")} is group- or other-writable`);
+  });
+
+  it("accepts a root-owned ancestor only when it is not group/other-writable, or is sticky", async () => {
+    const m = await toolchain("/stub/cache");
+    const uid = process.getuid!();
+    // Root ownership cannot be faked on disk without root: inject the stat for the root-owned levels only.
+    const chain = (rootMode: number) => (dir: string) => {
+      const own = dir === "/stub/cache";
+      return { uid: own ? uid : 0, mode: own ? 0o40700 : rootMode, isDirectory: () => true, isSymbolicLink: () => false };
+    };
+    expect(m.untrustedCache("/stub/cache", chain(0o40755))).toBeUndefined();
+    expect(m.untrustedCache("/stub/cache", chain(0o41777))).toBeUndefined(); // sticky, like /tmp
+    expect(m.untrustedCache("/stub/cache", chain(0o40775))).toContain("/stub is group- or other-writable (mode 775)");
+    expect(m.untrustedCache("/stub/cache", chain(0o40777))).toContain("/stub is group- or other-writable (mode 777)");
+  });
+
   it("refuses a symlinked toolchain directory", async () => {
     const base = privateDir();
     fs.mkdirSync(path.join(base, "real"), { mode: 0o700 });

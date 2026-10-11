@@ -5,7 +5,8 @@ export const TOOLCHAIN: {
 };
 export function nativeArch(): string;
 export function cacheRoot(): string;
-export function untrustedCache(root?: string): string | undefined;
+export function untrustedCache(root?: string,
+  stat?: (dir: string) => { uid: number; mode: number; isDirectory(): boolean; isSymbolicLink(): boolean }): string | undefined;
 export function pinnedTarball(): { path: string; reason?: undefined } | { path?: undefined; reason: string };
 export function withPinnedZig<T>(tarball: string, use: (zig: string, env: Record<string, string>) => T): T;
 export function fetchPinnedZig(): Promise<string>;

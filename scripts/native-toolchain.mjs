@@ -25,15 +25,20 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
  * owned by this uid and not group- or other-writable: no other user can plant or swap the tarball.
  * Returns why not, or undefined when the chain holds.
  */
-export const untrustedCache = (root = cacheRoot()) => {
+export const untrustedCache = (root = cacheRoot(), stat = lstatSync) => {
   const uid = process.getuid?.();
   for (let dir = root; ; dir = dirname(dir)) {
-    let stat;
-    try { stat = lstatSync(dir); } catch (error) { return `${dir}: ${error.code ?? error.message}`; }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) return `${dir} is not a real directory`;
-    if (stat.uid === 0 && dir !== root) return undefined; // a system ancestor: the chain below it is ours
-    if (stat.uid !== uid) return `${dir} is owned by uid ${stat.uid}, not ${uid}`;
-    if ((stat.mode & 0o022) !== 0) return `${dir} is group- or other-writable (mode ${(stat.mode & 0o7777).toString(8)})`;
+    let info;
+    try { info = stat(dir); } catch (error) { return `${dir}: ${error.code ?? error.message}`; }
+    if (info.isSymbolicLink() || !info.isDirectory()) return `${dir} is not a real directory`;
+    const writable = (info.mode & 0o022) !== 0;
+    // ponytail: the one exception is a root-owned sticky directory (/tmp): others may add entries there but
+    // cannot rename or remove ours. Any other group/other-writable ancestor could swap a directory below it.
+    if (writable && !(info.uid === 0 && dir !== root && (info.mode & 0o1000) !== 0)) {
+      return `${dir} is group- or other-writable (mode ${(info.mode & 0o7777).toString(8)})`;
+    }
+    if (info.uid === 0 && dir !== root) return undefined; // a system ancestor: the chain below it is ours
+    if (info.uid !== uid) return `${dir} is owned by uid ${info.uid}, not ${uid}`;
     if (dirname(dir) === dir) return undefined;
   }
 };

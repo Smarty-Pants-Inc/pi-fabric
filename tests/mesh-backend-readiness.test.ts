@@ -183,6 +183,9 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     const [intent, outcome] = records(root);
     expect(intent).toMatchObject({ phase: "intent", overrideAlarm });
     expect(outcome).toMatchObject({ phase: "outcome", ok: true, overrideAlarm });
+    // Each alarm event names the switch it belongs to: the same switchId as its intent and outcome lines.
+    expect(alarms.map(event => (event.data as { switchId?: unknown }).switchId)).toEqual([intent!.switchId, intent!.switchId]);
+    expect(outcome!.switchId).toBe(intent!.switchId);
   });
 
   it("refuses the switch when the override alarm cannot be raised, and alarms nothing when nothing was accepted (smarty-dev#9436)", async () => {
@@ -250,14 +253,43 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
       overrideAlarm: { armed: ["factory"], accepted: ["factory"] } });
   });
 
+  // pi-fabric#919 BEFORE-MERGE evidence: a beforeCommit rejection under the fence rolls back ALL switch state. At the
+  // importing commit: no backend flag, no epoch, state.json untouched (no moved marker); the switch record shows the
+  // intent and a refused outcome, never a commit. (The sqlite-commit case, where the importing commit stands, is
+  // "re-checks under the fence before the sqlite commit" above.)
+  it("a beforeCommit rejection under the fence leaves the backend flag, the epoch and state.json unchanged (pi-fabric#919)", async () => {
+    const root = await fileRoot();
+    const builtins = [{ name: "factory", installRoot: installRoot("r1") }];
+    expect(await proveFactory(root)).toBe(0);
+    const stateBefore = fs.readFileSync(path.join(root, "state.json"));
+    const before = await meshBackendStatus(root);
+    const refused = await run(["cutover", "--root", root], { builtins,
+      options: { beforeCommit: (commit) => { if (commit.phase === "importing") fs.rmSync(path.join(root, "readers", "factory.json")); } } });
+    expect(refused.code).toBe(3);
+    expect(refused.err).toContain("(under the fence, before the importing commit)");
+    const after = await meshBackendStatus(root);
+    // The fence opened state.db (backend=file, the same epoch) before the switch transaction: file stays authoritative.
+    // The rolled-back transaction left no importing/sqlite flag, no new epoch and no moved marker.
+    expect(before.backend).toBe("none");
+    expect({ backend: after.backend, epoch: after.epoch, fileMoved: after.fileMoved ?? false })
+      .toEqual({ backend: "file", epoch: before.epoch, fileMoved: false });
+    expect(fs.readFileSync(path.join(root, "state.json")).equals(stateBefore)).toBe(true);
+    const [intent, outcome, ...rest] = records(root);
+    expect(intent).toMatchObject({ phase: "intent" });
+    expect(outcome).toMatchObject({ switchId: intent!.switchId, phase: "outcome", ok: false, refused: true });
+    expect(rest).toEqual([]);
+  });
+
   it("refuses a principal instance or a non-single root as an alarm target (pi-fabric#919)", async () => {
     const root = await fileRoot();
     for (const flag of ["--alarm-owner", "--alarm-cc"]) {
-      for (const value of ["org", "org-kate", "org-anyone", "*", "session:*", "fabric-store,chief-of-staff", "lead>"]) {
+      for (const value of ["org", "org-kate", "org-anyone", "*", "session:*", "fabric-store,chief-of-staff", "lead>", "Org", "ORG-kate", " org"]) {
         const roots = flag === "--alarm-owner" ? [flag, value, "--alarm-cc", "session:chief"] : ["--alarm-owner", "session:owner", flag, value];
         const refused = await run(["cutover", "--root", root, ...roots, "--accept-unready", "fabric@unknown"], anonymousWriter);
         expect(refused.code, `${flag} ${value}`).toBe(2);
         expect(refused.err).toContain(`Bad ${flag} ${value}`);
+        // An alias of a principal instance (case, padding) is refused as one, not merely as a malformed name.
+        if (/^org(-.*)?$/.test(value.trim().toLowerCase())) expect(refused.err).toContain(`Bad ${flag} ${value}: a principal instance`);
       }
     }
     expect(await backendOf(root)).toBe("none");

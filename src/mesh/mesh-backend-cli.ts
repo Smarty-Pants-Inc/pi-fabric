@@ -117,14 +117,15 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let alarmOwner: string | undefined;
   let alarmCc: string | undefined;
   const alarmRoot = (flag: string, value: string): string => {
+    // ponytail: Fabric keeps no list of principal instances (FabricPrincipal is input authority, RecordsPrincipal a
+    // records caller), so a fixed deny list: `org` and every `org-*` (org-kate) are principal instances, never alarm
+    // targets (R-org-delegate; pi-fabric#919 review). Checked on the normalized name, so an alias ("Org", " org") is too.
+    if (/^org(-.*)?$/.test(value.trim().toLowerCase())) {
+      throw new UsageError(`Bad ${flag} ${value}: a principal instance (org, org-*) is never an alarm target; name the owning lead`);
+    }
     // One root name (a participant id or a session root): no wildcard, list or broadcast form.
     if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/.test(value)) {
       throw new UsageError(`Bad ${flag} ${value} (one participant or root id: letters, digits, . _ : @ -; no wildcard or list)`);
-    }
-    // ponytail: Fabric keeps no list of principal instances, so a fixed deny list: `org` and every `org-*` (org-kate)
-    // are principal instances, never alarm targets (R-org-delegate; pi-fabric#919 review).
-    if (value === "org" || value.startsWith("org-")) {
-      throw new UsageError(`Bad ${flag} ${value}: a principal instance (org, org-*) is never an alarm target; name the owning lead`);
     }
     return value;
   };
@@ -405,7 +406,7 @@ class OverrideAlarmError extends Error {
   }
 }
 
-const raiseOverrideAlarm = async (options: Options, accepted: ReaderReadiness["unready"], phase: string): Promise<string[]> => {
+const raiseOverrideAlarm = async (options: Options, accepted: ReaderReadiness["unready"], phase: string, switchId: string): Promise<string[]> => {
   const { MeshStore } = await import("./store.js");
   const store = new MeshStore(options.root, 256 * 1024, 500, { lockProtocol: options.lockProtocol });
   try {
@@ -417,7 +418,8 @@ const raiseOverrideAlarm = async (options: Options, accepted: ReaderReadiness["u
       try {
         const event = await store.publish({ topic: "ops.owner", kind: OVERRIDE_ALARM_KIND, to, text,
           from: { id: "fabric-mesh-backend", name: "fabric-mesh-backend", kind: "agent" },
-          data: { root: options.root, command: options.command, phase, accepted: accepted.map(reader => ({ name: reader.name, reason: reader.reason })),
+          // switchId links the alarm to its intent and outcome lines in <root>/backend-switches.jsonl (pi-fabric#919 P2).
+          data: { root: options.root, command: options.command, phase, switchId, accepted: accepted.map(reader => ({ name: reader.name, reason: reader.reason })),
             owner: options.alarmOwner, cc: options.alarmCc } });
         deliveries.push({ to, role, state: "sent", id: event.id });
       } catch (error) { deliveries.push({ to, role, state: "failed", reason: error instanceof Error ? error.message : String(error) }); }
@@ -502,7 +504,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
       ?? { name, reason: "ready now; accepted if it turns unready under the fence" });
     try {
       gate.overrideAlarm = { owner: options.alarmOwner!, cc: options.alarmCc!, armed: options.acceptUnready,
-        accepted: readiness.unready.map(reader => reader.name), events: await raiseOverrideAlarm(options, armed, "before the switch") };
+        accepted: readiness.unready.map(reader => reader.name), events: await raiseOverrideAlarm(options, armed, "before the switch", gate.switchId) };
     } catch (error) {
       const deliveries = error instanceof OverrideAlarmError ? error.deliveries : undefined;
       for (const delivery of deliveries ?? []) {

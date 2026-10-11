@@ -642,3 +642,16 @@ Audited commit `93929fe6f628336ea31040443e056b4fa3f6a434` (parents `555710036d85
 ## FAIL/CONCERN findings
 
 None (3 PASS, 0 FAIL, 0 CONCERN); no severity, trigger, effect, or fix entries apply.
+
+
+## Independent per-row review receipts: main-merge rows (048e031e, merge b7534f6d)
+
+Auditor fv2-864-aud6 (Luna xhigh, read-only, not the author) reviewed the 3 rows of the 'Merge of current main (048e031e)' section, merge b7534f6d: **3 PASS, 0 FAIL, 0 CONCERN**.
+
+| file | verdict PASS/FAIL/CONCERN | risk | evidence (file:line) |
+|---|---|---|---|
+| `scripts/assert-build-artifacts.mjs` | PASS | Startup-forbidden union, native compiler gate, and lazy profile-replay entry are retained | `scripts/assert-build-artifacts.mjs:103,128-130,255`; `diff-048e031e-to-merge.txt:43-68,131-136`; `diff-085e829c-to-merge.txt:5-38` |
+| `src/index.ts` | PASS | #863's once-only context filter loads only on an inbox-bearing request in the migrated extension; branch orphan repair and thin entry remain | `src/extension.ts:5,1367-1435`; `048e031e:src/index.ts:1146-1207`; `src/topology/root-inbox-context.ts:1-131`; `diff-085e829c-to-merge.txt:40-115` |
+| `src/worker.ts` | PASS | #829 replays explicit profile extensions without enabling auto-discovery; #853 typed overflow path and durable-runner discovery policy remain | `src/worker.ts:468-471,492-520,1043-1044,1953-2000,2640-2642`; `src/worker/profile-extensions.ts:72-145`; `scripts/assert-build-artifacts.mjs:103`; `tests/actor-context-overflow.test.ts:207-244`; `diff-085e829c-to-merge.txt:163-214` |
+
+Findings: none (3 PASS, 0 FAIL, 0 CONCERN).

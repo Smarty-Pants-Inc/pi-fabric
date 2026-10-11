@@ -462,14 +462,32 @@ export class FabricRuntimeState {
   bindLifecycle(context: ExtensionContext, current: () => boolean): void {
     this.#binding = { context, current };
     // An old instance's late rebind must never take the record back from its successor.
-    if (!this.#runtimeEpoch) {
-      const sessionId = context.sessionManager.getSessionId();
-      this.#runtimeEpoch = { sessionId, record: claimFabricRuntimeInstance(sessionId, `${this.#instanceId}:${this.#epoch}`) };
-    }
+    if (!this.#runtimeEpoch) this.#claimRuntimeEpoch(context, this.#epoch);
     if (this.#backgroundReads?.epoch === this.#epoch) {
       for (const guard of this.#backgroundReads.guards) guard.rebind();
     }
     this.#participants?.rebindLifecycle();
+  }
+
+  /**
+   * Scope of this runtime's epoch record. Pi's session id lets a same-process successor instance
+   * (/reload) retire a stranded predecessor's timers. A closed-world managed host never reads
+   * ambient session state, and a context without a readable session has none to share: both
+   * scope the record to this instance, where every initialize() still claims a newer epoch.
+   */
+  #runtimeEpochScope(context: ExtensionContext): string {
+    if (!this.#managedHost) {
+      try {
+        const sessionId = context.sessionManager?.getSessionId?.();
+        if (typeof sessionId === "string" && sessionId) return sessionId;
+      } catch { /* A stale ctx fails at its first contextual operation, after teardown. */ }
+    }
+    return `fabric-runtime-instance:${this.#instanceId}`;
+  }
+
+  #claimRuntimeEpoch(context: ExtensionContext, epoch: number): void {
+    const sessionId = this.#runtimeEpochScope(context);
+    this.#runtimeEpoch = { sessionId, record: claimFabricRuntimeInstance(sessionId, `${this.#instanceId}:${epoch}`) };
   }
 
   /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
@@ -549,9 +567,8 @@ export class FabricRuntimeState {
     this.#epoch += 1;
     this.#meshActivationReady = () => false;
     const epoch = this.#epoch;
-    const runtimeSessionId = context.sessionManager.getSessionId();
-    this.#runtimeEpoch = { sessionId: runtimeSessionId,
-      record: claimFabricRuntimeInstance(runtimeSessionId, `${this.#instanceId}:${epoch}`) };
+    // Claimed synchronously in epoch order, before teardown awaits, without ambient host access.
+    this.#claimRuntimeEpoch(context, epoch);
     this.#binding = undefined;
     const live = this.#liveReads(epoch);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh

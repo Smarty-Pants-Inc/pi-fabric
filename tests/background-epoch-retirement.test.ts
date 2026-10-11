@@ -4,9 +4,11 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
-import { claimFabricRuntimeInstance, isFabricRuntimeInstanceObsolete, MeshBackgroundRetry } from "../src/core/atomic-write.js";
+import { AgentService, createAgentServiceClient, createAgentServiceHandler, createAgentsProvider } from "../src/agents.js";
+import { claimFabricRuntimeInstance, isFabricRuntimeInstanceObsolete, MeshBackgroundRetry, type FabricRuntimeEpochRecord } from "../src/core/atomic-write.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { FabricState } from "../src/fabric-state.js";
+import { FabricManagedHost } from "../src/managed-host.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
@@ -347,4 +349,46 @@ describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
       degradedCleared: !directories[0]!.degraded, leaseChecksWhileRetrying: checksDuringOutage,
       leaseRenewed: h.lease() > before }));
   }, 30_000);
+
+  it("re-initializes closed-world and session-less runtimes in a fresh instance-scoped epoch", async () => {
+    const epochs = (): Map<string, FabricRuntimeEpochRecord> =>
+      (globalThis as unknown as Record<symbol, Map<string, FabricRuntimeEpochRecord> | undefined>)[Symbol.for("pi-fabric.runtime-epoch")] ?? new Map();
+    const claimedSince = (before: Set<string>) => [...epochs().entries()].filter(([scope]) => !before.has(scope));
+    const forbidden = () => { throw new Error("Ambient host access"); };
+    // A closed-world managed host never exposes its Pi session; its record is scoped to the instance.
+    const service = new AgentService({ rootId: "root", port: { execute: async () => ({ status: "completed", text: "hosted" }) } });
+    const host = new FabricManagedHost({ providers: ["agents"] });
+    host.register(createAgentsProvider(createAgentServiceClient(createAgentServiceHandler(service, "root"))));
+    const managed = new FabricRuntimeState({ events: { emit: vi.fn() } } as unknown as ExtensionAPI, new CapturedToolCatalog(), { managedHost: host });
+    cleanup.push(() => host.close(), () => managed.shutdown());
+    const closedWorld = { cwd: "/not-a-real-hosted-directory", hasUI: false, ui: { setStatus: vi.fn() },
+      isProjectTrusted: forbidden, sessionManager: new Proxy({}, { get: forbidden }),
+      modelRegistry: new Proxy({}, { get: forbidden }) } as unknown as ExtensionContext;
+    let before = new Set(epochs().keys());
+    await managed.initialize(closedWorld);
+    const managedClaims = claimedSince(before);
+    expect(managedClaims).toHaveLength(1);
+    const [managedScope, managedFirst] = managedClaims[0]!;
+    expect(managedScope).toMatch(/^fabric-runtime-instance:/);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, managedFirst)).toBe(false);
+    await managed.initialize(closedWorld);
+    expect(epochs().get(managedScope)!.epoch).toBe(managedFirst.epoch + 1);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, managedFirst)).toBe(true);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, epochs().get(managedScope)!)).toBe(false);
+
+    // A context without a session manager claims before teardown and fails only at its first contextual call.
+    const bare = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());
+    cleanup.push(() => bare.shutdown());
+    const checkpoint = { ui: { setStatus: () => { throw new Error("context checkpoint"); } } } as unknown as ExtensionContext;
+    before = new Set(epochs().keys());
+    await expect(bare.initialize(checkpoint)).rejects.toThrow("context checkpoint");
+    const bareClaims = claimedSince(before);
+    expect(bareClaims).toHaveLength(1);
+    const [bareScope, bareFirst] = bareClaims[0]!;
+    expect(bareScope).toMatch(/^fabric-runtime-instance:/);
+    expect(bareScope).not.toBe(managedScope);
+    await expect(bare.initialize(checkpoint)).rejects.toThrow("context checkpoint");
+    expect(epochs().get(bareScope)!.epoch).toBe(bareFirst.epoch + 1);
+    expect(isFabricRuntimeInstanceObsolete(bareScope, bareFirst)).toBe(true);
+  });
 });

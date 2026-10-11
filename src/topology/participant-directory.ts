@@ -764,9 +764,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed) return;
     // Independent file renewal must not delay shared admission or let an
     // in-flight change failure disappear before a heartbeat joins its receipt.
-    const renewing = this.#renewActors();
-    const join = (publication: Promise<void>): Promise<void> =>
-      Promise.all([renewing, publication]).then(() => undefined);
+    // smarty-dev#8880: while a publication retry is in flight, its admission has just opened a short free
+    // mesh window. Preparation and the mesh try go first; the independent renewals start once it settles.
+    const deferRenewal = this.#publicationRetrying !== undefined;
+    const renewing = deferRenewal ? undefined : this.#renewActors();
+    const join = (publication: Promise<void>): Promise<void> => deferRenewal
+      ? publication.finally(() => this.#renewActors())
+      : Promise.all([renewing, publication]).then(() => undefined);
     if (this.#refreshing) {
       // A key waiter is still a live host. Do not turn this into a mesh-lock bypass:
       // confirmation remains gated on the shared write; shared-lock-only waits still lapse.

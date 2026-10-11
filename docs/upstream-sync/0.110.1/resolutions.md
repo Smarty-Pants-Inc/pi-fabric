@@ -592,3 +592,28 @@ None. All 12 resolutions preserve the applicable main guarantees and branch beha
 - Focused verified-removal, storage-retention, scratch, and root-inbox checks: 7 files, 251 tests passed. Log: `storage-inbox-tests.log`.
 - A broader selected run reported 1,600 passing tests, but actor lifecycle/provider/secondary-retention/root-index suites could not load because this checkout lacks `@earendil-works/pi-coding-agent` and `cross-spawn`; these are environment import blockers, not assertion failures. Log: `audit-tests.log`.
 
+
+## Independent per-row review receipts: main-merge rows (f8a03c8e, merge 93929fe6)
+
+An independent read-only auditor (Luna xhigh, not the author; lane fv2-864-aud5, 10-11 14:4x-14:56Z) reviewed the 3 rows of the 'Merge of current main (f8a03c8e)' section at 93929fe6, diffing against main (f8a03c8e) and against the branch (55571003). **Totals: 3 PASS, 0 FAIL, 0 CONCERN.** It confirmed that main's #841 recovery call and condition (f8a03c8e src/index.ts:426-433) match the runtime wiring in src/extension.ts:518-525, and that the #869 checkpoint/fsync and #857 handoff paths are byte-identical to main.
+
+# pi-fabric PR #864 — independent merge-resolution audit
+
+Audited commit `93929fe6f628336ea31040443e056b4fa3f6a434` (parents `555710036d85518db51049e6fbb65ce16c08c2e9` and `f8a03c8ec269acdd681731cd9542041d461877ce`).
+
+| file | verdict PASS/FAIL/CONCERN | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `docs/configuration.md` | PASS | #874 cooldown defaults coexist with upstream memory/trace example | `docs/configuration.md:376-388,963; src/config.ts:788-789,1679-1689` |
+| `src/actors/manager.ts` | PASS | cooldown classes and restart binding coexist with upstream scope handling | `src/actors/manager.ts:77-79,3821,3850,5593,6119-6174,6253-6258` |
+| `src/index.ts` | PASS | thin upstream entry retained; #841 recovery hook is active in extension | `src/index.ts:1-9; f8a03c8e:src/index.ts:426-433; src/extension.ts:518-525` |
+
+## Cross-row checks
+
+- `src/extension.ts` has the same `registerMainProviderRecovery` call and `ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery()` condition as main's `src/index.ts`; the comparison `f2814332..f8a03c8e` shows this is main's only `src/index.ts` change. The merge keeps `src/index.ts` byte-identical to branch parent `55571003` and adds the hook to the runtime implementation in `src/extension.ts`.
+- #843's `#restoreLoadedBinding` runs during load, checks the persisted owner-default model/thinking against the resolved run binding, fails closed on mismatch/refusal, and is unchanged from main (`src/actors/manager.ts:5593,6119-6174`). The scope imports and their usages remain (`src/actors/manager.ts:77-78,1031,3070,3601,3925,5445`).
+- #869 SQLite checkpoint/fsync paths and #857 moved-main handoff paths are byte-identical to main in the merge: `src/mesh/state-sqlite.ts` and `src/mesh/bridge-handoff.ts` (including `tests/mesh-state-sqlite-checkpoint-timing.test.ts`, `tests/mesh-state-sqlite-slow-fsync.test.ts`, and `tests/mesh-bridge-handoff.test.ts`). Source evidence: `src/mesh/state-sqlite.ts:36-68,1292-1295,1361-1364`; `src/mesh/bridge-handoff.ts:11-24,157-203`.
+- `git diff --check f8a03c8e 93929fe6` passed for the reviewed paths. No tracked files were edited; no tests/build were run for this read-only review.
+
+## FAIL/CONCERN findings
+
+None (3 PASS, 0 FAIL, 0 CONCERN); no severity, trigger, effect, or fix entries apply.

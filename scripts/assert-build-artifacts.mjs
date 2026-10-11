@@ -113,6 +113,11 @@ if (process.platform === "linux") {
       throw new Error(`Native helper ${helper} sha256 ${actual} differs from the build manifest (${manifest.helpers?.[helper]})`);
     }
   }
+  // The operator's readiness gate trusts only the digest compiled into its bundle (reader-proof.ts).
+  const cli = readFileSync(join(dist, "mesh/mesh-backend-cli.js"), "utf8");
+  if (!cli.includes(`"fabric-mesh-lease":"${manifest.helpers["fabric-mesh-lease"]}"`)) {
+    throw new Error("dist/mesh/mesh-backend-cli.js does not embed the fabric-mesh-lease digest of the build manifest (a lost esbuild define)");
+  }
 }
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");

@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createLockEvents, LOCK_EVENT_MAX_LINE_BYTES, LOCK_EVENTS_FILE, LOCK_EVENTS_ROTATE_BYTES, LOCK_HELD_EVENT_MS, lockEventLine,
-  lockStatsHost, type LockEvent, type LockEvents,
+  createLockEvents, LOCK_EVENT_MAX_LINE_BYTES, LOCK_EVENTS_FILE, LOCK_EVENTS_ROTATE_BYTES, LOCK_EVENTS_ROTATE_LOCK,
+  LOCK_EVENTS_ROTATE_LOCK_STALE_MS, LOCK_HELD_EVENT_MS, lockEventLine, lockStatsHost, type LockEvent, type LockEvents,
 } from "../src/mesh/commit-stats.js";
 import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
@@ -142,7 +142,113 @@ describe("lock events across processes", () => {
   }, 60_000);
 });
 
+describe("lock events: rotation across processes", () => {
+  // Review P2: rotation is serialized by an O_EXCL lock and re-checks the inode, so no appender can
+  // rename a newer file over .1 or drop its line on ENOENT. Sized for exactly one rotation, so every
+  // line must be in events.jsonl or events.jsonl.1.
+  it("N concurrent appenders across a forced rotation lose no lines", async () => {
+    const root = temp();
+    fs.mkdirSync(path.join(root, "lock-stats"), { mode: 0o700 });
+    const writers = 8;
+    const lines = 250;
+    const sample = lockEventLine({ v: 1, at: Date.now(), kind: "held", store: "mesh-lock", class: "publish", heldMs: 100,
+      holder: { pid: 1_000_000, process: "node", op: "publish", host: lockStatsHost() } });
+    const total = writers * lines * Buffer.byteLength(sample);
+    const rotateBytes = Math.floor(total * 0.6);
+    const go = path.join(root, "go");
+    const code = `
+      import { createJiti } from "jiti";
+      import { pathToFileURL } from "node:url";
+      import fs from "node:fs";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+      const { createLockEvents } = await jiti.import("./src/mesh/commit-stats.ts");
+      const [root, go, lines, rotateBytes] = process.argv.slice(1);
+      const events = createLockEvents("1", { rotateBytes: Number(rotateBytes), warn: (message) => console.error(message) });
+      process.stdout.write("ready\\n");
+      while (!fs.existsSync(go)) await new Promise((resolve) => setTimeout(resolve, 2));
+      for (let i = 0; i < Number(lines); i++) events.held(root, "mesh-lock", "publish", 100 + i);
+      console.log("errors=" + events.errors);`;
+    const children = Array.from({ length: writers }, () => {
+      const handle = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", code,
+        root, go, String(lines), String(rotateBytes)], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      const ready = new Promise<void>((resolve) => handle.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        if (stdout.includes("ready")) resolve();
+      }));
+      handle.stderr.on("data", (chunk) => { stderr += chunk; });
+      const done = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+        handle.once("error", reject);
+        handle.once("close", (exit) => resolve({ code: exit, stdout, stderr }));
+      });
+      return { pid: handle.pid!, ready, done };
+    });
+    await Promise.all(children.map((entry) => entry.ready));
+    fs.writeFileSync(go, "");
+    for (const result of await Promise.all(children.map((entry) => entry.done))) {
+      expect(result, result.stderr).toMatchObject({ code: 0 });
+      expect(result.stdout).toContain("errors=0");
+    }
+    const file = eventsFile(root);
+    expect(fs.existsSync(`${file}.1`)).toBe(true); // the rotation happened
+    expect(fs.readdirSync(path.join(root, "lock-stats")).sort()).toEqual([LOCK_EVENTS_FILE, `${LOCK_EVENTS_FILE}.1`]);
+    const seen = [...readEvents(`${file}.1`), ...readEvents(file)].map((event) => `${event.holder.pid}:${event.heldMs}`);
+    expect(seen).toHaveLength(writers * lines);
+    expect(new Set(seen).size).toBe(writers * lines);
+    for (const { pid } of children) for (let i = 0; i < lines; i++) expect(seen).toContain(`${pid}:${100 + i}`);
+  }, 60_000);
+
+  it("a busy rotation lock defers rotation without losing the line; a crashed rotator's lock is broken", () => {
+    const events = createLockEvents("1", { rotateBytes: 4096 })!;
+    const root = temp();
+    const directory = path.join(root, "lock-stats");
+    fs.mkdirSync(directory, { mode: 0o700 });
+    const file = eventsFile(root);
+    const lock = path.join(directory, LOCK_EVENTS_ROTATE_LOCK);
+    fs.writeFileSync(file, `${"x".repeat(4000)}\n`, { mode: 0o600 });
+    fs.writeFileSync(lock, "", { mode: 0o600 }); // another process is rotating
+    events.held(root, "mesh-lock", "publish", 1_001);
+    expect(fs.existsSync(`${file}.1`)).toBe(false);
+    expect(fs.readFileSync(file, "utf8")).toContain('"heldMs":1001');
+    const old = (Date.now() - LOCK_EVENTS_ROTATE_LOCK_STALE_MS - 5_000) / 1000;
+    fs.utimesSync(lock, old, old); // ... and crashed holding it
+    events.held(root, "mesh-lock", "publish", 1_002);
+    expect(fs.readFileSync(`${file}.1`, "utf8")).toContain('"heldMs":1001');
+    expect(readEvents(file).map((event) => event.heldMs)).toEqual([1_002]);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(events.errors).toBe(0);
+  });
+});
+
 describe("lock events in one process", () => {
+  // Review P2: a protocol-2 store whose incarnation is still pending fails closed for a shorter
+  // budget before it ever tries .lock: no wait-timeout event (and no owner-record read for one).
+  it("a cold protocol-2 fail-closed acquisition records no wait-timeout event", async () => {
+    const { MeshLock } = await load();
+    const root = temp();
+    const holder = new MeshLock(root, {}, () => undefined);
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    const holding = holder.withLockAcrossAwait(async () => { entered(); await released; }, undefined, "custody");
+    await inside;
+    const cold = new MeshLock(root, { lockProtocol: 2 }, () => undefined);
+    expect(cold.ownIncarnationReady).toBe(false);
+    await expect(cold.withLock(() => 1, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0 });
+    release();
+    await holding;
+    expect(readEvents(eventsFile(root))).toEqual([]);
+    // Once ready, the same store tries .lock: a full-budget timeout is an event again.
+    await cold.ownIncarnation;
+    const holdingAgain = holder.withLockAcrossAwait(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); }, undefined, "custody");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(cold.withLock(() => 1, 100, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await holdingAgain;
+    expect(readEvents(eventsFile(root)).map((event) => [event.kind, event.class])).toEqual([["wait-timeout", "publish"]]);
+  });
+
   it("mesh .lock: held above the threshold, wait-timeout naming the owner record's pid, nothing for a bounded try", async () => {
     const { MeshLock } = await load();
     const root = temp();

@@ -441,7 +441,8 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
 // (`wait-timeout`, FABRIC_MESH_STATE_BUSY at the bridge), naming the holder it could identify.
 // It is a local append, never a mesh publish: publishing would need the very lock that is
 // contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
-// appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept).
+// appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept),
+// under a short O_EXCL rotation lock and only if the name still holds the oversized inode.
 // An I/O error never blocks or throws into the lock path: it is counted, and warned about at most
 // once a minute. Off with the minute files (PI_FABRIC_LOCK_STATS=0); `held` is also off with a
 // threshold of 0 (`lockHeldEventMs`). Bounded tries (registry-fenced or zero-wait callers and the
@@ -487,6 +488,10 @@ export interface LockEvents {
 export const LOCK_EVENTS_FILE = "events.jsonl";
 /** At this size the file is renamed to `events.jsonl.1`, replacing the older one. */
 export const LOCK_EVENTS_ROTATE_BYTES = 1024 * 1024;
+/** Exclusive (O_EXCL) rotation lock beside the file: one rotator at a time across processes. */
+export const LOCK_EVENTS_ROTATE_LOCK = `${LOCK_EVENTS_FILE}.rotating`;
+/** A rotation lock older than this was left by a crashed rotator (a rotation takes microseconds). */
+export const LOCK_EVENTS_ROTATE_LOCK_STALE_MS = 10_000;
 /** PIPE_BUF: an O_APPEND write() of at most this many bytes never interleaves with another. */
 export const LOCK_EVENT_MAX_LINE_BYTES = 4096;
 /** Default `lockHeldEventMs`: a hold longer than this emits a `held` event; 0 disables them. */
@@ -498,6 +503,8 @@ const LOCK_EVENTS_WARN_EVERY_MS = 60_000;
 const PROCESS_NAME_MAX_CHARS = LOCK_STATS_WRITER_MAX_CHARS;
 const APPEND_FLAGS = process.platform === "win32" ? "a"
   : fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0);
+const ROTATE_LOCK_FLAGS = process.platform === "win32" ? "wx"
+  : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
 
 interface ProcessLockEvents {
   /** Registry generation. Keep the event API and line shape stable; hand over before changing them. */
@@ -579,22 +586,62 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       checkStatsDirectory(directory);
       const file = path.join(directory, LOCK_EVENTS_FILE);
       const data = Buffer.from(lockEventLine(event));
-      let { descriptor, stat } = open(file);
-      try {
-        if (stat.size > 0 && stat.size + data.length > rotateBytes) {
-          // Rotate only the file this descriptor saw: a concurrent appender may have rotated it
-          // already. Closed first, so the rename also works on Windows.
-          fs.closeSync(descriptor);
-          descriptor = -1;
-          const current = fs.lstatSync(file);
-          if (current.dev === stat.dev && current.ino === stat.ino) fs.renameSync(file, `${file}.1`);
-          ({ descriptor, stat } = open(file));
-        }
-        // ONE write per line, appended atomically by O_APPEND.
-        const written = fs.writeSync(descriptor, data);
-        if (written !== data.length) throw new Error(`short append to ${file} (${written} of ${data.length} bytes)`);
-      } finally { if (descriptor >= 0) fs.closeSync(descriptor); }
+      try { appendOnce(file, data); }
+      catch (error) {
+        // A concurrent rotation moved the name between our open and our rename check: append once
+        // more against the current events.jsonl (O_APPEND|O_CREAT). A second failure is counted.
+        if (errorCodeOf(error) !== "ENOENT") throw error;
+        appendOnce(file, data);
+      }
     } catch (error) { failed(error); }
+  };
+  /** Takes the rotation lock, breaking one a crashed rotator left; undefined when another holds it. */
+  const takeRotateLock = (lock: string): number | undefined => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { return fs.openSync(lock, ROTATE_LOCK_FLAGS, 0o600); }
+      catch (error) {
+        if (errorCodeOf(error) !== "EEXIST" || attempt > 0) return undefined;
+        try {
+          if (Date.now() - fs.lstatSync(lock).mtimeMs <= LOCK_EVENTS_ROTATE_LOCK_STALE_MS) return undefined;
+          fs.unlinkSync(lock);
+        } catch (stale) { if (errorCodeOf(stale) !== "ENOENT") return undefined; }
+      }
+    }
+    return undefined;
+  };
+  /**
+   * Renames the oversized file `seen` to `.1` under the rotation lock, only if the name still holds
+   * that inode: an appender holding a stale lstat can never rename a newer file over `.1`. Busy lock:
+   * skip (the holder rotates; this line lands in whichever file the name holds next).
+   */
+  const rotate = (file: string, seen: fs.Stats): void => {
+    const lock = path.join(path.dirname(file), LOCK_EVENTS_ROTATE_LOCK);
+    const held = takeRotateLock(lock);
+    if (held === undefined) return;
+    try {
+      let current: fs.Stats;
+      try { current = fs.lstatSync(file); }
+      catch (error) { if (errorCodeOf(error) === "ENOENT") return; throw error; }
+      if (current.dev === seen.dev && current.ino === seen.ino) fs.renameSync(file, `${file}.1`);
+    } finally {
+      try { fs.closeSync(held); } catch { /* Closed either way. */ }
+      try { fs.unlinkSync(lock); } catch { /* A stale-lock breaker may have removed it. */ }
+    }
+  };
+  const appendOnce = (file: string, data: Buffer): void => {
+    let { descriptor, stat } = open(file);
+    try {
+      if (stat.size > 0 && stat.size + data.length > rotateBytes) {
+        // Closed first, so the rename also works on Windows.
+        fs.closeSync(descriptor);
+        descriptor = -1;
+        rotate(file, stat);
+        ({ descriptor, stat } = open(file));
+      }
+      // ONE write per line, appended atomically by O_APPEND.
+      const written = fs.writeSync(descriptor, data);
+      if (written !== data.length) throw new Error(`short append to ${file} (${written} of ${data.length} bytes)`);
+    } finally { if (descriptor >= 0) fs.closeSync(descriptor); }
   };
   const events: LockEvents = {
     held(root, store, lockClass, heldMs) {

@@ -220,11 +220,9 @@ export class MeshLock {
     const ownerPath = path.join(this.#lockPath, "owner");
     if (this.#lockProtocol === 2 && !this.#ownIncarnationReady &&
       (scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) {
-      // Fails closed before the common accounting below: count it (and any event) once here.
-      const tried = Boolean(scope?.active) || bounded;
-      const waitedMs = performance.now() - lockWaitStart;
-      lockStats?.failed(this.root, lockClass, waitedMs, tried);
-      if (!tried) lockEvents?.waitTimeout(this.root, "mesh-lock", lockClass, waitedMs, lockOwnerPid(ownerPath));
+      // Fails closed before the common accounting below: count it once here. It never tried .lock,
+      // so it is no wait-timeout event (and reads no owner record for one): nobody made it wait.
+      lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
       throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
     }
     const startTime = this.#lockProtocol === 2

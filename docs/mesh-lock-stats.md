@@ -94,7 +94,8 @@ never a mesh publish: publishing would need the very lock that is contended. One
   release in between, no single holder) means `pid` and `process` are `null`. `holder.op` is always
   `null` here: neither record carries the holder's class. Bounded tries (registry-fenced
   `withTryLock` scopes, zero-wait callers, the single-attempt R20 fence) fail by design while the
-  lock is busy; they stay `tries` in the minute files and emit no event.
+  lock is busy; they stay `tries` in the minute files and emit no event. Nor does a protocol-2
+  store that fails closed before its process incarnation is ready: it never tried `.lock`.
 - `class` (and `waiter.op`) is the caller class from the table above. SQLite writes use the same
   classes: `put`/`delete` `put/delete`, `writeBatch` `writeBatch` (or `bridge`), `confirmWritable`
   `heartbeat/confirm`, `exclusive` `custody`, the write fence, `retire` and imports `other`.
@@ -105,7 +106,11 @@ never a mesh publish: publishing would need the very lock that is contended. One
 Each line is written with `O_APPEND` and a single `write()` of at most 4096 bytes (`PIPE_BUF`), so
 lines from concurrent processes never interleave; process names are truncated to keep a line under
 that. Before an append that would take the file past 1 MiB, it is renamed to `events.jsonl.1`
-(replacing the previous one; one old file is kept). The file is created mode 0600, never through a
+(replacing the previous one; one old file is kept). One process rotates at a time, under a short
+exclusive lock file (`events.jsonl.rotating`, `O_EXCL`; one older than 10 s is a crashed rotator's
+and is broken), and only if `events.jsonl` still holds the oversized inode it saw, so a stale view
+never renames a newer file over `events.jsonl.1`. An append that finds the name gone mid-rotation
+retries once against the current `events.jsonl`; a second failure is counted. The file is created mode 0600, never through a
 symlink, in the same private `lock-stats` directory as the minute files (same safety checks), and
 the minute-file reader and pruner ignore it. An I/O error is never thrown into, and never waits in,
 the lock path: it is counted and reported at most once a minute in the profile's private

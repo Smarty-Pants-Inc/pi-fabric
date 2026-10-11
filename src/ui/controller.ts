@@ -72,7 +72,6 @@ export class FabricUiController {
   #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
   #closeTasks: (() => void) | undefined;
   #scheduledRefresh: NodeJS.Timeout | undefined;
-  #retentionTimer: NodeJS.Timeout | undefined;
   #widgetTui: TUI | undefined;
   #conversationWatchKey: string | undefined;
   #conversationWatches: fs.FSWatcher[] = [];
@@ -146,8 +145,6 @@ export class FabricUiController {
     this.#conversationState?.clear();
     this.#conversationState = undefined;
     if (this.#scheduledRefresh) clearTimeout(this.#scheduledRefresh);
-    if (this.#retentionTimer) clearTimeout(this.#retentionTimer);
-    this.#retentionTimer = undefined;
     this.#meshUnsubscribe?.();
     this.#meshUnsubscribe = undefined;
     this.#scheduledRefresh = undefined;
@@ -703,23 +700,6 @@ export class FabricUiController {
     this.#scheduledRefresh.unref();
   }
 
-  // Display-only completion leases expire at their own deadline (upstream
-  // retention). One unref'ed one-shot timer for the nearest deadline, never a
-  // recurring poll: it exists only while a retained completion row is shown.
-  #scheduleRetentionExpiry(): void {
-    if (this.#retentionTimer) clearTimeout(this.#retentionTimer);
-    this.#retentionTimer = undefined;
-    if (!this.#context || this.#context.mode !== "tui" || this.state.config.ui.widget === "hidden") return;
-    const delay = this.#widgetRetention.nextExpiryDelay(this.#snapshot, Date.now());
-    if (delay === undefined) return;
-    const epoch = this.#epoch;
-    this.#retentionTimer = setTimeout(() => {
-      this.#retentionTimer = undefined;
-      this.#runBackground(epoch, () => this.#refresh());
-    }, delay);
-    this.#retentionTimer.unref();
-  }
-
   /** Coalesced event refreshes own their faults; a queued old epoch cannot rearm. */
   #runBackground(epoch: number, callback: () => void): void {
     if (epoch !== this.#epoch || !this.#context || this.#context.mode !== "tui" || !this.state.initialized) return;
@@ -858,8 +838,9 @@ export class FabricUiController {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
       this.#widgetRetention.sync(this.#snapshot);
+      // Fork (46857f02, no widget clock): retained completion rows expire on the
+      // next event refresh after their deadline, never on a timer of their own.
       this.#renderWidget(context);
-      this.#scheduleRetentionExpiry();
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
       if (this.#conversationTui && this.#conversationView?.refresh?.() !== false) {

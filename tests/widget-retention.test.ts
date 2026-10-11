@@ -143,8 +143,15 @@ const participant = (id: string, finishedAt?: number): FabricParticipantInfo => 
   controlProtocol: "v1", local: false, stale: false,
 });
 
+// Fork (46857f02, no widget clock): idle Main arms no timer for widget expiry.
+// Retained completion rows expire on the next event refresh after their
+// deadline. Upstream repainted at each deadline from its poll/timer.
 describe("controller idle expiry repaint", () => {
-  it.each([1000, 60_000])("repaints at individual deadlines even with refreshMs=%s, preserving participant and dashboard data", async refreshMs => {
+  const event = async (h: ReturnType<typeof controllerFixture>) => {
+    h.refresh();
+    await vi.advanceTimersByTimeAsync(100);
+  };
+  it.each([1000, 60_000])("expires rows at the first event after their deadline with refreshMs=%s, preserving participant and dashboard data", async refreshMs => {
     vi.useFakeTimers(); vi.setSystemTime(10_000);
     const records = [participant("older", 10_000), participant("newer", 15_000),
       { ...participant("root", 1), kind: "root" as const }];
@@ -153,17 +160,22 @@ describe("controller idle expiry repaint", () => {
       h.controller.start(h.context);
       expect(h.widget().render(160)).toHaveLength(3);
       expect(h.controller.snapshot().agents.map(row => row.id).sort()).toEqual(["newer", "older"]);
+      expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(29_999);
       expect(h.widget().render(160).join("\n")).toContain("older");
       h.requestRender.mockClear();
       await vi.advanceTimersByTimeAsync(1);
+      expect(h.requestRender).not.toHaveBeenCalled();
+      await event(h);
       expect(h.requestRender).toHaveBeenCalled();
       expect(h.widget().render(160)).toHaveLength(2);
       expect(h.widget().render(160).join("\n")).not.toContain("older");
       expect(h.controller.snapshot().agents).toHaveLength(2);
-      await vi.advanceTimersByTimeAsync(4999);
+      await vi.advanceTimersByTimeAsync(4_799);
+      await event(h);
       expect(h.widget().render(160).join("\n")).toContain("newer");
       await vi.advanceTimersByTimeAsync(1);
+      await event(h);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().agents).toHaveLength(2);
       expect(h.controller.snapshot().participants).toEqual(stored);
@@ -182,6 +194,7 @@ describe("controller idle expiry repaint", () => {
       h.controller.start(h.context);
       expect(h.widget().render(160)).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(30_000);
+      await event(h);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().peers).toEqual([peer]);
       expect(h.controller.snapshot().participants).toEqual(records);
@@ -195,12 +208,13 @@ describe("controller idle expiry repaint", () => {
     try {
       h.controller.start(h.context); h.widget().render(160);
       await vi.advanceTimersByTimeAsync(20_000);
-      records[0]!.updatedAt = 30_000; h.refresh();
-      await vi.advanceTimersByTimeAsync(100);
+      records[0]!.updatedAt = 30_000; await event(h);
       expect(h.widget().render(160).join("\n")).toContain("legacy");
-      await vi.advanceTimersByTimeAsync(9899);
+      await vi.advanceTimersByTimeAsync(9_799);
+      await event(h);
       expect(h.setWidget).not.toHaveBeenLastCalledWith("pi-fabric", undefined);
       await vi.advanceTimersByTimeAsync(1);
+      await event(h);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().agents[0]!.updatedAt).toBe(30_000);
       expect(records[0]!.status).toBe("completed");

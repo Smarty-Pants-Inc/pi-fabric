@@ -8,8 +8,12 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const out = path.resolve(process.argv[2] ?? process.env.TASK_OUT);
-fs.mkdirSync(out, { recursive: true });
+// Write only into a fresh run directory created by mkdtemp (mode 0700, never pre-existing), so a planted
+// symlink at a fixed output name cannot redirect a write outside it (review P3, pi-fabric#459).
+const outParent = path.resolve(process.argv[2] ?? process.env.TASK_OUT);
+fs.mkdirSync(outParent, { recursive: true });
+const out = fs.mkdtempSync(path.join(outParent, 'nested-return-'));
+console.error(`proof output: ${out}`);
 const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), 'native-nested-return-'));
 const profile = path.join(scratch, 'profile'), cwd = path.join(scratch, 'workspace'), log = path.join(out, 'native-proof.jsonl');
 for (const dir of [profile, cwd, path.join(scratch, 'home'), path.join(scratch, 'tmp')]) fs.mkdirSync(dir, { recursive: true });

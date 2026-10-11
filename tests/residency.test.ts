@@ -5,7 +5,6 @@ import { installInProcessResidentFence } from "./helpers/in-process-resident-fen
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
 import { completionConsumed } from "../src/agents/completion-journal.js";
-import { currentOwnerIdentity } from "../src/core/atomic-write.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1382,40 +1381,6 @@ describe("durable completion receipts", () => {
       await expect(client.cleanupAgent(seeded.id, false, controller.signal)).rejects.toThrow("owned cleanup cancellation");
       expect(fs.existsSync(seeded.runDirectory)).toBe(true); expect(fs.existsSync(seeded.metadataPath)).toBe(true);
       expect(fs.existsSync(path.join(state.config.residencyRoot, "decisions"))).toBe(false);
-    } finally { await client.close(); await state.participants.close(); }
-  });
-
-  // PR #864 review P1: an invisible resident host is not an offline one.
-  it.each(["fresh", "stale"] as const)("offline cleanup refuses a resident host in another PID namespace with a %s heartbeat", async (heartbeat) => {
-    const state = await rootHarness(`offline-cleanup-foreign-${heartbeat}`);
-    const seeded = await seedCompletion(state, "completed");
-    const { pid: _pid, ...identity } = { ...currentOwnerIdentity(), pidNamespace: "pid:[4026599999]" };
-    fs.writeFileSync(path.join(state.config.residencyRoot, "owner.json"), JSON.stringify({
-      format: RESIDENT_HOST_FORMAT, hostId: residentHostId(state.identity.id), pid: 2147483647, token: "foreign-host",
-      identity, heartbeatAt: Date.now() - (heartbeat === "fresh" ? 1_000 : 120_000), startedAt: 1, readyAt: 1,
-    }));
-    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
-    try {
-      // The local probe answers ESRCH for 2147483647, but the owner is alive or unknown, never dead.
-      expect(residentProcessAlive(2147483647)).toBe(false);
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow();
-      expect(fs.existsSync(seeded.runDirectory)).toBe(true); expect(fs.existsSync(seeded.metadataPath)).toBe(true);
-      expect(fs.existsSync(path.join(state.config.residencyRoot, "decisions"))).toBe(false);
-    } finally { await client.close(); await state.participants.close(); }
-  });
-
-  it("offline cleanup still proceeds after a same-namespace resident host owner is confirmed dead", async () => {
-    const state = await rootHarness("offline-cleanup-local-dead");
-    const seeded = await seedCompletion(state, "completed");
-    const { pid: _pid, ...identity } = currentOwnerIdentity();
-    fs.writeFileSync(path.join(state.config.residencyRoot, "owner.json"), JSON.stringify({
-      format: RESIDENT_HOST_FORMAT, hostId: residentHostId(state.identity.id), pid: 2147483647, token: "dead-host",
-      identity, heartbeatAt: Date.now(), startedAt: 1, readyAt: 1,
-    }));
-    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
-    try {
-      await expect(client.cleanupAgent(seeded.id)).resolves.toEqual({ cleaned: true });
-      expect(fs.existsSync(seeded.runDirectory)).toBe(false);
     } finally { await client.close(); await state.participants.close(); }
   });
 

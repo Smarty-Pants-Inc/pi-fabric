@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG, type FabricSchemaMode } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
-import { currentOwnerIdentity } from "../src/core/atomic-write.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricState } from "../src/fabric-state.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
@@ -501,26 +500,6 @@ describe("Schema transactions", () => {
       (item) => item.status === "fulfilled" && item.value.outcome === "committed",
     );
     expect(committed).toHaveLength(1);
-  });
-
-  it.each(["namespace", "host"])("refuses recovery of a stale unconfirmed %s owner (stale heartbeat is unknown, not death)", kind => {
-    const setup = fixture();
-    const target = path.join(setup.cwd, "a.txt");
-    fs.writeFileSync(target, "owner applying\n");
-    const journalRoot = path.join(setup.mesh.root, "schema-transactions");
-    fs.mkdirSync(journalRoot, { recursive: true });
-    const owner = { ...currentOwnerIdentity(), heartbeatAt: Date.now() - 120_000,
-      ...(kind === "namespace" ? { pidNamespace: "pid:[foreign]" } : { hostname: "other-host" }) };
-    const lock = `${process.pid}\n0\n${JSON.stringify(owner)}\n`;
-    fs.writeFileSync(path.join(journalRoot, ".commit.lock"), lock);
-    const journal = JSON.stringify({ format: 1, id: "live", status: "applying", before: [{
-      path: "a.txt", absolute: target, existed: true, content: Buffer.from("before\n").toString("base64"), mode: 0o644,
-    }], createdAt: 0 });
-    fs.writeFileSync(path.join(journalRoot, "live.json"), journal);
-    new SchemaController(setup.cwd, setup.config, setup.mesh, identity, setup.state);
-    expect(fs.readFileSync(target, "utf8")).toBe("owner applying\n");
-    expect(fs.readFileSync(path.join(journalRoot, ".commit.lock"), "utf8")).toBe(lock);
-    expect(fs.readFileSync(path.join(journalRoot, "live.json"), "utf8")).toBe(journal);
   });
 
   it("recovers an applying crash journal before accepting new transactions", () => {

@@ -6,7 +6,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { encodeOwnerIdentityLine, lockOwnerLiveness, SHORT_LOCK_MAX_HOLD_MS } from "./atomic-write.js";
 
 const DEFAULT_LOCK_ATTEMPTS = 50;
 const DEFAULT_LOCK_DELAY_MS = 5;
@@ -28,28 +27,9 @@ const processAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (error) {
-    // EPERM (or an unknown probe failure) is not evidence of a dead owner.
-    return errorCode(error) !== "ESRCH";
+  } catch {
+    return false;
   }
-};
-
-// The identity line is additive: older readers only consume the first three.
-const ownerText = (token: string): string =>
-  `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`;
-
-const ownerCanBeReaped = (owner: string, mtimeMs: number, staleMs: number): boolean => {
-  const [, pid, created, identity] = owner.split("\n");
-  const timestamp = Number(created);
-  // Damaged metadata must not strand the lock forever. Still protect a live
-  // PID, and use filesystem age when the creation timestamp is unusable.
-  const since = created?.trim() && Number.isSafeInteger(timestamp) && timestamp >= 0 && timestamp <= Date.now()
-    ? timestamp
-    : mtimeMs;
-  return Date.now() - since > staleMs && lockOwnerLiveness(Number(pid), since, identity, {
-    legacyAlive: processAlive,
-    maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, staleMs),
-  }) === "dead";
 };
 
 const sleepAsync = (ms: number): Promise<void> =>
@@ -95,7 +75,7 @@ export const withExclusiveFileLockAsync = async <T>(
     try {
       await fs.promises.mkdir(lock, { mode: 0o700 });
       try {
-        await fs.promises.writeFile(ownerPath, ownerText(token), {
+        await fs.promises.writeFile(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n`, {
           encoding: "utf-8",
           mode: 0o600,
         });
@@ -109,15 +89,17 @@ export const withExclusiveFileLockAsync = async <T>(
       if (errorCode(error) !== "EEXIST") throw error;
       try {
         const firstOwner = await fs.promises.readFile(ownerPath, "utf8");
-        if (ownerCanBeReaped(firstOwner, (await fs.promises.stat(lock)).mtimeMs, staleMs)) {
+        const [, pidText, createdText] = firstOwner.trim().split("\n");
+        const stale = Date.now() - Number(createdText) > staleMs;
+        if (stale && !processAlive(Number(pidText))) {
           const secondOwner = await fs.promises.readFile(ownerPath, "utf8");
           if (
             secondOwner === firstOwner &&
             await reapStaleLockAsync(lock, async (claimed) => {
               try {
                 const owner = await fs.promises.readFile(path.join(claimed, "owner"), "utf8");
-                return owner === firstOwner &&
-                  ownerCanBeReaped(owner, (await fs.promises.stat(claimed)).mtimeMs, staleMs);
+                const [, pid, created] = owner.trim().split("\n");
+                return Date.now() - Number(created) > staleMs && !processAlive(Number(pid));
               } catch {
                 return false;
               }

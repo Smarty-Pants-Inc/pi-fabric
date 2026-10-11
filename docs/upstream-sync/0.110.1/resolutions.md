@@ -67,7 +67,7 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 | `docs/harnesses.md` | fresh | no | both fixed the same writing-style line; kept ours |
 | `docs/jev.md` | fresh | no | both fixed the same writing-style sentence; kept ours |
 | `docs/prompt-cache.md` | fresh | no | H1 ours (documents our hold-release semantics); H2 both style-fixed same sentence, kept ours |
-| `docs/residency-runtime.md` | fresh | no | union: our PR #394 scope/lease-fenced custody sections plus upstream scheduled-events, stale-command and PID-namespace sections |
+| `docs/residency-runtime.md` | fresh | no | union: our PR #394 scope/lease-fenced custody sections plus upstream scheduled-events, stale-command and PID-namespace sections. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the PID-namespace section is removed |
 | `.github/workflows/test.yml` | fresh | no | union: kept our Package install smoke step and added upstream CI-workflow and Python-diagnostics test steps; runners, matrix and jobs (including mesh-lock-bench) unchanged. Upstream setup-node, setup-python 3.14, Bend 2.0.36 and the Windows mkdir /tmp line auto-merged into our check job |
 | `package.json` | fresh | no (edited without conflict: 19dc43cb) | union of exports (our ./mesh, upstream ./scope) and smoke list; took upstream deps chord/pi-durable/pi-fabric-worker-sdk, pi-agent-core peer and Pi 1.1.0 + typebox 1.3.27 dev pins (upstream code needs Pi 1.x); kept our pg dependency; merged the two auto-merged bin objects (upstream pi-fabric CLI + our bins) and dropped the duplicate typebox 1.3.8 dev pin in favour of upstream 1.3.27 |
 | `README.md` | fresh | no (edited without conflict: 19dc43cb) | union: keep our Records doc link and add upstream thinking/durable/decisions/programs links |
@@ -90,8 +90,8 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 | `src/config.ts` | fresh | yes (9eba6fb1) | union: our nice/wakeText/deadRootFilter/landlock/mesh-backend config plus upstream thinking bounds, modelAdmission, worktree setup, child questions and jevFabric |
 | `src/core/action-registry.ts` | fresh | no (edited without conflict: 19dc43cb) | combined: our deadline check, cancellation sharing and principal snapshot plus upstream jev.decide strict result and host-issued scope |
 | `src/core/approval-controller.ts` | fresh | no | combined: our internalRouting param (position 7) and session-generation fence plus upstream headless param (now position 8) and action-level deny override |
-| `src/core/atomic-write.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our mesh-lock timeout/background retry plus upstream owner identity/heartbeat liveness (independent additions) |
-| `src/core/file-lock.ts` | fresh | no | kept our single withExclusiveFileLock in atomic-write.ts (re-exported); ported upstream FileLockTimeoutError (contention is retryable) into it; upstream identity-aware reaping of this lock left for follow-up |
+| `src/core/atomic-write.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our mesh-lock timeout/background retry plus upstream owner identity/heartbeat liveness (independent additions). **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the owner identity/heartbeat liveness is removed; main's lock liveness stays |
+| `src/core/file-lock.ts` | fresh | no | kept our single withExclusiveFileLock in atomic-write.ts (re-exported); ported upstream FileLockTimeoutError (contention is retryable) into it; upstream identity-aware reaping of this lock left for follow-up. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): the async lock keeps main's owner probe and reap rule |
 | `src/core/shell-inbox.ts` | fresh | no | combined: our sendFabricMessage delivery plus upstream #failed guard |
 | `src/core/shell-jobs.ts` | fresh | no | combined: our scratch scope, spill PID wait and cleanup plus upstream byte-offset task reads, durable jev-fabric jobs and output notifications |
 | `src/core/system-guidance.ts` | fresh | yes (19dc43cb) | combined: our host-globals/payload-literal guidance and state/mesh notes plus upstream shell-composition guidance, native models namespace text and codemode profile parameter |
@@ -115,9 +115,9 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 | `src/providers/mesh-provider.ts` | fresh | no | kept our publish path (topic fence, dedupe, principal, outgoing notice, publishBatch) and added upstream scheduled publish (notBefore/afterMs/key) plus grants imports |
 | `src/providers/pi-tools-provider.ts` | fresh | no | kept our Landlock confinement, temp-custody holds and Landlock-aware preflight; added upstream durable jev-fabric shell launch and notify (durable refused under Landlock enforce); H8 took upstream (the preflight helper already auto-merged, ours would duplicate it) |
 | `src/providers/state-provider.ts` | fresh | no | combined constructor: upstream options.schemaMode plus our piTools selector (function form still accepted) |
-| `src/residency/client.ts` | fresh | no (edited without conflict: 6fc3e89a) | kept our host-captured caller, idempotency and start-time owner liveness; added upstream runner-registry residentModule handoff (upstream heartbeat liveness for this check not taken: both fixed PID reuse) |
-| `src/residency/host.ts` | fresh | yes (6fc3e89a, 45b5fdbd) | kept our resident host (flock host fence, handover/watchdog custody, process-start identity, registry-scoped presence fences, request retention, caller-bound spawns, admission fences, idle confirmation); added upstream runner residentModule loading, hosted-run recovery, residentIdleDecision with schedule wake timer, launch scope recording, sender stamps and owner incarnation (shared with the control plane); upstream owner heartbeat/identity records not taken (our flock fence and start-time identity own liveness) |
-| `src/residency/launcher-owner.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our process-tree ownership plus upstream identity-based owner liveness import |
+| `src/residency/client.ts` | fresh | no (edited without conflict: 6fc3e89a) | kept our host-captured caller, idempotency and start-time owner liveness; added upstream runner-registry residentModule handoff (upstream heartbeat liveness for this check not taken: both fixed PID reuse). The round 2 heartbeat check (5300ffcd) is **superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"); main's start-time probe |
+| `src/residency/host.ts` | fresh | yes (6fc3e89a, 45b5fdbd) | kept our resident host (flock host fence, handover/watchdog custody, process-start identity, registry-scoped presence fences, request retention, caller-bound spawns, admission fences, idle confirmation); added upstream runner residentModule loading, hosted-run recovery, residentIdleDecision with schedule wake timer, launch scope recording, sender stamps and owner incarnation (shared with the control plane); upstream owner heartbeat/identity records not taken (our flock fence and start-time identity own liveness). The round 2 heartbeat records (5300ffcd) are **superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"); main's owner records |
+| `src/residency/launcher-owner.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our process-tree ownership plus upstream identity-based owner liveness import. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): main's file |
 | `src/residency/launcher.ts` | fresh | yes (6fc3e89a) | kept our launcher (handover, watchdog custody, process identity); imported upstream identity-aware liveOwnerPid from launcher-owner |
 | `src/residency/protocol.ts` | fresh | no (edited without conflict: 6fc3e89a) | union: our imports/caller/modelDenied fields plus upstream FabricRunOutcome, runnerModule and outcome fields |
 | `src/runtime/cpython-child-source.ts` | fresh | no | H1 both fixed Python 3.14 exc_type; kept ours (also handles exc_type_str); H2 union of guest roots |
@@ -129,7 +129,7 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 | `src/runtime/node-process-runtime.ts` | fresh | yes (19dc43cb) | kept our ExecutionDeadline, response acks and settle-then-abort of unawaited host calls; added upstream partial output streaming, native codemode setup args and human-wait pause via ExecutionDeadline |
 | `src/runtime/quickjs-runtime.ts` | fresh | yes (19dc43cb) | combined: guestSetupSource keeps our piTools flag (param 2) plus upstream native store/profile/tools flags; orchestration-only pi-tool hint kept, other tools.* route to upstream nativeTools; our ExecutionDeadline + upstream human-wait pause, __fabricRun wrapper and emitted images |
 | `src/runtime-state-builtins.ts` | fresh | no | combined: StateProvider gets upstream schemaMode and our piTools hint selector in one options object; upstream decisions provider added |
-| `src/storage/retention.ts` | fresh | yes (6fc3e89a) | kept our run-file set, follow-up/terminal-artifact vetoes, deadlines, age-first and run-by-run removal; threaded upstream run-root owner identity (owner param last) and veto when either liveness check says alive |
+| `src/storage/retention.ts` | fresh | yes (6fc3e89a) | kept our run-file set, follow-up/terminal-artifact vetoes, deadlines, age-first and run-by-run removal; threaded upstream run-root owner identity (owner param last) and veto when either liveness check says alive. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): main's run-root owner liveness |
 | `src/topology/control-plane.ts` | fresh | yes (6fc3e89a) | kept our ack grace, bridge timeouts, shared-claim policy, wake-cause/principal admission, idempotent command ids and terminal rejection fields; added upstream owner-incarnation fencing (stale-command refusal) and host-set sender stamps |
 | `src/topology/participant-directory.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb, 45b5fdbd) | combined: upstream ownerIncarnation stamping plus our root name and quiescing status (smarty-dev#1113) |
 | `src/ui/controller.ts` | fresh | no (edited without conflict: 6fc3e89a, 19dc43cb) | kept our event-driven refresh (no recurring poll), stale-context fence and streaming-stable widget; added upstream image-safe overlays and widget completion retention (FabricWidget args: stableWhileStreaming, retention) |
@@ -196,7 +196,7 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 | e848ed2d | Human-wait leave hop only for human-wait host calls. Settings tolerates hosts without a lease. |
 | 47bb9329 | QuickJS lets host tasks settle before aborting them at guest end (ours). Upstream's immediate abort fabricated ResidentOutcomeUnknown receipts. |
 | 198af542 | Upstream shell tests close the store on real timers; spill results carry our auto flag |
-| a8005ea4 | Upstream lock-owner reaping ported into our sync exclusive lock: identity line, EPERM counts as alive, mtime fallback for damaged metadata. Strict superset of our PID-only check. |
+| a8005ea4 | Upstream lock-owner reaping ported into our sync exclusive lock: identity line, EPERM counts as alive, mtime fallback for damaged metadata. Strict superset of our PID-only check. **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): reverted; main's sync lock |
 
 ## Deliberate deviations from upstream behaviour (review these)
 
@@ -204,7 +204,7 @@ The first 103 rows are the conflicts of the upstream merge 114f5e55. The last 4 
 2. **QuickJS end-of-run** keeps our settle-before-abort order.
 3. ~~Startup graph file budget is 47~~: superseded in part 2; back to 45 files (c960249f).
 4. **Upstream bounded worker-stderr capture is not ported.** A stderr pipe would delay the close event our process-tree custody relies on. Its probe is skipped with the reason.
-5. **Upstream owner heartbeat records are not adopted** for the resident host; our flock fence and start-time identity remain the authority. The sync lock now reads identity lines (a8005ea4).
+5. **Upstream owner heartbeat records are not adopted** for the resident host; our flock fence and start-time identity remain the authority. The sync lock now reads identity lines (a8005ea4). **Superseded by the scope cut** (see "Scope cut: PID-namespace liveness (to its own PR)"): no owner identity, heartbeat or locality code remains; all lock and owner liveness is main's.
 
 ## Test evidence
 
@@ -361,6 +361,8 @@ Parents 66f19a32 (this branch, round 2 fixes included) and f2814332 (`refs/remot
 The main design call: upstream 0.110.1 (a8d2714b) and main #709 each added an owner-incarnation fence under the same wire field (`ownerIncarnation` on participant records, commands, claims and ACKs). Main's fence is the stronger contract: a typed `FabricControlStaleIncarnationError` (`FABRIC_CONTROL_STALE_INCARNATION`), stricter ACK matching, fenced cancellation, the host-only `mesh.controlIncarnationFence` warn/enforce rollout, a captured request origin, and a fresh epoch for every activation, same-process reloads included. Main's fence is kept as the single implementation; upstream's per-control-plane epoch and its `incarnation` option are dropped. This supersedes e3170bb9's "reload keeps the owner incarnation" call (smarty-dev#2160 item 4): main's `tests/main-reload-messages.test.ts` now pins that a reload refuses the predecessor's queued messages with the typed error and delivers fresh ones once.
 
 The round 2 fixes stay as they were: a stale foreign heartbeat is `unknown` (89f2ed56), PID-namespace-aware liveness (bc69194c, and the `ownerAlive`/`childAlive` probes in retention and scratch), and a resident host with unknown liveness refuses offline cleanup (5300ffcd). Main touched none of their files except `src/residency/host.ts`, where its change is only the incarnation wiring.
+
+> **Superseded by the scope cut.** The round 2 namespace-aware liveness (89f2ed56, bc69194c, 5300ffcd, the `ownerAlive`/`childAlive` probes) and the later PR #864 P1 fixes (085e829c, f9d31966, 83d75f4c) are reverted to main's lock and owner liveness; see "Scope cut: PID-namespace liveness (to its own PR)". The liveness parts of the `src/residency/host.ts`, `src/storage/retention.ts` and `src/storage/scratch.ts` rows below are superseded too; main's incarnation wiring, `ownedStat`, `countRefusal` and `verifiedRemove` stay.
 
 | File | Method | Resolution |
 |---|---|---|
@@ -655,3 +657,51 @@ Auditor fv2-864-aud6 (Luna xhigh, read-only, not the author) reviewed the 3 rows
 | `src/worker.ts` | PASS | #829 replays explicit profile extensions without enabling auto-discovery; #853 typed overflow path and durable-runner discovery policy remain | `src/worker.ts:468-471,492-520,1043-1044,1953-2000,2640-2642`; `src/worker/profile-extensions.ts:72-145`; `scripts/assert-build-artifacts.mjs:103`; `tests/actor-context-overflow.test.ts:207-244`; `diff-085e829c-to-merge.txt:163-214` |
 
 Findings: none (3 PASS, 0 FAIL, 0 CONCERN).
+
+## Scope cut: PID-namespace liveness (to its own PR)
+
+Chief-of-staff ruling, 10-11 20:02Z: **split**. This sync lands on main's current lock and owner liveness. The PID-namespace liveness work moves to its own PR off main, under a new smarty-dev issue. The cut is one commit on top of 03782396, before the merge of current main below. The removed diff is kept outside the repo as `liveness-split.patch` for that PR. It re-applies on the cut commit.
+
+Why: the namespace-aware liveness has needed a P1 fix in every review round (89f2ed56, bc69194c, 5300ffcd, then 085e829c, f9d31966, 83d75f4c). It changes how every lock and owner record is judged, so it gets its own review against main. Without it, this PR has no lock or owner liveness change.
+
+What the cut removes:
+
+- Upstream 0.110.1 liveness: 7c836626 (owner identity, heartbeats and namespace-aware probes), 748580eb (run-root owners judged by identity and heartbeat), and the reap rule of 1ed0cf74 in `src/core/file-lock.ts` (`EPERM` counts as alive; damaged metadata falls back to the directory mtime).
+- Branch liveness: a8005ea4 (that reap rule and the identity line ported into our sync lock), round 2 (89f2ed56, bc69194c, 5300ffcd) and the PR #864 P1 fixes (085e829c, f9d31966, 83d75f4c).
+
+Restored to main (048e031e) exactly, whole file:
+
+| File | Liveness removed |
+|---|---|
+| `src/actors/binding-store.ts` | identity line in the binding lock owner; `lockOwnerLiveness` reaping |
+| `src/actors/registry-store.ts` | locality token (`localityLockToken`), `lockTokenLocality`, `unknownNamespaceLockLiveness` in dead-owner recovery |
+| `src/mesh/custody-lock.ts` | locality token; foreign owners never recovered; hostname previous-boot tag |
+| `src/mesh/mesh-lock.ts` | locality token; foreign and unknown-namespace recovery rules; the "another host or PID namespace" holder text |
+| `src/residency/launcher-owner.ts`, `src/residency/launcher.ts` | `liveOwnerPid` with `recordOwnerLiveness` (the launcher only imported it) |
+| `src/schema/controller.ts` | commit-lock identity and heartbeat; `recordOwnerLiveness` in journal recovery |
+| `src/storage/retention.ts` | `RUN_ROOT_HEARTBEAT_TTL_MS`, owner identity on run-root markers, `ownerAlive`/`childAlive`, the `owner` parameter of `safeRunTree` |
+| `src/storage/scratch.ts` | owner identity on scratch markers, `ownerAlive`/`childAlive` |
+| `tests/retention.test.ts`, `tests/scratch.test.ts`, `tests/schema-enforcement.test.ts`, `tests/host-lease-custody-paths.test.ts` | their namespace and identity cases, and the locality-token receipt match |
+
+Deleted, since main lacks them: `tests/liveness.test.ts`, `tests/lock-token-locality.test.ts`, `tests/mesh-lock-unknown-namespace-crash.test.ts` and its fixture `tests/fixtures/mesh-lock-unknown-namespace-crash.ts`.
+
+Liveness hunks removed; the upstream features in the same files stay:
+
+| File | Removed | Kept (not liveness) |
+|---|---|---|
+| `src/core/atomic-write.ts` | the owner-liveness section (`ownerLiveness`, `recordOwnerLiveness`, `lockOwnerLiveness`, identity lines, heartbeats, procfs evidence, `SHORT_LOCK_MAX_HOLD_MS`), lock-token locality (`localityLockToken`, `lockTokenLocality`, `unknownNamespaceLockLiveness`) and a8005ea4's sync-lock reap rule | upstream `FileLockTimeoutError`; the sync lock throws it on contention |
+| `src/core/file-lock.ts` | identity line, `ownerCanBeReaped` (`EPERM` alive, mtime fallback, `lockOwnerLiveness`); the owner probe and reap rule are main's again | `FileLockTimeoutError`; only `ENOENT` falls through to ownerless-lock recovery, which re-checks that the claimed directory is still ownerless |
+| `src/residency/client.ts` | `recordOwnerLiveness` in `#liveOwner` (5300ffcd); main's `residentProcessAlive` start-time probe is back | upstream runner `residentModule` handoff |
+| `src/residency/host.ts` | `ownerAlive`, the owner heartbeat timer, `identity`/`heartbeatAt` in `owner.json` and `host.lock`, `#refreshHeartbeat` (5300ffcd) | runner modules, hosted-run recovery, `residentIdleDecision` and its schedule wake, launch scope, sender stamps, `forkSeed` refusal, indeterminate outcome |
+| `src/residency/protocol.ts` | `ResidentHostOwner extends OwnerHeartbeatFields` | `runnerModule`, `outcome` and `scope` fields |
+| `tests/residency.test.ts` | the 3 foreign or local owner offline-cleanup cases (5300ffcd) | upstream runner-module and scope cases |
+| `tests/residency-host.test.ts` | "resident owner identity" | upstream `sender: null` expectations |
+| `tests/file-lock.test.ts` (upstream) | the 3 damaged-metadata recovery cases and the `EPERM` case, in both lock modes | ownerless recovery, dead-owner recovery, live-owner protection, grace period, release, contention |
+| `tests/mesh-schedules.test.ts` | `localityLockToken()` as the live holder's token; it is a plain `randomUUID()`, as on main | the cancelled-schedule case (0c0f9065) |
+| `docs/residency-runtime.md` | the "Containers and PID namespaces" section, with the operator-recovery text "Recovering a lock whose owner's PID namespace is unknown" (83d75f4c) | scope, scheduled-events and incarnation text |
+| `docs/configuration.md` | the locality-token and unknown-namespace recovery text in the mesh lock recovery paragraph | everything else |
+| `docs/architecture.md` | "Lock and owner liveness is PID-namespace aware" | upstream foreground tools and provider lines |
+
+Not changed: upstream's README release note for 0.103.0 still lists "heartbeat liveness across PID namespaces" as upstream's own history. The hosted-runner `liveness()` contract (`FabricHostedLiveness`) is unrelated and stays.
+
+Check: `git diff refs/remotes/origin/main-now HEAD -- src/core/atomic-write.ts` shows only `FileLockTimeoutError` and its throw. No file under `src/` or `tests/` names `ownerLiveness`, `lockOwnerLiveness`, `lockTokenLocality`, `pidNamespace` or `unknownNamespaceLockLiveness`.

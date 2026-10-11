@@ -6,13 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { FabricTraceSafeError } from "../audit/trace.js";
 import { schemaRefAllowedInEnforce } from "./policy.js";
-import {
-  writeFileAtomic,
-  writeJsonAtomic,
-  ownerHeartbeatFields,
-  recordOwnerLiveness,
-  startOwnerHeartbeat,
-} from "../core/atomic-write.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricSchemaConfig, FabricSchemaTrustedCommand } from "../config.js";
 import type { MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
@@ -820,17 +814,11 @@ export class SchemaController {
     return this.mesh.publish({ topic: SCHEMA_TOPIC, kind, from: this.identity, data });
   }
 
-  // `pid\ncreated\n{identity, heartbeatAt}\n`: the third line is additive and
-  // refreshed while the transaction runs, since postconditions can be slow.
   #acquireCommitLock(): () => void {
     fs.mkdirSync(this.#journalRoot, { recursive: true, mode: 0o700 });
-    const lockPath = this.#lockPath;
-    const prefix = `${process.pid}\n${Date.now()}\n`;
-    const { identity, heartbeatAt } = ownerHeartbeatFields();
-    const contents = (beat: number): string => `${prefix}${JSON.stringify({ ...identity, heartbeatAt: beat })}\n`;
     try {
-      const descriptor = fs.openSync(lockPath, "wx", 0o600);
-      fs.writeFileSync(descriptor, contents(heartbeatAt));
+      const descriptor = fs.openSync(this.#lockPath, "wx", 0o600);
+      fs.writeFileSync(descriptor, `${process.pid}\n${Date.now()}\n`);
       fs.closeSync(descriptor);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "EEXIST") {
@@ -838,47 +826,21 @@ export class SchemaController {
       }
       throw error;
     }
-    const stopHeartbeat = startOwnerHeartbeat((beat) => {
-      if (fs.readFileSync(lockPath, "utf8").startsWith(prefix)) writeFileAtomic(lockPath, contents(beat));
-    });
-    return () => {
-      stopHeartbeat();
-      fs.rmSync(lockPath, { force: true });
-    };
+    return () => fs.rmSync(this.#lockPath, { force: true });
   }
 
   #recoverJournals(): void {
     fs.mkdirSync(this.#journalRoot, { recursive: true, mode: 0o700 });
     try {
-      const [pidText, , ownerLine] = fs.readFileSync(this.#lockPath, "utf8").split("\n");
+      const [pidText] = fs.readFileSync(this.#lockPath, "utf8").split("\n");
       const pid = Number(pidText);
       if (Number.isSafeInteger(pid) && pid > 0) {
-        let owner: unknown;
         try {
-          owner = ownerLine && ownerLine.length <= 2_048 ? JSON.parse(ownerLine) : undefined;
+          process.kill(pid, 0);
+          return;
         } catch {
-          owner = undefined;
+          // The owner is gone; recover its applying journal below.
         }
-        // An owner in another PID namespace is judged by its heartbeat;
-        // "unknown" is not death, so its journal is left alone.
-        const liveness = recordOwnerLiveness({
-          pid,
-          identity: owner,
-          ...(typeof owner === "object" && owner !== null && "heartbeatAt" in owner
-            ? { heartbeatAt: owner.heartbeatAt }
-            : {}),
-        }, {
-          legacyAlive: (candidate) => {
-            try {
-              process.kill(candidate, 0);
-              return true;
-            } catch {
-              return false;
-            }
-          },
-        });
-        if (liveness !== "dead") return;
-        // The owner is gone; recover its applying journal below.
       }
       fs.rmSync(this.#lockPath, { force: true });
     } catch (error) {

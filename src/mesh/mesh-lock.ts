@@ -3,10 +3,10 @@ import { MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { lockTokenLocality, localityLockToken, ownProcessIncarnation, processIncarnation, unknownNamespaceLockLiveness, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -66,12 +66,11 @@ export const describeLockHolder = (ownerPath: string): string => {
   } catch {
     return " (lock directory has no owner record)";
   }
-  const [token, pidText, createdText] = owner.trim().split("\n");
+  const [, pidText, createdText] = owner.trim().split("\n");
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid <= 0) return " (lock owner record is unreadable)";
   const createdAt = Number(createdText);
   const held = Number.isFinite(createdAt) ? ` for ${Math.max(0, Math.round((Date.now() - createdAt) / 1000))} s` : "";
-  if (lockTokenLocality(token) === "foreign") return ` held by pid ${pid} (another host or PID namespace; not probed)${held}`;
   if (!processAlive(pid)) return ` held by pid ${pid} (not running)${held}`;
   let state = "";
   try {
@@ -213,8 +212,7 @@ export class MeshLock {
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
-    // The token names this process's host, PID namespace and boot (lockTokenLocality).
-    const token = localityLockToken();
+    const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
     const releaseOwned = (): void => {
       try {
@@ -377,17 +375,7 @@ export class MeshLock {
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
-      // The local signal probe answers only for this host, PID namespace and boot: an owner
-      // elsewhere is unknown, never dead (an invisible PID is not ESRCH proof). An owner from
-      // an earlier boot of this host is dead. Untagged (older) owners keep the plain probe.
-      // An owner on this host with an unknown PID namespace stays foreign, but its creation
-      // time is the heartbeat: past the hold ceiling it is dead and recovers here (PR #864 P1),
-      // unless our procfs still shows its PID (with the recorded start, when there is one).
-      const locality = lockTokenLocality(token);
-      const heartbeat = unknownNamespaceLockLiveness(token, Number(createdText),
-        { staleMs: this.#staleLockMs, pid, start: recordedStart });
-      if (locality === "foreign" && heartbeat !== "dead") return false;
-      if (heartbeat !== "dead" && locality !== "previous-boot" && processAlive(pid)) {
+      if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         // Registry-fenced publication cannot start even a bounded native read.
         // Fail closed; the ordinary outside-custody admission lane obtains fresh
@@ -408,17 +396,12 @@ export class MeshLock {
         } finally { clearTimeout(timer); }
         if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
       }
-      // The judged directory (dev/ino) and the complete owner record, token included, are re-read
-      // just before the rename; any change fails closed.
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
         return current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino && readOwner() === owner;
       };
       if (!unchanged()) return false;
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
-      // The fence name is a function of the judged identity, so recovery is serialized: of two
-      // recoverers that judged this owner, only one rename succeeds; the other meets the
-      // nonempty fence (or a successor's directory under the canonical name) and fails closed.
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting
       // it, or recursively deleting the canonical name after a re-read, reopens that race.

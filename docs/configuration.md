@@ -854,12 +854,7 @@ replaced aborts with `FABRIC_MESH_LOCK_OWNERSHIP_LOST` and never overwrites a su
 Protocol 2 uses fully initialized private-directory publication. Both require the complete
 owner record to match and detach the owned directory before recursive release. Recovery
 requires a complete recorded owner and proof that its PID is absent (native `ESRCH`), or
-that its native incarnation differs. The owner token names the writer's host, PID namespace
-and boot (`<uuid>-<locality>`); a local probe proves nothing about an owner on another host
-or in another PID namespace, so such an owner is never recovered, and an owner from an
-earlier boot of this host is dead. One exception: on this host with an unknown PID namespace,
-the owner's creation time is its heartbeat and the lock is recovered after 10 minutes unless
-`/proc` still shows its PID (see [Recovering a lock whose owner's PID namespace is unknown](residency-runtime.md#recovering-a-lock-whose-owners-pid-namespace-is-unknown)). Tokens without a locality suffix keep the plain probe. An empty directory with no owner record is stale
+that its native incarnation differs. An empty directory with no owner record is stale
 strictly after the 30-second grace (source-level `staleLockMs`). Recovery uses atomic
 empty-directory removal, not rename or recursive deletion: an initializer that publishes
 an owner before removal prevents it, even if the recoverer paused after its last check.

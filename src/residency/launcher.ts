@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
-import { liveOwnerPid, observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
+import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";

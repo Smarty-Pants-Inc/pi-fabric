@@ -23,7 +23,7 @@ import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ownerHeartbeatFields, recordOwnerLiveness, startOwnerHeartbeat, writeJsonAtomic } from "../core/atomic-write.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, type PiModelRegistryView } from "../core/model-refresh.js";
@@ -159,13 +159,6 @@ const loadRunnerModule = (specifier: string): Promise<void> => {
 
 export class ResidentHostAlreadyRunning extends Error {}
 
-// Identity-bearing owners (host, PID namespace, boot, heartbeat) are judged
-// namespace-aware: a reader in another PID namespace cannot see our PID, and
-// "unknown" is never death. Identity-less (older) records keep the start-time probe.
-const ownerAlive = (record: unknown): boolean =>
-  recordOwnerLiveness(record, { legacyAlive: (pid: number) => residentProcessAlive(pid,
-    (record as { processStartTime?: string } | null)?.processStartTime) }) !== "dead";
-
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
   const index = argv.indexOf("--config");
   const value = index >= 0 ? argv[index + 1] : undefined;
@@ -287,7 +280,6 @@ export class ResidentHost {
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
-  #stopHeartbeat: (() => void) | undefined;
   #idleSince = Date.now();
   #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
   // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
@@ -696,7 +688,6 @@ export class ResidentHost {
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
-      this.#stopHeartbeat = startOwnerHeartbeat((heartbeatAt: number) => this.#refreshHeartbeat(heartbeatAt));
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
@@ -756,7 +747,6 @@ export class ResidentHost {
         hostId: this.hostId,
         pid: process.pid,
         processStartTime: processStartTime(process.pid),
-        ...ownerHeartbeatFields(now),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
@@ -838,8 +828,6 @@ export class ResidentHost {
     // so the successor host's projector takes over at once.
     const projectorStopped = this.#stateProjector?.then(projector => projector?.stop()).catch(() => undefined);
     const routeClosed = this.#routeOwner?.close();
-    this.#stopHeartbeat?.();
-    this.#stopHeartbeat = undefined;
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
     if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
@@ -1914,7 +1902,7 @@ export class ResidentHost {
   /** Legacy Windows primitive: an atomic claim, not automatic crash recovery. */
   #acquireWindowsLock(): void {
     const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && ownerAlive(existing)) {
+    if (existing && residentProcessAlive(existing.pid, existing.processStartTime)) {
       throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
     }
     try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
@@ -1928,7 +1916,7 @@ export class ResidentHost {
     }
     this.#exclusiveCreateLock = true;
     try {
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), ...ownerHeartbeatFields() }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
     } catch (error) { this.#releaseLock(error); throw error; }
   }
 
@@ -1955,7 +1943,7 @@ export class ResidentHost {
       if (!sameInode(current)) throw new Error("Fabric resident host startup inode was replaced; verify legacy drain");
       // Read before overwriting: an unknown birth identity is not permission to displace a live owner.
       const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
-      if (records.some((owner) => owner && owner.pid !== process.pid && ownerAlive(owner))) {
+      if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
         throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
       }
       const provenancePath = path.join(this.config.residencyRoot, "host-fence.json");
@@ -1970,7 +1958,7 @@ export class ResidentHost {
         atomicWrite(provenancePath, { format: 1, dev: String(locked.dev), ino: String(locked.ino) });
       }
       fs.ftruncateSync(this.#lockFd, 0);
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid), ...ownerHeartbeatFields() }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
     } catch (error) { this.#releaseLock(error); throw error; }
   }
 
@@ -1990,22 +1978,7 @@ export class ResidentHost {
     } catch { return false; }
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (owner?.token === this.#token) return owner.pid === process.pid;
-    return !owner || !ownerAlive(owner);
-  }
-
-  // Long-lived ownership: refresh both the start lock and owner.json while
-  // they are still ours, so readers in other PID namespaces can judge us.
-  #refreshHeartbeat(heartbeatAt: number): void {
-    const lock = readJson<Record<string, unknown>>(this.#lockPath);
-    if (lock?.token === this.#token && this.#lockFd !== undefined) {
-      // flock fences this inode for the whole host lifetime: atomic rename would
-      // replace it and let a second host acquire an unrelated lock. Refresh in place.
-      const text = JSON.stringify({ ...lock, heartbeatAt });
-      fs.writeSync(this.#lockFd, text, 0, "utf8");
-      fs.ftruncateSync(this.#lockFd, Buffer.byteLength(text));
-    }
-    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (owner?.token === this.#token) atomicWrite(this.#ownerPath, { ...owner, heartbeatAt });
+    return !owner || !residentProcessAlive(owner.pid, owner.processStartTime);
   }
 
   #releaseLock(failure = this.#failure): void {

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { AtomicFileWriter, localityLockToken, lockTokenLocality, renameAtomic, syncDirectoryChain, unknownNamespaceLockLiveness, writeFileAtomic } from "../core/atomic-write.js";
+import { AtomicFileWriter, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
 import { ActorRegistryPayloads } from "./registry-payloads.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
@@ -451,8 +451,7 @@ export class ActorRegistryStore {
     const lockPath = `${this.#registryPath}.lock`;
     const ownerPath = path.join(lockPath, "owner");
     const deadline = Date.now() + Math.min(timeoutMs, ACTOR_REGISTRY_LOCK_TIMEOUT_MS);
-    // The token names this process's host, PID namespace and boot (lockTokenLocality).
-    const token = localityLockToken();
+    const token = randomUUID();
     const started = this.#ownProcessStart;
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
     fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
@@ -477,25 +476,11 @@ export class ActorRegistryStore {
             createdText.trim() !== "" && Number.isFinite(Number(createdText));
           // A torn fourth line cannot prove PID reuse. Unknown/denied identities stay live.
           const recordedStart = firstOwner.endsWith("\n") && startText && /^\d+$/.test(startText) ? startText : undefined;
-          // The local probe answers only for this host, PID namespace and boot: an owner
-          // elsewhere is unknown and never reaped (an invisible PID is not proof of death).
-          // An owner from an earlier boot of this host is dead; untagged owners keep the probe.
-          // An owner on this host with an unknown PID namespace stays foreign, but its creation
-          // time is the heartbeat (never ESRCH): past the hold ceiling it is dead (PR #864 P1).
-          const locality = lockTokenLocality(holder);
-          // Positive evidence outranks age: our procfs still showing the PID (with the recorded
-          // start, when there is one) keeps an unknown-namespace owner alive however old.
-          const heartbeat = validOwner
-            ? unknownNamespaceLockLiveness(holder, Number(createdText),
-              { staleMs: ACTOR_REGISTRY_STALE_LOCK_MS, pid, start: recordedStart })
-            : undefined;
-          const alive = heartbeat === undefined && validPid && locality !== "previous-boot" && processAlive(pid);
+          const alive = validPid && processAlive(pid);
           const actualStart = alive && recordedStart ? processStartTime(pid) : undefined;
-          const dead = heartbeat === "dead" || (locality !== "foreign" && (alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
-            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS));
+          const dead = alive ? validOwner && actualStart !== undefined && actualStart !== recordedStart :
+            validOwner || Date.now() - stat.mtimeMs > ACTOR_REGISTRY_STALE_LOCK_MS;
           if (dead) {
-            // Re-read the judged directory (dev/ino) and the complete owner record, token
-            // included, just before the rename; the identity-bound fence serializes recoverers.
             const current = fs.lstatSync(lockPath);
             if (current.isDirectory() && current.dev === stat.dev && current.ino === stat.ino &&
               fs.readFileSync(ownerPath, "utf8") === firstOwner) {

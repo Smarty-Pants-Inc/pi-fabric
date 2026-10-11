@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFileRetrying, recordOwnerLiveness, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
@@ -1031,10 +1031,7 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      // Only confirmed death retires the owner. An identity-bearing owner in another PID
-      // namespace is judged by its heartbeat; "unknown" stays live, so cleanupAgent never
-      // falls through to offline run-directory removal on a local ESRCH.
-      recordOwnerLiveness(owner, { legacyAlive: (pid: number) => residentProcessAlive(pid, owner.processStartTime) }) === "dead"
+      !residentProcessAlive(owner.pid, owner.processStartTime)
     ) {
       return undefined;
     }

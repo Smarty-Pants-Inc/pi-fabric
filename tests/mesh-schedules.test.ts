@@ -1,9 +1,9 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
-import { localityLockToken } from "../src/core/atomic-write.js";
 import { MeshStore, MESH_MAX_PENDING_SCHEDULES, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider, meshScheduleDueAt } from "../src/providers/mesh-provider.js";
@@ -112,7 +112,7 @@ describe("mesh schedules", () => {
     // A live local holder: this process, without an incarnation, so recovery never takes it.
     const lock = path.join(store.root, ".lock");
     fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(lock, "owner"), `${localityLockToken()}\n${process.pid}\n${Date.now()}\n`);
+    fs.writeFileSync(path.join(lock, "owner"), `${randomUUID()}\n${process.pid}\n${Date.now()}\n`);
     const abort = new AbortController();
     const provider = new MeshProvider(store, identity, participants);
     const pending = (level === "store"

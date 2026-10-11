@@ -676,25 +676,6 @@ describe.skipIf(process.platform !== "linux")("#2566 owned startup shutdown", ()
   }, 15_000);
 });
 
-describe("resident owner identity", () => {
-  // PR #864 review P1: readers in another PID namespace judge the host by identity and heartbeat.
-  it("publishes namespace-aware identity and heartbeat in owner.json and the start lock", async () => {
-    const { root, config, host } = fixture();
-    try {
-      await host.start();
-      for (const file of ["owner.json", "host.lock"]) {
-        const record = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, file), "utf8"));
-        expect(record).toMatchObject({ pid: process.pid, identity: { hostname: os.hostname() } });
-        expect(record.heartbeatAt).toBeTypeOf("number");
-        expect(Math.abs(Date.now() - record.heartbeatAt)).toBeLessThan(60_000);
-      }
-    } finally {
-      await host.close();
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-});
-
 describe("resident loaded-path census metadata", () => {
   it("publishes the startup generation rather than a later desired configuration", async () => {
     const { root, config, host } = fixture();

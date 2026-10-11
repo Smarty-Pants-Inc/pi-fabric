@@ -1242,7 +1242,9 @@ export class AgentManager {
         throw error;
       }
       const runDirectory = path.join(this.#runRoot, id);
-      fs.mkdirSync(runDirectory, { recursive: true });
+      // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
+      // verified retention refuses (group-writable). recursive applies the mode only to directories it creates.
+      fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
       // Establish custody before a worker can produce its only full outcome. A
       // later disk failure cannot leave a terminal source collectible without a fence.
       if (this.#onSettled || this.#onStoppedAtClose || routeDispatch) {

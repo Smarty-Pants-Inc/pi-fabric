@@ -356,7 +356,7 @@ const main = async (): Promise<void> => {
     data?: Record<string, unknown>,
   ): void => {
     try {
-      fs.mkdirSync(path.dirname(options.lifecycleFile), { recursive: true });
+      fs.mkdirSync(path.dirname(options.lifecycleFile), { recursive: true, mode: 0o700 }); // smarty-dev#9016
       fs.appendFileSync(
         options.lifecycleFile,
         JSON.stringify({ version: 1, event, occurredAt: Date.now(), ...(data ? { data } : {}) }) + "\n",
@@ -368,7 +368,7 @@ const main = async (): Promise<void> => {
   };
   crashContext = { statusFile: options.statusFile, record };
   process.stdout.write(`[pi-fabric] ${options.name}\n${task}\n\n`);
-  fs.mkdirSync(path.dirname(options.logFile), { recursive: true });
+  fs.mkdirSync(path.dirname(options.logFile), { recursive: true, mode: 0o700 }); // smarty-dev#9016
   // Other processes tail this file while the run is live (transcript reader,
   // dashboards, preview trees). The previous buffered createWriteStream visibly
   // stalled mid-run — append synchronously so events are durable immediately.

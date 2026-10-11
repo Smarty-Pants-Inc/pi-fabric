@@ -6,6 +6,13 @@ import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
 import type { FabricActorMessage } from "./types.js";
 
+/** chmod 0700 every directory of a copied tree (lstat: links are never followed). */
+const closeDirectories = (directory: string, depth = 0): void => {
+  if (depth > 64 || !fs.lstatSync(directory).isDirectory()) return;
+  fs.chmodSync(directory, 0o700);
+  for (const name of fs.readdirSync(directory)) closeDirectories(path.join(directory, name), depth + 1);
+};
+
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
 
 export const ACTOR_MESSAGE_ENVELOPE_BYTES = 4_096;
@@ -104,6 +111,9 @@ export class ActorLogStore {
     if (fs.existsSync(nested)) {
       try {
         fs.cpSync(nested, path.join(dest, "nested"), { recursive: true });
+        // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
+        // the archive itself (smarty-dev#9016). Files keep their modes.
+        closeDirectories(path.join(dest, "nested"));
       } catch {
         /* best-effort recursive run retention */
       }

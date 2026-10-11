@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, actorTreeRemoval } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -1486,10 +1486,10 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
       try {
         const actor = await state.client.createActor({ ...requestArgs(state, "create"), name: "cleanup-retry", instructions: "Work.", residency: "durable" });
         const directory = path.join(state.config.actorRoot, actor.id);
-        const rm = fs.rmSync.bind(fs);
-        failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+        const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+        failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
           if (target === directory) throw new Error("accepted cleanup remains unavailable");
-          return rm(target, options);
+          return removeTree(target, real, judged);
         });
         await expect(state.client.removeActor(actor.id)).resolves.toMatchObject({ removed: true, cleaned: false });
         const accepted = decisionsFor(state).find(d => d.operation === "removeActor")!;

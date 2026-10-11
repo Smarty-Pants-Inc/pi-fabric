@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
-  activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+  activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError, actorTreeRemoval } from "../src/actors/manager.js";
 import { classifyActivationFailure } from "../src/actors/activation-failure.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
@@ -6020,7 +6020,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     const presenceKey = `actors/test/${actor.id}`;
     const registryIds = () => (JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as
       { actors: Array<{ id: string }> }).actors.map((entry) => entry.id);
-    const rm = fs.rmSync.bind(fs);
+    const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
     const del = mesh.delete.bind(mesh);
     let failures = 0;
     const fail = () => {
@@ -6029,9 +6029,9 @@ describe("ActorManager removal behind an in-flight run", () => {
       throw new Error(`persistent ${failure} failure`);
     };
     const spy = failure === "directory"
-      ? vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      ? vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
           if (target === sessionDir) fail();
-          return rm(target, options);
+          return removeTree(target, real, judged);
         })
       : vi.spyOn(mesh, "delete").mockImplementation(async (input) => {
           if (input.key === presenceKey) fail();
@@ -6249,10 +6249,10 @@ it("#169 round 3 answers owns() for a cleanup-only id on a cold manager", async 
   const { actors, root, agents, mesh, identity, meshConfig } = setup(true);
   const actor = await actors.create({ name: "cold", instructions: "Work." });
   await actors.stop(actor.id);
-  const rm = fs.rmSync.bind(fs);
-  const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+  const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+  const failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
     if (String(target) === path.join(root, "actors", actor.id)) throw new Error("directory busy");
-    return rm(target, options);
+    return removeTree(target, real, judged);
   });
   let result: { removed: boolean; cleaned?: boolean };
   try { result = await actors.remove(actor.id); } finally { failing.mockRestore(); }
@@ -6456,10 +6456,10 @@ describe("#169 round 1 removal safety", () => {
     const actor = await actors.create({ name: "healthy", instructions: "Work." });
     const actorRoot = path.join(root, "actors");
     const dir = path.join(actorRoot, actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const fail = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+    const fail = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
       if (target === dir) throw new Error("cleanup storage unavailable");
-      return rm(target, options);
+      return removeTree(target, real, judged);
     });
     try { await actors.remove(actor.id); } finally { fail.mockRestore(); }
     await actors.close();

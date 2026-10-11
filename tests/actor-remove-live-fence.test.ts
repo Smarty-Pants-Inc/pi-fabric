@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { offlineRemovalHooks } from "../src/actors/remove-offline.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { mainPublicationFenced, takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
@@ -54,16 +55,66 @@ describe.skipIf(process.platform !== "linux")("live actor remove under the Main 
     } finally { warn.mockRestore(); error.mockRestore(); await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
   }, 30_000);
 
+  it("an actor presence refresh under the fence is a pending refresh: no warning, and the next refresh publishes", async () => {
+    const meshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-fenced-presence-"));
+    const rootId = "session:fenced-presence";
+    const lines: unknown[][] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((...args) => { lines.push(args); });
+    const directory = mainDirectory(meshRoot, rootId, undefined, { heartbeatMs: 300 });
+    const updatedAt = () => readParticipantFile(meshRoot, rootParticipantKey(rootId))?.updatedAt ?? 0;
+    try {
+      await directory.start();
+      const before = updatedAt();
+      expect(before).toBeGreaterThan(0);
+      const release = await takeMainPublicationFence(meshRoot, rootId);
+      await expect(directory.refreshPresence()).resolves.toBeUndefined();
+      expect(updatedAt()).toBe(before);
+      release();
+      await vi.waitFor(() => expect(updatedAt()).toBeGreaterThan(before), { timeout: 2_000, interval: 10 });
+      expect(lines).toEqual([]);
+    } finally { warn.mockRestore(); await directory.close(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it("an actor root swapped for a symlink during the removal cannot redirect the tree delete outside it", async () => {
+    const f = await fixture();
+    const outside = path.join(f.root, "outside");
+    const moved = `${f.config.actorRoot}.real`;
+    let swapped = false;
+    try {
+      const actor = await seed(f, "swapped-root");
+      fs.mkdirSync(path.join(outside, actor.id), { recursive: true });
+      fs.writeFileSync(path.join(outside, actor.id, "keep.txt"), "outside");
+      // A concurrent writer, right before the tree delete: the actor root becomes a link to another directory that
+      // holds an entry with the actor's name.
+      const remove = ActorBindingStore.prototype.delete;
+      const spy = vi.spyOn(ActorBindingStore.prototype, "delete").mockImplementation(async function (this: ActorBindingStore, id: string) {
+        const deleted = await remove.call(this, id);
+        if (id === actor.id && !swapped) { swapped = true; fs.renameSync(f.config.actorRoot, moved); fs.symlinkSync(outside, f.config.actorRoot); }
+        return deleted;
+      });
+      let result: unknown;
+      try { result = await f.host.actors.remove(actor.id, { wait: false }); } finally { spy.mockRestore(); }
+      expect(swapped).toBe(true);
+      expect(fs.readFileSync(path.join(outside, actor.id, "keep.txt"), "utf8")).toBe("outside");
+      expect(result).toMatchObject({ cleaned: false, pending: expect.stringContaining("removal cleanup failed") });
+      expect(fs.readFileSync(path.join(moved, actor.id, "session.jsonl"), "utf8")).toBe("history\n"); // the real tree is kept
+    } finally {
+      if (swapped) { fs.unlinkSync(f.config.actorRoot); fs.renameSync(moved, f.config.actorRoot); }
+      await f.close();
+    }
+  }, 40_000);
+
   it("a Main-initiated removal deletes the tree under the fence, with no check", async () => {
     const f = await fixture();
-    const rm = fs.rmSync;
     const fencedAtDelete: boolean[] = [];
     try {
       const actor = await seed(f, "main-initiated");
-      const spy = vi.spyOn(fs, "rmSync").mockImplementation(((file: fs.PathLike, options?: fs.RmOptions) => {
-        if (String(file) === actor.dir) fencedAtDelete.push(mainPublicationFenced(f.config.meshRoot, f.config.rootId));
-        return rm(file, options);
-      }) as typeof fs.rmSync);
+      // The bindings delete runs right before the tree delete, inside the same fenced step.
+      const remove = ActorBindingStore.prototype.delete;
+      const spy = vi.spyOn(ActorBindingStore.prototype, "delete").mockImplementation(async function (this: ActorBindingStore, id: string) {
+        if (id === actor.id) fencedAtDelete.push(mainPublicationFenced(f.config.meshRoot, f.config.rootId));
+        return remove.call(this, id);
+      });
       try { await f.host.actors.remove(actor.id); } finally { spy.mockRestore(); }
       expect(fencedAtDelete).toEqual([true]);
       expect(fs.existsSync(actor.dir)).toBe(false);

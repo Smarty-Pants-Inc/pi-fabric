@@ -890,6 +890,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       try { await this.#refreshing; }
       catch (error) {
         if (isMeshLockTimeout(error)) return;
+        if (error instanceof MainPublicationFencedError) break; // that round was fenced; try ours
         throw error;
       }
     }
@@ -897,7 +898,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Do not call refresh(): mutation callers must not masquerade as automatic
     // heartbeats. The next full round still renews every actor envelope (#5128)
     // and its host lease in the same single batch.
-    await this.#runRefresh(false);
+    try { await this.#runRefresh(false); }
+    catch (error) {
+      // smarty-dev#8090 (pi-fabric#922 P2): an actor-tree delete fences this root. The change stays pending: a
+      // scheduled change refresh (itself a silent fenced retry) or the next heartbeat publishes it. Not a failure.
+      if (!(error instanceof MainPublicationFencedError)) throw error;
+      this.scheduleRefresh();
+    }
   }
 
   /** A heartbeat: publishes the records and renews this host's lease. */

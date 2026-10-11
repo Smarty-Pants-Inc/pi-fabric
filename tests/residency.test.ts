@@ -8,7 +8,7 @@ import { completionConsumed } from "../src/agents/completion-journal.js";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, actorTreeRemoval } from "../src/actors/manager.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
@@ -631,10 +631,10 @@ describe("#169 round 2 public cleanup outcome", () => {
       const actor = await client.createActor({ name: "public cleanup", instructions: "Work.", residency: "durable" });
       const dir = path.join(state.config.actorRoot, actor.id);
       const marker = path.join(state.config.actorRoot, `removal-${actor.id}.json`);
-      const rm = fs.rmSync.bind(fs);
-      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+      failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
         if (target === dir) throw new Error("public cleanup unavailable");
-        return rm(target, options);
+        return removeTree(target, real, judged);
       });
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
         removed: true, cleaned: false, pending: expect.stringContaining("cleanup failed"),
@@ -682,10 +682,10 @@ describe("#169 round 1 resident cleanup routing", () => {
       const actor = created.actor;
       const dir = path.join(scope === "project" ? state.config.actorRoot : state.config.sessionActorRoot!, actor.id);
       const marker = path.join(path.dirname(dir), `removal-${actor.id}.json`);
-      const rm = fs.rmSync.bind(fs);
-      failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+      failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
         if (target === dir) throw new Error("resident cleanup failure");
-        return rm(target, options);
+        return removeTree(target, real, judged);
       });
       const first = await request({ operation: "removeActor", id: actor.id });
       expect(first).toMatchObject({ ok: true, pending: expect.stringContaining("cleanup failed") });

@@ -10,6 +10,7 @@ import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { deleteRootActorTree } from "../topology/main-publication-fence.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
@@ -236,6 +237,15 @@ export const parseBashTimeoutSeconds = (value: unknown): number => {
     throw new Error(`bashTimeoutSeconds must be a non-negative integer at most ${MAX_ACTOR_BASH_TIMEOUT_S} (0 = no default timeout)`);
   }
   return value;
+};
+
+/** The pinned actor-tree delete after ActorManager's root checks (an object, so a test can fail exactly this step):
+ * verifiedRemove removes exactly the judged inode at `real`; `sessionDir` is the configured path it stands for. */
+export const actorTreeRemoval = {
+  remove(sessionDir: string, real: string, judged: fs.Stats): void {
+    const removed = verifiedRemove(real, judged, { deleter: "actorTreeRemoval" });
+    if (!removed.removed) throw new Error(`Actor tree not removed (${sessionDir}): ${removed.reason}`);
+  },
 };
 
 /** An operator's confirmed dead-root removal (smarty-dev#8090): its liveness check runs again, under the root's
@@ -619,6 +629,9 @@ export class ActorManager {
   readonly #removeCalls = new Map<string, Promise<RemovalResult>>();
   readonly #finishCalls = new Map<string, Promise<RemovalResult>>();
   readonly #actorRoot: string;
+  /** The actor root's real path and identity, first seen at construction (or at the first tree delete). */
+  #actorRootReal: string | undefined;
+  #actorRootPin: { dev: number; ino: number } | undefined;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
   readonly #persistent: boolean;
@@ -836,6 +849,11 @@ export class ActorManager {
   ) {
     this.#actorRoot =
       options.actorRoot ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-actors-"));
+    try {
+      this.#actorRootReal = fs.realpathSync(this.#actorRoot);
+      const root = fs.statSync(this.#actorRootReal);
+      this.#actorRootPin = { dev: root.dev, ino: root.ino };
+    } catch { /* made later: pinned at the first tree delete */ }
     this.#meshRetentionSweepPath = options.meshRetentionSweepPath === false ? undefined : options.meshRetentionSweepPath ??
       (import.meta.url.endsWith(".js") ? fileURLToPath(new URL("../storage/retention-cli.js", import.meta.url)) : undefined);
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
@@ -2761,7 +2779,7 @@ export class ActorManager {
         ?? (async () => { throw new Error("operator removal check unavailable in this process"); })) : undefined;
       await deleteRootActorTree(this.mesh.root, cleanup.owner?.rootId ?? this.#rootId, async () => {
         await this.#bindings.delete(cleanup.id);
-        fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+        this.#removeActorTree(cleanup.sessionDir);
       }, check);
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
@@ -2779,6 +2797,34 @@ export class ActorManager {
       cleanup.pending = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)} (a later remove or host start finishes it)`;
     }
     return this.#cleanupState(cleanup.id);
+  }
+
+  /**
+   * Delete one actor tree, confined to the actor root (pi-fabric#922 P2): the root, opened O_DIRECTORY|O_NOFOLLOW at
+   * its real path, must still be the directory first seen; the tree is judged (lstat) through that fd; verifiedRemove
+   * (smarty-dev#7916: fd-pinned, no-follow, every entry ours and re-verified) removes exactly that inode. A symlink
+   * swapped in for the tree or for the root then fails a check instead of redirecting the delete. Off Linux main's
+   * path-based removal stays (smarty-dev#7858).
+   */
+  #removeActorTree(sessionDir: string): void {
+    if (path.dirname(sessionDir) !== this.#actorRoot) throw new Error(`Actor tree is outside the actor root: ${sessionDir}`);
+    if (process.platform !== "linux") { fs.rmSync(sessionDir, { recursive: true, force: true }); return; }
+    // First seen now: the configured path itself must be a directory, not a link (O_NOFOLLOW; its ancestors may be
+    // links); its real path is read from the opened fd, so no swap fits between a check and the pin.
+    const rootFd = fs.openSync(this.#actorRootReal ?? this.#actorRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    try {
+      this.#actorRootReal ??= fs.readlinkSync(`/proc/self/fd/${rootFd}`);
+      const root = fs.fstatSync(rootFd);
+      this.#actorRootPin ??= { dev: root.dev, ino: root.ino };
+      if (root.dev !== this.#actorRootPin.dev || root.ino !== this.#actorRootPin.ino) {
+        throw new Error(`Actor root changed since this host first saw it; refusing the tree delete: ${this.#actorRoot}`);
+      }
+      const name = path.basename(sessionDir);
+      const judged = fs.lstatSync(`/proc/self/fd/${rootFd}/${name}`, { throwIfNoEntry: false });
+      if (!judged) return; // already gone
+      if (!judged.isDirectory()) throw new Error(`Actor tree is not a directory (a link?); refusing: ${sessionDir}`);
+      actorTreeRemoval.remove(sessionDir, path.join(this.#actorRootReal, name), judged);
+    } finally { fs.closeSync(rootFd); }
   }
 
   async #finishRemove(actor: ManagedActor): Promise<RemovalResult> {

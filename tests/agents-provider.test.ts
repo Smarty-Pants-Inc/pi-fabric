@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, actorTreeRemoval } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
@@ -1312,10 +1312,10 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     const actor = await owner.create({ name: "resident obligation", instructions: "Work.", residency: "durable" });
     expect(passive.list().map((entry) => entry.id)).toContain(actor.id); // Main had the pre-removal view.
     const dir = path.join(actorRoots.project, actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+    const failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
       if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
+      return removeTree(target, real, judged);
     });
     try { await owner.remove(actor.id); } finally { failing.mockRestore(); }
     const removeActor = vi.fn((id: string) => owner.remove(id));
@@ -1338,10 +1338,10 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, undefined, undefined, () => DEFAULT_FABRIC_CONFIG.models);
     const actor = await directory.create({ scope, name: "retry worker", instructions: "Work." });
     const dir = path.join(actorRoots[scope], actor.id);
-    const rm = fs.rmSync.bind(fs);
-    const failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
+    const failing = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
       if (target === dir) throw new Error("cleanup unavailable");
-      return rm(target, options);
+      return removeTree(target, real, judged);
     });
     try {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true, cleaned: false });

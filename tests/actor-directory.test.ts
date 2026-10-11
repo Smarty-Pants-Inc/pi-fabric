@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
+import { actorTreeRemoval } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -105,11 +106,11 @@ describe("ActorDirectory", () => {
     await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
     const dir = path.join(actorRoots[scope], actor.id);
     const marker = path.join(actorRoots[scope], `removal-${actor.id}.json`);
-    const rm = fs.rmSync.bind(fs);
+    const removeTree = actorTreeRemoval.remove.bind(actorTreeRemoval);
     let failures = 0;
-    const fail = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const fail = vi.spyOn(actorTreeRemoval, "remove").mockImplementation((target, real, judged) => {
       if (target === dir) { failures++; throw new Error("persistent cleanup failure"); }
-      return rm(target, options);
+      return removeTree(target, real, judged);
     });
     try {
       await directory.remove(actor.id, { wait: false });

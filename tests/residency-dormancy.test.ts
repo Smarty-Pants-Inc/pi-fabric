@@ -13,8 +13,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { readWakeJson, residentSleepingPath, residentWakeRequestPath, wakeResidentActors, type ResidentWakeRoutes } from "../src/residency/wake.js";
 import { superviseWake } from "../src/residency/launcher.js";
-import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable, DORMANT_RUNTIME_FIELDS, dormantActorConfigDigest } from "../src/residency/wake-index.js";
-import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { canonicalResidentWakeConfig, routesAt, indexResidentDeliveries, acknowledgeResidentDelivery, residentWakeCapacityAvailable } from "../src/residency/wake-index.js";
 import { requestResidentWake, ResidentWakeConfigMismatch } from "../src/residency/wake.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -777,59 +776,154 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { await host.close(); await resumed?.close(); await again?.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("admits a direct dormant message, commits before wake, then gets a real owner ACK and one actor activation", async () => {
-    type Ports = ConstructorParameters<typeof AgentMessageRouter>;
-    const { root, config, host } = fixture();
-    const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+  // #774 round 7: no retained-epoch exception. The woken owner runs under its own fresh epoch and
+  // refuses the retained route's predecessor epoch; the router re-reads the participant once and
+  // resends once with the same idempotency key (one commandId, so one claim and one delivery).
+  type RouterPorts = ConstructorParameters<typeof AgentMessageRouter>;
+  const dormantDirect = async (options: { launch: boolean }) => {
+    const f = fixture();
+    const mesh = new MeshStore(f.config.meshRoot, f.config.mesh.maxEventBytes, f.config.mesh.maxReadEvents);
     const identity = { id: "session:sender", name: "sender", kind: "main" as const };
     const sender = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 50 });
     let woken: ResidentHost | undefined;
+    let launches = 0;
     const seen: string[] = [];
+    const cleanup = async () => {
+      vi.restoreAllMocks(); await sender.close(); await f.host.close(); await woken?.close(); mesh.closeState();
+      fs.rmSync(f.root, { recursive: true, force: true });
+    };
     try {
-      await host.start();
-      const created = await host.actors.create({ name: "direct-listener", instructions: "process", residency: "durable" });
-      await until(() => host.actors.status(created.id).status === "dormant");
-      const actor = host.actors.status(created.id);
-      host.actors.pauseForRelease(); await host.actors.checkpointForRelease(); await host.close();
-      const routes = readWakeJson<{ actors: Array<{ participant?: { ownerHostId: string; actorOwnershipToken?: string } }> }>(path.join(config.residencyRoot, "wake-routes.json"));
-      expect(routes?.actors[0]?.participant?.actorOwnershipToken).toBe(actor.ownershipToken);
-      expect(routes?.actors[0]?.participant?.ownerHostId).toBe(host.hostId);
+      await f.host.start();
+      const created = await f.host.actors.create({ name: "direct-listener", instructions: "process", residency: "durable" });
+      await until(() => f.host.actors.status(created.id).status === "dormant");
+      const actor = f.host.actors.status(created.id);
+      f.host.actors.pauseForRelease(); await f.host.actors.checkpointForRelease(); await f.host.close();
+      const routeFile = path.join(f.config.residencyRoot, "wake-routes.json");
+      const route = () => readWakeJson<ResidentWakeRoutes>(routeFile)?.actors.find(entry => entry.id === actor.id)?.participant;
+      const retained = route()!;
+      expect(retained.actorOwnershipToken).toBe(actor.ownershipToken);
+      expect(retained.ownerHostId).toBe(f.host.hostId);
+      expect(retained.ownerIncarnation).toBeTruthy();
       sender.start(async () => ({ accepted: false, error: "sender does not own actors" }));
+      const { AgentManager } = await import("../src/agents/manager.js");
+      vi.spyOn(AgentManager.prototype, "run").mockImplementation(async (request, _signal, onSpawned) => {
+        const id = "1".repeat(32); onSpawned?.({ id } as never); seen.push(request.task);
+        return { id, status: "completed", text: "done", toolCalls: 0, startedAt: Date.now(), finishedAt: Date.now() } as never;
+      });
       const wake = await import("../src/residency/wake.js");
       const dispatch = wake.wakeResidentActors;
-      let launches = 0;
-      vi.spyOn(wake, "wakeResidentActors").mockImplementation((store, events) => dispatch(store, events, async () => {
+      if (!options.launch) vi.spyOn(wake, "wakeResidentActors").mockResolvedValue(undefined); // the test starts the successor
+      else vi.spyOn(wake, "wakeResidentActors").mockImplementation((store, events) => dispatch(store, events, async () => {
         launches++;
         expect(mesh.read().some(event => event.topic === "fabric.control.command" && (event.data as { targetId?: string }).targetId === actor.id)).toBe(true);
-        const { AgentManager } = await import("../src/agents/manager.js");
-        vi.spyOn(AgentManager.prototype, "run").mockImplementation(async (request, _signal, onSpawned) => {
-          const id = "1".repeat(32); onSpawned?.({ id } as never); seen.push(request.task);
-          return { id, status: "completed", text: "done", toolCalls: 0, startedAt: Date.now(), finishedAt: Date.now() } as never;
-        });
         // Cold startup exceeds the ordinary warm ACK deadline; the admitted command
         // must retain its bounded startup budget rather than expire and get resent.
         await sleep(250);
-        woken = new ResidentHost(config, () => {});
+        woken = new ResidentHost(f.config, () => {});
         await woken.start();
       }));
       const actors = { identity, mesh, owns: () => false, status: (id: string) => {
         if (id !== actor.id) throw new Error(`Unknown Fabric actor: ${id}`); return actor;
-      }, validateDirectMessage: host.actors.validateDirectMessage.bind(host.actors), resolveBinding: () => ({}),
+      }, validateDirectMessage: f.host.actors.validateDirectMessage.bind(f.host.actors), resolveBinding: () => ({}),
       resolveActivationBinding: vi.fn(), tell: vi.fn(), ask: vi.fn(), stop: vi.fn(), steerRemote: vi.fn() };
-      const router = new AgentMessageRouter({ status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as Ports[0],
-        actors as Ports[1], { id: identity.id, local: true, matches: (id: string) => id === identity.id, deliverAgent: vi.fn() } as Ports[2],
-        { get: () => undefined, scheduleRefresh: vi.fn(), lastKnown: () => undefined } as Ports[3], sender, binding => binding);
-      const result = await router.routeMessage(actor.id, "admitted direct delivery", undefined, "followUp");
+      const router = new AgentMessageRouter({ status: (id: string) => { throw new Error(`Unknown Fabric agent: ${id}`); } } as unknown as RouterPorts[0],
+        actors as RouterPorts[1], { id: identity.id, local: true, matches: (id: string) => id === identity.id, deliverAgent: vi.fn() } as RouterPorts[2],
+        { get: () => undefined, scheduleRefresh: vi.fn(), lastKnown: () => undefined } as RouterPorts[3], sender, binding => binding);
+      const commands = () => mesh.read({ topic: "fabric.control.command", limit: 1_000 })
+        .map(event => event.data as { commandId: string; targetId: string; ownerIncarnation?: string })
+        .filter(command => command.targetId === actor.id);
+      const acks = () => mesh.read({ topic: "fabric.control.ack", limit: 1_000 })
+        .map(event => event.data as { commandId: string; accepted: boolean; errorCode?: string; ownerIncarnation?: string; staleIncarnation?: string | null; messageId?: string });
+      const send = (ownerIncarnation: string, message: string, idempotencyKey: string) =>
+        sender.request(retained.ownerHostId, actor.id, "followUp", { message, ownerIncarnation }, retained.ownerIdentityId,
+          { idempotencyKey, timeoutMs: 20_000 });
+      return { ...f, mesh, sender, router, actor, actors, seen, predecessor: retained.ownerIncarnation!, routeEpoch: () => route()?.ownerIncarnation,
+        commands, acks, send, launches: () => launches, woken: () => woken, cleanup };
+    } catch (error) { await cleanup(); throw error; }
+  };
+
+  it("delivers a direct dormant message exactly once after the wake by re-resolving the woken owner's fresh epoch", async () => {
+    const d = await dormantDirect({ launch: true });
+    try {
+      const result = await d.router.routeMessage(d.actor.id, "admitted direct delivery", undefined, "followUp");
       expect(result.acknowledged).toBe(true);
-      expect(launches).toBe(1);
-      expect(mesh.read().filter(event => event.topic === "fabric.control.command")).toHaveLength(1);
-      await until(() => seen.length === 1);
-      expect(seen[0]).toContain("admitted direct delivery");
+      expect(d.launches()).toBe(1);
+      // The woken owner rewrote its wake route with its own fresh epoch once live.
+      const fresh = d.routeEpoch();
+      expect(fresh).toBe(d.woken()!.participants.ownerIncarnation);
+      expect(fresh).not.toBe(d.predecessor);
+      // One refused predecessor-epoch command, then one same-key (same commandId) resend.
+      const commands = d.commands();
+      expect(commands.map(command => command.ownerIncarnation)).toEqual([d.predecessor, fresh]);
+      expect(new Set(commands.map(command => command.commandId)).size).toBe(1);
+      expect(d.acks().map(ack => [ack.accepted, ack.errorCode, ack.staleIncarnation, ack.ownerIncarnation])).toEqual([
+        [false, CONTROL_STALE_INCARNATION, d.predecessor, fresh],
+        [true, undefined, undefined, fresh],
+      ]);
+      await until(() => d.seen.length === 1);
+      expect(d.seen[0]).toContain("admitted direct delivery");
       await sleep(100);
-      expect(seen).toHaveLength(1);
-      expect(actors.tell).not.toHaveBeenCalled();
-    } finally { vi.restoreAllMocks(); await sender.close(); await host.close(); await woken?.close(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); }
-  }, 15_000);
+      expect(d.seen).toHaveLength(1);
+      expect(d.actors.tell).not.toHaveBeenCalled();
+    } finally { await d.cleanup(); }
+  }, 20_000);
+
+  it("refuses a stale sender's predecessor epoch published after the successor is exposed but before its wake route is rewritten", async () => {
+    const d = await dormantDirect({ launch: false });
+    let successor: ResidentHost | undefined;
+    try {
+      const { ParticipantDirectory } = await import("../src/topology/participant-directory.js");
+      const start = ParticipantDirectory.prototype.start;
+      let stale: Promise<unknown> | undefined;
+      vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(async function (this: InstanceType<typeof ParticipantDirectory>) {
+        await start.call(this);
+        // The reviewer's window: participants.start() exposed the successor, its control plane
+        // is not consuming yet and its wake route still names the dormant predecessor's epoch.
+        expect(d.routeEpoch()).toBe(d.predecessor);
+        stale = d.send(d.predecessor, "stale sender in the start window", "stale-window").catch((error: unknown) => error);
+        await until(() => d.commands().length === 1);
+        expect(d.routeEpoch()).toBe(d.predecessor);
+      });
+      successor = new ResidentHost(d.config, () => {});
+      await successor.start();
+      const fresh = successor.participants.ownerIncarnation;
+      expect(await stale).toMatchObject({ name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION });
+      expect(d.acks()).toEqual([expect.objectContaining({ accepted: false, errorCode: CONTROL_STALE_INCARNATION,
+        staleIncarnation: d.predecessor, ownerIncarnation: fresh })]);
+      await sleep(150);
+      expect(d.seen).toEqual([]); // no admission, claim or handler for the predecessor epoch
+      // Only the successor's own epoch, now in its rewritten route, is admitted.
+      expect(d.routeEpoch()).toBe(fresh);
+      expect(await d.send(fresh, "fresh sender", "fresh-epoch")).toMatchObject({ acknowledged: true });
+      await until(() => d.seen.length === 1);
+      expect(d.seen[0]).toContain("fresh sender");
+      expect(d.seen.join("\n")).not.toContain("stale sender");
+    } finally { await successor?.close(); await d.cleanup(); }
+  }, 20_000);
+
+  it("delivers a duplicate same-key resend once: the woken owner answers it from the one claim", async () => {
+    const d = await dormantDirect({ launch: true });
+    try {
+      const idempotencyKey = "dormant-wake-once";
+      const first = await d.router.routeMessage(d.actor.id, "exactly once", undefined, "followUp", undefined, { idempotencyKey });
+      await until(() => d.seen.length === 1);
+      const fresh = d.routeEpoch()!;
+      // The caller retries the same logical message (same key) through the router, and a
+      // duplicate of the router's resend arrives as well: both share the one commandId.
+      const retried = await d.router.routeMessage(d.actor.id, "exactly once", undefined, "followUp", undefined, { idempotencyKey });
+      const duplicate = await d.send(fresh, "exactly once", idempotencyKey);
+      expect(retried.messageId).toBe(first.messageId);
+      expect(duplicate.messageId).toBe(first.messageId);
+      expect(d.launches()).toBe(1);
+      const commands = d.commands();
+      expect(commands.map(command => command.ownerIncarnation)).toEqual([d.predecessor, fresh, fresh, fresh]);
+      expect(new Set(commands.map(command => command.commandId)).size).toBe(1);
+      expect(d.acks().map(ack => ack.accepted)).toEqual([false, true, true, true]);
+      await sleep(200);
+      expect(d.seen).toHaveLength(1);
+      expect(d.seen[0]).toContain("exactly once");
+    } finally { await d.cleanup(); }
+  }, 20_000);
 
   it.skipIf(process.platform === "win32").each(["error", "deadline"] as const)("retains committed intent after external-owner watcher %s and replays on the next start", async failure => {
     const { root, config } = fixture();
@@ -972,231 +1066,4 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(processStartTime(process.pid)).toBeDefined();
     } finally { finish(); await active; fs.rmSync(root, { recursive: true, force: true }); }
   });
-});
-
-// #774 review round: a woken successor inherits its dormant actor's retained route epoch only
-// for message delivery, only for the dormant generation and config it slept under, and only
-// for the backlog published before the successor's own fresh route.
-describe("retained dormant route epoch", () => {
-  const stale = { name: "FabricControlStaleIncarnationError", code: CONTROL_STALE_INCARNATION };
-  const dormantRoute = async (create: { delivery?: "followUp"; triggerTurn?: boolean } = {}) => {
-    const f = fixture();
-    await f.host.start();
-    const actor = await f.host.actors.create({ name: "retained-route", instructions: "process", residency: "durable", ...create });
-    await until(() => f.host.actors.status(actor.id).status === "dormant");
-    f.host.actors.pauseForRelease(); await f.host.actors.checkpointForRelease(); await f.host.close();
-    const routeFile = path.join(f.config.residencyRoot, "wake-routes.json");
-    const entry = () => readWakeJson<ResidentWakeRoutes>(routeFile)!.actors.find(row => row.id === actor.id)!;
-    const participant = entry().participant!;
-    const mesh = new MeshStore(f.config.meshRoot, f.config.mesh.maxEventBytes, f.config.mesh.maxReadEvents);
-    const identity = { id: "session:sender", name: "sender", kind: "main" as const };
-    const sender = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 10, acknowledgementTimeoutMs: 10_000 });
-    sender.start(async () => ({ accepted: false, error: "sender does not own actors" }));
-    // This test starts the successor itself, so publication never launches one.
-    const wake = await import("../src/residency/wake.js");
-    vi.spyOn(wake, "wakeResidentActors").mockResolvedValue(undefined);
-    const { AgentManager } = await import("../src/agents/manager.js");
-    const seen: string[] = [];
-    vi.spyOn(AgentManager.prototype, "run").mockImplementation(async (request, _signal, onSpawned) => {
-      const id = "1".repeat(32); onSpawned?.({ id } as never); seen.push(request.task);
-      return { id, status: "completed", text: "done", toolCalls: 0, startedAt: Date.now(), finishedAt: Date.now() } as never;
-    });
-    let sent = 0;
-    const send = (operation: "followUp" | "stop", ownerIncarnation: string, message: string) =>
-      sender.request(participant.ownerHostId, actor.id, operation, { message, ownerIncarnation }, participant.ownerIdentityId,
-        { idempotencyKey: `retained-${++sent}` }).catch((error: unknown) => error);
-    const commands = () => mesh.read({ topic: "fabric.control.command", limit: 1_000 });
-    let successor: ResidentHost | undefined;
-    const wakeSuccessor = async (config = f.config) => { successor = new ResidentHost(config, () => {}); await successor.start(); return successor; };
-    const cleanup = async () => {
-      vi.restoreAllMocks(); await sender.close(); await f.host.close(); await successor?.close(); mesh.closeState();
-      fs.rmSync(f.root, { recursive: true, force: true });
-    };
-    return { ...f, actor, epoch: participant.ownerIncarnation!, entry, send, commands, seen, wakeSuccessor, cleanup };
-  };
-
-  it.each(["host config", "actor config"] as const)("refuses a stale route's epoch after a %s change while dormant", async change => {
-    const route = await dormantRoute();
-    try {
-      const pending = route.send("followUp", route.epoch, "addressed to the stale route");
-      await until(() => route.commands().length === 1);
-      let config = route.config;
-      if (change === "host config") {
-        // The stale wake-routes.json (and its configJson) stays; the restart config does not.
-        config = { ...route.config, piBinary: "pi-changed" };
-        fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
-      } else {
-        const registry = new ActorRegistryStore(route.config.actorRoot);
-        registry.write(registry.records().map(row => row.id === route.actor.id ? { ...row, instructions: "process differently" } : row));
-      }
-      const successor = await route.wakeSuccessor(config);
-      expect(await pending).toMatchObject(stale);
-      await sleep(100);
-      expect(route.seen).toEqual([]);
-      expect(successor.actors.status(route.actor.id).status).not.toBe("stopped");
-    } finally { await route.cleanup(); }
-  }, 20_000);
-
-  // #774 review P1: the digest binds the WHOLE persisted definition. Each persisted execution
-  // setting below must refuse the retained epoch when it changes while dormant; a runtime-only
-  // change (DORMANT_RUNTIME_FIELDS) must not. "session binding" is the persisted per-session
-  // model/thinking overlay, the one execution input stored outside the registry row.
-  const executionChanges: { [field: string]: { [key: string]: unknown } } = {
-    name: { name: "retained-route-renamed" },
-    instructions: { instructions: "process differently" },
-    events: { events: ["tool_error"] },
-    topics: { topics: ["retained.changed"] },
-    delivery: { delivery: "nextTurn" },
-    // Loaded only with steer/followUp delivery, so this case creates the actor with followUp.
-    triggerTurn: { triggerTurn: true },
-    responseMode: { responseMode: "directive" },
-    coalesce: { coalesce: false },
-    coalesceKey: { coalesceKey: "data.key" },
-    dedupeKey: { dedupeKey: "data.key" },
-    residency: { residency: "session" },
-    runner: { runner: "claude" },
-    kernel: { kernel: "python" },
-    pythonRuntime: { pythonRuntime: "cpython" },
-    extensions: { extensions: false },
-    runnerSessionId: { runnerSessionId: "runner-session-2" },
-    model: { model: "test/changed-model" },
-    modelReason: { modelReason: "changed reason" },
-    thinking: { thinking: "high" },
-    routeClass: { routeClass: "status-groom" },
-    protected: { protected: true },
-    tools: { tools: ["read"] },
-    transport: { transport: "tmux" },
-    timeoutMs: { timeoutMs: 1_234 },
-    nice: { nice: 5 },
-    bashTimeoutSeconds: { bashTimeoutSeconds: 7 },
-    inferenceContext: { inferenceContext: "activation" },
-    activation: { activation: { minIntervalMs: 2_000 } },
-    activationFilter: { activationFilter: [{ id: "skip-noise", topic: ["fleet.noise"] }] },
-    activationFilterExpiresAt: { activationFilterExpiresAt: Date.now() + 3_600_000 },
-    requirements: { requirements: [{ ref: "mesh.read", optional: true }] },
-    validWhile: { validWhile: { version: 1, source: "() => true" } },
-    records: { records: { topic: "retained.records" } },
-    project: { project: "elsewhere" },
-    supervisorFor: { supervisorFor: "session:dormancy" },
-    adoptedAt: { adoptedAt: 1 },
-    adoptedFrom: { adoptedFrom: ["session:predecessor"] },
-  };
-  // Excluded runtime fields a dormant row can carry; status/stopReason/sessionOrphan/removal and
-  // message storage belong to non-dormant or history rows and are covered by the digest test below.
-  const runtimeChanges: { [field: string]: { [key: string]: unknown } } = {
-    createdAt: { createdAt: 1 },
-    updatedAt: { updatedAt: 2 },
-    filterSkipped: { filterSkipped: { count: 3, lastKey: "k", lastTopic: "t", lastAt: 4 } },
-    filteredCount: { filteredCount: 5 },
-    lastFilteredAt: { lastFilteredAt: 6 },
-    activationBlocked: { activationBlocked: { reason: "transient", code: "provider-transient", since: 1, count: 1, retryAt: 2 } },
-    failureStreak: { failureStreak: { count: 1, notified: false } },
-    lastRunId: { lastRunId: "7".repeat(32) },
-    lastError: { lastError: "earlier failure" },
-    presenceError: { presenceError: "earlier presence failure" },
-    resolvedBinding: { resolvedBinding: { model: "test/last-run", thinking: "low" } },
-    capabilityDigest: { capabilityDigest: "8".repeat(64) },
-    sessionFile: { sessionFile: "/elsewhere/session.jsonl" },
-  };
-  const changeWhileDormant = async (route: Awaited<ReturnType<typeof dormantRoute>>, change: { [key: string]: unknown } | "session binding") => {
-    const pending = route.send("followUp", route.epoch, "addressed to the dormant generation");
-    await until(() => route.commands().length === 1);
-    if (change === "session binding") {
-      await new ActorBindingStore(route.config.sessionId, route.config.actorRoot).setModel(route.actor.id, "test/session-model");
-    } else {
-      const registry = new ActorRegistryStore(route.config.actorRoot);
-      registry.write(registry.records().map(row => row.id === route.actor.id ? { ...row, ...change } as typeof row : row));
-    }
-    await route.wakeSuccessor();
-    return pending;
-  };
-
-  it.each([...Object.keys(executionChanges), "session binding"])("refuses the retained epoch after persisted execution field %s changes while dormant", async field => {
-    const route = await dormantRoute(field === "triggerTurn" ? { delivery: "followUp", triggerTurn: false } : {});
-    try {
-      expect(await changeWhileDormant(route, field === "session binding" ? field : executionChanges[field]!)).toMatchObject(stale);
-      await sleep(50);
-      expect(route.seen).toEqual([]);
-    } finally { await route.cleanup(); }
-  }, 20_000);
-
-  it.each(Object.keys(runtimeChanges))("keeps the retained epoch after runtime field %s changes while dormant", async field => {
-    const route = await dormantRoute();
-    try {
-      expect(await changeWhileDormant(route, runtimeChanges[field]!)).toMatchObject({ acknowledged: true });
-    } finally { await route.cleanup(); }
-  }, 20_000);
-
-  it("digests every persisted definition field except the named runtime fields", async () => {
-    const route = await dormantRoute();
-    try {
-      // A fully populated dormant row: every change above at once (runner/residency stay compatible).
-      const { runner: _runner, residency: _residency, triggerTurn: _triggerTurn, ...execution } = Object.assign({}, ...Object.values(executionChanges)) as { [key: string]: unknown };
-      const registry = new ActorRegistryStore(route.config.actorRoot);
-      registry.write(registry.records().map(row => row.id === route.actor.id
-        ? { ...row, ...execution, ...Object.assign({}, ...Object.values(runtimeChanges)) } as typeof row : row));
-      const successor = new ResidentHost(route.config, () => {});
-      try {
-        await successor.start();
-        const definition = successor.actors.dormantDefinition(route.actor.id)!;
-        expect(Object.keys(definition)).toEqual(expect.arrayContaining(["transport", "bashTimeoutSeconds", "model", "thinking",
-          "instructions", "tools", "residency", "topics", "activationFilter", "effectiveBinding", "effectiveTimeoutMs"]));
-        // Inputs the row cannot change directly: identity, scope, lineage (adoptedAt/adoptedFrom/rootId cases),
-        // session binding ("session binding" case) and the default timeout (timeoutMs case / host config).
-        const derived = ["id", "rootId", "scope", "ownershipToken", "effectiveBinding", "effectiveTimeoutMs"];
-        const unclassified = Object.keys(definition).filter(field => !DORMANT_RUNTIME_FIELDS.has(field) &&
-          !Object.hasOwn(executionChanges, field) && !derived.includes(field));
-        // A new persisted field is digested by default; give it a refusal case above (or, only if it
-        // is runtime state, add it to DORMANT_RUNTIME_FIELDS).
-        expect(unclassified).toEqual([]);
-        const digest = dormantActorConfigDigest(definition);
-        for (const field of Object.keys(definition)) {
-          const changed = dormantActorConfigDigest({ ...definition, [field]: { changed: field } });
-          if (DORMANT_RUNTIME_FIELDS.has(field)) expect(changed, field).toBe(digest);
-          else expect(changed, field).not.toBe(digest);
-        }
-        for (const field of DORMANT_RUNTIME_FIELDS) {
-          expect(dormantActorConfigDigest({ ...definition, [field]: { changed: field } }), field).toBe(digest);
-        }
-      } finally { await successor.close(); }
-    } finally { await route.cleanup(); }
-  }, 20_000);
-
-  it("refuses a queued predecessor stop under the retained epoch while delivering a followUp under it", async () => {
-    const route = await dormantRoute();
-    try {
-      const stop = route.send("stop", route.epoch, "stop the dormant predecessor");
-      const followUp = route.send("followUp", route.epoch, "deliver to the woken actor");
-      await until(() => route.commands().length === 2);
-      // The dormant generation the route names is the epoch the stop addresses.
-      expect(route.entry().dormancy?.ownerIncarnation ?? route.epoch).toBe(route.epoch);
-      const successor = await route.wakeSuccessor();
-      expect(await stop).toMatchObject(stale);
-      expect(await followUp).toMatchObject({ acknowledged: true });
-      await until(() => route.seen.length === 1);
-      expect(route.seen[0]).toContain("deliver to the woken actor");
-      expect(successor.actors.status(route.actor.id).status).not.toBe("stopped");
-    } finally { await route.cleanup(); }
-  }, 20_000);
-
-  it("drops the retained epoch once the woken host publishes its fresh route", async () => {
-    const route = await dormantRoute();
-    try {
-      const backlog = route.send("followUp", route.epoch, "dormant backlog");
-      await until(() => route.commands().length === 1);
-      await route.wakeSuccessor();
-      expect(await backlog).toMatchObject({ acknowledged: true });
-      const fresh = route.entry().participant?.ownerIncarnation;
-      expect(fresh).toBeTruthy();
-      expect(fresh).not.toBe(route.epoch);
-      // The fresh route no longer names the consumed generation (only, if it re-armed, its own).
-      expect(route.entry().dormancy?.ownerIncarnation).not.toBe(route.epoch);
-      expect(await route.send("followUp", route.epoch, "late, to the consumed epoch")).toMatchObject(stale);
-      expect(await route.send("followUp", fresh!, "to the fresh route")).toMatchObject({ acknowledged: true });
-      await until(() => route.seen.length === 2);
-      expect(route.seen.join("\n")).not.toContain("late, to the consumed epoch");
-      expect(route.seen[0]).toContain("dormant backlog");
-      expect(route.seen[1]).toContain("to the fresh route");
-    } finally { await route.cleanup(); }
-  }, 20_000);
 });

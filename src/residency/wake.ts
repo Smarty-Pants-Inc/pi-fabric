@@ -28,13 +28,6 @@ export async function ensureResidentWakeArchive(mesh: Pick<MeshStore, "root" | "
   });
 }
 
-/**
- * The dormant generation an actor's retained route belongs to (#774): the epoch the actor
- * went dormant under and a digest of the actor config it sleeps with. Only the host that
- * arms an actor's dormancy writes it; any later route, including the woken host's, omits it.
- */
-export interface ResidentDormantGeneration { ownerIncarnation: string; configDigest: string }
-
 /** Routing metadata, not a second inbox: deliveries remain in the mesh archive. */
 export interface ResidentWakeRoutes {
   format: 1;
@@ -42,7 +35,7 @@ export interface ResidentWakeRoutes {
   hostId: string;
   /** Canonical snapshot of every field of the exact restart configuration. */
   configJson: string;
-  actors: Array<{ id: string; name: string; topics: string[]; participant?: FabricParticipantRecord; dormancy?: ResidentDormantGeneration }>;
+  actors: Array<{ id: string; name: string; topics: string[]; participant?: FabricParticipantRecord }>;
 }
 export interface ResidentWakeRequest { format: 1; id: string; sequence?: number; requestedAt: number }
 export const residentSleepingPath = (root: string): string => path.join(root, "sleeping.json");

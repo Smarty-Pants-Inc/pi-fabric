@@ -4671,7 +4671,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/one-off", thinking: "xhigh" },
       }),
       "identity:owner",
-      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000 + (stale ? 90_000 : 0), routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000 + (stale ? 90_000 : 0), idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await expect(
@@ -4770,7 +4770,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "ask",
       { ownerIncarnation: "fixture:owner", message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
       "identity:resident",
-      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await provider.invoke("tell", {

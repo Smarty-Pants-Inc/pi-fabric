@@ -624,8 +624,6 @@ export class ActorManager {
   readonly #notifications = new MeshBackgroundQueue("actor notification/reap");
   /** Actor ids named by the last successfully parsed registry (undefined until one is). */
   #registryIds: Set<string> | undefined;
-  /** Registry rows that were dormant when this runtime loaded them (#774 dormant-route successor). */
-  readonly #loadedDormant = new Set<string>();
   /** Orphan deletes, fenced to the entry version seen when it was found. */
   readonly #orphanPresence = new Map<string, number>();
   #presenceTimer: NodeJS.Timeout | undefined;
@@ -1085,26 +1083,6 @@ export class ActorManager {
     return [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id))
       .map((actor) => this.#publicInfo(actor, true, registryView));
-  }
-
-  /** Whether this runtime loaded the actor's registry row as dormant, i.e. it woke that actor's dormant route. */
-  loadedDormant(id: string): boolean { return this.#loadedDormant.has(id); }
-
-  /**
-   * The persisted definition a dormant generation sleeps under (#774): the exact registry row plus
-   * the execution inputs resolved outside it (scope, lineage, session model/thinking binding and the
-   * host default timeout). The residency digest excludes only named runtime fields from it.
-   */
-  dormantDefinition(id: string): Record<string, unknown> | undefined {
-    const actor = this.#actors.get(id);
-    if (!actor) return undefined;
-    return {
-      ...this.#serializedActor(actor),
-      scope: this.#actorScope,
-      ownershipToken: this.#lineage(actor),
-      effectiveBinding: this.#runBinding(actor),
-      effectiveTimeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
-    };
   }
 
   /** Whether at least one owned durable actor can be made dormant right now. */
@@ -5407,7 +5385,6 @@ export class ActorManager {
       // custody instead of carrying a retired host's idle decision through reload.
       const status = record.status === "stopped" && !restarted ? "stopped" : "idle";
       const stopReason = status === "stopped" ? persistedStopReason(source) : undefined;
-      if (record.status === "dormant") this.#loadedDormant.add(record.id);
       const delivery: FabricActorDelivery =
         record.delivery === "steer" ||
         record.delivery === "followUp" ||

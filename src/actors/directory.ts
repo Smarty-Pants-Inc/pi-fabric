@@ -121,8 +121,6 @@ export class ActorDirectory extends ActorManager {
     return [...actors.values()];
   }
   override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
-  override loadedDormant(id: string): boolean { return super.loadedDormant(id) || this.#secondary.loadedDormant(id); }
-  override dormantDefinition(id: string): Record<string, unknown> | undefined { return super.dormantDefinition(id) ?? this.#secondary.dormantDefinition(id); }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);

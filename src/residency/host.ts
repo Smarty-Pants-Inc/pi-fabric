@@ -36,7 +36,7 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
-import { canonicalResidentWakeConfig, dormantActorConfigDigest, routesAt, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
+import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
@@ -135,6 +135,7 @@ const readJson = <T>(filePath: string): T | undefined => {
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
 export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
@@ -243,11 +244,6 @@ export class ResidentHost {
   #idleSince = Date.now();
   #sleeping = false;
   #wakeRoutesJson: string | undefined;
-  /**
-   * Predecessor route epochs this activation inherited per dormant actor (#774 + #709), and
-   * the last mesh sequence they still cover once this host published its own route.
-   */
-  readonly #retainedIncarnations = new Map<string, { epoch: string; until?: number }>();
   #wakeRecovery: ResidentWakeRecoveryReader | undefined;
   #wakeRecoveryPending: Promise<void> | undefined;
   #wakeRecoveryIgnored = 0;
@@ -381,7 +377,6 @@ export class ResidentHost {
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       ownerIncarnation: this.participants.ownerIncarnation,
       controlIncarnationFence: config.mesh.controlIncarnationFence,
-      retainedOwnerIncarnation: (targetId, sequence) => this.#retainedEpoch(targetId, sequence),
       enabled: true,
       hostId: this.hostId,
       pollMs: config.mesh.actorPollMs,
@@ -709,7 +704,6 @@ export class ResidentHost {
         this.#wakeWatchNeedsReprobe = true;
         this.#scheduleIdleCheck();
       });
-      this.#retainDormantRouteEpochs(); // before control consumes, and before routes are rewritten
       this.control.start((command, from, signal, verification) =>
         this.#acceptControl(command, from, signal, verification));
       if (this.#staged) this.control.pause();
@@ -1411,58 +1405,7 @@ export class ResidentHost {
     return available;
   }
 
-  /**
-   * A dormant actor's retained route keeps naming the epoch of the activation that went
-   * dormant; senders address it (#774) and the fence refuses foreign epochs (#709). Inherit
-   * that epoch only for actors this activation woke from that route: owned, durable, same
-   * ownership token, and loaded from a dormant registry row. The route must also be this
-   * exact restart config (persisted and running), and name the dormant generation the actor
-   * slept in: that epoch and the actor's current config digest. Crash restarts of a live
-   * actor, changed configs, other targets and older epochs stay fenced. The control plane
-   * admits it only for message delivery; #writeWakeRoutes bounds it to the dormant backlog.
-   */
-  #retainDormantRouteEpochs(): void {
-    this.#retainedIncarnations.clear();
-    const routes = routesAt(this.config.residencyRoot);
-    if (!routes || routes.rootId !== this.config.rootId || routes.hostId !== this.hostId ||
-        routes.configJson !== canonicalResidentWakeConfig(this.config)) return;
-    const owned = new Map(this.actors.listOwned().map(actor => [actor.id, actor]));
-    for (const entry of routes.actors) {
-      const participant = entry?.participant, dormancy = entry?.dormancy;
-      const actor = owned.get(entry?.id);
-      if (!participant || !actor || participant.format !== 1 || participant.kind !== "actor" || participant.id !== actor.id ||
-          participant.rootId !== actor.rootId || participant.ownerHostId !== this.hostId || participant.controlProtocol !== "v1" ||
-          actor.residency !== "durable" || typeof actor.ownershipToken !== "string" ||
-          participant.actorOwnershipToken !== actor.ownershipToken || !this.actors.loadedDormant(actor.id) ||
-          typeof participant.ownerIncarnation !== "string" || !participant.ownerIncarnation ||
-          participant.ownerIncarnation === this.participants.ownerIncarnation ||
-          !dormancy || dormancy.ownerIncarnation !== participant.ownerIncarnation ||
-          typeof dormancy.configDigest !== "string" || dormancy.configDigest !== this.#dormantConfigDigest(actor.id)) continue;
-      this.#retainedIncarnations.set(actor.id, { epoch: participant.ownerIncarnation });
-    }
-  }
-
-  /** The whole persisted definition minus named runtime fields (#774); undefined when not loaded here. */
-  #dormantConfigDigest(actorId: string): string | undefined {
-    const definition = this.actors.dormantDefinition(actorId);
-    return definition ? dormantActorConfigDigest(definition) : undefined;
-  }
-
-  /** A retained epoch covers only commands published before this host's own route; later ones drop it. */
-  #retainedEpoch(targetId: string, sequence: number): string | undefined {
-    const retained = this.#retainedIncarnations.get(targetId);
-    if (retained?.until !== undefined && sequence > retained.until) {
-      this.#retainedIncarnations.delete(targetId);
-      return undefined;
-    }
-    return retained?.epoch;
-  }
-
-  /**
-   * `dormancyProtected` arms dormancy: idle durable actors outside it may become dormant
-   * next, so their route records the dormant generation (#774) before they can.
-   */
-  #writeWakeRoutes(dormancyProtected?: ReadonlySet<string>): void {
+  #writeWakeRoutes(): void {
     const routes: ResidentWakeRoutes = { format: 1, rootId: this.config.rootId, hostId: this.hostId,
       configJson: canonicalResidentWakeConfig(this.config),
       actors: this.actors.listOwned().filter(actor => actor.residency === "durable" && actor.status !== "stopped")
@@ -1472,30 +1415,12 @@ export class ResidentHost {
           const participant = this.participants.get(actor.id) ??
             readWakeJson<ResidentWakeRoutes>(path.join(this.config.residencyRoot, "wake-routes.json"))?.actors
               .find(entry => entry.id === actor.id)?.participant;
-          // Only a generation this host makes (or keeps) dormant carries its epoch and config
-          // digest; the woken host's routes omit it, so no later restart inherits the epoch.
-          const dormant = actor.status === "dormant" ||
-            (dormancyProtected !== undefined && actor.status === "idle" && !dormancyProtected.has(actor.id));
-          const configDigest = dormant && typeof participant?.ownerIncarnation === "string" && participant.ownerIncarnation
-            ? this.#dormantConfigDigest(actor.id) : undefined;
-          const dormancy = configDigest && participant?.ownerIncarnation
-            ? { ownerIncarnation: participant.ownerIncarnation, configDigest } : undefined;
-          return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}),
-            ...(dormancy ? { dormancy } : {}) };
+          return { id: actor.id, name: actor.name, topics: actor.topics, ...(participant ? { participant } : {}) };
         }) };
     const serialized = JSON.stringify(routes);
-    if (serialized !== this.#wakeRoutesJson) {
-      writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });
-      this.#wakeRoutesJson = serialized;
-    }
-    // Consumed on publication (#774): once this ready host has published its own route,
-    // senders address its fresh epoch. The retained one covers only the backlog before it.
-    if (this.#ready) {
-      let until: number | undefined;
-      for (const retained of this.#retainedIncarnations.values()) {
-        if (retained.until === undefined) retained.until = until ??= this.mesh.latestSequence();
-      }
-    }
+    if (serialized === this.#wakeRoutesJson) return;
+    writeJsonAtomic(path.join(this.config.residencyRoot, "wake-routes.json"), routes, { durable: true });
+    this.#wakeRoutesJson = serialized;
   }
 
   #expectedActors(): Set<string> {
@@ -1554,7 +1479,7 @@ export class ResidentHost {
           // The watcher proof may yield to delivery or presence changes. Refresh
           // expected participants; dormantIdleActors rechecks current work custody.
           const currentProtectedIds = this.#expectedActors();
-          this.#writeWakeRoutes(currentProtectedIds); // Arm routing and the dormant generation before an actor can become dormant.
+          this.#writeWakeRoutes(); // Arm routing before an actor can become dormant.
           await this.actors.dormantIdleActors(currentProtectedIds);
         } catch {
           // Keep the actor warm. Only a new actor/delivery/presence event retries.

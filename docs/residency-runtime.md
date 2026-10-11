@@ -155,6 +155,16 @@ revalidates ownership/binding and uses the existing claim, outcome and ACK path;
 no direct preflight or fabricated ACK constitutes accepted delivery. Older route
 snapshots without a published advertisement cannot grant dormant direct admission.
 
+The woken host runs under its own fresh owner incarnation, with no exception for
+the retained route's older epoch: it refuses the waking command with
+`FABRIC_CONTROL_STALE_INCARNATION` before any claim or handler, and once live it
+rewrites `wake-routes.json` with its own published advertisement. The sending
+router then re-reads that actor's participant once and, only when the same owner
+and actor lineage advertise a different epoch, resends once with the same
+idempotency key. The key keeps the command ID, so the owner's claim answers any
+duplicate with the one outcome. A second refusal, or a refusal from a target that
+was not resolved from a retained dormant route, reaches the caller unchanged.
+
 Before sleeping an actor-bearing host, residency ensures the existing file event
 archive is enabled under the mesh publication lock. It preserves an operator-selected
 archive, or creates `<mesh>/wake-archive` plus `event-archive.json` when the mesh
@@ -181,7 +191,7 @@ checked whole-attempt exit and completed-drain proofs before recovery admission.
 
 ### Owner incarnation fencing
 
-A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission. The one exception is dormant direct admission: an activation that loaded an actor from a dormant registry row inherits the epoch named by that actor's retained `wake-routes.json` advertisement, for that actor only, and admits, claims and ACKs message deliveries (`steer` without interrupt priority, `followUp`, `ask`) under that retained epoch. Control (`stop`, cancellation, setters and any other operation) is never admitted under it. The route must carry the dormant generation the host recorded when it armed that actor's dormancy (the epoch and a digest of the actor's config), the actor's current config must match that digest, and the route's restart config must equal both the persisted and running config; a stale route under a changed config lends no epoch. The exception covers only the dormant backlog: commands published after the woken host publishes its own route must address its fresh epoch, and the woken host's routes no longer name the old generation. Other targets, older epochs and relaunches of live (non-dormant) actors stay fenced. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; there is no stale automatic resend. Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
+A resident's root-derived host ID and durable actor IDs survive relaunch. Its control-owner incarnation does not: each new activation stamps its participant records and claims with a fresh random epoch. Predecessor-addressed unclaimed controls (`stop`, `ask`, `steer`, `followUp`, cancellation) are refused before actor admission, with no exception for a woken dormant actor's retained route. The caller must re-resolve the advertised epoch and explicitly decide whether a fresh request is still wanted; the only automatic resend is the router's single same-key resend of a message it addressed to a retained dormant route (see [dormant wake](#dormant-actors-and-delivery-owned-wake-6782--7299)). Senders addressing older resident releases with no published epoch retain the existing unfenced delivery path with a counted warning. Execution refusals use `FABRIC_CONTROL_STALE_INCARNATION`, while recorded predecessor outcomes retain their original epoch and are never re-executed. See [owner incarnation fencing](agents.md#owner-incarnation-fencing) for sender retry decisions, ACK matching, and the host-only `mesh.controlIncarnationFence` rollout policy: `"warn"` (default) admits older senders omitting an epoch with a counted sender-named warning at most once per hour; `"enforce"` refuses omission after every host has upgraded. Explicit stale epochs are refused in both modes.
 
 ### Lease-fenced consumption and accepted-work custody
 

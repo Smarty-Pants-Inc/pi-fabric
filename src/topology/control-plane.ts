@@ -92,15 +92,6 @@ export type FabricControlOperation = "steer" | "followUp" | "stop" | "ask" | "ca
 const detachedControlOperation = (operation: FabricControlOperation): boolean =>
   operation === "ask";
 
-/**
- * Dormant wake (#774): the only commands a retained predecessor epoch may deliver, i.e. the
- * messages a dormant wake exists for. Control (stop, cancel, setModel, setThinking and any
- * future operation) and interrupting steers always need this activation's own epoch.
- */
-const retainedEpochDelivery = (command: FabricControlCommand): boolean =>
-  (command.operation === "steer" || command.operation === "followUp" || command.operation === "ask") &&
-  command.priority === undefined;
-
 export interface FabricControlCommand {
   /** Hydrated from the admitted MeshEvent envelope, never event.data. */
   principal?: FabricPrincipal | undefined;
@@ -316,14 +307,6 @@ export interface FabricControlPlaneOptions {
   controlIncarnationFence?: MeshControlIncarnationFence;
   /** Must match this activation's participant directory. */
   ownerIncarnation?: string;
-  /**
-   * Dormant wake (#774): the predecessor epoch named by one target's retained dormant
-   * route, inherited by this successor activation for the command event at `sequence`.
-   * Only message deliveries (steer, followUp, ask) to that target addressed to exactly that
-   * epoch are admitted, claimed and ACKed under it; control operations and all other
-   * epochs stay fenced. The owner returns undefined once the exception is consumed.
-   */
-  retainedOwnerIncarnation?: (targetId: string, sequence: number) => string | undefined;
   enabled: boolean;
   hostId: string;
   pollMs?: number;
@@ -418,8 +401,6 @@ interface PendingControlRequest {
 interface OwnedControlCommand {
   event: MeshEvent;
   claimVersion: number;
-  /** The epoch this activation admitted the command under; its claim and ACK name it. */
-  ownerIncarnation: string;
   acceptance?: FabricControlAcceptance;
   saved?: boolean;
   running?: boolean;
@@ -1166,10 +1147,12 @@ export class FabricControlPlane {
       if (!owned.running) await this.#runOwnedCommand(ownedKey, owned);
       return;
     }
-    // Explicit epochs fence stale owners; see #admittingIncarnation for the only exceptions.
-    const admittedIncarnation = this.#admittingIncarnation(command, event.sequence);
+    // Explicit epochs always fence stale owners. Omission remains compatible only
+    // during warn-mode rollout; timestamps cannot substitute for an epoch in enforce.
+    const incarnationMatches = command.ownerIncarnation === this.incarnation ||
+      (command.ownerIncarnation === undefined && this.options.controlIncarnationFence !== "enforce");
     if (command.operation === "cancel") {
-      if (admittedIncarnation !== undefined) this.#acceptCancellation(command, event.from);
+      if (incarnationMatches) this.#acceptCancellation(command, event.from);
       return;
     }
     const now = Date.now();
@@ -1195,7 +1178,7 @@ export class FabricControlPlane {
     }
     // Stale wire epochs cannot downgrade a new admission in either mode. Enforce
     // also refuses omission; completed predecessor claims above remain observable.
-    if (admittedIncarnation === undefined) {
+    if (!incarnationMatches) {
       await this.#publishAcknowledgement(command, {
         accepted: false, error: STALE_INCARNATION_ERROR, errorCode: CONTROL_STALE_INCARNATION,
       }, this.incarnation, command.ownerIncarnation ?? null);
@@ -1220,7 +1203,7 @@ export class FabricControlPlane {
       const indeterminate = { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
       const local = ownRecord(controlSeenRecord(this.#seen.get(key)?.value));
       let acceptance: FabricControlAcceptance;
-      let outcomeIncarnation: string | null = admittedIncarnation;
+      let outcomeIncarnation: string | null = this.incarnation;
       if (local) {
         acceptance = local.acceptance ?? indeterminate;
         outcomeIncarnation = local.ownerIncarnation ?? null;
@@ -1235,7 +1218,7 @@ export class FabricControlPlane {
               hostId: this.options.hostId,
               commandId: command.commandId,
               targetId: command.targetId,
-              ownerIncarnation: admittedIncarnation,
+              ownerIncarnation: this.incarnation,
               expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
               ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
               acceptance: expired,
@@ -1267,7 +1250,7 @@ export class FabricControlPlane {
           hostId: this.options.hostId,
           commandId: command.commandId,
           targetId: command.targetId,
-          ownerIncarnation: admittedIncarnation,
+          ownerIncarnation: this.incarnation,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
         } satisfies FabricControlSeenRecord,
@@ -1282,7 +1265,7 @@ export class FabricControlPlane {
           hostId: this.options.hostId,
           commandId: command.commandId,
           targetId: command.targetId,
-          ownerIncarnation: admittedIncarnation,
+          ownerIncarnation: this.incarnation,
           expiresAt: deadlineAt + this.#ackTimeoutMs,
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
@@ -1310,7 +1293,7 @@ export class FabricControlPlane {
     }
 
     this.#sharedClaims.delete(key);
-    const admitted = { event, claimVersion: claim.version, ownerIncarnation: admittedIncarnation };
+    const admitted = { event, claimVersion: claim.version };
     this.#ownedCommands.set(key, admitted);
     await this.#runOwnedCommand(key, admitted);
   }
@@ -1332,22 +1315,6 @@ export class FabricControlPlane {
       return;
     }
     await execution;
-  }
-
-  /** The epoch this activation admits a command under, or undefined when it is fenced. */
-  #admittingIncarnation(command: FabricControlCommand, sequence: number): string | undefined {
-    if (command.ownerIncarnation === this.incarnation) return this.incarnation;
-    // Explicit epochs always fence stale owners. Omission remains compatible only
-    // during warn-mode rollout; timestamps cannot substitute for an epoch in enforce.
-    if (command.ownerIncarnation === undefined) {
-      return this.options.controlIncarnationFence !== "enforce" ? this.incarnation : undefined;
-    }
-    // A dormant actor's retained route (#774) still names its sleeping predecessor's
-    // epoch. This successor inherits it for message delivery to that exact target and
-    // epoch only, never for control: a queued predecessor stop stays fenced (#709).
-    if (!retainedEpochDelivery(command)) return undefined;
-    return this.options.retainedOwnerIncarnation?.(command.targetId, sequence) === command.ownerIncarnation
-      ? command.ownerIncarnation : undefined;
   }
 
   #warnUnfencedSenderDelivery(command: FabricControlCommand, from: MeshIdentity): void {
@@ -1430,7 +1397,7 @@ export class FabricControlPlane {
             hostId: this.options.hostId,
             commandId: command.commandId,
             targetId: command.targetId,
-            ownerIncarnation: owned.ownerIncarnation,
+            ownerIncarnation: this.incarnation,
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
             sequence,
             acceptance,
@@ -1449,7 +1416,7 @@ export class FabricControlPlane {
         throw error; // the owned outcome is retried by the next confirmed drain
       }
       try {
-        await this.#publishAcknowledgement(command, acceptance, owned.ownerIncarnation);
+        await this.#publishAcknowledgement(command, acceptance);
         this.#ownedCommands.delete(key);
       } catch (error) {
         if (!(error instanceof MeshConsumptionPausedError)) this.#releasePublicationFailed = true;
@@ -1464,7 +1431,7 @@ export class FabricControlPlane {
         try {
           const retained = await this.#seen.put({ key, identity: this.identity, ifVersion: owned.claimVersion,
             value: { format: 1, hostId: this.options.hostId, commandId: command.commandId,
-              targetId: command.targetId, ownerIncarnation: owned.ownerIncarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
+              targetId: command.targetId, ownerIncarnation: this.incarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
               acceptance: owned.acceptance } satisfies FabricControlSeenRecord });
           owned.claimVersion = retained.version;
         } catch { /* The owned in-memory outcome and durable claim remain; never replay. */ }

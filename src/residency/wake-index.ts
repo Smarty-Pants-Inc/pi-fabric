@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
@@ -40,31 +39,6 @@ export const canonicalResidentWakeConfig = (value: unknown): string => {
       .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, field]) => [key, sort(field)])) : json;
   return JSON.stringify(sort(JSON.parse(JSON.stringify(value))));
 };
-/**
- * Persisted actor-definition fields that never change what a woken dormant generation runs (#774).
- * The digest covers EVERY other field of the persisted definition, so a future persisted setting
- * binds the retained epoch by default. Add a field here only if it is runtime state.
- */
-export const DORMANT_RUNTIME_FIELDS: ReadonlySet<string> = new Set([
-  // Lifecycle status: a dormant row reloads as idle; stopped/orphaned/removing rows never route.
-  "status", "stopReason", "sessionOrphan", "removal",
-  // Clocks.
-  "createdAt", "updatedAt",
-  // Activation-filter counters (the filter and its expiry stay bound).
-  "filterSkipped", "filteredCount", "lastFilteredAt",
-  // Activation-block state.
-  "activationBlocked", "failureStreak",
-  // Last-run results and diagnostics; effectiveBinding binds the model/thinking setting itself.
-  "lastRunId", "lastError", "presenceError", "resolvedBinding", "capabilityDigest",
-  // Message history.
-  "messages", "messageHistory", "registryMessageReset",
-  // Derived from the actor root and id on load, never read back from the row.
-  "sessionFile",
-]);
-/** sha256 of the persisted definition (ActorManager.dormantDefinition) minus DORMANT_RUNTIME_FIELDS. */
-export const dormantActorConfigDigest = (definition: { readonly [field: string]: unknown }): string =>
-  createHash("sha256").update(canonicalResidentWakeConfig(Object.fromEntries(
-    Object.entries(definition).filter(([field]) => !DORMANT_RUNTIME_FIELDS.has(field))))).digest("hex");
 export const residentWakeConfigMatches = (saved: unknown, expected: unknown): boolean => {
   if (!saved || typeof saved !== "object" || Array.isArray(saved) ||
       !expected || typeof expected !== "object" || Array.isArray(expected)) return false;

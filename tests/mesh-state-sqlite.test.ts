@@ -574,13 +574,18 @@ describe("SqliteStateStore", () => {
         store.close();`, [root, go, stop, String(index)])),
     ];
     await waitFor(() => fs.readdirSync(root).filter(name => name.startsWith("ready-")).length === writers + readers, 90_000, `${procs} children ready`);
-    let maxWal = 0, lastWal = 0, appended = 0;
+    let maxWal = 0, lastWal = 0, appended = 0, wins = 0;
     const sampler = setInterval(() => {
       const wal = maintainer.walBytes();
-      appended += wal >= lastWal ? wal - lastWal : wal; // a reset restarts the WAL from its start
+      const won = maintainer.stats().checkpoints.truncate;
+      // A lower bound on the bytes appended since the last sample. After a reset the WAL restarted from 0, so at
+      // least `wal` bytes were appended: a reset seen as a drop, or a maintainer TRUNCATE win (its count, not the
+      // size, so a truncate-and-regrow inside one 10 ms sample is not missed). Otherwise only the growth.
+      appended += wal < lastWal || won > wins ? wal : wal - lastWal;
+      wins = won;
       lastWal = wal;
       maxWal = Math.max(maxWal, wal);
-      if (maintainer.stats().checkpoints.truncate > 0 && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
+      if (won > 0 && !fs.existsSync(truncated)) fs.writeFileSync(truncated, "");
     }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
@@ -599,7 +604,8 @@ describe("SqliteStateStore", () => {
     // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe): its peak is then every
     // byte appended in the run. smarty-dev#7651: bound the peak by what this run appended, not by 16 MiB, which
     // measured how often the busy-backoff TRUNCATE wins on the runner's CPU (windows-latest: 36-44 MiB with 0-2 wins;
-    // 2 cores here: 25-40 MiB). A starved or ineffective TRUNCATE still leaves peak == appended and fails.
+    // 2 cores here: 25-40 MiB). A starved checkpoint fails at truncate > 0 (the window is capped); a WAL that never
+    // resets leaves peak == appended; a TRUNCATE that is counted but does not empty the WAL fails at checkpoint(0) below.
     expect(appended).toBeGreaterThan(walTraffic);
     expect(maxWal).toBeLessThan(appended);
     maintainer.checkpoint(0);

@@ -459,6 +459,95 @@ sys.stdin.readline()`;
     expect(ready.stdout).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\)/);
   });
 
+  // smarty-dev#8116: a holder that opens AFTER the fenced lease probe and before the commit. The python3 child
+  // waits for a trigger file, so the switch's own onStep (between its open of state.db and the commit) runs it.
+  const lateHolder = async (file: string, mode: "open" | "link"): Promise<{ trigger: () => void; release: () => Promise<void> }> => {
+    const scratch = tempDir("late");
+    const code = `
+import ctypes, os, sys, time
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+print("ready", flush=True)
+while not os.path.exists(sys.argv[2] + "/go"): time.sleep(0.005)
+if sys.argv[3] == "link":
+    os.link(sys.argv[1], sys.argv[2] + "/alias"); fd = os.open(sys.argv[2] + "/alias", os.O_RDWR); os.unlink(sys.argv[2] + "/alias")
+else:
+    fd = os.open(sys.argv[1], os.O_RDWR)
+open(sys.argv[2] + "/opened", "w").close()
+sys.stdin.readline()`;
+    const child = spawn("python3", ["-c", code, file, scratch, mode], { stdio: ["pipe", "pipe", "inherit"] });
+    await new Promise<void>((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error("python3 holder not ready within 10 s")), 10_000);
+      child.stdout!.once("data", () => { clearTimeout(deadline); resolve(); });
+    });
+    const trigger = (): void => {
+      fs.writeFileSync(path.join(scratch, "go"), "");
+      const until = Date.now() + 10_000;
+      while (!fs.existsSync(path.join(scratch, "opened"))) {
+        if (Date.now() > until) throw new Error("late holder did not open");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    };
+    const release = (): Promise<void> => new Promise((resolve) => {
+      if (child.exitCode !== null) { resolve(); return; }
+      const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
+      child.once("exit", () => { clearTimeout(deadline); resolve(); });
+      child.stdin!.end("\n");
+    });
+    return { trigger, release };
+  };
+  const lateCases = [
+    { name: "state.db", mode: "open", why: "1 open(s) since the lease probe that this process does not hold" },
+    // -shm does not exist before the switch's own open: the watch sees it created after the probe.
+    { name: "state.db-shm", mode: "open", why: "1 open(s) since the lease probe that this process does not hold" },
+    // A hard link elsewhere, opened and removed again: the inode watch still sees the open.
+    { name: "state.db", mode: "link", why: "opened through another name (a hard link) since the lease probe" },
+  ] as const;
+  for (const late of lateCases) {
+    it.skipIf(leaseSkip !== "")(`refuses a lock-free, non-dumpable holder that opens ${late.name} (${late.mode}) after the lease probe and before the commit (smarty-dev#8116)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      if (late.name === "state.db-shm") expect(fs.existsSync(path.join(root, late.name))).toBe(false);
+      const holder = await lateHolder(path.join(root, late.name), late.mode);
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          options: { onStep: (step) => { if (step === "cutover-marker") holder.trigger(); } } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:${late.name} (unidentified holder of ${root}/${late.name} (${late.why}; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { await holder.release(); }
+      // Without the late holder the same switch is ready: its own SQLite fds are not holders.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+      expect(await backendOf(root)).toBe("sqlite");
+    });
+  }
+
+  // ponytail: an inotify queue overflow needs root (fs.inotify.max_queued_events); a fake helper with a matching
+  // digest stands in for the helper's report, so the gate's handling of it is what this proves.
+  for (const report of ["overflow", "newdir", "silent"] as const) {
+    it.skipIf(leaseSkip !== "")(`fails closed when the lease watch reports ${report}${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const helper = path.join(tempDir("fake"), "fabric-mesh-lease");
+      fs.writeFileSync(helper, `#!/bin/sh
+if [ "$1" = --watch ]; then control=$2; shift 2; fi
+for f in "$@"; do if [ -e "$f" ]; then echo "free $f"; else echo "absent $f"; fi; done
+[ -n "$control" ] || exit 0
+echo watching
+while [ ! -e "$control/go1" ]; do sleep 0.01; done
+${report === "silent" ? "" : `echo ${report}; echo "end 1"`}
+exec sleep 30
+`, { mode: 0o700 });
+      const expectedDigest = createHash("sha256").update(fs.readFileSync(helper)).digest("hex");
+      const started = Date.now();
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper, expectedDigest } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): ${report === "overflow"
+        ? "the lease watch reported lost events (inotify queue overflow)" : report === "newdir" ? "the lease watch reported a new state-shadow directory"
+          : "the lease watch did not report"} (smarty-dev#8116))`);
+      expect(await backendOf(root)).toBe("importing");
+      if (report === "silent") expect(Date.now() - started).toBeLessThan(30_000);
+    }, 60_000);
+  }
+
   it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();
     const copy = tempDir("helper");

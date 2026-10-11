@@ -59,7 +59,20 @@ The gate decides from an inventory, never from what readers chose to register:
    `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
 
-   Known limit (smarty-dev#8116, the accepted gap that remains of smarty-dev#7936; acceptance: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7936#issuecomment-6089556187): the window runs from the lease probe under the fence (before the switch opens `state.db`) to each commit, still under the fence. A process whose fd directory this user cannot read and that opens `state.db`, `-wal` or `-shm` WITHOUT any SQLite lock in that window is not detected; WAL connections always hold a lock on `-shm`. The gate does not probe again after its own open (its own fd makes the probe refuse), and the lease cannot be held through the commit: the switch's own open conflicts with it. Each gated switch prints this gap on stderr.
+   The fenced window (smarty-dev#8116): under the fence the helper runs as `fabric-mesh-lease --watch`. Its
+   inotify watches (the directories of `state.db`, `-wal` and `-shm`, plain and under `state-shadow/`, and
+   each existing file's inode) go up BEFORE the lease probe, so an open after the probe is an event,
+   whatever the opener's dumpability or locks. Before each commit the gate asks for the counts: opens minus
+   closes by name, minus this process's own open fds on those paths, must be zero. An inode opened through
+   another name (a hard link), a moved file, lost events (queue overflow), a `state-shadow/` that appeared,
+   or a helper that does not report within 10 s is never ready (`holder@lease:<file>` or
+   `holder@lease-probe`). On Linux a probe that cannot run is `holder@lease-probe` even when no SQLite file
+   exists yet. Neither simpler option works: any open breaks a held write lease, the switch's own
+   included, and a re-probe after the switch's own open always refuses.
+   Residual (for the security pass): a file created inside the window (`-wal`, `-shm` at the switch's own
+   open) is watched by name until the helper adds its inode watch, microseconds later; a hard-link open
+   inside that gap, or an open that inotify merges with an identical event just before it, is not seen.
+   A dup of one of the switch's own fds would count twice as its own (SQLite and Node do not dup them).
 
    On Linux, the census's SQLite-file evidence (`state-database`) is replaced by this scan, so
    `fabric@unknown` no longer covers it: each holder is named and accepted only by its own

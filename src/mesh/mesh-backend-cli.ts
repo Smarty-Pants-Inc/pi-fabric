@@ -9,7 +9,7 @@ import { censusSync as writerCensusSync, type CensusWriter } from "./writer-cens
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
-import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHolders, type LeaseProbeOptions, type ProcScanOptions, type StateDbHolder, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
+import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHolders, watchStateDbLeases, type StateDbLeaseWatch, type LeaseProbeOptions, type ProcScanOptions, type StateDbHolder, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
   type InstalledReader, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
 
 const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof"] as const;
@@ -178,7 +178,7 @@ const formatResult = (command: Command, result: Record<string, unknown>): string
   return `abort-rollback ${done}: backend=sqlite epoch ${String(result.epoch)}`;
 };
 
-interface Gate { ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
+interface Gate { stop?: () => void; ownStateDbFds?: string[]; switchId: string; required: RequiredReader[]; readiness: ReaderReadiness; final?: ReaderReadiness; checked: string[] }
 
 /**
  * The readiness gate of a switch to sqlite (smarty-dev#7815). The required readers come from the
@@ -198,12 +198,14 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   // Evidence the census cannot attribute, and a failed census, are required as fabric@unknown.
   let ownFds: string[] | undefined;
   // smarty-dev#7936: the write-lease probe runs while this process holds no fd on state.db: before the
-  // fence (the preflight) and under it before the switch opens state.db (beforeOpen). Its result stands
-  // for the checks before each commit, where our own connection would make a new probe refuse.
-  let fencedLeases: StateDbHolder[] | undefined;
+  // fence (the preflight) and under it before the switch opens state.db (beforeOpen). Under the fence it
+  // runs as a watch (smarty-dev#8116): each check before a commit adds the opens since the probe that
+  // this process does not hold, where our own connection would make a new probe refuse.
+  let fencedWatch: StateDbLeaseWatch | undefined;
   let underFence = false;
   const leaseHolders = (): StateDbHolder[] => !underFence ? probeStateDbLeases(options.root, leaseProbe)
-    : fencedLeases ?? [{ pid: 0, name: "holder@lease-probe", reason: "the state.db lease probe did not run under the fence (smarty-dev#7936)" }];
+    : fencedWatch ? [...fencedWatch.holders, ...fencedWatch.check()]
+      : [{ pid: 0, name: "holder@lease-probe", reason: "the state.db lease probe did not run under the fence (smarty-dev#7936)" }];
   const inventory = (): RequiredReader[] => {
     let writers: MeshCensusWriter[];
     let unattributed: MeshCensusWriter[] = [];
@@ -241,7 +243,7 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
     warn(`fabric-mesh-backend: reader ${reader.name} not ready: ${reader.reason}${options.acceptUnready.includes(reader.name) ? " (accepted by --accept-unready)" : ""}\n`);
   }
   const readiness = evaluate(window, "", required);
-  const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [] };
+  const gate: Gate = { switchId: randomUUID(), required, readiness, checked: [], stop: () => fencedWatch?.stop() };
   try {
     recordSwitch(options.root, { switchId: gate.switchId, phase: "intent", command: options.command, backend: "sqlite", from: backend, ...window,
       required, requireReader: options.requireReaders, acceptUnready: options.acceptUnready, readersReady: readiness.ready, acceptedUnready: readiness.unready });
@@ -251,14 +253,10 @@ const openGate = async (options: Options, library: MeshBackendOptions, builtins:
   const outerOpen = library.beforeOpen;
   library.beforeOpen = async () => {
     await outerOpen?.();
-    // ponytail: accepted gap smarty-dev#8116 (from smarty-dev#7936): the window runs from THIS probe to each commit,
-    // under the fence. A holder that opens state.db, -wal or -shm in that window is seen only by the fd scan and
-    // /proc/locks before the commit, so a non-dumpable, lock-free one is missed. No re-probe after our own
-    // open (our fd makes the probe refuse), and the lease cannot be held through the commit: our own open
-    // conflicts with it (EAGAIN, or a 45 s lease break).
-    fencedLeases = probeStateDbLeases(options.root, leaseProbe);
-    warn("fabric-mesh-backend: accepted gap smarty-dev#8116: a lock-free holder whose /proc/<pid>/fd is unreadable and that opens state.db "
-      + "between the lease probe and the commit (under the fence) is not detected\n");
+    // smarty-dev#8116: neither a held lease (any open breaks it, ours included) nor a re-probe (our own fds
+    // make it refuse) covers the window from this probe to each commit; the helper's inotify watch does.
+    fencedWatch?.stop();
+    fencedWatch = await watchStateDbLeases(options.root, leaseProbe);
     underFence = true;
   };
   const outer = library.beforeCommit;
@@ -369,5 +367,5 @@ export const main = async (argv: string[], io: {
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;
-  }
+  } finally { gate?.stop?.(); }
 };

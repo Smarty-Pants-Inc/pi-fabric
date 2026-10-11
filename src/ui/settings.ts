@@ -5,6 +5,7 @@ import { resolveAgentDir } from "../core/agent-dir.js";
 import {
   type FabricConfigScope,
   loadFabricConfigForScope,
+  loadFabricConfig,
   saveFabricConfig,
 } from "../config.js";
 import { listCachedMcpServerNames, mcpDescriptorCachePath } from "../providers/mcp-descriptor-cache.js";
@@ -29,18 +30,22 @@ import {
 } from "./settings-sections.js";
 import type { SettingItem } from "@earendil-works/pi-tui";
 import { openRpcFabricSettings } from "./settings-rpc.js";
+import { imageSafeCustom } from "./image-overlays.js";
+import { DECISION_PROFILE_SETTING_ID } from "./settings-decision-profiles.js";
 
 const ROOT_ITEM_IDS = [
   "fullCodeMode",
   "executor",
   "schema",
   "approvals",
+  "decisions",
   "mcp",
   "prewalk",
   "agents",
   "capture",
   "ui",
   "compaction",
+  "memory",
   "retention",
   "mesh",
   "codePreview",
@@ -97,7 +102,19 @@ export async function openFabricSettings(
       );
       return;
     }
-    deps.state.reloadConfig(context);
+    if (id === DECISION_PROFILE_SETTING_ID) {
+      // Apply only this selector. Do not reload approvals or other live policy.
+      const effective = loadFabricConfig(configLocation).jev.decisionProfile;
+      try {
+        deps.state.setDecisionProfile(effective);
+      } catch (error) {
+        context.ui.notify(`Decision profile saved but could not be applied: ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
+      }
+    } else {
+      deps.state.reloadConfig(context);
+    }
+    if (id.startsWith("memory.extractive.")) deps.state.pi.events.emit("pi-fabric:extractive-config-changed", {});
     // Render the persisted layers, not the live config: runtime-only
     // environment and session overrides must not change what this editor saves.
     Object.assign(
@@ -106,7 +123,7 @@ export async function openFabricSettings(
     );
     deps.onConfigApplied?.(id);
     dirty = true;
-    changedSections.add(id.split(".")[0] ?? id);
+    changedSections.add(id === DECISION_PROFILE_SETTING_ID ? "decisions" : id.split(".")[0] ?? id);
     const list = rootComponent?.settingsList;
     if (list) {
       for (const rootId of ROOT_ITEM_IDS) {
@@ -122,7 +139,23 @@ export async function openFabricSettings(
     "fabric_exec",
     ...deps.capturedTools.list().map((tool) => tool.name),
   ]);
-  const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
+  // Discovery belongs to the section that needs it. Visiting Decisions must
+  // never execute credential helpers or enumerate external runtimes.
+  let modelSource: ModelSource | undefined;
+  let availableClassifierModels: string[] | undefined;
+  let classifierDiscoveryStarted = false;
+  const discoverClassifiers = (): void => {
+    if (classifierDiscoveryStarted) return;
+    classifierDiscoveryStarted = true;
+    void (async () => {
+      try {
+        if (typeof context.modelRegistry.getAvailableOfType === "function") {
+          const available = await context.modelRegistry.getAvailableOfType("classifier", undefined, { signal: AbortSignal.timeout(3000) });
+          availableClassifierModels = available.map((m) => `${m.provider}/${m.id}`);
+        }
+      } catch { /* Unverified is not the same as unavailable. */ }
+    })();
+  };
   const configuredClaudeModel = deps.state.config.agents.claude.model;
   const claudeModelSource: ModelSource = {
     models: configuredClaudeModel
@@ -140,14 +173,23 @@ export async function openFabricSettings(
         "warning",
       );
     }
-  });
+    return claudeModelSource;
+  };
 
   const itemsForScope = (scope: FabricConfigScope, theme: Theme): SettingItem[] => {
     settingsConfig = loadFabricConfigForScope(configLocation, scope);
     return buildFabricSettingsItems(theme, settingsConfig, apply, {
       keepVisibleCandidates,
-      modelSource,
-      claudeModelSource,
+      get modelSource() { return modelSource ??= buildModelSource(context.modelRegistry, agentDir); },
+      get claudeModelSource() { return discoverClaudeModels(); },
+      get classifierModels() {
+        return typeof context.modelRegistry.getModelsOfType === "function"
+          ? context.modelRegistry.getModelsOfType("classifier").map(m => `${m.provider}/${m.id}`) : [];
+      },
+      get availableClassifierModels() {
+        discoverClassifiers();
+        return availableClassifierModels;
+      },
       cachedMcpServers: listCachedMcpServerNames(mcpDescriptorCachePath(context.cwd)),
       ...(activeModelKey ? { activeModelKey } : {}),
     });
@@ -167,7 +209,7 @@ export async function openFabricSettings(
     context.ui.notify("Fabric settings require an interactive UI", "warning");
     return;
   } else {
-    await context.ui.custom<void>(
+    await imageSafeCustom<void>(context.ui,
       (tui, theme, _keybindings, done) => {
         const component = new FabricSettingsComponent(
           theme,
@@ -205,6 +247,10 @@ export async function openFabricSettings(
 
   if (!live()) return;
   if (dirty) {
+    if (changedSections.size === 1 && changedSections.has("decisions")) {
+      context.ui.notify("Decision profile saved. Approvals and chat model unchanged.", "info");
+      return;
+    }
     if (deps.state.kernelReloadRequired) {
       if (deps.reloadResources) {
         context.ui.notify("Kernel saved. Reloading Pi to switch execution and skill resources together.", "info");

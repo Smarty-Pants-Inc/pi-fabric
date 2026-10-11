@@ -9,6 +9,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const stable = [
   "index.js",
+  "extension-bootstrap.js",
   "memory.js",
   "mesh.js",
   "mcp.js",
@@ -16,9 +17,11 @@ const stable = [
   "jev.js",
   "protocol.js",
   "judge-cli.js",
+  "scope.js",
   "core/provider-operations.js",
   "worker.js",
   "agents/worker-protocol.js",
+  "durable/worker.js",
   "residency/host.js",
   "compaction/hook.js",
   "core/action-registry.js",
@@ -30,6 +33,7 @@ const stable = [
   "memory/file-worker.js",
   "memory/worker-provider.js",
   "providers/memory-provider.js",
+  "cli/index.js",
 ];
 const lazy = [
   "residency/launcher-owner.js",
@@ -41,6 +45,13 @@ const lazy = [
   "coordination/unverified-ids.js",
   "agents/model-route.js",
   "agents/spawn-router.js",
+  "durable/worker-host.js",
+  "native-discovery.js",
+  "native-tool-catalog.js",
+  "native-image-artifacts.js",
+  "memory/extractive-history.js",
+  "cli/mesh.js",
+  "cli/decisions.js",
   "agents/claude-cli.js",
   "agents/compact-control.js",
   "agents/result.js",
@@ -65,6 +76,7 @@ const lazy = [
   "speculation/python-scanner.js",
   "ui/dashboard.js",
   "ui/shell-tasks.js",
+  "ui/image-overlays.js",
   "ui/languages/bend.js",
   "ui/conversation.js",
   "ui/conversation-host.js",
@@ -89,6 +101,7 @@ const lazy = [
   "worker/retry-profile.js",
   "worker/task-entry.js",
   "worker/run-log.js",
+  "worker/result.js",
   "worker/run-record.js",
   "worker/session-export.js",
 ];
@@ -117,7 +130,7 @@ if (!manifest.files?.includes("config/landlock-roles.json") || !existsSync(join(
 }
 const targets = (value) => typeof value === "string" ? [value]
   : value && typeof value === "object" ? Object.values(value).flatMap(targets) : [];
-for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions])) {
+for (const target of targets([manifest.main, manifest.types, manifest.exports, manifest.pi?.extensions, manifest.bin])) {
   if (!target.startsWith("./dist/") || target.split("/").includes("..") || !existsSync(join(root, target))) {
     throw new Error(`Missing or unpackaged public entrypoint: ${target}`);
   }
@@ -161,7 +174,20 @@ const staticClosure = (roots) => {
   return visited;
 };
 
-const startupFiles = staticClosure([join(dist, "index.js")]);
+// Bootstrap diagnostics must survive missing runtime dependencies.
+for (const file of staticClosure([join(dist, "worker.js"), join(dist, "durable/worker.js")])) {
+  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+    if (!match[1].startsWith(".") && !match[1].startsWith("node:")) {
+      throw new Error(`Worker bootstrap imports an external package: ${match[1]}`);
+    }
+  }
+}
+const validator = readFileSync(join(dist, "worker/result.js"), "utf8");
+if ([...validator.matchAll(staticImport)].length || /\bimport\s*\(/.test(validator)) {
+  throw new Error("Worker validator must be self-contained");
+}
+// Measure the entry Pi actually loads, including every shared static chunk.
+const startupFiles = staticClosure(manifest.pi.extensions.map(file => resolve(root, file)));
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes
@@ -169,7 +195,7 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 if (startupBytes > 1150 * 1024 || startupFiles.size > 45) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
-const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter"];
+const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];
 for (const file of startupFiles) {
   for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
     if (optionalPackages.some(name => match[1] === name || match[1]?.startsWith(`${name}/`))) {
@@ -185,7 +211,7 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
+for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/entropy/compiler.ts", "src/entropy/trial.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }
@@ -205,6 +231,16 @@ if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.
 }
 if (/src\/judge(?:\/|-cli)/.test(initialSource)) throw new Error("Judge code escaped into startup graph");
 if (manifest.bin?.["fabric-judge"] !== "./bin/fabric-judge" || !existsSync(join(root, "bin/fabric-judge"))) throw new Error("Missing fabric-judge bin");
+// The `pi-fabric` bin is standalone: an executable entry that never loads the extension.
+const cliEntry = join(dist, "cli/index.js");
+if (!readFileSync(cliEntry, "utf8").startsWith("#!/usr/bin/env node\n")) {
+  throw new Error("pi-fabric CLI entry lost its node shebang");
+}
+for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")])]) {
+  if (file === join(dist, "index.js") || readFileSync(file, "utf8").includes("src/fabric-runtime-state.ts")) {
+    throw new Error(`pi-fabric CLI statically reaches the extension graph: ${file}`);
+  }
+}
 const lazyFiles = staticClosure(lazy.map((file) => join(dist, file)));
 const lazySource = [...lazyFiles].map((file) => readFileSync(file, "utf8")).join("\n");
 const mandatoryPowerShellFactoryImport =
@@ -225,7 +261,7 @@ for (const file of entries) {
   if (checked.status !== 0) throw new Error(checked.stderr || `Syntax check failed: ${file}`);
 }
 await Promise.all(
-  stable.filter((file) => file !== "worker.js").map((file) =>
+  stable.filter((file) => file !== "worker.js" && file !== "durable/worker.js").map((file) =>
     import(new URL(`../dist/${file}`, import.meta.url)),
   ),
 );

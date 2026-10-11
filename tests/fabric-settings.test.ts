@@ -18,6 +18,7 @@ import {
   populateClaudeModelSource,
 } from "../src/ui/settings.js";
 import { buildMcpSection } from "../src/ui/settings-sections-execution.js";
+import { coerceValue } from "../src/ui/settings-values.js";
 import { SectionSubmenu } from "../src/ui/settings-submenus.js";
 
 const theme = {
@@ -80,6 +81,13 @@ describe("FabricSettingsComponent", () => {
     });
     const submenu = item.submenu!("", () => {}) as SectionSubmenu;
     const ids = submenu.items.map((row) => row.id);
+    expect(ids).toContain("mcp.nativeServers");
+    const native = submenu.items.find(row => row.id === "mcp.nativeServers")!;
+    expect(native.currentValue).toBe("");
+    expect(native.description).toContain("no automatic fallback");
+    expect(native.submenu).toBeTypeOf("function");
+    expect(coerceValue("mcp.nativeServers", " docs-api, issues ", DEFAULT_FABRIC_CONFIG)).toEqual(["docs-api", "issues"]);
+    expect(coerceValue("mcp.nativeServers", "", DEFAULT_FABRIC_CONFIG)).toEqual([]);
     expect(ids).toContain("mcp.jev.semanticSearch");
     expect(ids).toContain("mcp.jev.blockedServers");
     expect(submenu.items.find((row) => row.id === "mcp.jev.semanticSearch")?.currentValue).toBe("false");
@@ -180,19 +188,21 @@ describe("FabricSettingsComponent", () => {
       "Executor",
       "Schema",
       "Approvals",
+      "Decisions",
       "MCP",
       "Prewalk",
       "Agents",
       "Capture",
       "UI",
       "Compaction",
+      "Extractive history",
       "Retention",
       "Mesh",
       "Code previews",
     ]) {
       expect(labels).toContain(label);
     }
-    expect(items.length).toBe(13);
+    expect(items.length).toBe(15);
   });
 
   it("marks submenu rows with a drill-in marker and leaves inline toggles plain", () => {

@@ -25,7 +25,7 @@ const descriptors: FabricActionDescriptor[] = [
   {
     name: "plan",
     description:
-      "Record the approach the executor will follow: the outcome, the ordered steps with the exact files and checks, how each step is verified, and the risks. An armed session owes this before its mutation boundary hands off; Fabric delivers the recorded plan directly in the executor continuation or task, even if this action's return is discarded.",
+      "Submit the executor handoff plan only when this session is awaiting one and Fabric's armed advisory or checkpoint requests it. Not a general task planner, checklist, or acceptance-ledger store. Include the outcome, ordered steps with exact files and checks, verification, and risks. Fabric delivers the recorded plan directly to the executor even if this action's return is discarded.",
     inputSchema: prewalkPlanSchema as unknown as Record<string, unknown>,
     risk: "write",
   },
@@ -45,7 +45,7 @@ export const normalizePrewalkArgs = actionArgNormalizer(() => descriptors);
 export class PrewalkProvider implements FabricProvider {
   readonly name = "prewalk";
   readonly description =
-    "Frontier-first handoff readiness: record the plan an executor inherits";
+    "Prewalk executor handoff readiness; not general task planning";
 
   constructor(
     readonly controller: PrewalkController,
@@ -54,21 +54,23 @@ export class PrewalkProvider implements FabricProvider {
 
   async list(
     request: FabricProviderListRequest,
-    _context: FabricInvocationContext,
+    context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor[]> {
     const query = request.query?.toLowerCase();
-    return query
-      ? descriptors.filter((descriptor) =>
-          `${descriptor.name} ${descriptor.description}`.toLowerCase().includes(query),
-        )
-      : descriptors;
+    const planRequired = this.controller.planRequired(
+      context.extensionContext.sessionManager.getSessionId(),
+    );
+    return descriptors.filter((descriptor) =>
+      (descriptor.name !== "plan" || planRequired) &&
+      (!query || `${descriptor.name} ${descriptor.description}`.toLowerCase().includes(query)),
+    );
   }
 
   async describe(
     actionName: string,
-    _context: FabricInvocationContext,
+    context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor | undefined> {
-    return descriptors.find((descriptor) => descriptor.name === actionName);
+    return (await this.list({}, context)).find((descriptor) => descriptor.name === actionName);
   }
 
   prepareArguments(

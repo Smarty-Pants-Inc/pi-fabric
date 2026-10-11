@@ -54,7 +54,7 @@ describe("persistent actor kernels", () => {
     setKernel("typescript");
     setBackend("cpython");
     await actors.ask(actor.id, "check");
-    expect(run.mock.calls[0]?.[0]).toMatchObject({ kernel: "python", pythonRuntime: "monty", runner: "pi" });
+    expect(run.mock.calls[0]?.[0]).toMatchObject({ kernel: "python", pythonRuntime: "monty", runner: "pi-durable" });
     expect(actors.definition(actor.id).kernel).toBe("python");
     const explicit = await actors.create({ name: "TS reviewer", instructions: "Review", kernel: "typescript" });
     expect(explicit.kernel).toBe("typescript");

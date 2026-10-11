@@ -148,3 +148,24 @@ describe("managed scratch retention", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, SCRATCH_OWNER_FILE), "utf8")).closedAt).toEqual(expect.any(Number));
   });
 });
+
+describe("namespace-safe scratch ownership", () => {
+  it("records owner identity and never orphans a foreign-namespace owner it cannot judge", async () => {
+    const own = createScratch("output", sandbox());
+    const marker = JSON.parse(fs.readFileSync(path.join(own, SCRATCH_OWNER_FILE), "utf8"));
+    expect(marker.hostname).toBe(os.hostname());
+    expect(marker.startedAt).toEqual(expect.any(Number));
+    const tempRoot = sandbox();
+    // The PID looks dead here, but the owner lives in another PID namespace.
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    });
+    const foreign = fixture(tempRoot, "output", {
+      pid: 123_456, hostname: os.hostname(), pidNamespace: "pid:[foreign]", startedAt: 1,
+    });
+    const legacy = fixture(tempRoot, "output", { pid: 123_457 });
+    const result = await sweepScratch({ tempRoot, now: 100 * HOUR });
+    expect(result.orphaned).toEqual([legacy]);
+    expect(fs.existsSync(foreign)).toBe(true);
+  });
+});

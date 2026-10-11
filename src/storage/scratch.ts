@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
+import { currentOwnerIdentity, ownerIdentityFields, ownerLiveness } from "../core/atomic-write.js";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
 export const SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -24,12 +25,32 @@ interface Owner {
   createdAt: number;
   closedAt?: number;
   orphanedAt?: number;
+  // Optional owner identity (namespace-safe liveness); absent on old markers.
+  hostname?: string;
+  pidNamespace?: string;
+  bootId?: string;
+  startedAt?: number;
 }
 const timestamp = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 export const processAlive = (pid: number): boolean => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return true; // uncertainty is not death
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+};
+// Identity-less (old) markers keep the plain signal probe. Scratch owners do
+// not heartbeat, so a foreign namespace stays "unknown", which is not death.
+const ownerAlive = (owner: Owner): boolean => {
+  const identity = ownerIdentityFields(owner);
+  return ownerLiveness(identity ? { ...identity, pid: owner.pid } : { pid: owner.pid }, {
+    legacyAlive: processAlive,
+  }) !== "dead";
+};
+// A shell child lives in its owner's namespace; its start time is unrecorded.
+const childAlive = (owner: Owner, pid: number): boolean => {
+  const identity = ownerIdentityFields(owner);
+  if (!identity || !Number.isSafeInteger(pid) || pid <= 0) return processAlive(pid);
+  const { startedAt: _startedAt, ...place } = identity;
+  return ownerLiveness({ ...place, pid }, { legacyAlive: processAlive }) !== "dead";
 };
 export const ownedStat = (file: string): fs.Stats | undefined => {
   try {
@@ -58,8 +79,9 @@ export const createScratch = (kind: ScratchKind, tempRoot = fabricDataRoot()): s
   const directory = fs.mkdtempSync(path.join(tempRoot, prefixes[kind]));
   try {
     fs.chmodSync(directory, 0o700);
+    const { pid: _pid, ...identity } = currentOwnerIdentity();
     fs.writeFileSync(path.join(directory, SCRATCH_OWNER_FILE), JSON.stringify({
-      app: "pi-fabric-scratch", version: 1, kind, pid: process.pid, createdAt: Date.now(),
+      app: "pi-fabric-scratch", version: 1, kind, pid: process.pid, createdAt: Date.now(), ...identity,
     } satisfies Owner), { mode: 0o600, flag: "wx" });
   } catch (error) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -142,10 +164,10 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       let childPid: number | undefined;
       if (owner.kind === "shell" && files.has("child.pid")) {
         childPid = Number(fs.readFileSync(path.join(directory, "child.pid"), "utf8").trim());
-        if (processAlive(childPid)) continue;
+        if (childAlive(owner, childPid)) continue;
       }
       if (owner.closedAt === undefined) {
-        if (processAlive(owner.pid)) continue;
+        if (ownerAlive(owner)) continue;
         if (owner.orphanedAt === undefined) {
           result.orphaned.push(directory);
           if (!options.dryRun) await fs.promises.writeFile(path.join(directory, SCRATCH_OWNER_FILE), JSON.stringify({ ...owner, orphanedAt: now }), { mode: 0o600 });
@@ -172,8 +194,8 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       const names = await fs.promises.readdir(candidate.directory);
       if (names.length !== candidate.files.size || names.some(name => !candidate.files.has(name))) continue;
       if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) continue;
-      if (candidate.owner.closedAt === undefined && processAlive(candidate.owner.pid)) continue;
-      if (candidate.childPid !== undefined && processAlive(candidate.childPid)) continue;
+      if (candidate.owner.closedAt === undefined && ownerAlive(candidate.owner)) continue;
+      if (candidate.childPid !== undefined && childAlive(candidate.owner, candidate.childPid)) continue;
       await fs.promises.rm(candidate.directory, { recursive: true, force: true });
       result.removed.push(candidate.directory);
       if (candidate.cache) { totalBytes -= candidate.bytes; totalItems--; }

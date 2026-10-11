@@ -28,6 +28,7 @@ export class AgentCompletionInbox {
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #suspended = false;
+  #failed = false;
   #closed = false;
   #receiptSource = "";
   #receiptOffset = 0;
@@ -45,10 +46,14 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         this.#confirmHeld();
         const stopReason = event.message?.role === "assistant" ? event.message.stopReason : undefined;
-        if (ctx.signal?.aborted || stopReason === "aborted" || stopReason === "error") {
+        if (ctx.signal?.aborted || stopReason === "aborted") {
           this.#suspended = true;
           return;
         }
+        // Automatic recovery does not emit input. Keep errors distinct from
+        // explicit interruption so a successful retry can release the inbox.
+        if (stopReason === "error") { this.#failed = true; return; }
+        if (stopReason) this.#failed = false;
         this.#flush();
       });
     // Any new run ends a suspension, not only typed input: after an abort the inbox must not
@@ -76,8 +81,8 @@ export class AgentCompletionInbox {
       });
     subscribe("context", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
     subscribe("turn_start", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
-    subscribe("agent_settled", (_event, ctx) => {
-        if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
+    subscribe("agent_settled", (event, ctx) => {
+        if (event.aborted || this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
         this.#confirmHeld();
         this.#schedule();
@@ -85,6 +90,7 @@ export class AgentCompletionInbox {
     subscribe("input", (_event, ctx) => {
         this.#context = ctx;
         this.#suspended = false;
+        this.#failed = false;
       });
     subscribe("session_tree", (_event, ctx) => {
         this.#context = ctx;
@@ -229,22 +235,26 @@ export class AgentCompletionInbox {
     }
   }
 
-  #schedule(): void {
-    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
+  #schedule(delayMs = IDLE_BATCH_MS): void {
+    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || this.#failed || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
+      if (this.#context.signal?.aborted) { this.#suspended = true; return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       if (this.#receiptRetries.size) this.#schedule();
-    }, IDLE_BATCH_MS);
+      // Manual compaction has no subsequent agent_settled event. Retain a
+      // low-frequency delivery retry only while unread results are queued.
+      this.#schedule(250);
+    }, delayMs);
     this.#timer.unref?.();
   }
 
   #flush(deliver: (message: CompletionMessage, result: Completion) => void = (message, result) =>
     sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true },
       { id: result.id, name: result.name, kind: "agent" }, "steer", "mesh")): void {
-    if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
+    if (this.#closed || this.#suspended || this.#failed || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));
     // Preparation is non-consuming: a later failure leaves every outcome unread.
@@ -300,6 +310,10 @@ export class AgentCompletionInbox {
       }
     } finally {
       this.#confirmHeld();
+    }
+    if (!this.#pending.size && this.#timer) {
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
     }
   }
 }

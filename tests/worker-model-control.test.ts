@@ -4,9 +4,14 @@ import { PiModelControl } from "../src/worker/model-control.js";
 const requested = "openai-codex/gpt-5.6-sol";
 const model = { provider: "openai-codex", id: "gpt-5.6-sol" };
 const wrong = { provider: "runinfra", id: "glm-5-3-flash" };
-const setup = (selector: string | undefined = requested, thinking: string | undefined = "high", finishStartup = true) => {
+const setup = (
+  selector: string | undefined = requested,
+  thinking: string | undefined = "high",
+  finishStartup = true,
+  admission: "strict" | "permissive" = "strict",
+) => {
   const io = { send: vi.fn(), admitted: vi.fn(), observed: vi.fn(), fail: vi.fn() };
-  const control = new PiModelControl("run", selector, thinking, io);
+  const control = new PiModelControl("run", selector, thinking, io, admission);
   const reply = (data?: unknown, success = true) => {
     const sent = io.send.mock.calls.at(-1)![0];
     control.observe({ type: "response", id: sent.id, command: sent.type, success, data, error: success ? undefined : "denied" });
@@ -119,6 +124,38 @@ describe("Pi model admission", () => {
     expect(h.io.admitted).not.toHaveBeenCalled();
     expect(h.io.observed).toHaveBeenCalledWith("runinfra/glm-5-3-flash");
     expect(h.io.fail).toHaveBeenCalledWith(expect.stringContaining("task was not sent"));
+  });
+
+  // Virtual providers keep the requested key while the child streams on a
+  // concrete backend. Permissive admission records that attribution.
+  it("admits and records the reported backend under permissive admission", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ model: wrong, thinkingLevel: "high" });
+    expect(h.io.fail).not.toHaveBeenCalled();
+    expect(h.control.ready).toBe(true);
+    expect(h.io.observed).toHaveBeenCalledWith("runinfra/glm-5-3-flash");
+    expect(h.io.admitted).toHaveBeenCalledExactlyOnceWith("runinfra/glm-5-3-flash", "high");
+  });
+
+  it("keeps permissive admission open through later assistant attribution", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ model: wrong, thinkingLevel: "high" });
+    h.control.observeAssistant({ role: "assistant", provider: wrong.provider, model: wrong.id });
+    expect(h.io.fail).not.toHaveBeenCalled();
+    expect(h.io.observed).toHaveBeenLastCalledWith("runinfra/glm-5-3-flash");
+  });
+
+  it("still fails closed when permissive admission sees no model at all", () => {
+    const h = setup(requested, "high", true, "permissive");
+    h.reply(model);
+    h.reply();
+    h.reply({ isStreaming: false });
+    expect(h.control.ready).toBe(false);
+    expect(h.io.fail).toHaveBeenCalledOnce();
   });
 
   it.each([undefined, {}, { model: null }, { model }, { model, isStreaming: true }, { model, isCompacting: true }])("validates get_state %#", state => {

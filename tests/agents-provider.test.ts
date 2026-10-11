@@ -2140,11 +2140,14 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup();
     const run = await provider.describe("run", context);
     const spawn = await provider.describe("spawn", context);
-    type RunnerProperty = { enum?: string[]; type?: string; description?: string };
+    type RunnerProperty = { enum?: string[]; pattern?: string; type?: string; description?: string };
     const runProperties = (run?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     const spawnProperties = (spawn?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
-    expect(runProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
-    expect(spawnProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
+    for (const properties of [runProperties, spawnProperties]) {
+      expect(properties.runner?.description).toContain("pi, claude, veda");
+      expect(new RegExp(properties.runner!.pattern!).test("veda")).toBe(true);
+      expect(new RegExp(properties.runner!.pattern!).test("Bad Runner")).toBe(false);
+    }
     expect(runProperties.persona?.type).toBe("string");
     expect(runProperties.persona?.description).toContain("Veda persona");
     expect(spawnProperties.persona?.type).toBe("string");
@@ -2839,7 +2842,7 @@ describe("AgentsProvider runner support", () => {
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi-durable", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
     expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
 
     const outerToolResult = {
@@ -3811,7 +3814,7 @@ return { first, second, tail: "continued" };`,
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi-durable", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
 
     const outerToolResult = {
       role: "toolResult" as const,
@@ -3883,7 +3886,7 @@ return { first, second, tail: "continued" };`,
       kind: "fabric-agent-tools",
       name: "preview-agent",
       status: "completed",
-      runner: "pi",
+      runner: "pi-durable",
       owner: "agent",
       text: "fake worker complete",
       tools: expect.any(Array),
@@ -5741,6 +5744,75 @@ describe("AgentsProvider switchModel", () => {
         undefined,
       );
     }
+  });
+
+  it.each(["run", "spawn"] as const)(
+    "preserves a case-insensitive alias thinking default in agents.%s",
+    async (action) => {
+      const { provider, agents } = setup([], [], undefined, {
+        modelsConfig: {
+          aliases: {
+            fast: { targets: ["provider/model-a"], thinking: "high" },
+          },
+        },
+        agentsConfig: { thinking: "medium" },
+      });
+      const spawn = vi.spyOn(agents, "spawn");
+
+      const result = await provider.invoke(
+        action,
+        { task: `alias ${action}`, model: "FAST" },
+        context,
+      );
+
+      expect(spawn).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "provider/model-a", thinking: "high" }),
+        undefined,
+      );
+      if (action === "run") {
+        expect(result).toMatchObject({ thinking: "high" });
+      } else {
+        await expect(agents.wait((result as { id: string }).id)).resolves.toMatchObject({
+          thinking: "high",
+        });
+      }
+    },
+  );
+
+  it("keeps explicit thinking above an alias and the agent default below it", async () => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: {
+          fast: { targets: ["provider/model-a"], thinking: "high" },
+          steady: { targets: ["provider/model-b"] },
+        },
+      },
+      agentsConfig: { thinking: "medium" },
+    });
+    const spawn = vi.spyOn(agents, "spawn");
+
+    const explicit = (await provider.invoke(
+      "spawn",
+      { task: "explicit alias level", model: "fast", thinking: "low" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-a", thinking: "low" }),
+      undefined,
+    );
+    await expect(agents.wait(explicit.id)).resolves.toMatchObject({ thinking: "low" });
+
+    const fallback = (await provider.invoke(
+      "spawn",
+      { task: "global default level", model: "steady" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-b" }),
+      undefined,
+    );
+    expect(spawn.mock.calls.at(-1)?.[0]).not.toHaveProperty("thinking");
+    await expect(agents.wait(fallback.id)).resolves.toMatchObject({ thinking: "medium" });
   });
 
   it.each(["run", "spawn"] as const)(

@@ -1,0 +1,77 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import piFabric from "../src/index.js";
+import { MISSING_TOOL_RESULT_TEXT } from "../src/compaction/orphan-repair.js";
+
+type Handler = (...args: unknown[]) => unknown;
+
+const loadExtension = async (): Promise<Map<string, Handler[]>> => {
+  const handlers = new Map<string, Handler[]>();
+  const pi = {
+    events: { emit: vi.fn(), on: vi.fn(() => () => undefined) },
+    getActiveTools: vi.fn(() => []),
+    getAllTools: vi.fn(() => []),
+    on: vi.fn((event: string, handler: Handler) => {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    }),
+    registerCommand: vi.fn(),
+    registerMessageRenderer: vi.fn(),
+    registerTool: vi.fn(),
+    setActiveTools: vi.fn(),
+  } as unknown as ExtensionAPI;
+  await piFabric(pi);
+  return handlers;
+};
+
+const hostContext = (sessionId = "session-1") => ({
+  hasUI: false,
+  sessionManager: { getSessionId: () => sessionId, getBranch: () => [] },
+});
+
+describe("Fabric compaction extension hooks", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("repairs orphaned tool results in the outgoing context and keeps clean lists untouched", async () => {
+    const handlers = await loadExtension();
+    const [context] = handlers.get("context")!;
+    const clean = [
+      { role: "user", content: "go", timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "a", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
+      { role: "toolResult", toolCallId: "a", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 1 },
+    ];
+    expect(await context!({ type: "context", messages: clean }, hostContext())).toBeUndefined();
+
+    const broken = [
+      { role: "user", content: "go", timestamp: 1 },
+      { role: "toolResult", toolCallId: "ghost", toolName: "read", content: [{ type: "text", text: "x" }], isError: false, timestamp: 1 },
+      { role: "assistant", content: [{ type: "toolCall", id: "b", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 1 },
+      { role: "user", content: "again", timestamp: 1 },
+    ];
+    const repaired = await context!({ type: "context", messages: broken }, hostContext()) as {
+      messages: Array<{ role: string; toolCallId?: string; content?: unknown }>;
+    };
+    expect(repaired.messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "user"]);
+    expect(repaired.messages[2]).toMatchObject({
+      toolCallId: "b",
+      isError: true,
+      content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    });
+  });
+
+  it("warns once per session when another extension owns a compaction", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const handlers = await loadExtension();
+    const sessionCompact = handlers.get("session_compact")!;
+    const event = {
+      type: "session_compact",
+      compactionEntry: { type: "compaction", details: { compactor: "other" }, fromHook: true },
+      fromExtension: true,
+      reason: "threshold",
+      willRetry: false,
+    };
+    for (const handler of sessionCompact) await handler(event, hostContext());
+    for (const handler of sessionCompact) await handler(event, hostContext());
+    const ownership = warn.mock.calls.filter(([message]) => String(message).includes("load order"));
+    expect(ownership).toHaveLength(1);
+  });
+});

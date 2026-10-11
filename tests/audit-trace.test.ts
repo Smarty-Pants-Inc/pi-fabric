@@ -319,7 +319,7 @@ return true;
       },
     });
     const timed = serviceFor(waitingProvider);
-    timed.service.config.executor.timeoutMs = 40;
+    timed.service.config.executor.timeoutMs = 1_000;
     const timedResult = await execute(
       timed.service,
       timed.context,
@@ -331,9 +331,13 @@ return true;
       failureStage: "invoke",
     });
 
-    const aborted = serviceFor(waitingProvider);
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("cancel-secret")), 30);
+    const aborted = serviceFor(demoProvider({
+      async list() {
+        queueMicrotask(() => controller.abort(new Error("cancel-secret")));
+        return new Promise(() => undefined);
+      },
+    }));
     const abortedResult = await execute(
       aborted.service,
       aborted.context,

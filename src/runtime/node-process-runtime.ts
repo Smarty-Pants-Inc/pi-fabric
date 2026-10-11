@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mainExecutionCeilingAbortReason, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { guestSetupSource } from "./quickjs-runtime.js";
 import type { FabricHostCall, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { NODE_PROCESS_CHILD_SOURCE } from "./node-process-child-source.js";
@@ -31,7 +32,7 @@ interface ChildResponseAckMessage {
   responseId: number;
 }
 
-type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage;
+type ChildMessage = ChildCallMessage | ChildResultMessage | ChildResponseAckMessage | { type: "output"; text?: string; image?: unknown };
 
 const HOST_TASK_SETTLE_GRACE_MS = 250;
 
@@ -98,7 +99,7 @@ export class NodeProcessRuntime {
       : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
     const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
     const guestLineCount = guestBundle.code.split("\n").length;
-    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false);
+    const setup = guestSetupSource(options.piToolCanonicalFields, options.piTools !== false, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled);
     const child = spawn(
       interpreterPath,
       this.#interpreter === "bun"
@@ -123,6 +124,9 @@ export class NodeProcessRuntime {
     const hostTasks = new Set<Promise<void>>();
     let nextResponseId = 0;
     const pendingReceipts = new Map<number, { id: number; commit: () => void }>();
+    const partialLogs: string[] = [];
+    const partialImages: unknown[] = [];
+    let partialChars = 0;
 
     return new Promise<FabricSandboxResult>((resolve) => {
       const finish = (result: FabricSandboxResult, unawaitedHostCalls = false): void => {
@@ -142,7 +146,7 @@ export class NodeProcessRuntime {
         child.removeAllListeners();
         if (child.connected) child.disconnect();
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        resolve(result);
+        resolve(result.terminationReason === "completed" ? result : { ...result, logs: result.logs.length ? result.logs : partialLogs, emitted: result.emitted?.length ? result.emitted : partialImages });
       };
       const expireDeadline = (): void => {
         if (settled) return;
@@ -174,8 +178,25 @@ export class NodeProcessRuntime {
       };
       const extendDeadline = (ref: string, args: Record<string, unknown>): void => {
         const requested = options.minimumTimeoutMsForHostCall?.(ref, args);
+        if (typeof requested === "number" && Number.isFinite(requested) && humanWait.paused) {
+          humanWait.raise(requested);
+          return;
+        }
         if (executionDeadline.extend(requested)) scheduleDeadline();
       };
+
+      const humanWait = new HumanWaitDeadlinePause({
+        // ExecutionDeadline owns the clock, so a pause never lifts the host-owned ceiling.
+        remainingMs: () => executionDeadline.remainingMs(),
+        suspend: () => {
+          executionDeadline.suspend();
+          scheduleDeadline();
+        },
+        resume: (remainingMs) => {
+          executionDeadline.resume(remainingMs);
+          scheduleDeadline();
+        },
+      });
 
       abortHandler = () => {
         // Preserve only the Main watchdog reason for host observers (e.g. a local actor ASK).
@@ -200,6 +221,15 @@ export class NodeProcessRuntime {
           if (!receipt || receipt.id !== message.id) return;
           pendingReceipts.delete(message.responseId);
           receipt.commit();
+          return;
+        }
+        if (message.type === "output") {
+          const chars = typeof message.text === "string" ? message.text.length : JSON.stringify(message.image ?? null).length;
+          partialChars += chars;
+          if (partialChars <= 16_777_216) {
+            if (typeof message.text === "string") partialLogs.push(message.text);
+            else if (message.image !== undefined) partialImages.push(message.image);
+          }
           return;
         }
         if (message.type === "result") {
@@ -252,9 +282,13 @@ export class NodeProcessRuntime {
           });
           return;
         }
+        const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
+        if (waitsForHuman) humanWait.enter();
         const task = runAbortable(hostAbortController.signal, () =>
           hostCall(message.ref, message.args, hostAbortController.signal),
-        ).then(
+        ).finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        }).then(
           (value) => {
             if (settled || finishing || !child.connected) return;
             if (executionDeadline.reached) { expireDeadline(); return; }

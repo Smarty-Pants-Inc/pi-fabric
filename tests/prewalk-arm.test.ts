@@ -97,6 +97,7 @@ describe("armFabricPrewalkSession", () => {
     expect(h.prewalk.planRequired("session-1")).toBe(false);
     expect(h.sendMessage.mock.calls[0]?.[0].content).not.toContain("prewalk.plan(");
     expect(h.sendMessage.mock.calls[0]?.[0].content).toContain("first successful");
+    expect(h.sendMessage.mock.calls[0]?.[0].details.requirePlan).toBe(false);
   });
 
   it("arms from the live config and mirrors arm-time side effects", async () => {

@@ -9,8 +9,13 @@ import type { FabricInvocationContext } from "../protocol.js";
 import type { JevLaunch, JevRunInfo, JevJson, JevResponse } from "./types.js";
 import { checkSchema, checkValue, jsonText, object } from "./validation.js";
 import { checkObserve, type JevObservationHost, type JevSubscription } from "./observation.js";
+import { decisionUsage } from "./decisions.js";
+import { DECISION_MAX_BYTES } from "./decision-profiles.js";
+import type { DecisionResult } from "./decision-types.js";
 
 interface Run {
+  usesDecisions: boolean;
+  inferenceLimits: { evaluations: number; tokens: number };
   info: JevRunInfo;
   controller: AbortController;
   done: Promise<JevRunInfo>;
@@ -24,6 +29,8 @@ export interface JevManagerOptions {
   registry: ActionRegistry;
   config: FabricConfig;
   observationHost?: JevObservationHost | undefined;
+  /** Host-only target snapshot hook, before any guest execution. */
+  onRunStarted?(id: string): void;
   authorize?(ref: string, parentToolCallId: string): Promise<void>;
 }
 const prelude = `const input = JSON.parse(π.__jevInput);
@@ -40,6 +47,8 @@ export class JevProgramManager {
   #closed = false;
   #starting = 0;
   constructor(readonly options: JevManagerOptions) {}
+  usesDecisions(id: string): boolean { return this.#runs.get(id)?.usesDecisions ?? false; }
+  inferenceLimits(id: string) { return this.#runs.get(id)?.inferenceLimits; }
   list() {
     return [...this.#runs.values()].map(({ info }) => ({
       id: info.id, name: info.name, state: info.state, background: info.background,
@@ -107,7 +116,7 @@ export class JevProgramManager {
       checkValue(definition.inputSchema, input, "Program input");
       const requires = [...new Set(definition.requires)];
       for (const ref of requires) {
-        if (!/^[a-z][a-z0-9_-]*\.[a-zA-Z0-9_.$-]+$/.test(ref) || (ref.startsWith("jev.") && ref !== "jev.evaluate" && ref !== "jev.advise"))
+        if (!/^[a-z][a-z0-9_-]*\.[a-zA-Z0-9_.$-]+$/.test(ref) || (ref.startsWith("jev.") && !["jev.evaluate", "jev.decide", "jev.resolveDecision", "jev.decisionProviders", "jev.models", "jev.advise"].includes(ref)))
           throw new Error("Programs require exact action refs; recursive Jev lifecycle calls are not allowed");
         if (context.capabilityView && !Object.hasOwn(context.capabilityView.bindings, ref))
           throw new Error(`Jev program cannot widen its caller's capabilities: ${ref}`);
@@ -165,14 +174,17 @@ export class JevProgramManager {
       let timedOut = false;
       const timer = setTimeout(() => { timedOut = true; controller.abort(new Error("Jev deadline exceeded")); }, timeoutMs);
       let evaluating = false;
+      let inferenceBlocked = false;
+      let reportedTokens = 0;
       const audits: FabricCallAudit[] = [];
       const emit = (value: unknown) => {
         jsonText(value, 4096, "Program event");
         info.events.push({ sequence: info.nextSequence++, at: Date.now(), value: value as JevJson });
         if (info.events.length > 64) info.events.shift();
       };
-      const run: Run = { info, controller, observation, done: undefined! };
+      const run: Run = { info, controller, observation, usesDecisions: requires.includes("jev.decide"), inferenceLimits: { evaluations: maxEvaluations, tokens: maxTokens }, done: undefined! };
       this.#runs.set(id, run);
+      this.options.onRunStarted?.(id);
       this.#starting--;
       starting = false;
       this.#prune();
@@ -200,13 +212,15 @@ export class JevProgramManager {
             }
             if (ref === "jev.advise" && args.id !== id) throw new Error("A Jev program can only advise through its own run");
             if (!Object.hasOwn(runLease.view!.bindings, ref)) throw new Error(`Capability not granted to Jev program: ${ref}`);
-            if (ref === "jev.evaluate") {
+            const inference = ref === "jev.evaluate" || ref === "jev.decide";
+            if (inference) {
               if (evaluating) throw new Error("One Jev evaluation may be in flight per program; batch independent questions in one request");
-              if (info.evaluations >= maxEvaluations || info.usage.input_tokens + info.usage.output_tokens >= maxTokens)
+              if (inferenceBlocked || info.evaluations >= maxEvaluations || reportedTokens >= maxTokens)
                 return failBudget("Jev inference budget exhausted");
               info.evaluations++;
               evaluating = true;
             }
+            let accounted = false;
             try {
               const value = await registry.invoke(ref, args, {
                 cwd: context.cwd, extensionContext: context.extensionContext, signal, capabilityView: runLease.view!,
@@ -220,18 +234,30 @@ export class JevProgramManager {
                     await approval.approve({ ...action, risk: "execute" }, prepared);
                   } else await approval.approve(action, prepared);
                 },
-                audits, maxResultChars: ref === "jev.evaluate" ? 1_048_576 : config.executor.maxNestedResultChars,
+                audits, maxResultChars: ref === "jev.decide" ? DECISION_MAX_BYTES : ref === "jev.evaluate" ? 1_048_576 : config.executor.maxNestedResultChars,
               });
-              if (ref === "jev.evaluate") {
-                const response = value as JevResponse;
-                info.usage.input_tokens += response.usage.input_tokens;
-                info.usage.output_tokens += response.usage.output_tokens;
-                if (info.usage.input_tokens + info.usage.output_tokens > maxTokens)
+              if (inference) {
+                const response = ref === "jev.decide" ? decisionUsage(value as DecisionResult) : {
+                  input: (value as JevResponse).usage.input_tokens, output: (value as JevResponse).usage.output_tokens, exhausted: false,
+                };
+                info.usage.input_tokens = response.input === null || info.usage.input_tokens === null ? null : info.usage.input_tokens + response.input;
+                info.usage.output_tokens = response.output === null || info.usage.output_tokens === null ? null : info.usage.output_tokens + response.output;
+                reportedTokens += (response.input ?? 0) + (response.output ?? 0);
+                inferenceBlocked ||= response.exhausted || reportedTokens >= maxTokens;
+                accounted = true;
+                // Lossless calls retain even the final over-budget/error response.
+                // The next inference is blocked; deterministic inspection still works.
+                if (ref === "jev.evaluate" && reportedTokens > maxTokens)
                   return failBudget("Jev reported-token budget exhausted");
               }
               return value;
+            } catch (error) {
+              // A failed dispatch may still have billed. Do not let a guest catch
+              // it and start another inference with a fabricated zero usage count.
+              if (inference && !accounted) { inferenceBlocked = true; info.usage.input_tokens = null; info.usage.output_tokens = null; }
+              throw error;
             } finally {
-              if (ref === "jev.evaluate") evaluating = false;
+              if (inference) evaluating = false;
               // Keep audit retention bounded even in a long-lived loop.
               if (audits.length > 64) audits.splice(0, audits.length - 64);
             }
@@ -258,6 +284,9 @@ export class JevProgramManager {
           context.signal?.removeEventListener("abort", abort);
           // Bound the unread-result hold from termination, not asynchronous lease cleanup.
           info.endedAt = Date.now();
+          // Providers release what this run acquired (interactive sessions, leases),
+          // exactly as they do when a fabric_exec invocation ends.
+          await registry.endInvocation(`jev:${id}`).catch(() => undefined);
           await runLease.release();
           this.#prune();
         }

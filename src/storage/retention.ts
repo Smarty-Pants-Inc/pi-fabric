@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import {
+  type OwnerIdentity,
+  ownerHeartbeatFields,
+  ownerIdentityFields,
+  ownerLiveness,
+  recordOwnerLiveness,
+  writeFileAtomic,
+  writeJsonAtomic,
+} from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
@@ -12,10 +20,19 @@ import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSe
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
 const TERMINAL_STATUSES = new Set(["completed", "failed", "stopped", "timed_out"]);
+/**
+ * A run root is heartbeated by each retention sweep of its owner, every 15
+ * minutes (`RETENTION_SWEEP_INTERVAL_MS` in agents/manager.ts). Across PID
+ * namespaces a signal probe means nothing, so three missed sweeps prove the
+ * owner dead.
+ */
+export const RUN_ROOT_HEARTBEAT_TTL_MS = 45 * 60 * 1_000;
 interface RunRootOwner {
   pid: number;
   startedAt: number;
   heartbeatAt: number;
+  // Optional owner identity (namespace-safe liveness); absent on old markers.
+  identity?: Omit<OwnerIdentity, "pid">;
   orphanedAt?: number;
   closedAt?: number;
   childrenStopped?: boolean;
@@ -79,12 +96,27 @@ const writeOwner = (root: string, owner: RunRootOwner): void => {
 };
 export const markRunRootActive = (root: string, now = Date.now()): void => {
   const existing = readJson<RunRootOwner>(ownerPath(root));
-  writeOwner(root, { pid: process.pid, startedAt: validOwner(existing) ? existing.startedAt : now, heartbeatAt: now });
+  writeOwner(root, { pid: process.pid, startedAt: validOwner(existing) ? existing.startedAt : now, ...ownerHeartbeatFields(now) });
 };
 export const heartbeatRunRoot = markRunRootActive;
 export const markRunRootClosed = (root: string, now = Date.now(), childrenStopped = false): void => {
   const existing = readJson<RunRootOwner>(ownerPath(root));
-  writeOwner(root, { pid: process.pid, startedAt: validOwner(existing) ? existing.startedAt : now, heartbeatAt: now, closedAt: now, childrenStopped });
+  writeOwner(root, { pid: process.pid, startedAt: validOwner(existing) ? existing.startedAt : now, ...ownerHeartbeatFields(now), closedAt: now, childrenStopped });
+};
+// Identity-less (old) markers keep the plain signal probe. Uncertainty is not death.
+const ownerAlive = (owner: RunRootOwner, now: number): boolean =>
+  recordOwnerLiveness(owner, {
+    heartbeatTtlMs: RUN_ROOT_HEARTBEAT_TTL_MS,
+    legacyAlive: processAlive,
+    probes: { now: () => now },
+  }) !== "dead";
+// A process-transport child lives in its owner's namespace; its start time is
+// unrecorded. Without an owner identity, keep the plain signal probe.
+const childAlive = (owner: RunRootOwner | undefined, pid: number): boolean => {
+  const identity = ownerIdentityFields(owner?.identity);
+  if (!identity) return processAlive(pid);
+  const { startedAt: _startedAt, ...place } = identity;
+  return ownerLiveness({ ...place, pid }, { legacyAlive: processAlive }) !== "dead";
 };
 /**
  * A run whose worker may still be running (lost contact, or an unconfirmed launch) keeps
@@ -336,7 +368,7 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
   return true;
 };
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false, owner?: RunRootOwner): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
@@ -349,7 +381,8 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   // Unknown identity always vetoes.
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
-  if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return false;
+  // Veto if either our saved-writer identity check or the run-root owner's identity/heartbeat says alive.
+  if (pid !== undefined && (savedWriterAlive(pid, record, acceptPidReuse) || (owner !== undefined && childAlive(owner, pid)))) return false;
   if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
     if (!childrenStopped) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
@@ -389,7 +422,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse, owner)) return false;
         continue;
       }
       return false;
@@ -403,14 +436,14 @@ export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDe
   const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
-const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
+const safeRootContents = (root: string, childrenStopped: boolean, owner?: RunRootOwner): boolean => {
+  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped, 0, noDeadline, false, owner)); }
   catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
   if (!ownedStat(root)?.isDirectory()) return false;
   const owner = readJson<RunRootOwner>(ownerPath(root));
-  return validOwner(owner) && owner.pid === process.pid && safeRootContents(root, true);
+  return validOwner(owner) && owner.pid === process.pid && safeRootContents(root, true, owner);
 };
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
@@ -443,7 +476,7 @@ const pruneClosedRunRoot = (
       continue;
     }
     if (!processAlive(owner.pid)) recoverActorRunArchives(directory, expired);
-    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) continue;
+    if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired, false, owner)) continue;
     try { fs.rmSync(directory, { recursive: true, force: true }); removed.push(directory); } catch {}
   }
   return removed;
@@ -534,7 +567,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
       continue;
     }
-    if (processAlive(owner.pid)) continue;
+    if (ownerAlive(owner, now)) continue;
     if (owner.orphanedAt === undefined) {
       try { writeOwner(root, { ...owner, orphanedAt: now }); } catch {}
       continue;
@@ -549,7 +582,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       if (run.name === RUN_ROOT_OWNER_FILE || !run.isDirectory()) continue;
       const directory = path.join(root, run.name);
       recoverActorRunArchives(directory, expired);
-      if (!safeRunTree(directory, false, 0, expired)) continue;
+      if (!safeRunTree(directory, false, 0, expired, false, owner)) continue;
       // Reported as the root's removal once it is empty, as before.
       try { fs.rmSync(directory, { recursive: true, force: true }); } catch {}
     }

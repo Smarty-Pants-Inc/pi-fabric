@@ -23,6 +23,7 @@ const selectListThemeFor = (theme: unknown) => {
   };
 };
 import type { FabricApprovalConfig } from "../config.js";
+import { actionApprovalOverride } from "./approval-overrides.js";
 import type { FabricRisk } from "../protocol.js";
 import type { ResolvedFabricAction } from "./action-registry.js";
 import {
@@ -101,6 +102,8 @@ export class ApprovalController {
     readonly brokeredNetwork?: (provider: string) => boolean,
     /** Internal routing cannot own a classifier or approval dialog: refuse ungranted `auto`/`ask` before queuing. */
     readonly internalRouting = false,
+    /** approvals.headless "decision": resolve to true only on an explicit approve. */
+    readonly headless?: (action: ResolvedFabricAction, reason?: string) => Promise<boolean>,
   ) { this.#generation = sessionApprovals.generation; }
 
   #assertCurrent(): void {
@@ -114,9 +117,15 @@ export class ApprovalController {
     args: Record<string, unknown> = {},
   ): Promise<void> {
     this.#assertCurrent();
+    const override = actionApprovalOverride(this.config.actions, action.ref);
+    // An action-level deny is absolute: no inherited or session risk grant lifts it.
+    if (override === "deny") {
+      throw new FabricTraceSafeError(`${action.ref} is denied by the Fabric approvals.actions policy`);
+    }
     // This is an immutable host capability, not a model/configurable network grant.
     if (action.risk === "network" && this.brokeredNetwork?.(action.provider) === true) return;
-    const mode = this.config[action.risk];
+    // Exact ref beats provider wildcard beats the risk-class mode.
+    const mode = override ?? this.config[action.risk];
     if (
       mode === "allow" ||
       (!this.brokeredNetwork && (
@@ -195,6 +204,10 @@ export class ApprovalController {
   ): Promise<void> {
     this.#assertCurrent();
     if (!this.context.hasUI) {
+      if (this.config.headless === "decision" && this.headless) {
+        if (await this.headless(action, escalationReason)) return;
+        throw new FabricTraceSafeError(`${action.ref} approval was denied, cancelled, or expired`);
+      }
       throw new FabricTraceSafeError(`${action.ref} requires approval, but no interactive UI is available`);
     }
 

@@ -397,7 +397,7 @@ describe("Fabric configuration", () => {
   });
 
   it("normalizes the default runner and independent Claude settings", () => {
-    expect(DEFAULT_FABRIC_CONFIG.agents.runner).toBe("pi");
+    expect(DEFAULT_FABRIC_CONFIG.agents.runner).toBe("pi-durable");
     expect(DEFAULT_FABRIC_CONFIG.agents.claude).toEqual({ binary: "claude" });
     const configured = normalizeFabricConfig({
       agents: {
@@ -411,9 +411,9 @@ describe("Fabric configuration", () => {
       model: "claude/haiku",
     });
     const invalid = normalizeFabricConfig({
-      agents: { runner: "other", claude: { binary: " ", model: " " } },
+      agents: { runner: "Not A Runner", claude: { binary: " ", model: " " } },
     });
-    expect(invalid.agents.runner).toBe("pi");
+    expect(invalid.agents.runner).toBe("pi-durable");
     expect(invalid.agents.claude).toEqual({ binary: "claude" });
   });
 
@@ -446,8 +446,12 @@ describe("Fabric configuration", () => {
     expect(backendModel.agents.veda.model).toBe("opus");
     const blankBackend = normalizeFabricConfig({ agents: { veda: { backend: " " } } });
     expect(blankBackend.agents.veda.backend).toBe("agy");
-    const invalidRunner = normalizeFabricConfig({ agents: { runner: "other" } });
-    expect(invalidRunner.agents.runner).toBe("pi");
+    const invalidRunner = normalizeFabricConfig({ agents: { runner: 42 } });
+    expect(invalidRunner.agents.runner).toBe("pi-durable");
+    // A well-formed id may name a runner registered later; launch fails closed if not.
+    const registered = normalizeFabricConfig({ agents: { runner: "acme-daemon" } });
+    expect(registered.agents.runner).toBe("acme-daemon");
+    expect(invalidRunner.agents.runner).toBe("pi-durable");
   });
 
   it("defaults the agent thinking level to medium and validates the value", () => {
@@ -1011,6 +1015,26 @@ describe("Fabric configuration", () => {
   });
 });
 
+describe("native MCP ownership configuration", () => {
+  it("rejects invalid settings before replacing the working configuration", () => {
+    const directory = temporaryDirectory();
+    const location = { cwd: directory, agentDir: directory, projectTrusted: false };
+    const saved = saveFabricConfig(location, { mcp: { nativeServers: ["docs"] } });
+    const before = fs.readFileSync(saved.path, "utf8");
+    expect(() => saveFabricConfig(location, { mcp: { nativeServers: ["bad.name"] } })).toThrow("mcp.nativeServers");
+    expect(fs.readFileSync(saved.path, "utf8")).toBe(before);
+    expect(loadFabricConfig(location).mcp.nativeServers).toEqual(["docs"]);
+  });
+
+  it("is opt-in, deduplicates exact names, and rejects malformed selections rather than falling back", () => {
+    expect(normalizeFabricConfig({}).mcp.nativeServers).toEqual([]);
+    expect(normalizeFabricConfig({ mcp: { nativeServers: [" docs-api ", "docs-api", "issues"] } }).mcp.nativeServers).toEqual(["docs-api", "issues"]);
+    for (const nativeServers of ["docs", ["bad.name"], [1], [""], ["*"]]) {
+      expect(() => normalizeFabricConfig({ mcp: { nativeServers } })).toThrow("mcp.nativeServers");
+    }
+  });
+});
+
 describe("MCP descriptor cache configuration", () => {
   it("defaults to an enabled cache with changed revalidation", () => {
     const config = normalizeFabricConfig({});
@@ -1069,5 +1093,14 @@ describe("MCP Jev semantic search configuration", () => {
     expect(config.mcp.jev.blockedServers).toEqual(["github"]);
     expect(config.mcp.jev.semanticCandidateLimit).toBe(127);
     expect(config.mcp.jev.semanticMinProbability).toBe(0.75);
+  });
+
+  it("normalizes the agent model admission policy", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.modelAdmission).toBe("strict");
+    expect(normalizeFabricConfig({}).agents.modelAdmission).toBe("strict");
+    expect(normalizeFabricConfig({ agents: { modelAdmission: "permissive" } }).agents.modelAdmission)
+      .toBe("permissive");
+    expect(normalizeFabricConfig({ agents: { modelAdmission: "relaxed" } }).agents.modelAdmission)
+      .toBe("strict");
   });
 });

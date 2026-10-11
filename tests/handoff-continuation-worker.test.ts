@@ -19,7 +19,7 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
     if (directory) rmTempSync(directory);
   });
 
-  it("finishes its original work after a nested depth rejection instead of returning failure text (offline)", async () => {
+  it.each(["pi", "pi-durable"] as const)("%s finishes its original work after a nested depth rejection instead of returning failure text (offline)", async (runner) => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-handoff-continuation-"));
     const agentDir = path.join(directory, "agent");
     fs.mkdirSync(agentDir);
@@ -30,8 +30,9 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
     }));
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({
       fullCodeMode: true,
+      mcp: { enabled: false },
       prewalk: { mode: "trajectory", model: "handoff-probe/executor", alwaysRearm: true },
-      agents: { maxDepth: 1, timeoutMs: 30_000 },
+      agents: { runner, maxDepth: 1, timeoutMs: 30_000 },
       mesh: { enabled: false },
     }));
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -51,8 +52,11 @@ describe.skipIf(!fs.existsSync(workerPath))("real trajectory executor continuati
       role: "toolResult", toolCallId: "frontier", toolName: "fabric_exec", content: [{ type: "text", text: "partial work" }],
       isError: false, timestamp: 3,
     }, "frontier");
-    manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, maxDepth: 1, timeoutMs: 30_000 }, {
-      workerPath, piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+    manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, runner, maxDepth: 1, timeoutMs: 30_000 }, {
+      workerPath,
+      piBinary: runner === "pi"
+        ? path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
+        : path.join(directory, "forbidden-native-pi"),
       fullCodeMode: true, fabricExtensionPath: path.resolve("dist/index.js"), runRoot: path.join(directory, "runs"),
     });
     const result = await manager.run({

@@ -2130,6 +2130,9 @@ export class FabricRuntimeState {
     return this.#shellJobs.unannounced() + (this.#shellInbox?.pendingCount() ?? 0) + (this.#jevPrograms?.runningCount() ?? 0);
   }
 
+  /** A busy period of Main ended outside the inbox's own events (smarty-dev#9271). */
+  completionIdleSignal(): void { this.#completionInbox?.idleSignal(); }
+
   /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
   mainOwnsProviderRecovery(): boolean {
     return this.#mainAgent?.ownsProviderRecovery() ?? false;

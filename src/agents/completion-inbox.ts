@@ -28,7 +28,6 @@ export class AgentCompletionInbox {
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #suspended = false;
-  #failed = false;
   #closed = false;
   #receiptSource = "";
   #receiptOffset = 0;
@@ -46,14 +45,15 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         this.#confirmHeld();
         const stopReason = event.message?.role === "assistant" ? event.message.stopReason : undefined;
+        // Only an owner cancel parks results until Main's next run (smarty-dev#733).
         if (ctx.signal?.aborted || stopReason === "aborted") {
           this.#suspended = true;
           return;
         }
-        // Automatic recovery does not emit input. Keep errors distinct from
-        // explicit interruption so a successful retry can release the inbox.
-        if (stopReason === "error") { this.#failed = true; return; }
-        if (stopReason) this.#failed = false;
+        // A provider error or refusal (pi-ai maps Anthropic `refusal` to "error") ends the run, and
+        // Pi starts no run for a steer queued now. Keep results pending, not suspended: the idle
+        // flush armed at agent_settled, or a later enqueue, wakes Main (smarty-dev#6134, as #4012).
+        if (stopReason === "error") return;
         this.#flush();
       });
     // Any new run ends a suspension, not only typed input: after an abort the inbox must not
@@ -85,12 +85,19 @@ export class AgentCompletionInbox {
         if (event.aborted || this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
         this.#confirmHeld();
-        this.#schedule();
+        this.idleSignal();
       });
+    // Pi counts a compacting Main as busy, and a compaction that no run surrounds (a manual
+    // /compact, Fabric's retry of a failed compaction) ends without agent_settled. Its end events
+    // arm the idle check for a completion that landed during it (smarty-dev#9271). Pi emits
+    // session_compact just before it leaves its compaction state, which it does as soon as the
+    // last handler returns; session_compact_failed comes after. Fabric's retry also signals from
+    // Pi's onComplete/onError callback, which runs after that state is gone (compaction/recovery.ts).
+    subscribe("session_compact", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
+    subscribe("session_compact_failed", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
     subscribe("input", (_event, ctx) => {
         this.#context = ctx;
         this.#suspended = false;
-        this.#failed = false;
       });
     subscribe("session_tree", (_event, ctx) => {
         this.#context = ctx;
@@ -134,6 +141,19 @@ export class AgentCompletionInbox {
     this.#acknowledged.add(id);
     this.#pending.delete(id);
     this.#handed.delete(id);
+  }
+
+  /**
+   * An event that can end Main's busy period arms one idle check, IDLE_BATCH_MS from now. A check
+   * that finds Main busy arms nothing: a run delivers at its own turn_end or before_agent_start,
+   * and a busy period without a run ends with one of these events (smarty-dev#9271). No polling.
+   */
+  idleSignal(): void {
+    if (this.#closed) return;
+    // Restart an earlier check: it could run before Pi leaves the busy state this event ends.
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#schedule();
   }
 
   close(): void {
@@ -235,26 +255,24 @@ export class AgentCompletionInbox {
     }
   }
 
-  #schedule(delayMs = IDLE_BATCH_MS): void {
-    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || this.#failed || !this.#pending.size))) return;
+  #schedule(): void {
+    if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
+    // A check that finds Main busy does not re-arm itself; idleSignal() does, on an event.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
       if (this.#context.signal?.aborted) { this.#suspended = true; return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       if (this.#receiptRetries.size) this.#schedule();
-      // Manual compaction has no subsequent agent_settled event. Retain a
-      // low-frequency delivery retry only while unread results are queued.
-      this.#schedule(250);
-    }, delayMs);
+    }, IDLE_BATCH_MS);
     this.#timer.unref?.();
   }
 
   #flush(deliver: (message: CompletionMessage, result: Completion) => void = (message, result) =>
     sendFabricMessage(this.pi, message, { deliverAs: "steer", triggerTurn: true },
       { id: result.id, name: result.name, kind: "agent" }, "steer", "mesh")): void {
-    if (this.#closed || this.#suspended || this.#failed || this.#context.signal?.aborted || !this.#pending.size) return;
+    if (this.#closed || this.#suspended || this.#context.signal?.aborted || !this.#pending.size) return;
     const batch = [...this.#pending.values()].slice(0, 32);
     const perResult = Math.max(0, Math.min(SUMMARY_CHARS, Math.floor(BATCH_CHARS / batch.length) - 320));
     // Preparation is non-consuming: a later failure leaves every outcome unread.

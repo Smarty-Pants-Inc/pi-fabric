@@ -29,8 +29,13 @@ export const INBOX_INJECT_MAX_EVENTS = 8;
 export const INBOX_INJECT_MAX_TEXT_BYTES = 12 * 1024;
 export const INBOX_INJECT_EVENT_TEXT_BYTES = 4 * 1024;
 
+export interface RootInboxEvent extends MeshEvent {
+  /** Shaped on drain only: old actionable work never requests a turn. */
+  deliveredLate?: true;
+}
+
 export interface RootInboxBatch {
-  events: MeshEvent[];
+  events: RootInboxEvent[];
   /** The sequence the cursor moves to once these events are in the session. */
   through: number;
   /** Expired addressed shadows skipped in this drain, never delivered as work. */

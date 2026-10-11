@@ -597,6 +597,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     observations: new entropy.SessionObservationCache(),
   });
   let entropyCaches: ReturnType<typeof createEntropyCaches> | undefined;
+  // smarty-dev#8881: AgentSession.dispose() invalidates extension contexts without emitting session_shutdown
+  // (pi-coding-agent docs/sdk.md), and Pi exposes no dispose hook; every getter of a stale context throws.
+  // A compile scheduled by a disposed session stops before it reads or writes the agent dir, which may
+  // already be the next session's.
+  const contextLive = (context: ExtensionContext): boolean => {
+    try { void context.hasUI; return true; } catch { return false; }
+  };
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -612,7 +619,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   ): Promise<boolean> => {
     const current = (): boolean =>
       !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
-      state.config.entropy.compile;
+      state.config.entropy.compile && contextLive(context);
     if (!current()) return false;
     const entropy = await import("./entropy/index.js");
     if (!current()) return false;
@@ -712,7 +719,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         }
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
-        if (request.signal.aborted) return;
+        if (request.signal.aborted || !contextLive(request.context)) return;  // shutdown or dispose
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
@@ -1301,6 +1308,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       await state.ensure(context); // Failure is first use, never an eager idle import.
       await state.publishOpsEvent(COMPACTION_FAILED_ALARM, COMPACTION_FAILED_ALARM, data);
     },
+    // No agent_settled follows a retry on an idle Main: its end wakes Main for a completion (smarty-dev#9271).
+    retryEnded: () => state.completionIdleSignal(),
   });
 
   // Deterministic, LLM-free compaction is registered unconditionally and is

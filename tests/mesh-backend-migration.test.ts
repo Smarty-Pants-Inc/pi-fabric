@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireMeshCustodyLock } from "../src/mesh/custody-lock.js";
 import { abortMeshRollback, assertFileStateWritable, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
-  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, readMeshStateMovedMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
+  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
   type MeshBackendAlarm, type MeshCensusAdvisory, type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
@@ -469,6 +469,50 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     expect(meshSnapshotDigest(decodeFile(after))).toBe(imported);
     const conflict = (failed as MeshCutoverFailedError).conflictFile!;
     expect((decodeMeshStateFile(conflict, 64 * 1024 * 1024, false) as MeshStateFile).entries["rogue/key"]?.value).toBe(1);
+  });
+});
+
+describe("the NATS moved marker and backend=nats (smarty-dev#7504, docs/mesh-backends.md §Migration)", () => {
+  it("over a file root: file and sqlite mode fail closed and name the stream; status reports it", async () => {
+    const root = tempRoot("nats-marker");
+    await seedFileRoot(root);
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker("FABRIC_MESH_X", 2));
+    const bytes = fs.readFileSync(path.join(root, "state.json"));
+    expect(readMeshStateNatsMarker(root)).toMatchObject({ format: "nats", backend: "nats", stream: "FABRIC_MESH_X", epoch: 2 });
+    expect(readMeshStateMovedMarker(root)).toBeUndefined(); // never taken for the SQLite marker (which opens state.db)
+    const store = fileStore(root);
+    expect(() => store.get("seed/solo")).toThrow(/moved to NATS stream FABRIC_MESH_X .*must run in nats mode/);
+    await expect(store.put({ key: "seed/solo", value: "late", identity })).rejects.toBeInstanceOf(MeshBackendFenceError);
+    expect(() => assertMeshStateReadable(root)).toThrow(MeshBackendFenceError);
+    expect(() => resolveMeshStateSource(root)).toThrow(/NATS stream FABRIC_MESH_X/);
+    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow();
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "state.json"))).toEqual(bytes);
+    const status = await meshBackendStatus(root);
+    expect(status).toMatchObject({ backend: "none", fileEpoch: 2, fileMoved: true, natsStream: "FABRIC_MESH_X", fenceHolds: true });
+    expect(status.reader).toHaveProperty("error");
+  });
+
+  it("backend=nats in state.db fences sqlite readers and writers and file-mode writers", async () => {
+    const root = tempRoot("nats-flag");
+    await seedFileRoot(root);
+    await importMeshState(root);
+    const sqlite = await openSqlite(root);
+    expect(sqlite.get("seed/solo")?.value).toBe("plain");
+    setRawMeta(root, "backend", "nats");
+    setRawMeta(root, "epoch", 2);
+    expect(() => resolveMeshStateSource(root)).toThrow(/backend=nats at epoch 2/);
+    expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
+    await expect(sqlite.put({ key: "seed/solo", value: "late", identity })).rejects.toBeInstanceOf(MeshStateRetiredError);
+    expect(() => sqlite.get("seed/solo")).toThrow(MeshStateRetiredError);
+    // The marker then replaces the SQLite one at the same epoch: the fence still holds.
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker("FABRIC_MESH_X", 2));
+    expect(await meshBackendStatus(root)).toMatchObject({ backend: "nats", epoch: 2, natsStream: "FABRIC_MESH_X", fenceHolds: true });
+  });
+
+  it("refuses a stream name NATS would not accept", () => {
+    expect(() => encodeMeshStateNatsMarker("a.b", 1)).toThrow(/Invalid NATS stream name/);
+    expect(() => encodeMeshStateNatsMarker("", 1)).toThrow(/Invalid NATS stream name/);
   });
 });
 

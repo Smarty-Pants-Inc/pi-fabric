@@ -132,6 +132,12 @@ export type FabricActorDelivery = "mailbox" | "steer" | "followUp" | "nextTurn";
 export type FabricActorResponseMode = "text" | "directive";
 /** failed excludes routing after the failure budget; explicit repair/probe asks remain available. */
 export type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+/**
+ * Why a stopped actor stopped (smarty-dev#9241). explicit: agents.stop/remove; directive: the actor's
+ * own stop directive; host-exit: its session Main exited and the root-gone reconciler retired it.
+ * Only host-exit is restarted, by the same session's next start. A reload never stops an actor.
+ */
+export type FabricActorStopReason = "explicit" | "directive" | "host-exit";
 export type FabricActorBindingScope = "session" | "project";
 export type FabricActorStorageScope = "session" | "project";
 
@@ -338,7 +344,9 @@ export interface FabricActorInfo {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
-  /** Terminal foreign session-root record, not authority to adopt or restart it. */
+  /** Present only while stopped; missing on a legacy stop means explicit. */
+  stopReason?: FabricActorStopReason;
+  /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */
   sessionOrphan?: FabricActorSessionOrphan;
   runner: FabricAgentRunner;
   kernel?: FabricKernel;

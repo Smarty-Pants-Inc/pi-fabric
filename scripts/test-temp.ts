@@ -24,7 +24,13 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
     // Config probes and workers share this path; their exit must not delete live siblings.
     return { TMPDIR: sharedDirectory, TMP: sharedDirectory, TEMP: sharedDirectory };
   }
-  const directory = mkdtempSync(join(tmpdir(), prefix));
+  // ponytail: smarty-dev#7554. Unix socket paths have a 108-byte limit; an agent host's long TMPDIR
+  // (/srv/scratch/<user>/smarty-pi-tmp/...) plus nested fixture dirs exceeded it (listen EINVAL, tmux
+  // "File name too long"). POSIX-only: Windows keeps its own TEMP and pipes, not path-bound sockets.
+  const base = tmpdir();
+  const directory = process.platform !== "win32" && base.length > 40
+    ? mkdtempSync(join("/tmp", prefix))
+    : mkdtempSync(join(base, prefix));
   process.once("exit", () => {
     try {
       rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
@@ -55,12 +61,16 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   // Scrub production/future selectors, not the exact test-only controls above.
   // Keep values verbatim: consumers own strict booleans and artifact selection.
   // Unsetting paths alone would fall back to the checkout or the user's Pi profile.
+  // smarty-dev#7554: an agent pane's own Herdr pane, Pi session and lane lead must not
+  // reach transports, spawner attribution or project-agent resolution under test.
   for (const key of Object.keys(process.env)) {
-    if (key.toUpperCase().startsWith("PI_FABRIC_") && !testControls.has(key)) delete process.env[key];
+    const upper = key.toUpperCase();
+    if (upper.startsWith("PI_FABRIC_") && !testControls.has(key)) delete process.env[key];
+    else if (upper.startsWith("HERDR_")) delete process.env[key];
   }
   for (const key of [
-    "PI_CODING_AGENT_DIR", "SMARTY_ROLE", "HERDR_ENV", "HERDR_SOCKET_PATH",
-    "HERDR_WORKSPACE_ID", "HERDR_PANE_ID", "HERDR_BIN_PATH", "MCPORTER_CONFIG",
+    "PI_CODING_AGENT_DIR", "PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE",
+    "SMARTY_ROLE", "SMARTY_LEAD_SESSION", "MCPORTER_CONFIG",
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.

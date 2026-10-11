@@ -24,6 +24,7 @@ import type { FabricComponentEntry } from "./components/types.js";
 import type { FabricRisk } from "./protocol.js";
 import type { FabricKernel } from "./runtime/kernel.js";
 import { DEFAULT_FABRIC_THINKING, isFabricThinking, type FabricThinking } from "./thinking.js";
+import { MESH_STATE_BACKEND_KIND_LIST, MESH_STATE_BACKEND_KINDS, type MeshStateBackendKind } from "./mesh/state-backend-kinds.js";
 import {
   defaultCodePreviewSettings,
   normalizeCodePreviewSettings,
@@ -359,23 +360,27 @@ const meshLockProtocol = (value: unknown): MeshLockProtocol => {
 };
 
 /** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
-export type MeshStateBackend = "file" | "shadow" | "sqlite";
+export type MeshStateBackend = MeshStateBackendKind;
 
-// Local and tiny on purpose: importing state-backend.ts here would put SQLite in the config graph.
-const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = ["file", "shadow", "sqlite"];
+// The import-free kinds leaf on purpose: importing state-backend.ts here would put SQLite in the config graph.
+const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = MESH_STATE_BACKEND_KINDS;
 const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
-  // The environment overrides the file setting; an unknown environment value is ignored (fail safe).
+  // The environment overrides the file setting. An unknown non-empty value is refused, never ignored:
+  // a typo would silently open a different store than its peers and split the mesh (pi-fabric#796).
   const override = env?.trim().toLowerCase();
-  if (override && (MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+  if (override) {
+    if ((MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
+    throw new Error(`PI_FABRIC_MESH_STATE_BACKEND must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
+  }
   if (value === undefined) return "file";
   if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
-  throw new Error("mesh.stateBackend must be file, shadow or sqlite");
+  throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
 };
 
 export interface FabricMeshConfig {
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
-  /** Keyed-state backend: "file" (default), "shadow" or "sqlite"; env PI_FABRIC_MESH_STATE_BACKEND overrides. */
+  /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
   enabled: boolean;
   root?: string;

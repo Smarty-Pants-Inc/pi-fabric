@@ -314,7 +314,7 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !remoteHostValid(value.remoteHost) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
-    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken"]) ||
+    !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId"]) ||
     // v1 of the bridge mirrors root presence only; remote agents and actors come in v2.
     (value.remoteHost !== undefined && kind !== "root") ||
     typeof value.id !== "string" ||
@@ -526,6 +526,9 @@ export interface ParticipantDirectoryOptions {
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
+  /** Complete runtime mesh activation before any presence write. A lock timeout
+   * follows the same startup warning and background refresh retry as publication. */
+  beforePublication?: () => Promise<void>;
   /** Prepare outside custody; validate exact registry generations inside the
    * existing publication fence before any ownership/presence write. */
   preparePublicationFence?: () => () => boolean;
@@ -533,12 +536,12 @@ export interface ParticipantDirectoryOptions {
   listReadCacheMs?: number;
   /** Registry -> mesh/key order for shared publication. Accepted actor file copies
    * may follow outside custody with exact token validation under their key lock. */
-  withPublicationFence?: <T>(publish: () => Promise<T>) => Promise<T>;
+  withPublicationFence?: <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>) => Promise<T>;
   /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
    * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
   waitForPublicationRetry?: () => Promise<void>;
   /** Extra presence writes share this host's one fenced heartbeat acquisition. */
-  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void };
+  publicationBatch?: (full: boolean) => { ops: MeshBatchOperation[]; committed: () => void; actorIds?: readonly string[] };
   hostId: string;
   rootId: string;
   identity: MeshIdentity;
@@ -835,6 +838,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.#prepareLeaseLock = false;
         if (this.#closed) return false;
       }
+      // Complete runtime mesh activation (custody + lineage resume) after the host
+      // lease is joined/prepared and before any presence write.
+      if (this.options.beforePublication) await this.options.beforePublication();
+      if (this.#closed) return false;
       if (this.#prepareFileLocks) {
         await prepareParticipantFileLocks(this.mesh);
         this.#prepareFileLocks = false;
@@ -1998,6 +2005,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
         ? [{ key: entry.key, version: entry.version, participant }] : [];
     });
     const actorCopies: Array<{ key: string; version: number }> = [];
+    // smarty-dev#8526: renewals of actor files this host already owns run after the registry
+    // fence, like actorCopies: the key lock plus a fresh registry-lineage check at the write
+    // decision is the receipt adoption shares (it changes lineage holding this key's lock).
+    const actorRenewals: Array<() => Promise<void>> = [];
+    const renewOutsideFence = (record: FabricParticipantRecord): boolean => !!validPublication &&
+      !!this.options.withPublicationFence && !!this.options.actorRenewalAllowed &&
+      record.kind === "actor" && record.actorOwnershipToken !== undefined;
     const copyCommitted = async (key: string, version: number, participant: FabricParticipantRecord): Promise<void> => {
       if (validPublication && this.options.actorRenewalAllowed && participant.kind === "actor" && participant.actorOwnershipToken !== undefined) {
         actorCopies.push({ key, version });
@@ -2045,8 +2059,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           // hold it (review/astra round 4 on #142).
           const key = keyFor(PARTICIPANT_PREFIX, record.id);
           const migrating = existingById.get(record.id)?.entry;
-          const publish = async (): Promise<void> => {
+          const publish = async (afterFence = false): Promise<void> => {
             const published = await this.#retryFile(() => this.#writeFile(record, (current) => {
+              if (afterFence && !this.options.actorRenewalAllowed!(record)) return false;
               const taken = (entry: MeshStateEntry | undefined): boolean => {
                 if (!entry || ownParticipant(entry) !== undefined) return false;
                 const holder = participantFromEntry(entry);
@@ -2060,7 +2075,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
             }
           };
           if (migrating || !ownParticipant(filesByKey.get(key))) await publish();
-          else deferredFileWrites.push(publish);
+          else if (renewOutsideFence(record)) actorRenewals.push(() => publish(true));
+          else deferredFileWrites.push(() => publish());
         }
       }
       for (const copy of copies) await copyCommitted(copy.key, copy.version, copy.participant);
@@ -2178,12 +2194,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return committedAt;
     };
+    // smarty-dev#8526: the actors this round can write, so the fence locks only their registries.
+    // undefined (every registry, as before) when the round also writes a root/legacy record,
+    // removes an own record, or carries a batch op not attributed to an actor id.
+    const fencedActors = ((): ReadonlySet<string> | undefined => {
+      const ids = new Set(publication?.actorIds ?? []);
+      if (publication && publication.ops.length > 0 && publication.actorIds === undefined) return undefined;
+      // Prepared ops are the batch, the statePuts and (only) a legacy session delete.
+      if (ops.length > (publication?.ops.length ?? 0) + statePuts.size || legacyChanged || legacyPut !== undefined) return undefined;
+      if (existing.some(({ participant }) => !desired.has(participant.id)) ||
+        fileEntries.some(entry => { const own = ownParticipant(entry); return own !== undefined && !desired.has(own.id); })) return undefined;
+      for (const record of [...statePuts.values(), ...fileWrites, ...activityWrites, ...copies.map(copy => copy.participant)]) {
+        if (record.kind !== "actor") return undefined;
+        ids.add(record.id);
+      }
+      return ids.size > 0 ? ids : undefined;
+    })();
     const committed = validPublication && this.options.withPublicationFence
-      ? await this.options.withPublicationFence(commitPrepared) : await commitPrepared();
+      ? await this.options.withPublicationFence(commitPrepared, fencedActors) : await commitPrepared();
     // The shared receipt already committed. Copies recheck that exact receipt
     // AND current registry lineage while holding the actor key; adoption takes
     // the same key before changing lineage. New/changed actor files therefore
     // need no registry custody, keeping first publication of 50 actors bounded.
+    for (const renew of actorRenewals) await renew();
     for (const copy of actorCopies) await this.#copyCommitted(copy.key, copy.version);
     return committed;
   }

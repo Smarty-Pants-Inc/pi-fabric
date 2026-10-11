@@ -712,7 +712,7 @@ variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesy
 fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
 
-`mesh.lockProtocol` accepts only numeric `1` or `2` and defaults to `1`. It is captured
+`mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
 store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time
 wire without an incarnation: if a dead holder's PID is reused by a live process, v1
@@ -731,6 +731,31 @@ Fresh ownerless directories, empty/torn/corrupt owner files and nonempty unrecor
 directories fail closed; recorded live owners never expire. Unrecoverable unrecorded
 orphans need trusted repair after all possible writers/cleaners are fenced out. Immediate
 proven-dead-holder recovery, retained recovery receipts and bounded jitter/backoff remain.
+
+Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on its own owner line:
+`linux:<machine-id>:<boot_id>:<pid-ns inode>`, `darwin:<IOPlatformUUID>:<bootsessionuuid>:host` or
+`win32:<MachineGuid>:<boot ticks>:host`. The mesh `.lock` and `custody.lock` (plain and host-qualified) write it.
+
+- **Why:** a container, VM or other host sharing a mesh root sees ESRCH, or an unrelated process, for a LIVE holder
+  in another namespace. Reclaiming that holder lets two writers into the critical section.
+- **Pid evidence only in our own namespace:** a reclaimer uses pid evidence (ESRCH, another incarnation) only for a
+  holder of ITS OWN namespace.
+- **An earlier boot:** a holder from an earlier boot of the same machine is dead, and is reclaimed at once.
+- **Never reclaimed automatically:** a holder of another namespace, or one whose namespace is unknown or malformed
+  (`FABRIC_MESH_LOCK_FOREIGN_HOLDER` / `FABRIC_MESH_LOCK_UNPROVEN_HOLDER`, still a `MeshLockTimeoutError`).
+  - Recover it from inside its namespace, or with
+    `fabric-mesh-backend lock-recover --root DIR --lock mesh|custody --holder TOKEN`. That command acts only on a
+    provably dead holder.
+  - Its labelled `--unsafe-holder-stopped` override recovers on the operator's word that the holder is stopped.
+- **Rollout:**
+  - Old releases accept only 4- or 5-field (custody: 7-field) records, so they can never reclaim a protocol-3
+    record.
+  - New releases reclaim legacy records by today's rule. Switch a root to 3 once its writers run a release that
+    knows it.
+- **Not covered:** the synchronous SQLite create fence (`holdMeshFenceSync`, a single brief attempt) still writes
+  the legacy record.
+- **Residual off Linux:** a holder's release by name is still exposed to a forced rename (smarty-dev#9569 (b)/(d)).
+  Linux releases through the pinned directory fd.
 These safeguards do not repair old B68 binaries still running on the root. Even on
 protocol 1, claiming this new-only safety boundary requires fencing every older capable
 writer/cleaner and preventing respawn or later resumption. Rollback needs the same

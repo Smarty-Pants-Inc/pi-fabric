@@ -57,7 +57,7 @@ export type IncarnationCommandRunner = (
   options: { timeout: number; maxBuffer: number; windowsHide: boolean; signal: AbortSignal; env?: NodeJS.ProcessEnv },
 ) => Promise<string>;
 
-const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
+export const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
   childProcess.execFile(executable, args, { ...options, env: childProcessEnvironment(options.env), encoding: "utf8" }, (error, stdout) => {
     if (error) reject(error);
     else resolve(stdout);
@@ -134,6 +134,9 @@ const nativeReader = () => {
 export const processIncarnation = (pid: number, timeoutMs?: number): Promise<string | undefined> => nativeReader().read(pid, timeoutMs);
 /** Memoized lazily, not at import/registration/session start. */
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
+
+/** Why the last stale check left a holder alone (smarty-dev#9569): its namespace is foreign or unprovable. */
+export interface StaleLockNote { verdict?: "foreign" | "unproven"; namespace?: string }
 
 export interface AtomicWriteOptions {
   // File mode for the committed file (default 0o600) and for mkdir -p of its
@@ -668,6 +671,21 @@ export class MeshLockTimeoutError extends Error {
   constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number) {
     super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`);
     this.name = "MeshLockTimeoutError";
+  }
+}
+
+/**
+ * A lock whose holder this process may not reclaim on pid evidence (smarty-dev#9569): another PID namespace, or one
+ * it cannot prove. Still a MeshLockTimeoutError (callers keep their retry handling), with its own code.
+ */
+export class MeshLockForeignHolderError extends MeshLockTimeoutError {
+  readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
+  constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
+    readonly holderNamespace: string) {
+    super(holder, attempts, maxGapMs);
+    this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
+    this.message = `${this.foreignCode}: ${this.message}; its holder is in ${verdict === "foreign" ? `another PID namespace (${holderNamespace})` : "a PID namespace this process cannot prove"}, so it is never reclaimed on pid evidence. Recover it from that namespace, or with the labelled unsafe override once the holder is stopped`;
+    this.name = "MeshLockForeignHolderError";
   }
 }
 

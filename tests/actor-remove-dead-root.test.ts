@@ -439,7 +439,11 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       (process as { getuid?: unknown }).getuid = undefined;
       let result: Awaited<ReturnType<typeof f.cli>>;
       try { result = await f.cli(actor.id); } finally { (process as { getuid?: unknown }).getuid = getuid; }
-      expect(result.code).toBe(1); expect(result.err).toContain("file ownership cannot be proven (smarty-dev#7858)");
+      // Off Windows the CLI's channel owner check (smarty-dev#6001) refuses first; on Windows owner SIDs pass it
+      // and the offline removal's own ownership gate refuses.
+      expect(result.code).toBe(1);
+      expect(result.err).toMatch(process.platform === "win32" ? /file ownership cannot be proven \(smarty-dev#7858\)/
+        : /Cannot verify that the resident channel is owned by this OS user \(no uid available\); refusing stop\/remove/);
       expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
     } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }

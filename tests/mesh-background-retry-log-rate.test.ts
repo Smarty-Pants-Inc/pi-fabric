@@ -242,6 +242,6 @@ describe("background mesh retry warning rate limit", () => {
     }
     vi.stubEnv("PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS", "250");
     expect(new MeshBackgroundRetry("poll").warningWindowMs).toBe(250);
-    expect(new MeshBackgroundRetry("poll", 100, 5_000, 10).warningWindowMs).toBe(10);
+    expect(new MeshBackgroundRetry("poll", 100, 5_000, undefined, 10).warningWindowMs).toBe(10);
   });
 });

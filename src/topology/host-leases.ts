@@ -244,7 +244,9 @@ export const commitHostLeaseUnderCustody = (meshRoot: string, lease: FabricHostL
 /** Initial claim compares the captured predecessor, not clocks; subsequent renewal never
  * recreates a missing/different lease. Legacy admission has one expiry/deadline wake only. */
 export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease,
-  options: HostLeaseLockOptions & { claim?: boolean; expected?: FabricHostLease | undefined } = {}): Promise<void> => {
+  options: HostLeaseLockOptions & { claim?: boolean; expected?: FabricHostLease | undefined;
+    /** Claim admission under the lease lock, immediately before the CAS; a throw writes nothing. */
+    admit?: () => void } = {}): Promise<void> => {
   if (!lease.incarnationToken) throw new TypeError("Host lease mutation requires an incarnation token");
   const expected = options.claim
     ? Object.hasOwn(options, "expected") ? options.expected : hostLeasePredecessor(mesh.root, lease.id)
@@ -256,6 +258,7 @@ export const renewHostLease = async (mesh: HostLeaseMesh, lease: FabricHostLease
   }
   try {
     await withHostLeaseLock(mesh, hostLeasePath(mesh.root, lease.id), () => {
+      if (options.claim) options.admit?.();
       commitHostLeaseUnderCustody(mesh.root, lease, { claim: options.claim ?? false, expected });
     }, { ...options, lease: { incarnationToken: lease.incarnationToken, expiresAt: lease.expiresAt } });
   } catch (error) {

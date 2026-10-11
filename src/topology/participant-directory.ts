@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundQueue, MeshBackgroundRetry, type MeshBackgroundOwner } from "../core/atomic-write.js";
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
@@ -578,10 +578,13 @@ export interface ParticipantDirectoryOptions {
    * Explicit refresh()/quiesce() calls still publish from the owner's last live snapshot.
    */
   live?: () => boolean;
+  /** Unlike a rebindable live token, an obsolete runtime epoch must cancel its timers. */
+  backgroundEpoch?: Pick<MeshBackgroundOwner, "epoch" | "current" | "obsolete">;
   /**
    * Once per outage: more than LIFECYCLE_LOST_TICKS consecutive heartbeats found no live
    * lifecycle to read (smarty-dev#5962/#4313). The lease is no longer renewed, so the owner
-   * must say so visibly instead of vanishing from the directory in silence.
+   * must say so visibly instead of vanishing from the directory in silence. A current
+   * epoch keeps its timer and reports after the same consecutive-failure threshold.
    */
   onLifecycleLost?: (ticks: number) => void;
 }
@@ -594,7 +597,7 @@ export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
   readonly ownerIncarnation = randomUUID();
-  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #backgroundRefresh: MeshBackgroundRetry;
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   #startedAt = Date.now();
@@ -673,6 +676,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     readonly mesh: MeshStore,
     readonly options: ParticipantDirectoryOptions,
   ) {
+    this.#backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh", 100, 5_000,
+      options.backgroundEpoch ? {
+        ...options.backgroundEpoch,
+        retire: () => this.#stopBackgroundTimers(),
+        // Probe failures only: lock/WAL-cap/operation errors back off but never mean "ctx lost".
+        onFailure: (_error, failures) => this.#lifecycleTick(false, failures),
+        onRecovery: () => this.#lifecycleTick(true),
+      } : undefined);
     this.#leasePredecessor = options.enabled ? hostLeasePredecessor(mesh.root, options.hostId) : undefined;
     // Prepare the participant-file lock receipt before any publication fence. A cold
     // Darwin/Windows native identity read must never be awaited while registries are held.
@@ -686,7 +697,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
   }
 
-  /** A retired owner lifecycle skips background work; a throwing token is retired too. */
+  /** An unavailable owner lifecycle skips work without retiring its timer. */
   #live(): boolean {
     try { return this.options.live?.() ?? true; } catch { return false; }
   }
@@ -694,13 +705,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
   get degraded(): boolean { return this.#degraded; }
 
-  #lifecycleTick(live: boolean): void {
+  #lifecycleTick(live: boolean, failures?: number): void {
     if (live) {
       this.#retiredTicks = 0;
       this.#degraded = false;
       return;
     }
-    if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
+    this.#retiredTicks = failures ?? this.#retiredTicks + 1;
+    if (this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
     console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
@@ -714,6 +726,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#sources.delete(source);
       if (this.#timer) this.scheduleRefresh();
     };
+  }
+
+  #stopBackgroundTimers(): void {
+    if (this.#timer) clearInterval(this.#timer);
+    this.#timer = undefined;
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    this.#refreshAgain = false;
+    this.#cancelPublicationRetry();
+  }
+
+  /** A live rebind clears the outage; an obsolete instance cannot regain its timers. */
+  rebindLifecycle(): void {
+    if (this.#closed) return;
+    this.#backgroundRefresh.rebind();
+    this.#armHeartbeat();
   }
 
   async start(): Promise<void> {
@@ -735,17 +764,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingReadAt = 0;
     this.#leaseConfirmed = false;
     this.#refreshedAt = Date.now();
-    if (this.options.enabled) {
+    this.#armHeartbeat();
+    await this.refresh();
+  }
+
+  #armHeartbeat(): void {
+    // A superseded incarnation (main's host-lease UUID fence) never regains its heartbeat, even on a live rebind.
+    if (this.options.enabled && !this.#timer && !this.#backgroundRefresh.retired && !this.#superseded) {
       // Start before the initial publish: its per-key work can contend too. The
       // timer also retries a failed initial publish so the host can join later.
       this.#retiredTicks = 0;
       this.#degraded = false;
       this.#timer = setInterval(() => {
-        if (this.#closed) return;
+        // The lifecycle gate, not operation backoff: a mesh-lock timeout, WAL-cap refusal or
+        // other operation error must never skip actor/file/host lease renewal (pi-fabric#808).
+        if (this.#closed || !this.#backgroundRefresh.lifecycleActive) return;
         const live = this.#live();
-        this.#lifecycleTick(live);
+        if (!this.options.backgroundEpoch) this.#lifecycleTick(live);
         if (!live) return;
-        void this.#renewActors();
+        void this.#renewActors().catch(error => this.#backgroundRefresh.failure(error));
         // The retry runner coalesces shared publication, not independent liveness.
         // Renew through per-key waits even when run() skips an in-flight refresh;
         // shared-lock-only waits still lapse and confirmation still needs its lock.
@@ -758,13 +795,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
           return;
         }
         if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
-          void this.#backgroundRefresh.run(() => this.refresh(), false);
+          void this.#backgroundRefresh.run(() => this.refresh(), false, { ignoreBackoff: true });
         }
       }, this.#heartbeatMs);
       this.#timer.unref();
       this.#installExitHook();
     }
-    await this.refresh();
   }
 
   // An exit before close() finished withdrawing (a /quit or SIGTERM that ends the process
@@ -843,7 +879,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // Publishes changed local records soon: at once after a quiet second, otherwise at the
   // end of that second (one write for a burst of changes).
   scheduleRefresh(): void {
-    if (this.#closed || this.#superseded || isMeshLockTimeout(this.#refreshError)) return;
+    if (this.#closed || this.#superseded || !this.#backgroundRefresh.active || isMeshLockTimeout(this.#refreshError)) return;
     if (this.#refreshing) {
       this.#refreshAgain = true;
       return;
@@ -854,7 +890,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!this.#refreshScheduled || this.#closed) return;
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
-      if (!this.#live()) return;
+      if (!this.#backgroundRefresh.active || !this.#live()) return;
       void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
@@ -1005,7 +1041,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // live process retains its ownership/incarnation and renews only that file lease.
       // Do not advance confirmedAt, clear the outage, admit an unregistered host, or let
       // canConsumeMesh treat this as a successful commit. Peers still use #484's grace.
-      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing && !(error instanceof HostLeaseLockBusyError)) {
+      if (this.#leaseConfirmed && !this.#closed && !this.#quiescing && !this.#backgroundRefresh.retired &&
+        !(error instanceof HostLeaseLockBusyError)) {
         try { await this.#renewFileLease(); } catch (renewError) {
           if (renewError instanceof FabricHostLeaseSupersededError) error = renewError;
         }
@@ -1044,6 +1081,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   #schedulePublicationRetry(): void {
     if (!this.options.waitForPublicationRetry || !this.#timer || this.#closed || this.#quiescing ||
+      !this.#backgroundRefresh.active ||
       !isMeshLockTimeout(this.#refreshError) || this.#refreshError instanceof HostLeaseLockBusyError ||
       this.#publicationRetryTimer || this.#publicationRetrying) return;
     // Not tied to the heartbeat phase: one jittered, capped retry for the whole host.
@@ -1051,7 +1089,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#publicationRetryDelay = Math.min(2_000, this.#publicationRetryDelay * 2);
     this.#publicationRetryTimer = setTimeout(() => {
       this.#publicationRetryTimer = undefined;
-      if (!this.#live()) return;
+      if (!this.#backgroundRefresh.active || !this.#live()) return;
       const work = this.#retryPublication();
       this.#publicationRetrying = work;
       void work.finally(() => {
@@ -1067,7 +1105,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // The failed fence has fully unwound. A FIFO mesh ticket can now wait without
       // occupying either actor registry; admission is not itself a heartbeat receipt.
       await this.options.waitForPublicationRetry!();
-      if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+      if (this.#closed || this.#quiescing || !this.#backgroundRefresh.active || !isMeshLockTimeout(this.#refreshError)) return;
       // Release mesh BEFORE taking registries. Re-select every actor under fresh
       // registry custody, preserving #504/#531 and the registry -> mesh lock order.
       await this.refresh();
@@ -2299,6 +2337,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
         prepare: view => {
+          // This commit's outbox claims the retained reload lease: an obsolete epoch must not.
+          if (this.#keptReloadLease) this.#assertClaimAuthority();
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));
           return compactExpiredHostRecords(view, this.mesh.root, this.options.hostId);
@@ -2307,9 +2347,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
         // commit hook, after COMMIT on every backend. As afterCommit it cost SQLite a second
         // BEGIN IMMEDIATE on every heartbeat (smarty-dev#6477).
         commitOutbox: () => {
-          if (this.#keptReloadLease) {
+          if (this.#keptReloadLease && !this.#epochObsolete()) {
             // Retained reload authority is checked under the SAME gate as this COMMIT.
             // Rotate only after success, before any post-commit file copy or gate release.
+            // An epoch obsoleted after prepare skips the claim: its fenced writes then lapse.
             commitHostLeaseUnderCustody(this.mesh.root, this.#fileLease(Date.now()),
               { claim: true, expected: this.#leasePredecessor });
             this.#leaseClaimed = true; this.#keptReloadLease = false;
@@ -2511,6 +2552,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
           lease.session.expiresAt !== lease.session.updatedAt + PARTICIPANT_LEASE_MS));
   }
 
+  /** Fabric's runtime epoch record (smarty-dev#8588): a later in-process instance of this session won. */
+  #epochObsolete(): boolean {
+    try { return this.options.backgroundEpoch?.obsolete?.() === true; } catch { return false; }
+  }
+
+  /** Two overlapping /reloads construct two successors that captured the SAME predecessor lease.
+   * The epoch record names the live one; an obsolete one that claimed first would supersede the
+   * live successor's captured predecessor and leave no heartbeat at all (smarty-dev#8382). An
+   * obsolete epoch therefore never claims; renewing a lease it already owns is unchanged. */
+  #assertClaimAuthority(): void {
+    if (this.#leaseClaimed || !this.#epochObsolete()) return;
+    throw new FabricHostLeaseSupersededError(this.options.hostId, this.options.identity.id, this.#startedAt);
+  }
+
   #assertLeaseActive(): void {
     if (this.#superseded) throw this.#superseded;
   }
@@ -2581,6 +2636,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     try { await renewHostLease(this.mesh, this.#fileLease(leaseAt),
       { claim: !this.#leaseClaimed, expected: this.#leasePredecessor, signal: this.#leaseAbort.signal,
+        admit: () => this.#assertClaimAuthority(),
         ownIncarnation: this.#ownIncarnationValue });
     } catch (error) {
       if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);

@@ -1,0 +1,496 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { AgentService, createAgentServiceClient, createAgentServiceHandler, createAgentsProvider } from "../src/agents.js";
+import { claimFabricRuntimeInstance, isFabricRuntimeInstanceObsolete, MeshBackgroundRetry, MeshLockTimeoutError, type FabricRuntimeEpochRecord } from "../src/core/atomic-write.js";
+import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
+import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { FabricState } from "../src/fabric-state.js";
+import { FabricManagedHost } from "../src/managed-host.js";
+import { readHostLeases } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { RootInbox } from "../src/topology/root-inbox.js";
+
+const STALE = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.reload().";
+const roots: string[] = [];
+const cleanup: Array<() => Promise<unknown> | unknown> = [];
+afterEach(async () => {
+  for (const close of cleanup.splice(0).reverse()) await close();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+const invalidatable = <T extends object>(target: T) => {
+  let stale = false;
+  return {
+    value: new Proxy(target, { get(object, key, receiver) {
+      if (stale) throw new Error(STALE);
+      return Reflect.get(object, key, receiver);
+    } }),
+    invalidate: () => { stale = true; },
+  };
+};
+
+const harness = () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-8588-")));
+  roots.push(base);
+  for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+  const meshRoot = path.join(base, "mesh");
+  vi.stubEnv("PI_FABRIC_PROJECT_ROOT", base);
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(base, "agent"));
+  fs.mkdirSync(path.join(base, ".pi"));
+  fs.writeFileSync(path.join(base, ".pi", "fabric.json"), JSON.stringify({ fullCodeMode: false,
+    mesh: { enabled: true, root: meshRoot, actorPollMs: 20 }, agents: { enabled: false }, residency: { enabled: false },
+    mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+    prewalk: { enabled: false, alwaysRearm: false } }));
+  const sessionId = "8588aaaa-0000-0000-0000-000000000001";
+  const session = () => invalidatable({
+    cwd: base, hasUI: true, mode: "rpc", model: { provider: "faux", id: "m1" },
+    isIdle: () => true, hasPendingMessages: () => false, isProjectTrusted: () => true, abort: () => {},
+    modelRegistry: { getAvailable: () => [], find: () => undefined },
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined, getBranch: () => [],
+      getLeafId: () => null, getEntries: () => [] },
+    ui: { setStatus: () => {}, notify: () => {} },
+  });
+  const generation = () => {
+    const pi = invalidatable({ on: () => () => {}, events: { emit: () => {}, on: () => () => {} },
+      sendMessage: () => {}, appendEntry: () => {}, getThinkingLevel: () => "off", getSessionName: () => "epoch-main" });
+    const state = new FabricState(pi.value as unknown as ExtensionAPI, new CapturedToolCatalog(), { paths: {
+      extension: path.resolve("dist/index.js"), worker: path.resolve("tests/fixtures/fake-worker.mjs"),
+      residentHost: path.join(base, "unused.mjs"), skills: base,
+    } });
+    cleanup.push(() => state.shutdown("exit"));
+    return { state, pi, ctx: session() };
+  };
+  const activate = async (entry: ReturnType<typeof generation>, first = false) => {
+    const ctx = entry.ctx.value as unknown as ExtensionContext;
+    await entry.state.bootstrap(ctx);
+    if (first || entry.state.shouldEagerlyActivate(ctx)) await entry.state.ensure(ctx);
+    expect(entry.state.initialized).toBe(true);
+  };
+  return { meshRoot, sessionId, generation, activate, session,
+    lease: () => readHostLeases(meshRoot).get(`session:${sessionId}`)?.updatedAt ?? 0 };
+};
+
+/** Census actual scheduled heartbeat handles, not implementation strings or total process timers. */
+const timerCensus = () => {
+  const scheduled = new Map<ReturnType<typeof setInterval>, () => void>();
+  const interval = globalThis.setInterval;
+  const clear = globalThis.clearInterval;
+  // Other Main maintenance intervals also use 5 s. Count only scheduling performed
+  // by the participant directory's executable start/rebind boundaries.
+  let participantBoundary = false;
+  const start = ParticipantDirectory.prototype.start;
+  vi.spyOn(ParticipantDirectory.prototype, "start").mockImplementation(function (this: ParticipantDirectory) {
+    participantBoundary = true;
+    try { return start.call(this); } finally { participantBoundary = false; }
+  });
+  const rebind = ParticipantDirectory.prototype.rebindLifecycle;
+  vi.spyOn(ParticipantDirectory.prototype, "rebindLifecycle").mockImplementation(function (this: ParticipantDirectory) {
+    participantBoundary = true;
+    try { return rebind.call(this); } finally { participantBoundary = false; }
+  });
+  vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: (...args: unknown[]) => void,
+    delay?: number, ...args: unknown[]) => {
+    const timer = interval(callback, delay, ...args);
+    if (participantBoundary && delay === 5_000) scheduled.set(timer, () => callback(...args));
+    return timer;
+  }) as typeof setInterval);
+  vi.spyOn(globalThis, "clearInterval").mockImplementation((timer) => {
+    if (typeof timer === "object" && timer) scheduled.delete(timer);
+    clear(timer);
+  });
+  return scheduled;
+};
+
+const warningLines = (warn: ReturnType<typeof vi.spyOn>): string[] =>
+  warn.mock.calls.map((call: unknown[]) => call.map(String).join(" "));
+
+describe("epoch-owned background timer retirement (smarty-dev#8588)", () => {
+  it("only a newer Fabric-owned instance cancels once, even when its Pi binding still looks live", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const owner = claimFabricRuntimeInstance("obsolete-unit", "first");
+    let attempts = 0;
+    let timer: ReturnType<typeof setInterval>;
+    const current = vi.fn(() => true);
+    const retry = new MeshBackgroundRetry("participant heartbeat/change refresh", 100, 5_000, {
+      epoch: 2, current,
+      obsolete: () => isFabricRuntimeInstanceObsolete("obsolete-unit", owner),
+      retire: () => clearInterval(timer),
+    });
+    timer = setInterval(() => void retry.run(() => { attempts++; }), 100);
+    claimFabricRuntimeInstance("obsolete-unit", "second");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(retry.retired).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(current).not.toHaveBeenCalled();
+    expect(attempts).toBe(0);
+    expect(warningLines(warn)).toEqual([expect.stringContaining("retired obsolete background timer for epoch 2")]);
+    retry.success();
+    retry.rebind();
+    await retry.run(() => { attempts++; });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(attempts).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("an unrelated Error with Pi's stale prefix on the CURRENT probe retries, counts probe failures, and resets once recovered", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let failing = true;
+    const failures: number[] = [];
+    const retire = vi.fn();
+    const retry = new MeshBackgroundRetry("current-owner", 100, 400, {
+      epoch: 1, obsolete: () => false,
+      current: () => { if (failing) throw new Error(`${STALE} unrelated bug`); return true; },
+      retire, onFailure: (_error, count) => { failures.push(count); },
+    });
+    const operation = () => {};
+    for (const wait of [0, 50, 100, 200]) {
+      await vi.advanceTimersByTimeAsync(wait);
+      await retry.run(operation);
+    }
+    expect(failures).toEqual([1, 2, 3, 4]);
+    expect(retire).not.toHaveBeenCalled();
+    expect(retry.retired).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warningLines(warn).filter(line => line.includes(STALE))).toEqual([]);
+    failing = false;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await retry.run(operation)).toBe("done");
+    failing = true;
+    await retry.run(operation);
+    expect(failures).toEqual([1, 2, 3, 4, 1]);
+    // Recovery resets the failure count, not the per-instance warning window (smarty-dev#8305).
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["mesh lock timeout", () => new MeshLockTimeoutError(" held by test", 3, 50)],
+    ["WAL cap", () => new MeshStateWalCapError(2, 1)],
+    ["unrelated stale-prefix", () => new Error(`${STALE} unrelated bug`)],
+  ])("%s operation errors on the CURRENT owner back off without suppressing the lifecycle gate or counting as lost", async (_kind, error) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failures: number[] = [];
+    const recoveries = vi.fn();
+    let live = true;
+    const retry = new MeshBackgroundRetry("current-owner", 100, 5_000, {
+      epoch: 1, obsolete: () => false, current: () => live, retire: vi.fn(),
+      onFailure: (_error, count) => { failures.push(count); }, onRecovery: recoveries,
+    });
+    let attempts = 0;
+    const failing = () => { attempts++; throw error(); };
+    for (let i = 0; i < 6; i++) {
+      await vi.advanceTimersByTimeAsync(retry.waitMs);
+      expect(await retry.run(failing)).toBe("retry");
+    }
+    expect(attempts).toBe(6);
+    // (b) repeated operation errors with a live owner never report its lifecycle as lost.
+    expect(failures).toEqual([]);
+    // (a) the backoff skips operation retries, never the owner's lifecycle gate (its heartbeat).
+    expect(retry.waitMs).toBeGreaterThan(1_000);
+    expect(retry.active).toBe(false);
+    expect(retry.lifecycleActive).toBe(true);
+    expect(await retry.run(failing)).toBe("skipped");
+    expect(await retry.run(() => { attempts++; }, false, { ignoreBackoff: true })).toBe("done");
+    expect(attempts).toBe(7);
+    expect(failures).toEqual([]);
+    // (c) a real failed lifecycle probe still reaches onFailure, counting probes only, even
+    // with operation errors in between.
+    live = false;
+    expect(retry.lifecycleActive).toBe(false);
+    retry.failure(error());
+    expect(retry.lifecycleActive).toBe(false);
+    retry.failure(error());
+    expect(retry.lifecycleActive).toBe(false);
+    expect(failures).toEqual([1, 2, 3]);
+    live = true;
+    expect(retry.lifecycleActive).toBe(true);
+    expect(recoveries).toHaveBeenCalledTimes(1);
+    expect(retry.retired).toBe(false);
+  });
+
+  it("a transient CURRENT context-probe failure keeps the heartbeat and renews on the next tick", async () => {
+    const h = harness();
+    const scheduled = timerCensus();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    const probe = vi.spyOn(one.ctx.value, "isIdle").mockImplementationOnce(() => { throw new Error("transient current probe"); });
+    const before = h.lease();
+    tick();
+    expect(scheduled.size).toBe(1);
+    expect(h.lease()).toBe(before);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    tick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    expect(scheduled.size).toBe(1);
+    expect(probe.mock.calls.length).toBeGreaterThan(1);
+    expect(warningLines(warn).filter(line => line.includes("retired"))).toEqual([]);
+    console.info("8588 transient probe", JSON.stringify({ heartbeatTimers: scheduled.size, leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
+  it.each([
+    ["mesh lock timeout", () => new MeshLockTimeoutError(" held by test", 3, 50)],
+    ["WAL cap", () => new MeshStateWalCapError(2, 1)],
+    ["unrelated stale-prefix", () => new Error(`${STALE} unrelated storage error`)],
+  ])("repeated %s tick errors on a CURRENT live runtime never report the session ctx lost, never retire, and recover", async (_kind, error) => {
+    const h = harness();
+    const scheduled = timerCensus();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let directory: ParticipantDirectory | undefined;
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      directory = this;
+      return register.call(this, source);
+    });
+    let runtime: FabricRuntimeState | undefined;
+    const bind = FabricRuntimeState.prototype.bindLifecycle;
+    vi.spyOn(FabricRuntimeState.prototype, "bindLifecycle").mockImplementation(function (this: FabricRuntimeState, ctx, current) {
+      runtime = this;
+      return bind.call(this, ctx, current);
+    });
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    const refresh = vi.spyOn(directory!, "refresh").mockImplementation(async () => { throw error(); });
+    const before = h.lease();
+    for (let i = 0; i < 6; i++) {
+      tick();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(directory!.degraded).toBe(false);
+      expect(scheduled.size).toBe(1);
+    }
+    expect(refresh).toHaveBeenCalledTimes(6);
+    expect(h.lease()).toBe(before);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(runtime!.mesh.read({ topic: "ops.fabric.presence" }).filter(event => event.kind === "fabric.presence.degraded")).toEqual([]);
+    expect(warningLines(warn).filter(line => line.includes("is degraded") || line.includes("no live session ctx"))).toEqual([]);
+    expect(warningLines(warn).filter(line => line.includes("retired"))).toEqual([]);
+    refresh.mockRestore();
+    tick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    expect(directory!.degraded).toBe(false);
+    expect(scheduled.size).toBe(1);
+    console.info("808 operation errors", JSON.stringify({ kind: _kind, heartbeatTimers: scheduled.size,
+      degraded: directory!.degraded, leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
+  it("mesh-lock-timeout operation errors with an active backoff still attempt and renew the host lease on every scheduled heartbeat", async () => {
+    const h = harness();
+    const scheduled = timerCensus();
+    // A near-ceiling jitter keeps the operation backoff open (seconds) across every tick below.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let directory: ParticipantDirectory | undefined;
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      directory = this;
+      return register.call(this, source);
+    });
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    const original = directory!.refresh.bind(directory!);
+    let failing = true;
+    const refresh = vi.spyOn(directory!, "refresh").mockImplementation(async () => {
+      if (failing) throw new MeshLockTimeoutError(" held by test", 3, 50);
+      return original();
+    });
+    const before = h.lease();
+    for (let i = 0; i < 4; i++) {
+      const calls = refresh.mock.calls.length;
+      tick();
+      // Every scheduled heartbeat attempts its lease renewal, backoff or not.
+      expect(refresh.mock.calls.length).toBe(calls + 1);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(directory!.degraded).toBe(false);
+    }
+    expect(h.lease()).toBe(before);
+    // The lock is free again while the operation backoff is still open: the next scheduled
+    // heartbeat renews at once instead of waiting out the backoff (the #9151 lapse class).
+    failing = false;
+    const calls = refresh.mock.calls.length;
+    tick();
+    expect(refresh.mock.calls.length).toBe(calls + 1);
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before), { timeout: 2_000 });
+    expect(directory!.degraded).toBe(false);
+    expect(scheduled.size).toBe(1);
+    console.info("808 lock backoff heartbeat", JSON.stringify({ heartbeatTimers: scheduled.size,
+      refreshAttempts: refresh.mock.calls.length, leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
+  it("two interrupted reloads leave exactly one heartbeat, no stale failure spam, and a renewing lease", async () => {
+    const runtimes: FabricRuntimeState[] = [];
+    const bind = FabricRuntimeState.prototype.bindLifecycle;
+    vi.spyOn(FabricRuntimeState.prototype, "bindLifecycle").mockImplementation(function (this: FabricRuntimeState, ctx, current) {
+      if (!runtimes.includes(this)) runtimes.push(this);
+      return bind.call(this, ctx, current);
+    });
+    const h = harness();
+    const scheduled = timerCensus();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const one = h.generation();
+    await h.activate(one, true);
+    one.ctx.invalidate(); one.pi.invalidate();
+    // Deliberately omit old session_shutdown: /reload during /reload can strand its old instance.
+    const two = h.generation();
+    await h.activate(two);
+    two.ctx.invalidate(); two.pi.invalidate();
+    const three = h.generation();
+    await h.activate(three); // #660 re-arm on activation, without first tool use
+    expect(scheduled.size).toBe(3);
+    const scheduledBeforeFirstTick = scheduled.size;
+    const callbacks = [...scheduled.values()];
+    const before = h.lease();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    for (const tick of callbacks) tick();
+    expect(scheduled.size).toBe(1);
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    const retirements = warningLines(warn).filter(line => line.includes("participant heartbeat/change refresh: retired obsolete background timer"));
+    expect(retirements).toHaveLength(2);
+    expect(retirements.every(line => line.includes("epoch 1"))).toBe(true); // epoch ids are local to each extension instance
+    const afterFirstTick = warn.mock.calls.length;
+    // A late callback from either old extension must not take the process-global record back.
+    for (const runtime of runtimes.slice(0, 2)) runtime.bindLifecycle(h.session().value as unknown as ExtensionContext, () => true);
+    expect(scheduled.size).toBe(1);
+    for (let i = 0; i < 4; i++) for (const tick of callbacks.slice(0, 2)) tick();
+    expect(warn.mock.calls).toHaveLength(afterFirstTick);
+    expect(warningLines(warn).filter(line => line.includes("This extension ctx is stale"))).toEqual([]);
+    const renewed = h.lease();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    for (const tick of scheduled.values()) tick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(renewed));
+    expect(scheduled.size).toBe(1);
+    console.info("8588 timer census", JSON.stringify({ generations: 3, scheduledBeforeFirstTick,
+      scheduledAfterFirstTick: scheduled.size, retiredHeartbeats: retirements.length,
+      repeatedOldTickWarnings: warn.mock.calls.length - afterFirstTick,
+      staleFailureLines: warningLines(warn).filter(line => line.includes("This extension ctx is stale")).length,
+      leaseRenewed: h.lease() > renewed }));
+  }, 30_000);
+
+  it.each(["ctx read", "lease check"])("a stale CURRENT %s keeps its timer, raises #660 after three failures, and recovers on a live rebind", async staleVia => {
+    const h = harness();
+    const scheduled = timerCensus();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let inbox: RootInbox | undefined;
+    const inboxStart = RootInbox.prototype.start;
+    vi.spyOn(RootInbox.prototype, "start").mockImplementation(function (this: RootInbox) {
+      inbox = this;
+      return inboxStart.call(this);
+    });
+    const directories: ParticipantDirectory[] = [];
+    const register = ParticipantDirectory.prototype.registerSource;
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+      if (!directories.includes(this)) directories.push(this);
+      return register.call(this, source);
+    });
+    let runtime: FabricRuntimeState | undefined;
+    const bind = FabricRuntimeState.prototype.bindLifecycle;
+    vi.spyOn(FabricRuntimeState.prototype, "bindLifecycle").mockImplementation(function (this: FabricRuntimeState, ctx, current) {
+      runtime = this;
+      return bind.call(this, ctx, current);
+    });
+    const one = h.generation();
+    await h.activate(one, true);
+    const tick = [...scheduled.values()][0]!;
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    let leaseChecks = 0;
+    if (staleVia === "lease check") {
+      runtime!.bindLifecycle(one.ctx.value as unknown as ExtensionContext, () => { leaseChecks++; throw new Error(STALE); });
+    } else {
+      one.ctx.invalidate(); // lease still says current: only the ctx probe discovers the outage
+    }
+    for (let i = 0; i < 3; i++) {
+      tick();
+      expect(scheduled.size).toBe(1);
+      expect(directories[0]!.degraded).toBe(i === 2);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await vi.waitFor(() => {
+      const events = runtime!.mesh.read({ topic: "ops.fabric.presence" }).filter(event => event.kind === "fabric.presence.degraded");
+      expect(events).toHaveLength(1);
+      expect(events[0]!.data).toMatchObject({ participantId: `session:${h.sessionId}`, hostId: `session:${h.sessionId}`, ticks: 3 });
+    });
+    const noticesAfterDegraded = warn.mock.calls.length;
+    for (let i = 0; i < 4; i++) {
+      tick();
+      inbox!.names();
+      void runtime!.mesh.stateBackendHandle.backgroundReadCacheMs;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const checksDuringOutage = leaseChecks;
+    if (staleVia === "lease check") expect(checksDuringOutage).toBeGreaterThan(3);
+    expect(scheduled.size).toBe(1);
+    const degradedWarnings = warningLines(warn).filter(line => line.includes("is degraded"));
+    expect(degradedWarnings).toHaveLength(1);
+    // Reads have their own deduplicated outage warning, not one warning per stale read.
+    expect(warn.mock.calls.length - noticesAfterDegraded).toBeLessThanOrEqual(2);
+    expect(warningLines(warn).filter(line => line.includes("This extension ctx is stale"))).toEqual([]);
+    const live = h.session();
+    runtime!.bindLifecycle(live.value as unknown as ExtensionContext, () => true);
+    expect(scheduled.size).toBe(1);
+    expect(directories[0]!.degraded).toBe(false);
+    const before = h.lease();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    for (const currentTick of scheduled.values()) currentTick();
+    await vi.waitFor(() => expect(h.lease()).toBeGreaterThan(before));
+    console.info("8588 current-binding probe", JSON.stringify({ staleVia, scheduledAfterLiveRebind: scheduled.size,
+      degradedCleared: !directories[0]!.degraded, leaseChecksWhileRetrying: checksDuringOutage,
+      leaseRenewed: h.lease() > before }));
+  }, 30_000);
+
+  it("re-initializes closed-world and session-less runtimes in a fresh instance-scoped epoch", async () => {
+    const epochs = (): Map<string, FabricRuntimeEpochRecord> =>
+      (globalThis as unknown as Record<symbol, Map<string, FabricRuntimeEpochRecord> | undefined>)[Symbol.for("pi-fabric.runtime-epoch")] ?? new Map();
+    const claimedSince = (before: Set<string>) => [...epochs().entries()].filter(([scope]) => !before.has(scope));
+    const forbidden = () => { throw new Error("Ambient host access"); };
+    // A closed-world managed host never exposes its Pi session; its record is scoped to the instance.
+    const service = new AgentService({ rootId: "root", port: { execute: async () => ({ status: "completed", text: "hosted" }) } });
+    const host = new FabricManagedHost({ providers: ["agents"] });
+    host.register(createAgentsProvider(createAgentServiceClient(createAgentServiceHandler(service, "root"))));
+    const managed = new FabricRuntimeState({ events: { emit: vi.fn() } } as unknown as ExtensionAPI, new CapturedToolCatalog(), { managedHost: host });
+    cleanup.push(() => host.close(), () => managed.shutdown());
+    const closedWorld = { cwd: "/not-a-real-hosted-directory", hasUI: false, ui: { setStatus: vi.fn() },
+      isProjectTrusted: forbidden, sessionManager: new Proxy({}, { get: forbidden }),
+      modelRegistry: new Proxy({}, { get: forbidden }) } as unknown as ExtensionContext;
+    let before = new Set(epochs().keys());
+    await managed.initialize(closedWorld);
+    const managedClaims = claimedSince(before);
+    expect(managedClaims).toHaveLength(1);
+    const [managedScope, managedFirst] = managedClaims[0]!;
+    expect(managedScope).toMatch(/^fabric-runtime-instance:/);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, managedFirst)).toBe(false);
+    await managed.initialize(closedWorld);
+    expect(epochs().get(managedScope)!.epoch).toBe(managedFirst.epoch + 1);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, managedFirst)).toBe(true);
+    expect(isFabricRuntimeInstanceObsolete(managedScope, epochs().get(managedScope)!)).toBe(false);
+
+    // A context without a session manager claims before teardown and fails only at its first contextual call.
+    const bare = new FabricRuntimeState({} as ExtensionAPI, new CapturedToolCatalog());
+    cleanup.push(() => bare.shutdown());
+    const checkpoint = { ui: { setStatus: () => { throw new Error("context checkpoint"); } } } as unknown as ExtensionContext;
+    before = new Set(epochs().keys());
+    await expect(bare.initialize(checkpoint)).rejects.toThrow("context checkpoint");
+    const bareClaims = claimedSince(before);
+    expect(bareClaims).toHaveLength(1);
+    const [bareScope, bareFirst] = bareClaims[0]!;
+    expect(bareScope).toMatch(/^fabric-runtime-instance:/);
+    expect(bareScope).not.toBe(managedScope);
+    await expect(bare.initialize(checkpoint)).rejects.toThrow("context checkpoint");
+    expect(epochs().get(bareScope)!.epoch).toBe(bareFirst.epoch + 1);
+    expect(isFabricRuntimeInstanceObsolete(bareScope, bareFirst)).toBe(true);
+  });
+});

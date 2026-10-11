@@ -1554,9 +1554,11 @@ describe("ParticipantDirectory", () => {
         expect(await tick()).toBe("retry");
         expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
-        heartbeat();
-        expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
-        expect(confirmations).toHaveBeenCalledTimes(2);
+        // pi-fabric#808: the operation backoff gates change refreshes, never a scheduled
+        // heartbeat. Inside it the heartbeat still attempts its lease renewal.
+        expect(await tick()).toBe("retry");
+        expect(warn).toHaveBeenCalledOnce();
+        expect(confirmations).toHaveBeenCalledTimes(3);
 
         fs.rmSync(lockPath, { recursive: true, force: true });
         await vi.advanceTimersByTimeAsync(retry.waitMs);
@@ -1570,8 +1572,8 @@ describe("ParticipantDirectory", () => {
         // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
         expect(warn).toHaveBeenCalledOnce();
 
-        // The first real acquisition after the window prints the final summary of both
-        // suppressed retries (the continuous outage's second timeout and the later outage).
+        // The first real acquisition after the window prints the final summary of all three
+        // suppressed retries (the continuous outage's second and third timeouts and the later outage).
         fs.rmSync(lockPath, { recursive: true, force: true });
         vi.setSystemTime(Date.now() + 60_000);
         expect(retry.waitMs).toBe(0);
@@ -1579,7 +1581,7 @@ describe("ParticipantDirectory", () => {
         expect(recovered).toHaveBeenCalledTimes(2);
         expect(warn).toHaveBeenCalledTimes(2);
         expect(warn.mock.calls[1]![0]).toMatch(
-          /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
+          /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(3 similar retries suppressed in the last 6\ds\)$/);
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();

@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -336,6 +336,10 @@ export class FabricState {
   async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
     await this.#current()?.consumeRootInbox(ids, receipts);
   }
+  /** Whether the root inbox acked this event (smarty-dev#8962): the context hook shows it once. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#current()?.rootInboxAcked(id, sequence) ?? false;
+  }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
     this.#recordsWake = wake;
@@ -362,6 +366,11 @@ export class FabricState {
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#current()?.mainOwnsProviderRecovery() ?? false;
+  }
+
   reportMainProviderError(message: string): Promise<unknown> {
     return this.#required().reportMainProviderError(message);
   }

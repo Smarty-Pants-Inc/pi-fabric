@@ -8,7 +8,7 @@ import type { MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#6100 round 2: every complete checkpoint lets the next writer restart the WAL and fsync its header under
 // the writer lock, so the routine checkpoints are bounded by volume (autocheckpoint) and age, not run every second.
-// Each checkpoint is timed in stats() and logged (debug: every checkpoint; info: one summary line per minute).
+// Checkpoint timing and its log are main's (tests/mesh-state-sqlite-checkpoint-timing.test.ts); here only the cadence.
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const roots: string[] = [];
 const stores: SqliteStateStore[] = [];
@@ -32,7 +32,7 @@ const openStore = async (root: string, options: Parameters<typeof SqliteStateSto
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const setImmediateTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-describe("SQLite mesh checkpoint cadence and timing (smarty-dev#6100 round 2)", () => {
+describe("SQLite mesh checkpoint cadence (smarty-dev#6100 round 2)", () => {
   it("syncs by age after a commit: one PASSIVE on the writer's path once unsynced frames are older than walSyncMaxAgeMs", async () => {
     const root = tempRoot("age");
     const store = await openStore(root, { walSyncMaxAgeMs: 200, checkpointLog: "off" });
@@ -61,48 +61,6 @@ describe("SQLite mesh checkpoint cadence and timing (smarty-dev#6100 round 2)", 
     await setImmediateTurn();
     expect(store.stats().checkpointTiming.passive.count).toBe(0);
   }, 20_000);
-
-  it("times every checkpoint, logs it at debug level, and writes one info summary per minute with counts", async () => {
-    const root = tempRoot("log");
-    const lines: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => { lines.push(String(chunk)); return true; }) as typeof process.stderr.write);
-    const store = await openStore(root, { checkpointLog: "debug", walSyncMaxAgeMs: 0 });
-    for (let step = 0; step < 5; step += 1) await store.put({ key: `k/${step}`, value: step, identity });
-    store.checkpoint(0); // PASSIVE, then the guarded TRUNCATE (its own PASSIVE first; threshold 0 forces the attempt)
-    const timing = store.stats().checkpointTiming;
-    expect(timing.passive.count).toBe(2);
-    expect(timing.truncate.count).toBe(1);
-    expect(timing.onWriterPath).toBe(0);
-    const debug = lines.filter((line) => line.startsWith("[mesh] state checkpoint "));
-    expect(debug).toHaveLength(3);
-    const passive = JSON.parse(debug[0]!.slice("[mesh] state checkpoint ".length)) as Record<string, unknown>;
-    expect(passive).toMatchObject({ mode: "passive", via: "explicit", busy: 0, writerPath: false });
-    expect(passive.frames).toBeGreaterThan(0);
-    expect(typeof passive.ms).toBe("number");
-    expect(typeof passive.walBytes).toBe("number");
-    expect(JSON.parse(debug[2]!.slice("[mesh] state checkpoint ".length))).toMatchObject({ mode: "truncate", via: "explicit", busy: 0 });
-    // The minute summary is emitted by the next commit after the window (no timer).
-    expect(lines.some((line) => line.startsWith("[mesh] state checkpoints "))).toBe(false);
-    const now = Date.now();
-    vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
-    await store.put({ key: "k/after", value: 1, identity });
-    vi.mocked(Date.now).mockRestore();
-    const summaries = lines.filter((line) => line.startsWith("[mesh] state checkpoints "));
-    expect(summaries).toHaveLength(1);
-    expect(JSON.parse(summaries[0]!.slice("[mesh] state checkpoints ".length))).toMatchObject({ passive: 2, truncate: 1, busy: 0,
-      onWriterPath: 0, lockTimeouts: 0 });
-    expect(store.stats().maxCommitMs).toBeGreaterThanOrEqual(0);
-    expect(store.stats().lockTimeouts).toBe(0);
-  }, 20_000);
-
-  it("checkpointLog off writes nothing", async () => {
-    const root = tempRoot("off");
-    const write = vi.spyOn(process.stderr, "write").mockImplementation((() => true) as typeof process.stderr.write);
-    const store = await openStore(root, { checkpointLog: "off" });
-    await store.put({ key: "k", value: 1, identity });
-    store.checkpoint(0);
-    expect(write).not.toHaveBeenCalled();
-  });
 
   it("the projector checkpoints a dirty WAL by age, not every checkpointMs", async () => {
     const root = tempRoot("projector");

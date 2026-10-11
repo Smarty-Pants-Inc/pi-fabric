@@ -61,8 +61,10 @@
  * last frame). A power loss still drops only commits no checkpoint synced (NORMAL's contract), now at most 4,000
  * frames AND, while commits continue, at most ~30 s of them (before: 1,000 frames and no time bound; the tail after
  * the last commit stays unsynced until the next checkpoint, as before: nothing polls). `sync()` is unchanged.
- * Every checkpoint this store runs is timed (`stats().checkpointTiming`), logged at debug level, and summarised once
- * a minute at info level (`checkpointLog`); the summary also carries COMMIT durations and lock timeouts.
+ *
+ * Checkpoint timing (smarty-dev#6100). Every checkpoint this store runs is timed (`stats().checkpointTiming`), logged
+ * at debug level, and summarised once a minute at info level (`checkpointLog`); the summary also carries COMMIT
+ * durations and lock timeouts. Observability only: no checkpoint, sync, pragma or cadence depends on it.
  *
  * TRUNCATE never copies, syncs or waits under the writer lock (smarty-dev#6100). FULL/RESTART/TRUNCATE take SQLite's
  * WRITER lock and then backfill every frame not yet in the database (an fsync of the WAL and one of the database

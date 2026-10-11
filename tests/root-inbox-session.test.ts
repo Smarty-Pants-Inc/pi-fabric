@@ -359,7 +359,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     // The steer that carried work key "steered" reached the session, as Main's deliverAgent writes it.
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("Only published.");
@@ -406,8 +406,11 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       fauxAssistantMessage("mailbox followUp processed"),
     ]);
     await session.prompt("fail the stream");
-    expect(session.isStreaming).toBe(false);
+    // During-error work may already have started its one event-driven followUp
+    // when the original prompt's promise resolves. The assertions below still
+    // require exactly one inbox delivery and exactly one additional model call.
     if (timing === "after-error") {
+      expect(session.isStreaming).toBe(false);
       await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
       missedWork("Follow up after stream disconnect.");
@@ -441,7 +444,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     faux.setResponses([fauxAssistantMessage("should not run")]);
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("For everyone.", null);

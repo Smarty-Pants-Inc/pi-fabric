@@ -353,6 +353,11 @@ export interface FabricRetentionConfig {
 export interface FabricActorsConfig {
   /** Reset an actor's Pi session at a run boundary once its file exceeds this many bytes; 0 disables. */
   maxSessionBytes: number;
+  /** How long a transient activation block (provider stream error, timeout, preparation or lock
+   * timeout) gates routing before the actor gets a probe run (default 10 min; smarty-dev#6509). */
+  transientBlockCooldownMs?: number;
+  /** Cap of the doubling backoff after failed probes (default 60 min). */
+  transientBlockMaxMs?: number;
 }
 
 export type MeshLockProtocol = 1 | 2;
@@ -381,7 +386,17 @@ const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE
   throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
 };
 
+/** Host rollout policy for controls whose sender omits the destination epoch. */
+export type MeshControlIncarnationFence = "warn" | "enforce";
+const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFence => {
+  if (value === undefined) return "warn";
+  if (value === "warn" || value === "enforce") return value;
+  throw new Error("mesh.controlIncarnationFence must be warn or enforce");
+};
+
 export interface FabricMeshConfig {
+  /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
+  controlIncarnationFence: MeshControlIncarnationFence;
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
@@ -649,8 +664,11 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   },
   actors: {
     maxSessionBytes: 20 * 1024 * 1024,
+    transientBlockCooldownMs: 10 * 60_000,
+    transientBlockMaxMs: 60 * 60_000,
   },
   mesh: {
+    controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
     enabled: true,
@@ -1405,8 +1423,21 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         Number.MAX_SAFE_INTEGER,
       ),
+      transientBlockCooldownMs: boundedInteger(
+        actors.transientBlockCooldownMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockCooldownMs!,
+        1_000,
+        24 * 60 * 60_000,
+      ),
+      transientBlockMaxMs: boundedInteger(
+        actors.transientBlockMaxMs,
+        DEFAULT_FABRIC_CONFIG.actors.transientBlockMaxMs!,
+        1_000,
+        7 * 24 * 60 * 60_000,
+      ),
     },
     mesh: {
+      controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
@@ -1832,6 +1863,9 @@ const resolveFabricConfig = (
       delete agents.placement;
       delete agents.deadRootFilter; // Host-only: a lane cannot drop the fleet's exemptions.
       document.agents = agents;
+      const mesh = { ...objectValue(document.mesh) };
+      delete mesh.controlIncarnationFence; // Host-only: a workspace cannot weaken the fence.
+      document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };
       const landlock = { ...objectValue(executor.landlock) };
       delete landlock.disabled; // Host-only fleet kill switch wins over lane config.

@@ -182,6 +182,8 @@ export const sessionActorRootGone = (
   } catch { return undefined; }
 };
 
+const wellFormedSnapshots = new WeakMap<object, boolean>();
+
 /** Foreign session registries are observed directly, NEVER loaded into an ActorManager. */
 export class SessionActorOrphans {
   #pending: Promise<number> | undefined;
@@ -205,10 +207,15 @@ export class SessionActorOrphans {
 
   #rows(store: ActorRegistryStore): ReturnType<ActorRegistryStore["snapshot"]>["actors"] {
     const snapshot = store.snapshot();
-    const parsed = record(JSON.parse(snapshot.bytes ?? "null"));
-    // Never compact away malformed rows as a side effect of a truth repair.
-    if (parsed?.format !== 1 || !Array.isArray(parsed.actors) || parsed.actors.length !== snapshot.actors.length) return [];
-    return snapshot.actors;
+    // smarty-dev#7791: snapshot() returns the same object while the file is unchanged; parse its bytes once.
+    let wellFormed = wellFormedSnapshots.get(snapshot);
+    if (wellFormed === undefined) {
+      const parsed = record(JSON.parse(snapshot.bytes ?? "null"));
+      // Never compact away malformed rows as a side effect of a truth repair.
+      wellFormed = parsed?.format === 1 && Array.isArray(parsed.actors) && parsed.actors.length === snapshot.actors.length;
+      wellFormedSnapshots.set(snapshot, wellFormed);
+    }
+    return wellFormed ? snapshot.actors : [];
   }
 
   list(): FabricActorInfo[] {
@@ -238,7 +245,7 @@ export class SessionActorOrphans {
     return {
       id: row.id, name: row.name, scope: "session", rootId: row.rootId, ownerSessionId: sessionId,
       ...(typeof row.project === "string" ? { project: row.project } : {}),
-      status: "stopped", sessionOrphan: row.sessionOrphan as unknown as FabricActorSessionOrphan,
+      status: "stopped", stopReason: "host-exit", sessionOrphan: row.sessionOrphan as unknown as FabricActorSessionOrphan,
       ...(typeof row.lastError === "string" ? { lastError: row.lastError } : {}),
       instructionsDigest: digest(instructions), instructionsLength: instructions.length,
       runner: row.runner === "claude" ? "claude" : "pi", residency: "session",
@@ -292,7 +299,8 @@ export class SessionActorOrphans {
           if (!gone) continue;
           const text = SESSION_ACTOR_ORPHAN_TEXT;
           const marker: FabricActorSessionOrphan = { ...gone, oldRoot: rootId, lastUpdated: current.updatedAt, orphanedAt: Date.now() };
-          const row = { ...current, status: "stopped", lastError: `root-gone: ${text}`, sessionOrphan: marker, updatedAt: marker.orphanedAt };
+          // host-exit: the only stop the same session's next start restarts (smarty-dev#9241).
+          const row = { ...current, status: "stopped", stopReason: "host-exit", lastError: `root-gone: ${text}`, sessionOrphan: marker, updatedAt: marker.orphanedAt };
           const prepared = store.prepare(snapshot.actors.map(before => before.id === id ? row : before), { durable: true }, snapshot);
           let committed: boolean;
           try {

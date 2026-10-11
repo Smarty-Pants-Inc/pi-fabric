@@ -32,6 +32,7 @@ import { projectOf } from "../src/topology/project-identity.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import {
   RESIDENT_HOST_FORMAT,
+  residentActorRoots,
   residentDeliveryPrefix,
   residentHostId,
   residentResultPath,
@@ -39,6 +40,7 @@ import {
   type ResidentHostConfig,
   type ResidentHostOwner,
 } from "../src/residency/protocol.js";
+import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { launchLog, same, startedAtMs } from "./helpers/owned-processes.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -375,7 +377,7 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
       const beforeSubscriptions = subscriptions();
       sender = new FabricControlPlane(state.mesh, state.identity, { enabled: true, hostId: state.identity.id, pollMs: 20, acknowledgementTimeoutMs: 30_000 });
       sender.start(() => ({ accepted: false }));
-      controlResult = sender.request(residentHostId(state.identity.id), actor.id, "followUp", { message: "control backlog" }).catch(error => error);
+      controlResult = sender.request(residentHostId(state.identity.id), actor.id, "followUp", { message: "control backlog", ownerIncarnation: seed.control.incarnation }).catch(error => error);
       for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
       vi.stubEnv("NODE_OPTIONS", `${launches.env.NODE_OPTIONS} --import=${pathToFileURL(path.resolve("tests/fixtures/readiness-preload.mjs")).href}`);
       vi.stubEnv("PI_FABRIC_TEST_READINESS_PATH", receiptPath);
@@ -500,7 +502,7 @@ describe("resident setter Main authorization", () => {
       // Even same-ceiling setters require the actual owning Main.
       await expect(provider.invoke("setTools", { id, tools: ["read"] }, context)).rejects.toMatchObject({ name: "ResidentActorAuthorizationError", code: "RESIDENT_ACTOR_FORBIDDEN" });
       expect((await mainClient.actorStatus(id)).tools).toEqual(["read"]);
-      const reply = await control.requestResult<FabricActorMessage>(residentHostId(state.identity.id), id, "ask", { message: "ECHO_MODEL security next activation" });
+      const reply = await control.requestResult<FabricActorMessage>(residentHostId(state.identity.id), id, "ask", { message: "ECHO_MODEL security next activation", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, id) });
       const runFile = path.join((target === "self" ? child : sibling).logDir!, reply.runId!, "status.json");
       await waitFor(() => fs.existsSync(runFile));
       expect(JSON.parse(fs.readFileSync(runFile, "utf8"))).toMatchObject({ tools: ["read", "fabric_exec"] });
@@ -1720,12 +1722,12 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       client.start();
       const actor = await client.createActor({ name: "resident live review", instructions: "Reply.", residency: "durable", transport: "process", responseMode: "text", delivery: "mailbox", coalesce: false });
       const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
-      await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline" }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "settled baseline", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
       await waitFor(() => participant()?.status === "idle" && Boolean(passive.status(actor.id).lastRunId));
       const baseline = passive.status(actor.id);
       expect(passive.owns(actor.id)).toBe(false);
       const definition = passive.definition(actor.id);
-      await control.request(client.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", data: { fakeWorkerReleasePath: releasePath } }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), data: { fakeWorkerReleasePath: releasePath } }, client.hostId);
       await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined);
       const running = participant()!;
       expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({
@@ -1734,8 +1736,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
         id: actor.id, status: "running", queued: 0, inFlightRun: expect.objectContaining({ id: running.actorRun!.id }),
       }));
-      await control.request(client.hostId, actor.id, "followUp", { message: "queued review one" }, client.hostId);
-      await control.request(client.hostId, actor.id, "followUp", { message: "queued review two" }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review one", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "queued review two", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
       await waitFor(() => participant()?.actorQueued === 2);
       const live = participant()!;
       expect(live).toMatchObject({ status: "running", ownerHostId: client.hostId, actorQueued: 2,
@@ -2070,10 +2072,10 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const participant = () => state.participants.get(actor.id, undefined, { fresh: true });
       const current = () => state.mesh.get(`actors/${state.config.sessionId}/${actor.id}`, { fresh: true })?.value as import("../src/actors/types.js").FabricActorInfo | undefined;
       if (queued) {
-        first = control.requestResult(client.hostId, actor.id, "ask", { message: "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+        first = control.requestResult(client.hostId, actor.id, "ask", { message: "LIVE_WITHOUT_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
         await waitFor(() => participant()?.actorRun !== undefined);
       }
-      const observation = control.requestResult(client.hostId, actor.id, "ask", { message: queued ? "accepted durable queue item" : "LIVE_WITHOUT_PROGRESS" }, client.hostId, { timeoutMs: 10_000, signal: controller.signal, detachOnMainCeiling: true }).catch(error => error);
+      const observation = control.requestResult(client.hostId, actor.id, "ask", { message: queued ? "accepted durable queue item" : "LIVE_WITHOUT_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId, { timeoutMs: 10_000, signal: controller.signal, detachOnMainCeiling: true }).catch(error => error);
       await waitFor(() => queued ? current()?.queued === 1 : current()?.inFlightRun !== undefined);
       const runId = current()!.inFlightRun!.id;
       const ceiling = createMainExecutionCeilingError(700);
@@ -2093,9 +2095,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await delay(200);
       expect(state.deliveries).toHaveLength(queued ? 2 : 1);
       // An explicit remote stop still owns activation lifetime after observation expiry.
-      const again = control.requestResult(client.hostId, actor.id, "ask", { message: "HANG" }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
+      const again = control.requestResult(client.hostId, actor.id, "ask", { message: "HANG", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId, { timeoutMs: 10_000 }).catch(error => error);
       await waitFor(() => participant()?.actorRun !== undefined);
-      await control.request(client.hostId, actor.id, "stop", {}, client.hostId);
+      await control.request(client.hostId, actor.id, "stop", { ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
       await again;
       await waitFor(() => participant()?.actorRun === undefined);
       expect(state.deliveries).toHaveLength(queued ? 2 : 1);
@@ -2177,7 +2179,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       client.hostId,
       actor.id,
       "followUp",
-      { message: "before Main shutdown" },
+      { message: "before Main shutdown", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) },
       client.hostId,
     );
     await waitFor(() => messageCount() >= 2);
@@ -2206,7 +2208,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       residentHostId(state.identity.id),
       actor.id,
       "followUp",
-      { message: "after Main shutdown" },
+      { message: "after Main shutdown", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) },
       residentHostId(state.identity.id),
     );
     await waitFor(() => messageCount() >= before + 2);
@@ -2214,7 +2216,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       residentHostId(state.identity.id),
       actor.id,
       "stop",
-      {},
+      { ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) },
       residentHostId(state.identity.id),
     );
     await peerControl.close();
@@ -2272,7 +2274,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const request = { name: "hung reviewer", instructions: "Review.", residency: "durable" as const, delivery: "mailbox" as const };
       const actor = await client.createActor(request);
       await lifecycle.subscribe({ from: actor.id, to: state.identity.id, events: ["pi.turn_end"], delivery: "followUp", triggerTurn: false });
-      await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS" }, client.hostId);
+      await control.request(client.hostId, actor.id, "followUp", { message: "HANG_WITH_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
       await waitFor(() => state.participants.get(actor.id, undefined, { fresh: true })?.actorRun !== undefined, 30_000);
       const runId = state.participants.get(actor.id, undefined, { fresh: true })!.actorRun!.id;
       // A launch handle precedes worker progress. Removing then can abort the worker rather
@@ -2392,7 +2394,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       acknowledgementTimeoutMs: 3_000,
     });
     control.start(() => ({ accepted: false }));
-    await control.request(client.hostId, actor.id, "followUp", { message: "respond" }, client.hostId);
+    await control.request(client.hostId, actor.id, "followUp", { message: "respond", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) }, client.hostId);
     const prefix = residentDeliveryPrefix(state.identity.id);
     await waitFor(() => state.mesh.listAll(prefix).length === 1);
     expect(state.deliveries).toEqual([]);
@@ -2622,13 +2624,88 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
           client.hostId,
           actor.id,
           "followUp",
-          { message: "Do not launch the hidden binding" },
+          { message: "Do not launch the hidden binding", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id) },
           client.hostId,
         ),
       ).rejects.toThrow(/not available to this Pi session/);
       await client.removeActor(actor.id);
     } finally {
       await control.close();
+      await client.close();
+      await state.participants.close();
+      await stopResident(state.config);
+    }
+  });
+
+  // pi-fabric#843 review (smarty-dev#8487): a REAL resident restart. The resident host process
+  // gets SIGTERM, an older runtime's save drops resolvedBinding, the owner re-ensures the actor
+  // and the new host process republishes the idle presence the router reads with its verified
+  // model/thinking, with no new run; a forged row's model, which the run path refuses, stays unknown.
+  it("republishes a verified legacy actor binding after a real resident SIGTERM restart, without a run (pi-fabric#843)", { timeout: 120_000 }, async () => {
+    const state = await rootHarness("resident-binding-restart");
+    const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants,
+      mainAgent: state.mainAgent, hostPath });
+    const ownerPath = path.join(state.config.residencyRoot, "owner.json");
+    const presence = (id: string) =>
+      state.mesh.get(`actors/${state.config.sessionId}/${id}`)?.value as Record<string, unknown> | undefined;
+    const registryFile = (id: string): string => {
+      const roots = Object.values(residentActorRoots(state.config));
+      const file = roots.map(root => path.join(root, "actors.json")).find(candidate => fs.existsSync(candidate) &&
+        (JSON.parse(fs.readFileSync(candidate, "utf8")) as { actors: Array<{ id: string }> }).actors.some(row => row.id === id));
+      if (!file) throw new Error(`No registry row for ${id}`);
+      return file;
+    };
+    const row = (id: string) => (JSON.parse(fs.readFileSync(registryFile(id), "utf8")) as { actors: Array<Record<string, unknown>> })
+      .actors.find(candidate => candidate.id === id)!;
+    const runs = (): string[] => {
+      const directory = path.join(state.config.residencyRoot, "runs");
+      return fs.existsSync(directory) ? fs.readdirSync(directory) : [];
+    };
+    try {
+      const bound = await client.createActor({ name: "review pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", modelReason: "review pair", thinking: "high" });
+      const forged = await client.createActor({ name: "forged pair", instructions: "Review.", residency: "durable",
+        runner: "pi", model: "provider/visible", thinking: "high" });
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      expect(row(bound.id).resolvedBinding).toMatchObject({ model: "provider/visible", thinking: "high" });
+      const before = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      const runsBefore = runs();
+
+      // Real SIGTERM of the resident host process; wait for the process itself to exit.
+      await stopResident(state.config);
+      expect(residentProcessAlive(before.pid, before.processStartTime)).toBe(false);
+      // Seed what an older runtime's save leaves: rows without resolvedBinding, one with a
+      // forged model. Drop the old presence so only the restarted process can write it.
+      for (const [id, model] of [[bound.id, undefined], [forged.id, "provider/forged"]] as const) {
+        const file = registryFile(id);
+        const registry = JSON.parse(fs.readFileSync(file, "utf8")) as { actors: Array<Record<string, unknown>> };
+        const target = registry.actors.find(candidate => candidate.id === id)!;
+        delete target.resolvedBinding;
+        if (model) target.model = model;
+        fs.writeFileSync(file, JSON.stringify(registry));
+        await state.mesh.delete({ key: `actors/${state.config.sessionId}/${id}` });
+      }
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+
+      // The owner re-ensures the actor: a new resident host process loads the legacy rows.
+      await client.ensureActor(bound.id);
+      const after = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+      expect(after.pid).not.toBe(before.pid);
+      await waitFor(() => presence(bound.id)?.model === "provider/visible", 20_000);
+      expect(presence(bound.id)).toMatchObject({ id: bound.id, status: "idle", model: "provider/visible",
+        modelReason: "review pair", thinking: "high" });
+      await waitFor(() => presence(forged.id) !== undefined, 20_000);
+      // The resident resolver refuses the forged selector; give it time to settle, then prove unknown.
+      await delay(1_500);
+      expect(presence(forged.id)?.status).toBe("idle");
+      expect(presence(forged.id)).not.toHaveProperty("model");
+      expect(presence(forged.id)).not.toHaveProperty("thinking");
+      // No new run: no run directory, no lastRunId, and the verified view was not persisted as a run pin.
+      expect(runs()).toEqual(runsBefore);
+      expect(row(bound.id).lastRunId).toBeUndefined();
+      expect(row(forged.id).lastRunId).toBeUndefined();
+      expect(row(bound.id).resolvedBinding).toBeUndefined();
+    } finally {
       await client.close();
       await state.participants.close();
       await stopResident(state.config);
@@ -2690,7 +2767,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "ask",
-        { message: "ECHO_MODEL ping", binding: { model: "probe-late/claude-late-5-6" } },
+        { message: "ECHO_MODEL ping", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-6" } },
         client.hostId,
         { timeoutMs: 20_000 },
       );
@@ -2702,7 +2779,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "followUp",
-        { message: "ECHO_MODEL pong", binding: { model: "probe-late/claude-late-5-7" } },
+        { message: "ECHO_MODEL pong", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-late/claude-late-5-7" } },
         client.hostId,
       );
       await waitFor(() => state.mesh.read({ topic: "fabric.actor.output", limit: 50 })
@@ -2713,7 +2790,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
         actor.id,
         "followUp",
-        { message: "nope", binding: { model: "probe-missing/claude-late-5-9" } },
+        { message: "nope", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), binding: { model: "probe-missing/claude-late-5-9" } },
         client.hostId,
       )).rejects.toThrow(/not available to this Pi session/);
       expect(ownerPid()).toBe(pid);

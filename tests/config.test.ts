@@ -35,6 +35,16 @@ afterEach(() => {
   }
 });
 
+describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
+  it("defaults to 10 minutes capped at 60 and bounds overrides", () => {
+    expect(normalizeFabricConfig({}).actors).toMatchObject({ transientBlockCooldownMs: 600_000, transientBlockMaxMs: 3_600_000 });
+    expect(normalizeFabricConfig({ actors: { transientBlockCooldownMs: 120_000, transientBlockMaxMs: 900_000 } }).actors)
+      .toMatchObject({ transientBlockCooldownMs: 120_000, transientBlockMaxMs: 900_000 });
+    expect(normalizeFabricConfig({ actors: { transientBlockCooldownMs: 1, transientBlockMaxMs: "x" } }).actors)
+      .toMatchObject({ transientBlockCooldownMs: 1_000, transientBlockMaxMs: 3_600_000 });
+  });
+});
+
 describe("host-only explicit model exceptions (#3134)", () => {
   it("defaults to Astra and supports an empty rollback or normalized override", () => {
     expect(normalizeFabricConfig({}).agents.modelPolicy.requireReason).toEqual(["gpt-6-astra"]);
@@ -111,6 +121,30 @@ describe("host-only processSlice (#4383)", () => {
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
     fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { processSlice: "batch.slice" } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.processSlice).toBeUndefined();
+  });
+});
+
+describe("host-only control incarnation rollout fence (#7514)", () => {
+  it("defaults to warn, accepts both modes, and rejects invalid policy values", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.controlIncarnationFence).toBe("warn");
+    expect(normalizeFabricConfig({}).mesh.controlIncarnationFence).toBe("warn");
+    for (const mode of ["warn", "enforce"]) {
+      expect(normalizeFabricConfig({ mesh: { controlIncarnationFence: mode } }).mesh.controlIncarnationFence).toBe(mode);
+    }
+    for (const value of [null, false, "off", "ENFORCE", 1]) {
+      expect(() => normalizeFabricConfig({ mesh: { controlIncarnationFence: value } })).toThrow("mesh.controlIncarnationFence must be warn or enforce");
+    }
+  });
+  it.each([true, false])("ignores project rollout policy, even in trusted lanes (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "enforce" } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).mesh.controlIncarnationFence).toBe("warn");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "enforce" } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: { controlIncarnationFence: "warn" } }));
+    for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }),
+      loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
+      expect(config.mesh.controlIncarnationFence).toBe("enforce");
+    }
   });
 });
 

@@ -160,6 +160,23 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    `state.json.rollback-<E>.tmp`) path. Verify the digest, switch the local flag, and replace
    the marker. **Abort** publishes `unretire{E+2}`, as `abortMeshRollback` does.
 
+**Built (smarty-dev#9670, `backend-migration-nats.ts`): file <-> nats.** `importMeshStateToNats`
+and `rollbackMeshStateFromNats` run steps 2-4 for a file root (no `state.db`, epoch 0, so E+1 = 1
+and `retire` is epoch 2). A sqlite root refuses: roll it back to file first (`rollbackMeshState`),
+then import. The details:
+
+- `import-begin` also records the source digest and `readGeneration`.
+- The chunks are deterministic batch records: entries in key order, then tombstones in eviction
+  order, at most 512 KiB of changes each, with fixed message ids.
+- The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
+- **Rerun without the marker:** the same source resumes. Stored chunks must match byte for byte.
+  A changed source refuses; use a fresh stream (an import never purges).
+- **Rerun with the marker:** the stream is checked against the kept copy, then committed.
+- **Rollback:** it retires the stream and exports the projection through the `state.json`
+  encoder into `state.json.nats-rollback-<E+2>.tmp`. It reads the temp back, checks the digest
+  and renames it over the marker. A rerun redoes the export, or only verifies after the rename.
+- **Not built:** the sqlite-direct path and abort (`unretire`).
+
 The local locks fence only this host. Other hosts are fenced by the stream itself, because every
 nats write carries an expected sequence. Each host's `.lock` and the census still stop its
 file/sqlite writers. The #708 KV lease can carry `custody` across hosts. The migration then takes

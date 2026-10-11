@@ -497,6 +497,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     observations: new SessionObservationCache(),
   });
   let entropyCaches = createEntropyCaches();
+  // smarty-dev#8881: AgentSession.dispose() invalidates extension contexts without emitting session_shutdown
+  // (pi-coding-agent docs/sdk.md), and Pi exposes no dispose hook; every getter of a stale context throws.
+  // A compile scheduled by a disposed session stops before it reads or writes the agent dir, which may
+  // already be the next session's.
+  const contextLive = (context: ExtensionContext): boolean => {
+    try { void context.hasUI; return true; } catch { return false; }
+  };
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -512,7 +519,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   ): Promise<void> => {
     const current = (): boolean =>
       !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
-      state.config.entropy.compile;
+      state.config.entropy.compile && contextLive(context);
     if (!current()) return;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
@@ -590,7 +597,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         }
         await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
-        if (request.signal.aborted) return;
+        if (request.signal.aborted || !contextLive(request.context)) return;  // shutdown or dispose
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)

@@ -233,6 +233,21 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
     });
   });
 
+  it("serves a MeshStore opened with stateBackend nats on a prepared root", async () => {
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const fs = await import("node:fs");
+    const meshRoot = root();
+    fs.mkdirSync(meshRoot, { recursive: true, mode: 0o700 });
+    await openNatsStateBackend({ root: meshRoot, port: fakeJetStream().port(), stream: "M" });
+    const store = new MeshStore(meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
+    try {
+      const written = await store.put({ key: "shared/a", value: { n: 1 }, identity });
+      expect(store.get("shared/a")).toMatchObject({ value: { n: 1 }, version: written.version });
+      expect(store.listAll("shared/").map(entry => entry.key)).toEqual(["shared/a"]);
+      expect(fs.existsSync(`${meshRoot}/state.json`)).toBe(false);
+    } finally { store.closeState(); fs.rmSync(meshRoot, { recursive: true, force: true }); }
+  });
+
   it("loads no NATS client unless a backend is opened without a port", async () => {
     const port: JetStreamPort = fakeJetStream().port();
     await open({ ...fakeJetStream(), port: () => port } as unknown as FakeJetStreamServer);

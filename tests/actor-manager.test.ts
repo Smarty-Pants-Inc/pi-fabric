@@ -3760,12 +3760,13 @@ describe("ActorManager", () => {
       time.set(third.activationBlocked!.retryAt! + 1_000);
       expect(manager.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { count: 3 } });
 
-      expect([1, 2, 3, 4, 5, 6, 40].map(activationBlockBackoffMs)).toEqual([
+      // smarty-dev#6509: 10 min, doubling, capped at 60 min.
+      expect([1, 2, 3, 4, 5, 6, 40].map(count => activationBlockBackoffMs(count))).toEqual([
         ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS,
-        8 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
+        ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
         ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
       ]);
-      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MS).toBe(5 * 60 * 1000);
+      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MS).toBe(10 * 60 * 1000);
       expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS).toBe(60 * 60 * 1000);
     }, 60_000);
 
@@ -3793,8 +3794,9 @@ describe("ActorManager", () => {
       const wakes = captureWakes();
       await failOnce(s.actors, s.agents, actor.id, error);
       const blocked = s.actors.status(actor.id).activationBlocked!;
-      expect(blocked).toMatchObject({ code, count: 1 });
+      expect(blocked).toMatchObject({ code, class: "hard", count: 1 });
       expect(blocked.classification).toMatch(classification);
+      expect(blocked).not.toHaveProperty("backoffMs");
       expect(blocked).not.toHaveProperty("retryAt");
       expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
         entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
@@ -3943,6 +3945,147 @@ describe("ActorManager", () => {
       expect(s.mesh.get(`actors/test/${stuck.id}`)?.value).not.toHaveProperty("activationBlocked");
       expect(s.mesh.get(`actors/test/${preparing.id}`)?.value).toMatchObject({ activationBlocked: { code: "failing-preparation" } });
     }, 60_000);
+
+    // smarty-dev#6509: one transient error (a Luna stream error, a preparation timeout) lost a
+    // reviewer until it was re-created. The class is explicit and durable, the cooldown is
+    // configurable, and only a failed probe doubles the backoff.
+    describe("transient block class, cooldown and probe backoff (smarty-dev#6509)", () => {
+      const WINDOW = "Error: Activation window lost current activation messages";
+      const configured = async (s: ReturnType<typeof setup>, cooldownMs: number, maxMs: number) => {
+        await s.actors.close();
+        const manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true, transientBlockCooldownMs: cooldownMs, transientBlockMaxMs: maxMs,
+        });
+        actorManagers.push(manager);
+        return manager;
+      };
+
+      it("uses the configured cooldown; each failed probe doubles it up to the configured cap", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "configured-route", instructions: "Respond.", responseMode: "text" });
+        const manager = await configured(s, 2_000, 5_000);
+        await failOnce(manager, s.agents, actor.id);
+        const first = manager.status(actor.id).activationBlocked!;
+        expect(first).toMatchObject({ code: "provider-transient", class: "transient", count: 1, backoffMs: 2_000,
+          blockedAt: first.since, retryAt: first.since + 2_000 });
+        const backoffs = [first.backoffMs];
+        for (let probe = 0; probe < 3; probe++) {
+          time.set(manager.status(actor.id).activationBlocked!.retryAt! + 1);   // expired: the next run is the probe
+          expect(manager.status(actor.id)).toMatchObject({ activationBlockExpired: { class: "transient" } });
+          await failOnce(manager, s.agents, actor.id);
+          const blocked = manager.status(actor.id).activationBlocked!;
+          expect(blocked.retryAt).toBe(blocked.blockedAt! + blocked.backoffMs!);
+          backoffs.push(blocked.backoffMs);
+        }
+        expect(backoffs).toEqual([2_000, 4_000, 5_000, 5_000]);
+      }, 60_000);
+
+      it("a failure inside the cooldown restarts it without doubling; a probe failing with another transient cause doubles", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "burst-route", instructions: "Respond.", responseMode: "text" });
+        await failOnce(s.actors, s.agents, actor.id);
+        const first = s.actors.status(actor.id).activationBlocked!;
+        expect(first).toMatchObject({ class: "transient", backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        time.set(first.blockedAt! + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS / 2);              // still blocked: not a probe
+        await failOnce(s.actors, s.agents, actor.id);
+        const burst = s.actors.status(actor.id).activationBlocked!;
+        expect(burst).toMatchObject({ count: 2, since: first.since, backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        expect(burst.retryAt).toBe(burst.blockedAt! + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
+        time.set(burst.retryAt! + 1);                                                  // expired: this run is the probe
+        await failOnce(s.actors, s.agents, actor.id, WINDOW);
+        expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "activation-window-lost", class: "transient", count: 1,
+          backoffMs: 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        await s.actors.ask(actor.id, "recover");
+        await waitFor(() => !s.actors.status(actor.id).inFlightRun && s.actors.status(actor.id).activationBlocked === undefined);
+        // A later episode starts again from the cooldown.
+        await failOnce(s.actors, s.agents, actor.id);
+        expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ count: 1, backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      }, 60_000);
+
+      it("persists the class, failure time and backoff; a restored block keeps gating until its expiry", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "durable-route", instructions: "Respond.", responseMode: "text" });
+        await failOnce(s.actors, s.agents, actor.id);
+        time.set(s.actors.status(actor.id).activationBlocked!.retryAt! + 1);
+        await failOnce(s.actors, s.agents, actor.id);                                  // a failed probe: doubled
+        const blocked = s.actors.status(actor.id).activationBlocked!;
+        expect(blocked).toMatchObject({ class: "transient", backoffMs: 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        const restored = await restart(s, s.actors);
+        const stored = (JSON.parse(fs.readFileSync(path.join(s.root, "actors", "actors.json"), "utf8")).actors as Array<Record<string, unknown>>)
+          .find((row) => row.id === actor.id)!.activationBlocked;
+        expect(stored).toEqual(blocked);
+        expect(restored.status(actor.id).activationBlocked).toEqual(blocked);
+        time.set(blocked.retryAt! - 1);
+        expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+        time.set(blocked.retryAt! + 1);
+        expect(restored.status(actor.id).activationBlockExpired).toMatchObject({ class: "transient", blockedAt: blocked.blockedAt,
+          backoffMs: blocked.backoffMs, expiredAt: blocked.retryAt });
+        await failOnce(restored, s.agents, actor.id);                                  // the probe after restart fails: doubled again
+        expect(restored.status(actor.id).activationBlocked).toMatchObject({ backoffMs: 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      }, 60_000);
+
+      it("releases a reviewer an older host blocked for good on a preparation timeout or a stream error", async () => {
+        const s = setup(true);
+        const prep = await s.actors.create({ name: "prep-timeout", instructions: "Respond.", responseMode: "text" });
+        const lock = await s.actors.create({ name: "lock-timeout", instructions: "Respond.", responseMode: "text" });
+        const stream = await s.actors.create({ name: "luna-stream", instructions: "Respond.", responseMode: "text" });
+        const config = await s.actors.create({ name: "bad-model", instructions: "Respond.", responseMode: "text" });
+        await s.actors.close();
+        const file = path.join(s.root, "actors", "actors.json");
+        const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+        const since = Date.now() - 13 * 60 * 60 * 1000;
+        const PREPARATION = "permanent: activation preparation kept failing past its retry budget";
+        const stuck: Record<string, Record<string, unknown>> = {
+          [prep.id]: { reason: `Actor ${prep.id} preparation (model): timed out after 30000 ms`, code: "failing-preparation", classification: PREPARATION },
+          [lock.id]: { reason: "Timed out waiting for the Fabric actor registry lock", code: "failing-preparation", classification: PREPARATION },
+          [stream.id]: { reason: "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion", code: "unknown",
+            classification: "fail-closed: no transient cause recognised" },
+          [config.id]: { reason: `Actor ${config.id} preparation (model): Model "x/y" is not allowed by agents.allowedModels`,
+            code: "failing-preparation", classification: PREPARATION },
+        };
+        for (const row of registry.actors as Array<Record<string, unknown>>) {
+          row.activationBlocked = { ...stuck[row.id as string]!, since, count: 7 };
+          row.failureStreak = { count: 7, notified: true };
+        }
+        fs.writeFileSync(file, JSON.stringify(registry));
+        const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true,
+        });
+        actorManagers.push(restored);
+        expect(restored.status(prep.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "preparation-timeout", class: "transient" } });
+        expect(restored.status(lock.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "preparation-timeout", class: "transient" } });
+        expect(restored.status(stream.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "provider-transient", class: "transient",
+          classification: expect.stringMatching(/^transient: model stream disconnect/) } });
+        // A configuration failure stays a hard block until it is fixed or the actor is re-created.
+        expect(restored.status(config.id)).toMatchObject({ status: "failing-preparation",
+          activationBlocked: { code: "failing-preparation", class: "hard", classification: PREPARATION } });
+        expect(restored.status(config.id).activationBlocked).not.toHaveProperty("retryAt");
+      }, 60_000);
+
+      it.each([
+        [{ lastError: "Actor a preparation (model): timed out after 80 ms", preparation: true }, "preparation-timeout",
+          /^transient: activation preparation timed out \(matched "timed out"\)$/],
+        [{ lastError: "Actor a preparation (capability): MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock after 9 attempts", preparation: true },
+          "preparation-timeout", /^transient: activation preparation timed out/],
+        [{ lastError: "Agent launch preparation (model/auth) timed out after 30000 ms", preparation: true, preparationTimeout: true },
+          "preparation-timeout", /^transient: activation preparation timed out \(a preparation deadline\)$/],
+        [{ lastError: "Actor a preparation (model): 401 Unauthorized: token expired; timed out", preparation: true }, "failing-preparation",
+          /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (model): Model \"x/y\" is not allowed", preparation: true }, "failing-preparation", /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (instructions): invalid instructions file", preparation: true }, "failing-preparation", /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (model): 403 Forbidden", preparationTimeout: true }, "permission", /^permanent: permission denied/],
+        [{ lastError: "stream error: stream disconnected before completion" }, "provider-transient", /^transient: model stream disconnect/],
+        [{ lastError: "cliproxyapi/gpt-6-luna: stream error: upstream reset" }, "provider-transient", /^transient: model stream disconnect \(matched "stream error"\)$/],
+        [{ lastError: "Error: stream error: 401 invalid api key" }, "auth", /^permanent: credential/],
+      ])("classifies %j as %s (smarty-dev#6509)", (input, code, classification) => {
+        const result = classifyActivationFailure(input);
+        expect(result).toMatchObject({ code, transient: classification.source.startsWith("^transient") });
+        expect(result.classification).toMatch(classification);
+      });
+    });
   });
 
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice

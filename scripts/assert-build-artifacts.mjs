@@ -87,6 +87,7 @@ const lazy = [
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/retry-profile.js",
+  "worker/profile-extensions.js",
   "worker/task-entry.js",
   "worker/run-log.js",
   "worker/run-record.js",

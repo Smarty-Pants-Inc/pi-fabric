@@ -1031,7 +1031,10 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      !residentProcessAlive(owner.pid, owner.processStartTime)
+      // Only confirmed death retires the owner. An identity-bearing owner in another PID
+      // namespace is judged by its heartbeat; "unknown" stays live, so cleanupAgent never
+      // falls through to offline run-directory removal on a local ESRCH.
+      recordOwnerLiveness(owner, { legacyAlive: (pid: number) => residentProcessAlive(pid, owner.processStartTime) }) === "dead"
     ) {
       return undefined;
     }

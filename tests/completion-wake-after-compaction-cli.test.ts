@@ -20,7 +20,7 @@ const PROVIDER = "compact-9271";
 const SUMMARIZER = "context summarization assistant";
 
 // smarty-dev#9271 (round 3 of #6134): Pi counts a compacting Main as busy (isIdle() is false), and
-// the completion inbox's idle timer skipped delivery when it found Main busy, without retrying.
+// the completion inbox's idle timer skipped delivery when it found Main busy, and nothing re-armed it.
 // A compaction on an idle Main that no agent_settled follows (a manual /compact, Fabric's retry of a
 // failed compaction) then left a child completion that landed during it undelivered until some
 // other turn. Real native Pi RPC Main -> fabric_exec agents.spawn -> built worker -> real native Pi
@@ -178,8 +178,8 @@ const scenario = async (mode: Mode): Promise<void> => {
     await wait(() => of("agent_settled").length === of("agent_start").length && !!of("agent_settled").length &&
       of("agent_settled").at(-1)!.at > timing.mainSawCompletion!, 20_000, "woken turn settled");
     expect(await client.getLastAssistantText()).toBe(SEEN_MARKER);
-    // Exactly one delivery: the retry never sends a completion twice. Count session entries, since a
-    // later compaction drops the delivered message from the model context.
+    // Exactly one delivery. Count session entries, since a later compaction drops the delivered
+    // message from the model context.
     const { entries } = await client.getEntries();
     const completions = entries.filter(entry => entry.type === "custom_message" &&
       (entry as { customType?: string }).customType === "pi-fabric-agent-complete");

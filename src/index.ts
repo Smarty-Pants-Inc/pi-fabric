@@ -1113,6 +1113,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.ensure(context); // Failure is first use, never an eager idle import.
       await state.publishOpsEvent(COMPACTION_FAILED_ALARM, COMPACTION_FAILED_ALARM, data);
     },
+    // No agent_settled follows a retry on an idle Main: its end wakes Main for a completion (smarty-dev#9271).
+    retryEnded: () => state.completionIdleSignal(),
   });
 
   // Deterministic, LLM-free compaction is registered unconditionally and is

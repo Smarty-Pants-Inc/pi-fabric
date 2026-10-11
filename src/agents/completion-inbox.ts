@@ -9,9 +9,6 @@ export const AGENT_COMPLETION_MESSAGE_TYPE = "pi-fabric-agent-complete";
 const SUMMARY_CHARS = 4_000;
 const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
-// A busy idle-time check defers delivery, never drops it: retry 1 s, doubling to 30 s (smarty-dev#9271).
-const BUSY_RETRY_FIRST_MS = 1_000;
-const BUSY_RETRY_MAX_MS = 30_000;
 
 type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "partialText" | "warnings" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
 type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
@@ -30,7 +27,6 @@ export class AgentCompletionInbox {
   readonly #unsubscribe: Array<() => void> = [];
   #context: ExtensionContext;
   #timer: ReturnType<typeof setTimeout> | undefined;
-  #busyRetryMs = 0;
   #suspended = false;
   #closed = false;
   #receiptSource = "";
@@ -89,14 +85,16 @@ export class AgentCompletionInbox {
         if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
         this.#confirmHeld();
-        this.#wakeOnIdleSignal();
+        this.idleSignal();
       });
-    // Pi counts a compacting Main as busy. A compaction that no run surrounds (a manual /compact,
-    // Fabric's retry of a failed compaction) ends without agent_settled, so its end is the idle
-    // signal for a completion that landed during it (smarty-dev#9271). Pi leaves its busy state
-    // only after every session_compact handler returns; a still-busy check falls back to backoff.
-    subscribe("session_compact", (_event, ctx) => { this.#context = ctx; this.#wakeOnIdleSignal(); });
-    subscribe("session_compact_failed", (_event, ctx) => { this.#context = ctx; this.#wakeOnIdleSignal(); });
+    // Pi counts a compacting Main as busy, and a compaction that no run surrounds (a manual
+    // /compact, Fabric's retry of a failed compaction) ends without agent_settled. Its end events
+    // arm the idle check for a completion that landed during it (smarty-dev#9271). Pi emits
+    // session_compact just before it leaves its compaction state, which it does as soon as the
+    // last handler returns; session_compact_failed comes after. Fabric's retry also signals from
+    // Pi's onComplete/onError callback, which runs after that state is gone (compaction/recovery.ts).
+    subscribe("session_compact", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
+    subscribe("session_compact_failed", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
     subscribe("input", (_event, ctx) => {
         this.#context = ctx;
         this.#suspended = false;
@@ -143,6 +141,19 @@ export class AgentCompletionInbox {
     this.#acknowledged.add(id);
     this.#pending.delete(id);
     this.#handed.delete(id);
+  }
+
+  /**
+   * An event that can end Main's busy period arms one idle check, IDLE_BATCH_MS from now. A check
+   * that finds Main busy arms nothing: a run delivers at its own turn_end or before_agent_start,
+   * and a busy period without a run ends with one of these events (smarty-dev#9271). No polling.
+   */
+  idleSignal(): void {
+    if (this.#closed) return;
+    // Restart an earlier check: it could run before Pi leaves the busy state this event ends.
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#schedule();
   }
 
   close(): void {
@@ -244,43 +255,17 @@ export class AgentCompletionInbox {
     }
   }
 
-  #schedule(delay = IDLE_BATCH_MS): void {
+  #schedule(): void {
     if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
+    // A check that finds Main busy does not re-arm itself; idleSignal() does, on an event.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
-      const idle = this.#context.isIdle() && !this.#context.hasPendingMessages();
-      if (idle) {
-        this.#busyRetryMs = 0;
-        this.#flush();
-      }
+      if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       if (this.#receiptRetries.size) this.#schedule();
-      else if (!idle) this.#retryWhileBusy();
-    }, delay);
+    }, IDLE_BATCH_MS);
     this.#timer.unref?.();
-  }
-
-  /**
-   * Main was busy (a run, a compaction, queued input) when the idle check ran. Check again
-   * later: a busy state can end with no event this inbox hears, and a skipped check used to
-   * leave the results unread until some other turn (smarty-dev#9271). A run's turn_end or
-   * before_agent_start takes them first; the retry stops once nothing is pending.
-   */
-  #retryWhileBusy(): void {
-    if (this.#closed || this.#suspended || !this.#pending.size) return;
-    this.#busyRetryMs = Math.min(BUSY_RETRY_MAX_MS, this.#busyRetryMs ? this.#busyRetryMs * 2 : BUSY_RETRY_FIRST_MS);
-    this.#schedule(this.#busyRetryMs);
-  }
-
-  /** Main may be idle again: replace a pending busy backoff with the short idle check. */
-  #wakeOnIdleSignal(): void {
-    if (this.#timer && this.#busyRetryMs) {
-      clearTimeout(this.#timer);
-      this.#timer = undefined;
-    }
-    this.#busyRetryMs = 0;
-    this.#schedule();
   }
 
   #flush(deliver: (message: CompletionMessage, result: Completion) => void = (message, result) =>

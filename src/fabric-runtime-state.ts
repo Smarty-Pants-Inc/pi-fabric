@@ -1971,6 +1971,9 @@ export class FabricRuntimeState {
     return this.#shellJobs.unannounced() + (this.#shellInbox?.pendingCount() ?? 0) + (this.#jevPrograms?.runningCount() ?? 0);
   }
 
+  /** A busy period of Main ended outside the inbox's own events (smarty-dev#9271). */
+  completionIdleSignal(): void { this.#completionInbox?.idleSignal(); }
+
   /** Best-effort ops event on the mesh, e.g. ops.fabric.reloaded (smarty-dev#2160). */
   publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return Promise.resolve();

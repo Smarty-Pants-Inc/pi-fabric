@@ -43,11 +43,17 @@ export default {
     projects: [
       {
         define: policyConstants("missing"),
-        test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts", "tests/host-policy.test.ts"] },
+        test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
+          "tests/process-slice-scope-e2e.test.ts"] },
       },
       {
         define: policyConstants("host-policy"),
         test: { ...sharedTests, name: "host-policy", include: ["tests/host-policy.test.ts"] },
+      },
+      {
+        // smarty-dev#8953: its own policy file, so the staged processSlice never reaches another file's config.
+        define: policyConstants("scope-e2e"),
+        test: { ...sharedTests, name: "scope-e2e", include: ["tests/process-slice-scope-e2e.test.ts"] },
       },
       {
         define: policyConstants("missing"),

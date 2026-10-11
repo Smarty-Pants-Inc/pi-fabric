@@ -43,7 +43,7 @@ describe("background mesh retry boundary", () => {
     retry.success(); random.mockReturnValue(0.75); retry.failure(busy()); expect(retry.waitMs).toBe(75);
   });
 
-  it("backs off explicitly admitted watcher faults, deduplicates diagnostics and resets after recovery", async () => {
+  it("backs off explicitly admitted watcher faults, rate-limits diagnostics and resets backoff after recovery", async () => {
     vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const retry = new MeshBackgroundRetry("watcher", 1_000, 5_000);
@@ -53,10 +53,18 @@ describe("background mesh retry boundary", () => {
       await vi.advanceTimersByTimeAsync(expected);
     }
     expect(warn).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0); // Owner arms any timer.
+    // Recovery resets backoff, not the warning window (#809): a new outage inside it is counted.
     retry.success(); retry.fault(new Error("new watcher outage"));
-    expect(retry.waitMs).toBe(500); expect(warn).toHaveBeenCalledTimes(2);
+    expect(retry.waitMs).toBe(500); expect(warn).toHaveBeenCalledOnce();
     vi.spyOn(Math, "random").mockReturnValue(0); retry.fault(new Error("zero draw"));
     expect(retry.waitMs).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000); retry.fault(new Error("later outage"));
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1]![0]).toMatch(/watcher: observed fault; retrying in \d+ ms: later outage \(6 similar retries suppressed in the last 68s\)$/);
+    // The final recovery summary names the observed fault, not a mesh lock.
+    retry.fault(new Error("suppressed")); await vi.advanceTimersByTimeAsync(60_000); retry.success();
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[2]![0]).toBe("[pi-fabric] watcher: observed fault recovered (1 similar retries suppressed in the last 60s)");
   });
 
   it("contains sync/async non-lock bugs visibly without imposing lock backoff", async () => {

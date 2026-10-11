@@ -669,6 +669,8 @@ export class MeshBackgroundRetry {
   #retryAt = 0;
   #lastReportedAt: number | undefined;
   #suppressed = 0;
+  /** Recovery wording for the outage kind that last backed off (lock vs observed fault). */
+  #recovered = "mesh lock recovered";
   #running = false;
   constructor(readonly label: string, readonly minMs = 100, readonly maxMs = 5_000,
     readonly warningWindowMs = meshRetryWarningWindowMs()) {}
@@ -685,7 +687,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    console.warn(`[pi-fabric] ${this.label}: ${this.#recovered} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -699,15 +701,16 @@ export class MeshBackgroundRetry {
       console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    this.#backoff(error, "mesh lock timeout; retrying");
+    this.#backoff(error, "mesh lock timeout; retrying", "mesh lock recovered");
     return true;
   }
 
   /** Explicit observed-fault admission (e.g. a lost watcher), not automatic retry policy
    * for unrelated operation errors. The owner retains its obligation and attempt cap. */
-  fault(error: unknown): void { this.#backoff(error, "observed fault; retrying"); }
+  fault(error: unknown): void { this.#backoff(error, "observed fault; retrying", "observed fault recovered"); }
 
-  #backoff(error: unknown, reason: string): void {
+  #backoff(error: unknown, reason: string, recovered: string): void {
+    this.#recovered = recovered;
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
     // Keep the exponential ceiling separate from the randomized draw. Timers
     // have a 1ms scheduling floor so a zero draw cannot form a microtask spin.

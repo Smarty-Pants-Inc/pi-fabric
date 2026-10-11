@@ -113,12 +113,21 @@ describe("ParticipantDirectory routing freshness (#2386)", () => {
     expect(directory.routingUnavailable()).toContain("no confirmed view");
     expect(directory.canConsumeMesh()).toBe(false);
     // A bounded state operation, not exclusive() on the mesh lock (smarty-dev#6477 L2b).
-    const read = vi.spyOn(directory.mesh, "withTryLock");
+    // smarty-dev#7651: withStateFence passes the budget LEFT (deadline - Date.now()), which drops to
+    // 1999 when a millisecond ticks between computing the deadline and the try. Bound it by the clock
+    // time that elapsed around the call instead of demanding the exact constant.
+    const tryLock = directory.mesh.withTryLock.bind(directory.mesh);
+    let triedAt = 0;
+    const read = vi.spyOn(directory.mesh, "withTryLock").mockImplementation((operation, timeout) => {
+      triedAt ||= Date.now(); return tryLock(operation, timeout);
+    });
     const exclusive = vi.spyOn(directory.mesh, "exclusive");
     const fence = vi.spyOn(directory.mesh, "writeBatch");
+    const calledAt = Date.now();
     await directory.refreshRoutingView();
     expect(read).toHaveBeenCalledWith(expect.any(Function), expect.any(Number));
-    expect(read.mock.calls[0]![1]).toBe(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeLessThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS);
+    expect(read.mock.calls[0]![1]).toBeGreaterThanOrEqual(ROUTING_REFRESH_LOCK_BUDGET_MS - (triedAt - calledAt));
     expect(fence).toHaveBeenCalledWith(expect.objectContaining({ ops: [], prepare: expect.any(Function) }));
     expect(exclusive).not.toHaveBeenCalled();
     expect(directory.routingUnavailable()).toBeUndefined();
@@ -1558,7 +1567,20 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBe(0);
         hold();
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledTimes(2); // a later outage gets its own warning
+        // smarty-dev#8305: a later outage inside the warning window is counted, not printed.
+        // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
+        expect(warn).toHaveBeenCalledOnce();
+
+        // The first real acquisition after the window prints the final summary of both
+        // suppressed retries (the continuous outage's second timeout and the later outage).
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        vi.setSystemTime(Date.now() + 60_000);
+        expect(retry.waitMs).toBe(0);
+        expect(await tick()).toBe("done");
+        expect(recovered).toHaveBeenCalledTimes(2);
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(warn.mock.calls[1]![0]).toMatch(
+          /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();

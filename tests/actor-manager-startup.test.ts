@@ -245,7 +245,8 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
   });
 
   it("reads a shared foreign lineage once per synchronous refresh, never once per actor", () => {
-    const f = fixture(200);
+    // Three retention batches (8 per batch) tell once-per-refresh from once-per-actor; 200 actors took ~4 s (smarty-dev#7834).
+    const f = fixture(17);
     const lineageAlive = vi.fn(() => true);
     const manager = f.make({ rootId: "session:other", canManageActor: () => undefined,
       snapshotActorOwnership: () => new Map(), lineageAlive });

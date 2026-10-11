@@ -433,7 +433,9 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe("fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
+    expect(err).toBe("fabric-mesh-backend: accepted gap smarty-dev#8116: a lock-free holder whose /proc/<pid>/fd "
+      + "is unreadable and that opens state.db between the lease probe and the commit (under the fence) is not detected\n"
+      + "fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 

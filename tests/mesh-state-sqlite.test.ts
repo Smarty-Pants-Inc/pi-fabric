@@ -607,16 +607,14 @@ describe("SqliteStateStore", () => {
     // Evidence for the PR: the WAL peaks before and after the first in-load win, and the wins.
     console.log(JSON.stringify({ wins, peakBefore, peakAfter, walTraffic, reads, checkpoints: stats.checkpoints }));
     expect(reads).toBeGreaterThan(readers);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). smarty-dev#7651: not a
-    // fixed 16 MiB peak, which measured how often the busy-backoff TRUNCATE wins on the runner's CPU (windows-latest:
-    // 36-44 MiB with 0-2 wins in a fixed window). Instead: WINS successful in-load TRUNCATEs within the work-bounded
-    // window, and the WAL peak stays bounded across every cycle: under 96 MiB, the store's 64 MiB emergency threshold
-    // (emergencyCheckpointBytes) plus the writes 16 processes still have in flight on starved cores while the busy-
-    // backoff TRUNCATE waits. Measured peaks: 13-62 MB on 4 cores + 4 burners, one 67.6 MB with 3 wins on 2 cores +
-    // 2 burners, 36-44 MiB on windows-latest. The growth mutations fail on WINS, not on this bound: a disabled
-    // maintainer wins 0 (peak 67-74 MB) and one that wins once then stops wins 2 (peak 67.5-86 MB).
+    // smarty-dev#7651: this test proves the maintainer is not starved: WINS successful in-load TRUNCATEs against the
+    // constant readers, within a window bounded by work. It has no WAL-size bound. The WAL's growth backstop is the
+    // writers' emergency checkpoint at 64 MiB (emergencyCheckpointBytes), covered by
+    // tests/mesh-state-sqlite-wal-pinned.test.ts "Case A: a pinned reader past the 64 MiB emergency threshold"
+    // (pinnedStats.emergency > 0). A peak bound here measured that backstop, not the maintainer (pi-fabric#891
+    // round 5): on 2 cores + 2 burners, 20 runs each, maintained peaks were 11.9/27.4/69.5 MB (min/median/max) and
+    // maintainer-less ones 44.1/68.5/76.1 MB. The distributions overlap; only the wins tell them apart (0 vs 3-8).
     expect(wins).toBeGreaterThanOrEqual(WINS);
-    expect(Math.max(peakBefore, peakAfter)).toBeLessThan(96 * 1024 * 1024);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();

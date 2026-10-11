@@ -53,8 +53,15 @@ jobs:
         run: bun run proof:check
       - name: Type check
         run: bun run typecheck
+      # smarty-dev#8121: one exact compiler for the static native helpers (native/toolchain.json). The build
+      # requires it on Linux and fails unless both helpers equal the expected sha256 for that toolchain.
+      - name: Fetch the pinned native toolchain
+        if: runner.os == 'Linux'
+        run: node scripts/native-toolchain.mjs fetch
       # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: ${{ runner.os == 'Linux' && '1' || '' }}
         run: bun run build
       # Pi installs packages without peer or dev dependencies; the agent and memory
       # workers run outside Pi's module aliases, so their imports must resolve there.

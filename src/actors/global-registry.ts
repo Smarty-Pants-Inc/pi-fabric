@@ -380,7 +380,8 @@ export class GlobalActorRegistry {
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid global actor residency: ${String(def.residency)}`);
     }
-    const runner = def.runner ?? "pi-durable";
+    // Smarty fork: templates default to "pi" like agents.runner (upstream: pi-durable).
+    const runner = def.runner ?? "pi";
     if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
       throw new Error(`Invalid global actor runner: ${String(def.runner)}`);
     }

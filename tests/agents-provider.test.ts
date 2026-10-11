@@ -1615,20 +1615,23 @@ describe.skipIf(process.platform !== "linux")("native written-but-unadmitted obs
     let guest!: ReturnType<typeof childProcess.spawn>;
     let wrote!: () => void;
     const written = new Promise<void>(resolve => { wrote = resolve; });
+    // Only the response to the stopped agents.wait call counts; upstream's
+    // native-tools catalog call (fabric.$piAllTools) answers before it.
+    let stopped = false;
     const spawn = vi.mocked(childProcess.spawn).mockImplementationOnce((...args: Parameters<typeof childProcess.spawn>) => {
       guest = actual.spawn(...args);
       if (backend === "node-process") {
         const send = guest.send.bind(guest);
         guest.send = ((message: any, callback: (error: Error | null) => void) => send(message, (error) => {
           callback(error);
-          if (message.type === "response" && !error) wrote();
+          if (message.type === "response" && !error && stopped) wrote();
         })) as typeof guest.send;
       } else {
         const channel = guest.stdio[3] as Duplex;
         const write = channel.write.bind(channel);
         channel.write = ((frame: string, callback: (error?: Error | null) => void) => write(frame, (error) => {
           callback(error);
-          if (JSON.parse(frame).type === "response" && !error) wrote();
+          if (JSON.parse(frame).type === "response" && !error && stopped) wrote();
         })) as typeof channel.write;
       }
       return guest;
@@ -1639,6 +1642,7 @@ describe.skipIf(process.platform !== "linux")("native written-but-unadmitted obs
       deadlineAt = ctx.mainDeadlineAt!;
       process.kill(guest.pid!, "SIGSTOP");
       await waitFor(() => /\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8")), 5_000);
+      stopped = true;
       return invoke(ref, args, ctx);
     });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2842,7 +2846,7 @@ describe("AgentsProvider runner support", () => {
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, runner: "pi-durable", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
     expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
 
     const outerToolResult = {
@@ -3814,7 +3818,7 @@ return { first, second, tail: "continued" };`,
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, runner: "pi-durable", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
 
     const outerToolResult = {
       role: "toolResult" as const,
@@ -3886,7 +3890,7 @@ return { first, second, tail: "continued" };`,
       kind: "fabric-agent-tools",
       name: "preview-agent",
       status: "completed",
-      runner: "pi-durable",
+      runner: "pi",
       owner: "agent",
       text: "fake worker complete",
       tools: expect.any(Array),

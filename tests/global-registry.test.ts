@@ -64,7 +64,7 @@ describe("GlobalActorRegistry", () => {
     expect(created.name).toBe("reviewer");
     expect(created.events).toEqual(["turn_end"]);
     expect(created.delivery).toBe("steer");
-    expect(created.runner).toBe("pi-durable");
+    expect(created.runner).toBe("pi");
     expect(created.model).toBeUndefined();
 
     expect(registry.list()).toHaveLength(1);

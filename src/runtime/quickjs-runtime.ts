@@ -785,7 +785,7 @@ globalThis.rlm = Object.freeze({
     if (args && args.runner && args.runner !== "pi" && args.runner !== "pi-durable") {
       throw new Error("rlm.query requires a Pi runner (pi-durable or pi) for recursive Fabric");
     }
-    return __budgetedRun({ ...args, runner: args?.runner ?? "pi-durable", recursive: true });
+    return __budgetedRun({ ...args, runner: args?.runner ?? "pi", recursive: true });
   },
 });
 globalThis.council = Object.freeze({

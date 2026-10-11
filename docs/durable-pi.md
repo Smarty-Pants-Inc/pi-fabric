@@ -1,6 +1,6 @@
 # Durable Pi runner
 
-`agents.runner` defaults to **`pi-durable`**: an isolated Pi SDK process with a real
+In this fork `agents.runner` defaults to `pi`; set it to **`pi-durable`** for an isolated Pi SDK process with a real
 `AgentSession`, native RPC, and a `DurableAgent` backed by the published durable
 Harness. Pinned worker dependencies ship with Fabric; registration and idle hooks
 do not load the worker or engines.

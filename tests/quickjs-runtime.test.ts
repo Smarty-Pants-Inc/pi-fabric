@@ -1131,10 +1131,10 @@ return "done";
     );
     expect(result.error).toBeUndefined();
     expect(result.value).toMatchObject({ status: "completed", text: "recursive target" });
-    expect(request).toMatchObject({ task: "map", cwd: "target", worktree: true, runner: "pi-durable", recursive: true });
+    expect(request).toMatchObject({ task: "map", cwd: "target", worktree: true, runner: "pi", recursive: true });
   });
 
-  it("counts rlm.query usage and defaults to the durable Pi runner", async () => {
+  it("counts rlm.query usage and defaults to the Pi runner (fork default; pi-durable is opt-in)", async () => {
     let request: Record<string, unknown> | undefined;
     const result = await new QuickJsRuntime().execute(
       `await rlm.query({ task: "map" }); return budget.spent();`,
@@ -1149,7 +1149,7 @@ return "done";
     );
     expect(result.error).toBeUndefined();
     expect(result.value).toBe(10);
-    expect(request).toMatchObject({ task: "map", runner: "pi-durable", recursive: true });
+    expect(request).toMatchObject({ task: "map", runner: "pi", recursive: true });
   });
 
   it("keeps explicit legacy Pi selection and rejects non-recursive runners for RLM", async () => {

@@ -256,6 +256,8 @@ export interface AgentRunRecord {
 export interface AgentRunResult extends AgentRunRecord {
   /** Resolution marker in agents.run results; does not replace the observed model. */
   via?: string;
+  /** smarty-dev#8935: an ENODEV-unconfirmed run's saved answer, not yet settled; the actor commits it after delivery. */
+  enodevRecovered?: boolean;
   /** Canonical launch selection when via is present; may differ from the observed model. */
   selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.

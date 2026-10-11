@@ -60,6 +60,8 @@ export const enodevUnresolvedRuns = (runRoot: string): string[] => {
  * pi-fabric#912: the actor's queue state was unknown (`unknown`) or known at this start. Counts consecutive unknown
  * starts in each of the actor's ENODEV markers (`unknownStarts`; a known start resets it) and returns the highest.
  */
+/** From this many consecutive unknown starts the actor's owner is alarmed (ActorManager, ops.owner). */
+export const UNKNOWN_STARTS_ALARM = 3;
 export const countUnknownEnodevStarts = (directories: readonly string[], actorId: string, unknown: boolean): number => {
   let highest = 0;
   for (const directory of directories) {
@@ -69,10 +71,15 @@ export const countUnknownEnodevStarts = (directories: readonly string[], actorId
       readJson(path.join(directory, "status.json"))?.actorId !== actorId) continue;
     const prior = typeof marker.unknownStarts === "number" ? marker.unknownStarts : 0;
     const next = unknown ? prior + 1 : 0;
-    if (next !== prior) {
-      try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch { continue; }
-    }
+    // The observed count escalates even when it cannot be saved (round 3 P2): a count that cannot persist would
+    // never reach the third start, so an unknown start whose count is not saved escalates at once.
     highest = Math.max(highest, next);
+    if (next !== prior) {
+      try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch (error) {
+        console.warn(`[pi-fabric] actor ${actorId}: could not save unknownStarts ${next} in ${file}: ${String(error)} (smarty-dev#8935)`);
+        if (unknown) highest = Math.max(highest, UNKNOWN_STARTS_ALARM);
+      }
+    }
   }
   return highest;
 };
@@ -110,6 +117,18 @@ const settle = (directory: string, run: EnodevRun, terminal: Record<string, unkn
   try { commitRunArchive(directory, "settlement"); } catch { /* no awaiting archive: nothing to discharge */ }
   fs.rmSync(path.join(directory, UNRESOLVED_WORKER_FILE), { force: true });
   return result;
+};
+
+/**
+ * The saved answer for this restored actor activation when every fact above holds, WITHOUT settling: the marker and
+ * the record stay until the actor delivered it and commits (settleEnodevRun), so a delivery its ownership check
+ * refuses keeps both for the next owner (pi-fabric#912 round 3).
+ */
+export const peekEnodevRun = (directory: string, actorId: string, activationId: string): AgentRunResult | undefined => {
+  const run = inspect(directory, actorId);
+  if (!run || run.activationId !== activationId || run.text === undefined) return undefined;
+  return { ...run.record, id: run.id, status: "completed", text: run.text,
+    finishedAt: typeof run.record.finishedAt === "number" ? run.record.finishedAt : Date.now() } as unknown as AgentRunResult;
 };
 
 /** Settles `directory` for this restored actor activation when every fact above holds; undefined keeps the veto. */

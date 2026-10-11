@@ -3431,6 +3431,7 @@ export class ActorManager {
         let runId: string | undefined;
         const previousRunId = actor.lastRunId;
         let runCompleted = false;
+        let enodevRecovered = false; // a saved answer handed back, not a run: nothing to protect from a repeat
         let handoffConsumed = false;
         // A run ended by a stop (agents.stop, a signal) is interrupted, not failing.
         let runStopped = false;
@@ -3555,6 +3556,7 @@ export class ActorManager {
           // Captured before any check that can throw: a completed run is never parked and
           // rerun, whatever happens to ownership afterwards.
           runCompleted = result.status === "completed";
+          enodevRecovered = result.enodevRecovered === true;
           runStopped = result.status === "stopped";
           const cancelled = actor.cancelAbort === abortController;
           if (cancelled) delete actor.cancelAbort;
@@ -3670,6 +3672,10 @@ export class ActorManager {
             continue;
           }
           this.#recordMessage(this.#liveActor(actor), message);
+          // smarty-dev#8935: delivered under a confirmed owner; only now does the recovered run settle.
+          if (enodevRecovered) {
+            try { this.agents.commitEnodevRecovery?.(result.id); } catch { /* the marker stays; retention keeps the veto */ }
+          }
           await this.#publishNotification({
               topic: "fabric.actor.output",
               principal: message.principal,
@@ -3721,7 +3727,8 @@ export class ActorManager {
             // An ownership change cut the run off. An event without a caller is kept for
             // the next owner run instead of lost (smarty-dev#442); one whose run already
             // completed is recorded, not rerun, so its side effects do not repeat.
-            if (runCompleted) this.#drop(actor, [item], message);
+            // A recovered ENODEV answer was never run here: park it, and the next owner recovers it (marker kept).
+            if (runCompleted && !enodevRecovered) this.#drop(actor, [item], message);
             else this.#park(actor, [item], message);
             this.#scheduleRestoreParked();
             continue;
@@ -6013,7 +6020,8 @@ export class ActorManager {
     const files = [own, ...(actor.adoptedFrom ?? []).map(rootId => this.#queueFile(actor.id, rootId, actor.residency))
       .filter(file => file !== own && !this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file)))];
     return files.every(file => {
-      if (!fs.existsSync(file)) return true;
+      // Only ENOENT is absent: an unreadable parent (EACCES, EPERM, EIO) is unknown, never empty (#912 round 3).
+      try { fs.statSync(file); } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
       const saved = this.#readQueue(file) as { format?: unknown; items?: unknown } | undefined;
       return saved !== undefined && saved !== null && saved.format === 1 && Array.isArray(saved.items);
     });

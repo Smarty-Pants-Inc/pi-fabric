@@ -17,7 +17,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { countUnknownEnodevStarts, enodevUnresolvedRuns, settleEnodevRun, settleLostEnodevRun } from "./enodev-recovery.js";
+import { countUnknownEnodevStarts, enodevUnresolvedRuns, peekEnodevRun, settleEnodevRun, settleLostEnodevRun } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -727,6 +727,7 @@ export class AgentManager {
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
   #enodevRuns: string[] | undefined;
+  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   readonly #foregroundPrepared = new Set<string>();
   readonly #pendingAbandonment = new Set<string>();
   readonly #foregroundDelivered = new Set<string>();
@@ -1799,7 +1800,7 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
-    const recovered = this.#recoverEnodevRun(request);
+    const recovered = this.#recoverEnodevRun(request, signal, authorize);
     if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
@@ -2392,18 +2393,33 @@ export class AgentManager {
    * unconfirmed" by the pre-pi-fabric#849 ENODEV scope observation, gets that run's saved answer instead of a rerun.
    * The run root is scanned once per manager; each run settles at most once (settleEnodevRun).
    */
-  #recoverEnodevRun(request: AgentRunRequest): AgentRunResult | undefined {
+  // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
+  // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
+  // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
+  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
     if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (signal?.aborted || (authorize && !authorize())) return undefined;
     this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
     for (const directory of this.#enodevRuns) {
-      const result = settleEnodevRun(directory, request.actorId, request.activationId);
+      const result = peekEnodevRun(directory, request.actorId, request.activationId);
       if (!result) continue;
-      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
-      this.#previousRuns.set(result.id, structuredClone(result));
-      this.#retentionRevision++;
-      return result;
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
+      return { ...result, enodevRecovered: true };
     }
     return undefined;
+  }
+
+  /** The actor delivered a recovered answer: settle its run (terminal record, archive, marker removed last). */
+  commitEnodevRecovery(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    this.#enodevCommits.delete(runId);
+    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (!result) return false;
+    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#previousRuns.set(result.id, structuredClone(result));
+    this.#retentionRevision++;
+    return true;
   }
 
   /**

@@ -533,3 +533,37 @@ Audited at HEAD `66f19a321d907f07367d617fbec539d1e3b0dcd9` on `qs32729`. Scope: 
 - Required HEAD matched exactly; audit commands were read-only and no tracked worktree changes were present (`.pi/` was pre-existing untracked state).
 - `bunx vitest run tests/agent-request-alias.test.ts`: **51 passed** across three configured Vitest projects.
 - Provider integration probe could not load `@earendil-works/pi-coding-agent` in this worktree, so no provider test result is claimed.
+
+## Independent per-row review receipts: main-merge rows (f2814332, merge d316c841)
+
+An independent read-only auditor (Luna xhigh, not the author; lane fv2-864-aud4, 10-11 14:1x-14:33Z) reviewed all 12 rows of the main-merge section at head 99d614bb, test files included. For each row it diffed the merge against main (f2814332) and against the branch (66f19a32), and checked that the row text matches the diff. **Totals: 12 PASS, 0 FAIL, 0 CONCERN.** Tests: the two conflicted test files pass (149 tests), and the focused storage, scratch, verified-removal and root-inbox suites pass (251 tests). Some actor and provider suites could not load in the audit checkout because two dependencies were missing; CI runs them on this head. The named security pass also judged all 12 resolutions safe on 99d614bb (pi-fabric#864 SECURITY_REVIEW, 10-11 14:05Z).
+
+# pi-fabric PR #864 — independent audit receipts
+
+Audited fetched commit `99d614bb4b30ade56af8e261c07848a8cea867c6`; merge under review `d316c841bfc8ed1b3a9216a8727b6e073543a2b0` (parents `66f19a321d907f07367d617fbec539d1e3b0dcd9`, `f2814332418300c13a5181c41c3731417c1318d7`). Both requested parent-relative diffs were run for every row.
+
+| file | verdict PASS/FAIL/CONCERN | risk (one phrase) | evidence (file:line) |
+|---|---|---|---|
+| `docs/agents.md` | PASS | documented stale-command and reload fence drift | `docs/upstream-sync/0.110.1/resolutions.md:365; docs/agents.md:966,968` |
+| `src/actors/manager.ts` | PASS | activation classification or safe relaunch could be lost | `docs/upstream-sync/0.110.1/resolutions.md:366; src/actors/manager.ts:3763,5304,5369` |
+| `src/providers/agents-message-router.ts` | PASS | stale cached epoch could authorize routing | `docs/upstream-sync/0.110.1/resolutions.md:367; src/providers/agents-message-router.ts:612` |
+| `src/providers/agents-provider.ts` | PASS | remote ask/stop could target the wrong activation | `docs/upstream-sync/0.110.1/resolutions.md:368; src/providers/agents-provider.ts:1357,2169` |
+| `src/residency/host.ts` | PASS | resident activation or liveness fence could regress | `docs/upstream-sync/0.110.1/resolutions.md:369; src/residency/host.ts:165,417,1071` |
+| `src/storage/retention.ts` | PASS | live foreign-namespace worker could be deleted | `docs/upstream-sync/0.110.1/resolutions.md:370; src/storage/retention.ts:108,116,505,614` |
+| `src/storage/scratch.ts` | PASS | live scratch owner/child or replaced inode could be swept | `docs/upstream-sync/0.110.1/resolutions.md:371; src/storage/scratch.ts:38,203` |
+| `src/topology/control-plane.ts` | PASS | stale command, ACK, or cancellation could cross activations | `docs/upstream-sync/0.110.1/resolutions.md:372; src/topology/control-plane.ts:1157,1186` |
+| `src/topology/participant-directory.ts` | PASS | source-provided epoch could spoof the owner | `docs/upstream-sync/0.110.1/resolutions.md:373; src/topology/participant-directory.ts:606,1935` |
+| `src/topology/types.ts` | PASS | participant/control epoch contract could diverge | `docs/upstream-sync/0.110.1/resolutions.md:374; src/topology/types.ts:27,30` |
+| `tests/control-plane-incarnation.test.ts` | PASS | main fence or upstream epoch cases could be omitted | `docs/upstream-sync/0.110.1/resolutions.md:375; tests/control-plane-incarnation.test.ts:432,506,619` |
+| `tests/control-plane.test.ts` | PASS | forged-ACK ordering or epoch-bound request coverage could regress | `docs/upstream-sync/0.110.1/resolutions.md:376; tests/control-plane.test.ts:1571,1580` |
+
+## FAIL and CONCERN findings
+
+None. All 12 resolutions preserve the applicable main guarantees and branch behavior; the resolution-table descriptions match the reviewed diffs. Main's per-activation #709 fence is the sole control-plane epoch, #850 `verifiedRemove` remains the deletion gate alongside owner-aware PID-namespace checks, #842 activation classes and #866 `stopReason` relaunch logic coexist in the actor manager, and root-inbox source/session-test paths are unchanged by the merge relative to either parent.
+
+## Validation notes
+
+- `tests/control-plane-incarnation.test.ts` and `tests/control-plane.test.ts`: 2 files, 149 tests passed. Log: `control-plane-tests.log`.
+- Focused verified-removal, storage-retention, scratch, and root-inbox checks: 7 files, 251 tests passed. Log: `storage-inbox-tests.log`.
+- A broader selected run reported 1,600 passing tests, but actor lifecycle/provider/secondary-retention/root-index suites could not load because this checkout lacks `@earendil-works/pi-coding-agent` and `cross-spawn`; these are environment import blockers, not assertion failures. Log: `audit-tests.log`.
+

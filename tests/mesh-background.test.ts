@@ -6,7 +6,7 @@ const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)",
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("background mesh retry boundary", () => {
-  it("backs off only typed timeouts, caps delay, logs holder once and resets after recovery", async () => {
+  it("backs off only typed timeouts, caps delay, logs holder once and resets backoff after recovery", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(Math, "random").mockReturnValue(0.5);
@@ -28,7 +28,7 @@ describe("background mesh retry boundary", () => {
     expect(retry.waitMs).toBe(0);
     expect(await retry.run(operation)).toBe("retry");
     expect(retry.waitMs).toBe(50);
-    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledOnce();
   });
 
   it("randomizes within each ceiling independently and yields even on a zero draw", async () => {

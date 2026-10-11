@@ -302,6 +302,7 @@ const main = async (): Promise<void> => {
   runRecordHelpers = loadedRunRecordHelpers;
   const {
     applyUsage,
+    assistantContextTokens,
     createRunningRecord,
     emptyUsage,
     extractUsageDelta,
@@ -744,6 +745,8 @@ const main = async (): Promise<void> => {
   let producedFinalAnswer = false;
   let finalAnswerReceipt: FinalAnswerReceipt | undefined;
   let lastUsageMessageTimestamp: number | undefined;
+  // smarty-dev#3238: the child's model window, from its own get_state, for an actor's contextUsage.
+  let childContextWindow: number | undefined;
   let finalTurnCompleted = false;
   let attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
   let completedToolInTurn = false;
@@ -1572,6 +1575,10 @@ const main = async (): Promise<void> => {
       } else modelControl.fail("resident readiness does not match the selected run/extension/nonce");
       return;
     }
+    if (event.type === "response" && event.command === "get_state" && event.success === true) {
+      const window = (event.data as { model?: { contextWindow?: unknown } } | null | undefined)?.model?.contextWindow;
+      if (typeof window === "number" && Number.isFinite(window) && window > 0) childContextWindow = window;
+    }
     if (modelControl.observe(event)) return;
     if (contextAdmission?.observe(event)) return;
     if (event.type === "message_start" || event.type === "message_update") {
@@ -1782,6 +1789,10 @@ const main = async (): Promise<void> => {
       const usageDelta = extractUsageDelta(messageRecord);
       lastUsageMessageTimestamp = typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : undefined;
       applyUsage(record, messageRecord);
+      const contextTokens = assistantContextTokens(messageRecord);
+      if (options.actorId && childContextWindow && contextTokens > 0) {
+        record.contextUsage = { tokens: contextTokens, contextWindow: childContextWindow };
+      }
       emitTokenUsage(usageDelta, {
         model: stringField(messageRecord.model),
         provider: stringField(messageRecord.provider),

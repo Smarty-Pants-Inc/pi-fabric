@@ -219,6 +219,8 @@ export interface AgentRunRecord {
   stderr?: string;
   exitCode?: number | null;
   usage: AgentUsage;
+  /** Actor runs: the last assistant turn's context tokens and the child model's window (smarty-dev#3238). */
+  contextUsage?: { tokens: number; contextWindow: number };
   budget?: FabricBudgetSummary;
   /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;

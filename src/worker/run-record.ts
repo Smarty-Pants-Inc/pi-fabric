@@ -185,6 +185,16 @@ export const applyUsage = (
   }
 };
 
+/** Pi's calculateContextTokens: the context one assistant turn occupied (smarty-dev#3238). */
+export const assistantContextTokens = (message: Record<string, unknown>): number => {
+  const usage = message.usage;
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return 0;
+  const values = usage as Record<string, unknown>;
+  const total = numberField(values.totalTokens);
+  return total > 0 ? total
+    : numberField(values.input) + numberField(values.output) + numberField(values.cacheRead) + numberField(values.cacheWrite);
+};
+
 /**
  * Extract the per-message token delta a Pi assistant `message_end` contributed.
  * Unlike `applyUsage`, which mutates the run record, this returns the delta so

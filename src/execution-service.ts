@@ -68,7 +68,6 @@ import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   FabricHostCall,
   FabricKernel,
-  FabricHostCall,
   FabricKernelRuntime,
   FabricResidentOutcomeReceipt,
   FabricSandboxResult,

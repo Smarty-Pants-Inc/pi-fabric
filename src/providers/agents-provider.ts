@@ -88,7 +88,6 @@ import {
 import {
   aliasThinking,
   FUZZY_RESOLUTION_MARKERS,
-  aliasThinking,
   resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
@@ -1513,7 +1512,7 @@ export class AgentsProvider implements FabricProvider {
           return { ...this.globalActors.update(template.id, { model: resolved.model, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
         }
         const target = await this.#resolveActorTarget(id);
-        const runner = target.actor?.runner ?? target.participant!.runner;
+        const runner = target.actor?.runner ?? target.participant!.runner ?? this.manager.config.runner;
         this.manager.assertExplicitModelReason(model, args.modelReason, runner);
         const resident = await this.#residentActorOwner(id);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;

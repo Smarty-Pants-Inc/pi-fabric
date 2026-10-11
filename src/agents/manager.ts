@@ -2128,6 +2128,16 @@ export class AgentManager {
     const record = hosted.record;
     const recovered = options.recovered;
     const managed: ManagedAgent = {
+      // Route classification has no hosted transport; a hosted run classifies like a process task.
+      runRoute: createRunRouteMetadata({
+        runner: record.runner,
+        transport: "process",
+        ...(hosted.context.actorId ? { actorId: hosted.context.actorId } : {}),
+        ...(hosted.context.actorName ? { actorName: hosted.context.actorName } : {}),
+      }),
+      // Hosted runs carry no captured mailbox principal; automatic outputs stay unattributed.
+      outputPrincipal: undefined,
+      onOutputPrincipalDowngrade: undefined,
       id: record.id,
       name: record.name,
       task: record.task,

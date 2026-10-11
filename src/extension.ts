@@ -7,7 +7,7 @@ import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostId
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
-import { claimFabricRegistration, yieldsToExplicitFabric } from "./core/explicit-fabric.js";
+import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -20,11 +20,11 @@ import {
 } from "./ui/code-preview-shell.js";
 import { registerFabricActorHostEventObservers } from "./actors/host-event-observer.js";
 import { CapturedToolCatalog } from "./capture/catalog.js";
-import { isSelectedNativeMcpTool, nativeMcpIdentity } from "./core/native-mcp-identity.js";
+import { isSelectedNativeMcpTool } from "./core/native-mcp-identity.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
-import { setActiveCompiledSurface } from "./entropy/active-state.js";
+import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
   filterPrewalkPlanningDirectives,
@@ -248,7 +248,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
-  if (!options.managedHost && !claimFabricRegistration(FABRIC_EXTENSION_ENTRY_PATH, pi)) return;
   registerFabricPrincipalCapture(pi);
   if (!options.managedHost) registerJevAuth(pi);
   const codePreviewSettings = defaultCodePreviewSettings();
@@ -286,18 +285,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     pi,
     () => state.config,
     state.sessionApprovals,
-    undefined,
-    undefined,
-    (toolName, config) => {
-      const definition = pi.getAllTools().find((tool) => tool.name === toolName);
-      const namespace = definition?.namespace?.name;
-      const selected = namespace?.startsWith("mcp__") && (config.mcp.nativeServers ?? []).includes(namespace.slice(5));
-      if (!selected) return undefined;
-      const registered = capturedTools.registeredTools().find((entry) => entry.definition.name === toolName);
-      const identity = nativeMcpIdentity(registered?.definition);
-      if (!identity) throw new Error(`Unsupported Pi MCP identity metadata for ${toolName}; refusing native dispatch`);
-      return identity;
-    },
   );
   const pendingHandoffs = new Map<string, PendingFabricHandoff>();
   const toolOwnership = new FabricToolOwnership(pi);
@@ -820,7 +807,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // Invalidate cancelled/unreceived leases even if the durable cursor read fails.
     if (options.commitOnly) queuedRootInboxIds.clear();
     if (!state.initialized) return;
-    const inbox = await state.nextRootInbox(inboxHeldBy(context), undefined, options).catch(() => undefined);
+    const inbox = await state.nextRootInbox(await inboxHeldBy(context), undefined, options).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
     if (!inbox) return;
     // Commit-only returns no deliverable events, including for an unheld pending batch.

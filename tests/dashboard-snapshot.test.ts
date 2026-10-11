@@ -272,7 +272,9 @@ describe("dashboard snapshot agent ownership", () => {
     expect(snapshot.agents.filter((agent) => agent.local === false)).toHaveLength(239);
   });
 
-  it("excludes agents owned by another session's lineage", () => {
+  // Fork (smarty-dev#1089, #2004): the dashboard topology keeps every root's agents
+  // and the widget alone narrows to this session; upstream filtered the snapshot.
+  it("keeps agents owned by another session's lineage as foreign-root rows", () => {
     const local = {
       ...record("local-agent"),
       startedAt: 1,
@@ -301,7 +303,10 @@ describe("dashboard snapshot agent ownership", () => {
 
     const snapshot = createDashboardSnapshot(fakeState([], [local], [], [], foreign), []);
 
-    expect(snapshot.agents.map((agent) => agent.id)).toEqual([local.id]);
+    expect(snapshot.agents.map((agent) => agent.id).sort()).toEqual([local.id, "foreign-0", "foreign-1", "foreign-2"].sort());
+    expect(snapshot.agents.filter((agent) => agent.rootId === "session:other")).toHaveLength(3);
+    expect(snapshot.agents.filter((agent) => agent.rootId === undefined || agent.rootId === snapshot.main.id).map((agent) => agent.id))
+      .toEqual([local.id]);
   });
 
   it("does not overlay private local actor state when another host owns it", () => {

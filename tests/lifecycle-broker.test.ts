@@ -265,7 +265,10 @@ describe("LifecycleBroker", () => {
     const reads = vi.spyOn(mesh, "read");
     await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "two" });
     await waitFor(() => reads.mock.calls.length > 0);
-    expect(new Set(gets.mock.calls.map(([id]) => id))).toEqual(new Set([targetIdentity.id]));
+    // One project directory build per drain (upstream ee2b27b8) serves the lookup;
+    // any individual lookup is for this host's target only.
+    expect(lists.mock.calls.length + gets.mock.calls.length).toBeGreaterThan(0);
+    expect(gets.mock.calls.every(([id]) => id === targetIdentity.id)).toBe(true);
     expect((mesh.get("topology/subscriptions/elsewhere")?.value as FabricLifecycleSubscription).afterSequence)
       .toBe(0);
   });
@@ -701,6 +704,10 @@ describe("LifecycleBroker", () => {
     // cycle resolves every target from a single directory build; only an id the
     // projection omits (for example the "main" alias) pays an individual lookup.
     const beforeDrain = get.mock.calls.length;
+    // Fork (smarty-dev#557): caught-up subscriptions skip the directory entirely,
+    // so put them behind the log before the drain is observed.
+    await mesh.publish({ topic: "unrelated", from: sourceIdentity, text: "behind" });
+    target.start();
     await waitFor(() => list.mock.calls.length > 0);
     const duringDrain = get.mock.calls.slice(beforeDrain).map((call) => call[0]);
     expect(duringDrain).not.toContain(targetIdentity.id);

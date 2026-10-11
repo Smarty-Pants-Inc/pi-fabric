@@ -119,18 +119,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   }
   // smarty-dev#8777: release through the directory pinned now (the publication fence's fd-pinned release),
   // never a check-then-rename by name that a reclaimed, stalled holder could run against its successor.
-  const pin = pinFenceLock(lock, record);
-  if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(` (custody lock ${lock} was reclaimed before entry)`, attempts, maxGapMs);
-  // The pinned release closes its fd, so it runs once; main's release below may be called again after a failure.
-  let done = false;
-  return () => {
-    if (pin !== undefined) {
-      if (done) return;
-      done = true;
-      releaseFenceLock(lock, record, {}, pin);
-      return;
-    }
-    // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
+  // Main's release by name. Non-Linux keeps it; the stalled-holder race there is tracked in smarty-dev#9569.
+  const releaseByName = (): void => {
     try {
       if (readOwner() !== record) return;
       // Detach before removal: never recursively delete through the canonical name.
@@ -140,6 +130,29 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     } catch {
       // Already recovered or replaced: never delete a successor.
     }
+  };
+  const pin = pinFenceLock(lock, record);
+  // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
+  // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
+  // /proc/self/fd/<fd>/owner. Still OUR record: we hold the lock we just published (no successor can acquire
+  // while it is there), so release it by name and fail retryably; never hand out an unpinned custody on Linux.
+  // Not ours: reclaimed before entry, so release nothing.
+  if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux")) {
+    let ours = false;
+    try { ours = readOwner() === record; } catch { /* unreadable: not provably ours */ }
+    if (ours) releaseByName();
+    throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs);
+  }
+  // The pinned release closes its fd, so it runs once; main's release may be called again after a failure.
+  let done = false;
+  return () => {
+    if (pin !== undefined) {
+      if (done) return;
+      done = true;
+      releaseFenceLock(lock, record, {}, pin);
+      return;
+    }
+    releaseByName();
   };
 };
 

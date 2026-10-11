@@ -322,8 +322,18 @@ export class MeshLock {
         }
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);
-      // Already reclaimed before we entered: we never held it, so run nothing and release nothing.
-      if (pin === FOREIGN_LOCK) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+      // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
+      // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
+      // /proc/self/fd/<fd>/owner. If `<lock>/owner` is still OUR record we hold the lock we just created (no
+      // successor can acquire while it is there): release it by name (main's release) and fail retryably; never
+      // run the section unpinned on Linux. Not ours: reclaimed before entry, so release nothing.
+      if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux")) {
+        pin = undefined;
+        let ours = false;
+        try { ours = fs.readFileSync(ownerPath, "utf8") === ownerRecord; } catch { /* unreadable: not provably ours */ }
+        if (ours) releaseOwned();
+        throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+      }
       if (lockStats) lockHeldAt = performance.now();
       try {
         this.#writeAbortSignal?.throwIfAborted();

@@ -85,14 +85,13 @@ describe.runIf(process.platform === "linux")("mesh locks release only the direct
 // pi-fabric#889 review: without a pin (non-Linux; here /proc/self/fd made unreadable) the custody release is main's,
 // and like main it can be called again after a transient failure, so a live owner never keeps the lock.
 describe("the unpinned custody release keeps main's retry", () => {
-  it("a release whose rename failed transiently succeeds when it is called again", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  afterEach(() => { Object.defineProperty(process, "platform", platform); });
+  it("a release whose rename failed transiently succeeds when it is called again (non-Linux)", async () => {
     const root = tempRoot();
     const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
-    const read = fs.readFileSync;
-    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
-      if (String(file).startsWith("/proc/self/fd/")) throw Object.assign(new Error("EACCES: no fd traversal"), { code: "EACCES" });
-      return (read as (...args: unknown[]) => unknown)(file, options);
-    }) as typeof fs.readFileSync);
+    // Off Linux there is no pin (pinFenceLock: undefined); a Linux host cannot take this path any more.
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
     const release = await acquireMeshCustodyLock(root, 1_000, { ownIncarnation: undefined });
     const rename = fs.renameSync;
     let failures = 1;
@@ -104,5 +103,50 @@ describe("the unpinned custody release keeps main's retry", () => {
     expect(fs.existsSync(path.join(lock, "owner"))).toBe(true); // the transient failure kept it
     release();
     expect(fs.existsSync(lock)).toBe(false);
+  });
+});
+
+// pi-fabric#889 review (Astra P1): on Linux a pin that fails operationally must not strand our lock (FOREIGN_LOCK
+// from a failed open) nor let the section run unpinned (undefined from an unreadable /proc/self/fd/<fd>/owner).
+describe.runIf(process.platform === "linux")("a failed pin releases the just-created lock and fails retryably", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  const failOpen = (lock: string) => {
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === lock) throw Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+  };
+  const failPinnedRead = () => {
+    const read = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (/^\/proc\/self\/fd\/\d+\/owner$/.test(String(file))) throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+      return (read as (...args: unknown[]) => unknown)(file, options);
+    }) as typeof fs.readFileSync);
+  };
+
+  it.each(["open EMFILE", "read EIO"] as const)("mesh .lock (%s): no section runs, the lock is gone, the next acquire succeeds", async failure => {
+    const root = tempRoot();
+    const lock = path.join(root, ".lock");
+    const mesh = new MeshLock(root, { lockProtocol: 2, lockTimeoutMs: 1_000 }, () => undefined);
+    if (failure === "open EMFILE") failOpen(lock); else failPinnedRead();
+    const operation = vi.fn(async () => "ran");
+    await expect(mesh.withLockAcrossAwait(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(lock)).toBe(false);
+    vi.restoreAllMocks();
+    await expect(mesh.withLockAcrossAwait(async () => "ran")).resolves.toBe("ran");
+  });
+
+  it.each(["open EMFILE", "read EIO"] as const)("custody.lock (%s): the acquire fails, the lock is gone, the next acquire succeeds", async failure => {
+    const root = tempRoot();
+    const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    if (failure === "open EMFILE") failOpen(lock); else failPinnedRead();
+    await expect(acquireMeshCustodyLock(root, 1_000, { ownIncarnation: undefined })).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    expect(fs.existsSync(lock)).toBe(false);
+    vi.restoreAllMocks();
+    const release = await acquireMeshCustodyLock(root, 1_000, { ownIncarnation: undefined });
+    expect(fs.existsSync(path.join(lock, "owner"))).toBe(true);
+    release();
   });
 });

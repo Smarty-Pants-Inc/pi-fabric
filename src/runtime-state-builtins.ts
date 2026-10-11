@@ -17,6 +17,7 @@ import { powerShellToolDefinitionFactory } from "./providers/pi-bash-cwd.js";
 import type { FabricShellJobStore } from "./core/shell-jobs.js";
 import { TasksProvider } from "./providers/tasks-provider.js";
 import { StateProvider } from "./providers/state-provider.js";
+import { createShellCommandPreflight } from "./providers/shell-preflight.js";
 
 import type { FabricManagedHost } from "./managed-host.js";
 
@@ -105,7 +106,7 @@ export class RuntimeStateBuiltins {
     }
   }
 
-  async mesh(config: FabricConfig, mesh: MeshStore, identity: MeshIdentity, participants: ParticipantDirectory): Promise<void> {
+  async mesh(config: FabricConfig, mesh: MeshStore, identity: MeshIdentity, participants: ParticipantDirectory, capturedTools: CapturedToolCatalog): Promise<void> {
     if (this.managedHost) {
       for (const provider of ["mesh", "state"]) {
         if (this.managedHost.has(provider)) await this.install(createProviderComponent({provider, description: "Managed scoped provider", create: () => this.managedHost!.provider(provider)}));
@@ -121,7 +122,8 @@ export class RuntimeStateBuiltins {
         provider: "state",
         description: "Labeled world state over the project mesh",
         requires: ["mesh.get"],
-        create: () => new StateProvider(mesh, identity, () => config.fullCodeMode || config.schema.mode === "enforce"),
+        create: () => new StateProvider(mesh, identity, () => config.fullCodeMode || config.schema.mode === "enforce",
+          { preflight: createShellCommandPreflight(capturedTools) }),
       }));
     } else {
       const meshDisabled =

@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import {
   bundleExtensionRunnerConstructors,
+  HOST_EXTENSION_RUNNER_SYMBOL,
   installRegisteredToolCapture,
   type RegisteredToolCaptureController,
 } from "../src/capture/interceptor.js";
@@ -346,6 +347,32 @@ describe("registered extension tool capture", () => {
     } finally {
       process.argv[1] = savedArgv1;
       await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("captures the runner class a native SDK task entry registers (#8606)", async () => {
+    // Fabric's task entry runs a Pi SDK from another package realm while
+    // process.argv[1] is the entry script, so no lookup finds that SDK. Its
+    // registered ExtensionRunner is the class the guards' runner instantiates.
+    class TaskEntryRunner {
+      extensions: Array<{ tools: Map<string, RegisteredTool> }> = [];
+      getAllRegisteredTools(): RegisteredTool[] {
+        return this.extensions.flatMap((extension) => [...extension.tools.values()]);
+      }
+    }
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value: TaskEntryRunner, configurable: true });
+    try {
+      const fabricTool = tool("fabric_exec");
+      const catalog = new CapturedToolCatalog();
+      controllers.push(await installRegisteredToolCapture({ anchorDefinition: fabricTool, catalog }));
+      const runner = new TaskEntryRunner();
+      runner.extensions = [{ tools: new Map([["fabric_exec", registered(fabricTool, "/extensions/pi-fabric/index.ts")]]) }];
+      expect(catalog.runner).toBeUndefined();
+      runner.getAllRegisteredTools();
+      expect(catalog.runner).toBe(runner);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
     }
   });
 });

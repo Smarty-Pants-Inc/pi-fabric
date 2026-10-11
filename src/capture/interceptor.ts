@@ -35,6 +35,13 @@ export interface RegisteredToolCaptureOptions {
 }
 
 const HUB_SYMBOL = Symbol.for("pi-fabric.registered-tool-capture.v1");
+/**
+ * Set by Fabric's native SDK task entry (src/worker/task-entry.ts) to the
+ * ExtensionRunner class of the SDK it runs. There process.argv[1] is the entry
+ * script, so neither argv lookup below finds the host package and the
+ * in-realm fallback patches Fabric's private peer copy instead (#8606).
+ */
+export const HOST_EXTENSION_RUNNER_SYMBOL = Symbol.for("pi-fabric.host-extension-runner.v1");
 const ANCHOR_SYMBOL = Symbol.for("pi-fabric.registered-tool-anchor.v1");
 
 const definitionDelegatesTo = (
@@ -186,6 +193,8 @@ const entryRealmPackageRoot = (): string | undefined => {
 
 const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
   const constructors = new Set<ExtensionRunnerConstructor>();
+  const registered = (globalThis as Record<PropertyKey, unknown>)[HOST_EXTENSION_RUNNER_SYMBOL];
+  if (isExtensionRunnerConstructor(registered)) constructors.add(registered);
   const packageRoots = new Set(
     [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()].filter(
       (root): root is string => typeof root === "string" && Boolean(root),

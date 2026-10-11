@@ -95,6 +95,12 @@ const MAX_REPLACE_ALL_FILE_CHARS = 2_000_000;
 
 interface PiToolsProviderHostCapabilities {
   requireCapturedOverrides?: boolean;
+  /**
+   * Test-only: let mutating pi.* calls run with no extension runner, so no
+   * tool_call hook (a guard extension) can see them. Production config never
+   * sets it; without it such a call fails closed (smarty-dev#8606).
+   */
+  allowUnhookedTools?: boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
   getShellHangMs?: () => number;
   getLandlockSettings?: (() => LandlockSettings) | undefined;
@@ -165,6 +171,8 @@ const writeTools = new Set<PiCoreToolName>(["edit", "write"]);
 
 // The content array every pi core tool returns: text and/or image blocks.
 type ToolContent = AgentToolResult<unknown>["content"];
+
+const shellQuote = (value: string): string => "'" + value.replaceAll("'", "'\\''") + "'";
 
 const riskForTool = (name: PiCoreToolName): FabricRisk => {
   if (readTools.has(name)) return "read";
@@ -248,6 +256,7 @@ export class PiToolsProvider implements FabricProvider {
   readonly #capturedTools: CapturedToolsProvider | undefined;
   readonly #cwd: string;
   readonly #requireCapturedOverrides: boolean;
+  readonly #allowUnhookedTools: boolean;
   readonly #bashDefinitions = new BashCwdDefinitions();
   readonly #powershellDefinitions: PowerShellCwdDefinitions | undefined;
   readonly #shellJobs: FabricShellJobStore;
@@ -264,6 +273,7 @@ export class PiToolsProvider implements FabricProvider {
   ) {
     this.#cwd = cwd;
     this.#requireCapturedOverrides = hostCapabilities.requireCapturedOverrides === true;
+    this.#allowUnhookedTools = hostCapabilities.allowUnhookedTools === true;
     const powerShellFactory = hostCapabilities.powerShellToolDefinitionFactory;
     this.#powershellDefinitions = powerShellFactory
       ? new PowerShellCwdDefinitions(powerShellFactory)
@@ -626,14 +636,14 @@ export class PiToolsProvider implements FabricProvider {
     // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
     const middleware = this.#bashMiddleware(name);
     const runner = this.#catalog?.runner;
-    // Gap B: a catalog is installed but its runner — and the tool_call
-    // preflight extensions rely on — is not yet available. This is the
-    // transient window before the first tool refresh populates the runner.
-    // Running a mutating tool here would silently skip that preflight, so fail
-    // closed for non-read tools and let the model retry once hooks are live.
-    // The no-catalog path (tests, embeds) has no extension system to guard and
-    // keeps the direct-execute fallback below unchanged.
-    if (this.#catalog && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
+    // smarty-dev#8606: a mutating call needs the tool_call preflight that guard
+    // extensions rely on. With no observed runner (no catalog, or a catalog
+    // whose runner was never captured or is not populated yet) nothing could
+    // refuse it, so fail closed instead of executing unhooked. A captured
+    // override replays the lifecycle on its own runner. Only the test-only
+    // allowUnhookedTools option keeps the direct execute.
+    const capturedOverride = this.#catalog?.get(name) !== undefined && !middleware;
+    if (!runner && !capturedOverride && !this.#allowUnhookedTools && riskForTool(name) !== "read") {
       throw new Error(
         `Pi tool ${name} is unavailable until extension tool hooks initialize; retry once tools are ready`,
       );
@@ -681,9 +691,8 @@ export class PiToolsProvider implements FabricProvider {
       return this.#normalizeResult(name, result, args);
     }
     const tool = this.#definitionFor(name, args);
-    // Without a runner (e.g. before the first tool refresh populated the
-    // catalog) fall back to a direct execute — no extension hooks fire, but
-    // the call still works. Once tools are refreshed the runner is available.
+    // No runner: only read-risk tools, or a test that set allowUnhookedTools,
+    // reach this direct execute; no extension hooks fire here.
     if (!runner) {
       const result = await this.#runExecute(
         name,
@@ -713,16 +722,32 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
+    // smarty-dev#8606: a native bash call runs in the session cwd, and guards
+    // judge its command against ctx.cwd. pi.bash's cwd argument moves execution
+    // elsewhere, so the guard sees the same leading cd a native call would need.
+    const cwd = args[PI_BASH_CWD_KEY];
+    const preface = name === "bash" && typeof cwd === "string" && typeof args.command === "string" && cwd !== this.#cwd
+      ? `cd ${shellQuote(cwd)} && ` : undefined;
+    const input = preface ? { ...args, command: preface + (args.command as string) } : args;
     const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
       type: "tool_call",
       toolName: name,
       toolCallId: context.nestedToolCallId,
-      input: args,
+      input,
     }));
-    context.updateArguments?.(args);
     if (preflight?.block) {
+      context.updateArguments?.(args);
       throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
     }
+    if (preface) {
+      // Carry hook rewrites back, but only through the cd it judged.
+      if (typeof input.command !== "string" || !input.command.startsWith(preface) || input[PI_BASH_CWD_KEY] !== cwd) {
+        throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the cwd it judged; run the command without cwd`);
+      }
+      for (const [key, value] of Object.entries(input)) if (key !== "command") args[key] = value;
+      args.command = input.command.slice(preface.length);
+    }
+    context.updateArguments?.(args);
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so

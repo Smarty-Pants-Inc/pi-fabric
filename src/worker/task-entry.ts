@@ -13,6 +13,11 @@ const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
 const load = (file: string) => import(pathToFileURL(path.join(sdkDirectory, file)).href);
 const sdk = await load("index.js") as typeof import("@earendil-works/pi-coding-agent");
+// Fabric's tool capture must observe this SDK's runner, the one that carries the
+// profile guards' tool_call hooks, not Fabric's own peer copy (smarty-dev#8606).
+// Same key as HOST_EXTENSION_RUNNER_SYMBOL in src/capture/interceptor.ts; kept
+// literal so this entry does not load the capture module.
+Object.defineProperty(globalThis, Symbol.for("pi-fabric.host-extension-runner.v1"), { value: sdk.ExtensionRunner, configurable: true });
 const { parseArgs } = await load("cli/args.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js");
 const { createSessionManager } = await load("main.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/main.js");
 const { resolveProjectTrusted } = await load("core/project-trust.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/core/project-trust.js");

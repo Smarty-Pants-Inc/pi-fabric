@@ -12,6 +12,9 @@ import {
   STATE_TOPIC,
 } from "../src/state/store.js";
 import { StateProvider } from "../src/providers/state-provider.js";
+import { createShellCommandPreflight } from "../src/providers/shell-preflight.js";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
@@ -1241,7 +1244,7 @@ describe("StateStore", () => {
 describe("StateProvider", () => {
   it("dispatches actions through the provider surface", async () => {
     const mesh = createStore();
-    const provider = new StateProvider(mesh, identity);
+    const provider = new StateProvider(mesh, identity, () => true, { allowUnhookedTools: true });
 
     const listed = await provider.list({}, context);
     expect(listed.map((descriptor) => descriptor.name)).toEqual([
@@ -1281,6 +1284,46 @@ describe("StateProvider", () => {
       passed: boolean;
     };
     expect(goalResult.passed).toBe(true);
+  });
+
+  it("runs goal and evidence commands only through the bash tool_call preflight (#8606)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-state-guard-"));
+    const marker = path.join(root, "ran");
+    try {
+      const commandContext = { ...context, cwd: root };
+      const command = `git stash list > '${marker}'`;
+      // No preflight: the model-supplied shell command must not run unhooked.
+      const unhooked = new StateProvider(createStore(), identity);
+      await unhooked.invoke("goal", { check: command }, commandContext);
+      await expect(unhooked.invoke("checkGoal", {}, commandContext)).rejects.toThrow("state.checkGoal is unavailable until extension tool hooks initialize");
+      await unhooked.invoke("transition", { label: "init", to: "drafted", summary: "draft", evidence: [command] }, commandContext);
+      await expect(unhooked.invoke("verify", {}, commandContext)).rejects.toThrow("state.verify is unavailable until extension tool hooks initialize");
+      // A catalog whose runner was never captured fails closed too.
+      const empty = new StateProvider(createStore(), identity, () => true, { preflight: createShellCommandPreflight(new CapturedToolCatalog()) });
+      await empty.invoke("goal", { check: command }, commandContext);
+      await expect(empty.invoke("checkGoal", {}, commandContext)).rejects.toThrow("state.checkGoal is unavailable until extension tool hooks initialize");
+      expect(fs.existsSync(marker)).toBe(false);
+      // With a runner, the guard sees a bash tool_call and its block wins.
+      const calls: Array<{ toolName: string; input: { command: string } }> = [];
+      const runner = { emitToolCall: vi.fn(async (event: { toolName: string; input: { command: string } }) => {
+        calls.push(event);
+        return event.input.command.includes("git stash") ? { block: true, reason: "guard refused git stash" } : undefined;
+      }) };
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([], runner as never, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const guarded = new StateProvider(createStore(), identity, () => true, { preflight: createShellCommandPreflight(catalog) });
+      await guarded.invoke("goal", { check: command }, commandContext);
+      await expect(guarded.invoke("checkGoal", {}, commandContext)).rejects.toThrow("guard refused git stash");
+      await guarded.invoke("transition", { label: "init", to: "drafted", summary: "draft", evidence: [command] }, commandContext);
+      await expect(guarded.invoke("verify", {}, commandContext)).rejects.toThrow("guard refused git stash");
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(calls.map((call) => [call.toolName, call.input.command])).toEqual([["bash", command], ["bash", command]]);
+      // An allowed command runs.
+      await guarded.invoke("goal", { check: "true" }, commandContext);
+      expect(await guarded.invoke("checkGoal", {}, commandContext)).toMatchObject({ passed: true });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects unknown state actions", async () => {

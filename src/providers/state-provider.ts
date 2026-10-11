@@ -6,6 +6,7 @@ import type {
 } from "../protocol.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
 import { StateStore, type StateTransitionKind } from "../state/store.js";
+import type { ShellCommandPreflight } from "./shell-preflight.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 
 const STATE_ENTITY_ID = "fabric-state";
@@ -207,10 +208,31 @@ export class StateProvider implements FabricProvider {
   // Whether `pi` exists inside fabric_exec; selects the recovery hint wording.
   readonly #piTools: () => boolean;
 
-  constructor(store: MeshStore, identity: MeshIdentity, piTools: () => boolean = () => true) {
+  // state.verify/checkGoal run model-supplied shell commands. They pass the
+  // same tool_call preflight as pi.bash, or fail closed (smarty-dev#8606).
+  readonly #shellPreflight: ShellCommandPreflight | undefined;
+  readonly #allowUnhookedTools: boolean;
+
+  constructor(
+    store: MeshStore,
+    identity: MeshIdentity,
+    piTools: () => boolean = () => true,
+    shell: { preflight?: ShellCommandPreflight; /** Test-only, like PiToolsProvider's. */ allowUnhookedTools?: boolean } = {},
+  ) {
     this.#store = new StateStore(store);
     this.#identity = identity;
     this.#piTools = piTools;
+    this.#shellPreflight = shell.preflight;
+    this.#allowUnhookedTools = shell.allowUnhookedTools === true;
+  }
+
+  #prepareCommand(action: string, context: FabricInvocationContext): ((command: string, index: number) => Promise<string>) | undefined {
+    if (this.#shellPreflight) {
+      const preflight = this.#shellPreflight;
+      return (command, index) => preflight(command, context, `state.${action}`, index);
+    }
+    if (this.#allowUnhookedTools) return undefined;
+    throw new Error(`state.${action} is unavailable until extension tool hooks initialize; retry once tools are ready`);
   }
 
   get state(): StateStore {
@@ -332,6 +354,7 @@ export class StateProvider implements FabricProvider {
           : undefined;
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
         const includeArchived = args.includeArchived === true;
+        const prepareCommand = this.#prepareCommand("verify", context);
         context.activity?.({
           type: "entity",
           id: STATE_ENTITY_ID,
@@ -339,6 +362,7 @@ export class StateProvider implements FabricProvider {
           name: "verify",
         });
         const result = await this.#store.verify({
+          ...(prepareCommand ? { prepareCommand } : {}),
           ...(labels ? { labels } : {}),
           includeArchived,
           cwd: context.cwd,
@@ -372,7 +396,9 @@ export class StateProvider implements FabricProvider {
       }
       case "checkGoal": {
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
+        const prepareCommand = this.#prepareCommand("checkGoal", context);
         const result = await this.#store.checkGoal({
+          ...(prepareCommand ? { prepareCommand } : {}),
           cwd: context.cwd,
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(context.signal ? { signal: context.signal } : {}),

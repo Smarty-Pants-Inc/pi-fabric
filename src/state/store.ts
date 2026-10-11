@@ -1172,6 +1172,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for the shell command; may rewrite it or throw a refusal (#8606). */
+    prepareCommand?: (command: string, index: number) => Promise<string>;
   }): Promise<{
     passed: boolean;
     output: string;
@@ -1181,7 +1183,8 @@ export class StateStore {
     const entry = this.store.get(GOAL_KEY);
     if (!entry) throw new Error("No goal set");
     const goal = entry.value as StateGoal;
-    const result = await runCommand(goal.check, {
+    const command = input.prepareCommand ? await input.prepareCommand(goal.check, 0) : goal.check;
+    const result = await runCommand(command, {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs ?? 30_000,
       ...(input.signal ? { signal: input.signal } : {}),
@@ -1294,6 +1297,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for each evidence command; may rewrite it or throw a refusal (#8606). */
+    prepareCommand?: (command: string, index: number) => Promise<string>;
   }): Promise<VerificationReport> {
     const verificationHead = this.getHead();
     const boundedHeadLabel = verificationHead
@@ -1371,6 +1376,7 @@ export class StateStore {
       });
     }
 
+    let commandIndex = 0;
     for (const target of targets) {
       const evidence = target.evidence ?? [];
       if (evidence.length === 0) {
@@ -1392,7 +1398,7 @@ export class StateStore {
               outputDigest: digest(""),
               error: "aborted before execution",
             }
-          : await runCommand(command, {
+          : await runCommand(input.prepareCommand ? await input.prepareCommand(command, commandIndex++) : command, {
               cwd: input.cwd,
               timeoutMs: input.timeoutMs ?? 30_000,
               ...(input.signal ? { signal: input.signal } : {}),

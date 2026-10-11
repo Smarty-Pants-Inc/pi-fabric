@@ -863,7 +863,7 @@ export class FabricRuntimeState {
       readMirroredOwner: (ownerHostId, ownerIdentityId, targetId) =>
         this.#participants?.mirroredControlOwner(ownerHostId, ownerIdentityId, targetId),
     });
-    await builtins.mesh(this.#config, this.#mesh, identity, this.#participants);
+    await builtins.mesh(this.#config, this.#mesh, identity, this.#participants, this.capturedTools);
     this.#schema = new SchemaController(
       context.cwd,
       this.#config.schema,

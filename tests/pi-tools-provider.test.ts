@@ -17,6 +17,7 @@ import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.
 import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registry.js";
 import { NESTED_TOOL_CALL_ID_PREFIX } from "../src/core/action-registry.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 const baseContext = {
   cwd: process.cwd(),
@@ -180,7 +181,7 @@ describe("PiToolsProvider lifecycle", () => {
   });
 
   it("forwards bounded partial previews without an extension runner", async () => {
-    const provider = new PiToolsProvider(process.cwd(), undefined, undefined);
+    const provider = new PiToolsProvider(process.cwd(), undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true });
     const previews: Array<{ result?: unknown }> = [];
     const updates: string[] = [];
 
@@ -200,7 +201,7 @@ describe("PiToolsProvider lifecycle", () => {
 
   it("falls back to a direct execute (no events) when no runner is bound", async () => {
     const registry = new ActionRegistry();
-    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined));
+    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
     const result = await registry.invoke("pi.ls", { path: process.cwd() }, baseContext);
     expect(typeof result).toBe("string");
     expect((result as string).length).toBeGreaterThan(0);
@@ -214,7 +215,7 @@ describe("PiToolsProvider lifecycle", () => {
     fs.mkdirSync(nested);
     try {
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(root, undefined, undefined));
+      registry.register(new PiToolsProvider(root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const result = await registry.invoke(
         "pi.bash",
         {
@@ -253,7 +254,7 @@ describe("PiToolsProvider lifecycle", () => {
   });
 
   it("registers PowerShell with shell schema and execution risk", async () => {
-    const provider = new PiToolsProvider(process.cwd(), undefined, undefined);
+    const provider = new PiToolsProvider(process.cwd(), undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true });
     const descriptor = await provider.describe("powershell", baseContext);
 
     expect(descriptor).toMatchObject({
@@ -279,7 +280,7 @@ describe("PiToolsProvider lifecycle", () => {
       fs.writeFileSync(skillPath, source);
       fs.writeFileSync(referencePath, source);
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const context = {
         ...baseContext,
         cwd,
@@ -299,7 +300,7 @@ describe("PiToolsProvider lifecycle", () => {
 
   it("returns truncated Bash output once while preserving recovery metadata", async () => {
     const registry = new ActionRegistry();
-    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined));
+    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
     const result = await registry.invoke(
       "pi.bash",
       {
@@ -340,7 +341,7 @@ describe("PiToolsProvider lifecycle", () => {
     try {
       fs.writeFileSync(filePath, "header\nneedle one\nneedle two\n");
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const result = await registry.invoke(
         "pi.edit",
         {
@@ -372,7 +373,7 @@ describe("PiToolsProvider lifecycle", () => {
     try {
       fs.writeFileSync(filePath, before);
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       await expect(registry.invoke(
         "pi.edit",
         {
@@ -405,7 +406,7 @@ describe("PiToolsProvider lifecycle", () => {
     try {
       fs.writeFileSync(path.join(cwd, "example.ts"), before);
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const audits: FabricCallAudit[] = [];
       const result = await registry.invoke(
         "pi.write",
@@ -700,6 +701,98 @@ describe("tool_call preflight coverage for nested bash", () => {
       expect(fs.realpathSync.native(result.output.trim())).toBe(fs.realpathSync.native(nested));
     } finally {
       await registry.close();
+    }
+  });
+});
+
+describe("pi.* without an extension runner (smarty-dev#8606)", () => {
+  it("fails closed for mutating calls unless the test-only allowUnhookedTools option is set", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-unhooked-"));
+    const marker = path.join(root, "executed");
+    const note = path.join(root, "note.txt");
+    fs.writeFileSync(note, "readable");
+    const context = { ...baseContext, cwd: root };
+    try {
+      // No catalog, and a catalog whose runner was never captured, both leave
+      // nothing that could see a tool_call: neither may run a mutation.
+      for (const catalog of [undefined, new CapturedToolCatalog()]) {
+        const provider = new PiToolsProvider(root, catalog, undefined);
+        await expect(provider.invoke("bash", { command: `git stash list > '${marker}'` }, context))
+          .rejects.toThrow("Pi tool bash is unavailable until extension tool hooks initialize");
+        await expect(provider.invoke("write", { path: marker, content: "x" }, context))
+          .rejects.toThrow("Pi tool write is unavailable until extension tool hooks initialize");
+        await expect(provider.invoke("edit", { path: note, edits: [{ oldText: "readable", newText: "edited" }] }, context))
+          .rejects.toThrow("Pi tool edit is unavailable until extension tool hooks initialize");
+        expect(fs.existsSync(marker)).toBe(false);
+        expect(fs.readFileSync(note, "utf8")).toBe("readable");
+        // Read-risk tools stay available without hooks.
+        expect(JSON.stringify(await provider.invoke("read", { path: note }, context))).toContain("readable");
+      }
+      const unhooked = new PiToolsProvider(root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true });
+      await unhooked.invoke("bash", { command: `printf ran > '${marker}'` }, context);
+      expect(fs.readFileSync(marker, "utf8")).toBe("ran");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows guards a pi.bash cwd as the leading cd a native call needs", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cwd-preflight-")));
+    const nested = path.join(root, "it's nested");
+    fs.mkdirSync(nested);
+    const prefix = `cd '${nested.replaceAll("'", "'\\''")}' && `;
+    try {
+      const seen: string[] = [];
+      const run = async (hook: (input: { command: string; cwd?: string }) => unknown) => {
+        const runner = makeRunner({ emitToolCall: vi.fn(async (event: { input: { command: string; cwd?: string } }) => {
+          seen.push(event.input.command);
+          return hook(event.input);
+        }) });
+        const catalog = new CapturedToolCatalog();
+        catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+        const registry = new ActionRegistry();
+        registry.register(new PiToolsProvider(root, catalog, undefined));
+        try {
+          return await registry.invoke("pi.bash", { command: "pwd", cwd: nested }, { ...baseContext, cwd: root, audits: [] }) as { output: string };
+        } finally { await registry.close(); }
+      };
+      // The guard judges the cd target; execution still runs the original command in cwd.
+      const plain = await run(() => undefined);
+      expect(seen.at(-1)).toBe(`${prefix}pwd`);
+      expect(plain.output.trim()).toBe(nested);
+      await expect(run((input) => input.command.startsWith(prefix) ? { block: true, reason: "guard judged the cd" } : undefined))
+        .rejects.toThrow("guard judged the cd");
+      // A rewrite inside the judged cd is carried to execution.
+      const rewritten = await run((input) => { input.command = `${input.command} && printf rewritten`; });
+      expect(rewritten.output).toContain("rewritten");
+      // A hook that drops the cd it judged cannot redirect execution.
+      await expect(run((input) => { input.command = "pwd"; })).rejects.toThrow("a tool_call hook rewrote the cwd it judged");
+      // The session cwd needs no preface.
+      seen.length = 0;
+      const runner = makeRunner({ emitToolCall: vi.fn(async (event: { input: { command: string } }) => { seen.push(event.input.command); return undefined; }) });
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      await new PiToolsProvider(root, catalog, undefined).invoke("bash", { command: "pwd" }, { ...baseContext, cwd: root });
+      expect(seen).toEqual(["pwd"]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the tool_call preflight once a runner exists and obeys its block", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-hooked-"));
+    const marker = path.join(root, "executed");
+    try {
+      const runner = makeRunner({ emitToolCall: vi.fn(async () => ({ block: true, reason: "guard refused git stash" })) });
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const provider = new PiToolsProvider(root, catalog, undefined);
+      await expect(provider.invoke("bash", { command: `git stash list > '${marker}'` }, { ...baseContext, cwd: root }))
+        .rejects.toThrow("guard refused git stash");
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(runner.emitToolCall).toHaveBeenCalledWith(expect.objectContaining({ toolName: "bash" }));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

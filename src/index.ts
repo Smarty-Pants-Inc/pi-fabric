@@ -431,6 +431,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.ensure(context);
       await state.reportMainProviderError(message);
     },
+    ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery(),
   });
   pi.on("input", (event) => {
     if ((event as { source?: string }).source !== "extension") escapeLatched = false;

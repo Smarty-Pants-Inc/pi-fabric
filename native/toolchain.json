@@ -18,7 +18,7 @@
   },
   "expected": {
     "windows": {
-      "fabric-win-remove.exe": "af4910b0b14ea2f916a73d619913e1a8e9a88abb116ecf99173e1d94a89d0613"
+      "fabric-win-remove.exe": "f4651be3eb25fb05a10ddb8fa16a0571fd5f84e7476fdd6eba59ac64a56e8fbe"
     },
     "x86_64": {
       "fabric-landlock": "feb223824e44d02fcc4735d85ae0a91f2a29394197007c11b893c8b8ea02772a",

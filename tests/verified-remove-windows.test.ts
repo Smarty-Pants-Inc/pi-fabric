@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -65,6 +65,39 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     expect(fs.readFileSync(path.join(`${nested}.real`, "events.jsonl"), "utf8")).toBe("{}\n");
     expect(fs.existsSync(tree)).toBe(true);
   });
+
+  // pi-fabric#913 round 2 (Astra P1): after the helper validated the tree, neither an entry nor an ancestor of the
+  // target can be moved before the deletes: all are held without FILE_SHARE_DELETE. A move tried in that window fails,
+  // and the delete happens exactly where the tree was judged.
+  it("holds the tree and its ancestors against a rename between validation and the deletes", async () => {
+    const parent = tempDir();
+    const tree = path.join(parent, "run");
+    fs.mkdirSync(path.join(tree, "nested"), { recursive: true });
+    fs.writeFileSync(path.join(tree, "nested", "events.jsonl"), "{}\n");
+    const entry = (file: string) => { const stat = fs.lstatSync(file, { bigint: true });
+      return [stat.isDirectory() ? "d" : "f", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)]; };
+    const args = [path.join(tree, "nested", "events.jsonl"), path.join(tree, "nested"), tree].flatMap(entry);
+    const pause = tempDir();
+    const child = spawn(windowsRemoveHelper()!, args, { env: { ...process.env, FABRIC_WIN_REMOVE_TEST_PAUSE: pause }, windowsHide: true });
+    let stdout = "";
+    child.stdout!.on("data", (data: Buffer) => { stdout += String(data); });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const started = Date.now();
+    while (!fs.existsSync(path.join(pause, "paused"))) {
+      if (Date.now() - started > 20_000) throw new Error(`the helper never paused: ${stdout}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const elsewhere = path.join(tempDir(), "moved");
+    expect(() => fs.renameSync(path.join(tree, "nested"), elsewhere)).toThrow();   // an entry
+    expect(() => fs.renameSync(tree, elsewhere)).toThrow();                         // the target
+    expect(() => fs.renameSync(parent, `${parent}.moved`)).toThrow();               // an ancestor
+    fs.writeFileSync(path.join(pause, "go"), "");
+    expect(await exited, stdout).toBe(0);
+    expect(stdout.trim()).toBe("ok 3 removed");
+    expect(fs.existsSync(tree)).toBe(false);
+    expect(fs.existsSync(elsewhere)).toBe(false);
+    expect(fs.existsSync(parent)).toBe(true);
+  }, 60_000);
 
   // pi-fabric#913 (Astra P1): a record we own whose DACL lets another SID write it is not private.
   it("accepts our private record and refuses one that another SID may write", () => {

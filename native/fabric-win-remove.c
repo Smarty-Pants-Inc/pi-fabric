@@ -8,8 +8,11 @@
  * its default owner, the SID it stamps on what it creates), and (pi-fabric#913 P1) bound to the judged tree: its
  * final path (GetFinalPathNameByHandle, every reparse point in it resolved) must be the target's final path plus
  * its own relative name, so an ancestor swapped for a junction after the walk is refused, never followed.
- * Then each is deleted BY HANDLE (FileDispositionInfoEx with POSIX semantics, else FileDispositionInfo), so a
- * name swapped after the check is never touched. One stdout line: "ok N", or "refused I REASON" for entry I
+ * Every entry, and every ancestor of the target up to the volume root, is held WITHOUT FILE_SHARE_DELETE from
+ * before the checks until exit (pi-fabric#913 round 2), so nothing in or above the tree can be renamed between
+ * validation and the deletes. Then each is deleted BY HANDLE (FileDispositionInfoEx with POSIX semantics, else
+ * FileDispositionInfo), so a name swapped after the check is never touched. An ancestor or entry already open by
+ * someone with delete access cannot be held: the removal is refused (fail closed). One stdout line: "ok N", or "refused I REASON" for entry I
  * (nothing deleted), or "failed I REASON" during deletion. Exit: 0 ok, 3 refused, 2 failed or usage.
  *
  * fabric-win-remove --private VOLUME INDEX PATH (pi-fabric#913 P1): a private record (a retention approval or the
@@ -65,7 +68,8 @@ static HANDLE openJudged(const wchar_t *path, DWORD access, int directory, const
     int okVolume, okIndex;
     unsigned long long volume = hex(volumeText, &okVolume), index = hex(indexText, &okIndex);
     if (!okVolume || !okIndex) { *why = "usage"; return NULL; }
-    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+    /* No FILE_SHARE_DELETE (pi-fabric#913 round 2): while we hold it, nobody can rename or delete it. */
+    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (handle == INVALID_HANDLE_VALUE) { *why = "open failed"; return NULL; }
     BY_HANDLE_FILE_INFORMATION info;
@@ -102,6 +106,45 @@ static const char *privateDacl(HANDLE handle) {
     return why;
 }
 
+/* pi-fabric#913 round 2: every ancestor of the target, up to the volume root, held open WITHOUT FILE_SHARE_DELETE
+ * (and checked: a real directory, not a reparse point) until exit, so no ancestor can be renamed or replaced
+ * between validation and the deletes: the judged tree stays where it was judged. With every entry held the same
+ * way, nothing in the tree can move either. */
+static const char *holdAncestors(const wchar_t *target) {
+    static wchar_t path[32768];
+    size_t length = wcslen(target);
+    if (length >= 32768) return "path too long";
+    wcscpy(path, target);
+    for (;;) {
+        wchar_t *cut = wcsrchr(path, L'\\');
+        if (!cut) return NULL;
+        int root = cut > path && cut[-1] == L':';
+        if (root) cut[1] = 0; else *cut = 0; /* "\\?\C:\" for the volume root */
+        if (!*path || wcscmp(path, L"\\\\?") == 0) return NULL;
+        HANDLE handle = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (handle == INVALID_HANDLE_VALUE) return "an ancestor could not be held (in use with delete access, or gone)";
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(handle, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return "an ancestor is not a real directory (a reparse point)";
+        /* Held until the process exits. */
+        if (root) return NULL;
+    }
+}
+
+/* Tests only (FABRIC_WIN_REMOVE_TEST_PAUSE=DIR, inert unless set): after validation, create DIR\paused and wait
+ * (at most 30 s) for DIR\go, so a test can try to move an entry or ancestor in exactly that window. */
+static void testPause(void) {
+    static wchar_t dir[4096], file[4200];
+    DWORD got = GetEnvironmentVariableW(L"FABRIC_WIN_REMOVE_TEST_PAUSE", dir, 4096);
+    if (got == 0 || got >= 4096) return;
+    swprintf(file, 4200, L"%ls\\paused", dir);
+    HANDLE marker = CreateFileW(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (marker != INVALID_HANDLE_VALUE) CloseHandle(marker);
+    swprintf(file, 4200, L"%ls\\go", dir);
+    for (int tries = 0; tries < 6000 && GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES; tries++) Sleep(5);
+}
+
 int wmain(int argc, wchar_t **argv) {
     BYTE userBuffer[256], ownerBuffer[256];
     user = tokenSid(TokenUser, userBuffer, sizeof(userBuffer));
@@ -119,6 +162,7 @@ int wmain(int argc, wchar_t **argv) {
     if (argc > 1 && wcscmp(argv[1], L"--dry-run") == 0) { dry = 1; first = 2; }
     int count = (argc - first) / 4;
     if (count < 1 || count > MAX_ENTRIES || (argc - first) % 4 != 0) { printf("failed -1 usage\n"); return 2; }
+    if ((why = holdAncestors(argv[first + 4 * (count - 1) + 3]))) return fail("refused", count - 1, why, 3);
     for (int i = 0; i < count; i++) {
         wchar_t **arg = argv + first + 4 * i;
         int directory = wcscmp(arg[0], L"d") == 0;
@@ -144,6 +188,7 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
     if (dry) return fail("ok", count, "verified", 0);
+    testPause();
     for (int i = 0; i < count; i++) {
         FILE_DISPOSITION_INFO_EX extended = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
         FILE_DISPOSITION_INFO plain = { TRUE };

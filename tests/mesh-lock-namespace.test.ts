@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeshLockForeignHolderError, readPhysicalMachineId } from "../src/core/atomic-write.js";
 import {
-  createPidNamespaceReader, ownPidNamespace, pidNamespaceTestHooks, pidNamespaceVerdict, validPidNamespace,
+  createPidNamespaceReader, localFilesystemTestHooks, onLocalFilesystem, ownPidNamespace, pidNamespaceTestHooks, pidNamespaceVerdict,
+  validPidNamespace,
 } from "../src/core/pid-namespace.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
@@ -15,9 +16,13 @@ import { MeshLock } from "../src/mesh/mesh-lock.js";
 // evidence (ESRCH, another incarnation) only for a holder of its own namespace. A container or VM sharing the mesh
 // root sees ESRCH for a LIVE foreign holder; reclaiming it would let two writers into the section.
 const roots: string[] = [];
+// The roots of these tests are host-local (ext4) on every CI OS, so the namespace logic runs the same on macOS and
+// Windows runners, whose real rule fails closed (pi-fabric#923 round 3); the local-filesystem tests override this.
+beforeEach(() => { localFilesystemTestHooks.set(0xEF53); });
 afterEach(() => {
   vi.restoreAllMocks();
   pidNamespaceTestHooks.reset();
+  localFilesystemTestHooks.reset();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const tempRoot = (): string => {
@@ -188,6 +193,33 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     } finally { clone.kill(); }
   });
 
+  it.each([
+    ["nfs", 0x6969], ["cifs/smb", 0xFF534D42], ["9p (WSL, VM shares)", 0x01021997], ["virtiofs", 0x6A656A63], ["fuse", 0x65735546],
+    ["ceph", 0x00C36400], ["gfs2", 0x01161970], ["ocfs2", 0x7461636F], ["unreadable", undefined],
+  ] as const)("pi-fabric#923 round 3: a dead holder of OUR namespace on a %s root is NOT reclaimed (a VM clone with our identity can share it)", async (_name, type) => {
+    const own = ns();
+    pidNamespaceTestHooks.set(own);
+    localFilesystemTestHooks.set(type);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const root = tempRoot();
+    const record = meshRecord(deadPid(), own);
+    plant(path.join(root, ".lock"), record);
+    await expect(contend(root)).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+    const { recoverMeshLock, MeshLockRecoverRefusedError } = await import("../src/mesh/lock-recover.js");
+    await expect(recoverMeshLock(root, { lock: "mesh", holder: record.split("\n")[0]!, alive: () => false })).rejects.toBeInstanceOf(MeshLockRecoverRefusedError);
+    expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
+  });
+
+  it("pi-fabric#923 round 3: the local-filesystem allowlist, and the real rule on this host", () => {
+    localFilesystemTestHooks.reset();
+    // This test host's TMPDIR: ext4 on the fleet's Linux hosts (local), so pid evidence is allowed there; never off Linux.
+    if (process.platform !== "linux") expect(onLocalFilesystem(os.tmpdir())).toBe(false);
+    for (const local of [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0x794C7630, 0xF2F52010]) {
+      localFilesystemTestHooks.set(local);
+      expect(onLocalFilesystem("/any")).toBe(true);
+    }
+  });
+
   it("pi-fabric#923 round 2: the printed recovery command shell-quotes the root and the token from disk", () => {
     const refused = new MeshLockForeignHolderError(" (x)", 1, 0, "unproven", "", "/srv/it's here/.lock", "tok'$(touch pwned)");
     expect(refused.recovery).toBe("fabric-mesh-backend lock-recover --root '/srv/it'\\''s here' --lock mesh --holder 'tok'\\''$(touch pwned)'");
@@ -350,6 +382,12 @@ describe("fabric-mesh-backend lock-recover (smarty-dev#9569 D2): safe form, labe
     const linked = await recover(audit => fs.symlinkSync("/dev/null", audit));
     expect(linked.result).toBeInstanceOf(MeshLockRecoverRefusedError);
     expect(linked.held).toBe(true); // refused BEFORE the rename
+    // Round 3: a FIFO planted at the audit path never blocks the open (O_NONBLOCK), and is refused.
+    if (process.platform !== "win32") {
+      const fifo = await recover(audit => { childProcess.execFileSync("mkfifo", ["-m", "600", audit]); });
+      expect(fifo.result).toBeInstanceOf(MeshLockRecoverRefusedError);
+      expect(fifo.held).toBe(true);
+    }
     const open = await recover(audit => { fs.writeFileSync(audit, ""); fs.chmodSync(audit, 0o666); });
     expect((open.result as Error).message).toMatch(/not a private regular file \(mode 666/);
     expect(open.held).toBe(true);

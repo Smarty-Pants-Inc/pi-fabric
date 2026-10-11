@@ -216,7 +216,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       const namespaces = await import("../core/pid-namespace.js");
       // Under protocol 3 a record without a namespace is UNPROVEN too: recovered only by the operator.
       const verdict = recordNamespace === null ? "unproven"
-        : namespaces.pidNamespaceVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false));
+        : namespaces.reclaimVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false), path.dirname(lock));
       if (verdict !== "pid") {
         note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
         return false;

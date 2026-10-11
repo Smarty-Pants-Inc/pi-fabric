@@ -40,8 +40,9 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
                   Both write under the migration fence (custody.lock, then .lock).
   lock-recover    (smarty-dev#9569) recover a .lock or custody.lock that automatic recovery refuses: a holder of
                   another PID namespace (container, VM, other host) or an unprovable one. It acts only on the
-                  named --holder token, only when that holder is provably dead here (our namespace and ESRCH, or an
-                  earlier boot of this machine). Run it inside the holder's namespace when you can.
+                  named --holder token, only when that holder is provably dead here: our own PID namespace, its pid
+                  gone (ESRCH), and the mesh root on a host-local filesystem (Linux; never on macOS or Windows). No
+                  earlier-boot inference. Run it inside the holder's namespace when you can.
                   --unsafe-holder-stopped recovers on YOUR word that the holder is stopped; if it still runs, its
                   release can remove its successor's lock and two writers can run.
 

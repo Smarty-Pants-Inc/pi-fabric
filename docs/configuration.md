@@ -742,6 +742,14 @@ Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on it
   holder of ITS OWN namespace.
 - **No earlier-boot inference:** another boot id with the same machine id is NOT taken as proof of death (two running
   VM clones look exactly like that), so it is unproven (pi-fabric#923).
+- **Precondition: a mesh root lives on ONE host's local filesystem** (pi-fabric#923 round 3). A live VM snapshot clone
+  can reproduce the whole namespace id, but two clones can share a root only over shared storage. So pid evidence is
+  used only when the root is on a known local filesystem:
+  - **Linux:** `statfs` type ext2/3/4, xfs, btrfs, tmpfs, zfs, overlay or f2fs.
+  - **Anything else is unproven:** nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, an unknown type.
+  - **macOS fails closed:** Node exposes only `statfs`'s numeric `f_type`, which macOS does not keep stable. A crashed
+    holder there needs `--unsafe-holder-stopped`.
+  - **Windows fails closed** (below).
 - **Never reclaimed automatically:** a holder of another namespace, or one whose namespace is unknown or malformed
   (`FABRIC_MESH_LOCK_FOREIGN_HOLDER` / `FABRIC_MESH_LOCK_UNPROVEN_HOLDER`, still a `MeshLockTimeoutError`).
   - **Under protocol 3, a record without a namespace (a holder from before protocol 3) is UNPROVEN too**

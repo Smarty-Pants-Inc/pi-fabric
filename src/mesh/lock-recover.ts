@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ownPidNamespace, pidNamespaceVerdict, type PidNamespaceVerdict } from "../core/pid-namespace.js";
+import { ownPidNamespace, reclaimVerdict, type PidNamespaceVerdict } from "../core/pid-namespace.js";
 import { MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 
 export class MeshLockRecoverRefusedError extends Error {
@@ -49,7 +49,10 @@ const appendAudit = (file: string, line: string, maxBytes: number): void => {
     const noFollow = fs.constants.O_NOFOLLOW;
     // Without O_NOFOLLOW (Windows), refuse a symlink seen by lstat right before the open.
     if (noFollow === undefined && fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("a symbolic link");
-    return fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (noFollow ?? 0) | extra, 0o600);
+    // O_NONBLOCK: a FIFO planted at the audit path must not block the open (with no reader it fails with ENXIO);
+    // the fstat below then refuses anything that is not a regular file.
+    return fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (noFollow ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0) | extra, 0o600);
   };
   try {
     let fd = open(0);
@@ -137,7 +140,7 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
   // form recovers only a holder of OUR namespace whose pid is gone; everything else is the audited unsafe override.
-  const verdict: PidNamespaceVerdict = namespace === null ? "unproven" : pidNamespaceVerdict(namespace, await ownPidNamespace());
+  const verdict: PidNamespaceVerdict = namespace === null ? "unproven" : reclaimVerdict(namespace, await ownPidNamespace(), root);
   const provenDead = verdict === "pid" && !(options.alive ?? alive)(pid);
   if (!provenDead && options.unsafeHolderStopped !== true) {
     throw new MeshLockRecoverRefusedError(verdict === "pid"

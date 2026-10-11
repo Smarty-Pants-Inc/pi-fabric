@@ -139,5 +139,40 @@ export const pidNamespaceVerdict = (recordNs: string | null, ownNs: string | und
   return "foreign";
 };
 
+/**
+ * Linux filesystems that live on ONE host (pi-fabric#923 round 3, fabric-store decision). A live VM snapshot clone can
+ * reproduce the whole (machine, boot, namespace) identity, but two clones can share a mesh root only on SHARED storage.
+ * So pid evidence is allowed only when the root is on one of these local types: ext2/3/4, xfs, btrfs, tmpfs, zfs,
+ * overlay, f2fs. Anything else (nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, unknown) is unproven.
+ */
+const LOCAL_LINUX_FILESYSTEMS = new Set([0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0x794C7630, 0xF2F52010]);
+let filesystemTypeOverride: { type: number | undefined } | undefined;
+/** Test seam: pretend the root's `statfs` type is `type` (undefined: unreadable); `reset` restores the real one. */
+export const localFilesystemTestHooks = {
+  set: (type: number | undefined): void => { filesystemTypeOverride = { type }; },
+  reset: (): void => { filesystemTypeOverride = undefined; },
+};
+/**
+ * Is this mesh root on a known host-local filesystem? Linux: `statfs` type in the allowlist. macOS: false (fail closed):
+ * Node exposes only `statfs`'s numeric `f_type`, which macOS assigns at filesystem registration and does not keep stable,
+ * and not `f_fstypename`. Windows: false (its namespace never proves a holder dead anyway).
+ */
+export const onLocalFilesystem = (root: string): boolean => {
+  if (filesystemTypeOverride) return filesystemTypeOverride.type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(filesystemTypeOverride.type);
+  if (process.platform !== "linux") return false;
+  let type: number | undefined;
+  try { type = Number(fs.statfsSync(root).type); } catch { type = undefined; }
+  return type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(type);
+};
+
+/**
+ * The reclaim verdict for a lock under `root`: `pidNamespaceVerdict`, and a "pid" verdict only when the root is on a
+ * host-local filesystem (a clone with the same identity can only share the root over shared storage).
+ */
+export const reclaimVerdict = (recordNs: string | null, ownNs: string | undefined, root: string): PidNamespaceVerdict => {
+  const verdict = pidNamespaceVerdict(recordNs, ownNs);
+  return verdict === "pid" && recordNs !== null && !onLocalFilesystem(root) ? "unproven" : verdict;
+};
+
 /** The lock code's lazy handle on this module (a stable lazy entry point, scripts/build.mjs). */
 export type PidNamespaceModule = typeof import("./pid-namespace.js");

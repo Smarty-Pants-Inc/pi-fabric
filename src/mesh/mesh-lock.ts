@@ -431,7 +431,8 @@ export class MeshLock {
       if (recordNamespace !== null) {
         const namespaces = await import("../core/pid-namespace.js");
         const own = await namespaces.ownNamespaceForReclaim(deadline, Boolean(this.#tryLockScope.getStore()?.active));
-        const verdict = namespaces.pidNamespaceVerdict(recordNamespace, own);
+        // pid evidence only for our own namespace AND a host-local root (pi-fabric#923 round 3).
+        const verdict = namespaces.reclaimVerdict(recordNamespace, own, this.root);
         if (verdict !== "pid") { note.verdict = verdict; note.namespace = recordNamespace; note.token = token!; return false; }
       }
       if (processAlive(pid)) {

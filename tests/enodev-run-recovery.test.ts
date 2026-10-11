@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { settleEnodevRun, settleLostEnodevRun } from "../src/agents/enodev-recovery.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -98,13 +99,16 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
 
   // Through the real ActorManager restore: the restored in-flight item asks for a run with its activationId, and the
   // earlier ENODEV-unconfirmed run's saved answer completes it. Only the process launch is stubbed.
-  it("a restarted actor gets its interrupted activation's saved answer once, with no new launch", async () => {
+  // An actor activation interrupted mid-run by a real close, then given the pre-#849 outcome: the worker completed
+  // and saved its answer, but its exit stayed unconfirmed (ENODEV). Returns what a restart needs.
+  const interruptedRun = async () => {
     const root = tempRoot();
     const runRoot = path.join(root, "runs");
+    const actorRoot = path.join(root, "actors");
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-    const actors = (agents: AgentManager) => new ActorManager("reload", { id: "session:reload", name: "main", kind: "main", sessionId: "reload" },
-      mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
-      { actorRoot: path.join(root, "actors"), persistent: true, meshCursorPath: path.join(root, "actors", "mesh-cursor.json") });
+    const actors = (agents: AgentManager, rootId = "session:reload") => new ActorManager("reload",
+      { id: rootId, name: "main", kind: "main", sessionId: rootId.slice(8) }, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
+      agents, () => {}, { actorRoot, persistent: true, meshCursorPath: path.join(actorRoot, "mesh-cursor.json") });
     const config = { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true };
     const first = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
     const before = actors(first);
@@ -114,14 +118,26 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     const id = fs.readdirSync(runRoot).find(name => /^[a-f0-9]{32}$/.test(name))!;
     await before.close();
     await first.close();
-    // The pre-#849 outcome: the worker completed and saved its answer, but its exit stayed unconfirmed (ENODEV).
     const directory = path.join(runRoot, id);
     const status = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
-    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...status, status: "running", sessionId: String(deadPid()), transport: "process" }));
+    // The worker's own record (it ran to completion), whatever the close left: a slow worker may not have written it.
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ ...status, id, actorId: actor.id, status: "running",
+      sessionId: String(deadPid()), transport: "process" }));
     fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
     fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "SAVED_ANSWER" }));
     const second = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
     const launched = vi.spyOn(second, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    return { actor, id, directory, actorRoot, actors, second, launched };
+  };
+  /** The registry now names `adopter` as the actor's root, adopted from the lineage that ran it (its queue file). */
+  const adopt = (actorRoot: string, actorId: string, adopter: string) => {
+    const store = new ActorRegistryStore(actorRoot);
+    store.write(store.snapshot().actors.map(row => row.id === actorId
+      ? { ...row, rootId: adopter, adoptedAt: Date.now(), adoptedFrom: [row.rootId] } : row) as unknown as Record<string, unknown>[]);
+  };
+
+  it("a restarted actor gets its interrupted activation's saved answer once, with no new launch", async () => {
+    const { actor, id, directory, actors, second, launched } = await interruptedRun();
     const after = actors(second);
     try {
       await vi.waitFor(() => expect(after.status(actor.id)).toMatchObject({ lastRunId: id }), { timeout: 15_000, interval: 20 });
@@ -129,6 +145,42 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
       expect(launched).not.toHaveBeenCalled();
       expect(vetoed(directory)).toBe(false);
       expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "SAVED_ANSWER" });
+    } finally {
+      await after.close();
+      await second.close();
+    }
+  }, 60_000);
+
+  // pi-fabric#912 review: the item can live only in an ADOPTED predecessor's queue file. The lost sweep must wait for
+  // that takeover, and an unreadable queue state is unknown, never empty.
+  it("an activation pending only in an adopted predecessor queue is recovered after the takeover, not settled as lost", async () => {
+    const { actor, id, directory, actorRoot, actors, second, launched } = await interruptedRun();
+    adopt(actorRoot, actor.id, "session:adopter");
+    const warn = vi.spyOn(console, "warn");
+    const after = actors(second, "session:adopter");
+    try {
+      await vi.waitFor(() => expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")))
+        .toMatchObject({ status: "completed", text: "SAVED_ANSWER" }), { timeout: 15_000, interval: 20 });
+      await vi.waitFor(() => expect(after.status(actor.id).status).toBe("idle"), { timeout: 10_000, interval: 20 });
+      expect(launched).not.toHaveBeenCalled();
+      expect(warn.mock.calls.some(([line]) => String(line).includes("settled as lost"))).toBe(false);
+      expect(after.status(actor.id)).toMatchObject({ lastRunId: id });
+    } finally {
+      await after.close();
+      await second.close();
+    }
+  }, 60_000);
+
+  it("an unreadable predecessor queue leaves the run's marker: nothing settles as lost", async () => {
+    const { actor, directory, actorRoot, actors, second } = await interruptedRun();
+    adopt(actorRoot, actor.id, "session:adopter");
+    const predecessor = fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!;
+    fs.writeFileSync(path.join(actorRoot, actor.id, predecessor), "{ torn");
+    const after = actors(second, "session:adopter");
+    try {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      expect(vetoed(directory)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("running");
     } finally {
       await after.close();
       await second.close();

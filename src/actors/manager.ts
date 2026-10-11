@@ -5714,11 +5714,6 @@ export class ActorManager {
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
         this.#seedDeadLetterDeliveries(actor);
-        // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost.
-        const pending = new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
-          ...(this.#deferredHandoffs.get(actor.id) ?? []), ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : [])]
-          .map(item => item.id));
-        try { this.agents.settleLostEnodevRuns?.(actor.id, pending); } catch { /* retention keeps the veto; next start retries */ }
         firstLoads.push(actor);
       }
       added++;
@@ -5739,6 +5734,16 @@ export class ActorManager {
     if (restartedIds.length) this.#scheduleRegistrySave(true, 1);
     // After every own file, whose counters the predecessors' activations shift against.
     for (const actor of firstLoads) this.#takeOverPredecessors(actor);
+    // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost, only
+    // once every queue that can hold the activation is restored (own and adopted predecessors). An unreadable queue
+    // state is unknown, not empty: then nothing of that actor settles, and its markers stay for the next start.
+    for (const actor of firstLoads) {
+      if (!this.#queueStatesReadable(actor)) continue;
+      const pending = new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+        ...(this.#deferredHandoffs.get(actor.id) ?? []), ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : [])]
+        .map(item => item.id));
+      try { this.agents.settleLostEnodevRuns?.(actor.id, pending); } catch { /* retention keeps the veto; next start retries */ }
+    }
     if (added > 0) this.#emitChange();
     this.#scheduleRestoreParked();
     // Dead letters from before a restart re-queue once this host manages an idle actor (#816),
@@ -5985,6 +5990,18 @@ export class ActorManager {
       for (const id of pending) store.releaseResult(id);
       this.#pendingHandoffConsumption.delete(actor.id);
     } catch { /* Keep original archives and retry each owner poll. */ }
+  }
+
+  /** Every queue file that can hold this actor's activations (own and adopted predecessors) is absent or valid. */
+  #queueStatesReadable(actor: ManagedActor): boolean {
+    const own = this.#ownQueueFile(actor);
+    const files = [own, ...(actor.adoptedFrom ?? []).map(rootId => this.#queueFile(actor.id, rootId, actor.residency))
+      .filter(file => file !== own && !this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file)))];
+    return files.every(file => {
+      if (!fs.existsSync(file)) return true;
+      const saved = this.#readQueue(file) as { format?: unknown; items?: unknown } | undefined;
+      return saved !== undefined && saved !== null && saved.format === 1 && Array.isArray(saved.items);
+    });
   }
 
   #readQueue(file: string): unknown {

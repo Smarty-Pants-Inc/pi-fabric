@@ -4052,6 +4052,8 @@ export class ActorManager {
   ): AgentRunRequest {
     return {
       ...(item.provenance ? { provenance: structuredClone(item.provenance) } : {}),
+      // smarty-dev#8935: a restored activation may already have run to completion before a restart.
+      ...(item.resumed ? { activationId: item.id } : {}),
       task: [
         `Fabric actor message from ${item.source}:`,
         JSON.stringify({ source: item.source, payload: item.payload, id: item.id }, null, 2),
@@ -5712,6 +5714,11 @@ export class ActorManager {
         this.#ownQueueRead.add(actor.id);
         this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
         this.#seedDeadLetterDeliveries(actor);
+        // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost.
+        const pending = new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
+          ...(this.#deferredHandoffs.get(actor.id) ?? []), ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : [])]
+          .map(item => item.id));
+        try { this.agents.settleLostEnodevRuns?.(actor.id, pending); } catch { /* retention keeps the veto; next start retries */ }
         firstLoads.push(actor);
       }
       added++;

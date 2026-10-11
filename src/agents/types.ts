@@ -58,6 +58,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
+  activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */
   routeClass?: string;
   protected?: boolean;

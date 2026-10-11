@@ -185,6 +185,7 @@ export interface FabricAgentConfig {
   processSlice?: string;
   /** Host-only opt-in process task placement; workspace files cannot override it. */
   placement?: AgentPlacementConfig;
+  /** User/workspace Pi default; package defaults intentionally leave this unset. */
   model?: string;
   /** Root deny baseline unioned with agent-dir additions; workspace lists are ignored. */
   deniedModels: string[];
@@ -196,6 +197,8 @@ export interface FabricAgentConfig {
   claude: FabricClaudeRunnerConfig;
   veda: FabricVedaRunnerConfig;
   thinking: FabricThinking;
+  /** Configured effort only; excludes the built-in thinking fallback. */
+  configuredThinking?: FabricThinking | undefined;
   maxConcurrent: number;
   maxPerExecution: number;
   maxDepth: number;
@@ -1251,6 +1254,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         persona: vedaPersona ?? DEFAULT_FABRIC_CONFIG.agents.veda.persona,
       },
       thinking: agentThinking,
+      // Idempotent: a normalized config carries the key (possibly undefined), so re-normalizing keeps it
+      // instead of promoting the filled-in thinking fallback to a configured value.
+      configuredThinking: Object.hasOwn(agents, "configuredThinking")
+        ? (isFabricThinking(agents.configuredThinking) ? agents.configuredThinking : undefined)
+        : (isFabricThinking(agents.thinking) ? agents.thinking : undefined),
       maxConcurrent: boundedInteger(
         agents.maxConcurrent,
         DEFAULT_FABRIC_CONFIG.agents.maxConcurrent,
@@ -1768,6 +1776,8 @@ const resolveFabricConfig = (
   applyEnvironmentOverrides: boolean,
 ): FabricConfig => {
   let merged = structuredClone(DEFAULT_FABRIC_CONFIG) as unknown as Record<string, unknown>;
+  // Normalize supplies the fallback; retain whether a persisted layer sets effort.
+  delete objectValue(merged.agents).thinking;
   const policy = readHostPolicy();
   const rootPolicyValid = policy.status === "valid";
   // Invalid/unprovable policy must tighten even when there is no writable config.

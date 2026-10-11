@@ -4767,9 +4767,10 @@ export class ActorManager {
           try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
         }
         child.unref();
-      }, now);
+      }, now, () => !this.#closing);
       if (typeof outcome === "object") this.#alarmSweepLock(meshRoot, outcome.uncertain);
-      else this.#sweepLockAlarmed = false;
+      // smarty-dev#9508: only a successful acquire proves the lock works again; "busy" proves nothing about it.
+      else if (outcome === "started" || outcome === "claimed") this.#sweepLockAlarmed = false;
     } catch { /* the next slot retries */ }
   }
 

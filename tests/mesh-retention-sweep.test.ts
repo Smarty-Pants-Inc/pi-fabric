@@ -4,7 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, removeUnreferencedRun } from "../src/storage/retention.js";
+import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
+import { spawn, type ChildProcess } from "node:child_process";
+import { ActorManager, FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, MESH_RETENTION_SWEEP_INTERVAL_MS } from "../src/actors/manager.js";
+import { AgentManager } from "../src/agents/manager.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { appendResidentLog } from "../src/residency/launcher.js";
 
@@ -505,6 +509,130 @@ describe("mesh retention sweep claim", () => {
     expect(fs.readdirSync(root).filter(name => name.startsWith(MESH_RETENTION_SWEEP_PREFIX)).sort())
       .toEqual([`${MESH_RETENTION_SWEEP_PREFIX}13.json`]);
     expect(claimMeshRetentionSweep(path.join(root, "absent"), hour, 13 * hour)).toBe(false);
+  });
+
+  // smarty-dev#7916 (ops-lead, Ryzen 1 2026-10-11): each sweep took 30-35 min at ~0.7 core, hourly. Daily now, and
+  // single flight: no slot is claimed while the previous slot's recorded sweeper provably still runs.
+  const DAY = 24 * 60 * 60 * 1_000;
+  const slotFile = (root: string, day: number) => path.join(root, `${MESH_RETENTION_SWEEP_PREFIX}${day}.json`);
+  it("sweeps once a day: one claim per 24 h slot", () => {
+    expect(MESH_RETENTION_SWEEP_INTERVAL_MS).toBe(DAY);
+    const root = tmp("fabric-mesh-daily-");
+    expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 10 * DAY)).toBe(true);
+    for (const hours of [1, 6, 12, 23]) expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 10 * DAY + hours * 3_600_000)).toBe(false);
+    expect(claimMeshRetentionSweep(root, MESH_RETENTION_SWEEP_INTERVAL_MS, 11 * DAY)).toBe(true);
+  });
+
+  // pi-fabric#883 SEC/CODE P1: single flight is a kernel lock the sweep itself holds, never a pid record.
+  // A child process stands in for the detached sweep: it inherits the locked descriptor as fd 3, as the manager's does.
+  const sweeps: ChildProcess[] = [];
+  afterEach(() => { for (const sweep of sweeps.splice(0)) if (sweep.exitCode === null && sweep.signalCode === null) sweep.kill("SIGKILL"); });
+  const startSweep = async (root: string, now: number) => {
+    let sweep: ChildProcess | undefined;
+    const outcome = await startLockedMeshRetentionSweep(root, DAY, (lock) => {
+      sweep = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "ignore", "ignore", lock] });
+      sweeps.push(sweep);
+    }, now);
+    return { outcome, sweep };
+  };
+  const exited = (child: ChildProcess) => new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
+  it.skipIf(process.platform !== "linux")("a sweep still holding the lock blocks the next start, with NO pid recorded (spawn-to-record window)", async () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    const first = await startSweep(root, 10 * DAY);
+    expect(first.outcome).toBe("started");
+    expect(JSON.parse(fs.readFileSync(slotFile(root, 10), "utf8")).sweeper).toBeUndefined(); // nothing recorded
+    let started = false;
+    for (const day of [11, 12]) {
+      expect(await startLockedMeshRetentionSweep(root, DAY, () => { started = true; }, day * DAY)).toBe("busy");
+    }
+    expect(started).toBe(false);
+    expect(fs.existsSync(slotFile(root, 11))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("a crashed sweep releases the lock, so the next start proceeds", async () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    const { sweep } = await startSweep(root, 10 * DAY);
+    expect(await startLockedMeshRetentionSweep(root, DAY, () => undefined, 11 * DAY)).toBe("busy");
+    const gone = exited(sweep!);
+    sweep!.kill("SIGKILL"); // the sweep crashes mid-run
+    await gone;
+    expect((await startSweep(root, 11 * DAY)).outcome).toBe("started");
+  });
+
+  it.skipIf(process.platform !== "linux")("an uncertain lock state (flock missing) never sweeps", async () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    const saved = process.env.PATH;
+    process.env.PATH = path.join(root, "no-bin"); // neither setpriv nor flock can be found
+    let started = false;
+    try {
+      expect(await startLockedMeshRetentionSweep(root, DAY, () => { started = true; }, 10 * DAY))
+        .toEqual({ uncertain: expect.stringMatching(/ENOENT/) });
+    } finally { process.env.PATH = saved; }
+    expect(started).toBe(false);
+    expect(fs.existsSync(slotFile(root, 10))).toBe(false); // no slot is spent on it either
+  });
+
+  it.skipIf(process.platform !== "linux")("the owner skips the sweep on an uncertain lock: one log line and one mesh alarm", async () => {
+    const root = tmp("fabric-mesh-lock-alarm-");
+    const meshRoot = path.join(root, "mesh");
+    const actorRoot = path.join(meshRoot, "actors", "session-a");
+    fs.mkdirSync(actorRoot, { recursive: true });
+    const script = path.join(root, "sweep.mjs");
+    fs.writeFileSync(script, "");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const published: Array<{ topic: string; kind?: string }> = [];
+    vi.spyOn(mesh, "publish").mockImplementation(async (input) => { published.push(input as never); return undefined as never; });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const saved = process.env.PATH;
+    process.env.PATH = path.join(root, "no-bin"); // flock cannot run: the lock state is unknown
+    const manager = new ActorManager("lock-alarm", { id: "session:lock-alarm", name: "main", kind: "main", sessionId: "lock-alarm" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, enabled: true }, agents, () => {}, {
+        actorRoot, persistent: true, canConsumeMesh: () => true, reapDeadSessionPresence: false,
+        meshRetentionSweepPath: script, retentionSweepMs: 20, closeGraceMs: 0,
+      });
+    try {
+      await vi.waitFor(() => expect(published.some((event) => event.topic === FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC)).toBe(true), { timeout: 5_000 });
+      await new Promise((resolve) => setTimeout(resolve, 200)); // several more ticks: still one alarm
+    } finally {
+      process.env.PATH = saved;
+      await manager.close();
+      await agents.close();
+    }
+    expect(published.filter((event) => event.topic === FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC)).toHaveLength(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("mesh retention sweep skipped"))).toHaveLength(1);
+    expect(fs.readdirSync(meshRoot).filter((name) => name.startsWith(MESH_RETENTION_SWEEP_PREFIX))).toEqual([]); // no sweep
+  });
+
+  it.each([
+    ["a dead pid", { pid: 2147483647, startTime: "1" }],
+    ["a reused pid (live, another start time)", { pid: process.pid, startTime: "1" }],
+    ["this live process", { pid: process.pid, startTime: processStartTime(process.pid) ?? "1" }],
+    ["no recorded sweeper", undefined],
+  ])("a record never gates the slot claim, even when it names %s (diagnostics only)", (_name, sweeper) => {
+    const root = tmp("fabric-mesh-single-flight-");
+    expect(claimMeshRetentionSweep(root, DAY, 10 * DAY)).toBe(true);
+    if (sweeper) fs.writeFileSync(slotFile(root, 10), JSON.stringify({ pid: process.pid, claimedAt: 10 * DAY, sweeper }), { mode: 0o600 });
+    expect(claimMeshRetentionSweep(root, DAY, 11 * DAY)).toBe(true);
+  });
+
+  it.skipIf(process.platform !== "linux")("records the sweeper for diagnostics", () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    expect(claimMeshRetentionSweep(root, DAY, 10 * DAY)).toBe(true);
+    recordMeshRetentionSweeper(root, DAY, process.pid, 10 * DAY);
+    expect(JSON.parse(fs.readFileSync(slotFile(root, 10), "utf8")).sweeper).toEqual({ pid: process.pid, startTime: expect.stringMatching(/^\d+$/) });
+  });
+
+  it("claims the next slot when the previous claim is torn, and drops the former hourly slot files", () => {
+    const root = tmp("fabric-mesh-single-flight-");
+    fs.writeFileSync(slotFile(root, 10), '{"pid":1,"sweeper":{"pid":', { mode: 0o600 });
+    fs.writeFileSync(slotFile(root, 492_000), JSON.stringify({ pid: 1, claimedAt: 1 }), { mode: 0o600 }); // an hourly-era slot
+    expect(claimMeshRetentionSweep(root, DAY, 11 * DAY)).toBe(true);
+    expect(fs.readdirSync(root).filter(name => name.startsWith(MESH_RETENTION_SWEEP_PREFIX)).sort())
+      .toEqual([`${MESH_RETENTION_SWEEP_PREFIX}10.json`, `${MESH_RETENTION_SWEEP_PREFIX}11.json`]);
   });
 });
 

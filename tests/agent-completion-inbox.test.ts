@@ -229,10 +229,10 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).toHaveBeenCalledOnce();
   });
 
-  it.each(["aborted", "error"])("does not restart Main after %s; results remain for the next input", async (reason) => {
+  it("does not restart Main after an owner abort; results remain for the next input", async () => {
     const h = harness();
     h.inbox.enqueue(result("a"));
-    h.boundary(reason);
+    h.boundary("aborted");
     h.idle();
     h.emit("agent_settled");
     h.inbox.enqueue(result("b"));
@@ -286,9 +286,69 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
+  // smarty-dev#6134 (R-stall #4313): a provider refusal ended Main's turn while a child ran; the
+  // child's completion then sat in this inbox for ~56 minutes. An error is not an owner cancel.
+  it("wakes idle Main after a provider error or refusal, never at the failed boundary", async () => {
+    const h = harness();
+    h.inbox.enqueue(result("a"));                                   // landed mid-turn
+    h.boundary("error");
+    expect(h.sendMessage).not.toHaveBeenCalled();                  // Pi starts no run for a steer queued now
+    h.idle();
+    h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage.mock.calls.map(([message, options]) => [message.details.ids, options]))
+      .toEqual([[["a"], { deliverAs: "steer", triggerTurn: true }]]);
+    h.inbox.enqueue(result("b"));                                   // lands after the failed run settled
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage.mock.calls.map(([message]) => message.details.ids)).toEqual([["a"], ["b"]]);
+  });
+
+  // smarty-dev#9271. The real-Pi /compact run (completion-wake-after-compaction-cli.test.ts) is the
+  // end-to-end proof. These cover only what it cannot reach: Fabric's retry of a failed compaction,
+  // a failed compaction, and that a check which finds Main busy polls nothing.
+  it("arms no timer while Main is busy; the end of Fabric's compaction retry delivers once", async () => {
+    const h = harness();
+    const isIdle = vi.spyOn(h.context, "isIdle");
+    h.idle();
+    h.emit("agent_settled");                                       // the run settled; Main is idle
+    h.idle(false);                                                 // Fabric's retry: busy without a run
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(100);
+    h.emit("session_compact", { reason: "manual" });              // a slow later handler keeps Pi busy
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();                  // never into a compacting Main
+    expect(vi.getTimerCount()).toBe(0);                            // a busy check re-arms nothing
+    const checks = isIdle.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(isIdle.mock.calls.length).toBe(checks);
+    h.idle();                                                      // Pi left its compaction state,
+    h.inbox.idleSignal();                                          // then ran the retry's onComplete
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage.mock.calls.map(([message, options]) => [message.details.ids, options]))
+      .toEqual([[["a"], { deliverAs: "steer", triggerTurn: true }]]);
+    h.inbox.idleSignal();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("delivers at session_compact_failed, which Pi emits after it leaves its compaction state", async () => {
+    const h = harness();
+    h.idle();
+    h.emit("agent_settled");
+    h.idle(false);                                                 // a compaction on an idle Main
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.idle();
+    h.emit("session_compact_failed", { reason: "manual" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+  });
+
   it("still starts no run by itself after an abort while nothing else runs", async () => {
     const h = harness();
-    h.boundary("error");
+    h.boundary("aborted");
     h.idle();
     h.emit("agent_settled");
     for (const id of ["a", "b", "c"]) h.inbox.enqueue(result(id));

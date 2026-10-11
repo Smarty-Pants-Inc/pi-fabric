@@ -67,6 +67,15 @@ describe.runIf(process.platform === "linux" && ["x64", "arm64"].includes(process
     expect(m.untrustedCache("/stub/cache", chain(0o40777))).toContain("/stub is group- or other-writable (mode 777)");
   });
 
+  it("refuses a sticky world-writable ancestor that is ours: only a root-owned sticky one is exempt", async () => {
+    const base = privateDir();
+    fs.mkdirSync(path.join(base, "shared"));
+    fs.chmodSync(path.join(base, "shared"), 0o1777);
+    fs.mkdirSync(path.join(base, "shared", "cache"), { mode: 0o700 });
+    const m = await toolchain(path.join(base, "shared", "cache"));
+    expect(m.untrustedCache()).toContain(`${path.join(base, "shared")} is group- or other-writable (mode 1777)`);
+  });
+
   it("refuses a symlinked toolchain directory", async () => {
     const base = privateDir();
     fs.mkdirSync(path.join(base, "real"), { mode: 0o700 });

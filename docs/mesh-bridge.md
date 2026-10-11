@@ -85,6 +85,10 @@ existing events and mirrors root presence. There is no new store or protocol.
   participant name. A remote root must have a canonical id (`session:<session id>`). A native
   Main never accepts a `session:` name other than its own id (RootInbox), so native name delivery
   and bridged ids are disjoint by construction.
+- The one exception is a hub handoff (smarty-dev#9074, below): a Main moved off the hub keeps its
+  session id, and its own dead native records would reserve that id forever. A handoff in force
+  waives that identity's own ids (id, session id, name) on exactly the link it names, and reserves
+  them on every other link. Every other reservation is unchanged.
 - Authority comes from ownership after the mirror step, not from the peer's claims: for each page it
   forwards, the bridge rereads the records this link holds now and checks them against the current
   reservations. A claim refused or lost in the same pass (to another link or to a new native) gets no
@@ -179,6 +183,33 @@ When the bridge dies, the other side's copies stay live until their lease lapses
 (about 13 s on average). A steer or followUp sent in that window is not delivered; it fails when
 its acknowledgement times out (the control plane's bounded wait), and nothing hangs. After the
 lapse, senders get the lease-lapsed error at once.
+
+## Moving a Main off the hub (handoff)
+
+A Main that moves from the hub to a remote host keeps its session id. Its native records on the
+hub (host record, root participant, left-over agents) reserve that id, live or not, so the hub's
+bridge refuses the moved Main ("sender claims a hub identity") until the host reaper removes them
+hours later. After the hub's Pi for that session has stopped, run on the hub, with the hub
+bridge's mesh root, `--lock-protocol` and environment:
+
+    mesh-bridge handoff --mesh ~/proj/.pi/fabric/mesh --session <session id> --link <remote name> [--operator NAME]
+
+It refuses, writing nothing, while the hub still holds the identity: a live host lease, Main
+session lease or reload lease; a recorded Main or lease-writer process that is not proven gone from
+this host; or another link holding a live mirror of it. Otherwise it removes the dead native's host
+record and root participant (record and file), and in the same state commit writes the handoff
+record `topology/handoffs/<sha256(id)>` with the link, time, operator and hub host. Output is one
+JSON object (`ok`, `message`, the record, what it retired and what it observed); exit 0 handed off,
+1 refused, 2 usage. A usage error (a missing or malformed flag, a path that is not a mesh root, a
+bad session id) writes nothing and is one JSON object too: `ok: false`, `message: "usage: ..."`
+and the command's synopsis in `usage`. `handoff-list` shows every handoff and whether it is in
+force; `handoff-revoke` removes one.
+
+The handoff is the only authority: local write access to the hub's mesh. The bridge writes only
+mirror records and bridged events there, and agents cannot write `topology/` keys through the
+mesh provider, so no remote party can write one. A native that answers to the id again (any
+native host or participant record, live or not, or a live native lease) voids the handoff at once,
+and the next mirror pass of any hub bridge deletes it; a later move needs a new handoff.
 
 The bridge exits with status 1 when the transport closes. The service manager restarts it, and it
 resumes from the cursor file. `-- COMMAND...` replaces ssh with any stdio transport (tests use a

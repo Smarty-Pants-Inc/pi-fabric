@@ -273,11 +273,12 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     actorManagers.push(restored);
     expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project", ...defaults });
     expect(restored.resolveBinding(actor.id)).toEqual(defaults);
-    // An old save may lose knowledge of the last run, never the defaults.
-    expect(restored.listOwned(true)[0]?.model).toBeUndefined();
+    // An old save may lose knowledge of the last run, never the defaults. The
+    // shared view then republishes the persisted binding, not unknown (#8487).
+    expect(restored.listOwned(true)[0]).toMatchObject(defaults);
   });
 
-  it.each([false, true])("round 2 keeps legacy shared views unknown with project defaults=%s and reader overlays", async hasDefaults => {
+  it.each([false, true])("round 2 keeps reader overlays out of legacy shared views with project defaults=%s", async hasDefaults => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "legacy-reader", instructions: "Observe.",
       ...(hasDefaults ? { model: "provider/project", thinking: "medium" as const } : {}),
@@ -299,6 +300,8 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       actorManagers.push(reader);
       const before = fs.readFileSync(file, "utf8");
       expect(reader.status(actor.id)).toMatchObject({ model: `provider/${sessionId}`, thinking: "high" });
+      // A foreign root cannot see the owner's overlay, so even a legacy row's persisted
+      // model/thinking stays unknown here (pi-fabric#843): never this reader's overlay.
       const shared = reader.listOwned(true)[0]!;
       expect(shared.model).toBeUndefined();
       expect(shared.thinking).toBeUndefined();
@@ -312,6 +315,7 @@ describe("ActorManager bound registry metadata (#7682)", () => {
       await reader.setModel(actor.id, `provider/${sessionId}-new`);
       expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("model");
       expect(state.mesh.get(`actors/${sessionId}/${actor.id}`)?.value).not.toHaveProperty("thinking");
+      // A restored binding is a derived view: never saved, so never an overlay in the row.
       expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
       expect(row(state.root, actor.id).model).toBe(hasDefaults ? "provider/project" : undefined);
       expect(row(state.root, actor.id).thinking).toBe(hasDefaults ? "medium" : undefined);
@@ -331,6 +335,194 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(restored.status(actor.id).projectDefaults).toEqual({ scope: "project" });
     expect(restored.resolveBinding(actor.id)).toEqual({});
   });
+
+  // smarty-dev#8487: the factory router serves a review pair only when its idle
+  // presence names (model, thinking). A resident restart must republish the last
+  // persisted binding at once, not an unknown binding until the actor runs again.
+  const restart = (state: ReturnType<typeof setup>) => {
+    const restarted = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+    });
+    actorManagers.push(restarted);
+    return restarted;
+  };
+
+  it("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "restart-binding", instructions: "Observe.",
+      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+    await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
+    await state.actors.setThinking(actor.id, "xhigh");
+    await state.actors.ask(actor.id, "first");
+    await waitFor(() => state.actors.status(actor.id).status === "idle");
+    const key = `actors/test/${actor.id}`;
+    expect(state.mesh.get(key)?.value).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    await state.actors.close();
+    // Only the restarted host may write the entry the router reads.
+    await state.mesh.delete({ key });
+    const runs = state.agents.list().length;
+    const restarted = restart(state);
+    // The resident host publishes through its heartbeat batch; a plain session through the retry timer.
+    const batched = restarted.presenceBatch(true).ops.find(op => op.kind === "put" && op.key === key);
+    expect(batched && "value" in batched ? batched.value : undefined).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    await waitFor(() => state.mesh.get(key)?.value !== undefined, 10_000);
+    expect(state.mesh.get(key)?.value).toMatchObject({ status: "idle", model: "cliproxyapi/gpt-6-luna", thinking: "xhigh" });
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "xhigh",
+      projectDefaults: { model: "anthropic/claude-opus-5-5", thinking: "medium" } });
+    expect(state.agents.list()).toHaveLength(runs);
+  }, 20_000);
+
+  it.each<[string, { model?: string; modelReason?: string; thinking?: "high" }]>([
+    ["model and thinking", { model: "provider/review", modelReason: "review pair", thinking: "high" }],
+    ["model only", { model: "provider/review" }],
+    ["no model", { thinking: "high" }],
+  ])("restores a row without a persisted run binding from its persisted fields: %s (#8487)", async (_case, persisted) => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "legacy-restart", instructions: "Observe.", ...persisted });
+    await state.actors.close();
+    // A pre-#7682 row, or one an old-runtime writer rebuilt from its known fields.
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].resolvedBinding;
+    fs.writeFileSync(file, JSON.stringify(registry));
+    const key = `actors/test/${actor.id}`;
+    await state.mesh.delete({ key });
+    const restarted = restart(state);
+    await waitFor(() => state.mesh.get(key)?.value !== undefined, 10_000);
+    const value = state.mesh.get(key)!.value as Record<string, unknown>;
+    expect(value.status).toBe("idle");
+    // A run without an overlay uses the configured thinking when the row has none, as create records.
+    if (persisted.model) expect(value).toMatchObject({ ...persisted, thinking: persisted.thinking ?? state.agents.config.thinking });
+    else {
+      // No persisted model: unknown, exactly as before.
+      expect(value).not.toHaveProperty("model");
+      expect(value).not.toHaveProperty("thinking");
+    }
+    expect(restarted.status(actor.id).projectDefaults).toEqual({ scope: "project", ...persisted });
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  // pi-fabric#843 review: a legacy row's persisted model/thinking is advertised only when
+  // it EXACTLY equals what an owner-defaults run on this owning host would pin, after the
+  // owner's session overlay and the run path's selector admission/canonicalization.
+  const legacyRow = async (
+    state: ReturnType<typeof setup>,
+    request: { model: string; modelReason?: string; thinking?: "medium" | "high" },
+    edit?: (row: Record<string, unknown>) => void,
+  ) => {
+    const actor = await state.actors.create({ name: "legacy-verify", instructions: "Observe.", ...request });
+    await state.actors.close();
+    const file = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete registry.actors[0].resolvedBinding;
+    edit?.(registry.actors[0]);
+    fs.writeFileSync(file, JSON.stringify(registry));
+    await state.mesh.delete({ key: `actors/test/${actor.id}` });
+    return actor;
+  };
+  const restartWith = (state: ReturnType<typeof setup>, resolvePiModel?: (model: string) => string | Promise<string>) => {
+    const restarted = new ActorManager("test", state.identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, ...(resolvePiModel ? { resolvePiModel } : {}),
+    });
+    actorManagers.push(restarted);
+    return restarted;
+  };
+  const presenceOf = (state: ReturnType<typeof setup>, id: string) =>
+    state.mesh.get(`actors/test/${id}`)?.value as Record<string, unknown> | undefined;
+  // The current registry: "luna" is an alias of the canonical key; "provider/forged" does not exist.
+  const canonical = (model: string): string => {
+    if (model === "provider/forged") throw new Error(`Model ${model} is not available to this Pi session`);
+    return model === "luna" ? "cliproxyapi/gpt-6-luna" : model;
+  };
+  const resolvers = [
+    ["sync", (model: string) => canonical(model)],
+    ["async", async (model: string) => { await new Promise(resolve => setTimeout(resolve, 30)); return canonical(model); }],
+  ] as const;
+  const settled = async (resolver: ReturnType<typeof vi.fn>) => {
+    await Promise.allSettled(resolver.mock.results.map(result => result.value));
+    await new Promise(resolve => setTimeout(resolve, 80));
+  };
+
+  it.each(resolvers)("restores a legacy row equal to the owner's canonical effective binding with a %s resolver, without a run (pi-fabric#843)", async (_kind, resolve) => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
+    const resolver = vi.fn(resolve);
+    const restarted = restartWith(state, resolver);
+    await waitFor(() => presenceOf(state, actor.id)?.model !== undefined, 10_000);
+    expect(presenceOf(state, actor.id)).toMatchObject({ status: "idle", model: "cliproxyapi/gpt-6-luna", modelReason: "review pair", thinking: "high" });
+    expect(restarted.listOwned(true)[0]).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
+    expect(resolver).toHaveBeenCalledWith("cliproxyapi/gpt-6-luna", false);
+    // Verified and advertised, never persisted as if a run had admitted it.
+    expect(row(state.root, actor.id).resolvedBinding).toBeUndefined();
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it.each(resolvers.flatMap(([kind, resolve]) => [
+    [kind, "a stale alias the run path now canonicalizes to another key", "luna", resolve],
+    [kind, "a forged model the run path refuses", "provider/forged", resolve],
+    [kind, "a model the current policy denies", "provider/denied", resolve],
+  ] as const))("omits a legacy row whose persisted model differs from the effective binding (%s resolver): %s (pi-fabric#843)", async (_kind, _case, persisted, resolve) => {
+    const state = setup(true, undefined, undefined, undefined, {}, { deniedModels: ["provider/denied"] });
+    const actor = await legacyRow(state, { model: "cliproxyapi/gpt-6-luna", thinking: "high" }, row => { row.model = persisted; });
+    const resolver = vi.fn(resolve);
+    const restarted = restartWith(state, resolver);
+    await waitFor(() => presenceOf(state, actor.id) !== undefined, 10_000);
+    await settled(resolver);
+    expect(presenceOf(state, actor.id)?.status).toBe("idle");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    expect(restarted.listOwned(true)[0]?.thinking).toBeUndefined();
+    // The persisted value remains the project default; only the advertised binding is unknown.
+    expect(restarted.status(actor.id).projectDefaults).toMatchObject({ model: persisted, thinking: "high" });
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it.each<[string, { model?: string; thinking?: "low" | "medium" }, boolean]>([
+    ["a different model", { model: "provider/override" }, false],
+    ["a different thinking level", { thinking: "low" }, false],
+    ["the persisted model and thinking", { model: "provider/project", thinking: "medium" }, true],
+  ])("applies an owner session override before restoring: %s (pi-fabric#843)", async (_case, override, restored) => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "provider/project", thinking: "medium" });
+    // The owner's own session overlay, which #runBinding applies to an owner-defaults run.
+    const bindings = new ActorBindingStore("test", path.join(state.root, "actors"));
+    if (override.model) await bindings.setModel(actor.id, override.model);
+    if (override.thinking) await bindings.setThinking(actor.id, override.thinking);
+    const restarted = restartWith(state);
+    expect(restarted.resolveBinding(actor.id)).toMatchObject({ model: override.model ?? "provider/project", thinking: override.thinking ?? "medium" });
+    await waitFor(() => presenceOf(state, actor.id) !== undefined, 10_000);
+    if (restored) {
+      // The override is exactly the persisted binding: that is what a run would pin.
+      expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "medium" });
+      expect(restarted.listOwned(true)[0]).toMatchObject({ model: "provider/project", thinking: "medium" });
+    } else {
+      expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+      expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+      expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+      expect(restarted.listOwned(true)[0]?.thinking).toBeUndefined();
+    }
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
+
+  it("withdraws a restored binding once an owner override diverges, and restores it when cleared (pi-fabric#843)", async () => {
+    const state = setup(true);
+    const actor = await legacyRow(state, { model: "provider/project", thinking: "medium" });
+    const restarted = restartWith(state);
+    await waitFor(() => presenceOf(state, actor.id)?.model === "provider/project", 10_000);
+    await restarted.setModel(actor.id, "provider/override");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("model");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    await restarted.setModel(actor.id, undefined);
+    expect(presenceOf(state, actor.id)).toMatchObject({ model: "provider/project", thinking: "medium" });
+    await restarted.setThinking(actor.id, "low");
+    expect(presenceOf(state, actor.id)).not.toHaveProperty("thinking");
+    // A project-scope change also moves the effective binding away from the verified row.
+    await restarted.setThinking(actor.id, undefined);
+    await restarted.setModel(actor.id, "provider/next", "project");
+    expect(restarted.listOwned(true)[0]?.model).toBeUndefined();
+    expect(state.agents.list()).toHaveLength(0);
+  }, 20_000);
 
   it("records a known configuration binding at create without pinning project defaults", async () => {
     const state = setup(true, undefined, undefined, {
@@ -3760,12 +3952,13 @@ describe("ActorManager", () => {
       time.set(third.activationBlocked!.retryAt! + 1_000);
       expect(manager.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { count: 3 } });
 
-      expect([1, 2, 3, 4, 5, 6, 40].map(activationBlockBackoffMs)).toEqual([
+      // smarty-dev#6509: 10 min, doubling, capped at 60 min.
+      expect([1, 2, 3, 4, 5, 6, 40].map(count => activationBlockBackoffMs(count))).toEqual([
         ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS,
-        8 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
+        ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
         ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
       ]);
-      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MS).toBe(5 * 60 * 1000);
+      expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MS).toBe(10 * 60 * 1000);
       expect(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS).toBe(60 * 60 * 1000);
     }, 60_000);
 
@@ -3793,8 +3986,9 @@ describe("ActorManager", () => {
       const wakes = captureWakes();
       await failOnce(s.actors, s.agents, actor.id, error);
       const blocked = s.actors.status(actor.id).activationBlocked!;
-      expect(blocked).toMatchObject({ code, count: 1 });
+      expect(blocked).toMatchObject({ code, class: "hard", count: 1 });
       expect(blocked.classification).toMatch(classification);
+      expect(blocked).not.toHaveProperty("backoffMs");
       expect(blocked).not.toHaveProperty("retryAt");
       expect(wakes.filter(entry => entry.ms <= ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS &&
         entry.ms % ACTOR_TRANSIENT_BLOCK_BACKOFF_MS === 0)).toHaveLength(0);
@@ -3943,6 +4137,147 @@ describe("ActorManager", () => {
       expect(s.mesh.get(`actors/test/${stuck.id}`)?.value).not.toHaveProperty("activationBlocked");
       expect(s.mesh.get(`actors/test/${preparing.id}`)?.value).toMatchObject({ activationBlocked: { code: "failing-preparation" } });
     }, 60_000);
+
+    // smarty-dev#6509: one transient error (a Luna stream error, a preparation timeout) lost a
+    // reviewer until it was re-created. The class is explicit and durable, the cooldown is
+    // configurable, and only a failed probe doubles the backoff.
+    describe("transient block class, cooldown and probe backoff (smarty-dev#6509)", () => {
+      const WINDOW = "Error: Activation window lost current activation messages";
+      const configured = async (s: ReturnType<typeof setup>, cooldownMs: number, maxMs: number) => {
+        await s.actors.close();
+        const manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true, transientBlockCooldownMs: cooldownMs, transientBlockMaxMs: maxMs,
+        });
+        actorManagers.push(manager);
+        return manager;
+      };
+
+      it("uses the configured cooldown; each failed probe doubles it up to the configured cap", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "configured-route", instructions: "Respond.", responseMode: "text" });
+        const manager = await configured(s, 2_000, 5_000);
+        await failOnce(manager, s.agents, actor.id);
+        const first = manager.status(actor.id).activationBlocked!;
+        expect(first).toMatchObject({ code: "provider-transient", class: "transient", count: 1, backoffMs: 2_000,
+          blockedAt: first.since, retryAt: first.since + 2_000 });
+        const backoffs = [first.backoffMs];
+        for (let probe = 0; probe < 3; probe++) {
+          time.set(manager.status(actor.id).activationBlocked!.retryAt! + 1);   // expired: the next run is the probe
+          expect(manager.status(actor.id)).toMatchObject({ activationBlockExpired: { class: "transient" } });
+          await failOnce(manager, s.agents, actor.id);
+          const blocked = manager.status(actor.id).activationBlocked!;
+          expect(blocked.retryAt).toBe(blocked.blockedAt! + blocked.backoffMs!);
+          backoffs.push(blocked.backoffMs);
+        }
+        expect(backoffs).toEqual([2_000, 4_000, 5_000, 5_000]);
+      }, 60_000);
+
+      it("a failure inside the cooldown restarts it without doubling; a probe failing with another transient cause doubles", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "burst-route", instructions: "Respond.", responseMode: "text" });
+        await failOnce(s.actors, s.agents, actor.id);
+        const first = s.actors.status(actor.id).activationBlocked!;
+        expect(first).toMatchObject({ class: "transient", backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        time.set(first.blockedAt! + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS / 2);              // still blocked: not a probe
+        await failOnce(s.actors, s.agents, actor.id);
+        const burst = s.actors.status(actor.id).activationBlocked!;
+        expect(burst).toMatchObject({ count: 2, since: first.since, backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        expect(burst.retryAt).toBe(burst.blockedAt! + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
+        time.set(burst.retryAt! + 1);                                                  // expired: this run is the probe
+        await failOnce(s.actors, s.agents, actor.id, WINDOW);
+        expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ code: "activation-window-lost", class: "transient", count: 1,
+          backoffMs: 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        await s.actors.ask(actor.id, "recover");
+        await waitFor(() => !s.actors.status(actor.id).inFlightRun && s.actors.status(actor.id).activationBlocked === undefined);
+        // A later episode starts again from the cooldown.
+        await failOnce(s.actors, s.agents, actor.id);
+        expect(s.actors.status(actor.id).activationBlocked).toMatchObject({ count: 1, backoffMs: ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      }, 60_000);
+
+      it("persists the class, failure time and backoff; a restored block keeps gating until its expiry", async () => {
+        const s = setup(true);
+        const time = clock();
+        const actor = await s.actors.create({ name: "durable-route", instructions: "Respond.", responseMode: "text" });
+        await failOnce(s.actors, s.agents, actor.id);
+        time.set(s.actors.status(actor.id).activationBlocked!.retryAt! + 1);
+        await failOnce(s.actors, s.agents, actor.id);                                  // a failed probe: doubled
+        const blocked = s.actors.status(actor.id).activationBlocked!;
+        expect(blocked).toMatchObject({ class: "transient", backoffMs: 2 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+        const restored = await restart(s, s.actors);
+        const stored = (JSON.parse(fs.readFileSync(path.join(s.root, "actors", "actors.json"), "utf8")).actors as Array<Record<string, unknown>>)
+          .find((row) => row.id === actor.id)!.activationBlocked;
+        expect(stored).toEqual(blocked);
+        expect(restored.status(actor.id).activationBlocked).toEqual(blocked);
+        time.set(blocked.retryAt! - 1);
+        expect(restored.status(actor.id)).not.toHaveProperty("activationBlockExpired");
+        time.set(blocked.retryAt! + 1);
+        expect(restored.status(actor.id).activationBlockExpired).toMatchObject({ class: "transient", blockedAt: blocked.blockedAt,
+          backoffMs: blocked.backoffMs, expiredAt: blocked.retryAt });
+        await failOnce(restored, s.agents, actor.id);                                  // the probe after restart fails: doubled again
+        expect(restored.status(actor.id).activationBlocked).toMatchObject({ backoffMs: 4 * ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      }, 60_000);
+
+      it("releases a reviewer an older host blocked for good on a preparation timeout or a stream error", async () => {
+        const s = setup(true);
+        const prep = await s.actors.create({ name: "prep-timeout", instructions: "Respond.", responseMode: "text" });
+        const lock = await s.actors.create({ name: "lock-timeout", instructions: "Respond.", responseMode: "text" });
+        const stream = await s.actors.create({ name: "luna-stream", instructions: "Respond.", responseMode: "text" });
+        const config = await s.actors.create({ name: "bad-model", instructions: "Respond.", responseMode: "text" });
+        await s.actors.close();
+        const file = path.join(s.root, "actors", "actors.json");
+        const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+        const since = Date.now() - 13 * 60 * 60 * 1000;
+        const PREPARATION = "permanent: activation preparation kept failing past its retry budget";
+        const stuck: Record<string, Record<string, unknown>> = {
+          [prep.id]: { reason: `Actor ${prep.id} preparation (model): timed out after 30000 ms`, code: "failing-preparation", classification: PREPARATION },
+          [lock.id]: { reason: "Timed out waiting for the Fabric actor registry lock", code: "failing-preparation", classification: PREPARATION },
+          [stream.id]: { reason: "cliproxyapi/gpt-6-luna: stream error: stream disconnected before completion", code: "unknown",
+            classification: "fail-closed: no transient cause recognised" },
+          [config.id]: { reason: `Actor ${config.id} preparation (model): Model "x/y" is not allowed by agents.allowedModels`,
+            code: "failing-preparation", classification: PREPARATION },
+        };
+        for (const row of registry.actors as Array<Record<string, unknown>>) {
+          row.activationBlocked = { ...stuck[row.id as string]!, since, count: 7 };
+          row.failureStreak = { count: 7, notified: true };
+        }
+        fs.writeFileSync(file, JSON.stringify(registry));
+        const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true,
+        });
+        actorManagers.push(restored);
+        expect(restored.status(prep.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "preparation-timeout", class: "transient" } });
+        expect(restored.status(lock.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "preparation-timeout", class: "transient" } });
+        expect(restored.status(stream.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "provider-transient", class: "transient",
+          classification: expect.stringMatching(/^transient: model stream disconnect/) } });
+        // A configuration failure stays a hard block until it is fixed or the actor is re-created.
+        expect(restored.status(config.id)).toMatchObject({ status: "failing-preparation",
+          activationBlocked: { code: "failing-preparation", class: "hard", classification: PREPARATION } });
+        expect(restored.status(config.id).activationBlocked).not.toHaveProperty("retryAt");
+      }, 60_000);
+
+      it.each([
+        [{ lastError: "Actor a preparation (model): timed out after 80 ms", preparation: true }, "preparation-timeout",
+          /^transient: activation preparation timed out \(matched "timed out"\)$/],
+        [{ lastError: "Actor a preparation (capability): MESH_LOCK_TIMEOUT: Timed out waiting for the Fabric mesh lock after 9 attempts", preparation: true },
+          "preparation-timeout", /^transient: activation preparation timed out/],
+        [{ lastError: "Agent launch preparation (model/auth) timed out after 30000 ms", preparation: true, preparationTimeout: true },
+          "preparation-timeout", /^transient: activation preparation timed out \(a preparation deadline\)$/],
+        [{ lastError: "Actor a preparation (model): 401 Unauthorized: token expired; timed out", preparation: true }, "failing-preparation",
+          /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (model): Model \"x/y\" is not allowed", preparation: true }, "failing-preparation", /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (instructions): invalid instructions file", preparation: true }, "failing-preparation", /^permanent: activation preparation/],
+        [{ lastError: "Actor a preparation (model): 403 Forbidden", preparationTimeout: true }, "permission", /^permanent: permission denied/],
+        [{ lastError: "stream error: stream disconnected before completion" }, "provider-transient", /^transient: model stream disconnect/],
+        [{ lastError: "cliproxyapi/gpt-6-luna: stream error: upstream reset" }, "provider-transient", /^transient: model stream disconnect \(matched "stream error"\)$/],
+        [{ lastError: "Error: stream error: 401 invalid api key" }, "auth", /^permanent: credential/],
+      ])("classifies %j as %s (smarty-dev#6509)", (input, code, classification) => {
+        const result = classifyActivationFailure(input);
+        expect(result).toMatchObject({ code, transient: classification.source.startsWith("^transient") });
+        expect(result.classification).toMatch(classification);
+      });
+    });
   });
 
   // dev-lead review of #34: interrupted activations (ESC) are not failures, and no notice

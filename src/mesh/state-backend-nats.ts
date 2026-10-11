@@ -944,6 +944,11 @@ const versionAtLeast = (version: string, minimum: number[]): boolean => {
   return true;
 };
 
+/** Refuses a nats-server older than the minimum (the backend's open and the migration share it, pi-fabric#918). */
+export const assertNatsServerSupported = (version: string): void => {
+  if (!versionAtLeast(version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${version} is older than ${MIN_SERVER.join(".")}`);
+};
+
 export interface OpenNatsStateBackendOptions {
   /** The mesh root this backend serves (its stream is derived from it unless `stream` is given). */
   root: string;
@@ -1021,7 +1026,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     ...(tls === undefined ? {} : { tls }) });
   try {
     const server = await port.server();
-    if (!versionAtLeast(server.version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${server.version} is older than ${MIN_SERVER.join(".")}`);
+    assertNatsServerSupported(server.version);
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
     }

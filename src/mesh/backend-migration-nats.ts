@@ -32,7 +32,7 @@ import { renameAtomic } from "../core/atomic-write.js";
 import { encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshBackendRefusedError, meshSnapshotDigest, normalizeSnapshot, type MeshBackendStep, type MeshStateSnapshot } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
-import { applyNatsMessage, assertNatsTransportSecure, natsStreamName, NatsWrongLastSequenceError, type JetStreamPort, type NatsTlsFiles } from "./state-backend-nats.js";
+import { applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, natsStreamName, NatsWrongLastSequenceError, type JetStreamPort, type NatsTlsFiles } from "./state-backend-nats.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "./state-file.js";
 
 const STATE_JSON = "state.json";
@@ -221,6 +221,8 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions,
   const { port, owned } = await connect(options);
   try {
     const server = await port.server();
+    // Before ANY migration write: a server the backend refuses to open would strand a migrated root (pi-fabric#918).
+    assertNatsServerSupported(server.version);
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshBackendRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): refusing to migrate state onto it`);
     }

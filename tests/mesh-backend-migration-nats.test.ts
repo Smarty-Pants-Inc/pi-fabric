@@ -290,6 +290,20 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
   }, 60_000);
 });
 
+it("refuses a nats-server older than the backend's minimum before any write: no marker, state.json unchanged", async () => {
+  const server = fakeJetStream();
+  server.version = "2.10.22";
+  const root = tempRoot("old-server");
+  const digest = await seedFileRoot(root);
+  const bytes = fs.readFileSync(path.join(root, "state.json"));
+  await expect(importMeshStateToNats(root, { port: server.port() })).rejects.toThrow(/nats-server 2\.10\.22 is older than 2\.11\.0/);
+  expect(readMeshStateNatsMarker(root)).toBeUndefined();
+  expect(fs.readFileSync(path.join(root, "state.json"))).toEqual(bytes);
+  expect(fileDigest(root)).toBe(digest);
+  expect(server.messages).toHaveLength(0);
+  expect(fs.readdirSync(root).filter(name => name.startsWith("state.json."))).toEqual([]);
+});
+
 it("refuses a server that does not report sync_always", async () => {
   const server = fakeJetStream();
   server.syncAlways = false;

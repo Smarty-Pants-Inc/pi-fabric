@@ -374,6 +374,15 @@ export class FabricRuntimeState {
     return batch;
   }
 
+  /** Record inbox events that entered a turn as consumed (R-token-waste); never injected again. */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    if (!ids.length || !this.#meshActivationReady()) return;
+    await this.#inboxRetry.run(async () => {
+      if (!this.#meshActivationReady()) return;
+      await this.#rootInbox?.consume(ids, receipts);
+    });
+  }
+
   /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
   recordsWake: (() => Promise<void>) | undefined;
 
@@ -831,9 +840,16 @@ export class FabricRuntimeState {
       if (!isMeshLockTimeout(error)) throw error;
       initialMeshError = error;
     }
+    // Capture this activation's directory: no control may claim/run before its epoch
+    // commits, after failed renewal, or through a replacement generation's lease.
+    const controlParticipants = participants;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
+      ownerIncarnation: controlParticipants.ownerIncarnation,
+      controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      // Both gates: this activation's custody/succession completed (main) AND its
+      // directory epoch is committed under a live, renewed lease (#709).
+      canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
-      canConsumeMesh: () => meshActivationReady,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,

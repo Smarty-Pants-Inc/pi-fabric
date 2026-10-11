@@ -129,7 +129,7 @@ describe("#3752 participant heartbeat contention", () => {
     advance(20_000);
     writeHostLease(root, { ...lease, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
       ...(mismatch === "root" ? { rootId: "another" } : {}),
-      ...(mismatch === "host incarnation" ? { startedAt: lease.startedAt! + 1 } : {}),
+      ...(mismatch === "host incarnation" ? { incarnationToken: "different-incarnation" } : {}),
       ...(mismatch === "identity" ? { identityId: "another" } : {}),
       session: { ...lease.session!, updatedAt: Date.now(), expiresAt: Date.now() + 15_000,
         ...(mismatch === "session" ? { id: "another" } : {}),

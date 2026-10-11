@@ -31,7 +31,7 @@ import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
@@ -1160,7 +1160,7 @@ export class ResidencyClient {
         } catch (error) {
           // The record remains durable. Back off a locked mesh; retain ordinary failed senders
           // without blocking the other entries in this pass.
-          if (isMeshLockTimeout(error)) throw error;
+          if (isMeshWriteDeferred(error)) throw error;
           fault ??= error;
         }
       }
@@ -1168,7 +1168,7 @@ export class ResidencyClient {
       if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;
     } catch (error) {
-      if (isMeshLockTimeout(error)) throw error; // Let the owned background retry back off the outage.
+      if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
       if (diagnostic !== this.#completionFault) console.warn(diagnostic);
       this.#completionFault = diagnostic;

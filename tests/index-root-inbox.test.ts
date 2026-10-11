@@ -64,6 +64,7 @@ const fixture = async () => {
   const lifecycle = vi.spyOn(FabricState.prototype, "publishHostLifecycle").mockResolvedValue(undefined);
   const reconcile = vi.spyOn(FabricState.prototype, "nextRootInbox").mockImplementation((session, _idle, options) => inbox.next(session, options));
   vi.spyOn(FabricState.prototype, "nextRecordsInboxMessage").mockResolvedValue(undefined);
+  const consumed = vi.spyOn(FabricState.prototype, "consumeRootInbox").mockImplementation((ids, receipts) => inbox.consume(ids, receipts));
   await piFabric(fake as unknown as ExtensionAPI);
   const emit = async (name: string, event: any = {}) => {
     if (name === "before_agent_start") {
@@ -83,7 +84,12 @@ const fixture = async () => {
     message: { role: "assistant", stopReason },
     ...(preview ? { context: { pendingMessages: queued.map(message => ({ role: "custom", ...message })) } } : {}),
   });
-  return { mesh, inbox, context, entries, fake, queued, emit, consume, work, cursor, ids, turn, reconcile,
+  // Pi's agent loop emits message_end for each queued message it injects into a turn. Here the
+  // native append is lost (no canonical receipt): only the injection itself is observed.
+  const injectUnconfirmed = async () => {
+    for (const message of queued.splice(0)) await emit("message_end", { message: { role: "custom", ...message } });
+  };
+  return { mesh, inbox, context, entries, fake, queued, emit, consume, injectUnconfirmed, consumed, work, cursor, ids, turn, reconcile,
     maybeCommit, lifecycle, advance: (ms: number) => { now += ms; } };
 };
 
@@ -205,6 +211,27 @@ describe("index root inbox turn/settle reconciliation (#4313)", () => {
     h.lifecycle.mockRejectedValueOnce(new Error("lifecycle failed"));
     await expect(h.turn()).rejects.toThrow("lifecycle failed");
     expect(h.cursor().pending).toBeUndefined();
+  });
+
+  it("injects a batch into one turn only, even when the session file never confirms it (R-token-waste)", async () => {
+    const h = await fixture();
+    await h.work("held"); await h.emit("before_agent_start"); h.consume();
+    const events = [];
+    for (let index = 0; index < 20; index++) events.push(await h.work(`report ${index} ${"x".repeat(600)}`));
+    h.fake.sendMessage.mockClear();
+    await h.turn();
+    expect(h.fake.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.queued.flatMap(message => message.details.ids)).toEqual(events.map(event => event.id));
+    await h.injectUnconfirmed();
+    expect(h.consumed).toHaveBeenCalledTimes(1);
+    // Many later turns, with and without queue evidence, a completed settle and a new prompt.
+    for (let turn = 0; turn < 6; turn++) await h.turn("stop", turn % 2 === 0);
+    await h.emit("agent_settled", { outcome: "completed" });
+    await h.emit("before_agent_start");
+    expect(h.fake.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.queued).toEqual([]);
+    expect(h.cursor().pending).toBeUndefined();
+    expect(h.cursor().after).toBeGreaterThanOrEqual(events.at(-1)!.sequence);
   });
 
   it("publishes one wedge alarm for an old pending range while the Main takes turns", async () => {

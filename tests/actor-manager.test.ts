@@ -1006,7 +1006,7 @@ describe("ActorManager across a session reload", () => {
     });
     const asker = plane({ id: "session:asker", name: "main", kind: "main", sessionId: "asker" });
     asker.start(() => ({ accepted: false }));
-    const asked = asker.request("session:owner", actor.id, "ask", { message: "HANG_WITH_PROGRESS job" }).catch(() => undefined);
+    const asked = asker.request("session:owner", actor.id, "ask", { message: "HANG_WITH_PROGRESS job", ownerIncarnation: control.incarnation }).catch(() => undefined);
     await waitFor(() => manager.status(actor.id).status === "running", 10_000);
     await new Promise((resolve) => setTimeout(resolve, 300));   // the worker has reported progress
 
@@ -3448,6 +3448,54 @@ describe("ActorManager", () => {
       expect(gated.calls).toBe(2);
       await settle();
       expect(repeats(s.mesh, actor.id)).toHaveLength(2);
+    }, 60_000);
+
+    it("a block that clears between the claim and the publish publishes nothing and releases the claim (smarty-dev#7905)", async () => {
+      const s = setup(true);
+      await s.actors.close();
+      const clock = fakeClock();
+      const manager = persistentManager(s);
+      const actor = await block(manager);
+      const writeBatch = s.mesh.writeBatch.bind(s.mesh);
+      let claimed = false, cleared = false;
+      vi.spyOn(s.mesh, "writeBatch").mockImplementation(async (request) => {
+        const results = await writeBatch(request);
+        if (!claimed && results.some((result) => result.key === actorRealarmKey(actor.id) && result.applied)) {
+          claimed = true;
+          await manager.ask(actor.id, "all good");          // the block clears after the claim
+          cleared = true;
+        }
+        return results;
+      });
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => cleared);
+      expect(manager.status(actor.id).activationBlocked).toBeUndefined();
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(0);
+      expect(claim(s.mesh, actor.id)).toBeUndefined();
+    }, 60_000);
+
+    it("a crash between the claim and the publish is retried by the next sweep, once (smarty-dev#7905)", async () => {
+      const { s, clock, owns, actor } = await startOwned();
+      const publish = s.mesh.publish.bind(s.mesh);
+      let attempts = 0;
+      vi.spyOn(s.mesh, "publish").mockImplementation(async (request) => {
+        // The first repeat publish never happens: its manager died after the claim.
+        if ((request.data as { repeat?: boolean } | undefined)?.repeat && attempts++ === 0) return new Promise<never>(() => {});
+        return publish(request);
+      });
+      clock.skew = 2 * HOUR + 1_000;
+      await waitFor(() => attempts === 1);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0 });
+      owns.a = false;
+      const restarted = persistentManager(s, "a", { canManageActor: () => true });
+      expect(restarted.status(actor.id).activationBlocked?.count).toBe(ACTOR_FAILURE_NOTICE_AFTER);
+      clock.skew += 10 * 60_000;                             // past the publish timeout, well inside slot 0
+      await waitFor(() => repeats(s.mesh, actor.id).length === 1, 5_000);
+      await settle();
+      expect(repeats(s.mesh, actor.id)).toHaveLength(1);
+      expect(attempts).toBe(2);
+      expect(claim(s.mesh, actor.id)).toMatchObject({ slot: 0, state: "published" });
     }, 60_000);
 
     it("clears the claim when the block clears, and a new block episode claims and alarms again", async () => {

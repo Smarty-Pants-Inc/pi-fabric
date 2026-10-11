@@ -123,7 +123,7 @@ describe("opaque profile extension resolution", () => {
   it("resolves already-installed npm/git packages, respects package filters and never installs missing sources", () => {
     const f = fixture();
     const npm = f.file("profile/npm/node_modules/@test/safety/extensions/npm.ts");
-    f.file("profile/npm/node_modules/@test/safety/package.json", JSON.stringify({ name: "@test/safety" }));
+    f.file("profile/npm/node_modules/@test/safety/package.json", JSON.stringify({ name: "@test/safety", version: "1.0.0" }));
     const git = f.file("profile/git/github.com/test/safety/extensions/git.ts");
     f.file("profile/git/github.com/test/safety/package.json", JSON.stringify({ name: "git-safety" }));
     const disabled = f.file("disabled/disabled.ts"); f.file("disabled/package.json", JSON.stringify({ name: "disabled", pi: { extensions: ["disabled.ts"] } }));
@@ -233,6 +233,68 @@ describe("opaque profile extension resolution", () => {
     f.settings({ extensions: ["../real-ext", "linked", "!linked/b.ts"] });
     actual = profileResult(f);
     expect(sorted(actual.paths)).toEqual(sorted([a, b])); expect(new Set(actual.paths)).toEqual(await nativeEnabled(f));
+  });
+  it("lets a top-level exclusion beat a package entry for the identical path: stricter than Pi, never looser", async () => {
+    const f = fixture(); const a = f.file("package/extensions/a.ts"); const b = f.file("package/extensions/b.ts");
+    f.file("package/package.json", JSON.stringify({ name: "guards" }));
+    for (const extensions of [
+      ["../package/extensions/b.ts", "!b.ts"],
+      ["../package/extensions", "!../package/extensions/b.ts"],
+      ["../package/extensions", `-${b}`],
+      ["../package/extensions/b.ts", "!*.ts", "+../package/extensions/a.ts"],
+    ]) {
+      f.settings({ extensions, packages: ["../package"] });
+      const actual = profileResult(f);
+      expect(actual, extensions.join(" ")).toEqual({ paths: [a], names: ["a.ts"], warnings: [] });
+      // Pi keeps the package entry for the identical listed path, so it would still load b.
+      const native = await nativeEnabled(f);
+      expect(native.has(b), extensions.join(" ")).toBe(true); expect(actual.paths.every(file => native.has(file)), extensions.join(" ")).toBe(true);
+    }
+  });
+  it("lets a top-level inclusion beat a package exclusion of the same canonical file, like Pi", async () => {
+    const f = fixture(); const { a, b } = linkedDirectory(f, "package/extensions");
+    f.file("package/package.json", JSON.stringify({ name: "guards" }));
+    for (const item of [{ source: "../package", extensions: ["!extensions/b.ts"] }, { source: "../package", extensions: [] }, { source: "../package", autoload: false, extensions: ["extensions/*.ts", "-extensions/b.ts"] }]) {
+      f.settings({ extensions: ["../real-ext/b.ts"], packages: [item] });
+      const actual = profileResult(f);
+      expect(actual.paths, JSON.stringify(item)).toContain(b); expect(actual.warnings).toEqual([]);
+      expect(new Set(actual.paths), JSON.stringify(item)).toEqual(await nativeEnabled(f));
+    }
+    expect(profileResult(f).paths).toEqual([b, a]);
+    // For the identical listed path Pi keeps the excluding package entry; so do we, never loading what Pi leaves disabled.
+    f.settings({ extensions: ["../package/extensions/b.ts"], packages: [{ source: "../package", extensions: ["!extensions/b.ts"] }] });
+    const identical = profileResult(f);
+    expect(identical.paths).toEqual([a]); expect(new Set(identical.paths)).toEqual(await nativeEnabled(f));
+  });
+  it("skips an installed npm package whose version does not satisfy the configured spec, like Pi", async () => {
+    const f = fixture(); const npm = f.file("profile/npm/node_modules/@test/pinned/extensions/pinned.ts");
+    const manifestFile = path.join(f.profile, "npm/node_modules/@test/pinned/package.json");
+    const cases: Array<[string, string | undefined, boolean]> = [
+      ["npm:@test/pinned@1.0.0", "1.0.0", true], ["npm:@test/pinned@^1.0.0", "1.4.2", true], ["npm:@test/pinned", "0.1.0", true], ["npm:@test/pinned@latest", "9.9.9", true],
+      ["npm:@test/pinned@1.0.0", "2.0.0", false], ["npm:@test/pinned@^2.0.0", "1.4.2", false], ["npm:@test/pinned@1.0.0", undefined, false],
+    ];
+    for (const [source, version, loaded] of cases) {
+      fs.writeFileSync(manifestFile, JSON.stringify({ name: "@test/pinned", ...(version ? { version } : {}) }));
+      f.settings({ packages: [source] });
+      const actual = profileResult(f); const label = `${source} installed ${version}`;
+      expect(actual.paths, label).toEqual(loaded ? [npm] : []);
+      expect(actual.warnings, label).toEqual(loaded ? [] : [`Profile extension packages[0] skipped: ${version ? "installed version does not match the configured spec" : "installed npm package has no version"}`]);
+      expect(new Set(actual.paths), label).toEqual(await nativeEnabled(f));
+    }
+  });
+  it("resolves Pi's git:-prefixed SCP and ssh:// sources to the clone but leaves a bare git@host:owner/repo a local path, like Pi", async () => {
+    const f = fixture(); const clone = f.file("profile/git/github.com/test/scp/extensions/scp.ts");
+    f.file("profile/git/github.com/test/scp/package.json", JSON.stringify({ name: "scp" }));
+    for (const source of ["git:git@github.com:test/scp", "git:git@github.com:test/scp.git@v1", "ssh://git@github.com/test/scp"]) {
+      f.settings({ packages: [source] });
+      expect(profileResult(f), source).toEqual({ paths: [clone], names: ["scp.ts"], warnings: [] });
+      expect(new Set(profileResult(f).paths), source).toEqual(await nativeEnabled(f));
+    }
+    // Pi's parseSource treats a source without git: or a URL scheme as a local path.
+    f.settings({ packages: ["git@github.com:test/scp"] });
+    const bare = profileResult(f);
+    expect(bare.paths).toEqual([]); expect(bare.warnings).toEqual(["Profile extension packages[0] skipped: missing, unreadable or invalid package"]);
+    expect(await nativeEnabled(f)).toEqual(new Set());
   });
   it("excludes Fabric packages, direct files and symlink aliases but retains unrelated checkout hooks", () => {
     const f = fixture(); const other = f.file("foreign/dist/index.js");

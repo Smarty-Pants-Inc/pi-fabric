@@ -350,7 +350,9 @@ For extension-enabled runs it also passes explicit `-e` paths for the selected
 personal profile's non-Fabric extensions and installed package extensions.
 The profile is `PI_CODING_AGENT_DIR`, or `~/.pi/agent`; relative settings paths
 resolve from that profile directory. Fabric does not install missing packages or
-replay project resources, and its pinned Fabric extension loads separately.
+replay project resources, and its pinned Fabric extension loads separately. An
+installed npm package whose version does not satisfy the configured spec is
+skipped with a warning, because Pi would reinstall it rather than load it.
 Explicitly disabled extensions and resident startup probes do not replay profile
 hooks.
 
@@ -359,7 +361,11 @@ through a selected directory, exactly as Pi matches them, even when that
 directory is a symlink. Exclusions also match the symlink target's path, so an
 exclusion written against the target holds too. Each file is then passed once:
 as in Pi, its highest-ranked entry decides whether it loads, and an excluded
-entry is not overridden by a lower-ranked entry for the same file.
+entry is not overridden by a lower-ranked entry for the same file. Top-level
+settings outrank packages, and a top-level exclusion also wins when a package
+lists the identical path (Pi would keep the package entry there). A top-level
+inclusion of that identical path does not re-enable a package's exclusion,
+matching Pi.
 
 The worker log's `fabric_profile_extensions` event records extension basenames,
 `loadedCount` (paths supplied to Pi), and `skippedCount`. Missing or invalid

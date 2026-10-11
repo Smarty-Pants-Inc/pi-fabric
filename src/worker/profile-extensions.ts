@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
+import { satisfies, validRange } from "semver";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import { fabricResourceRoot } from "../core/fabric-resource.js";
 
@@ -239,6 +240,17 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
       seenPackages.add(identity);
       const rootStat = fs.statSync(root);
       const pkg = rootStat.isDirectory() ? manifest(root) : undefined;
+      if (source.trim().startsWith("npm:")) {
+        // Pi reinstalls an npm package whose installed version does not satisfy
+        // the configured spec; an opaque launcher never installs, so skip it.
+        const spec = source.trim().slice(4).trim();
+        const split = spec.indexOf("@", spec.startsWith("@") ? 1 : 0);
+        const configured = split < 0 ? undefined : spec.slice(split + 1);
+        const range = configured ? validRange(configured) ?? undefined : undefined;
+        const installed = pkg?.version;
+        if (typeof installed !== "string" || !installed) { warn(entry, "installed npm package has no version"); continue; }
+        if (range && !satisfies(installed, range)) { warn(entry, "installed version does not match the configured spec"); continue; }
+      }
       if (record(item) && item.extensions !== undefined && (!Array.isArray(item.extensions) || item.extensions.some(value => typeof value !== "string" || !value))) {
         warn(entry, "invalid extension filter"); continue;
       }
@@ -273,9 +285,18 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
   // listed before top-level settings), top-level settings outrank packages,
   // then the first-ranked entry per canonical file decides it, enabled or not.
   // A disabled alias therefore also suppresses a lower-ranked enabled alias.
+  // One deliberate departure, stricter than Pi and never looser: Pi keeps the
+  // package entry when a top-level entry lists the identical path, so a
+  // top-level exclusion of that path would lose. Here a disabled top-level
+  // entry replaces the package entry at its own top-level rank and position,
+  // so the top-level exclusion decides that canonical file. An enabled
+  // top-level entry for the identical path still leaves Pi's package entry in
+  // place, so nothing loads that Pi leaves disabled.
   const listed = new Map<string, Resource & { rank: number }>();
-  for (const [rank, resources] of [[4, packageResources], [2, topLevel]] as const) {
-    for (const resource of resources) if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank });
+  for (const resource of packageResources) if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank: 4 });
+  for (const resource of topLevel) {
+    if (!resource.enabled && listed.get(resource.file)?.rank === 4) listed.delete(resource.file);
+    if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank: 2 });
   }
   const seen = new Set<string>();
   const paths: string[] = [];

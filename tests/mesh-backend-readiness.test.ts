@@ -283,13 +283,18 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
   it("refuses a principal instance or a non-single root as an alarm target (pi-fabric#919)", async () => {
     const root = await fileRoot();
     for (const flag of ["--alarm-owner", "--alarm-cc"]) {
-      for (const value of ["org", "org-kate", "org-anyone", "*", "session:*", "fabric-store,chief-of-staff", "lead>", "Org", "ORG-kate", " org"]) {
+      for (const value of ["org", "org-kate", "org-anyone", "*", "session:*", "fabric-store,chief-of-staff", "lead>", "Org", "ORG-kate", " org",
+        // pi-fabric#919 SEC P2: aliases through whitespace, control characters, Unicode compatibility forms and separators.
+        "\torg", "org\n", "\uff2f\uff32\uff27", "org:", "org/", "Org.kate", "org@host", "org_x",
+        // Not a principal, but not canonical either: refused, never normalized silently.
+        "Fabric-Store", "fabric-store "]) {
         const roots = flag === "--alarm-owner" ? [flag, value, "--alarm-cc", "session:chief"] : ["--alarm-owner", "session:owner", flag, value];
         const refused = await run(["cutover", "--root", root, ...roots, "--accept-unready", "fabric@unknown"], anonymousWriter);
-        expect(refused.code, `${flag} ${value}`).toBe(2);
-        expect(refused.err).toContain(`Bad ${flag} ${value}`);
-        // An alias of a principal instance (case, padding) is refused as one, not merely as a malformed name.
-        if (/^org(-.*)?$/.test(value.trim().toLowerCase())) expect(refused.err).toContain(`Bad ${flag} ${value}: a principal instance`);
+        expect(refused.code, `${flag} ${JSON.stringify(value)}`).toBe(2);
+        expect(refused.err).toContain(`Bad ${flag} ${JSON.stringify(value)}`);
+        // An alias of a principal instance is refused as one, not merely as a malformed or non-canonical name.
+        const normalized = value.normalize("NFKC").toLowerCase().replace(/[\s\p{Cc}\p{Cf}]/gu, "");
+        expect(refused.err.includes(": a principal instance"), `${flag} ${JSON.stringify(value)}`).toBe(/^org($|[-:._@/])/.test(normalized));
       }
     }
     expect(await backendOf(root)).toBe("none");

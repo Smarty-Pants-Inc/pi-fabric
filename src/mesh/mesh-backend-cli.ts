@@ -119,13 +119,19 @@ const parseArgs = (argv: string[]): Options | "help" => {
   const alarmRoot = (flag: string, value: string): string => {
     // ponytail: Fabric keeps no list of principal instances (FabricPrincipal is input authority, RecordsPrincipal a
     // records caller), so a fixed deny list: `org` and every `org-*` (org-kate) are principal instances, never alarm
-    // targets (R-org-delegate; pi-fabric#919 review). Checked on the normalized name, so an alias ("Org", " org") is too.
-    if (/^org(-.*)?$/.test(value.trim().toLowerCase())) {
-      throw new UsageError(`Bad ${flag} ${value}: a principal instance (org, org-*) is never an alarm target; name the owning lead`);
+    // targets (R-org-delegate; pi-fabric#919 review). Checked on the normalized name (NFKC, lowercase, no whitespace,
+    // control or format characters), so no alias passes: "Org", "\torg", a fullwidth ＯＲＧ, org:, org/, Org.kate.
+    const normalized = value.normalize("NFKC").toLowerCase().replace(/[\s\p{Cc}\p{Cf}]/gu, "");
+    if (/^org($|[-:._@/])/.test(normalized)) {
+      throw new UsageError(`Bad ${flag} ${JSON.stringify(value)}: a principal instance (org, org-*) is never an alarm target; name the owning lead`);
+    }
+    // Only canonical roots are accepted (and sent as given): a root that differs from its normalized form is refused.
+    if (value !== normalized) {
+      throw new UsageError(`Bad ${flag} ${JSON.stringify(value)}: not a canonical root (lowercase, NFKC, no whitespace or control characters)`);
     }
     // One root name (a participant id or a session root): no wildcard, list or broadcast form.
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/.test(value)) {
-      throw new UsageError(`Bad ${flag} ${value} (one participant or root id: letters, digits, . _ : @ -; no wildcard or list)`);
+    if (!/^[a-z0-9][a-z0-9._:@-]{0,255}$/.test(value)) {
+      throw new UsageError(`Bad ${flag} ${JSON.stringify(value)} (one participant or root id: letters, digits, . _ : @ -; no wildcard or list)`);
     }
     return value;
   };

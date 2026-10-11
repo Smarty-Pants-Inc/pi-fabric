@@ -950,7 +950,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         await delay(900); return actor;
       });
     }
-    const args = requestArgs(state, "create");
+    // This fixture proves receipt expiry and resumed reconciliation, not host idle
+    // exit. Make its writer a real live-Main supervisor so advancing the retention
+    // wall clock cannot race unrelated cold-host shutdown before status/stop.
+    const args = { ...requestArgs(state, "create"), events: ["agent_settled"] };
     const mutation = `await pi.write({path:${JSON.stringify(path.join(state.root, "trigger.txt"))},text:"triggered"});`;
     const requests = `await agents.create(${JSON.stringify({ ...args, name: "boundary-one" })});` +
       (ending === "terminal failure" ? `await agents.create(${JSON.stringify({ ...args, name: "boundary-two" })});` : "");
@@ -1080,7 +1083,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
     try {
       const run = await registeredExecution(state, main, 5_000);
       const executed = vi.spyOn(FabricExecutionService.prototype, "execute");
-      const result = await run(`try { await agents.create(${JSON.stringify(requestArgs(state, "create"))}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
+      const result = await run(`try { await agents.create(${JSON.stringify({ ...requestArgs(state, "create"), events: ["agent_settled"] })}); } catch {} console.log("guest-large-log" + "log;".repeat(10000)); return "guest swallowed expiry";`);
       const settled = await executed.mock.results[0]!.value;
       const text = visibleText(result);
       artifactPath = /saved to: ([^\n]+)\]/.exec(text)?.[1];
@@ -1089,6 +1092,7 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
       await waitFor(() => entries(state.residencyRoot, "processing").length === 0);
       const realNow = Date.now.bind(Date);
       const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + RESIDENT_REQUEST_RETENTION_MS + 20_000);
+      await state.participants.refresh(); // resumed Main owns a real renewed lease at this watermark
       // The 250 ms exchange budget exists to expire the create above; this follow-up status read only checks the
       // committed actor, so give it a bounded 5 s budget (a 2-core CI runner timed out at 250 ms; smarty-dev#7651).
       state.client.options.commandTimeoutMs = 5_000;

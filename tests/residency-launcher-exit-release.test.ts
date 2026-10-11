@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
-import { reportResidentExit, runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { ResidentHost, reportResidentExit, runResidentHostFromConfigPath } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const waitFor = async (predicate: () => boolean, boundMs: number): Promise<void> => {
@@ -78,6 +78,35 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
     expect(exitLines(h.residencyRoot)).toHaveLength(1);
     expect(h.late()).toEqual([]);
   } finally {
+    vi.restoreAllMocks();
+    fs.rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+it.skipIf(!posix)("a dormant exit leaves one resident-exit dormant line before owner.json is removed", { timeout: 60_000 }, async () => {
+  const h = harness("dormant");
+  const controller = new AbortController();
+  let host: ResidentHost | undefined;
+  const start = ResidentHost.prototype.start;
+  vi.spyOn(ResidentHost.prototype, "start").mockImplementation(async function (this: ResidentHost) {
+    host = this;
+    await start.call(this);
+  });
+  const run = runResidentHostFromConfigPath(h.configPath, controller.signal);
+  try {
+    await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
+    const actor = await host!.actors.create({ name: "exit-listener", instructions: "wait", residency: "durable", topics: ["exit.wake"] });
+    await waitFor(() => host!.actors.status(actor.id).status === "dormant", 8_000);
+    const now = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
+    await run;
+    expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "dormant", pid: process.pid })]);
+    expect(exitLines(h.residencyRoot)).toHaveLength(1);
+    expect(fs.existsSync(h.ownerPath)).toBe(false);
+    expect(h.late()).toEqual([]);
+  } finally {
+    controller.abort();
+    await run.catch(() => undefined);
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
   }

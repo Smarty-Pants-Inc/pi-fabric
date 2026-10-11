@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { recordResidentGenerationExit, residentGenerationExitPath, residentGenerationsPath,
-  type ResidentGenerationExit } from "../src/residency/generation-exit.js";
+import { readResidentGenerationExit, recordLauncherGenerationExit, recordResidentGenerationExit, residentGenerationExitPath,
+  residentGenerationsPath, residentLauncherExitPath, type ResidentGenerationExit } from "../src/residency/generation-exit.js";
 import { processHarness } from "./helpers/process-harness.js";
 
 // smarty-dev#7950 (pi-fabric#902 review P1-1, P1-2): the record goes only into the verified generations/ dir of the
@@ -90,6 +90,37 @@ describe.skipIf(process.platform !== "linux")("resident generation exit record",
     expect(f.entries()).toEqual([`${f.generation}.exit.json`]);
   });
 
+  it("a short write is completed before the link; a write that makes no progress publishes nothing", () => {
+    const f = setup();
+    const write = fs.writeSync;
+    let calls = 0;
+    const spy = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Buffer, offset?: number, length?: number) =>
+      write(fd, buffer, offset ?? 0, ++calls === 1 ? 1 : length ?? buffer.length - (offset ?? 0))) as unknown as typeof fs.writeSync);
+    expect(f.outcome("host")).toEqual({ outcome: "written" });
+    expect(calls).toBeGreaterThan(1);
+    expect(f.read()).toMatchObject({ writer: "host", generation: f.generation });
+    spy.mockRestore();
+    const g = setup();
+    vi.spyOn(fs, "writeSync").mockImplementation((() => 0) as unknown as typeof fs.writeSync);
+    quiet();
+    expect(g.outcome("host")).toMatchObject({ outcome: "unavailable", reason: expect.stringContaining("short write") });
+    expect(g.entries()).toEqual([]);
+  });
+
+  it("the launcher keeps its diagnostic in the generation-private file when the host's record is invalid; readers fall back to it", () => {
+    const f = setup();
+    fs.writeFileSync(residentGenerationExitPath(f.root, f.generation), "{\"format\":1}", { mode: 0o600 });
+    quiet();
+    expect(recordLauncherGenerationExit(f.root, { ...f.record("launcher"), signal: "SIGKILL", code: null }))
+      .toMatchObject({ outcome: "invalid" });
+    const diagnostic = JSON.parse(fs.readFileSync(residentLauncherExitPath(f.root, f.generation), "utf8"));
+    expect(diagnostic).toMatchObject({ writer: "launcher", reason: "unreported", signal: "SIGKILL", diagnostic: expect.stringContaining("incomplete") });
+    expect(readResidentGenerationExit(f.root, f.generation)).toEqual(diagnostic);
+    const g = setup();
+    expect(g.outcome("host")).toEqual({ outcome: "written" });
+    expect(readResidentGenerationExit(g.root, g.generation)).toMatchObject({ writer: "host" });
+  });
+
   it("a host killed between its temp write and the link publishes nothing; the launcher's record goes in", async () => {
     const f = setup();
     const h = processHarness();
@@ -98,8 +129,10 @@ describe.skipIf(process.platform !== "linux")("resident generation exit record",
       await host.next("paused");
       expect(await host.kill("SIGKILL")).toEqual([null, "SIGKILL"]);
       expect(fs.existsSync(residentGenerationExitPath(f.root, f.generation))).toBe(false);
+      expect(fs.readdirSync(residentGenerationsPath(f.root)).filter(name => name.endsWith(".tmp"))).toHaveLength(1); // the dead host's
       expect(f.outcome("launcher")).toEqual({ outcome: "written" });
       expect(f.read()).toMatchObject({ writer: "launcher", reason: "unreported" });
+      expect(f.entries()).toEqual([`${f.generation}.exit.json`]); // the stale temp is gone
     } finally { await h.close(); }
   }, 60_000);
 

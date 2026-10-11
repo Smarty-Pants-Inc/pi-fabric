@@ -11,7 +11,7 @@ import { observeResidentOwner, captureDescendants, stopObservedDescendants, chec
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
-import { recordResidentGenerationExit } from "./generation-exit.js";
+import { recordLauncherGenerationExit } from "./generation-exit.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
   HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
@@ -332,13 +332,9 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       // owned child's exit goes only to its own generation's record, created
       // once: the host wrote it at release, else (SIGKILL, a crash) we do.
       if (attempt.generation) {
-        const recorded = recordResidentGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
+        // The exit record, else a generation-private diagnostic; never the shared error.json (a successor's).
+        recordLauncherGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
           reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
-        // A record exists but is not a complete one for this generation: keep this exit in error.json, as for
-        // other launcher failures (its fence: smarty-dev#9627), and say why.
-        if (recorded.outcome === "invalid") {
-          writeFailure(root, `Resident generation ${attempt.generation} exited (${signal ?? code ?? "unknown"}); its exit record is invalid: ${recorded.reason}`);
-        }
         return;
       }
       if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });

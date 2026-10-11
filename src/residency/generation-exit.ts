@@ -5,10 +5,12 @@ import path from "node:path";
 /**
  * Per-generation exit record (smarty-dev#7950): `<residencyRoot>/generations/<token>.exit.json`, where `<token>` is
  * the owner token the resident host published in owner.json. The host makes `generations/` while it owns the root.
- * The file is created with O_EXCL: the first writer wins and nothing ever rewrites it. The host writes its own exit
- * reason at release; the launcher writes one only for an owned child that exited without it (SIGKILL, a crash).
- * The path is private to that generation, so no write ever lands in a file a successor owns, and the writer needs
- * no ownership check before its open (the check-to-open window of smarty-dev#7770's launcher.log line).
+ * The record is published once, complete, and never replaced. The host writes its own exit reason at release; the
+ * launcher writes one only for an owned child that exited without it (SIGKILL, a crash). When that fails (the
+ * host left an invalid record, or the publish itself failed), the launcher keeps its diagnostic in
+ * `<token>.launcher-exit.json`, also generation-private. These paths are private to one generation, so no write
+ * ever lands in a file a successor owns (never the shared error.json or launcher.log), and the writer needs no
+ * ownership check before its open (the check-to-open window of smarty-dev#7770's launcher.log line).
  */
 export interface ResidentGenerationExit {
   format: 1;
@@ -20,13 +22,22 @@ export interface ResidentGenerationExit {
   at: number;
   code?: number | null;
   signal?: string | null;
+  /** Launcher diagnostic file only: why the exit record could not be used. */
+  diagnostic?: string;
 }
 
 const TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const EXIT = (generation: string): string => `${generation}.exit.json`;
+const LAUNCHER_EXIT = (generation: string): string => `${generation}.launcher-exit.json`;
+/** A temp file of this module for `generation`: `.<generation>.<pid>.<uuid>.tmp`. */
+const tempPattern = (generation: string): RegExp =>
+  new RegExp(`^\\.${generation}\\.(\\d+)\\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.tmp$`);
 
 export const residentGenerationsPath = (residencyRoot: string): string => path.join(residencyRoot, "generations");
 export const residentGenerationExitPath = (residencyRoot: string, generation: string): string =>
-  path.join(residentGenerationsPath(residencyRoot), `${generation}.exit.json`);
+  path.join(residentGenerationsPath(residencyRoot), EXIT(generation));
+export const residentLauncherExitPath = (residencyRoot: string, generation: string): string =>
+  path.join(residentGenerationsPath(residencyRoot), LAUNCHER_EXIT(generation));
 
 /** The host, while it owns the root: make `generations/`. Diagnostics only: a failure (or a foreign path, which
  * the record step refuses) never blocks the start; that generation then has no exit record. */
@@ -34,30 +45,42 @@ export const ensureResidentGenerations = (residencyRoot: string): void => {
   try { fs.mkdirSync(residentGenerationsPath(residencyRoot), { mode: 0o700 }); } catch { /* exists, or unavailable */ }
 };
 
-/** Directory-relative path through the pinned directory fd: no second resolution of `generations/` (Node has no
- * openat/linkat; the same /proc/self/fd form as verified-remove.ts). */
+/** Directory-relative path through a pinned directory fd: no second resolution (Node has no openat/linkat; the same
+ * /proc/self/fd form as verified-remove.ts). */
 const at = (dirFd: number, name: string): string => `/proc/self/fd/${dirFd}/${name}`;
 
+/** Why `text` is not a complete record for `generation`; undefined when it is. */
+const invalidRecord = (text: string, generation: string): string | undefined => {
+  let value: Partial<ResidentGenerationExit> | null;
+  try { value = JSON.parse(text) as Partial<ResidentGenerationExit> | null; }
+  catch (error) { return `the record is unreadable: ${error instanceof Error ? error.message : String(error)}`; }
+  if (value?.format !== 1 || value.generation !== generation || (value.writer !== "host" && value.writer !== "launcher") ||
+      typeof value.reason !== "string" || !Number.isSafeInteger(value.pid) || !Number.isFinite(value.at)) {
+    return "the record is incomplete or names another generation";
+  }
+  return undefined;
+};
+
+export type GenerationExitOutcome = { outcome: "written" | "exists" | "unavailable" | "invalid"; reason?: string };
+
 /**
- * Create the generation's exit record, once, complete. Never makes a directory: a missing or foreign `generations/`
- * (no owning host made it) writes nothing.
+ * Publish `<generation><suffix>` once, complete, in the verified `generations/` dir:
  * 1. Open the residency root, then `generations/` relative to it, each as a handle (O_DIRECTORY|O_NOFOLLOW), and
  *    check each fd: a directory, ours, not group- or world-writable. Everything after goes through the
- *    `generations/` fd, so a swapped path cannot receive the record.
- * 2. Write the JSON to a fresh temp name (O_EXCL) and fsync it; then link(temp, final), which fails with EEXIST if a
- *    record exists: an atomic no-replace publish of a complete file. A writer killed before the link publishes
- *    nothing (the other writer's record goes in); one killed after it has published a complete record.
- * 3. Unlink the temp and fsync the directory.
- * 4. On EEXIST, validate the existing record (a complete record for this generation): "exists" if so, else
- *    "invalid" with the reason, so the caller can keep its own report elsewhere.
- * Linux only (the fd-relative form needs /proc/self/fd); elsewhere it fails closed. One stderr line when unavailable
- * or invalid; never throws (diagnostics never block an exit).
+ *    `generations/` fd, so a swapped path cannot receive the file.
+ * 2. Remove this generation's stale temp files: exact temp name, a regular file of ours, its writer pid gone.
+ * 3. Write the JSON to a fresh temp name (O_EXCL), every byte (a short write is retried; no progress fails before
+ *    the link), and fsync it; then link(temp, final), which fails with EEXIST if the file exists: an atomic
+ *    no-replace publish. A writer killed before the link publishes nothing; one killed after it published a
+ *    complete file. Unlink the temp and fsync the directory.
+ * 4. Read the published (or existing) file back through the same handle and validate it.
+ * Linux only (the fd-relative form needs /proc/self/fd); elsewhere it fails closed. One stderr line when
+ * unavailable or invalid; never throws (diagnostics never block an exit).
  */
-export type GenerationExitOutcome = { outcome: "written" | "exists" | "unavailable" | "invalid"; reason?: string };
-export const recordResidentGenerationExit = (residencyRoot: string, record: ResidentGenerationExit,
-  constants: Partial<typeof fs.constants> = fs.constants): GenerationExitOutcome => {
+const publish = (residencyRoot: string, record: ResidentGenerationExit, name: string,
+  constants: Partial<typeof fs.constants>): GenerationExitOutcome => {
   const refuse = (outcome: "unavailable" | "invalid", reason: string): GenerationExitOutcome => {
-    try { process.stderr.write(`Fabric resident generation exit record ${outcome} (${record.generation}): ${reason}\n`); }
+    try { process.stderr.write(`Fabric resident generation ${name} ${outcome} (${record.generation}): ${reason}\n`); }
     catch { /* best effort */ }
     return { outcome, reason };
   };
@@ -67,13 +90,12 @@ export const recordResidentGenerationExit = (residencyRoot: string, record: Resi
   if (process.platform !== "linux" || O_EXCL === undefined || O_NOFOLLOW === undefined || O_DIRECTORY === undefined) {
     return unavailable("needs Linux O_DIRECTORY/O_NOFOLLOW and /proc/self/fd");
   }
-  const privateDir = (fd: number, name: string): string | undefined => {
+  const uid = process.getuid?.();
+  const privateDir = (fd: number, label: string): string | undefined => {
     const stat = fs.fstatSync(fd);
-    if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0) {
-      return `${name} is not a private directory owned by this user`;
-    }
+    if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o022) !== 0) return `${label} is not a private directory owned by this user`;
     const pinned = fs.statSync(`/proc/self/fd/${fd}`);
-    return pinned.dev === stat.dev && pinned.ino === stat.ino ? undefined : `/proc/self/fd does not resolve ${name}`;
+    return pinned.dev === stat.dev && pinned.ino === stat.ino ? undefined : `/proc/self/fd does not resolve ${label}`;
   };
   let rootFd: number | undefined, dirFd: number | undefined, fileFd: number | undefined, temp: string | undefined;
   try {
@@ -83,20 +105,40 @@ export const recordResidentGenerationExit = (residencyRoot: string, record: Resi
     dirFd = fs.openSync(at(rootFd, "generations"), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     const dirRefusal = privateDir(dirFd, "generations/");
     if (dirRefusal) return unavailable(dirRefusal);
+    const stale = tempPattern(record.generation);
+    for (const entry of fs.readdirSync(at(dirFd, "."))) {
+      const match = stale.exec(entry);
+      if (!match || Number(match[1]) === process.pid) continue;
+      try { process.kill(Number(match[1]), 0); continue; } // its writer may still be writing
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue; }
+      const stat = fs.lstatSync(at(dirFd, entry), { throwIfNoEntry: false });
+      if (stat?.isFile() && stat.uid === uid) fs.rmSync(at(dirFd, entry), { force: true });
+    }
     temp = `.${record.generation}.${process.pid}.${randomUUID()}.tmp`;
     fileFd = fs.openSync(at(dirFd, temp), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
-    fs.writeSync(fileFd, JSON.stringify(record));
+    const bytes = Buffer.from(JSON.stringify(record));
+    for (let offset = 0; offset < bytes.length;) {
+      const written = fs.writeSync(fileFd, bytes, offset, bytes.length - offset);
+      if (!(written > 0)) throw new Error(`short write: ${offset} of ${bytes.length} bytes`);
+      offset += written;
+    }
     fs.fsyncSync(fileFd);
     fs.closeSync(fileFd); fileFd = undefined;
-    const final = at(dirFd, `${record.generation}.exit.json`);
     let existed = false;
-    try { fs.linkSync(at(dirFd, temp), final); }
+    try { fs.linkSync(at(dirFd, temp), at(dirFd, name)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; existed = true; }
     fs.unlinkSync(at(dirFd, temp)); temp = undefined;
     fs.fsyncSync(dirFd);
-    if (!existed) return { outcome: "written" };
-    const invalid = invalidGenerationExit(final, record.generation, O_RDONLY | O_NOFOLLOW);
-    return invalid ? refuse("invalid", invalid) : { outcome: "exists" };
+    let invalid: string | undefined;
+    let readFd: number | undefined;
+    try {
+      readFd = fs.openSync(at(dirFd, name), O_RDONLY | O_NOFOLLOW);
+      const stat = fs.fstatSync(readFd);
+      invalid = !stat.isFile() || stat.size > 64 * 1024 ? "the record is not a small regular file"
+        : invalidRecord(fs.readFileSync(readFd, "utf8"), record.generation);
+    } finally { if (readFd !== undefined) fs.closeSync(readFd); }
+    if (invalid) return refuse("invalid", `${existed ? "the existing" : "the published"} ${invalid.replace(/^the /, "")}`);
+    return { outcome: existed ? "exists" : "written" };
   } catch (error) {
     return unavailable(error instanceof Error ? error.message : String(error));
   } finally {
@@ -107,20 +149,36 @@ export const recordResidentGenerationExit = (residencyRoot: string, record: Resi
   }
 };
 
-/** Why an existing record is not a complete record for `generation`; undefined when it is. */
-const invalidGenerationExit = (file: string, generation: string, flags: number): string | undefined => {
-  let fd: number | undefined;
-  try {
-    fd = fs.openSync(file, flags);
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > 64 * 1024) return "the existing record is not a small regular file";
-    const value = JSON.parse(fs.readFileSync(fd, "utf8")) as Partial<ResidentGenerationExit> | null;
-    if (value?.format !== 1 || value.generation !== generation || (value.writer !== "host" && value.writer !== "launcher") ||
-        typeof value.reason !== "string" || !Number.isSafeInteger(value.pid) || !Number.isFinite(value.at)) {
-      return "the existing record is incomplete or names another generation";
-    }
-    return undefined;
-  } catch (error) {
-    return `the existing record is unreadable: ${error instanceof Error ? error.message : String(error)}`;
-  } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } } }
+/** Create the generation's exit record, once, complete (see `publish`). "exists" means a complete record for this
+ * generation already stands; "invalid" names why the standing (or just published) file is not one. */
+export const recordResidentGenerationExit = (residencyRoot: string, record: ResidentGenerationExit,
+  constants: Partial<typeof fs.constants> = fs.constants): GenerationExitOutcome =>
+  publish(residencyRoot, record, EXIT(record.generation), constants);
+
+/**
+ * The launcher, after its owned child exited: the exit record, else (the host's record is invalid, or the publish
+ * failed) its diagnostic in the generation-private `<generation>.launcher-exit.json`. Never a shared root file.
+ */
+export const recordLauncherGenerationExit = (residencyRoot: string, record: ResidentGenerationExit,
+  constants: Partial<typeof fs.constants> = fs.constants): GenerationExitOutcome => {
+  const recorded = recordResidentGenerationExit(residencyRoot, record, constants);
+  if (recorded.outcome === "written" || recorded.outcome === "exists") return recorded;
+  publish(residencyRoot, { ...record, diagnostic: recorded.reason ?? recorded.outcome }, LAUNCHER_EXIT(record.generation), constants);
+  return recorded;
+};
+
+/** A generation's exit as recorded: the host's (or launcher's) complete exit record, else the launcher's diagnostic. */
+export const readResidentGenerationExit = (residencyRoot: string, generation: string): ResidentGenerationExit | undefined => {
+  if (!TOKEN.test(generation)) return undefined;
+  for (const file of [residentGenerationExitPath(residencyRoot, generation), residentLauncherExitPath(residencyRoot, generation)]) {
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      if (!fs.fstatSync(fd).isFile()) continue;
+      const text = fs.readFileSync(fd, "utf8");
+      if (!invalidRecord(text, generation)) return JSON.parse(text) as ResidentGenerationExit;
+    } catch { /* absent or unreadable: the next */ }
+    finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } } }
+  }
+  return undefined;
 };

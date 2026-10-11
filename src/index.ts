@@ -3,7 +3,7 @@ import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
-import { actorBashTimeout } from "./guards/actor-bash-timeout.js";
+import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -964,9 +964,9 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);
     if (reason) return { block: true, reason };
-    // smarty-dev#2184: judged on the caller's own timeout above, so the injected default never unblocks a wait.
-    const injected = actorBashTimeout(process.env, timeout);
-    if (injected !== undefined) (event.input as { timeout?: number }).timeout = injected;
+    // smarty-dev#2184, #6137: judged on the caller's own command and timeout above, so the injected
+    // defaults (total cap, idle watchdog) never unblock a wait.
+    applyRunBashDefaults(process.env, event.input as Parameters<typeof applyRunBashDefaults>[1]);
     return undefined;
   });
 

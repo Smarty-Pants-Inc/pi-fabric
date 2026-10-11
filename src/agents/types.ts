@@ -72,6 +72,8 @@ export interface AgentRunRequest {
   /** Host-only admission snapshot. Never accepted by normalizeAgentRunRequest. */
   provenance?: FabricTurnProvenance | undefined;
   task: string;
+  /** Caller classification passed to the optional external spawn router. */
+  complexity?: "simple" | "normal" | "complex" | "delicate";
   /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
   /** Absolute inputs that must exist on the selected execution host before starting. */
@@ -123,6 +125,8 @@ export interface AgentRunRequest {
   nice?: number;
   /** Actor runs: default bash timeout (s), exported as PI_FABRIC_ACTOR_BASH_TIMEOUT_S; 0 = none. */
   bashTimeoutSeconds?: number;
+  /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
+  bashIdleSeconds?: number;
 }
 
 export interface AgentUsage {
@@ -196,6 +200,8 @@ export interface AgentRunRecord {
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
   toolCalls: number;
+  /** Durable ordinary-task answer boundary; native execution custody is separate. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
   /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
@@ -250,6 +256,7 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
@@ -325,6 +332,7 @@ export interface AgentWorkerOptions {
   /** Niceness applied to the spawned child (and IO priority on Linux). */
   nice?: number;
   bashTimeoutSeconds?: number;
+  bashIdleSeconds?: number;
   fabricExtensionPath?: string;
   routeHeader?: string;
   /** Host-only bounded judge: no ambient resources, compaction or retry. */

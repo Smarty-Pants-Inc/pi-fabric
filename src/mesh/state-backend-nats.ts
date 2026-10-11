@@ -614,7 +614,15 @@ export class NatsStateBackend implements StateBackend {
     const body = serializeModelBounded(model, this.#limits.maxBytes);
     if (body === undefined) return false;
     const parts: string[] = [];
-    for (let offset = 0; offset < body.length; offset += SNAPSHOT_CHUNK) parts.push(body.slice(offset, offset + SNAPSHOT_CHUNK));
+    // pi-fabric#907 round 5: never split a surrogate pair. A boundary right after a high surrogate moves back one code
+    // unit, so every chunk is well-formed text and the per-chunk UTF-8 byte counts sum to the body's.
+    for (let offset = 0; offset < body.length;) {
+      let end = Math.min(offset + SNAPSHOT_CHUNK, body.length);
+      const last = body.charCodeAt(end - 1);
+      if (end < body.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+      parts.push(body.slice(offset, end));
+      offset = end;
+    }
     const snapshot = randomUUID();
     const header = headerOf(model, body, snapshot, parts.length);
     const records: NatsRecord[] = [

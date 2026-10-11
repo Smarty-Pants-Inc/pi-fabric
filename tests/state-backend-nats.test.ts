@@ -712,6 +712,25 @@ describe("NATS state snapshots: review round 2 (pi-fabric#907)", () => {
     expect(() => backend.get("v/0")).toThrow(MeshStateNatsSnapshotIntegrityError);
   });
 
+  it("an emoji across the 64 Ki chunk boundary round-trips byte-identical, and the chunk byte counts sum to the body", async () => {
+    const server = fakeJetStream();
+    const backend = await open(server, { snapshotEvery: 0 });
+    // The body starts `{"entries":[{"key":"e/a","value":"` (34 code units): the emoji's high surrogate lands at 65535,
+    // the last unit of chunk 0, so a plain slice would split the pair.
+    const value = `${"x".repeat(65_535 - 34)}\u{1F600}${"y".repeat(10)}`;
+    await backend.put({ key: "e/a", value, identity });
+    expect(await backend.compact()).toBe(true);
+    const end = server.messages.length;
+    const header = json(server, end).header as { bytes: number };
+    const chunks = server.messages.slice(-1 - (json(server, end) as { chunks: number }).chunks, -1).map(message => (JSON.parse(Buffer.from(message.data).toString()) as { part: string }).part);
+    expect(chunks[0]!.length).toBe(65_535); // moved back off the high surrogate
+    expect(chunks.reduce((sum, part) => sum + Buffer.byteLength(part, "utf8"), 0)).toBe(header.bytes);
+    expect(chunks.join("")).toContain("\u{1F600}");
+    const replica = await replicaOf(server);
+    expect(replica.get("e/a")?.value).toBe(value);
+    replica.close();
+  });
+
   it("a live end record claiming 2^52 bytes is refused against the configured bound, before any entry is serialized", async () => {
     const { server, backend, end } = await snapshotted();
     const forged = json(server, end);

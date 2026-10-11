@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeshBackendRefusedError } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -156,6 +156,82 @@ describe.skipIf(process.platform === "win32")("a non-Fabric reader's documented 
     expect(refused.code).toBe(3);
     expect(JSON.parse(refused.out).error).toBe(`--scratch-proof-from ${big} is larger than 64 MiB (67108865 bytes)`);
     expect(fs.readdirSync(parent)).toEqual([]);
+  });
+
+  // smarty-dev#9526 (pi-fabric#884 P2-a): the cap is enforced while reading, from the same fd, not after a whole read.
+  it("refuses a source that grows past 64 MiB after its fstat, reading at most 64 MiB + 1 byte of it", async () => {
+    const mesh = await fileRoot();
+    const source = path.join(mesh, "state.json");
+    const parent = tempDir("parent");
+    const fstat = fs.fstatSync, readSync = fs.readSync, readFileSync = fs.readFileSync;
+    let grown = false, read = 0;
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+      const stat = (fstat as (...args: unknown[]) => fs.Stats)(fd, ...rest);
+      if (!grown && stat.isFile() && stat.ino === fs.statSync(source).ino) { grown = true; fs.truncateSync(source, 80 * 1024 * 1024); }
+      return stat;
+    }) as typeof fs.fstatSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+      const n = (readSync as (...values: unknown[]) => number)(...args);
+      read += n;
+      return n;
+    }) as typeof fs.readSync);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      const result = (readFileSync as (...values: unknown[]) => string | Buffer)(file, ...rest);
+      if (typeof file === "number") read += result.length;
+      return result;
+    }) as typeof fs.readFileSync);
+    try {
+      const refused = await cli(["import", "--scratch-proof-from", source, "--scratch-parent", parent, "--json"]);
+      expect(grown).toBe(true);
+      expect(refused.code).toBe(3);
+      expect(JSON.parse(refused.out).error).toBe(`--scratch-proof-from ${source} grew past 64 MiB while it was read`);
+      expect(read).toBeLessThanOrEqual(64 * 1024 * 1024 + 1);
+      expect(fs.readdirSync(parent)).toEqual([]);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  // smarty-dev#9526 (pi-fabric#884 P2-b): without a directory-fd base the pin cannot hold, and nothing is created.
+  it("with neither /proc/self/fd nor /dev/fd, refuses before creating the scratch directory", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    const absent = (name: string) => name.startsWith("/proc/self/fd") || name.startsWith("/dev/fd");
+    const enoent = () => Object.assign(new Error("ENOENT: no fd directory"), { code: "ENOENT" });
+    const statSync = fs.statSync, readdirSync = fs.readdirSync, openSync = fs.openSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (absent(String(file))) { if ((rest[0] as { throwIfNoEntry?: boolean } | undefined)?.throwIfNoEntry === false) return undefined; throw enoent(); }
+      return (statSync as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.statSync);
+    vi.spyOn(fs, "readdirSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (absent(String(file))) throw enoent();
+      return (readdirSync as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readdirSync);
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (absent(String(file))) throw enoent();
+      return (openSync as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    try {
+      const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"]);
+      expect(refused.code).toBe(3);
+      expect(JSON.parse(refused.out).error).toContain("to pin its scratch directory");
+      expect(fs.readdirSync(parent)).toEqual([]);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  // smarty-dev#9637: an open that fails right after mkdtemp (EMFILE) removes the empty directory it just made.
+  it("a failed open of the new scratch directory removes it and surfaces the error", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    const openSync = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (path.basename(String(file)).startsWith("fabric-scratch-proof-")) throw Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+      return (openSync as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    try {
+      const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"]);
+      expect(refused.code).not.toBe(0);
+      expect(refused.out + refused.err).toContain("EMFILE");
+      expect(fs.readdirSync(parent)).toEqual([]);
+    } finally { vi.restoreAllMocks(); }
   });
 
   it("warns in --json and on stderr when the scratch cleanup fails", async () => {

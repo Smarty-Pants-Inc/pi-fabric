@@ -4,6 +4,7 @@ import { childProcessEnvironment } from "./core/atomic-write.js";
 import fs from "node:fs";
 import { followUpFile, followUpState, followUpMessageId, releaseFollowUpPayload } from "./agents/follow-up-delivery.js";
 import path from "node:path";
+import { mkdirPrivate } from "./storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
@@ -345,7 +346,9 @@ const main = async (): Promise<void> => {
   const taskProvenance = fs.existsSync(options.taskFile + ".provenance.json")
     ? copyFabricProvenance(JSON.parse(fs.readFileSync(options.taskFile + ".provenance.json", "utf8"))) : undefined;
   const deliveryDirectory = path.join(path.dirname(options.taskFile), "deliveries");
-  fs.mkdirSync(deliveryDirectory, { recursive: true, mode: 0o700 });
+  // The run root (the run directory's parent) is the Fabric-owned anchor (pi-fabric#875 round 3).
+  const runRoot = path.dirname(path.dirname(options.taskFile));
+  mkdirPrivate(deliveryDirectory, runRoot);
   const images = readImages(options.imagesFile);
   const record = createRunningRecord(options, task, thinking, Date.now());
   if (options.runner === "pi") {
@@ -368,7 +371,7 @@ const main = async (): Promise<void> => {
     data?: Record<string, unknown>,
   ): void => {
     try {
-      fs.mkdirSync(path.dirname(options.lifecycleFile), { recursive: true });
+      mkdirPrivate(path.dirname(options.lifecycleFile), runRoot); // smarty-dev#9016: 0700 under any umask
       fs.appendFileSync(
         options.lifecycleFile,
         JSON.stringify({ version: 1, event, occurredAt: Date.now(), ...(data ? { data } : {}) }) + "\n",
@@ -380,7 +383,7 @@ const main = async (): Promise<void> => {
   };
   crashContext = { statusFile: options.statusFile, record };
   process.stdout.write(`[pi-fabric] ${options.name}\n${task}\n\n`);
-  fs.mkdirSync(path.dirname(options.logFile), { recursive: true });
+  mkdirPrivate(path.dirname(options.logFile), runRoot); // smarty-dev#9016: 0700 under any umask
   // Other processes tail this file while the run is live (transcript reader,
   // dashboards, preview trees). The previous buffered createWriteStream visibly
   // stalled mid-run — append synchronously so events are durable immediately.

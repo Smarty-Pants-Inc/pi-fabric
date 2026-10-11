@@ -227,6 +227,21 @@ const assertSafeChain = (directory: string): void => {
  */
 const MAX_SCRATCH_SOURCE_BYTES = 64 * 1024 * 1024;
 interface Scratch { root: string; fd: number; pinned: string }
+/**
+ * The fd directory through which a held directory fd can be traversed (`/proc/self/fd`, else `/dev/fd`), proven on
+ * an fd of `base` itself: `<fdBase>/<fd>/.` must name that directory. Refuses when neither works. Creates nothing.
+ */
+const scratchFdBase = (base: string): string => {
+  const probe = fs.openSync(base, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  try {
+    const held = fs.fstatSync(probe);
+    for (const fdBase of ["/proc/self/fd", "/dev/fd"]) {
+      const through = (() => { try { return fs.statSync(path.join(fdBase, String(probe), ".")); } catch { return undefined; } })();
+      if (through?.isDirectory() && through.dev === held.dev && through.ino === held.ino) return fdBase;
+    }
+  } finally { fs.closeSync(probe); }
+  throw new MeshBackendRefusedError("--scratch-proof-from needs /proc/self/fd or /dev/fd to pin its scratch directory");
+};
 const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch => {
   if (process.platform === "win32" || typeof process.getuid !== "function") throw new MeshBackendRefusedError("--scratch-proof-from needs POSIX ownership (not on this platform)");
   const base = parent ?? os.tmpdir();
@@ -237,17 +252,37 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
     const stat = fs.fstatSync(source);
     if (!stat.isFile()) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is not a regular file`);
     if (stat.size > MAX_SCRATCH_SOURCE_BYTES) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is larger than 64 MiB (${stat.size} bytes)`);
-    bytes = fs.readFileSync(source);
-    if (bytes.length > MAX_SCRATCH_SOURCE_BYTES) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} grew past 64 MiB while it was read`);
+    // smarty-dev#9526: read at most cap+1 bytes from this fd; a source that grew after the fstat is refused unread.
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let read; (read = fs.readSync(source, chunk, 0, Math.min(chunk.length, MAX_SCRATCH_SOURCE_BYTES + 1 - total), null)) > 0;) {
+      chunks.push(Buffer.from(chunk.subarray(0, read)));
+      total += read;
+      if (total > MAX_SCRATCH_SOURCE_BYTES) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} grew past 64 MiB while it was read`);
+    }
+    bytes = Buffer.concat(chunks, total);
   } finally { fs.closeSync(source); }
+  // smarty-dev#9526: the copy, the import and the cleanup all go through the pinned fd, so prove the platform can
+  // traverse a directory fd BEFORE anything is created: otherwise a refused pin also left its directory behind.
+  const fdBase = scratchFdBase(base);
   const root = fs.mkdtempSync(path.join(base, "fabric-scratch-proof-"));
-  const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-  const pinned = `/proc/self/fd/${fd}`;
+  let fd: number;
+  try { fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); }
+  catch (error) {
+    // smarty-dev#9637: no fd (EMFILE, say), so no pin. Remove the directory just made, by name and only while it is
+    // still empty (rmdir, never recursive), then surface the open's error.
+    const warnings: string[] = [];
+    try { fs.rmdirSync(root); }
+    catch (cleanup) { warnings.push(`could not remove the scratch directory ${root}: ${(cleanup as Error).message}`); }
+    throw Object.assign(error as Error, { cleanupWarnings: warnings });
+  }
+  const pinned = `${fdBase}/${fd}`;
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o700) throw new MeshBackendRefusedError(`scratch directory ${root} is not our private directory`);
     const through = fs.statSync(pinned, { throwIfNoEntry: false });
-    if (!through || through.dev !== stat.dev || through.ino !== stat.ino) throw new MeshBackendRefusedError("--scratch-proof-from needs /proc/self/fd to pin its scratch directory");
+    if (!through || through.dev !== stat.dev || through.ino !== stat.ino) throw new MeshBackendRefusedError(`--scratch-proof-from needs ${fdBase} to pin its scratch directory`);
     const copy = fs.openSync(path.join(pinned, "state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
     try { fs.writeFileSync(copy, bytes); fs.fsyncSync(copy); } finally { fs.closeSync(copy); }
   } catch (error) {

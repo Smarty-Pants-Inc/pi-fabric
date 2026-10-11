@@ -143,7 +143,7 @@ const __call = async (ref, args) => {
   __recordSuccessfulCall(ref, normalizedArgs);
   return value;
 };
-const __piToolNames = ["read","bash","powershell","edit","write","grep","find","ls"];
+// __piToolNames is declared once, below, beside the π proxy (upstream placement).
 const __coreToolHint = (name) => __piToolsAvailable
   ? "For the Pi core tool, call pi." + name + "(args), e.g. pi." + name + "({ ... })."
   : "Orchestration-only mode: pi does not exist inside fabric_exec; call the native " + name + " tool directly, outside fabric_exec.";

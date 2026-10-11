@@ -311,7 +311,8 @@ export class AgentCompletionInbox {
     } finally {
       this.#confirmHeld();
     }
-    if (!this.#pending.size && this.#timer) {
+    // A failed delivered receipt keeps its retry timer even with nothing left to send.
+    if (!this.#pending.size && !this.#receiptRetries.size && this.#timer) {
       clearTimeout(this.#timer);
       this.#timer = undefined;
     }

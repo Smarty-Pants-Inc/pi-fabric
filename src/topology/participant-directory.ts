@@ -658,6 +658,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** Per-key waits must not stop the independent host heartbeat. */
   #fileWork = 0;
   #refreshedAt = Date.now();
+  // canConsumeMesh's own refresh kick: last attempt and its backoff during a non-lock outage.
+  #confirmKickAt = Number.NEGATIVE_INFINITY;
+  #confirmKickDelay = 0;
   #refreshStartedAt: number | undefined;
   #refreshError: unknown;
   /** A bounded routing read is not a heartbeat/admission receipt. */
@@ -1692,7 +1695,20 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A typed lock timeout already has a single host recovery lane. Idle consumers
     // call this gate as often as every 100 ms; they must not multiply attempts.
     if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
-      void this.#backgroundRefresh.run(() => this.refresh(), false);
+      // A failed refresh still renews the watched host-lease file, and event-driven
+      // consumers (#792) re-check this gate on that very notification. Without a bound,
+      // each failed attempt would re-arm the next one at once: a CPU and log spin (a
+      // vitest fork ran out of heap on it). Back off kicks while the same non-lock
+      // error persists, capped at the heartbeat timer that retries it anyway.
+      const at = Date.now();
+      if (this.#refreshError === undefined) this.#confirmKickDelay = 0;
+      if (at - this.#confirmKickAt >= this.#confirmKickDelay) {
+        this.#confirmKickAt = at;
+        if (this.#refreshError !== undefined) {
+          this.#confirmKickDelay = Math.min(this.#heartbeatMs, Math.max(100, this.#confirmKickDelay * 2));
+        }
+        void this.#backgroundRefresh.run(() => this.refresh(), false);
+      }
     }
     return confirmed;
   }

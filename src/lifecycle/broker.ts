@@ -56,6 +56,8 @@ export class LifecycleBroker {
   #failedStamp: string | undefined;
   #deliveryFailed = false;
   #dirty = false;
+  // One owned backoff retry after a typed lock timeout/WAL-cap deferral; never idle polling.
+  #retryTimer: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
   #publishTail: Promise<void> = Promise.resolve();
   #pollScheduled = false;
@@ -200,6 +202,8 @@ export class LifecycleBroker {
 
   pause(): void {
     this.#paused = true;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
   }
   resume(): void { if (!this.#closed) { this.#paused = false; this.#schedulePoll(); } }
   async checkpointForRelease(): Promise<void> {
@@ -216,6 +220,8 @@ export class LifecycleBroker {
     this.#closed = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     for (const watcher of this.#directoryWatchers.values()) watcher.close();
@@ -278,15 +284,18 @@ export class LifecycleBroker {
     } catch { /* The fixed-file safety witness covers unavailable watches. */ }
   }
 
-  #schedulePoll(): void {
+  #schedulePoll(retry = false): void {
     if (this.#closed || this.#paused || !this.options.enabled) return;
     this.#dirty = true;
     if (this.#pollScheduled || this.#running) return;
     this.#pollScheduled = true;
-    this.#backgroundPoll.success(); // Only a real event/explicit resume owns this attempt.
+    // Only a real event/explicit resume owns this attempt; the owned retry keeps its backoff.
+    if (!retry) this.#backgroundPoll.success();
     queueMicrotask(() => {
       this.#pollScheduled = false;
       if (this.#closed || this.#paused) return;
+      if (this.#retryTimer) clearTimeout(this.#retryTimer); // This attempt supersedes it.
+      this.#retryTimer = undefined;
       this.#running = true;
       this.#dirty = false;
       this.#deliveryFailed = false;
@@ -297,7 +306,18 @@ export class LifecycleBroker {
           this.#failedStamp = meshObserverStamp(this.mesh.root, OBSERVED_FILES);
         } else this.#failedStamp = undefined;
         if (result === "done" && !this.#deliveryFailed && this.#dirty) this.#schedulePoll();
-        // Unread work/receipts wait for an event, never a periodic delivery retry.
+        // A typed lock timeout/WAL-cap deferral logged "retrying in N ms": releasing a lock
+        // is no observed file event, so this attempt owns exactly that backoff retry.
+        else if (result === "retry") {
+          const timer = setTimeout(() => {
+            if (this.#retryTimer !== timer) return;
+            this.#retryTimer = undefined;
+            this.#schedulePoll(true);
+          }, Math.max(1, this.#backgroundPoll.waitMs));
+          this.#retryTimer = timer;
+          timer.unref();
+        }
+        // Other unread work/receipts wait for an event, never a periodic delivery retry.
       });
     });
   }

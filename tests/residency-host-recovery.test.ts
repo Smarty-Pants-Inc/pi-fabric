@@ -116,8 +116,13 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       expect(renewal === "confirmWritable" ? writes : confirmations).not.toHaveBeenCalled();
       tail = vi.spyOn(host.mesh, "tail");
       lifecycle = vi.spyOn(host.mesh, "read");
+      const renewals = renewal === "confirmWritable" ? confirmations : writes;
+      const attempts = renewals.mock.calls.length;
       const event = await host.mesh.publish({ topic: "fleet.recovery", kind: "probe", from: host.identity, data: {} });
       await new Promise(resolve => setTimeout(resolve, 100));
+      // A failed attempt renews the watched host-lease file; that notification must not
+      // re-arm the gate's refresh at once (#792: unbounded spin, then a worker heap OOM).
+      expect(renewals.mock.calls.length - attempts).toBeLessThanOrEqual(3);
       expect(tail).not.toHaveBeenCalled();
       expect(lifecycle).not.toHaveBeenCalled();
       expect(host.participants.canConsumeMesh()).toBe(false);

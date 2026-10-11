@@ -520,6 +520,23 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(checkpointFlagRaised(root)).toBe(false);
   });
 
+  // smarty-dev#7421: a crashed holder's flag is removed by the next writer's scan; a live holder's flag stays.
+  it("the next writer removes a crashed holder's stale flag and keeps a live holder's", () => {
+    const root = lockRoot();
+    const crash = `import { createJiti } from "jiti"; import { pathToFileURL } from "node:url";
+      const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+      const { raiseCheckpointFlag, ownerToken } = await jiti.import("./src/mesh/state-sqlite.ts");
+      process.stdout.write(raiseCheckpointFlag(process.argv[1], ownerToken())); process.exit(0);`; // no lowerCheckpointFlag
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", crash, root], { cwd: process.cwd(), encoding: "utf8" });
+    const crashed = child.stdout;
+    expect(path.basename(crashed).startsWith(`${child.pid}.`)).toBe(true);
+    const live = raiseCheckpointFlag(root, ownerToken());
+    age(crashed, 5_000);
+    age(live, 5_000); // a live holder's stale flag is kept: only a dead holder's flag is removed
+    expect(checkpointFlagRaised(root)).toBe(false);
+    expect(fs.readdirSync(path.dirname(live))).toEqual([path.basename(live)]);
+  });
+
   // pi-fabric#694 P2-D: an existing flag directory is never followed or written through unless it is ours.
   it.skipIf(process.platform === "win32")("refuses a symlinked or group-writable flag directory and never writes through it", () => {
     const root = lockRoot();

@@ -44,21 +44,41 @@
  * no maintainer in production a hub's WAL reached 48 MB. A store opened with `checkpoint: "maintainer"` (the L3 projector, the
  * maintenance holder, tests) checkpoints on WAL/store notifications (coalesced by a one-shot deadline): PASSIVE first (copies and fsyncs
  * without blocking writers), then, only when the WAL file is above `checkpointBytes` and still
- * growing (constant readers keep it from restarting), TRUNCATE with a short busy budget. SQLite's own busy handler would lose the writer lock to writers retrying every
- * few ms, so the checkpointer raises its own flag in `state-checkpoint.flags/` and writers yield while any is fresh
- * (< 1 s, so a crashed checkpointer stalls nobody for longer). TRUNCATE then holds the writer lock,
- * so the WAL stops growing, and waits only for readers that started before it; new readers read
- * the database file. Reads are single statements (`.get()`/`.all()`, never an iterator or a read
- * transaction held across an await) and the budget doubles after each busy attempt (50 ms to
- * 400 ms), so constant readers cannot starve it. If no maintainer runs, any writer runs the same checkpoint after
- * its COMMIT once the WAL passes `emergencyCheckpointBytes`, so the WAL stays bounded regardless.
- * `journal_size_limit` caps a reset WAL. `stats()` exports the WAL size and checkpoint progress.
+ * growing (constant readers keep it from restarting), one guarded TRUNCATE attempt (`#truncateWal`).
+ * If no maintainer runs, any writer runs the same checkpoint after its COMMIT once the WAL passes
+ * `emergencyCheckpointBytes`, so the WAL stays bounded regardless. `journal_size_limit` caps a reset WAL.
+ * `stats()` exports the WAL size and checkpoint progress.
+ *
+ * Checkpoint timing (smarty-dev#6100). Every checkpoint this store runs is timed (`stats().checkpointTiming`), logged
+ * at debug level, and summarised once a minute at info level (`checkpointLog`); the summary also carries COMMIT
+ * durations and lock timeouts. Observability only: no checkpoint, sync, pragma or cadence depends on it.
+ *
+ * TRUNCATE never copies, syncs or waits under the writer lock (smarty-dev#6100). FULL/RESTART/TRUNCATE take SQLite's
+ * WRITER lock and then backfill every frame not yet in the database (an fsync of the WAL and one of the database
+ * file) and wait for readers, all while holding it: with a slow fsync on a loaded host that held every writer for
+ * 10 s (the bridge's FABRIC_MESH_STATE_BUSY timeouts). Every TRUNCATE here (maintainer, emergency, WAL reset, WAL
+ * cap) is therefore: (1) PASSIVE, which does the copy and both fsyncs without the writer lock; it must complete
+ * (every frame backfilled), else no TRUNCATE; (2) a second connection of this store (the guard) begins a read
+ * transaction, and `PRAGMA data_version` proves that no commit landed between before the PASSIVE and the guard's
+ * snapshot, so the guard holds SQLite's read lock 0 (the "WAL fully backfilled, read the database file" lock),
+ * which any backfill needs EXCLUSIVELY; (3) ONE TRUNCATE with busy_timeout 0. A frame committed after the guard
+ * began cannot be copied (lock 0 is shared), so TRUNCATE returns busy at once instead of syncing under the writer
+ * lock; a busy writer lock, a pinned reader or a running checkpointer also return busy at once (no busy handler,
+ * so it never waits for readers while holding the writer lock either). A busy attempt backs off; nothing retries
+ * in a loop. What remains under the writer lock is the WAL-index header reset and an ftruncate of the WAL.
+ * The checkpointer still raises a flag in `state-checkpoint.flags/` while it confirms (2) so writers pause
+ * briefly, but writers ignore a flag older than `CHECKPOINT_FLAG_STALE_MS` (250 ms) and yield at most
+ * `WRITER_YIELD_BUDGET_MS` (250 ms) per acquisition, so a stuck or flapping checkpointer can never park them.
+ * Crash safety is SQLite's own: TRUNCATE only runs on a WAL whose every frame PASSIVE already synced into the
+ * database file (with synchronous=NORMAL's barriers), a process crash loses nothing committed, and
+ * synchronous=NORMAL is unchanged on every connection.
  *
  * Reader starvation (smarty-dev#6477, full-load soak): with many processes reading constantly, some reader
  * always holds a WAL read mark, so PASSIVE autocheckpoints copy frames but the WAL never restarts and grows
  * to the emergency path. After a COMMIT that leaves the WAL above `walResetBytes` (8 MiB), one process at a
- * time (the `state-wal-reset.lock` try-lock) TRUNCATEs it: ONE non-blocking attempt (busy_timeout 0) after
- * the writer's continuation, outside any transaction, so no client stalls on it. A busy attempt is not
+ * time (the `state-wal-reset.lock` try-lock) runs the guarded TRUNCATE above: ONE attempt after the writer's
+ * continuation, outside any transaction, and only while this store has no write waiting (its PASSIVE runs on the
+ * event loop, smarty-dev#6100), so no client stalls on it. A busy attempt is not
  * retried (pi-fabric#694 P1-B, R-no-polling): the next commit that finds the WAL above the threshold
  * tries again, no sooner than 2 s later. Commits drive the reset; nothing sleeps or polls.
  *
@@ -361,10 +381,15 @@ export interface SqliteStateStoreOptions {
   emergencyCheckpointBytes?: number;
   /** Minimum spacing of notification-driven maintenance and one busy retry. Default 1,000 ms. */
   checkpointIntervalMs?: number;
-  /** First busy budget of a TRUNCATE attempt; doubles after each busy attempt up to 400 ms. Default 50 ms. */
+  /** Ignored since smarty-dev#6100: every TRUNCATE makes one guarded attempt with busy_timeout 0. Kept for callers. */
   checkpointBusyMs?: number;
   /** WAL size above which a writer resets the WAL with a client-side TRUNCATE after its COMMIT; 0 disables. Default 8 MiB. */
   walResetBytes?: number;
+  /**
+   * Checkpoint timing log on stderr: "debug" (each checkpoint plus the summary), "info" (one summary line per minute
+   * with activity), "off". Default: `PI_FABRIC_MESH_CHECKPOINT_LOG`, else "info" unless stderr is a terminal.
+   */
+  checkpointLog?: CheckpointLogLevel;
   /**
    * WAL hard cap (smarty-dev#6477 security pass P1). A reader that pins one snapshot defeats every
    * checkpoint, so the WAL only grows. Before EVERY write transaction (pi-fabric#694 P1 1) the store stats
@@ -410,7 +435,22 @@ export interface SqliteStateStats {
   lastCheckpoint?: { busy: number; log: number; checkpointed: number };
   walBytes: number;
   maxWalBytes: number;
+  /**
+   * smarty-dev#6100: the checkpoints this store ran, by mode. `onWriterPath`: ran in a writer's path (the WAL-cap
+   * admission before BEGIN, or the emergency or reset checkpoint after its COMMIT). `walRestartsSeen`: a lower
+   * bound on WAL restarts, from PASSIVE's frame count falling between two of this store's checkpoints.
+   */
+  checkpointTiming: { passive: CheckpointTiming; truncate: CheckpointTiming; onWriterPath: number; walRestartsSeen: number };
+  /** COMMIT statements: SQLite's autocheckpoint and a restart's WAL-header fsync both run inside one. */
+  maxCommitMs: number;
+  /** COMMITs that took at least `SLOW_COMMIT_MS` (50 ms). */
+  slowCommits: number;
+  /** `FABRIC_MESH_LOCK_TIMEOUT`s this store threw (FABRIC_MESH_STATE_BUSY at the bridge). */
+  lockTimeouts: number;
 }
+
+export interface CheckpointTiming { count: number; maxMs: number; totalMs: number }
+export type CheckpointLogLevel = "off" | "info" | "debug";
 
 /** The state in the file store's envelope shape (minus readGeneration), for projection and rollback. */
 export interface SqliteStateExport {
@@ -466,14 +506,47 @@ const ENVELOPE_BYTES = 256;
 // One flag file per active checkpoint request, so requests never share or clear each other's flag
 // (pi-fabric#691 review). Writers yield while any fresh one exists.
 const CHECKPOINT_FLAGS = "state-checkpoint.flags";
-const CHECKPOINT_FLAG_STALE_MS = 1_000;
-const MAX_TRUNCATE_BUDGET_MS = 400;
+// smarty-dev#6100: writers ignore a flag older than this, and yield to flags at most WRITER_YIELD_BUDGET_MS per
+// acquisition, so no checkpointer (stuck in an fsync, crashed, or several raising flags in turn) parks a writer.
+const CHECKPOINT_FLAG_STALE_MS = 250;
+const WRITER_YIELD_BUDGET_MS = 250;
+// The dead-flag reclaim's claim file (removeDeadFlag) keeps its own, unchanged staleness.
+const CHECKPOINT_FLAG_CLAIM_STALE_MS = 1_000;
+// After a busy maintainer/emergency TRUNCATE this store makes no new attempt for this long (a maintainer: at most
+// its own interval; an explicit checkpoint(0) still tries). The client WAL reset keeps WAL_RESET_BACKOFF_MS.
+const TRUNCATE_BACKOFF_MS = 1_000;
+// checkpointSettled: at most this many guarded attempts, within this long (below CHECKPOINT_FLAG_STALE_MS).
+const TRUNCATE_SETTLE_ATTEMPTS = 8;
+const TRUNCATE_SETTLE_MS = 100;
+
+type CheckpointCounters = { busy: number; log: number; checkpointed: number };
+type CheckpointResult = CheckpointCounters & { truncated: boolean; walBytes: number };
 // The client-side WAL reset (reader starvation, smarty-dev#6477): one process at a time, one attempt.
 const WAL_RESET_LOCK = "state-wal-reset.lock";
 const WAL_RESET_LOCK_STALE_MS = 2_000;
 // A busy reset: this process's next attempt waits for a commit at least this much later.
 const WAL_RESET_BACKOFF_MS = 2_000;
 const DEFAULT_WAL_RESET_BYTES = 8 * 1024 * 1024;
+const SLOW_COMMIT_MS = 50;
+const CHECKPOINT_SUMMARY_MS = 60_000;
+type CheckpointVia = "explicit" | "maintainer" | "emergency" | "reset" | "cap" | "sync";
+const WRITER_PATH_VIAS: ReadonlySet<CheckpointVia> = new Set(["emergency", "reset", "cap"]);
+type CheckpointWindow = { startedAt: number; passive: number; passiveMaxMs: number; truncate: number; truncateMaxMs: number;
+  busy: number; onWriterPath: number; walRestartsSeen: number; commits: number; slowCommits: number; maxCommitMs: number;
+  lockTimeouts: number; maxWaitMs: number; maxWalBytes: number };
+const newCheckpointWindow = (startedAt: number): CheckpointWindow => ({ startedAt, passive: 0, passiveMaxMs: 0, truncate: 0,
+  truncateMaxMs: 0, busy: 0, onWriterPath: 0, walRestartsSeen: 0, commits: 0, slowCommits: 0, maxCommitMs: 0, lockTimeouts: 0,
+  maxWaitMs: 0, maxWalBytes: 0 });
+const checkpointLogLevel = (option: CheckpointLogLevel | undefined): CheckpointLogLevel => {
+  const level = option ?? process.env.PI_FABRIC_MESH_CHECKPOINT_LOG;
+  if (level === "off" || level === "info" || level === "debug") return level;
+  // Never into a TUI: a terminal on stderr defaults to off (stdout may carry a protocol, so never stdout).
+  return process.stderr.isTTY ? "off" : "info";
+};
+const writeCheckpointLog = (line: string): void => {
+  try { process.stderr.write(`${line}\n`); } catch { /* observability only */ }
+};
+const round1 = (ms: number): number => Math.round(ms * 10) / 10;
 // ponytail: 96 MiB, not 256: with a pinned reader every commit above 64 MiB stalls ~400 ms, so the cap must act
 // within minutes (~6-7 min at 2.5 commits/s); normal peaks are ~6-11 MiB (smarty-dev#6477).
 const DEFAULT_WAL_HARD_CAP_BYTES = 96 * 1024 * 1024;
@@ -626,14 +699,21 @@ export class SqliteStateStore {
   readonly #signal: AbortSignal | undefined;
   readonly #checkpointBytes: number;
   readonly #emergencyBytes: number;
-  readonly #checkpointBusyMs: number;
   readonly #changesRetained: number;
+  readonly #opener: SqliteOpener;
+  // smarty-dev#6100: the guard connection (opened at the first TRUNCATE attempt) and its data_version statement.
+  #guard: { db: SqliteConnection; dataVersion: SqliteStatement } | undefined;
+  #truncateRetryAt = 0;
+  #settling = false;
+  #writesWaiting = 0;
   readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #stats: SqliteStateStats = {
     transactions: 0, commits: 0, busyRetries: 0, transientRetries: 0, fifoJoins: 0, maxWaitMs: 0, maxHoldMs: 0,
     totalHoldMs: 0, maxPrepareMs: 0, maxAfterCommitMs: 0, afterCommitReacquired: 0, afterCommitIntervened: 0,
     checkpoints: { passive: 0, truncate: 0, truncateBusy: 0, emergency: 0, failed: 0, writerYields: 0, walResets: 0, walResetBusy: 0 },
     walBytes: 0, maxWalBytes: 0,
+    checkpointTiming: { passive: { count: 0, maxMs: 0, totalMs: 0 }, truncate: { count: 0, maxMs: 0, totalMs: 0 }, onWriterPath: 0, walRestartsSeen: 0 },
+    maxCommitMs: 0, slowCommits: 0, lockTimeouts: 0,
   };
   #timer: NodeJS.Timeout | undefined;
   #maintenanceWatcher: fs.FSWatcher | undefined;
@@ -646,13 +726,15 @@ export class SqliteStateStore {
   #closed = false;
   #dataVersion = -1;
   #lastEmergencyCheck = 0;
-  #truncateBudgetMs: number;
   #lastWalBytes = 0;
   readonly #walResetBytes: number;
   readonly #walHardCapBytes: number;
   #walResetting = false;
   #walResetBusyAt = Number.NEGATIVE_INFINITY;
   #lastWalResetCheck = 0;
+  #lastPassiveLog = -1;
+  readonly #checkpointLog: CheckpointLogLevel;
+  #window = newCheckpointWindow(Date.now());
 
   private constructor(readonly root: string, readonly maxEventBytes: number, readonly maxReadEvents: number,
     db: SqliteConnection, file: string, identity: { epoch: number; storeId: string }, options: SqliteStateStoreOptions) {
@@ -669,11 +751,11 @@ export class SqliteStateStore {
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
     this.#emergencyBytes = Math.max(this.#checkpointBytes, options.emergencyCheckpointBytes ?? 64 * 1024 * 1024);
-    this.#checkpointBusyMs = Math.max(1, Math.min(MAX_TRUNCATE_BUDGET_MS, options.checkpointBusyMs ?? 50));
-    this.#truncateBudgetMs = this.#checkpointBusyMs;
+    this.#opener = options.open ?? openNodeSqlite;
     this.#changesRetained = Math.max(1, Math.floor(options.changesRetained ?? 4_096));
     this.#walResetBytes = Math.max(0, Math.floor(options.walResetBytes ?? DEFAULT_WAL_RESET_BYTES));
     this.#walHardCapBytes = walHardCapOf(options);
+    this.#checkpointLog = checkpointLogLevel(options.checkpointLog);
     if (options.checkpoint === "maintainer") {
       this.#maintainer = true;
       this.#maintenanceIntervalMs = Math.max(10, options.checkpointIntervalMs ?? 1_000);
@@ -1163,17 +1245,17 @@ export class SqliteStateStore {
       this.#timer = undefined;
       if (this.#closed) return;
       this.#maintenanceAt = Date.now();
-      try {
+      void (async () => {
         this.assertLive(); // A rollback/retirement is never checkpointed by the maintainer.
         if (this.walBytes() === 0) return;
-        const result = this.checkpoint();
+        const result = await this.checkpointSettled();
         // One retry belongs to unfinished checkpoint work, not to an idle WAL-size poll.
         // A long-lived pinned reader exhausts this retry; the next commit tries again.
         if (!this.#maintenanceRetry && (result.busy > 0 || result.checkpointed < result.log)) {
           this.#maintenanceRetry = true;
           this.#queueMaintenance(true);
         }
-      } catch { this.#stats.checkpoints.failed += 1; }
+      })().catch(() => { if (!this.#closed) this.#stats.checkpoints.failed += 1; });
     }, Math.max(0, this.#maintenanceAt + this.#maintenanceIntervalMs - Date.now()));
     this.#timer.unref?.();
   }
@@ -1190,46 +1272,90 @@ export class SqliteStateStore {
    * PASSIVE (never blocks writers or readers), then TRUNCATE only when the WAL is starving: the
    * file is above the threshold AND grew since the previous checkpoint. A WAL that restarts reuses
    * its file from the start, so it stops growing and writers are never paused for it; one pinned by
-   * constant readers only grows. A threshold of 0 forces a TRUNCATE. Never call it in a transaction.
+   * constant readers only grows. The TRUNCATE is the guarded single attempt of `#truncateWal`
+   * (smarty-dev#6100: no copy, fsync or reader wait under the writer lock); after a busy attempt the
+   * store backs off for `TRUNCATE_BACKOFF_MS`. A threshold of 0 forces an attempt. Never call it in a transaction.
    */
-  checkpoint(thresholdBytes = this.#checkpointBytes): { busy: number; log: number; checkpointed: number; truncated: boolean; walBytes: number } {
+  checkpoint(thresholdBytes = this.#checkpointBytes): CheckpointResult {
+    const step = this.#checkpointStep(thresholdBytes, "explicit");
+    let truncate: CheckpointCounters | undefined;
+    if (step.truncate) {
+      // The flag pauses writers (at most CHECKPOINT_FLAG_STALE_MS) while the guard confirms that the WAL is fully
+      // backfilled, so the confirmation is rarely invalidated by a commit. The TRUNCATE itself never waits.
+      const flag = raiseCheckpointFlag(this.root, ownerToken());
+      try { truncate = this.#truncateWal("explicit").truncated; } finally { lowerCheckpointFlag(flag); }
+    }
+    return this.#checkpointDone(step, truncate);
+  }
+
+  /**
+   * `checkpoint()` for a caller that can await (the projector, the maintainer timer, the emergency path): the
+   * same PASSIVE, then up to `TRUNCATE_SETTLE_ATTEMPTS` guarded TRUNCATE attempts within `TRUNCATE_SETTLE_MS`
+   * under one checkpoint flag (smarty-dev#6100). Between attempts it sleeps holding no lock, so readers that
+   * started before the backfill finish their single statement; no attempt ever waits or syncs under the writer
+   * lock. It stops early when PASSIVE makes no progress twice (a pinned reader: only its release helps).
+   */
+  async checkpointSettled(thresholdBytes = this.#checkpointBytes): Promise<CheckpointResult> {
+    return this.#settled(thresholdBytes, "maintainer");
+  }
+
+  async #settled(thresholdBytes: number, via: CheckpointVia): Promise<CheckpointResult> {
+    const step = this.#checkpointStep(thresholdBytes, via);
+    const truncate = step.truncate ? await this.#truncateSettled(via) : undefined;
+    return this.#checkpointDone(step, truncate);
+  }
+
+  // PASSIVE (no writer lock), and whether a TRUNCATE attempt is due (starving, and not inside a busy back-off).
+  #checkpointStep(thresholdBytes: number, via: CheckpointVia): { result: CheckpointCounters; truncate: boolean } {
     this.#assertOpen();
     if (this.#inTransaction) throw new Error("Fabric mesh state checkpoint inside a transaction");
-    const passive = this.#sql.checkpointPassive.get() ?? {};
-    this.#stats.checkpoints.passive += 1;
+    const passive = this.#passive(via);
     const result = { busy: Number(passive.busy ?? 0), log: Number(passive.log ?? 0), checkpointed: Number(passive.checkpointed ?? 0) };
-    let truncated = false;
     const size = this.walBytes();
     const growing = size > this.#lastWalBytes;
     this.#lastWalBytes = size;
     const starving = thresholdBytes <= 0 ? size > 0 : (growing && size > thresholdBytes) || size > this.#emergencyBytes;
-    if (starving) {
-      // Writers yield to the flag, so the writer lock is free within one short hold; the busy budget
-      // then only waits for readers that started before the checkpoint. It escalates after each
-      // busy attempt, so readers that outlast it delay the reset but can never starve it.
-      const flag = raiseCheckpointFlag(this.root, ownerToken());
-      this.#db.exec(`PRAGMA busy_timeout = ${this.#truncateBudgetMs}`);
-      try {
-        const truncate = this.#sql.checkpointTruncate.get() ?? {};
-        truncated = Number(truncate.busy ?? 1) === 0;
-        Object.assign(result, { busy: Number(truncate.busy ?? 0), log: Number(truncate.log ?? 0), checkpointed: Number(truncate.checkpointed ?? 0) });
-      } catch (error) {
-        if (!isBusy(error)) throw error;
-      } finally {
-        this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
-        lowerCheckpointFlag(flag);
-      }
-      if (truncated) {
-        this.#lastWalBytes = 0;
-        this.#stats.checkpoints.truncate += 1;
-        this.#truncateBudgetMs = this.#checkpointBusyMs;
-      } else {
-        this.#stats.checkpoints.truncateBusy += 1;
-        this.#truncateBudgetMs = Math.min(MAX_TRUNCATE_BUDGET_MS, this.#truncateBudgetMs * 2);
-      }
+    return { result, truncate: starving && (thresholdBytes <= 0 || Date.now() >= this.#truncateRetryAt) };
+  }
+
+  #checkpointDone(step: { result: CheckpointCounters; truncate: boolean }, truncate: CheckpointCounters | undefined): CheckpointResult {
+    const result = truncate ? { ...truncate } : step.result;
+    if (truncate) {
+      this.#lastWalBytes = 0;
+      this.#stats.checkpoints.truncate += 1;
+      this.#truncateRetryAt = 0;
+    } else if (step.truncate) {
+      this.#stats.checkpoints.truncateBusy += 1;
+      // Immediate back-off, no retry loop: a maintainer's next pass (its own interval), else TRUNCATE_BACKOFF_MS.
+      this.#truncateRetryAt = Date.now() + (this.#maintainer ? Math.min(TRUNCATE_BACKOFF_MS, this.#maintenanceIntervalMs) : TRUNCATE_BACKOFF_MS);
     }
     this.#stats.lastCheckpoint = { busy: result.busy, log: result.log, checkpointed: result.checkpointed };
-    return { ...result, truncated, walBytes: this.walBytes() };
+    return { ...result, truncated: truncate !== undefined, walBytes: this.walBytes() };
+  }
+
+  // The settle loop of checkpointSettled (single flight per store).
+  async #truncateSettled(via: CheckpointVia): Promise<CheckpointCounters | undefined> {
+    if (this.#settling) return undefined;
+    this.#settling = true;
+    const flag = raiseCheckpointFlag(this.root, ownerToken());
+    const deadline = performance.now() + TRUNCATE_SETTLE_MS;
+    try {
+      let previous: string | undefined;
+      let stalled = 0;
+      for (let attempt = 1; ; attempt += 1) {
+        if (this.#closed) return undefined;
+        const outcome = this.#truncateWal(via);
+        if (outcome.truncated) return outcome.truncated;
+        const progress = outcome.passive ? `${outcome.passive.log}:${outcome.passive.checkpointed}` : undefined;
+        stalled = progress !== undefined && progress === previous && (outcome.passive?.checkpointed ?? 0) < (outcome.passive?.log ?? 0) ? stalled + 1 : 0;
+        previous = progress;
+        if (stalled >= 2 || attempt >= TRUNCATE_SETTLE_ATTEMPTS || performance.now() + 4 >= deadline) return undefined;
+        await delay(1 + Math.random() * 2);
+      }
+    } finally {
+      lowerCheckpointFlag(flag);
+      this.#settling = false;
+    }
   }
 
   /**
@@ -1240,8 +1366,7 @@ export class SqliteStateStore {
     const deadline = Date.now() + Math.max(0, budgetMs);
     for (;;) {
       this.#assertOpen();
-      const result = this.#sql.checkpointPassive.get() ?? {};
-      this.#stats.checkpoints.passive += 1;
+      const result = this.#passive("sync");
       // checkpointed === log: every frame (ours included) was copied after a WAL sync and the
       // database file was synced; log 0 means a complete checkpoint already reset the WAL.
       if (Number(result.busy ?? 1) === 0 && Number(result.checkpointed ?? -1) === Number(result.log ?? -2)) return;
@@ -1250,8 +1375,64 @@ export class SqliteStateStore {
     }
   }
 
+  // One timed PASSIVE (smarty-dev#6100: every checkpoint this store runs is timed and counted).
+  #passive(via: CheckpointVia): Record<string, unknown> {
+    const started = performance.now();
+    const row = this.#sql.checkpointPassive.get() ?? {};
+    this.#stats.checkpoints.passive += 1;
+    this.#recordCheckpoint("passive", via, performance.now() - started, row);
+    return row;
+  }
+
+  #recordCheckpoint(mode: "passive" | "truncate", via: CheckpointVia, ms: number, row: Record<string, unknown>): void {
+    const timing = this.#stats.checkpointTiming;
+    const window = this.#window;
+    const busy = Number(row.busy ?? 1);
+    const log = Number(row.log ?? -1);
+    const onWriterPath = WRITER_PATH_VIAS.has(via);
+    timing[mode].count += 1;
+    timing[mode].maxMs = Math.max(timing[mode].maxMs, ms);
+    timing[mode].totalMs += ms;
+    if (onWriterPath) { timing.onWriterPath += 1; window.onWriterPath += 1; }
+    if (mode === "passive" && busy === 0 && log >= 0) {
+      if (this.#lastPassiveLog >= 0 && log < this.#lastPassiveLog) { timing.walRestartsSeen += 1; window.walRestartsSeen += 1; }
+      this.#lastPassiveLog = log;
+    } else if (mode === "truncate" && busy === 0) this.#lastPassiveLog = 0;
+    if (mode === "passive") { window.passive += 1; window.passiveMaxMs = Math.max(window.passiveMaxMs, ms); }
+    else { window.truncate += 1; window.truncateMaxMs = Math.max(window.truncateMaxMs, ms); }
+    if (busy !== 0) window.busy += 1;
+    let walBytes = -1;
+    try { walBytes = this.walBytes(); } catch { /* reported as -1 */ }
+    window.maxWalBytes = Math.max(window.maxWalBytes, walBytes);
+    if (this.#checkpointLog === "debug") {
+      writeCheckpointLog(`[mesh] state checkpoint ${JSON.stringify({ root: this.root, mode, via, ms: round1(ms), busy, frames: log,
+        checkpointed: Number(row.checkpointed ?? -1), walBytes, writerPath: onWriterPath })}`);
+    }
+    this.#flushCheckpointWindow();
+  }
+
+  // The once-a-minute info summary, emitted by the next checkpoint, commit or lock timeout after the minute (no timer).
+  #flushCheckpointWindow(now = Date.now()): void {
+    const window = this.#window;
+    if (now - window.startedAt < CHECKPOINT_SUMMARY_MS) return;
+    this.#window = newCheckpointWindow(now);
+    if (this.#checkpointLog === "off" || window.passive + window.truncate + window.lockTimeouts + window.slowCommits === 0) return;
+    const { startedAt, passiveMaxMs, truncateMaxMs, maxCommitMs, maxWaitMs, ...counts } = window;
+    writeCheckpointLog(`[mesh] state checkpoints ${JSON.stringify({ root: this.root, windowMs: now - startedAt, ...counts,
+      passiveMaxMs: round1(passiveMaxMs), truncateMaxMs: round1(truncateMaxMs), maxCommitMs: round1(maxCommitMs), maxWaitMs: round1(maxWaitMs) })}`);
+  }
+
+  #noteCommit(ms: number, changed: boolean): void {
+    this.#stats.maxCommitMs = Math.max(this.#stats.maxCommitMs, ms);
+    if (changed) this.#window.commits += 1;
+    this.#window.maxCommitMs = Math.max(this.#window.maxCommitMs, ms);
+    if (ms >= SLOW_COMMIT_MS) { this.#stats.slowCommits += 1; this.#window.slowCommits += 1; }
+  }
+
   stats(): SqliteStateStats {
+    const timing = this.#stats.checkpointTiming;
     return { ...this.#stats, checkpoints: { ...this.#stats.checkpoints },
+      checkpointTiming: { ...timing, passive: { ...timing.passive }, truncate: { ...timing.truncate } },
       ...(this.#stats.lastCheckpoint ? { lastCheckpoint: { ...this.#stats.lastCheckpoint } } : {}) };
   }
 
@@ -1263,6 +1444,9 @@ export class SqliteStateStore {
     this.#maintenanceWatcher?.close();
     this.#maintenanceWatcher = undefined;
     try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* closing anyway */ }
+    const guard = this.#guard;
+    this.#guard = undefined;
+    if (guard) try { guard.db.close(); } catch { /* closing anyway */ }
     this.#db.close();
   }
 
@@ -1390,13 +1574,19 @@ export class SqliteStateStore {
     let last = started;
     let transient = 0;
     let ticket: MeshLockTicket | undefined;
+    let yieldedMs = 0;
+    let waiting = true;
+    this.#writesWaiting += 1;
     try {
       for (;;) {
+        const iteration = performance.now();
+        let yielding = false;
         this.#signal?.throwIfAborted();
         this.#assertOpen();
         if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
         if (!walCapExempt) this.#refuseAboveWalCap();
-        if (this.#checkpointPending()) this.#stats.checkpoints.writerYields += 1;
+        // smarty-dev#6100: a checkpoint flag pauses this writer for at most WRITER_YIELD_BUDGET_MS in total.
+        if (yieldedMs < WRITER_YIELD_BUDGET_MS && this.#checkpointPending()) { this.#stats.checkpoints.writerYields += 1; yielding = true; }
         else if (!ticket || ticket.mayContend()) {
           const now = performance.now();
           if (attempts > 0) maxGap = Math.max(maxGap, now - last);
@@ -1413,20 +1603,36 @@ export class SqliteStateStore {
           }
           if (begun) {
             this.#stats.maxWaitMs = Math.max(this.#stats.maxWaitMs, performance.now() - started);
+            this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, performance.now() - started);
+            // smarty-dev#6100: the SQLite writer lock is the exclusion; the advisory receipt only orders waiters.
+            // Leave the queue now, so post-COMMIT work (SQLite's autocheckpoint fsync inside COMMIT, the emergency
+            // checkpoint) never keeps the next waiter from contending.
+            ticket?.close();
+            ticket = undefined;
+            this.#writesWaiting -= 1;
+            waiting = false;
             return this.#run(body);
           }
         }
         const now = performance.now();
-        if (now >= deadline) throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
+        if (now >= deadline) {
+          this.#stats.lockTimeouts += 1;
+          this.#window.lockTimeouts += 1;
+          this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
+          this.#flushCheckpointWindow();
+          throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
+        }
         if (!ticket && now - started >= this.#fifoAfterMs) {
           ticket = this.#ticket(deadline - now);
           if (ticket) this.#stats.fifoJoins += 1;
         }
         const cap = Math.min(4, 2 ** Math.min(attempts - 1, 2));
         await delay(Math.min(deadline - now, cap * (0.5 + Math.random() / 2)), this.#signal);
+        if (yielding) yieldedMs += performance.now() - iteration;
       }
     } finally {
       ticket?.close();
+      if (waiting) this.#writesWaiting -= 1;
     }
   }
 
@@ -1460,8 +1666,10 @@ export class SqliteStateStore {
       }
       if (tx.changes.length > 0 || tx.finish) { this.#finish(tx); changed = true; }
       tx.beforeCommit?.();
+      const commitStarted = performance.now();
       this.#db.exec("COMMIT");
       committed = true;
+      this.#noteCommit(performance.now() - commitStarted, changed);
       if (changed) this.#stats.commits += 1;
       return result;
     } finally {
@@ -1477,6 +1685,7 @@ export class SqliteStateStore {
         this.#emergencyCheckpoint();
         this.#maybeResetWal();
       }
+      if (committed) this.#flushCheckpointWindow();
     }
   }
 
@@ -1506,27 +1715,31 @@ export class SqliteStateStore {
   }
 
   // Fallback when no maintainer runs: after COMMIT, outside any transaction, throttled to 4/s.
+  // smarty-dev#6100: scheduled after the writer's own continuation (it never extends #run or a lock hold), PASSIVE
+  // first and then the settled guarded TRUNCATE, like the maintainer.
   #emergencyCheckpoint(): void {
     const now = Date.now();
     if (now - this.#lastEmergencyCheck < 250) return;
     this.#lastEmergencyCheck = now;
     try {
       if (this.walBytes() <= this.#emergencyBytes) return;
-      this.#stats.checkpoints.emergency += 1;
-      this.checkpoint(this.#checkpointBytes);
-    } catch { this.#stats.checkpoints.failed += 1; }
+    } catch { this.#stats.checkpoints.failed += 1; return; }
+    this.#stats.checkpoints.emergency += 1;
+    void new Promise<void>((resolve) => setImmediate(resolve))
+      .then(() => this.#closed ? undefined : this.#settled(this.#checkpointBytes, "emergency"))
+      .catch(() => { if (!this.#closed) this.#stats.checkpoints.failed += 1; });
   }
 
   // Admission before EVERY write transaction (pi-fabric#694 P1 1): one stat of the SHARED state.db-wal, so a
   // fresh or restarted store, and every other store or process on the root, sees the same over-cap WAL (no
-  // per-store latch to arm). Above the cap: ONE non-blocking TRUNCATE (busy_timeout 0), then re-stat; still
-  // above it: refuse. No loop, no timer; the next write re-checks. A write already admitted may land at most
-  // one commit past the cap per store.
+  // per-store latch to arm). Above the cap: ONE guarded TRUNCATE attempt (`#truncateWal`: PASSIVE, then busy_timeout 0;
+  // smarty-dev#6100), then re-stat; still above it: refuse (deferred, never blocked). No loop, no timer; the next
+  // write re-checks. A write already admitted may land at most one commit past the cap per store.
   #refuseAboveWalCap(): void {
     let size = this.walBytes();
     if (size > this.#walHardCapBytes && !this.#db.isTransaction) {
       try {
-        if (this.#tryTruncate()) { this.#stats.checkpoints.walResets += 1; this.#lastWalBytes = 0; }
+        if (this.#truncateWal("cap").truncated) { this.#stats.checkpoints.walResets += 1; this.#lastWalBytes = 0; }
         else this.#stats.checkpoints.walResetBusy += 1;
       } catch { this.#stats.checkpoints.failed += 1; }
       size = this.walBytes();
@@ -1556,11 +1769,16 @@ export class SqliteStateStore {
       });
   }
 
-  // ONE non-blocking TRUNCATE (pi-fabric#694 P1-B): busy defers to a later commit; nothing retries here.
+  // ONE guarded TRUNCATE attempt (pi-fabric#694 P1-B, smarty-dev#6100): busy defers to a later commit; nothing retries
+  // here. A store with a write waiting defers too: the attempt's PASSIVE runs on this event loop and must not eat
+  // that write's lock budget.
   #resetWal(): boolean {
     try {
       if (this.#closed) return true;
-      if (this.#inTransaction || this.#db.isTransaction || !this.#tryTruncate()) { this.#stats.checkpoints.walResetBusy += 1; return false; }
+      if (this.#inTransaction || this.#db.isTransaction || this.#writesWaiting > 0 || !this.#truncateWal("reset").truncated) {
+        this.#stats.checkpoints.walResetBusy += 1;
+        return false;
+      }
       this.#stats.checkpoints.walResets += 1;
       this.#lastWalBytes = 0;
       return true;
@@ -1569,18 +1787,64 @@ export class SqliteStateStore {
     }
   }
 
-  // One TRUNCATE with no busy handler (busy_timeout 0): true when the WAL was reset.
-  #tryTruncate(): boolean {
-    this.#db.exec("PRAGMA busy_timeout = 0");
+  /**
+   * smarty-dev#6100: the only TRUNCATE in this module (see the module comment). PASSIVE first (the copy and both
+   * fsyncs, no writer lock); then the guard connection begins a read transaction whose snapshot `data_version`
+   * proves equal to the one before the PASSIVE, so the PASSIVE backfilled every frame of it and the guard holds
+   * read lock 0; then ONE TRUNCATE with busy_timeout 0. Under the writer lock that TRUNCATE can only reset an
+   * already-backfilled WAL: a newer frame needs read lock 0 exclusively to be copied, so it returns busy instead
+   * of syncing, and with no busy handler it never waits for readers or writers. Returns the TRUNCATE's counters
+   * when the WAL was reset, else undefined (busy, incomplete PASSIVE, a commit raced the guard, or no guard).
+   */
+  #truncateWal(via: CheckpointVia): { truncated?: CheckpointCounters; passive?: CheckpointCounters } {
+    if (this.#closed || this.#inTransaction || this.#db.isTransaction) return {};
+    const guard = this.#guardConnection();
+    if (!guard) return {};
+    let reading = false;
+    let passive: CheckpointCounters | undefined;
     try {
-      const result = this.#sql.checkpointTruncate.get() ?? {};
-      return Number(result.busy ?? 1) === 0;
+      const before = Number(guard.dataVersion.get()?.data_version ?? -1);
+      const row = this.#passive(via);
+      passive = { busy: Number(row.busy ?? 1), log: Number(row.log ?? -1), checkpointed: Number(row.checkpointed ?? -2) };
+      if (passive.busy !== 0 || passive.checkpointed !== passive.log) return { passive };
+      guard.db.exec("BEGIN");
+      reading = true;
+      // The first read of the deferred transaction fixes the guard's snapshot (and its WAL read lock).
+      if (Number(guard.dataVersion.get()?.data_version ?? -2) !== before) return { passive };
+      this.#db.exec("PRAGMA busy_timeout = 0");
+      try {
+        const started = performance.now();
+        const truncate = this.#sql.checkpointTruncate.get() ?? {};
+        this.#recordCheckpoint("truncate", via, performance.now() - started, truncate);
+        if (Number(truncate.busy ?? 1) !== 0) return { passive };
+        return { passive, truncated: { busy: 0, log: Number(truncate.log ?? 0), checkpointed: Number(truncate.checkpointed ?? 0) } };
+      } finally {
+        this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
+      }
     } catch (error) {
-      if (!isBusy(error)) throw error;
-      return false;
+      if (isBusy(error) || isTransient(error)) return passive ? { passive } : {};
+      throw error;
     } finally {
-      this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
+      if (reading) try { guard.db.exec("ROLLBACK"); } catch { /* the read already ended */ }
     }
+  }
+
+  // A second connection of this store, opened through the same gate and driver at the first TRUNCATE attempt. It
+  // only ever runs `PRAGMA data_version` (one short read transaction per attempt) and never writes. SQLite shares
+  // POSIX locks between connections of one process, so closing it never drops the main connection's locks.
+  #guardConnection(): { db: SqliteConnection; dataVersion: SqliteStatement } | undefined {
+    if (this.#guard || this.#closed) return this.#guard;
+    let db: SqliteConnection | undefined;
+    try {
+      db = openPrivateStateDb(this.file, this.#opener);
+      db.exec("PRAGMA busy_timeout = 0");
+      db.exec("PRAGMA trusted_schema = OFF");
+      this.#guard = { db, dataVersion: db.prepare("PRAGMA data_version") };
+    } catch {
+      this.#stats.checkpoints.failed += 1;
+      if (db) try { db.close(); } catch { /* never opened fully */ }
+    }
+    return this.#guard;
   }
 }
 
@@ -1697,7 +1961,7 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
   if (holder?.started === undefined || residentProcessAlive(holder.pid, holder.started)) return;
   const token = ownerToken();
   const claim = reclaimClaimPath(dir, `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`);
-  if (!tryLockFile(claim, CHECKPOINT_FLAG_STALE_MS, token)) return;
+  if (!tryLockFile(claim, CHECKPOINT_FLAG_CLAIM_STALE_MS, token)) return;
   try {
     const flag = path.join(dir, name);
     const current = fs.lstatSync(flag, { throwIfNoEntry: false });

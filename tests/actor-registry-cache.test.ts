@@ -243,8 +243,9 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     expect(parse).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
     if (cacheable) expect(last).toBe(first);
     else expect(last).not.toBe(first);
-    expect(fstat).toHaveBeenCalledTimes(1_000);
-    expect(stat).not.toHaveBeenCalled();
+    // smarty-dev#7791: a proven generation is re-checked with one stat of the path and never reopened.
+    expect(fstat).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
+    expect(stat).toHaveBeenCalledTimes(cacheable ? 999 : 0);
     expect(disk).toHaveBeenCalledTimes(cacheable ? 1 : 1_000);
     const view = first as typeof value;
     expect(() => view.actors.push({ id: "bad", extra: { values: [] } })).toThrow(TypeError);
@@ -359,6 +360,17 @@ describe("ActorRegistryStore cached read (#7791)", () => {
     const disk = vi.spyOn(fs, "readFileSync");
     const fstat = fs.fstatSync.bind(fs);
     let replaced = false, deferred = false;
+    // A warm cache answers from a stat of the path (smarty-dev#7791): replace right after whichever look comes first.
+    const pathStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options: unknown) => {
+      const stat = Reflect.apply(pathStat, fs, [target, options]);
+      if (!replaced && String(target) === file) {
+        replaced = true;
+        fs.writeFileSync(`${file}.new`, JSON.stringify(replacement));
+        fs.renameSync(`${file}.new`, file);
+      }
+      return stat;
+    }) as typeof fs.statSync);
     vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options: unknown) => {
       const stat = Reflect.apply(fstat, fs, [fd, options]);
       if (!replaced) {
@@ -464,6 +476,12 @@ describe("ActorRegistryStore cached read (#7791)", () => {
       Object.assign(Reflect.apply(fstat, fs, [fd, options]), {
         dev: 0n, ino: 0n, size: stamp.size, mtimeNs: stamp.mtimeNs, ctimeNs: stamp.ctimeNs,
       })) as typeof fs.fstatSync);
+    // The same zero-ID filesystem answers a path stat too (the smarty-dev#7791 fast path).
+    const pathStat = fs.statSync.bind(fs);
+    vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options: unknown) =>
+      Object.assign(Reflect.apply(pathStat, fs, [target, options]) as object, {
+        dev: 0n, ino: 0n, size: stamp.size, mtimeNs: stamp.mtimeNs, ctimeNs: stamp.ctimeNs,
+      })) as typeof fs.statSync);
     const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     try {
       if (platform === "win32") Object.defineProperty(process, "platform", { ...descriptor, value: "win32" });

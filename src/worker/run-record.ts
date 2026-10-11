@@ -185,6 +185,37 @@ export const applyUsage = (
   }
 };
 
+// ponytail: Pi 0.87 raises its own window refusal as a plain Error with no code: compaction
+// assertContextFitsWindow ("Context exceeds window: estimated N input tokens, window W. Compact or
+// reduce input before retrying.") and AgentSession's compaction stop ("Context exceeds window:
+// Compaction failed|aborted before the next assistant turn"). pi-agent-core handleRunFailure turns it
+// into an assistant message with stopReason error/aborted and EMPTY_USAGE. Only that whole message,
+// on that structured shape, is Pi's refusal; provider text quoting the phrase never matches.
+const PI_WINDOW_REFUSAL = /^Context exceeds window: (?:estimated \d+ input tokens, window \d+(?:\. Compact or reduce input before retrying\.)?|Compaction (?:failed|aborted) before the next assistant turn)$/;
+
+/** smarty-dev#3238: whether an assistant message is Pi's own context-window refusal (see above). */
+export const piWindowRefusal = (message: Record<string, unknown>): boolean => {
+  if (message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) return false;
+  if (typeof message.errorMessage !== "string" || !PI_WINDOW_REFUSAL.test(message.errorMessage)) return false;
+  const usage = message.usage;
+  if (usage === undefined) return true;
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return false;
+  const values = usage as Record<string, unknown>;
+  // No request was sent: a provider reply that quotes the phrase carries its own usage.
+  return numberField(values.input) === 0 && numberField(values.output) === 0 &&
+    numberField(values.cacheRead) === 0 && numberField(values.cacheWrite) === 0;
+};
+
+/** Pi's calculateContextTokens: the context one assistant turn occupied (smarty-dev#3238). */
+export const assistantContextTokens = (message: Record<string, unknown>): number => {
+  const usage = message.usage;
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return 0;
+  const values = usage as Record<string, unknown>;
+  const total = numberField(values.totalTokens);
+  return total > 0 ? total
+    : numberField(values.input) + numberField(values.output) + numberField(values.cacheRead) + numberField(values.cacheWrite);
+};
+
 /**
  * Extract the per-message token delta a Pi assistant `message_end` contributed.
  * Unlike `applyUsage`, which mutates the run record, this returns the delta so

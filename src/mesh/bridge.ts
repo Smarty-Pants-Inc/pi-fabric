@@ -5,10 +5,10 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type FabricHostLease, hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
-import { ROOT_ID_PREFIX } from "../topology/root-inbox.js";
+import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
 import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
@@ -23,7 +23,8 @@ import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
  *
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
- * its recipient is native to the hub. Mirrored records never replace a native record.
+ * its recipient is native to the hub. Mirrored records never replace a native record. The one
+ * exception to "no hub record uses its id" is a hub-written handoff (smarty-dev#9074, below).
  */
 
 /** v2 requires change notifications; v1 remains the explicit pre-capability rollout path. */
@@ -111,7 +112,10 @@ export interface BridgePresence {
   hosts: BridgeHost[];
   /** Root participants of those hosts. */
   participants: FabricParticipantRecord[];
-  /** Every id and identity id of native records, live or not: a peer may never claim them. */
+  /**
+   * Every id and identity id of native records, live or not: a peer may never claim them. Only a
+   * hub handoff in force to this link waives a dead native's own ids (smarty-dev#9074).
+   */
   reserved: string[];
 }
 
@@ -202,6 +206,114 @@ const participantOf = (key: string, value: unknown): FabricParticipantRecord | u
 const contentDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(value, (_key, item) =>
   isObject(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item,
 )).digest("hex");
+
+// ---------------------------------------------------------------------------------------------
+// Handoffs (smarty-dev#9074). A Main moved from the hub to a remote host keeps its session id, so
+// its own dead native records on the hub reserve that id and the bridge refuses the moved Main
+// forever. A handoff is a hub-side record, written only by the hub's local handoff command
+// (bridge-handoff.ts) after it verified the native is dead and retired its records: "native
+// identity <id> handed off to link <link>". While it is in force, the ids of that identity (its id,
+// session id and name) are not reserved on that one link, so that link may mirror it; every other
+// link stays refused, by the handoff itself. A native that answers to the id again, live or not,
+// voids it (a live native always wins), and a bridge deletes a void handoff in its next mirror commit.
+
+export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
+
+export interface BridgeHandoff {
+  format: 1;
+  /** The handed-off root id (`session:<session id>`), its host and identity id alike. */
+  id: string;
+  sessionId: string;
+  /** The root participant's name when it was handed off, if known. */
+  name?: string;
+  /** The one bridge link (its remote name) that may present this identity. */
+  link: string;
+  handedOffAt: number;
+  operator: string;
+  /** The hub host the handoff command ran on. */
+  hub: string;
+}
+
+export const bridgeHandoffOf = (entry: Pick<MeshStateEntry, "key" | "value">): BridgeHandoff | undefined => {
+  const value = entry.value;
+  if (!isObject(value) || value.format !== 1 || typeof value.id !== "string" || !CANONICAL_ID.test(value.id)) return undefined;
+  if (entry.key !== keyFor(BRIDGE_HANDOFF_PREFIX, value.id) || value.sessionId !== value.id.slice(ROOT_ID_PREFIX.length)) return undefined;
+  if (typeof value.link !== "string" || !validBridgeName(value.link)) return undefined;
+  if (typeof value.handedOffAt !== "number" || !Number.isFinite(value.handedOffAt)) return undefined;
+  if (typeof value.operator !== "string" || !value.operator || typeof value.hub !== "string") return undefined;
+  if (value.name !== undefined && (typeof value.name !== "string" || !value.name)) return undefined;
+  return value as unknown as BridgeHandoff;
+};
+
+export interface BridgeHandoffScope {
+  /** Ids handoffs reserve on this link: those of handoffs to other links, and of void ones. */
+  reserved: string[];
+  /** Whether a native record's reserved id is waived on this link by a handoff in force. */
+  waived(value: unknown, id: string): boolean;
+  /** Handoffs a native voided, for removal. */
+  voided: MeshStateEntry[];
+}
+
+const NO_HANDOFFS: BridgeHandoffScope = { reserved: [], waived: () => false, voided: [] };
+
+/** A lease only a native writes: a mirror's lease carries neither writer census data nor a Main session. */
+const nativeLeaseLive = (lease: FabricHostLease, now: number): boolean =>
+  (lease.writer !== undefined || lease.session !== undefined) &&
+  Math.max(lease.expiresAt, lease.session?.expiresAt ?? -Infinity, lease.reloadUntil ?? -Infinity) >= now;
+
+/**
+ * The handoffs as `peer`'s link sees them. A handoff is void when any native record (host or
+ * participant, state or file, live or not) or a live native lease answers to its id: the handoff
+ * command retired the dead native's records, so one there now is a native that came back.
+ */
+export const bridgeHandoffScope = (
+  handoffEntries: readonly MeshStateEntry[],
+  hostEntries: readonly MeshStateEntry[],
+  participantEntries: readonly MeshStateEntry[],
+  leases: () => ReadonlyMap<string, FabricHostLease>,
+  now: number,
+  peer: string,
+): BridgeHandoffScope => {
+  if (handoffEntries.length === 0) return NO_HANDOFFS;
+  const answering = new Set<string>();
+  for (const entry of [...hostEntries, ...participantEntries]) {
+    if (!isObject(entry.value) || remoteHostOf(entry.value) !== undefined) continue;
+    const value = entry.value;
+    const ids = [value.id];
+    if (entry.key.startsWith(HOST_PREFIX)) ids.push(value.rootId, isObject(value.identity) ? value.identity.id : undefined);
+    for (const id of ids) if (typeof id === "string") answering.add(id);
+  }
+  for (const lease of leases().values()) {
+    if (nativeLeaseLive(lease, now)) answering.add(lease.id).add(lease.rootId).add(lease.identityId);
+  }
+  const reserved: string[] = [];
+  const voided: MeshStateEntry[] = [];
+  const held = new Map<string, Set<string>>();
+  for (const entry of handoffEntries) {
+    const handoff = bridgeHandoffOf(entry);
+    // A malformed handoff grants nothing and reserves its id, like any malformed record.
+    if (!handoff) {
+      if (isObject(entry.value) && typeof entry.value.id === "string") reserved.push(entry.value.id);
+      continue;
+    }
+    const ids = [handoff.id, handoff.sessionId, ...(handoff.name ? [handoff.name] : [])];
+    const isVoid = answering.has(handoff.id);
+    if (isVoid) voided.push(entry);
+    if (isVoid || handoff.link !== peer) reserved.push(...ids);
+    else held.set(handoff.id, new Set(ids));
+  }
+  if (held.size === 0) return { reserved, waived: () => false, voided };
+  return {
+    reserved,
+    voided,
+    // Only the identity's own native records (its leftover agents and actors), and only its own ids.
+    waived: (value, id) => {
+      if (!isObject(value) || remoteHostOf(value) !== undefined) return false;
+      const owners = [value.id, value.rootId, value.ownerHostId, value.ownerIdentityId, isObject(value.identity) ? value.identity.id : undefined];
+      return owners.some((owner) => typeof owner === "string" && held.get(owner)?.has(id) === true);
+    },
+  };
+};
 
 /** Host lease fields that change on every renewal; participant updatedAt is source activity. */
 const settled = (value: Record<string, unknown>): string =>
@@ -329,7 +441,8 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   #presenceSnapshot(): BridgePresence {
-    return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries());
+    return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries(),
+      this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
   }
 
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
@@ -392,10 +505,19 @@ export class StoreBridgeSide implements BridgeSide {
     return () => { active = false; if (retryTimer !== undefined) clearTimeout(retryTimer); close(); };
   }
 
-  #presence(hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[]): BridgePresence {
+  #presence(hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[]): BridgePresence {
+    return this.#scan(hostEntries, participantEntries, handoffEntries).presence;
+  }
+
+  #scan(
+    hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
+  ): { presence: BridgePresence; voided: MeshStateEntry[] } {
     const now = this.now();
     const leases = readHostLeases(this.store.root);
-    const reserved = new Set<string>();
+    const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
+    const reserved = new Set<string>(handoffs.reserved);
+    // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
+    const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
@@ -407,7 +529,7 @@ export class StoreBridgeSide implements BridgeSide {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
-      reserved.add(host.id).add(host.identity.id).add(host.rootId);
+      for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined || entry.updatedBy.id !== host.identity.id) continue;
       const liveness = hostLiveness(leases, host);
       const expiresAt = liveness.expiresAt;
@@ -425,10 +547,10 @@ export class StoreBridgeSide implements BridgeSide {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
-      reserved.add(participant.id).add(participant.ownerIdentityId).add(participant.rootId);
-      if (typeof participant.name === "string" && participant.name) reserved.add(participant.name);
+      for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
+      if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
       // Labels are minted per mesh and collide by design; they are never addresses across.
-      if (typeof participant.sessionId === "string" && participant.sessionId) reserved.add(participant.sessionId);
+      if (typeof participant.sessionId === "string" && participant.sessionId) reserve(entry.value, participant.sessionId);
       const owner = live.get(participant.ownerHostId);
       if (
         mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
@@ -436,7 +558,10 @@ export class StoreBridgeSide implements BridgeSide {
         (participants.get(participant.id)?.updatedAt ?? -Infinity) < entry.updatedAt
       ) participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
     }
-    return { hosts, participants: [...participants.values()].map(({ record }) => record), reserved: [...reserved] };
+    return {
+      presence: { hosts, participants: [...participants.values()].map(({ record }) => record), reserved: [...reserved] },
+      voided: handoffs.voided,
+    };
   }
 
   // Participant entries of both kinds: the shared state's (natives and mirrors) and the natives'
@@ -536,17 +661,20 @@ export class StoreBridgeSide implements BridgeSide {
     return remoteHostOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
   }
 
-  // Every id this side holds that is not this link's mirror, read now.
+  // Every id this side holds that is not this link's mirror, read now, under the same handoffs.
   #reservedNow(): Set<string> {
-    const reserved = new Set<string>();
-    for (const entries of [this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries()]) {
+    const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
+    const participantEntries = this.#participantEntries();
+    const handoffs = bridgeHandoffScope(this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), hostEntries, participantEntries,
+      () => readHostLeases(this.store.root), this.now(), this.peer);
+    const reserved = new Set<string>(handoffs.reserved);
+    for (const entries of [hostEntries, participantEntries]) {
       for (const entry of entries) {
         if (remoteHostOf(entry.value) === this.peer || !isObject(entry.value)) continue;
         const value = entry.value;
-        for (const field of ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"]) {
-          if (typeof value[field] === "string" && value[field]) reserved.add(value[field] as string);
-        }
-        if (isIdentity(value.identity)) reserved.add(value.identity.id);
+        const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
+        if (isIdentity(value.identity)) ids.push(value.identity.id);
+        for (const id of ids) if (typeof id === "string" && id && !handoffs.waived(value, id)) reserved.add(id);
       }
     }
     return reserved;
@@ -636,7 +764,8 @@ export class StoreBridgeSide implements BridgeSide {
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
         const participantFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp
           ? files : participantFileSnapshot(this.store.root);
-        const own = new Set(this.#presence(hostEntries, [...participantEntries, ...participantFiles.entries]).reserved);
+        const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
+        const own = new Set(scan.presence.reserved);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt } of presence.hosts) {
@@ -703,6 +832,8 @@ export class StoreBridgeSide implements BridgeSide {
           }
           ops.push({ kind: "delete", key, ifVersion: version, onConflict: "skip" });
         }
+        // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
+        for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
         // A changing commit records its lease effects in the same commit; a lease-only renewal
         // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
         return plan.stage(ops, effects());
@@ -1142,6 +1273,9 @@ const addresses = (presence: Pick<BridgePresence, "hosts" | "participants">): Se
  * is reserved, so no hub recipient but the remote owner answers to an admitted id.
  */
 const CANONICAL_ID = new RegExp(`^${ROOT_ID_PREFIX}[A-Za-z0-9-]{8,128}$`);
+
+/** Whether `id` is a root's canonical id, the only form a bridge admits (and a handoff names). */
+export const isCanonicalRootId = (id: string): boolean => CANONICAL_ID.test(id);
 
 /**
  * The remote's presence as this link admits it: hosts and roots none of whose ids or aliases

@@ -783,6 +783,57 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
     }
   });
 
+  // CODE_REVIEW P1 on 3215b712: without a cd preface the hook used to receive
+  // the caller's args itself, so it could add or change cwd after the guard
+  // judged the command in the session cwd and move execution elsewhere.
+  it("refuses a tool_call hook that moves pi.bash execution to another cwd", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cwd-move-")));
+    const repo = path.join(root, "repo");
+    const linked = path.join(root, "linked");
+    fs.mkdirSync(repo);
+    const git = (...gitArgs: string[]) => execFileSync("git", gitArgs, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    git("init", "-q");
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "init");
+    git("worktree", "add", "-q", "-b", "linked", linked, "HEAD");
+    const probe = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`;
+    const write = `printf ran > ran.txt`;
+    try {
+      const run = async (args: Record<string, unknown>, hook: (input: Record<string, unknown>) => unknown) => {
+        const runner = makeRunner({ emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => hook(event.input)) });
+        const catalog = new CapturedToolCatalog();
+        catalog.replace([], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+        const registry = new ActionRegistry();
+        registry.register(new PiToolsProvider(repo, catalog, undefined));
+        try {
+          return await registry.invoke("pi.bash", args, {
+            ...baseContext,
+            cwd: repo,
+            extensionContext: { ...baseContext.extensionContext, cwd: repo } as ExtensionContext,
+            audits: [],
+          }) as { output: string };
+        } finally { await registry.close(); }
+      };
+      // (a) A hook that ADDS cwd=<linked worktree> to a call without cwd is refused.
+      await expect(run({ command: write }, (input) => { input.cwd = linked; }))
+        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+      // (b) A hook that CHANGES cwd is refused, whether or not the original cwd needed a preface.
+      await expect(run({ command: write, cwd: repo }, (input) => { input.cwd = linked; }))
+        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+      await expect(run({ command: write, cwd: linked }, (input) => { input.cwd = repo; }))
+        .rejects.toThrow("a tool_call hook moved the cwd its command was judged in");
+      expect(fs.existsSync(path.join(repo, "ran.txt"))).toBe(false);
+      expect(fs.existsSync(path.join(linked, "ran.txt"))).toBe(false);
+      // (c) A hook that rewrites only the command text still runs, in the session cwd.
+      const rewritten = await run({ command: "printf original" }, (input) => { input.command = probe; });
+      expect(fs.realpathSync.native(rewritten.output.trim())).toBe(fs.realpathSync.native(repo));
+      // Removing a cwd that already named the session cwd does not move execution.
+      const dropped = await run({ command: probe, cwd: repo }, (input) => { delete input.cwd; });
+      expect(fs.realpathSync.native(dropped.output.trim())).toBe(fs.realpathSync.native(repo));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("runs the tool_call preflight once a runner exists and obeys its block", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-hooked-"));
     const marker = path.join(root, "executed");

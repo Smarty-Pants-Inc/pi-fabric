@@ -779,7 +779,12 @@ export class PiToolsProvider implements FabricProvider {
     const cwd = args[PI_BASH_CWD_KEY];
     const preface = name === "bash" && typeof cwd === "string" && typeof args.command === "string" && cwd !== this.#cwd
       ? `cd ${shellQuote(cwd)} && ` : undefined;
-    const input = preface ? { ...args, command: preface + (args.command as string) } : args;
+    // The hook sees a copy, never the caller's args: a hook may rewrite the
+    // command, but every bash preflight snapshots the effective cwd it was
+    // judged in (args.cwd, or the session cwd when absent), and a hook that
+    // adds, changes or otherwise moves that cwd is refused below.
+    const judgedCwd = name === "bash" ? this.#effectiveBashCwd(args, context) : undefined;
+    const input: Record<string, unknown> = preface ? { ...args, command: preface + (args.command as string) } : { ...args };
     const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
       type: "tool_call",
       toolName: name,
@@ -790,15 +795,29 @@ export class PiToolsProvider implements FabricProvider {
       context.updateArguments?.(args);
       throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
     }
+    if (name === "bash" && this.#effectiveBashCwd(input, context) !== judgedCwd) {
+      throw new Error(`Pi tool ${name} was blocked: a tool_call hook moved the cwd its command was judged in; a hook may not move execution`);
+    }
     if (preface) {
       // Carry hook rewrites back, but only through the cd it judged.
       if (typeof input.command !== "string" || !input.command.startsWith(preface) || input[PI_BASH_CWD_KEY] !== cwd) {
         throw new Error(`Pi tool ${name} was blocked: a tool_call hook rewrote the cwd it judged; run the command without cwd`);
       }
-      for (const [key, value] of Object.entries(input)) if (key !== "command") args[key] = value;
-      args.command = input.command.slice(preface.length);
+      input.command = input.command.slice(preface.length);
     }
+    // Carry the hook's accepted rewrites back onto the caller's args.
+    for (const key of Object.keys(args)) if (!Object.hasOwn(input, key)) delete args[key];
+    Object.assign(args, input);
     context.updateArguments?.(args);
+  }
+
+  // The directory a pi.bash call executes in: its cwd argument when present,
+  // otherwise the session cwd its execution context carries (see
+  // #executionContextFor). Compared by value, so a hook that rewrites the cwd
+  // into any other form is treated as moving execution.
+  #effectiveBashCwd(args: Record<string, unknown>, context: FabricInvocationContext): unknown {
+    const cwd = args[PI_BASH_CWD_KEY];
+    return cwd !== undefined ? cwd : (context.extensionContext?.cwd ?? this.#cwd);
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so

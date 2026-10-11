@@ -6,7 +6,7 @@ import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult } from "./state-file.js";
-import { createStateBackend, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
+import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
@@ -264,6 +264,10 @@ export interface MeshStoreOptions {
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
 let unreadableStateRevisions = 0;
 
+/** A SQLite WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP): a reader pins the WAL above the hard cap (smarty-dev#7451). */
+export const MESH_WAL_CAP_ALARM_TOPIC = "fabric.alarm.mesh-wal-cap";
+const MESH_WAL_CAP_ALARM_MS = 10 * 60 * 1_000;
+
 export class MeshStore {
   readonly #lock: MeshLock;
   readonly #state: StateBackend;
@@ -390,16 +394,38 @@ export class MeshStore {
   }
 
   put(input: { key: string; value: unknown; identity: MeshIdentity; ifVersion?: number }): Promise<MeshStateEntry> {
-    return this.#state.put(input);
+    return this.#alarmWalCap(this.#state.put(input), input.identity);
   }
 
   delete(input: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }> {
-    return this.#state.delete(input);
+    return this.#alarmWalCap(this.#state.delete(input));
   }
 
   /** Transaction and callback semantics: StateBackendBatchInput (state-backend.ts). */
   writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
-    return this.#state.writeBatch(input);
+    return this.#alarmWalCap(this.#state.writeBatch(input), input.identity);
+  }
+
+  // smarty-dev#7451 item 6: a write the SQLite WAL cap refused (a reader pins the WAL) raises one log line and one
+  // MESH_WAL_CAP_ALARM_TOPIC event per store at most every MESH_WAL_CAP_ALARM_MS. The event goes to events.jsonl,
+  // which the cap does not gate. The refusal itself is rethrown unchanged (callers retry it, item 8).
+  #walCapAlarmAt = Number.NEGATIVE_INFINITY;
+  #walCapIdentity: MeshIdentity | undefined;
+  #alarmWalCap<T>(write: Promise<T>, identity?: MeshIdentity): Promise<T> {
+    if (identity) this.#walCapIdentity = identity;
+    return write.catch((error: unknown) => {
+      const now = Date.now();
+      if (isMeshStateWalCap(error) && now - this.#walCapAlarmAt >= MESH_WAL_CAP_ALARM_MS) {
+        this.#walCapAlarmAt = now;
+        const { walBytes, capBytes, readers } = error as { walBytes?: number; capBytes?: number; readers?: string };
+        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes)${readers ? `; ${readers}` : ""}`;
+        console.warn(`[pi-fabric] ${text} at ${this.root}`);
+        const from = this.#walCapIdentity;
+        if (from) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
+          data: { root: this.root, walBytes, capBytes, readers } }).catch(() => undefined);
+      }
+      throw error;
+    });
   }
 
   confirmWritable(onAcquired?: (at: number) => void): Promise<void> {

@@ -304,6 +304,21 @@ it("refuses a nats-server older than the backend's minimum before any write: no 
   expect(fs.readdirSync(root).filter(name => name.startsWith("state.json."))).toEqual([]);
 });
 
+it("rollback is the escape hatch: a NATS root on a server below 2.11.0 (or a prerelease) still rolls back (pi-fabric#918 round 4)", async () => {
+  for (const version of ["2.10.22", "2.11.0-rc.1"]) {
+    const server = fakeJetStream();
+    const root = tempRoot("old-server-rollback");
+    const digest = await seedFileRoot(root);
+    await importMeshStateToNats(root, { port: server.port() });
+    server.version = version; // the server was downgraded (or reports a prerelease) after the switch
+    await expect(importMeshStateToNats(tempRoot("old-server-import"), { port: server.port() })).rejects.toThrow(/older than 2\.11\.0|not a release version/);
+    const back = await rollbackMeshStateFromNats(root, { port: server.port() });
+    expect(back).toMatchObject({ digest, epoch: 2, converged: false });
+    expect(readMeshStateNatsMarker(root)).toBeUndefined();
+    expect(fileDigest(root)).toBe(digest);
+  }
+});
+
 it("refuses a server that does not report sync_always", async () => {
   const server = fakeJetStream();
   server.syncAlways = false;

@@ -2,9 +2,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
-  MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
-  NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
+  applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError,
+  MeshStateNatsOutcomeUnknownError, MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError,
+  MeshStateNatsUnavailableError, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -237,12 +237,22 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
   describe("refusals (never a fallback to file)", () => {
     it.each([
       ["a server older than 2.11", { version: "2.10.22", syncAlways: true }, /older than 2\.11/],
+      ["a prerelease of the minimum (pi-fabric#918)", { version: "2.11.0-rc.1", syncAlways: true }, /not a release version/],
+      ["a version with a suffix", { version: "2.11.0junk", syncAlways: true }, /not a release version/],
       ["a server that does not fsync every write", { version: "2.14.7", syncAlways: false }, /sync_always/],
       ["a server that does not report its sync policy", { version: "2.14.7", syncAlways: undefined }, /sync_always/],
     ])("refuses %s", async (_name, facts, reason) => {
       const server = fakeJetStream();
       Object.assign(server, facts);
       await expect(open(server)).rejects.toThrow(reason);
+    });
+
+    it("the version rule: MAJOR.MINOR.PATCH at or above 2.11.0; a prerelease, a prefix, a suffix or a short version fails closed", () => {
+      for (const version of ["2.11.0", "2.14.7", "2.12.10", "3.0.0"]) expect(() => assertNatsServerSupported(version)).not.toThrow();
+      for (const version of ["2.10.99", "1.99.99"]) expect(() => assertNatsServerSupported(version)).toThrow(/older than 2\.11\.0/);
+      for (const version of ["2.11.0-rc.1", "2.11.0junk", "v2.11.0", "2.11", "2.11.0.1", " 2.11.0", ""]) {
+        expect(() => assertNatsServerSupported(version)).toThrow(/not a release version/);
+      }
     });
 
     it("accepts a periodic-sync server only when the operator says so", async () => {

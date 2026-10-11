@@ -214,15 +214,16 @@ const connect = async (options: MeshNatsMigrationOptions): Promise<{ port: JetSt
 };
 
 /** Connects, refuses an unsafe server, ensures the stream, then runs `body` under the migration fence. */
-const run = async <T>(root: string, options: MeshNatsMigrationOptions,
+const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersion: boolean,
   body: (port: JetStreamPort, stream: string, subject: string) => Promise<T>): Promise<T> => {
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
   const { port, owned } = await connect(options);
   try {
     const server = await port.server();
-    // Before ANY migration write: a server the backend refuses to open would strand a migrated root (pi-fabric#918).
-    assertNatsServerSupported(server.version);
+    // Before an IMPORT writes anything: a server the backend refuses to open would strand a migrated root (pi-fabric#918).
+    // A rollback is the escape hatch from such a server, so it is never gated on the version (round 4).
+    if (gateVersion) assertNatsServerSupported(server.version);
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshBackendRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): refusing to migrate state onto it`);
     }
@@ -287,7 +288,7 @@ const encodeExport = (state: ReturnType<typeof snapshotOf>, limits: Limits): Buf
 
 /** Imports a file root's state into its NATS stream and moves state.json to the NATS marker. */
 export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
-  run(root, options, async (port, stream, subject) => {
+  run(root, options, true, async (port, stream, subject) => {
     root = path.resolve(root);
     if (fs.existsSync(path.join(root, "state.db")) || readMeshStateMovedMarker(root)) {
       throw new MeshBackendRefusedError(`Fabric mesh NATS import refused for ${root}: it has state.db; roll it back to file first (rollbackMeshState)`);
@@ -377,7 +378,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
 
 /** Rolls a NATS root back to file: retires the stream, exports its state to state.json over the marker. */
 export const rollbackMeshStateFromNats = (root: string, options: MeshNatsMigrationOptions = {}): Promise<MeshNatsMigrationResult> =>
-  run(root, options, async (port, stream, subject) => {
+  run(root, options, false, async (port, stream, subject) => {
     root = path.resolve(root);
     const limits = limitsOf(options);
     const marker = readMeshStateNatsMarker(root);

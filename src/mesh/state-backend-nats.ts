@@ -934,8 +934,12 @@ export const preparedNatsStateBackend = (root: string): NatsStateBackend | undef
 
 /** Minimum server: per-message TTL and delete markers (2.11), used by the KV leases of phase 2. */
 const MIN_SERVER = [2, 11, 0];
+/** A release version only (`2.14.7`): a prerelease (`2.11.0-rc.1`), a suffix or junk fails closed (pi-fabric#918). */
+const RELEASE_VERSION = /^(\d+)\.(\d+)\.(\d+)$/;
 const versionAtLeast = (version: string, minimum: number[]): boolean => {
-  const parts = version.replace(/^v/, "").split(/[.-]/).slice(0, 3).map(part => Number.parseInt(part, 10));
+  const match = RELEASE_VERSION.exec(version);
+  if (!match) return false;
+  const parts = match.slice(1, 4).map(part => Number.parseInt(part, 10));
   for (let index = 0; index < 3; index++) {
     const have = parts[index] ?? 0, want = minimum[index] ?? 0;
     if (!Number.isFinite(have)) return false;
@@ -946,6 +950,7 @@ const versionAtLeast = (version: string, minimum: number[]): boolean => {
 
 /** Refuses a nats-server older than the minimum (the backend's open and the migration share it, pi-fabric#918). */
 export const assertNatsServerSupported = (version: string): void => {
+  if (!RELEASE_VERSION.test(version)) throw new MeshStateNatsRefusedError(`nats-server version ${JSON.stringify(version)} is not a release version (MAJOR.MINOR.PATCH)`);
   if (!versionAtLeast(version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${version} is older than ${MIN_SERVER.join(".")}`);
 };
 

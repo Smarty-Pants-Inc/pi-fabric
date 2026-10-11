@@ -5,7 +5,6 @@ import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
-import { FileLockTimeoutError } from "./core/file-lock.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
@@ -614,9 +613,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (!current()) return false;
     const entropy = await import("./entropy/index.js");
     if (!current()) return false;
+    // The lock-contention error type comes with the lazy entropy module, never eagerly.
     const { comparableCompiledSurfaceScore, entropyRepairRows, formatEntropyCompileNotice,
       liveSurfaceSnapshot, loadCompiledSurfaceAsync, saveCompiledSurfaceAsync,
-      updateObservationPoolAsync, sessionWindowEvidenceAsync } = entropy;
+      updateObservationPoolAsync, sessionWindowEvidenceAsync, FileLockTimeoutError } = entropy;
     let retry = false;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;

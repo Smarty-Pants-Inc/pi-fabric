@@ -27,7 +27,8 @@ export class RecordsWatchdog {
     alarm?: (lag: ConsumerLag) => Promise<void>;
     lagMs?: number;
     intervalMs?: number;
-    /** Main's idle safety check is read-only: no relay, alarm, or turn delivery. */
+    /** Main's idle safety check is read-only: no relay flush, alarm, or turn delivery, except
+     * the documented own-root wake when this process holds no relay (no committed nudge, F9). */
     periodicObservationOnly?: boolean;
     /** Minimum time between two alarms for one consumer. */
     realarmMs?: number;
@@ -67,7 +68,18 @@ export class RecordsWatchdog {
   async #tick(observationOnly: boolean): Promise<{ lagging: ConsumerLag[]; woke: boolean; alarmed: string[] }> {
     const { store, relay, signal } = this.options;
     signal?.throwIfAborted();
-    if (observationOnly) return { lagging: await this.lagging(), woke: false, alarmed: [] };
+    if (observationOnly) {
+      const lagging = await this.lagging();
+      // A relay process's committed appends publish their nudges, which wake Main by event.
+      // Without the relay credential nothing publishes one (F9): keep the documented own-root
+      // wake on this same tick, for this root's own lag only, through the host's idle gate.
+      if (relay || !this.options.wake || !lagging.some(lag => lag.consumer === this.options.self)) {
+        return { lagging, woke: false, alarmed: [] };
+      }
+      signal?.throwIfAborted();
+      await this.options.wake();
+      return { lagging, woke: true, alarmed: [] };
+    }
     await relay?.flush(signal).catch(() => undefined);
     await this.options.check?.(signal);
     signal?.throwIfAborted();

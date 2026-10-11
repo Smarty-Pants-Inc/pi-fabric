@@ -32,3 +32,25 @@ it("Main records safety observes lag at most once a minute but never flushes, al
   } finally { watchdog.stop(); await watchdog.idle(); }
   expect(vi.getTimerCount()).toBe(0);
 });
+
+// #792 review P1-1: without the relay credential no committed append publishes a nudge (F9),
+// so the minute observation tick keeps the documented own-root wake (records/service.ts):
+// it wakes this root, through its gate, for this root's own lag only; never a peer's, never an alarm.
+it("without a relay credential, the observation tick still wakes this root for its own lag only", async () => {
+  const own = { consumer: "session:main", after: 0, count: 1, oldestAt: 1 };
+  const peer = { consumer: "session:peer", after: 0, count: 2, oldestAt: 1 };
+  const lagging = vi.fn().mockResolvedValue([peer, own]);
+  const claimAlarm = vi.fn(), alarm = vi.fn(), check = vi.fn();
+  const wake = vi.fn().mockResolvedValue(undefined);
+  const watchdog = new RecordsWatchdog({
+    store: { lagging, claimAlarm } as unknown as RecordsOps,
+    self: own.consumer, wake, alarm, check, periodicObservationOnly: true,
+  });
+  expect(await watchdog.tick(true)).toEqual({ lagging: [peer, own], woke: true, alarmed: [] });
+  expect(wake).toHaveBeenCalledOnce();
+  expect(alarm).not.toHaveBeenCalled(); expect(claimAlarm).not.toHaveBeenCalled(); expect(check).not.toHaveBeenCalled();
+  // No lag of its own: observation stays read-only.
+  lagging.mockResolvedValue([peer]);
+  expect(await watchdog.tick(true)).toEqual({ lagging: [peer], woke: false, alarmed: [] });
+  expect(wake).toHaveBeenCalledOnce();
+});

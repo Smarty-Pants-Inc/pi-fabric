@@ -87,6 +87,25 @@ describe("mesh schedules", () => {
     expect(store.read({ topic: "t" }).map((event) => event.text)).toEqual(["scheduled", "soon", "plain"]);
   });
 
+  it("persists the scheduling principal and revalidates it on release (#864)", async () => {
+    const store = new MeshStore(meshRoot(), 64 * 1024, 100);
+    const principal = { id: "paul", binding: "voice-call" as const };
+    const now = Date.now();
+    const kept = await store.schedule({ topic: "jobs", from: identity, text: "kept", dueAt: now + 60_000, key: "kept", principal });
+    expect(kept.principal).toEqual(principal);
+    await store.schedule({ topic: "jobs", from: identity, text: "none", dueAt: now + 60_000 });
+    await store.schedule({ topic: "jobs", from: identity, text: "damaged", dueAt: now + 60_000, key: "damaged", principal });
+    // A tampered principal in the persisted file is dropped, never released as authority.
+    const file = path.join(store.root, "schedules.json");
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    for (const entry of saved.schedules) if (entry.key === "damaged") entry.principal = { id: "admin", binding: "root" };
+    fs.writeFileSync(file, JSON.stringify(saved));
+    const released = await store.releaseDueSchedules(now + 120_000);
+    expect(Object.fromEntries(released.map(event => [event.text, event.principal]))).toEqual({
+      kept: principal, none: undefined, damaged: undefined,
+    });
+  });
+
   it("enforces bounds and fails closed on damaged schedule state", async () => {
     const root = meshRoot();
     const store = new MeshStore(root, 4 * 1024, 100);

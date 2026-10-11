@@ -11,6 +11,7 @@ import { createStateBackend, type MeshStateBackendKind, type StateBackend, type 
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
+import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
@@ -63,6 +64,8 @@ export interface MeshSchedule {
   createdAt: number;
   /** Stamped when scheduled; carried onto the released event. */
   sender?: FabricMessageSender;
+  /** The scheduling invocation's principal; revalidated and carried onto the released event. */
+  principal?: FabricPrincipal | undefined;
 }
 
 interface MeshScheduleFile {
@@ -457,6 +460,8 @@ export class MeshStore {
     data?: unknown;
     dueAt: number;
     key?: string;
+    /** Runtime-captured originating principal (host-only), as for publish. */
+    principal?: FabricPrincipal | undefined;
   }, now = Date.now()): Promise<MeshSchedule> {
     validateMeshTopic(input.topic);
     if (input.to !== undefined && !input.to.trim()) throw new Error("Mesh recipient is empty");
@@ -481,6 +486,7 @@ export class MeshStore {
       dueAt: input.dueAt,
       createdAt: now,
       sender: processSender(),
+      ...(copyFabricPrincipal(input.principal) ? { principal: copyFabricPrincipal(input.principal) } : {}),
     };
     // Reject at schedule time what release could never append.
     const released: MeshEvent = {
@@ -490,6 +496,7 @@ export class MeshStore {
       ...(schedule.data !== undefined ? { data: schedule.data } : {}),
       scheduled: { dueAt: schedule.dueAt, ...(schedule.key !== undefined ? { key: schedule.key } : {}) },
       ...(schedule.sender ? { sender: schedule.sender } : {}),
+      ...(schedule.principal ? { principal: schedule.principal } : {}),
       createdAt: Number.MAX_SAFE_INTEGER,
     };
     if (Buffer.byteLength(JSON.stringify(released), "utf8") > this.maxEventBytes) {
@@ -573,6 +580,8 @@ export class MeshStore {
           scheduled: { dueAt: entry.dueAt, ...(entry.key !== undefined ? { key: entry.key } : {}) },
           // Older schedules stay unstamped: the releasing host never lends its own authority.
           ...(entry.sender ? { sender: entry.sender } : {}),
+          // The scheduler's principal, revalidated: a damaged record carries none.
+          ...(copyFabricPrincipal(entry.principal) ? { principal: copyFabricPrincipal(entry.principal) } : {}),
         }));
         releasedIds.add(entry.id);
       }

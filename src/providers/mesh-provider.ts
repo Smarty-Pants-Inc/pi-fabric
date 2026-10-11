@@ -421,39 +421,30 @@ export class MeshProvider implements FabricProvider {
         const topic = String(args.topic);
         assertPublishTopic(topic);
         const dueAt = meshScheduleDueAt(args);
-        if (dueAt !== undefined) {
-          // Scheduled publish (upstream): the store releases it at dueAt; key replaces.
-          const schedule = await this.store.schedule({
-            topic,
-            from: this.identity,
-            ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
-            ...(typeof args.to === "string" ? { to: args.to } : {}),
-            ...(typeof args.text === "string" ? { text: args.text } : {}),
-            ...(args.data !== undefined ? { data: args.data } : {}),
-            dueAt,
-            ...(typeof args.key === "string" ? { key: args.key } : {}),
-          });
-          return { scheduled: true, ...schedule };
-        }
-        if (args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
-        const dedupeKey = namespacedDedupeKey(args, context);
+        if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
+        const dedupeKey = dueAt === undefined ? namespacedDedupeKey(args, context) : undefined;
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;
+        // One closure for both: a scheduled publish (upstream; the store releases it at dueAt,
+        // key replaces) keeps the originating principal and the outgoing-message notice path.
         const publish = (text?: string) => {
           context.signal?.throwIfAborted();
-          return this.store.publish({
+          const message = {
             topic,
             from: this.identity,
             principal: invocationFabricPrincipal(context),
-            signal: context.signal,
-            ...(dedupeKey === undefined ? {} : { dedupeKey }),
             ...(typeof args.kind === "string" ? { kind: args.kind } : {}),
             ...(typeof args.to === "string" ? { to: args.to } : {}),
             ...(text === undefined ? {} : { text }),
             ...(args.data !== undefined ? { data: args.data } : {}),
-          });
+          };
+          if (dueAt !== undefined) {
+            return this.store.schedule({ ...message, dueAt, ...(typeof args.key === "string" ? { key: args.key } : {}) })
+              .then(schedule => ({ scheduled: true as const, ...schedule }));
+          }
+          return this.store.publish({ ...message, signal: context.signal, ...(dedupeKey === undefined ? {} : { dedupeKey }) });
         };
         const event = checked
-          ? await deliverWithMessageNotice(args.text as string, checked, publish, "mesh.publish")
+          ? await deliverWithMessageNotice<Awaited<ReturnType<typeof publish>>>(args.text as string, checked, publish, "mesh.publish")
           : await publish();
         return checked?.notice ? { ...event, notice: checked.notice } : event;
       }

@@ -359,6 +359,11 @@ describe("registered extension tool capture", () => {
       getAllRegisteredTools(): RegisteredTool[] {
         return this.extensions.flatMap((extension) => [...extension.tools.values()]);
       }
+      getActiveTools(): string[] { return []; }
+      createContext(): object { return {}; }
+      async emit(): Promise<void> {}
+      async emitToolCall(): Promise<undefined> { return undefined; }
+      async emitToolResult(): Promise<undefined> { return undefined; }
     }
     const registry = globalThis as Record<PropertyKey, unknown>;
     Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value: TaskEntryRunner, configurable: true });
@@ -371,6 +376,35 @@ describe("registered extension tool capture", () => {
       expect(catalog.runner).toBeUndefined();
       runner.getAllRegisteredTools();
       expect(catalog.runner).toBe(runner);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
+    }
+  });
+
+  it.each([
+    ["a plain object", { getAllRegisteredTools() { return []; } }, /not a constructor/],
+    ["a class without the emit methods", class { getAllRegisteredTools() { return []; } },
+      /prototype lacks getActiveTools, createContext, emit, emitToolCall, emitToolResult/],
+    ["an arrow function", () => undefined, /prototype is not an object/],
+  ])("refuses a bogus registered host runner: %s (#8606)", async (_label, value, reason) => {
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value, configurable: true });
+    try {
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(reason);
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(/Pi Fabric refuses the host ExtensionRunner/);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
+    }
+  });
+
+  it("refuses an accessor registered as the host runner (#8606)", async () => {
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { get: () => class {}, configurable: true });
+    try {
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(/accessor, not a data property/);
     } finally {
       delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
     }

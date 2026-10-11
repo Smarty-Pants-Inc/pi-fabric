@@ -180,13 +180,16 @@ describe("synchronous busy retries stay inside their wall-clock budget (PR #691 
       sleepSync(5); // what SQLite's busy handler spends before it gives up
       throw Object.assign(new Error("database is locked"), { errcode: 5 });
     });
+    // The monotonic clock advances only by the blocking waits (handler and retry sleeps), as on an idle CPU:
+    // a loaded runner's preemption is not the retry loop's time (smarty-dev#7651, and Windows' 15.6 ms tick #7630).
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, ms) => { clock += ms ?? 0; return "timed-out"; });
     const { error, ms } = timed(() => store.listAll(""));
     expectRetryableBusy(error);
     expect(attempts).toBeGreaterThan(1); // it does retry
-    // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms (+ timer slack).
-    // Windows (smarty-dev#7630): Atomics.wait ends on a ~15.6 ms timer tick, so a first attempt ending just inside
-    // the budget (< 9 ms), its 1 ms sleep and one more 5 ms attempt can each round up to a tick: ~9 + 2 x 15.6 ms.
-    expect(ms).toBeLessThan(15 + (process.platform === "win32" ? 2 * 15.6 + 10 : 10));
+    // Six attempts at 5 ms plus 15 ms of sleeps blocked ~45 ms before; the budget is 15 ms, waits included.
+    expect(ms).toBeLessThanOrEqual(15);
   });
 
   it("a busy first open under an exclusive hold blocks for <= ~40 ms, busy-handler waits included", async () => {

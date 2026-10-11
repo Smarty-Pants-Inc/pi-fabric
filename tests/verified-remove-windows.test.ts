@@ -2,14 +2,17 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { verifiedRemove, verifiedRemoveTestHooks, windowsPrivate, windowsRemoveHelper } from "../src/storage/verified-remove.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setWindowsVerifiedRemoval, verifiedRemove, verifiedRemoveTestHooks, windowsPrivate, windowsRemoveHelper } from "../src/storage/verified-remove.js";
 
 // smarty-dev#7858: Windows verified removal through native/fabric-win-remove.c (built and digest-pinned by the build;
 // the Windows CI job builds it with the pinned Windows zig). Owner SID, volume serial and file index are checked on
 // the HANDLE, reparse points are opened as themselves, and the delete is by handle.
 const dirs: string[] = [];
+// The helper is on for the operator's retention sweep only (the CLI switches it on); these tests switch it on too.
+beforeEach(() => setWindowsVerifiedRemoval(true));
 afterEach(() => {
+  setWindowsVerifiedRemoval(false);
   delete verifiedRemoveTestHooks.beforeHelper;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -32,6 +35,21 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     fs.writeFileSync(path.join(tree, "nested", "events.jsonl"), "{}\n");
     expect(verifiedRemove(tree, fs.lstatSync(tree), { deleter: "test" })).toMatchObject({ removed: true });
     expect(fs.existsSync(tree)).toBe(false);
+  });
+
+  // pi-fabric#913 Windows CI: a caller's final check runs with the target off its name, as on Linux, so a compaction
+  // can publish its new tail there; a kept target goes back to its name.
+  it("runs the final check with the target moved off its name, and moves a kept target back", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "events.jsonl");
+    fs.writeFileSync(file, "old events\n");
+    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", freed: 4,
+      proceed: () => { fs.writeFileSync(file, "tail\n", { flag: "wx" }); return true; } })).toEqual({ removed: true, bytes: 4 });
+    expect(fs.readFileSync(file, "utf8")).toBe("tail\n");
+    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", proceed: () => false }))
+      .toMatchObject({ removed: false, reason: "kept by the final check" });
+    expect(fs.readFileSync(file, "utf8")).toBe("tail\n");
+    expect(fs.readdirSync(dir)).toEqual(["events.jsonl"]);
   });
 
   it("keeps a file whose id changed after it was judged", () => {

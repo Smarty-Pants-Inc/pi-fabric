@@ -5,7 +5,7 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backend-fence.js";
 import { meshStateDocumentProblem } from "../mesh/state-file.js";
-import { startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
+import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -139,6 +139,8 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
 } = {}) => {
   const tally = startRemovalTally();
   registryParses = new Map(); registryRewalks = 0;
+  // The operator's sweep removes through the Windows helper (smarty-dev#7858); in-process sweeps do not.
+  setWindowsVerifiedRemoval(true);
   try {
     const result = await sweep(meshRoot, options);
     const parses = [...registryParses.values()];
@@ -147,7 +149,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
       rootRewalks: registryRewalks } };
     if (ownedStat(meshRoot)?.isDirectory()) { const refusal = applyRefusal(meshRoot); if (refusal !== undefined) summary.applyRefusal = refusal; }
     return { ...result, summary };
-  } finally { stopRemovalTally(); }
+  } finally { stopRemovalTally(); setWindowsVerifiedRemoval(false); }
 };
 /** The operator's lines: per deleter, then the one total (GiB) on its own line. */
 export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): string[] => {

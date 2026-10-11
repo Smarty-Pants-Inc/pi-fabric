@@ -267,7 +267,16 @@ const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch
   // traverse a directory fd BEFORE anything is created: otherwise a refused pin also left its directory behind.
   const fdBase = scratchFdBase(base);
   const root = fs.mkdtempSync(path.join(base, "fabric-scratch-proof-"));
-  const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let fd: number;
+  try { fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); }
+  catch (error) {
+    // smarty-dev#9637: no fd (EMFILE, say), so no pin. Remove the directory just made, by name and only while it is
+    // still empty (rmdir, never recursive), then surface the open's error.
+    const warnings: string[] = [];
+    try { fs.rmdirSync(root); }
+    catch (cleanup) { warnings.push(`could not remove the scratch directory ${root}: ${(cleanup as Error).message}`); }
+    throw Object.assign(error as Error, { cleanupWarnings: warnings });
+  }
   const pinned = `${fdBase}/${fd}`;
   try {
     const stat = fs.fstatSync(fd);

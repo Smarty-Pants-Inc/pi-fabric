@@ -405,16 +405,28 @@ export class MeshStore {
 
   // Events (event-log.ts).
 
-  async publish(input: MeshPublishInput): Promise<MeshEvent> {
+  publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Due schedules go first so the log keeps due-time order relative to this event; damaged
-    // schedule state must not block ordinary publishing (upstream). The check is lockless.
-    await this.releaseDueSchedules().catch(() => undefined);
-    return this.#events.publish({ ...input, sender: input.sender ?? processSender() });
+    // schedule state must not block ordinary publishing (upstream). With nothing due this stays
+    // synchronous up to the EventLog call: no extra await or lock on the ordinary path.
+    const stamped = { ...input, sender: input.sender ?? processSender() };
+    if (!this.#scheduleDue()) return this.#events.publish(stamped);
+    return this.releaseDueSchedules().catch(() => undefined).then(() => this.#events.publish(stamped));
   }
 
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
-    await this.releaseDueSchedules().catch(() => undefined);
-    return this.#events.publishBatch(inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() })));
+  publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+    const stamped = inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() }));
+    if (!this.#scheduleDue()) return this.#events.publishBatch(stamped);
+    return this.releaseDueSchedules().catch(() => undefined).then(() => this.#events.publishBatch(stamped));
+  }
+
+  #scheduleDue(now = Date.now()): boolean {
+    try {
+      const next = this.nextScheduleDueAt();
+      return next !== undefined && next <= now;
+    } catch {
+      return false;
+    }
   }
 
   /**

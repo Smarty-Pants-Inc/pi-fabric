@@ -55,7 +55,7 @@ async invoke(actionName, args, context) {
 
 A provider that starts its own long-running work, such as a delegate that launches runs on another system, can register each run as a participant. Inside `fabric_exec`, `context.participants` is present (it is absent in other host contexts such as speculation, so check it):
 
-```ts
+```ts host
 async invoke(actionName, args, context) {
   const run = await backend.start(args.task);
   const participant = context.participants?.register({
@@ -85,7 +85,7 @@ Owned-work cancellation: when the `fabric_exec` program that registered a non-de
 
 An extension withdraws a provider it registered directly by emitting `FABRIC_PROVIDER_WITHDRAW_EVENT` (`pi-fabric:provider:withdraw:v1`):
 
-```ts
+```ts host
 import { FABRIC_PROVIDER_WITHDRAW_EVENT, type FabricProviderWithdrawalV1 } from "pi-fabric/protocol";
 
 pi.events.emit(FABRIC_PROVIDER_WITHDRAW_EVENT, { name: "example" } satisfies FabricProviderWithdrawalV1);
@@ -99,7 +99,7 @@ Optional `generation` pins the withdrawal to one binding: a number matches the b
 
 Extensions that need to know where a tool is reachable this turn can ask synchronously with `FABRIC_TOOL_PLACEMENT_EVENT` (`pi-fabric:tool-placement:v1`), so they need not guess from Fabric's mode:
 
-```ts
+```ts host
 import {
   FABRIC_TOOL_PLACEMENT_EVENT,
   type FabricToolPlacementRequestV1,
@@ -148,7 +148,7 @@ invocation path. See [incremental activity reads](interface.md#incremental-activ
 
 Every `workflow.item` status transition emits `pi-fabric:workflow-item:v1` (`FABRIC_WORKFLOW_ITEM_EVENT`) on `pi.events`, so a host extension can track program work without parsing results:
 
-```ts
+```ts host
 import { FABRIC_WORKFLOW_ITEM_EVENT, type FabricWorkflowItemEventV1 } from "pi-fabric/protocol";
 
 pi.events.on(FABRIC_WORKFLOW_ITEM_EVENT, (event: FabricWorkflowItemEventV1) => {
@@ -162,7 +162,7 @@ pi.events.on(FABRIC_WORKFLOW_ITEM_EVENT, (event: FabricWorkflowItemEventV1) => {
 
 A host extension, daemon bridge, or embedder runs a [saved program](programs.md#host-runs) without a model turn by emitting `pi-fabric:program:run:v1` (`FABRIC_PROGRAM_RUN_EVENT`):
 
-```ts
+```ts host
 import { FABRIC_PROGRAM_RUN_EVENT, type FabricProgramRunReplyV1 } from "pi-fabric/protocol";
 
 pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {
@@ -248,7 +248,7 @@ Fabric still delivers untrusted messages. Their envelope says they come from a d
 
 The resident host cannot prove that a request's scope or a sender stamp was issued by a host. Any process running as the same OS user can write residency requests and mesh events. This is the same single-user boundary as the mesh. Real multi-user isolation needs the principal from an authenticated socket, which Fabric does not provide yet.
 
-```ts
+```ts host
 import { deriveScope, issueRootScope, scopeAllows } from "pi-fabric/scope";
 
 const root = issueRootScope({

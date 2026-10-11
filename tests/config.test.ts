@@ -397,7 +397,7 @@ describe("Fabric configuration", () => {
   });
 
   it("normalizes the default runner and independent Claude settings", () => {
-    expect(DEFAULT_FABRIC_CONFIG.agents.runner).toBe("pi-durable");
+    expect(DEFAULT_FABRIC_CONFIG.agents.runner).toBe("pi");
     expect(DEFAULT_FABRIC_CONFIG.agents.claude).toEqual({ binary: "claude" });
     const configured = normalizeFabricConfig({
       agents: {
@@ -413,7 +413,7 @@ describe("Fabric configuration", () => {
     const invalid = normalizeFabricConfig({
       agents: { runner: "Not A Runner", claude: { binary: " ", model: " " } },
     });
-    expect(invalid.agents.runner).toBe("pi-durable");
+    expect(invalid.agents.runner).toBe("pi");
     expect(invalid.agents.claude).toEqual({ binary: "claude" });
   });
 
@@ -447,11 +447,11 @@ describe("Fabric configuration", () => {
     const blankBackend = normalizeFabricConfig({ agents: { veda: { backend: " " } } });
     expect(blankBackend.agents.veda.backend).toBe("agy");
     const invalidRunner = normalizeFabricConfig({ agents: { runner: 42 } });
-    expect(invalidRunner.agents.runner).toBe("pi-durable");
+    expect(invalidRunner.agents.runner).toBe("pi");
     // A well-formed id may name a runner registered later; launch fails closed if not.
     const registered = normalizeFabricConfig({ agents: { runner: "acme-daemon" } });
     expect(registered.agents.runner).toBe("acme-daemon");
-    expect(invalidRunner.agents.runner).toBe("pi-durable");
+    expect(invalidRunner.agents.runner).toBe("pi");
   });
 
   it("defaults the agent thinking level to medium and validates the value", () => {

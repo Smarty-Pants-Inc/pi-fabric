@@ -34,7 +34,7 @@ describe("published build artifact guards", () => {
     for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
       expect(manifest.dependencies[name]).toBeUndefined();
       expect(manifest.peerDependencies[name]).toBe("*");
-      expect(manifest.devDependencies[name]).toBe(name === "typebox" ? "1.3.27" : "1.0.0");
+      expect(manifest.devDependencies[name]).toBe(name === "typebox" ? "1.3.27" : "1.1.0");
       expect(manifest.overrides?.[name]).toBeUndefined();
       expect(manifest.resolutions?.[name]).toBeUndefined();
     }

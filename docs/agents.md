@@ -622,11 +622,11 @@ Veda children do not have recursive Fabric capabilities. Fabric rejects `recursi
 
 ### Custom runners
 
-The default `pi-durable` runner uses the full isolated Pi/Fabric worker host; explicit `pi` selects the legacy CLI. See [Durable Pi runner](durable-pi.md) for recovery boundaries and the separate `pi-durable-leaf` hosted factory. Neither restores arbitrary `fabric_exec` continuations.
+The `pi-durable` runner uses the full isolated Pi/Fabric worker host. In this fork it is opt-in: the default stays `pi`, the CLI runner our route pins, release pinning and residency build on. See [Durable Pi runner](durable-pi.md) for recovery boundaries and the separate `pi-durable-leaf` hosted factory. Neither restores arbitrary `fabric_exec` continuations.
 
 A Pi extension can add a runner through the `pi-fabric/runners` subpath. The subpath is never loaded by the Fabric extension at startup.
 
-```ts
+```ts host
 import { registerAgentRunner, listAgentRunners, getAgentRunner } from "pi-fabric/runners";
 
 const unregister = registerAgentRunner(adapter); // FabricWorkerRunner | FabricHostedRunner
@@ -647,7 +647,7 @@ Registration is process-local. The resident host runs Pi with `--no-extensions`,
 
 An illustrative daemon-backed adapter:
 
-```ts
+```ts host
 import { registerAgentRunner, type FabricHostedRunner } from "pi-fabric/runners";
 
 const daemon = "http://127.0.0.1:7777"; // hypothetical job daemon

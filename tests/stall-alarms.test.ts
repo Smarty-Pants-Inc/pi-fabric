@@ -428,6 +428,54 @@ it("publishes provider-dead alarms on ops.owner, firing each held message's inbo
   expect(mesh.read({ topic: "ops.owner", after: 0, limit: 100 })).toHaveLength(5);
 });
 
+// PR #841 code review P1 (round 6): Main holds up to 200 messages; every held message's sender is
+// alarmed at once, once per address, in publish batches of at most 50 alarms.
+it("alarms every held message's sender exactly once, in bounded batches, beyond the first 50 held", async () => {
+  const { mesh } = setup();
+  const batches: number[] = [];
+  const publishBatch = mesh.publishBatch.bind(mesh);
+  vi.spyOn(mesh, "publishBatch").mockImplementation(async inputs => { batches.push(inputs.length); return publishBatch(inputs); });
+  const held = Array.from({ length: 120 }, (_, index) => ({ id: `m${index}`, from: `session:sender${index}`, sentAt: index }));
+  const event = { error: "400 invalid_request_error", since: "2026-10-11T10:00:00.000Z", cause: "compaction-failed", held };
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");
+  await providerDeadAlarms(mesh, A, A.id, event, "session:owner");     // deduplicated per address
+  const age = mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm");
+  const senders = age.filter(alarm => alarm.to!.startsWith("session:sender"));
+  expect(senders.map(alarm => alarm.to).sort()).toEqual(held.map(item => item.from).sort());   // all 120, once each
+  expect(senders.find(alarm => alarm.to === "session:sender119")).toMatchObject({ dedupeKey: "inbox-age:m119:session:sender119",
+    text: `Undelivered Main message m119 to ${A.id}: provider-dead (non-retryable: 400 invalid_request_error)`,
+    data: { messageId: "m119", messageIds: ["m119"], heldCount: 1, sentAt: 119, rootId: A.id, reason: "provider-dead", error: event.error } });
+  // Owners: one alarm each, counting all 120 and listing the first 50.
+  for (const owner of [A.id, "session:owner"]) {
+    const alarm = age.filter(entry => entry.to === owner);
+    expect(alarm).toHaveLength(1);
+    expect(alarm[0]!.data).toMatchObject({ messageId: "m0", heldCount: 120 });
+    expect((alarm[0]!.data as { messageIds: string[] }).messageIds).toEqual(held.slice(0, 50).map(item => item.id));
+  }
+  expect(age).toHaveLength(122);
+  expect(Math.max(...batches)).toBeLessThanOrEqual(50);
+  expect(batches[0]).toBe(50);   // a batch may commit a prefix; the next one resumes after it
+  expect(Object.keys(senders[0]!.data as object).sort()).toEqual(["error", "heldCount", "messageId", "messageIds", "reason", "rootId", "sentAt"]);
+});
+
+it("alarms each sender once for all its held messages: 120 held from 3 senders is 3 sender alarms", async () => {
+  const { mesh } = setup();
+  const held = Array.from({ length: 120 }, (_, index) => ({ id: `m${index}`, from: `session:sender${index % 3}`, sentAt: index }));
+  await providerDeadAlarms(mesh, A, A.id, { error: "unclassified", kind: "unclassified", failures: 3,
+    since: "2026-10-11T11:00:00.000Z", cause: "unclassified-repeated", held });
+  const age = mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm");
+  const senders = age.filter(alarm => alarm.to !== A.id);
+  expect(senders.map(alarm => alarm.to).sort()).toEqual(["session:sender0", "session:sender1", "session:sender2"]);
+  const second = senders.find(alarm => alarm.to === "session:sender1")!;
+  expect(second).toMatchObject({ dedupeKey: "inbox-age:m1:session:sender1",
+    text: `40 undelivered Main messages to ${A.id}, first m1: provider-dead (unclassified)`, data: { messageId: "m1", heldCount: 40 } });
+  expect((second.data as { messageIds: string[] }).messageIds).toEqual(held.filter(item => item.from === "session:sender1").map(item => item.id));
+  expect(age.filter(alarm => alarm.to === A.id)).toHaveLength(1);   // the Main's own owner address, once
+  // The later age pass reuses the first held message's key, so it never repeats this alarm.
+  await mesh.publish({ topic: "ops.owner", kind: "inbox.age.alarm", from: A, to: "session:sender1", dedupeKey: "inbox-age:m1:session:sender1", data: {} });
+  expect(mesh.read({ topic: "ops.owner", after: 0, limit: 500 }).filter(alarm => alarm.kind === "inbox.age.alarm")).toHaveLength(4);
+});
+
 // PR #841 security review P1: alarm data is an allowlist; provider text never rides along.
 it("publishes only allowlisted provider-dead fields, and labels an unclassified incident", async () => {
   const { mesh } = setup();

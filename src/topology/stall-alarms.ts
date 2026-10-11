@@ -142,15 +142,19 @@ export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity
   }
 };
 
-/** The held messages a provider-dead alarm names one by one; the age pass covers the rest. */
-const PROVIDER_DEAD_MESSAGE_ALARMS = 50;
+/** Held messages one alarm lists by id; its heldCount still counts them all. */
+const PROVIDER_DEAD_LISTED_MESSAGES = 50;
+/** Alarms per mesh publishBatch call; the loop publishes batches until every address is covered. */
+const PROVIDER_DEAD_ALARM_BATCH = 50;
 
 /**
  * smarty-dev#8742: a Main whose provider rejects every request as non-retryable reaches ops at
- * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to each held
- * message's sender, deduplicated per address. Each held message's alarm IS its inbox.age.alarm,
- * under the same dedupe key, fired now instead of after mesh.undeliveredAlarmMs, so it crosses the
- * existing mesh bridge to remote senders and the age pass never repeats it.
+ * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to the sender
+ * of every held message (Main holds up to 200), one inbox.age.alarm per address however many of
+ * its messages are held. PR #841 review: no held message's sender is left for the age pass.
+ * An address's alarm reuses the age pass's dedupe key for its first held message, so it crosses
+ * the existing mesh bridge to remote senders and the age pass never repeats it; the age pass
+ * still reports that address's other messages if they stay unread past mesh.undeliveredAlarmMs.
  */
 export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
   event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
@@ -161,12 +165,28 @@ export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity
     topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
     dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
     text: `Main ${rootId} ${reason}: ${fields.cause}; ${event.held.length} held message(s) unread`,
-    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS), heldCount: event.held.length } });
-  for (const item of event.held.slice(0, PROVIDER_DEAD_MESSAGE_ALARMS)) {
-    for (const to of new Set([item.from, ...owners])) await mesh.publish({
-      topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to,
-      dedupeKey: `inbox-age:${item.id}:${to}`, text: `Undelivered Main message ${item.id} to ${rootId}: ${reason}`,
-      data: { messageId: item.id, rootId, sentAt: item.sentAt, reason: "provider-dead", error: fields.error } });
+    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_LISTED_MESSAGES), heldCount: event.held.length } });
+  // Deduplicated per address: each sender once, listing its own held messages; owners list all.
+  const byAddress = new Map<string, Array<ProviderDeadAlarmEvent["held"][number]>>();
+  for (const item of event.held) {
+    for (const to of new Set([item.from, ...owners])) {
+      const items = byAddress.get(to);
+      if (items) items.push(item); else byAddress.set(to, [item]);
+    }
+  }
+  const alarms = [...byAddress].map(([to, items]) => {
+    const first = items[0]!;
+    return { topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to, dedupeKey: `inbox-age:${first.id}:${to}`,
+      text: items.length === 1 ? `Undelivered Main message ${first.id} to ${rootId}: ${reason}`
+        : `${items.length} undelivered Main messages to ${rootId}, first ${first.id}: ${reason}`,
+      data: { messageId: first.id, rootId, sentAt: first.sentAt, reason: "provider-dead", error: fields.error,
+        messageIds: items.slice(0, PROVIDER_DEAD_LISTED_MESSAGES).map(item => item.id), heldCount: items.length } };
+  });
+  // A batch may commit only a prefix: continue from the first uncommitted alarm.
+  for (let next = 0; next < alarms.length;) {
+    const committed = await mesh.publishBatch(alarms.slice(next, next + PROVIDER_DEAD_ALARM_BATCH));
+    if (!committed.length) throw new Error("Provider-dead alarm batch committed nothing");
+    next += committed.length;
   }
 };
 

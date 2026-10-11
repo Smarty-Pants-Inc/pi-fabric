@@ -60,18 +60,29 @@ const aclReportScript = [
 
 /**
  * Batch report for pending request files, one constant script for all of them.
- * Paths arrive newline-separated in FABRIC_ACL_PATHS. Each file yields
- * `file <index>`, then `attributes <FileAttributes>` (from the entry itself, so a
- * reparse point reports ReparsePoint) and the same report as one directory, or
- * `error` alone when it cannot be read. A file's lines are buffered and written
- * only once complete, so a failure never leaves a partial report.
+ * Each path arrives in FABRIC_ACL_PATHS as one base64 token of its UTF-16 code
+ * units, tokens newline-separated, so any name (CR, LF and unpaired surrogates
+ * included) decodes exactly and can never split or forge a report line. Each file
+ * yields `file <index>`, then `path <base64>` (the decoded path, re-encoded the
+ * same way, so the parser binds the report to the path it asked about),
+ * `attributes <FileAttributes>` (from the entry itself, so a reparse point reports
+ * ReparsePoint) and the same report as one directory, or `error` alone when it
+ * cannot be read. A file's lines are buffered and written only once complete, so
+ * a failure never leaves a partial report.
  */
 const aclBatchReportScript = [
   "$ErrorActionPreference = 'Stop'",
   "$sid = [System.Security.Principal.SecurityIdentifier]",
   "$i = 0",
-  "foreach ($p in $env:FABRIC_ACL_PATHS.Split([char]10)) { try { " + [
+  "foreach ($e in $env:FABRIC_ACL_PATHS.Split([char]10)) { try { " + [
+    "$b = [System.Convert]::FromBase64String($e)",
+    "$c = [char[]]::new([int][Math]::Floor($b.Length / 2))",
+    "for ($k = 0; $k -lt $c.Length; $k++) { $c[$k] = [char]([int]$b[2 * $k] + 256 * [int]$b[2 * $k + 1]) }",
+    "$p = -join $c",
+    "$r = [byte[]]::new(2 * $p.Length)",
+    "for ($k = 0; $k -lt $p.Length; $k++) { $v = [int]$p[$k]; $r[2 * $k] = [byte]($v -band 255); $r[2 * $k + 1] = [byte]($v -shr 8) }",
     "$o = [System.Collections.Generic.List[string]]::new()",
+    "$o.Add('path ' + [System.Convert]::ToBase64String($r))",
     "$o.Add('attributes ' + [string][int64]([System.IO.File]::GetAttributes($p)))",
     "$acl = Get-Acl -LiteralPath $p",
     ...aclReportStatements(expression => `$o.Add(${expression})`),
@@ -156,12 +167,27 @@ export const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
 /** One pending request file: its attributes and ACL, or why they could not be read. */
 export type WindowsRequestFileReport = { attributes: number; acl: WindowsDirectoryAcl } | { error: string };
 
+/** One path as the batch script receives and echoes it: base64 of its UTF-16LE code units (exact for any name). */
+export function encodeWindowsAclPath(file: string): string {
+  return Buffer.from(file, "utf16le").toString("base64");
+}
+
+/** Inverse of encodeWindowsAclPath; undefined for anything that is not a canonical token. */
+export function decodeWindowsAclPath(token: string): string | undefined {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(token)) return undefined;
+  const bytes = Buffer.from(token, "base64");
+  if (bytes.length % 2 !== 0 || bytes.toString("base64") !== token) return undefined;
+  return bytes.toString("utf16le");
+}
+
 /**
- * Parse the batch report for `count` files. A malformed batch throws (nothing is
- * judged); a malformed or unreadable single file becomes an `error` entry, which
- * the callers treat as a failed batch (nothing is consumed or trusted).
+ * Parse the batch report for `files` (in request order). A malformed batch throws
+ * (nothing is judged); a malformed or unreadable single file, or a report that
+ * names another path, becomes an `error` entry, which the callers treat as a
+ * failed batch (nothing is consumed or trusted).
  */
-export function parseWindowsFileAclBatch(output: string, count: number): WindowsRequestFileReport[] {
+export function parseWindowsFileAclBatch(output: string, files: readonly string[]): WindowsRequestFileReport[] {
+  const count = files.length;
   const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (lines.at(-1) !== "batch-end") throw new Error("truncated file DACL batch report");
   const sections: string[][] = [];
@@ -173,12 +199,15 @@ export function parseWindowsFileAclBatch(output: string, count: number): Windows
     else sections.at(-1)!.push(line);
   }
   if (sections.length !== count) throw new Error(`file DACL batch report covers ${sections.length} of ${count} files`);
-  return sections.map((section): WindowsRequestFileReport => {
+  return sections.map((section, index): WindowsRequestFileReport => {
     if (section.length === 1 && section[0] === "error") return { error: "Get-Acl failed" };
-    const match = /^attributes (\d+)$/.exec(section[0] ?? "");
+    const named = /^path (\S*)$/.exec(section[0] ?? "");
+    if (!named) return { error: "missing file path" };
+    if (decodeWindowsAclPath(named[1]!) !== files[index]) return { error: "the report names another path" };
+    const match = /^attributes (\d+)$/.exec(section[1] ?? "");
     if (!match) return { error: "missing file attributes" };
     try {
-      return { attributes: Number(match[1]), acl: parseWindowsAclReport(section.slice(1).join("\n")) };
+      return { attributes: Number(match[1]), acl: parseWindowsAclReport(section.slice(2).join("\n")) };
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
@@ -214,14 +243,43 @@ export function windowsRequestFileViolations(evidence: WindowsRequestFileEvidenc
   return violations;
 }
 
-/** One Get-Acl process for all pending files: the constant batch script, fixed argv, paths in the environment. */
-export async function readWindowsFileAcls(files: string[]): Promise<WindowsRequestFileReport[]> {
-  if (files.length === 0) return [];
-  if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
+/** Runs the constant batch script once with fixed argv; `encodedPaths` is the FABRIC_ACL_PATHS value. */
+export type WindowsFileAclBatchRunner = (encodedPaths: string) => Promise<string>;
+const runWindowsFileAclBatch: WindowsFileAclBatchRunner = async encodedPaths => {
   const { stdout } = await execFileAsync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", aclBatchReportScript], {
-    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, FABRIC_ACL_PATHS: files.join("\n") },
+    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, FABRIC_ACL_PATHS: encodedPaths },
   });
-  return parseWindowsFileAclBatch(stdout, files.length);
+  return stdout;
+};
+
+/** Upper bound for one FABRIC_ACL_PATHS value, well below the 32767-character Windows variable limit. */
+export const WINDOWS_ACL_BATCH_ENV_BUDGET = 24_000;
+
+/**
+ * One Get-Acl process per batch of pending files: the constant batch script, fixed argv, every path
+ * base64-encoded in the environment (any name, CR/LF included, is carried exactly). Batches are split
+ * to stay within the environment budget; a single path too long for it is an `error` entry.
+ */
+export async function readWindowsFileAcls(files: string[], run: WindowsFileAclBatchRunner = runWindowsFileAclBatch): Promise<WindowsRequestFileReport[]> {
+  const reports: WindowsRequestFileReport[] = new Array(files.length);
+  const tokens = files.map(encodeWindowsAclPath);
+  let chunk: number[] = [];
+  let size = 0;
+  const flush = async () => {
+    if (chunk.length === 0) return;
+    const indexes = chunk;
+    chunk = []; size = 0;
+    const output = await run(indexes.map(index => tokens[index]!).join("\n"));
+    parseWindowsFileAclBatch(output, indexes.map(index => files[index]!)).forEach((report, j) => { reports[indexes[j]!] = report; });
+  };
+  for (const [index, token] of tokens.entries()) {
+    if (token.length > WINDOWS_ACL_BATCH_ENV_BUDGET) { reports[index] = { error: "path too long for one ACL report" }; continue; }
+    if (size + token.length + 1 > WINDOWS_ACL_BATCH_ENV_BUDGET) await flush();
+    chunk.push(index);
+    size += token.length + 1;
+  }
+  await flush();
+  return reports;
 }
 
 export async function readWindowsDirectoryAcl(directory: string): Promise<WindowsDirectoryAcl> {
@@ -255,23 +313,50 @@ export const windowsRequestsAclAdapters: Required<WindowsRequestsAclDeps> = {
   readAcl: readWindowsDirectoryAcl, restrict: restrictWindowsDirectory, readFileAcls: readWindowsFileAcls,
 };
 
+/** Volume, file id and creation time of an entry (not followed); the bigint `ino` is the NTFS file index on Windows. */
+const entryIdentity = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
+
+/** The identity of each resident metadata file, pinned while its ACL was verified (win32). */
+export type ResidentMetadataPins = ReadonlyMap<string, string>;
+
 /**
- * Windows: fail closed unless each resident metadata file (config.json, owner.json) is as private as a pending
- * request file, judged by the same batch report and policy (windowsRequestFileViolations). Whoever can write these
- * files picks the root, mesh, process and paths an operator tool acts on, so an owner SID check alone is not
- * enough: a foreign owner, a foreign write-class ACE, a NULL or missing DACL, a reparse point, or an unreadable
- * report refuses. POSIX: no-op (callers check the uid).
+ * Windows: fail closed unless the resident directory and each resident metadata file (config.json, owner.json)
+ * are private. Whoever can write these files, or replace them through the directory, picks the root, mesh, actor
+ * registries, process and paths an operator tool acts on, so an owner SID check alone is not enough. Each parent
+ * directory is judged by the requests-directory policy (windowsRequestsAclViolations) and each file by the
+ * request-file batch report and policy (windowsRequestFileViolations): a foreign owner, a foreign write-class
+ * ACE, a NULL or missing DACL, a reparse point, or an unreadable report refuses. Every entry's identity is pinned
+ * before the ACL reads and must be unchanged after them; the pins are returned so the caller reads exactly the
+ * verified files (readResidentMetadataFile). POSIX: no-op returning undefined (callers check the uid).
  */
 export async function assertWindowsResidentMetadataPrivate(files: string[], refusing: string,
   platform: NodeJS.Platform = process.platform,
-  readFileAcls: (files: string[]) => Promise<WindowsRequestFileReport[]> = windowsRequestsAclAdapters.readFileAcls): Promise<void> {
-  if (platform !== "win32") return;
+  readFileAcls: (files: string[]) => Promise<WindowsRequestFileReport[]> = windowsRequestsAclAdapters.readFileAcls,
+  readAcl: (directory: string) => Promise<WindowsDirectoryAcl> = windowsRequestsAclAdapters.readAcl): Promise<ResidentMetadataPins | undefined> {
+  if (platform !== "win32") return undefined;
   const cannot = (reason: string) =>
     new Error(`Cannot verify that the resident metadata is private to this Windows user (${reason}); refusing ${refusing}`);
-  const entries = files.map(file => {
-    const stat = fs.lstatSync(file);
-    return { file, regularFile: stat.isFile(), symbolicLink: stat.isSymbolicLink() };
-  });
+  const directories = [...new Set(files.map(file => path.dirname(file)))];
+  const identify = () => new Map([...directories, ...files].map(entry => {
+    const stat = fs.lstatSync(entry, { bigint: true });
+    return [entry, { identity: entryIdentity(stat), regularFile: stat.isFile(), directory: stat.isDirectory(), symbolicLink: stat.isSymbolicLink() }];
+  }));
+  const pinned = identify();
+  for (const directory of directories) {
+    const entry = pinned.get(directory)!;
+    if (entry.symbolicLink || !entry.directory) throw new Error(`Resident directory is not a real directory: ${directory}; refusing ${refusing}`);
+    let acl: WindowsDirectoryAcl;
+    try {
+      acl = await readAcl(directory);
+    } catch (error) {
+      throw cannot(`${directory}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const foreign = windowsRequestsAclViolations(acl);
+    if (foreign.length > 0) {
+      throw new Error(`Resident directory is not private to this OS user: ${directory} (owned or writable by other accounts (${foreign.join(", ")})); refusing ${refusing}`);
+    }
+  }
+  const entries = files.map(file => ({ file, regularFile: pinned.get(file)!.regularFile, symbolicLink: pinned.get(file)!.symbolicLink }));
   let reports: WindowsRequestFileReport[];
   try {
     reports = await readFileAcls(files);
@@ -287,6 +372,27 @@ export async function assertWindowsResidentMetadataPrivate(files: string[], refu
       throw new Error(`Resident metadata is not private to this OS user: ${file} (${violations.join("; ")}); refusing ${refusing}`);
     }
   });
+  let after: ReturnType<typeof identify>;
+  try { after = identify(); } catch { after = new Map(); }
+  for (const [entry, { identity }] of pinned) {
+    if (after.get(entry)?.identity !== identity) throw new Error(`Resident metadata was replaced while its ACL was verified: ${entry}; refusing ${refusing}`);
+  }
+  return new Map(files.map(file => [file, pinned.get(file)!.identity]));
+}
+
+/**
+ * Read one resident metadata file through a single descriptor (links not followed where the OS allows). With
+ * pins (win32, from assertWindowsResidentMetadataPrivate) the descriptor must be the verified file: a file
+ * replaced after its ACL was verified refuses instead of being trusted.
+ */
+export function readResidentMetadataFile(file: string, pins: ResidentMetadataPins | undefined, refusing: string): string {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    if (pins && (pins.get(file) === undefined || entryIdentity(fs.fstatSync(fd, { bigint: true })) !== pins.get(file))) {
+      throw new Error(`Resident metadata was replaced after its ACL was verified: ${file}; refusing ${refusing}`);
+    }
+    return fs.readFileSync(fd, "utf8");
+  } finally { fs.closeSync(fd); }
 }
 
 /** Fail closed unless only this user, SYSTEM and Administrators own or may write the directory. */
@@ -398,6 +504,8 @@ export class WindowsRequestsGuard {
   #verified: { identity: string; at: number } | undefined;
   #refusal: Error | undefined;
   #screenFailure: string | undefined;
+  /** The failure and candidate set last isolated, so a repeating systemic failure is not re-isolated every poll. */
+  #isolated: string | undefined;
   /** Refused files whose quarantine rename failed: never consumed, alarmed once. */
   readonly #unquarantined = new Set<string>();
   readonly #deps: () => WindowsRequestsAclDeps;
@@ -431,7 +539,10 @@ export class WindowsRequestsGuard {
    * quarantine name (no `.json` suffix, so it is never enumerated again) with a
    * logged alarm, and is never returned. If the batch read fails, or any single
    * file's report is unreadable or malformed, the whole batch is aborted: nothing
-   * is returned or quarantined this time, and each distinct failure alarms once.
+   * is returned this time, and each distinct failure alarms once. The abort is
+   * then isolated (see #isolate): an entry whose own report is unreadable or
+   * malformed is quarantined with an alarm naming it, so one planted name cannot
+   * stall the directory; its siblings are judged again on the next poll.
    * POSIX returns the entries unchanged.
    */
   async screenPending(entries: string[]): Promise<string[]> {
@@ -461,25 +572,67 @@ export class WindowsRequestsGuard {
         console.error(`[pi-fabric] ALARM: not consuming resident requests in ${this.directory}: cannot verify the request files (${message}); retrying`);
       }
       this.#screenFailure = message;
+      await this.#isolate(candidates.map(candidate => candidate.file), message);
       return [];
     }
     this.#screenFailure = undefined;
+    this.#isolated = undefined;
     const accepted: string[] = [];
     candidates.forEach((candidate, index) => {
       const violations = windowsRequestFileViolations({ ...candidate, report: reports[index]! });
       if (violations.length === 0) { accepted.push(candidate.entry); return; }
-      const quarantine = `${candidate.file}.quarantine-${randomUUID()}`;
-      try {
-        fs.renameSync(candidate.file, quarantine);
-        console.error(`[pi-fabric] ALARM: quarantined resident request ${candidate.file} as ${path.basename(quarantine)} ` +
-          `without consuming it: ${violations.join("; ")}`);
-      } catch (error) {
-        this.#unquarantined.add(candidate.file);
-        console.error(`[pi-fabric] ALARM: refusing resident request ${candidate.file} (${violations.join("; ")}); ` +
-          `quarantine failed (${error instanceof Error ? error.message : String(error)}), so it is skipped`);
-      }
+      this.#quarantine(candidate.file, violations.join("; "));
     });
     return accepted;
+  }
+
+  /** Rename a refused file out of the `.json` namespace with an alarm; a failed rename skips it from now on. */
+  #quarantine(file: string, reason: string): void {
+    const quarantine = `${file}.quarantine-${randomUUID()}`;
+    try {
+      fs.renameSync(file, quarantine);
+      console.error(`[pi-fabric] ALARM: quarantined resident request ${file} as ${path.basename(quarantine)} ` +
+        `without consuming it: ${reason}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // gone meanwhile: nothing to consume
+      this.#unquarantined.add(file);
+      console.error(`[pi-fabric] ALARM: refusing resident request ${file} (${reason}); ` +
+        `quarantine failed (${error instanceof Error ? error.message : String(error)}), so it is skipped`);
+    }
+  }
+
+  /**
+   * After an aborted batch, find the entries that caused it: the same report runs once for the requests
+   * directory itself (a control path that must always be readable) and then once per file. If the control
+   * fails too, the failure is systemic (PowerShell, permissions, the parser), not an entry: nothing is
+   * quarantined and the next poll retries. Otherwise each file whose own report fails, is unreadable or is
+   * malformed is quarantined with an alarm naming it; files that read cleanly alone are left for the next poll,
+   * which judges them by the usual policy. The same failure on the same entries is isolated only once.
+   */
+  async #isolate(files: string[], failure: string): Promise<void> {
+    const key = JSON.stringify([failure, files]);
+    if (key === this.#isolated) return;
+    this.#isolated = key;
+    const readFileAcls = this.#deps().readFileAcls ?? windowsRequestsAclAdapters.readFileAcls;
+    const single = async (file: string): Promise<string | undefined> => {
+      try {
+        const reports = await readFileAcls([file]);
+        if (reports.length !== 1) return `expected 1 file report, got ${reports.length}`;
+        return "error" in reports[0]! ? reports[0].error : undefined;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
+    const control = await single(this.directory);
+    if (control !== undefined) {
+      console.error(`[pi-fabric] ALARM: cannot isolate the failed resident request batch in ${this.directory}: ` +
+        `the report fails for the requests directory itself (${control}); nothing quarantined, retrying`);
+      return;
+    }
+    for (const file of files) {
+      const reason = await single(file);
+      if (reason !== undefined) this.#quarantine(file, `unverifiable DACL (${reason}); it aborted the request batch`);
+    }
   }
 
   /** Throws (and latches) unless the verified requests directory is still in place and private. */

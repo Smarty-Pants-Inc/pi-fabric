@@ -10,7 +10,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { residentProcessAlive } from "../src/residency/process-identity.js";
-import type { WindowsRequestFileReport } from "../src/residency/windows-acl.js";
+import type { WindowsDirectoryAcl, WindowsRequestFileReport } from "../src/residency/windows-acl.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -400,7 +400,9 @@ describe("resident channel owner check", () => {
         aces: [userSid, "S-1-5-18", "S-1-5-32-544"].map(sid => ({ type: "Allow" as const, sid, rights: 2032127 })) } });
       const calls: string[][] = [];
       const owners = (files: string[]) => ({ owners: files.map(() => userSid), user: userSid });
-      const probe = (foreign?: number) => ({ platform: "win32" as const, windowsOwnerSids: owners,
+      const privateDirectory = async (): Promise<WindowsDirectoryAcl> => ({ user: userSid, owner: userSid, dacl: "present",
+        aces: [userSid, "S-1-5-18", "S-1-5-32-544"].map(sid => ({ type: "Allow" as const, sid, rights: 2032127 })) });
+      const probe = (foreign?: number) => ({ platform: "win32" as const, windowsOwnerSids: owners, windowsDirectoryAcl: privateDirectory,
         windowsFileAcls: async (files: string[]) => {
           calls.push(files);
           return files.map((_, index) => {
@@ -425,9 +427,13 @@ describe("resident channel owner check", () => {
               `(owned or writable by other accounts (${otherSid})); refusing stop/remove`);
           }
         }
-        const noQuery = await run(action, f.confirm, { platform: "win32", windowsOwnerSids: owners });
+        const noQuery = await run(action, f.confirm, { platform: "win32", windowsOwnerSids: owners, windowsDirectoryAcl: privateDirectory });
         expect(noQuery.code).toBe(1);
         expect(noQuery.err).toContain("Cannot verify that the resident metadata is private to this Windows user (no file ACL query is available); refusing stop/remove");
+        const { windowsDirectoryAcl: _omitted, ...withoutDirectoryQuery } = probe();
+        const noDirectoryQuery = await run(action, f.confirm, withoutDirectoryQuery);
+        expect(noDirectoryQuery.code).toBe(1);
+        expect(noDirectoryQuery.err).toContain(`Cannot verify that the resident metadata is private to this Windows user (${directory}: no directory ACL query is available); refusing stop/remove`);
       }
       expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
       expect(f.host.actors.status(actor.id).status).toBe("idle");
@@ -435,6 +441,54 @@ describe("resident channel owner check", () => {
       expect(await run("stop", ["--dry-run", ...f.confirm], probe())).toMatchObject({ code: 0, err: "" });
       expect(calls).toEqual([metadata]);
       expect(f.host.actors.status(actor.id).status).toBe("idle");
+    } finally { await f.close(); }
+  }, 30_000);
+
+  it("simulated win32 stop/remove refuse when config.json and owner.json stay owned by the caller but another SID may write the resident directory, or a file is replaced during verification (smarty-dev#6001)", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("win32-directory");
+      const directory = fs.realpathSync(f.config.residencyRoot);
+      const configPath = path.join(directory, "config.json");
+      const original = fs.readFileSync(configPath, "utf8");
+      const ace = (sid: string, rights: number) => ({ type: "Allow" as const, sid, rights });
+      const trusted = [ace(userSid, 2032127), ace("S-1-5-18", 2032127), ace("S-1-5-32-544", 2032127)];
+      const privateFile = (): WindowsRequestFileReport => ({ attributes: 0x20, acl: { user: userSid, owner: userSid, dacl: "present", aces: [...trusted] } });
+      const owners = (files: string[]) => ({ owners: files.map(() => userSid), user: userSid });
+      const directoryQueries: string[] = [];
+      const probe = (options: { wideDirectory?: boolean; swapConfig?: boolean } = {}) => ({ platform: "win32" as const, windowsOwnerSids: owners,
+        windowsDirectoryAcl: async (queried: string): Promise<WindowsDirectoryAcl> => {
+          directoryQueries.push(queried);
+          // (M) for another local account on the resident directory: it could replace config.json/owner.json.
+          return { user: userSid, owner: userSid, dacl: "present", aces: [...trusted, ...(options.wideDirectory ? [ace(otherSid, 197055)] : [])] };
+        },
+        windowsFileAcls: async (files: string[]) => {
+          if (options.swapConfig) {
+            // Same owner and a private DACL, but another file now sits at config.json, pointing the registries elsewhere.
+            const swapped = { ...JSON.parse(original), actorRoot: path.join(os.tmpdir(), "elsewhere") };
+            fs.writeFileSync(`${configPath}.swap`, JSON.stringify(swapped)); fs.renameSync(`${configPath}.swap`, configPath);
+          }
+          return files.map(() => privateFile());
+        } });
+      const run = async (action: "stop" | "remove", ownerProbe: Parameters<typeof main>[2]) => {
+        let err = "";
+        const code = await main([action, "--resident", f.config.residencyRoot, "--actor", actor.id, "--mesh-root", f.config.meshRoot, ...f.confirm],
+          { out: () => {}, err: text => { err += text; } }, ownerProbe);
+        return { code, err };
+      };
+      for (const action of ["stop", "remove"] as const) {
+        const wide = await run(action, probe({ wideDirectory: true }));
+        expect(wide.code).toBe(1);
+        expect(wide.err).toContain(`Resident directory is not private to this OS user: ${directory} (owned or writable by other accounts (${otherSid})); refusing stop/remove`);
+        const swapped = await run(action, probe({ swapConfig: true }));
+        fs.writeFileSync(configPath, original);
+        expect(swapped.code).toBe(1);
+        expect(swapped.err).toContain(`Resident metadata was replaced while its ACL was verified: ${configPath}; refusing stop/remove`);
+      }
+      expect(directoryQueries.every(queried => queried === directory)).toBe(true);
+      expect(fs.readdirSync(path.join(f.config.residencyRoot, "requests"))).toHaveLength(0);
+      expect(f.host.actors.status(actor.id).status).toBe("idle");
+      expect(await run("stop", probe())).toMatchObject({ code: 0, err: "" });
     } finally { await f.close(); }
   }, 30_000);
 });

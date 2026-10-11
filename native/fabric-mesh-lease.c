@@ -13,9 +13,13 @@
  * PROBED the helper's own probe open (0 or 1). The caller takes its final report BEFORE its own first open of any
  * FILE, so every other open is foreign: it refuses when OPENS exceeds PROBED. Closes are never netted, and nothing
  * is subtracted for the caller (pi-fabric#881): inotify merges an event with an identical one at the queue tail
- * (same wd, mask and name; the pid is not compared), so an own open could swallow a foreign one. Merging with the
- * PROBE's open is safe: a foreign open during the probe holds the inode, so F_SETLEASE fails ("held"), and the
- * probe's own IN_CLOSE right after its open is a different event, so a later foreign open cannot merge into it;
+ * (same wd, mask and name; the pid is not compared; only the queue TAIL, unread), so an own open could swallow a
+ * foreign one. The probe therefore READS its own IN_OPEN from the queue (bounded, about 2 s; else "unwatched FILE",
+ * fail closed) BEFORE it takes the lease: every later open is a new queue entry and cannot merge into the probe's.
+ * A foreign open before that read holds the inode, so F_SETLEASE fails ("held"); one between F_UNLCK and close
+ * is a new entry (two foreign opens may merge with each other, but one is enough to refuse). Test only:
+ * FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK=DIR pauses once there; FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN=1
+ * makes the probe never see its own IN_OPEN (the fail-closed path). Both are inert unless set;
  * "alias FILE" (its inode opened through another name: a hard link), "moved FILE", then "overflow" (lost
  * events), "newdir" (a missing directory appeared) and "invalidated" (a watched directory or file inode was
  * deleted, moved or its watch dropped, so a replacement would go unwatched) when they apply, and "end N".
@@ -72,6 +76,11 @@ static int opened;
 static char dirs[MAXF][4096];
 static long D[MAXF], nfiles, ndirs, inotify;
 static int overflow, newdir, invalidated;
+static struct target *probing;
+static int probeSeen, ignoreProbe;
+static long controlWd = -1;
+static unsigned long seq;
+static const char *pauseDir;
 
 /* An inode watch: its opens (any name) must not exceed the opens by name seen in its generation. */
 static void watch(struct target *t) {
@@ -116,7 +125,7 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
         for (long i = 0; i < nfiles; i++) {
             struct target *t = &T[i];
             if (t->dir != d || !same(t->path + slash(t->path) + 1, e->name)) continue;
-            if (e->mask & IN_OPEN) { t->opens++; if (t->gen) t->seen++; }
+            if (e->mask & IN_OPEN) { t->opens++; if (t->gen) t->seen++; if (t == probing && !ignoreProbe) probeSeen = 1; }
             if (e->mask & IN_CLOSE) t->closes++;
             if (e->mask & IN_MOVE) t->moved = 1;
             if (e->mask & (IN_CREATE | IN_DELETE)) { endgen(t); if (e->mask & IN_CREATE) watch(t); }
@@ -125,7 +134,19 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
     for (long i = 0; i < nfiles; i++) if (T[i].gen && T[i].wd == e->wd && (e->mask & IN_OPEN)) T[i].inode++;
 }
 
-static long probe(char *file);
+/* One read of the inotify queue, every event processed; the bytes read, or a negative errno (EAGAIN when empty). */
+static long drain(void) {
+    static char buffer[4096] __attribute__((aligned(8)));
+    long n = SYS(read, inotify, buffer, sizeof(buffer));
+    for (long at = 0; at < n;) {
+        const struct inotify_event *e = (const struct inotify_event *)(buffer + at);
+        event(e, controlWd, &seq);
+        at += sizeof(*e) + e->len;
+    }
+    return n;
+}
+
+static long probe(char *file, struct target *t);
 
 __attribute__((noreturn)) static void watching(long argc, char **argv) {
     if (argc < 5 || argc - 4 > MAXF) fail("usage: --watch PARENTPID CONTROLDIR FILE...", -22);
@@ -159,31 +180,64 @@ __attribute__((noreturn)) static void watching(long argc, char **argv) {
         }
         watch(t);
     }
-    for (long i = 4; i < argc; i++) { opened = 0; probe(argv[i]); T[i - 4].probed = opened; }
+    controlWd = control;
+    for (long i = 4; i < argc; i++) { opened = 0; probe(argv[i], &T[i - 4]); T[i - 4].probed = opened; }
     out("watching\n");
-    static char buffer[4096] __attribute__((aligned(8)));
-    unsigned long seq = 0;
-    for (;;) {
-        long n = SYS(read, inotify, buffer, sizeof(buffer));
-        if (n <= 0) fail("read inotify", n < 0 ? n : -5);
-        for (long at = 0; at < n;) {
-            const struct inotify_event *e = (const struct inotify_event *)(buffer + at);
-            event(e, control, &seq);
-            at += sizeof(*e) + e->len;
-        }
-    }
+    for (;;) if (drain() <= 0) fail("read inotify", -5);
 }
 
-/* One lease probe line; the exit status contribution. */
-static long probe(char *file) {
+/* Wait (bounded, about 2 s) until the inotify queue has delivered the probe's own IN_OPEN for `t`: from then on any
+ * other open is a NEW queue entry and cannot be merged into the probe's (pi-fabric#881). */
+static int ownOpenRead(struct target *t) {
+    probing = t; probeSeen = 0;
+    SYS(fcntl, inotify, F_SETFL, O_NONBLOCK);
+    for (long tries = 0; tries < 2000 && !probeSeen; tries++) {
+        if (drain() < 0) { struct { long sec, nsec; } pause = { 0, 1000000 }; SYS(nanosleep, &pause, 0, 0); }
+    }
+    SYS(fcntl, inotify, F_SETFL, 0);
+    probing = 0;
+    return probeSeen;
+}
+
+/* Tests only (FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK=DIR, inert unless set): once, between F_UNLCK and close,
+ * create DIR/paused and wait (at most 30 s) for DIR/go, so a test can open the file exactly there. */
+static void testPause(void) {
+    if (!pauseDir) return;
+    static char file[4200];
+    long n = 0;
+    for (const char *s = pauseDir; *s && n < 4096; s++) file[n++] = *s;
+    const char *names[2] = { "/paused", "/go" };
+    for (int step = 0; step < 2; step++) {
+        long end = n;
+        for (const char *s = names[step]; *s; s++) file[end++] = *s;
+        file[end] = 0;
+        if (step == 0) { long made = SYS(openat, AT_FDCWD, file, O_CREAT | O_WRONLY | O_CLOEXEC); if (made >= 0) SYS(close, made, 0, 0); continue; }
+        for (long tries = 0; tries < 6000; tries++) {
+            long seen = SYS(openat, AT_FDCWD, file, O_RDONLY | O_CLOEXEC);
+            if (seen >= 0) { SYS(close, seen, 0, 0); break; }
+            struct { long sec, nsec; } pause = { 0, 5000000 };
+            SYS(nanosleep, &pause, 0, 0);
+        }
+    }
+    pauseDir = 0;
+}
+
+/* One lease probe line; the exit status contribution. `t` is set in --watch mode. */
+static long probe(char *file, struct target *t) {
     long status = 0;
     long fd = SYS(openat, AT_FDCWD, file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd == -ENOENT) { out("absent "); }
     else if (fd < 0) { out("error "); number(-fd); out(" "); status = 2; }
+    else if (t && !ownOpenRead(t)) {
+        /* The probe's own IN_OPEN never arrived: nothing can be counted exactly. Fail closed. */
+        SYS(close, fd, 0, 0);
+        out("unwatched "); status = 2;
+    }
     else {
-        opened = 1; /* this probe's own IN_OPEN, when watched */
+        opened = 1; /* this probe's own IN_OPEN, read from the queue above (watch mode) */
         long lease = SYS(fcntl, fd, F_SETLEASE, F_WRLCK);
         if (lease == 0) SYS(fcntl, fd, F_SETLEASE, F_UNLCK); /* release at once */
+        if (t) testPause();
         SYS(close, fd, 0, 0);
         if (lease == 0) out("free ");
         else if (lease == -EAGAIN) { out("held "); status = 3; }
@@ -196,10 +250,17 @@ static long probe(char *file) {
 __attribute__((noreturn, used)) void fabric_start(long *stack) {
     long argc = stack[0];
     char **argv = (char **)(stack + 1);
+    for (char **env = argv + argc + 1; *env; env++) {
+        const char *pause = "FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK=", *ignore = "FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN=1";
+        long k = 0;
+        while (pause[k] && (*env)[k] == pause[k]) k++;
+        if (!pause[k] && (*env)[k]) pauseDir = *env + k;
+        if (same(*env, ignore)) ignoreProbe = 1;
+    }
     if (argc >= 2 && same(argv[1], "--watch")) watching(argc, argv);
     int status = argc < 2 ? 2 : 0;
     for (long i = 1; i < argc; i++) {
-        long result = probe(argv[i]);
+        long result = probe(argv[i], 0);
         if (result == 2 || (result == 3 && status == 0)) status = (int)result;
     }
     SYS(exit_group, status, 0, 0);

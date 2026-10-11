@@ -443,6 +443,42 @@ sys.stdin.readline()`;
     } finally { await holder.release(); }
   });
 
+  // pi-fabric#881 (SEC + Astra P1): a lock-free, non-dumpable opener landing between the probe's F_UNLCK and its close
+  // used to merge into the probe's still-unread IN_OPEN. The probe now reads its own IN_OPEN before the lease, so this
+  // open is a new event. End to end through the operator's bin; the helper's test pause point places the open there.
+  it.skipIf(binSkip !== "")(`end to end: a lock-free opener between the probe's F_UNLCK and its close is refused${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pause = tempDir("pause");
+    const child = spawn(process.execPath, [BIN, "cutover", "--root", root, "--accept-unready", "factory,fabric@unknown"], {
+      env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "", FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK: pause }, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", (data: Buffer) => { stderr += String(data); });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const started = Date.now();
+    while (!fs.existsSync(path.join(pause, "paused"))) {
+      if (Date.now() - started > 20_000) throw new Error(`the helper never paused after F_UNLCK: ${stderr}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      fs.writeFileSync(path.join(pause, "go"), "");
+      expect(await exited, stderr).toBe(3);
+      expect(stderr).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (1 open(s) since the lease probe; smarty-dev#8116))`);
+    } finally { await holder.release(); }
+  }, 60_000);
+
+  // pi-fabric#881: if the probe's own IN_OPEN never arrives, nothing can be counted exactly: fail closed.
+  it.skipIf(leaseSkip !== "")(`fails closed when the probe's own IN_OPEN is not seen${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    vi.stubEnv("FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN", "1");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): unexpected helper output: unwatched ${root}/state.db)`);
+      expect(await backendOf(root)).toBe("importing");
+    } finally { vi.unstubAllEnvs(); }
+  }, 60_000);
+
   it.skipIf(binSkip !== "")(`end to end through the operator's bin: a lock-free holder refuses, without it the switch is ready${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     // The operator's entry point (package bin -> dist), as a child; the real census, fd scan, /proc/locks and lease probe.

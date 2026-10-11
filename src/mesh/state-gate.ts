@@ -94,6 +94,8 @@ export const filesystemRefusal = (root: string,
 export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return undefined;
+  // ponytail: Windows keeps main's behavior (type and symlink checks only, no ACL check); failing closed would break
+  // Windows mesh users. The ACL check was cut from smarty-dev#7548 to its own issue, linked there.
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   const uid = posix ? process.getuid!() : undefined;
   const why = stat.isSymbolicLink() ? "is a symbolic link"
@@ -229,8 +231,10 @@ export const openPrivateStateDb = (file: string, open: SqliteOpener): SqliteConn
 
 // StrictModes (smarty-dev#7548): every ancestor of the root, on the lexical and the real chain, is owned by this
 // uid or root, and a directory among them is not group or other writable unless sticky (like /tmp). Otherwise
-// another user could swap the root out from under the checks. Windows has no uid or mode bits here (#7858).
+// another user could swap the root out from under the checks.
 const assertPrivateAncestors = (root: string): void => {
+  // ponytail: no ancestor walk on Windows (none existed on main; no uid or mode bits here). The Windows ACL check was
+  // cut from smarty-dev#7548 to its own issue, linked there; it covers the ancestors too.
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
   const uid = process.getuid();
   const above = (dir: string): string[] => {

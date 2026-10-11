@@ -197,7 +197,7 @@ describe("AgentManager real durable parent worker", () => {
   }, 30000);
 
   it("preserves image input and validates structured recorded output after process restart", async () => {
-    const { manager } = setup(true);
+    const { manager, cwd } = setup(true);
     const schema = { type: "object", properties: { reply: { type: "string" }, images: { type: "integer" } }, required: ["reply", "images"], additionalProperties: false };
     const images = [{ type: "image" as const, mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" }];
     const result = await manager.run({ task: "image probe", tools: [], schema, images });
@@ -206,8 +206,12 @@ describe("AgentManager real durable parent worker", () => {
     const directory = manager.runDirectory(result.id)!;
     const first = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")) as AgentRunRecord;
     // Manager removes sensitive input images when consuming the first result.
-    fs.writeFileSync(path.join(directory, "images.json"), JSON.stringify(images));
-    const replay = await restart(directory, first, { "schema-file": path.join(directory, "schema.json"), "images-file": path.join(directory, "images.json"), tools: "[]" });
+    // On Windows it removes <run>/images.json again after the first worker's
+    // native close, which may follow this result; stage the replay copy outside
+    // the manager-owned run directory so that cleanup cannot race the restart.
+    const replayImages = path.join(cwd, "replay-images.json");
+    fs.writeFileSync(replayImages, JSON.stringify(images));
+    const replay = await restart(directory, first, { "schema-file": path.join(directory, "schema.json"), "images-file": replayImages, tools: "[]" });
     expect(replay.status, replay.error).toBe("completed");
     expect(replay.value).toEqual(result.value);
     expect(replay.usage).toEqual(first.usage);

@@ -421,8 +421,11 @@ export class MeshStore {
         const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes)${readers ? `; ${readers}` : ""}`;
         console.warn(`[pi-fabric] ${text} at ${this.root}`);
         const from = this.#walCapIdentity;
-        if (from) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
-          data: { root: this.root, walBytes, capBytes, readers } }).catch(() => undefined);
+        // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.
+        try {
+          if (from) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
+            data: { root: this.root, walBytes, capBytes, readers } }).catch(() => undefined);
+        } catch { /* the alarm is best effort */ }
       }
       throw error;
     });

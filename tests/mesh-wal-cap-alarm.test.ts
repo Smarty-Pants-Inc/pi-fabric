@@ -53,4 +53,14 @@ describe("mesh WAL-cap alarm (smarty-dev#7451 item 6)", () => {
     await store.put({ key: "a/b", value: 10, identity });
     expect(alarms()).toHaveLength(2);
   });
+
+  it("an alarm publish that throws synchronously never replaces the WAL-cap error", async () => {
+    const { store } = cappedStore();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.spyOn(store, "publish").mockImplementation(() => { throw new Error("event too large"); });
+    const refused = store.put({ key: "a/b", value: 1, identity });
+    await expect(refused).rejects.toBeInstanceOf(MeshStateWalCapError);
+    await expect(refused).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_WAL_CAP", walBytes: 120 * 1024 * 1024 });
+    expect(store.publish).toHaveBeenCalledOnce();
+  });
 });

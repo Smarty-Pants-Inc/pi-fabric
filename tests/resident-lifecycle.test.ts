@@ -285,7 +285,7 @@ it("resident control-plane stop cannot bypass the foreign-root authorization fen
   try {
     await directory.start(); control.start(() => ({ accepted: false }));
     const before = f.host.actors.status(f.actor.id);
-    await expect(control.request(f.host.hostId, f.actor.id, "stop", {}, f.host.identity.id)).rejects.toThrow(/owning Main/);
+    await expect(control.request(f.host.hostId, f.actor.id, "stop", { ownerIncarnation: f.host.control.incarnation }, f.host.identity.id)).rejects.toThrow(/owning Main/);
     expect(f.host.actors.status(f.actor.id)).toEqual(before);
   } finally { await control.close(); await directory.close(); await f.close(); }
 });
@@ -307,7 +307,7 @@ it.each(["closed", "reloading", "stale"] as const)("verified peer Main stop pres
     }
     control.start(() => ({ accepted: false }));
     const before = f.host.actors.status(f.actor.id);
-    const stop = control.request(f.host.hostId, f.actor.id, "stop", {}, f.host.identity.id);
+    const stop = control.request(f.host.hostId, f.actor.id, "stop", { ownerIncarnation: f.host.control.incarnation }, f.host.identity.id);
     if (state !== "closed") {
       await expect(stop).rejects.toThrow(/owning Main/);
       expect(f.host.actors.status(f.actor.id)).toEqual(before);
@@ -325,7 +325,7 @@ it.each(["actor", "agent"] as const)("withdrawn Main does not grant stop authori
   try {
     await f.participants.close(); control.start(() => ({ accepted: false }));
     const before = f.host.actors.status(f.actor.id);
-    await expect(control.request(f.host.hostId, f.actor.id, "stop", {}, f.host.identity.id)).rejects.toThrow(/owning Main/);
+    await expect(control.request(f.host.hostId, f.actor.id, "stop", { ownerIncarnation: f.host.control.incarnation }, f.host.identity.id)).rejects.toThrow(/owning Main/);
     expect(f.host.actors.status(f.actor.id)).toEqual(before);
   } finally { await control.close(); await f.close(); }
 });

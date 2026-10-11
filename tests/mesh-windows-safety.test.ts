@@ -61,9 +61,10 @@ function plane(mesh: MeshStore, id = "owner", platform: NodeJS.Platform = "win32
     pollMs: 20, acknowledgementTimeoutMs: 5_000, ...(lease ? { canConsumeMesh: lease } : {}) });
   closers.push(() => control.close()); return control;
 }
-const command = (mesh: MeshStore, operation = "followUp") => mesh.publish({ topic: "fabric.control.command",
+// Direct transport fixtures stamp the target owner's activation, as a fenced sender does.
+const command = (mesh: MeshStore, ownerIncarnation: string, operation = "followUp") => mesh.publish({ topic: "fabric.control.command",
   from: { ...identity, id: "sender" }, to: "owner", data: { version: 1, commandId: "one", targetId: "actor",
-    operation, replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+    operation, replyTo: "sender", ownerIncarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
 function resident(platform: NodeJS.Platform = "win32") {
   const root = temp(), meshRoot = path.join(root, "mesh"), rootId = "session:windows";
   const config: ResidentHostConfig = { format: 1, rootId, sessionId: "windows", mainName: "main", mainStartedAt: 1,
@@ -105,7 +106,7 @@ describe("Windows observation recovery", () => {
   it("recovers a missed control command at 5 s and pause/close never rearms delivery", async () => {
     vi.useFakeTimers(); fakeWatch(); const mesh = new MeshStore(path.join(temp(), "mesh"), 65_536, 100);
     const control = plane(mesh), handled = vi.fn(() => ({ accepted: true })); control.start(handled);
-    await vi.advanceTimersByTimeAsync(0); await command(mesh);
+    await vi.advanceTimersByTimeAsync(0); await command(mesh, control.incarnation);
     await vi.advanceTimersByTimeAsync(4_999); expect(handled).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1); expect(handled).toHaveBeenCalledOnce();
     control.pause(); const tail = vi.spyOn(mesh, "tail");
@@ -127,10 +128,12 @@ describe("Windows observation recovery", () => {
   it("recovers a missed ACK while the request is pending", async () => {
     vi.useFakeTimers(); fakeWatch(); const mesh = new MeshStore(path.join(temp(), "mesh"), 65_536, 100);
     const sender = plane(mesh, "sender"); sender.start(() => ({ accepted: false })); await vi.advanceTimersByTimeAsync(0);
-    const outcome = sender.request("owner", "actor", "followUp", { message: "work" });
+    // Synthetic owner snapshot: this test injects the wire ACK instead of running an owner.
+    const ownerIncarnation = "fixture:owner";
+    const outcome = sender.request("owner", "actor", "followUp", { message: "work", ownerIncarnation });
     await settled(); const sent = mesh.read({ topic: "fabric.control.command" })[0]!.data as { commandId: string; targetId: string };
     await mesh.publish({ topic: "fabric.control.ack", from: identity, to: "sender", data: { version: 1,
-      commandId: sent.commandId, targetId: sent.targetId, accepted: true, messageId: "once" } });
+      commandId: sent.commandId, targetId: sent.targetId, ownerIncarnation, accepted: true, messageId: "once" } });
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
     await sender.close(); expect(vi.getTimerCount()).toBe(0);
@@ -141,7 +144,7 @@ describe("Windows observation recovery", () => {
     let healthy = true, release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const handled = vi.fn(async () => { await held; return { accepted: true, messageId: "once" }; });
-    await command(mesh, "ask"); const control = plane(mesh, "owner", platform, () => healthy); control.start(handled);
+    const control = plane(mesh, "owner", platform, () => healthy); await command(mesh, control.incarnation, "ask"); control.start(handled);
     await vi.advanceTimersByTimeAsync(0); expect(handled).toHaveBeenCalledOnce();
     healthy = false; release(); await vi.advanceTimersByTimeAsync(120);
     expect(mesh.read({ topic: "fabric.control.ack" })).toHaveLength(0);

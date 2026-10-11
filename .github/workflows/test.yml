@@ -70,6 +70,23 @@ jobs:
         run: bunx vitest run tests/type-checker.test.ts
       - name: Launcher and Pi host regressions
         run: bunx vitest run tests/worker-e2e.test.ts tests/pi-binary.test.ts tests/script-runtime.test.ts tests/herdr-transport.test.ts tests/prewalk-handoff.test.ts tests/shell-middleware.test.ts
+      # smarty-dev#8953: agents.processSlice runs workers in systemd --user scopes. GitHub-hosted ubuntu boots
+      # systemd as PID 1 but starts no user manager for the runner: linger starts one, with its session bus.
+      - name: Start a user systemd manager
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo loginctl enable-linger "$USER"
+          bus="/run/user/$(id -u)/bus"
+          for _ in $(seq 1 150); do [ -S "$bus" ] && break; sleep 0.2; done
+          test -S "$bus"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$bus" >> "$GITHUB_ENV"
+      - name: Process-slice scope E2E (required on Linux)
+        if: runner.os == 'Linux'
+        env:
+          FABRIC_SCOPE_E2E_REQUIRED: "1"
+        run: bunx vitest run --project scope-e2e
       - name: Affected tests
         env:
           # Pull requests compare against the target branch; pushes compare
@@ -96,6 +113,24 @@ jobs:
           bun --version > "$output/BUN-VERSION"
           tar -czf "$output/fabric-runtime.tar.gz" -C "$stage" .
           (cd "$output" && sha256sum fabric-runtime.tar.gz > SHA256SUMS)
+      # smarty-dev#8467: the compiled bundle in a real Pi process leaves no mesh state temp or
+      # lock staging entry behind when it ends during a large write loop on a busy mesh: a normal
+      # exit, SIGTERM, and SIGKILL (whose staged temp the next start on the same root reaps)
+      # (pi-fabric#606). It runs the Pi pinned in devDependencies, installed above by
+      # `bun install --frozen-lockfile`, against the dist/ built above, placed like the real-Pi
+      # two-reload gate (smarty-dev#8382): after the runtime is packaged, so the earlier steps and
+      # the recorded NODE-VERSION keep the runner's Node, and before the upload, so only a runtime
+      # that passed it is uploaded. Pi 0.87 needs Node >= 22.19 and dist/ is built for node24.
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: 24
+      - name: Real Pi exit cleanup e2e (smarty-dev#8467)
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        env:
+          FABRIC_8467_REAL_PI: '1'
+        run: bunx vitest run tests/mesh-exit-cleanup-real-pi.e2e.test.ts
       - name: Upload tested Linux runtime
         if: runner.os == 'Linux' && github.event_name == 'push'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -114,7 +114,7 @@ describe("event-driven mesh observers", () => {
     await publish(mesh);
     await mesh.publish({ topic: "fabric.control.command", from: { ...identity, id: "sender" }, to: "target",
       data: { version: 1, commandId: "replaced", targetId: "target", operation: "steer", replyTo: "sender",
-        requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+        ownerIncarnation: control.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
     await vi.waitFor(() => { expect(delivered).toHaveBeenCalledOnce(); expect(handled).toHaveBeenCalledOnce(); });
     await new Promise(resolve => setTimeout(resolve, 1_100));
     // Ancillary-only replacement, independent of the root identity.
@@ -248,7 +248,7 @@ describe("event-driven mesh observers", () => {
     const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(handler); await vi.advanceTimersByTimeAsync(0);
     await mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
-      data: { version: 1, commandId: "missed", targetId: "target", operation: "steer", replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+      data: { version: 1, commandId: "missed", targetId: "target", operation: "steer", replyTo: "sender", ownerIncarnation: control.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
     await vi.advanceTimersByTimeAsync(59_999); expect(handler).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1); expect(handler).not.toHaveBeenCalled();
     watches[0]!.notify("change", "events.jsonl"); await vi.advanceTimersByTimeAsync(0);
@@ -264,7 +264,7 @@ describe("event-driven mesh observers", () => {
   it("reopens a closed control plane only on an explicit start, deferring a start made during close", async () => {
     vi.useFakeTimers(); const watches = mockWatch(); const mesh = store();
     const command = (commandId: string) => mesh.publish({ topic: "fabric.control.command", from: { id: "sender", name: "sender", kind: "main" }, to: "target",
-      data: { version: 1, commandId, targetId: "target", operation: "steer", replyTo: "sender", requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
+      data: { version: 1, commandId, targetId: "target", operation: "steer", replyTo: "sender", ownerIncarnation: control.incarnation, requestedAt: Date.now(), deadlineAt: Date.now() + 120_000 } });
     const first = vi.fn(() => ({ accepted: true })); const second = vi.fn(() => ({ accepted: true }));
     const control = new FabricControlPlane(mesh, identity, { platform: "linux", enabled: true, hostId: "target", pollMs: 20 });
     closers.push(() => control.close()); control.start(first); await vi.advanceTimersByTimeAsync(0);
@@ -316,7 +316,7 @@ describe("event-driven mesh observers", () => {
     closers.push(() => actor.close()); actor.start();
     await new Promise(resolve => setTimeout(resolve, 80));
     await publish(mesh); await mesh.publish({ topic: "fleet.work.native", from: identity });
-    await expect(sender.request("target", "target", "steer", { message: "native" })).resolves.toMatchObject({ acknowledged: true });
+    await expect(sender.request("target", "target", "steer", { message: "native", ownerIncarnation: owner.incarnation })).resolves.toMatchObject({ acknowledged: true });
     await vi.waitFor(() => { expect(delivered).toHaveBeenCalledOnce(); expect(seen).toHaveBeenCalledOnce(); }, { timeout: 6_000 });
     expect(handled).toHaveBeenCalledOnce();
   });

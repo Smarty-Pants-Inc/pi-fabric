@@ -92,6 +92,46 @@ export const jsonClone = <T>(value: T): T => {
   return JSON.parse(serialized) as T;
 };
 
+/**
+ * Deep check of a parsed state.json document, for callers that must not act on doubt (retention --apply,
+ * smarty-dev#7916). The tolerant reader below accepts `{"format":1,"entries":{"k":null}}`; this does not: the
+ * envelope has only known fields and every entry is a complete entry under its own key. Returns the first problem.
+ */
+export const meshStateDocumentProblem = (value: unknown): string | undefined => {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === "object" && item !== null && !Array.isArray(item);
+  const count = (item: unknown): boolean => Number.isSafeInteger(item) && (item as number) >= 0;
+  if (!object(value)) return "not an object";
+  const known = new Set(["format", "revisionFormat", "entries", "versions", "tombstoneOrder", "highWater", "readGeneration", "readJournalHash"]);
+  const unknown = Object.keys(value).find(key => !known.has(key));
+  if (unknown !== undefined) return `unknown field ${JSON.stringify(unknown)}`;
+  if (value.format !== 1 && value.format !== 2) return "unknown format";
+  if (value.revisionFormat !== undefined && value.revisionFormat !== 2) return "unknown revisionFormat";
+  if (value.highWater !== undefined && !count(value.highWater)) return "invalid highWater";
+  for (const field of ["readGeneration", "readJournalHash"] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") return `invalid ${field}`;
+  }
+  if (value.versions !== undefined && (!object(value.versions) || !Object.values(value.versions).every(count))) return "invalid versions";
+  if (value.tombstoneOrder !== undefined && (!Array.isArray(value.tombstoneOrder) || !value.tombstoneOrder.every(key => typeof key === "string"))) {
+    return "invalid tombstoneOrder";
+  }
+  if (!object(value.entries)) return "entries is not an object";
+  const entryFields = new Set(["key", "value", "version", "updatedAt", "updatedBy"]);
+  for (const [key, entry] of Object.entries(value.entries)) {
+    const at = `entry ${JSON.stringify(key)}`;
+    if (!object(entry)) return `${at} is not an object`;
+    if (Object.keys(entry).some(field => !entryFields.has(field))) return `${at} has an unknown field`;
+    if (entry.key !== key) return `${at} names another key`;
+    if (!count(entry.version)) return `${at} has an invalid version`;
+    if (typeof entry.updatedAt !== "number" || !Number.isFinite(entry.updatedAt) || entry.updatedAt < 0) return `${at} has an invalid updatedAt`;
+    const by = entry.updatedBy;
+    if (!object(by) || typeof by.id !== "string" || typeof by.name !== "string" || typeof by.kind !== "string" ||
+        (by.sessionId !== undefined && typeof by.sessionId !== "string") || (by.verified !== undefined && typeof by.verified !== "string")) {
+      return `${at} has an invalid updatedBy`;
+    }
+  }
+  return undefined;
+};
+
 const isMeshStateFile = (value: unknown): value is MeshStateFile => {
   if (
     typeof value !== "object" ||

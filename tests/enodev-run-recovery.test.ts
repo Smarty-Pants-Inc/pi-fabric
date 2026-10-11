@@ -125,9 +125,10 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
       sessionId: String(deadPid()), transport: "process" }));
     fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV, markedAt: 1, runId: id }));
     fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "SAVED_ANSWER" }));
-    const second = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
+    const restart = () => new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
+    const second = restart();
     const launched = vi.spyOn(second, "spawn").mockRejectedValue(new Error("launched a rerun"));
-    return { actor, id, directory, actorRoot, actors, second, launched };
+    return { actor, id, directory, actorRoot, actors, second, launched, restart, mesh };
   };
   /** The registry now names `adopter` as the actor's root, adopted from the lineage that ran it (its queue file). */
   const adopt = (actorRoot: string, actorId: string, adopter: string) => {
@@ -144,7 +145,9 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
       await vi.waitFor(() => expect(after.status(actor.id).status).toBe("idle"), { timeout: 10_000, interval: 20 });
       expect(launched).not.toHaveBeenCalled();
       expect(vetoed(directory)).toBe(false);
-      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", text: "SAVED_ANSWER" });
+      const delivered = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"));
+      expect(delivered).toMatchObject({ status: "completed", text: "SAVED_ANSWER" });
+      expect(delivered.settledLost).toBeUndefined();
     } finally {
       await after.close();
       await second.close();
@@ -171,16 +174,64 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     }
   }, 60_000);
 
-  it("an unreadable predecessor queue leaves the run's marker: nothing settles as lost", async () => {
-    const { actor, directory, actorRoot, actors, second } = await interruptedRun();
+  it("an unreadable predecessor queue leaves the run's marker: nothing settles; each start says so, the third alarms ops.owner", async () => {
+    const { actor, directory, actorRoot, actors, second, restart, mesh } = await interruptedRun();
     adopt(actorRoot, actor.id, "session:adopter");
     const predecessor = fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!;
     fs.writeFileSync(path.join(actorRoot, actor.id, predecessor), "{ torn");
-    const after = actors(second, "session:adopter");
+    const warn = vi.spyOn(console, "warn");
+    const unknownLines = () => warn.mock.calls.filter(([line]) => String(line).includes("a queue file is unreadable")).length;
+    const alarms = () => mesh.read({ after: 0, limit: 1_000 })
+      .filter(event => event.topic === "ops.owner" && (event.data as { reason?: string } | undefined)?.reason === "enodev-queue-unknown");
+    for (let start = 1; start <= 3; start++) {
+      const agents = start === 1 ? second : restart();
+      vi.spyOn(agents, "spawn").mockRejectedValue(new Error("launched a rerun"));
+      const after = actors(agents, "session:adopter");
+      try {
+        await vi.waitFor(() => expect(unknownLines()).toBe(start), { timeout: 10_000, interval: 20 });
+        expect(vetoed(directory)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("running");
+        expect(JSON.parse(fs.readFileSync(path.join(directory, "unresolved-worker.json"), "utf8")).unknownStarts).toBe(start);
+        if (start < 3) expect(alarms()).toHaveLength(0);
+        else await vi.waitFor(() => expect(alarms()).toMatchObject([{ to: "session:adopter", kind: "actor.alarm",
+          data: { actorId: actor.id, starts: 3 } }]), { timeout: 10_000, interval: 20 });
+      } finally {
+        await after.close();
+        await agents.close();
+      }
+    }
+  }, 90_000);
+
+  // The counterexample: the owning lineage still settles a run whose activation its (readable) queue no longer holds.
+  it("the owning lineage's restore settles a dropped activation's run as lost", async () => {
+    const { actor, directory, actorRoot, actors, second, launched } = await interruptedRun();
+    const own = fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!;
+    const saved = JSON.parse(fs.readFileSync(path.join(actorRoot, actor.id, own), "utf8"));
+    fs.writeFileSync(path.join(actorRoot, actor.id, own), JSON.stringify({ ...saved, items: [] }));
+    const after = actors(second);
     try {
+      await vi.waitFor(() => expect(vetoed(directory)).toBe(false), { timeout: 10_000, interval: 20 });
+      expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
+      expect(launched).not.toHaveBeenCalled();
+    } finally {
+      await after.close();
+      await second.close();
+    }
+  }, 60_000);
+
+  // pi-fabric#912 round 2: on a failover restart, a lineage that does not own the actor took nothing over; the owner's
+  // queue holds the pending activation. It must judge nothing: no settle, the marker stays.
+  it("a non-owning lineage's restore settles nothing and keeps the marker", async () => {
+    const { actor, directory, actors, second, launched } = await interruptedRun();
+    const warn = vi.spyOn(console, "warn");
+    const after = actors(second, "session:bystander");
+    try {
+      await vi.waitFor(() => expect(after.status(actor.id)).toBeDefined(), { timeout: 10_000, interval: 20 });
       await new Promise(resolve => setTimeout(resolve, 500));
       expect(vetoed(directory)).toBe(true);
       expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("running");
+      expect(warn.mock.calls.some(([line]) => String(line).includes("settled as lost"))).toBe(false);
+      expect(launched).not.toHaveBeenCalled();
     } finally {
       await after.close();
       await second.close();
@@ -196,7 +247,7 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     manager.settleLostEnodevRuns(ACTOR, new Set(["item-pending"]));
     expect(vetoed(lost)).toBe(false);
-    expect(JSON.parse(fs.readFileSync(path.join(lost, "status.json"), "utf8")).status).toBe("completed");
+    expect(JSON.parse(fs.readFileSync(path.join(lost, "status.json"), "utf8"))).toMatchObject({ status: "completed", settledLost: true });
     expect(vetoed(kept)).toBe(true); // a pending activation is claimed by its own run request instead
     expect(warn.mock.calls.filter(([line]) => String(line).includes("settled as lost"))).toHaveLength(1);
     expect(String(warn.mock.calls[0]![0])).toContain(`run ${path.basename(lost)}`);
@@ -204,6 +255,6 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
     // A lost run without a settlement receipt is terminal as failed.
     const bare = runDir(runRoot, "b".repeat(32), { activation: "item-gone", settlement: null });
     expect(settleLostEnodevRun(bare, ACTOR, new Set())).toBe("item-gone");
-    expect(JSON.parse(fs.readFileSync(path.join(bare, "status.json"), "utf8"))).toMatchObject({ status: "failed" });
+    expect(JSON.parse(fs.readFileSync(path.join(bare, "status.json"), "utf8"))).toMatchObject({ status: "failed", settledLost: true });
   });
 });

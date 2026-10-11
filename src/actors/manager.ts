@@ -5733,12 +5733,27 @@ export class ActorManager {
     // the actor's id, definition, filters, topics, mailbox and the session's mesh cursor.
     if (restartedIds.length) this.#scheduleRegistrySave(true, 1);
     // After every own file, whose counters the predecessors' activations shift against.
-    for (const actor of firstLoads) this.#takeOverPredecessors(actor);
+    const claimed = new Set(firstLoads.filter(actor => this.#takeOverPredecessors(actor)).map(actor => actor.id));
     // smarty-dev#8935: this host's ENODEV-unconfirmed runs of an activation no longer pending settle as lost, only
-    // once every queue that can hold the activation is restored (own and adopted predecessors). An unreadable queue
-    // state is unknown, not empty: then nothing of that actor settles, and its markers stay for the next start.
+    // in the lineage that owns the actor (its root and residency: the takeover fence, pi-fabric#912 round 2) and
+    // once every queue that can hold the activation is restored (own and adopted predecessors). Another lineage's
+    // queue files are not its to judge: it settles nothing. An unreadable queue state is unknown, not empty: nothing
+    // of that actor settles, its markers stay and count the start; one line per start, ops.owner from the third.
     for (const actor of firstLoads) {
-      if (!this.#queueStatesReadable(actor)) continue;
+      if (!claimed.has(actor.id)) continue;
+      const unknown = !this.#queueStatesReadable(actor);
+      let starts = 0;
+      try { starts = this.agents.countUnknownEnodevStarts?.(actor.id, unknown) ?? 0; } catch { /* the count only reports */ }
+      if (unknown) {
+        if (starts > 0) {
+          const text = `actor ${actor.name} (${actor.id}): a queue file is unreadable, so its ENODEV-unconfirmed runs ` +
+            `stay unsettled (start ${starts} in a row; smarty-dev#8935)`;
+          console.warn(`[pi-fabric] ${text}`);
+          if (starts >= 3) void this.mesh.publish({ topic: "ops.owner", kind: "actor.alarm", from: this.identity, to: actor.rootId,
+            text, data: { actorId: actor.id, reason: "enodev-queue-unknown", starts } }).catch(() => undefined);
+        }
+        continue;
+      }
       const pending = new Set([...actor.queue, ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? []),
         ...(this.#deferredHandoffs.get(actor.id) ?? []), ...(this.#inFlight.has(actor.id) ? [this.#inFlight.get(actor.id)!] : [])]
         .map(item => item.id));
@@ -6018,8 +6033,9 @@ export class ActorManager {
   // only delays the copy. A taken-over file is deleted once this lineage's own file is written.
   // Only the claiming lineage takes over: its root and its residency (a Main and its resident host
   // share a root, review/astra F6 on #79), and never from its own file (F7).
-  #takeOverPredecessors(actor: ManagedActor): void {
-    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return;
+  /** False when this lineage does not own the actor (root or residency), so it took nothing over. */
+  #takeOverPredecessors(actor: ManagedActor): boolean {
+    if (actor.rootId !== this.#rootId || (this.#claimResidency ?? actor.residency) !== actor.residency) return false;
     const own = this.#ownQueueFile(actor);
     for (const rootId of actor.adoptedFrom ?? []) {
       const file = this.#queueFile(actor.id, rootId, actor.residency);
@@ -6030,6 +6046,7 @@ export class ActorManager {
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
       this.#restoreQueue(actor, saved, true);
     }
+    return true;
   }
 
   // Merges saved queue items into the actor's parked work (which waits for ownership), skipping

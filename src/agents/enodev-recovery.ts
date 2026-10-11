@@ -56,6 +56,27 @@ export const enodevUnresolvedRuns = (runRoot: string): string[] => {
   });
 };
 
+/**
+ * pi-fabric#912: the actor's queue state was unknown (`unknown`) or known at this start. Counts consecutive unknown
+ * starts in each of the actor's ENODEV markers (`unknownStarts`; a known start resets it) and returns the highest.
+ */
+export const countUnknownEnodevStarts = (directories: readonly string[], actorId: string, unknown: boolean): number => {
+  let highest = 0;
+  for (const directory of directories) {
+    const file = path.join(directory, UNRESOLVED_WORKER_FILE);
+    const marker = readJson(file);
+    if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON) ||
+      readJson(path.join(directory, "status.json"))?.actorId !== actorId) continue;
+    const prior = typeof marker.unknownStarts === "number" ? marker.unknownStarts : 0;
+    const next = unknown ? prior + 1 : 0;
+    if (next !== prior) {
+      try { writeJsonAtomic(file, { ...marker, unknownStarts: next }, { durable: true }); } catch { continue; }
+    }
+    highest = Math.max(highest, next);
+  }
+  return highest;
+};
+
 /** The actor activation a run served: the top-level `id` of the item JSON its task carries (ActorManager#runRequest). */
 const activationOf = (directory: string): string | undefined => {
   try {
@@ -106,8 +127,9 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
 export const settleLostEnodevRun = (directory: string, actorId: string, pending: ReadonlySet<string>): string | undefined => {
   const run = inspect(directory, actorId);
   if (!run || pending.has(run.activationId)) return undefined;
+  // settledLost marks it for the install check (pi-fabric#912): a lost run's answer reached no actor.
   settle(directory, run, run.text === undefined
-    ? { status: "failed", error: "lost: the worker exit was unconfirmed (ENODEV) and its activation is no longer pending" }
-    : { status: "completed", text: run.text });
+    ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and its activation is no longer pending" }
+    : { status: "completed", settledLost: true, text: run.text });
   return run.activationId;
 };

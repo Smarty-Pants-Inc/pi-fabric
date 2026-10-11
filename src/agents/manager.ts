@@ -17,7 +17,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
-import { enodevUnresolvedRuns, settleEnodevRun, settleLostEnodevRun } from "./enodev-recovery.js";
+import { countUnknownEnodevStarts, enodevUnresolvedRuns, settleEnodevRun, settleLostEnodevRun } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -2422,6 +2422,13 @@ export class AgentManager {
       console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
         "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
     }
+  }
+
+  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
+  countUnknownEnodevStarts(actorId: string, unknown: boolean): number {
+    if (process.platform !== "linux") return 0;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
   }
 
   #previousRun(id: string): AgentRunResult | undefined {

@@ -163,15 +163,16 @@ export async function openFabricSettings(
       : [],
     lastUsed: {},
   };
-  void populateClaudeModelSource(
-    claudeModelSource,
-    () => deps.state.agents.claudeModels(),
-  ).catch((error: unknown) => {
-    if (live() && deps.state.config.agents.runner === "claude") {
-      context.ui.notify(
-        `Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-        "warning",
-      );
+  let claudeDiscoveryStarted = false;
+  const discoverClaudeModels = (): ModelSource => {
+    if (!claudeDiscoveryStarted) {
+      claudeDiscoveryStarted = true;
+      void populateClaudeModelSource(claudeModelSource, () => deps.state.agents.claudeModels()).catch((error: unknown) => {
+        // A replaced session's late failure must not reach a stale UI (#5962).
+        if (live() && deps.state.config.agents.runner === "claude") {
+          context.ui.notify(`Claude model discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        }
+      });
     }
     return claudeModelSource;
   };

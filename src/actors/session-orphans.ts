@@ -182,6 +182,8 @@ export const sessionActorRootGone = (
   } catch { return undefined; }
 };
 
+const wellFormedSnapshots = new WeakMap<object, boolean>();
+
 /** Foreign session registries are observed directly, NEVER loaded into an ActorManager. */
 export class SessionActorOrphans {
   #pending: Promise<number> | undefined;
@@ -205,10 +207,15 @@ export class SessionActorOrphans {
 
   #rows(store: ActorRegistryStore): ReturnType<ActorRegistryStore["snapshot"]>["actors"] {
     const snapshot = store.snapshot();
-    const parsed = record(JSON.parse(snapshot.bytes ?? "null"));
-    // Never compact away malformed rows as a side effect of a truth repair.
-    if (parsed?.format !== 1 || !Array.isArray(parsed.actors) || parsed.actors.length !== snapshot.actors.length) return [];
-    return snapshot.actors;
+    // smarty-dev#7791: snapshot() returns the same object while the file is unchanged; parse its bytes once.
+    let wellFormed = wellFormedSnapshots.get(snapshot);
+    if (wellFormed === undefined) {
+      const parsed = record(JSON.parse(snapshot.bytes ?? "null"));
+      // Never compact away malformed rows as a side effect of a truth repair.
+      wellFormed = parsed?.format === 1 && Array.isArray(parsed.actors) && parsed.actors.length === snapshot.actors.length;
+      wellFormedSnapshots.set(snapshot, wellFormed);
+    }
+    return wellFormed ? snapshot.actors : [];
   }
 
   list(): FabricActorInfo[] {

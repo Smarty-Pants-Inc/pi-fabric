@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MeshEvent } from "../mesh/store.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, fabricWakeMessage } from "../fabric-provenance.js";
-import { rootInboxBudget, rootInboxMessage } from "./root-inbox.js";
+import { rootInboxBudget, rootInboxMessage } from "./root-inbox-shared.js";
 
 /** Retained/mixed-version events need positive, recorded admission evidence. */
 const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || event.verification === "bridge"

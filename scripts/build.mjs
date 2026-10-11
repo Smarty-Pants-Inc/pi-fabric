@@ -59,6 +59,7 @@ const lazyEntryPoints = [
   "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
+  "src/topology/root-inbox-context.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",

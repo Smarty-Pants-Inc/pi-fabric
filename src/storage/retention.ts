@@ -539,12 +539,14 @@ export const lockMeshRetentionSweep = async (meshRoot: string): Promise<number |
  * (the lock state is unknown; the caller alarms). Skipping a daily sweep is safe.
  */
 export const startLockedMeshRetentionSweep = async (meshRoot: string, intervalMs: number, start: (lockFd: number) => void,
-  now = Date.now()): Promise<"started" | "busy" | "claimed" | { uncertain: string }> => {
+  now = Date.now(), wanted: () => boolean = () => true): Promise<"started" | "busy" | "claimed" | "cancelled" | { uncertain: string }> => {
   let lock: number | "busy";
   try { lock = await lockMeshRetentionSweep(meshRoot); }
   catch (error) { return { uncertain: error instanceof Error ? error.message : String(error) }; }
   if (lock === "busy") return "busy";
   try {
+    // smarty-dev#9508: the owner may have closed during the async acquire: no claim, no spawn, and the lock is released.
+    if (!wanted()) return "cancelled";
     if (!claimMeshRetentionSweep(meshRoot, intervalMs, now)) return "claimed";
     start(lock);
     return "started";

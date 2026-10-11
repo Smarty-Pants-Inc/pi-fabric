@@ -217,6 +217,23 @@ describe.skipIf(process.platform === "win32")("a non-Fabric reader's documented 
     } finally { vi.restoreAllMocks(); }
   });
 
+  // smarty-dev#9637: an open that fails right after mkdtemp (EMFILE) removes the empty directory it just made.
+  it("a failed open of the new scratch directory removes it and surfaces the error", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    const openSync = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (path.basename(String(file)).startsWith("fabric-scratch-proof-")) throw Object.assign(new Error("EMFILE: too many open files"), { code: "EMFILE" });
+      return (openSync as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    try {
+      const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"]);
+      expect(refused.code).not.toBe(0);
+      expect(refused.out + refused.err).toContain("EMFILE");
+      expect(fs.readdirSync(parent)).toEqual([]);
+    } finally { vi.restoreAllMocks(); }
+  });
+
   it("warns in --json and on stderr when the scratch cleanup fails", async () => {
     const mesh = await fileRoot();
     const parent = tempDir("parent");

@@ -11,6 +11,7 @@ import { observeResidentOwner, captureDescendants, stopObservedDescendants, chec
 import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { lockFile } from "./file-lock.js";
+import { recordResidentGenerationExit } from "./generation-exit.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
   HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
@@ -61,6 +62,8 @@ interface Attempt {
   stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
+  /** The owner token the child published while it owned the root (smarty-dev#7950). */
+  generation?: string;
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
@@ -324,8 +327,15 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
     void attempt.native.exit.then(({ code, signal }) => {
-      // #2010: after a clean owned release this directory may already belong
-      // to the next generation. Do not make a late diagnostic mutation there.
+      // #2010: after an owned release this directory may already belong to the
+      // next generation. Do not write its shared files (launcher.log) then. An
+      // owned child's exit goes only to its own generation's record, created
+      // once: the host wrote it at release, else (SIGKILL, a crash) we do.
+      if (attempt.generation) {
+        recordResidentGenerationExit(root, { format: 1, generation: attempt.generation, writer: "launcher",
+          reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
+        return;
+      }
       if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
@@ -343,6 +353,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
+    if (live !== undefined && live === attempt.child.pid && typeof owner?.token === "string") attempt.generation ??= owner.token;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }

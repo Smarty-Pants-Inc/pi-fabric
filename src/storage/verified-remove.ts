@@ -60,7 +60,9 @@ export const countRefusal = (deleter: string, reason: string, target?: string, b
 };
 
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */
-export const verifiedRemoveTestHooks: { beforeOpen?: (target: string) => void } = {};
+export const verifiedRemoveTestHooks: { beforeOpen?: (target: string) => void;
+  /** Windows: runs after the tree walk, right before the helper opens the entries (the ancestor-swap test). */
+  beforeHelper?: (target: string) => void } = {};
 
 // O_PATH (Linux): an fd for fstat and /proc traversal only; never reads a file, never blocks on a FIFO.
 const O_PATH = 0o10000000;
@@ -192,7 +194,8 @@ const windowsEntries = (target: string, judged: fs.Stats): Array<{ file: string;
   // The judged stat's ino is a double (a 64-bit NTFS index may round): the exact id goes to the helper from here.
   if (Number(top.dev) !== judged.dev || Number(top.ino) !== judged.ino) refuse("target inode was replaced since judgment");
   if (kind(judged) !== (top.isDirectory() ? "directory" : "file")) refuse("type changed since judgment");
-  if (Number(top.mtimeMs) !== judged.mtimeMs) refuse("target was modified since judgment");
+  // A bigint stat's mtimeMs is whole milliseconds; NTFS keeps 100 ns: compare the judged double with a plain lstat.
+  if (fs.lstatSync(target).mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
   return entries;
 };
 const windowsRemove = (helper: string, entries: Array<{ file: string; stat: fs.BigIntStats }>, dryRun: boolean): void => {
@@ -206,11 +209,14 @@ const windowsRemove = (helper: string, entries: Array<{ file: string; stat: fs.B
   refuse(match![1] === "refused" ? `${match![3]} (${entry}); nothing is deleted` : `removal failed at ${entry} (${match![3]})`);
 };
 
-/** Windows: `file` (its exact id from a bigint stat) is ours, proven on a handle by the verified helper; false without it. */
-export const windowsOwns = (file: string, stat: fs.BigIntStats): boolean => {
+/** Windows: `file` (its exact id from a bigint stat) is a private record, proven on a handle by the verified helper:
+ * ours, not a reparse point, and no SID but ours, SYSTEM or Administrators may write it (pi-fabric#913 P1). */
+export const windowsPrivate = (file: string, stat: fs.BigIntStats): boolean => {
   const helper = windowsRemoveHelper();
   if (!helper || !stat.isFile()) return false;
-  try { windowsRemove(helper, [{ file, stat }], true); return true; } catch { return false; }
+  const result = spawnSync(helper, ["--private", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)],
+    { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  return result.status === 0 && /^ok 1 private/.test(result.stdout ?? "");
 };
 
 export const verifiedRemove = (target: string, judged: fs.Stats | undefined, options: {
@@ -237,6 +243,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     try {
       verifiedRemoveTestHooks.beforeOpen?.(target);
       const entries = windowsEntries(target, judged);
+      verifiedRemoveTestHooks.beforeHelper?.(target);
       const bytes = options.freed ?? entries.reduce((sum, { stat }) => sum + (stat.isFile() ? Number(stat.size) : 0), 0);
       // A verify-only pass when nothing deletes, or before the caller's final check; the delete verifies all again.
       if (options.dryRun || options.proceed) windowsRemove(windowsHelper, entries, true);

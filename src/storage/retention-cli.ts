@@ -5,7 +5,7 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backend-fence.js";
 import { meshStateDocumentProblem } from "../mesh/state-file.js";
-import { startRemovalTally, stopRemovalTally, windowsOwns, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
+import { startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -93,9 +93,9 @@ const readPrivate = (file: string, maxBytes = 64 * 1024): Record<string, unknown
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const stat = fs.fstatSync(fd);
-    // Windows (smarty-dev#7858): the owner SID is proven on a handle by the verified helper; POSIX mode bits mean
-    // nothing there.
-    const owned = process.platform === "win32" ? windowsOwns(file, fs.fstatSync(fd, { bigint: true }))
+    // Windows (smarty-dev#7858, pi-fabric#913): the verified helper proves on a handle that we own it and that no SID
+    // but ours, SYSTEM or Administrators may write it (the DACL); POSIX mode bits mean nothing there.
+    const owned = process.platform === "win32" ? windowsPrivate(file, fs.fstatSync(fd, { bigint: true }))
       : typeof process.getuid === "function" && stat.uid === process.getuid() && (stat.mode & 0o022) === 0;
     if (!stat.isFile() || stat.size > maxBytes || !owned) throw new Error(`Unsafe record: ${file}`);
     return JSON.parse(fs.readFileSync(fd, "utf8"));

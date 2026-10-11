@@ -1002,6 +1002,10 @@ export const currentOwnerIdentity = (): OwnerIdentity => {
     // same way. Without a boot id, readers skip that comparison.
     if (bootId !== undefined) startedAt = procStartedAt("self");
     if (startedAt === undefined) bootId = undefined;
+  } else if (process.platform === "darwin" || process.platform === "win32") {
+    // No PID namespaces here: one host-wide PID space, named explicitly because an absent
+    // namespace is always unknown, never local (ownerLiveness, lockTokenLocality).
+    pidNamespace = `pid:${process.platform}`;
   }
   cachedIdentity = {
     pid: process.pid,
@@ -1018,8 +1022,9 @@ export const currentOwnerIdentity = (): OwnerIdentity => {
 // `<uuid>-<host><pid-namespace><boot>`, three 6-hex digests (`------` when unknown). The
 // token keeps the [a-f0-9-] alphabet that mesh lock-queue ticket names require, and old
 // readers only compare tokens for equality, so the wire is unchanged. A reader trusts its
-// local `kill(pid, 0)` answer only for a token from its own host, PID namespace and boot; any
-// other place is unknown, which is never death. As in ownerLiveness, an owner on the same host
+// local `kill(pid, 0)` answer only for a token from its own host, known PID namespace and boot;
+// any other place, including an unknown (`------`) namespace on either side, is unknown, which
+// is never death. As in ownerLiveness, an owner on the same host
 // from an earlier boot is dead: no process outlives its kernel boot.
 const LOCALITY_UNKNOWN = "------";
 const LOCALITY_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -1038,9 +1043,9 @@ export const localityLockToken = (): string => `${randomUUID()}-${ownerLocalityT
 
 /**
  * Where a lock token's writer ran, relative to this process:
- * - `local`: same host, PID namespace and boot; the signal probe is trustworthy.
+ * - `local`: same host, known PID namespace and boot; the signal probe is trustworthy.
  * - `previous-boot`: same host, another (known) boot; the owner is dead.
- * - `foreign`: another host or PID namespace (or an unknown boot); unknown, never dead.
+ * - `foreign`: another host, another or unknown PID namespace (or an unknown boot); unknown, never dead.
  * - `untagged`: an older writer; callers keep their pre-locality probe.
  */
 export type LockTokenLocality = "local" | "previous-boot" | "foreign" | "untagged";
@@ -1050,7 +1055,9 @@ export const lockTokenLocality = (token: string | undefined, self = ownerLocalit
   const own = LOCALITY_TAG.exec(self);
   if (!owner || !own) return "untagged";
   const [, host, namespace, boot] = owner;
-  if (host === own[1] && namespace === own[2] && boot === own[3]) return "local";
+  // An unknown namespace on either side is never the same namespace (PR #864 P1).
+  const sameNamespace = namespace !== LOCALITY_UNKNOWN && own[2] !== LOCALITY_UNKNOWN && namespace === own[2];
+  if (host === own[1] && sameNamespace && boot === own[3]) return "local";
   if (host === own[1] && boot !== own[3] && boot !== LOCALITY_UNKNOWN && own[3] !== LOCALITY_UNKNOWN) {
     return "previous-boot";
   }
@@ -1148,9 +1155,13 @@ export const ownerLiveness = (
   }
   const self = (probes.self ?? currentOwnerIdentity)();
   const sameHost = record.hostname === self.hostname;
+  // An absent PID namespace on either side is unknown, never the same place: two unreadable
+  // namespaces prove nothing, and ESRCH from another namespace is not death (PR #864 P1).
+  const sameNamespace = record.pidNamespace !== undefined && self.pidNamespace !== undefined &&
+    record.pidNamespace === self.pidNamespace;
   if (
     sameHost &&
-    record.pidNamespace === self.pidNamespace &&
+    sameNamespace &&
     record.bootId === self.bootId
   ) {
     const answer = signal(record.pid);
@@ -1164,7 +1175,8 @@ export const ownerLiveness = (
     }
     return "alive";
   }
-  // Another namespace, host, or boot: the signal answer means nothing here.
+  // Another or unknown namespace, another host, or another boot: the signal answer means
+  // nothing here, so a fresh heartbeat is the only evidence of life.
   // A missed heartbeat is only absence of evidence, never confirmed death:
   // a paused owner holds no fencing token and may resume and write again.
   if (options.heartbeatAt !== undefined) {

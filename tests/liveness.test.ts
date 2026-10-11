@@ -7,10 +7,12 @@ import {
   decodeOwnerIdentityLine,
   encodeOwnerIdentityLine,
   lockOwnerLiveness,
+  lockTokenLocality,
   OWNER_HEARTBEAT_INTERVAL_MS,
   OWNER_HEARTBEAT_TTL_MS,
   ownerHeartbeatFields,
   ownerLiveness,
+  ownerLocalityTag,
   parseProcStartedAt,
   recordOwnerLiveness,
   SHORT_LOCK_MAX_HOLD_MS,
@@ -57,11 +59,32 @@ describe("ownerLiveness", () => {
     expect(ownerLiveness(local, { probes: probes({ signal: () => "unknown" }) })).toBe("unknown");
   });
 
-  it("treats both-undefined namespace and boot as the same place", () => {
+  it("security round: never treats an absent namespace on either side as the same place", () => {
     const bare: OwnerIdentity = { pid: self.pid, hostname: self.hostname, startedAt: self.startedAt };
     const signal = vi.fn(() => "dead" as const);
-    expect(ownerLiveness({ pid: 9, hostname: "node-a", startedAt: 0 }, { probes: probes({ self: () => bare, signal }) })).toBe("dead");
-    expect(signal).toHaveBeenCalledWith(9);
+    // PR #864 P1: undefined === undefined is not one namespace. ESRCH proves nothing here.
+    expect(ownerLiveness({ pid: 9, hostname: "node-a", startedAt: 0 }, { probes: probes({ self: () => bare, signal }) })).toBe("unknown");
+    const { pidNamespace: _ownerNamespace, ...ownerWithout } = local;
+    const { pidNamespace: _selfNamespace, ...selfWithout } = self;
+    expect(ownerLiveness(ownerWithout, { probes: probes({ signal }) })).toBe("unknown");
+    expect(ownerLiveness(local, { probes: probes({ self: () => selfWithout, signal }) })).toBe("unknown");
+    expect(signal).not.toHaveBeenCalled();
+  });
+
+  it("security regression: unknown namespaces, same host and boot, fresh heartbeat, ESRCH is not death", () => {
+    const { pidNamespace: _ownerNamespace, ...owner } = local;
+    const { pidNamespace: _selfNamespace, ...selfWithout } = self;
+    const { signal: _signal, ...injected } = probes({ self: () => selfWithout });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("not visible here"), { code: "ESRCH" });
+    });
+    const liveness = ownerLiveness(owner, { heartbeatAt: NOW - 1_000, probes: injected });
+    expect(liveness).not.toBe("dead");
+    expect(liveness).toBe("alive");
+    expect(kill).not.toHaveBeenCalled();
+    const token = `00000000-0000-4000-8000-000000000000-${ownerLocalityTag(owner)}`;
+    expect(lockTokenLocality(token, ownerLocalityTag(selfWithout))).not.toBe("local");
+    expect(lockTokenLocality(token, ownerLocalityTag(selfWithout))).toBe("foreign");
   });
 
   it("detects PID reuse from a different process start time", () => {
@@ -133,6 +156,8 @@ describe("owner identity records", () => {
     expect(identity.hostname).toBe(os.hostname());
     expect(Number.isFinite(identity.startedAt)).toBe(true);
     if (process.platform === "linux") expect(identity.pidNamespace).toMatch(/^pid:\[/);
+    // One host-wide PID space, named so that absent always means unknown.
+    else if (process.platform === "darwin" || process.platform === "win32") expect(identity.pidNamespace).toBe(`pid:${process.platform}`);
     else expect(identity.pidNamespace).toBeUndefined();
     expect(currentOwnerIdentity()).toEqual(identity);
     // A record written by this process is alive to this process.

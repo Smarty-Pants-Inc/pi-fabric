@@ -35,6 +35,9 @@ const uuid = "00000000-0000-4000-8000-000000000000";
 const tagged = (place: Partial<typeof self> = {}): string => `${uuid}-${ownerLocalityTag({ ...self, ...place })}`;
 const foreignNamespace = (): string => tagged({ pidNamespace: "pid:[4026599999]" });
 const foreignHost = (): string => tagged({ hostname: `${self.hostname}-elsewhere` });
+// PR #864 P1: same host and boot, but the writer's PID namespace is unknown.
+const unknownNamespace = (): string =>
+  `${uuid}-${ownerLocalityTag({ hostname: self.hostname, ...(self.bootId === undefined ? {} : { bootId: self.bootId }) })}`;
 const previousBoot = (): string => tagged({ bootId: "11111111-2222-4333-8444-555555555555" });
 const deadPid = (): number => spawnSync(process.execPath, ["-e", ""]).pid!;
 const esrch = (): void => {
@@ -61,6 +64,12 @@ describe("lock token locality", () => {
     expect(lockTokenLocality(`${uuid}-${ownerLocalityTag({ ...withBoot, pidNamespace: "pid:[2]" })}`, own)).toBe("foreign");
     expect(lockTokenLocality(`${uuid}-${ownerLocalityTag({ hostname: "node-a", pidNamespace: "pid:[1]" })}`, own)).toBe("foreign");
     expect(lockTokenLocality(`${uuid}-${ownerLocalityTag({ ...withBoot, hostname: "node-b", bootId: "boot-b" })}`, own)).toBe("foreign");
+    // PR #864 P1: an unknown namespace on either side is never local; an earlier boot still is dead.
+    const noNamespace = { hostname: "node-a", bootId: "boot-a" };
+    expect(lockTokenLocality(`${uuid}-${ownerLocalityTag(noNamespace)}`, ownerLocalityTag(noNamespace))).toBe("foreign");
+    expect(lockTokenLocality(`${uuid}-${ownerLocalityTag(noNamespace)}`, own)).toBe("foreign");
+    expect(lockTokenLocality(`${uuid}-${ownerLocalityTag(withBoot)}`, ownerLocalityTag(noNamespace))).toBe("foreign");
+    expect(lockTokenLocality(`${uuid}-${ownerLocalityTag({ ...noNamespace, bootId: "boot-b" })}`, ownerLocalityTag(noNamespace))).toBe("previous-boot");
   });
 });
 
@@ -74,7 +83,7 @@ describe("mesh lock recovery across PID namespaces", () => {
 
   it.each([1, 2] as const)("protocol %s never detaches a foreign owner whose PID is invisible here", async (lockProtocol) => {
     const store = new MeshStore(temp("pi-fabric-locality-mesh-"), 64 * 1024, 100, { lockProtocol, lockTimeoutMs: 150 });
-    for (const token of [foreignNamespace(), foreignHost()]) {
+    for (const token of [foreignNamespace(), foreignHost(), unknownNamespace()]) {
       const owner = `${token}\n${deadPid()}\n${Date.now() - 60_000}\n`;
       const lock = holdLock(store, owner);
       const operation = vi.fn();
@@ -111,7 +120,7 @@ describe("actor registry lock recovery across PID namespaces", () => {
   };
 
   it("never reaps a foreign owner whose PID is invisible here, even when stale", async () => {
-    for (const token of [foreignNamespace(), foreignHost()]) {
+    for (const token of [foreignNamespace(), foreignHost(), unknownNamespace()]) {
       const { store, lockPath } = setup();
       const owner = `${token}\n123456\n${Date.now() - 120_000}\n`;
       fs.writeFileSync(path.join(lockPath, "owner"), owner);

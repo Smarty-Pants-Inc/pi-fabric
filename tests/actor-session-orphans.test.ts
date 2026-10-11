@@ -14,6 +14,9 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { reapDeadHostRecords } from "../src/topology/host-reaper.js";
+import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { canonicalResidentWakeConfig, residentWakeIndexPath } from "../src/residency/wake-index.js";
+import { dormantActorRoute, readWakeJson, residentWakeRequestPath, wakeDormantActor } from "../src/residency/wake.js";
 
 let deadPid: number;
 beforeAll(async () => {
@@ -376,5 +379,74 @@ describe("foreign session actor registry truth", () => {
     expect(store.records()[0]).toMatchObject({ id, status: "stopped", stopReason: "host-exit",
       lastError: expect.stringContaining("root-gone:"), sessionOrphan: { oldRoot: "session:old" } });
     expect(alarms(mesh)).toHaveLength(1);
+  });
+
+  it("never wakes, launches, runs or delivers to a dormant session actor after the orphan scan retired it", async () => {
+    const { root, mesh, identity, store, actor, repair, id } = fixture();
+    store.write([{ ...actor, status: "dormant", topics: ["orphan.wake"] }]);
+    await mesh.put({ identity, key: `actors/old/${id}`, value: { id, name: actor.name, rootId: "session:old", status: "dormant" } });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now + SESSION_ACTOR_ORPHAN_GRACE_MS + 1_000);
+    expect(await repair.reconcile()).toBe(1);
+    clock.mockRestore();
+    const retired = () => store.records().find(row => row.id === id);
+    expect(retired()).toMatchObject({ status: "stopped", stopReason: "host-exit", sessionOrphan: { oldRoot: "session:old" } });
+    // A real, armed dormant resident root on the same mesh, so the publish-time wake path is live.
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: "session:keeper", sessionId: "keeper", cwd: root, projectRoot: root,
+      meshRoot: root, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(root, "session:keeper"), fullCodeMode: true,
+      agents: { ...DEFAULT_FABRIC_CONFIG.agents }, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh },
+      retention: { ...DEFAULT_FABRIC_CONFIG.retention }, workerPath: path.resolve("dist/worker.js"),
+      fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+    };
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    fs.writeFileSync(path.join(config.residencyRoot, "wake-routes.json"), JSON.stringify({ format: 1, rootId: config.rootId,
+      hostId: "keeper-host", configJson: canonicalResidentWakeConfig(config),
+      actors: [{ id: "k".repeat(32), name: "keeper", topics: ["keeper.wake"] }] }));
+    const wake = await import("../src/residency/wake.js");
+    const dispatch = wake.wakeResidentActors;
+    const launches: string[] = [];
+    const routed = vi.spyOn(wake, "wakeResidentActors").mockImplementation((meshStore, events) => dispatch(meshStore, events, async () => {
+      launches.push(events.map(event => event.topic).join(","));
+    }));
+    // A live resident observer of the old Main's session registry: it would deliver to and run a live actor.
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    });
+    const runs = vi.spyOn(agents, "run");
+    const resident = new ActorDirectory(["old", { id: "resident:old", name: "resident", kind: "agent" }, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 25 }, agents, () => {},
+      { persistent: true, claimResidency: "durable", rootId: "session:old", canManageActor: () => true }],
+      { project: path.join(root, "actors"), session: path.join(root, "actors", "old") }, "project");
+    try {
+      expect(resident.status(id)).toMatchObject({ status: "stopped", sessionOrphan: { oldRoot: "session:old" } });
+      const from = { id: "session:sender", name: "sender", kind: "main" as const };
+      // The same topic, a direct id address and a direct name address would each wake a dormant actor.
+      const sent = [
+        await mesh.publish({ topic: "orphan.wake", from, data: { n: 1 } }),
+        await mesh.publish({ topic: "actor.message", from, to: id, data: { n: 2 } }),
+        await mesh.publish({ topic: "actor.message", from, to: actor.name, data: { n: 3 } }),
+      ];
+      expect(routed).toHaveBeenCalledTimes(3);
+      // No retained wake route and no explicit wake for the retired row.
+      expect(dormantActorRoute(root, resident.status(id))).toBeUndefined();
+      expect(await wakeDormantActor(root, id)).toBe(false);
+      expect(await wakeDormantActor(root, actor.name)).toBe(false);
+      await new Promise(resolve => setTimeout(resolve, 400)); // well past one 25 ms observer cycle
+      expect(launches).toEqual([]);
+      expect(readWakeJson(residentWakeRequestPath(config.residencyRoot))).toBeUndefined();
+      const index = fs.existsSync(residentWakeIndexPath(root)) ? fs.readFileSync(residentWakeIndexPath(root), "utf8") : "";
+      for (const event of sent) expect(index).not.toContain(event.id);
+      expect(runs).not.toHaveBeenCalled();
+      expect(resident.status(id)).toMatchObject({ status: "stopped", sessionOrphan: { oldRoot: "session:old" } });
+      expect(retired()).toMatchObject({ status: "stopped", stopReason: "host-exit", sessionOrphan: { oldRoot: "session:old" } });
+      // Positive control: the same wake path is live and wakes the armed resident for its own topic.
+      await mesh.publish({ topic: "keeper.wake", from, data: { n: 4 } });
+      expect(launches).toEqual(["keeper.wake"]);
+      expect(readWakeJson(residentWakeRequestPath(config.residencyRoot))).toMatchObject({ format: 1 });
+      expect(runs).not.toHaveBeenCalled();
+      expect(retired()?.status).toBe("stopped");
+    } finally { routed.mockRestore(); await resident.close(); await agents.close(); }
   });
 });

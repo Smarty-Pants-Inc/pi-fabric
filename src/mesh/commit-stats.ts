@@ -274,18 +274,26 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
-      if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
+      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash is pruned by age too.
+      if (!(name.endsWith(".json") || name.endsWith(".tmp") || /\.prune-\d+$/.test(name))) continue;
       const file = path.join(directory, name);
       try {
         const seen = fs.lstatSync(file);
         if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
-        // ponytail: re-lstat right before the unlink and skip a file its owner refreshed
-        // (rename = new inode, or a new mtime) since the age check. Best effort: a refresh
-        // between this lstat and the unlink still loses that file, until its owner's next
-        // write after an acquisition recreates it with the whole retained window.
-        const again = fs.lstatSync(file);
-        if (again.ino !== seen.ino || again.mtimeMs !== seen.mtimeMs) continue;
-        fs.unlinkSync(file);
+        // Temporaries and graveyards have unique names that no writer refreshes.
+        if (!name.endsWith(".json")) { fs.unlinkSync(file); continue; }
+        // Never unlink a stats file by name (smarty-dev#7879): its writer may refresh it by rename
+        // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
+        // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
+        // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
+        // works on NTFS too), then drop the graveyard name either way.
+        const grave = `${file}.prune-${process.pid}`;
+        fs.renameSync(file, grave);
+        const moved = fs.lstatSync(grave);
+        if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {
+          try { fs.linkSync(grave, file); } catch { /* A newer file holds the name. */ }
+        }
+        fs.unlinkSync(grave);
       } catch { /* Raced with its owner or another pruner. */ }
     }
   };

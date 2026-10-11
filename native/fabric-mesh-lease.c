@@ -99,11 +99,12 @@ static void event(const struct inotify_event *e, long control, unsigned long *se
     }
     for (long d = 0; d < ndirs; d++) {
         if (D[d] != e->wd || !e->len) continue;
-        if (e->mask & IN_ISDIR) {
-            if (e->mask & (IN_CREATE | IN_MOVED_TO))
-                for (long m = 0; m < ndirs; m++) if (D[m] < 0 && same(dirs[m] + slash(dirs[m]) + 1, e->name)) newdir = 1;
-            continue;
-        }
+        // A missing watched directory's name that appears by create or rename, as a directory, a symlink or
+        // anything else, is unwatched: refuse (pi-fabric#881 review round 2). A file name that appears by
+        // rename is "moved" below, which refuses too.
+        if (e->mask & (IN_CREATE | IN_MOVED_TO))
+            for (long m = 0; m < ndirs; m++) if (D[m] < 0 && same(dirs[m] + slash(dirs[m]) + 1, e->name)) newdir = 1;
+        if (e->mask & IN_ISDIR) continue;
         for (long i = 0; i < nfiles; i++) {
             struct target *t = &T[i];
             if (t->dir != d || !same(t->path + slash(t->path) + 1, e->name)) continue;

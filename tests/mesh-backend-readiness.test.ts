@@ -553,6 +553,37 @@ sys.stdin.readline()`;
     expect(await backendOf(root)).toBe("importing");
   });
 
+  // pi-fabric#881 review round 2 (SEC P1): the missing state-shadow/ appears as a SYMLINK to a directory elsewhere, and
+  // a holder opens state.db through it; or a pre-made directory is renamed into place. Both refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a missing state-shadow/ appears as a symlink and a holder opens state.db through it${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const outside = tempDir("outside");
+    fs.writeFileSync(path.join(outside, "state.db"), "");
+    const holder = await lateHolder(path.join(root, "state-shadow", "state.db"), "open");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        options: { onStep: (step) => {
+          if (step !== "cutover-marker") return;
+          fs.symlinkSync(outside, path.join(root, "state-shadow"));
+          holder.trigger();
+        } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+      expect(await backendOf(root)).toBe("importing");
+    } finally { await holder.release(); }
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses when a pre-made directory is renamed into place as state-shadow/${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const premade = path.join(root, "premade");
+    fs.mkdirSync(premade, { mode: 0o700 });
+    fs.writeFileSync(path.join(premade, "state.db"), "");
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      options: { onStep: (step) => { if (step === "cutover-marker") fs.renameSync(premade, path.join(root, "state-shadow")); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a new state-shadow directory (smarty-dev#8116)");
+  });
+
   // ponytail: an inotify queue overflow needs root (fs.inotify.max_queued_events); a fake helper with a matching
   // digest stands in for the helper's report, so the gate's handling of it is what this proves.
   for (const report of ["overflow", "silent"] as const) {

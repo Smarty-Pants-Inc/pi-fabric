@@ -212,16 +212,74 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
   });
 
+  it("pi-fabric#923 round 5: a root swapped between its filesystem check and the reclaim refuses (mesh, custody, safe lock-recover)", async () => {
+    const own = ns();
+    pidNamespaceTestHooks.set(own);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // The swap: the checked root moves away, a NEW directory takes its path, and the SAME lock directory (same inode,
+    // same owner bytes) moves into it. Only the held root fd can tell.
+    // The new root is on shared storage (nfs here), as an attacker would want: a later, consistent check refuses it too.
+    const swap = (root: string, name: string) => {
+      const moved = `${root}-moved`;
+      fs.renameSync(root, moved);
+      fs.mkdirSync(root, { mode: 0o700 });
+      fs.renameSync(path.join(moved, name), path.join(root, name));
+      roots.push(moved);
+      localFilesystemTestHooks.set(0x6969);
+    };
+    const swapOnLivenessProbe = (pid: number, root: string, name: string) => {
+      const kill = process.kill.bind(process);
+      let swapped = false;
+      vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+        if (target === pid && !swapped) { swapped = true; swap(root, name); }
+        return kill(target, signal as never);
+      }) as typeof process.kill);
+    };
+    // mesh .lock
+    const meshRoot = tempRoot();
+    const meshPid = deadPid();
+    const meshOwner = meshRecord(meshPid, own);
+    plant(path.join(meshRoot, ".lock"), meshOwner);
+    swapOnLivenessProbe(meshPid, meshRoot, ".lock");
+    await expect(contend(meshRoot)).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+    expect(fs.readFileSync(path.join(meshRoot, ".lock", "owner"), "utf8")).toBe(meshOwner);
+    vi.mocked(process.kill).mockRestore();
+    localFilesystemTestHooks.set(0xEF53);
+    // custody.lock
+    const custodyRoot = tempRoot();
+    const custodyPid = deadPid();
+    const custodyOwner = `${randomUUID()}\n${custodyPid}\n${Date.now()}\n\n${own}\n`;
+    plant(path.join(custodyRoot, MESH_CUSTODY_LOCK_NAME), custodyOwner);
+    swapOnLivenessProbe(custodyPid, custodyRoot, MESH_CUSTODY_LOCK_NAME);
+    await expect(acquireMeshCustodyLock(custodyRoot, 300, { lockProtocol: 3, ownIncarnation: undefined })).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
+    expect(fs.readFileSync(path.join(custodyRoot, MESH_CUSTODY_LOCK_NAME, "owner"), "utf8")).toBe(custodyOwner);
+    vi.mocked(process.kill).mockRestore();
+    localFilesystemTestHooks.set(0xEF53);
+    // safe lock-recover (its liveness probe is the `alive` seam)
+    const { recoverMeshLock, MeshLockRecoverRefusedError } = await import("../src/mesh/lock-recover.js");
+    const recoverRoot = tempRoot();
+    const recoverOwner = meshRecord(deadPid(), own);
+    plant(path.join(recoverRoot, ".lock"), recoverOwner);
+    const refused = await recoverMeshLock(recoverRoot, { lock: "mesh", holder: recoverOwner.split("\n")[0]!,
+      alive: () => { swap(recoverRoot, ".lock"); return false; } }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(MeshLockRecoverRefusedError);
+    expect((refused as Error).message).toMatch(/was replaced after its filesystem was checked/);
+    expect(fs.readFileSync(path.join(recoverRoot, ".lock", "owner"), "utf8")).toBe(recoverOwner);
+  });
+
   it("pi-fabric#923 round 3: the local-filesystem allowlist, and the real rule on this host", () => {
     localFilesystemTestHooks.reset();
     // This test host's TMPDIR: ext4 on the fleet's Linux hosts (local), so pid evidence is allowed there; never off Linux.
     if (process.platform !== "linux") expect(onLocalFilesystem(os.tmpdir())).toBe(false);
+    const any = tempRoot();
     for (const local of [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0xF2F52010]) {
       localFilesystemTestHooks.set(local);
-      expect(onLocalFilesystem("/any")).toBe(true);
+      expect(onLocalFilesystem(any)).toBe(true);
     }
     localFilesystemTestHooks.set(0x794C7630);
-    expect(onLocalFilesystem("/any")).toBe(false); // overlay
+    expect(onLocalFilesystem(any)).toBe(false); // overlay
+    localFilesystemTestHooks.set(0xEF53);
+    expect(onLocalFilesystem(path.join(any, "missing"))).toBe(false); // a root that cannot be opened
   });
 
   it.runIf(process.platform === "linux")("pi-fabric#923 round 4: statfs runs on the PINNED root (its /proc/self/fd entry), never on the path; unreadable is unproven", () => {

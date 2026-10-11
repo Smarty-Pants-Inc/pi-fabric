@@ -155,7 +155,10 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
   // form recovers only a holder of OUR namespace whose pid is gone; everything else is the audited unsafe override.
-  const verdict: PidNamespaceVerdict = namespace === null ? "unproven" : reclaimVerdict(namespace, await ownPidNamespace(), root);
+  const result = namespace === null ? { verdict: "unproven" as PidNamespaceVerdict } : reclaimVerdict(namespace, await ownPidNamespace(), root);
+  const pin = "pin" in result ? result.pin : undefined;
+  try {
+  const verdict: PidNamespaceVerdict = result.verdict;
   const provenDead = verdict === "pid" && !(options.alive ?? alive)(pid);
   if (!provenDead && options.unsafeHolderStopped !== true) {
     throw new MeshLockRecoverRefusedError(verdict === "pid"
@@ -169,6 +172,8 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   if (!current?.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || again !== owner) {
     throw new MeshLockRecoverRefusedError(`${lock} changed while it was checked; nothing was done`);
   }
+  // pi-fabric#923 round 5: the safe form's host-local proof holds only while the root path names the root it checked.
+  if (provenDead && pin && !pin.unchanged()) throw new MeshLockRecoverRefusedError(`${root} was replaced after its filesystem was checked; nothing was done`);
   const mode = provenDead ? "safe" : "unsafe";
   const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, holder: options.holder, holderPid: pid,
     holderNamespace: namespace, verdict, operator: operator() };
@@ -178,4 +183,5 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   fs.renameSync(lock, fence);
   return { recovered: true, mode, lock, fence, holderPid: pid, holderNamespace: namespace, verdict, audit,
     ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
+  } finally { pin?.close(); }
 };

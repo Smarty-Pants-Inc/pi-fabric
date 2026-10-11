@@ -158,27 +158,54 @@ export const localFilesystemTestHooks = {
  * Node exposes only `statfs`'s numeric `f_type`, which macOS assigns at filesystem registration and does not keep stable,
  * and not `f_fstypename`. Windows: false (its namespace never proves a holder dead anyway).
  */
-export const onLocalFilesystem = (root: string): boolean => {
-  if (filesystemTypeOverride) return filesystemTypeOverride.type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(filesystemTypeOverride.type);
-  if (process.platform !== "linux") return false;
-  // Round 4: the type of the PINNED root. Node has no fstatfs, so statfs goes through the held fd's /proc entry: a
-  // swap of the path after the open cannot change the answer. Anything unreadable is unproven.
+/**
+ * The mesh root, held open (round 5): `local` is its filesystem verdict, read through the held fd; `unchanged()` says
+ * the root PATH still names the held directory (fstat of the fd against lstat of the path, dev and inode). A reclaim
+ * calls `unchanged()` immediately before its rename, so a root swapped after the check fails closed. Close it after.
+ */
+export interface RootPin { readonly local: boolean; unchanged(): boolean; close(): void }
+export const pinRoot = (root: string): RootPin => {
   let fd = -1;
-  let type: number | undefined;
-  try {
-    fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW ?? 0));
-    type = Number(fs.statfsSync(`/proc/self/fd/${fd}`).type);
-  } catch { type = undefined; } finally { if (fd >= 0) try { fs.closeSync(fd); } catch { /* closed */ } }
-  return type !== undefined && Number.isFinite(type) && LOCAL_LINUX_FILESYSTEMS.has(type);
+  try { fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW ?? 0)); }
+  catch { return { local: false, unchanged: () => false, close: () => undefined }; }
+  let local: boolean;
+  if (filesystemTypeOverride) local = filesystemTypeOverride.type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(filesystemTypeOverride.type);
+  else if (process.platform !== "linux") local = false;
+  else {
+    // Round 4: the type of the PINNED root. Node has no fstatfs, so statfs goes through the held fd's /proc entry.
+    let type: number | undefined;
+    try { type = Number(fs.statfsSync(`/proc/self/fd/${fd}`).type); } catch { type = undefined; }
+    local = type !== undefined && Number.isFinite(type) && LOCAL_LINUX_FILESYSTEMS.has(type);
+  }
+  return {
+    local,
+    unchanged: () => {
+      try {
+        const held = fs.fstatSync(fd), named = fs.lstatSync(root, { throwIfNoEntry: false });
+        return named !== undefined && named.isDirectory() && named.dev === held.dev && named.ino === held.ino;
+      } catch { return false; }
+    },
+    close: () => { try { fs.closeSync(fd); } catch { /* closed */ } },
+  };
+};
+/** Is this mesh root on a known host-local filesystem? (`pinRoot(root).local`, closed at once.) */
+export const onLocalFilesystem = (root: string): boolean => {
+  const pin = pinRoot(root);
+  try { return pin.local; } finally { pin.close(); }
 };
 
 /**
  * The reclaim verdict for a lock under `root`: `pidNamespaceVerdict`, and a "pid" verdict only when the root is on a
- * host-local filesystem (a clone with the same identity can only share the root over shared storage).
+ * host-local filesystem (a clone with the same identity can only share the root over shared storage). A "pid" verdict
+ * from a protocol-3 record comes with the held root (round 5): the caller checks `pin.unchanged()` right before its
+ * rename, and closes it.
  */
-export const reclaimVerdict = (recordNs: string | null, ownNs: string | undefined, root: string): PidNamespaceVerdict => {
+export const reclaimVerdict = (recordNs: string | null, ownNs: string | undefined, root: string): { verdict: PidNamespaceVerdict; pin?: RootPin } => {
   const verdict = pidNamespaceVerdict(recordNs, ownNs);
-  return verdict === "pid" && recordNs !== null && !onLocalFilesystem(root) ? "unproven" : verdict;
+  if (verdict !== "pid" || recordNs === null) return { verdict };
+  const pin = pinRoot(root);
+  if (!pin.local) { pin.close(); return { verdict: "unproven" }; }
+  return { verdict, pin };
 };
 
 /** The lock code's lazy handle on this module (a stable lazy entry point, scripts/build.mjs). */

@@ -182,6 +182,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
   ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1): Promise<boolean> => {
   delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
+  let pin: { unchanged(): boolean; close(): void } | undefined;
   try {
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
@@ -215,8 +216,10 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     if (recordNamespace !== null || lockProtocol === 3) {
       const namespaces = await import("../core/pid-namespace.js");
       // Under protocol 3 a record without a namespace is UNPROVEN too: recovered only by the operator.
-      const verdict = recordNamespace === null ? "unproven"
+      const result = recordNamespace === null ? { verdict: "unproven" as const }
         : namespaces.reclaimVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false), path.dirname(lock));
+      pin = "pin" in result ? result.pin : undefined;
+      const verdict = result.verdict;
       if (verdict !== "pid") {
         note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
         return false;
@@ -238,12 +241,14 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     }
     const current = fs.lstatSync(lock);
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+    // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
+    if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
     fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
     return true;
   } catch (error) {
     if (error instanceof MeshCustodyUnrecoverableError) throw error;
     return false;
-  }
+  } finally { pin?.close(); }
 };
 
 /**

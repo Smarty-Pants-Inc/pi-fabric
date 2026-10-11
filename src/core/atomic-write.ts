@@ -597,6 +597,11 @@ export class MeshLockTimeoutError extends Error {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** A write that wrote nothing and may succeed later: a lock timeout, or a SQLite WAL-cap refusal
+ * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+export const isMeshWriteDeferred = (error: unknown): error is Error =>
+  isMeshLockTimeout(error) || (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+
 /** Best-effort protocol writes may swallow conflicts, but not a retryable lock wait. */
 export const rethrowMeshLockTimeout = (error: unknown): undefined => {
   if (isMeshLockTimeout(error)) throw error;
@@ -614,7 +619,7 @@ export class MeshBackgroundRetry {
   get waitMs(): number { return Math.max(0, this.#retryAt - Date.now()); }
   success(): void { this.#delay = 0; this.#retryAt = 0; this.#reported = false; }
   failure(error: unknown): boolean {
-    const transient = isMeshLockTimeout(error);
+    const transient = isMeshWriteDeferred(error);
     if (!transient) {
       // Contain the owned callback, but surface unrelated bugs and preserve its existing
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
@@ -630,7 +635,7 @@ export class MeshBackgroundRetry {
     if (!this.#reported) {
       // Includes the holder and scheduler-stall diagnostics. Once per continuous outage,
       // not once per poll, which would flood a throttled host's stderr.
-      console.warn(`[pi-fabric] ${this.label}: ${transient ? "mesh lock timeout; retrying" : "background operation failed"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
+      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`);
       this.#reported = true;
     }
     return transient;

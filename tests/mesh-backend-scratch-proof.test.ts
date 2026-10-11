@@ -121,6 +121,59 @@ describe.skipIf(process.platform === "win32")("a non-Fabric reader's documented 
     expect(fs.readdirSync(parent)).toEqual([]);
   });
 
+  // pi-fabric#884 round 2 (CODE P1): a root-owned symlink in the chain was accepted, its target chain unchecked.
+  // /bin is a root-owned symlink to usr/bin on merged-/usr hosts (ubuntu-latest included).
+  it.skipIf(!fs.lstatSync("/bin", { throwIfNoEntry: false })?.isSymbolicLink())("refuses a root-owned symlink in the --scratch-parent chain", async () => {
+    const mesh = await fileRoot();
+    const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", "/bin", "--json"]);
+    expect(refused.code).toBe(3);
+    expect(JSON.parse(refused.out).error).toBe("--scratch-parent chain: /bin is a symbolic link");
+  });
+
+  it("detects a swap of the scratch path before the gate-skipped import, and imports nothing there", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    let swapped = "";
+    const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"], {
+      afterScratch: (root: string) => {
+        swapped = root;
+        fs.renameSync(root, `${root}.moved`);
+        fs.mkdirSync(root, { mode: 0o700 });
+        fs.copyFileSync(path.join(mesh, "state.json"), path.join(root, "state.json"));
+      } } as Parameters<typeof main>[1]);
+    expect(refused.code).toBe(3);
+    expect(JSON.parse(refused.out).error).toBe(`the scratch directory ${swapped} changed before the import`);
+    expect(fs.readdirSync(swapped)).toEqual(["state.json"]);           // nothing imported into the swapped-in path
+    expect(fs.existsSync(`${swapped}.moved/state.db`)).toBe(false);
+  });
+
+  it("refuses a state.json source larger than 64 MiB", async () => {
+    const big = path.join(tempDir("big"), "state.json");
+    fs.writeFileSync(big, "");
+    fs.truncateSync(big, 64 * 1024 * 1024 + 1);
+    const parent = tempDir("parent");
+    const refused = await cli(["import", "--scratch-proof-from", big, "--scratch-parent", parent, "--json"]);
+    expect(refused.code).toBe(3);
+    expect(JSON.parse(refused.out).error).toBe(`--scratch-proof-from ${big} is larger than 64 MiB (67108865 bytes)`);
+    expect(fs.readdirSync(parent)).toEqual([]);
+  });
+
+  it("warns in --json and on stderr when the scratch cleanup fails", async () => {
+    const mesh = await fileRoot();
+    const parent = tempDir("parent");
+    let root = "";
+    const refused = await cli(["import", "--scratch-proof-from", path.join(mesh, "state.json"), "--scratch-parent", parent, "--json"], {
+      afterScratch: (made: string) => { root = made; },
+      options: { beforeCommit: () => { fs.chmodSync(root, 0o500); throw new MeshBackendRefusedError("refused under the fence"); } },
+    } as Parameters<typeof main>[1]);
+    try {
+      expect(refused.code).toBe(3);
+      const out = JSON.parse(refused.out);
+      expect(out).toMatchObject({ ok: false, removed: false, cleanupWarnings: expect.arrayContaining([expect.stringContaining(`could not remove ${root}/state.json`)]) });
+      expect(refused.err).toContain(`fabric-mesh-backend: could not remove ${root}/state.json`);
+    } finally { fs.chmodSync(root, 0o700); }
+  });
+
   it("refuses a state.json source that is a symlink", async () => {
     const mesh = await fileRoot();
     const link = path.join(tempDir("src"), "state.json");

@@ -46,11 +46,12 @@ runs again under the fence right before each flag commit (importing, sqlite), cr
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
 creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its
-ancestors must be ours or root's and not group/other-writable unless root-owned and sticky), copies
-STATE_JSON into it (read through an O_NOFOLLOW fd; a regular file; the live state.json is fine) and
-imports there without the readiness gate: the root is provably a copy this process just made. It prints
-"scratchProof": true and "root"; the caller reads it, then removes it. A refused or failed import
-removes the whole directory. No caller-named root ever skips the gate.
+ancestors must be ours or root's, no symlink, and not group/other-writable unless root-owned and sticky),
+copies STATE_JSON into it (read through an O_NOFOLLOW fd; a regular file of at most 64 MiB; the live
+state.json is fine) and imports there without the readiness gate: the root is provably a copy this
+process just made. It prints "scratchProof": true and "root"; the caller reads it, then removes it. A
+refused or failed import removes the whole directory; a cleanup failure warns (also "cleanupWarnings").
+No caller-named root ever skips the gate.
 
 The fence is the mesh .lock plus custody.lock, held for the whole section of import, cutover,
 rollback and abort-rollback. Stop every writer (Pi sessions, actors, mesh-bridge, the projector) first.
@@ -201,14 +202,14 @@ const formatResult = (command: Command, result: Record<string, unknown>): string
   return `abort-rollback ${done}: backend=sqlite epoch ${String(result.epoch)}`;
 };
 
-/** A directory other uids cannot change: ours or root's, not a link (unless root's), and not group/other-writable
- * unless root-owned and sticky (/tmp). The same rule as pi-fabric#875's openPrivateDir. Throws with the reason. */
+/** A directory other uids cannot change: ours or root's, never a symlink (pi-fabric#884 round 2: not even root's, whose
+ * target chain would go unchecked), and not group/other-writable unless root-owned and sticky (/tmp). Throws why. */
 const assertSafeChain = (directory: string): void => {
   const uid = process.getuid?.();
   for (let current = path.resolve(directory); ; current = path.dirname(current)) {
     const stat = fs.lstatSync(current);
     const owner = stat.uid === uid || stat.uid === 0;
-    if (stat.isSymbolicLink()) { if (stat.uid !== 0) throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is a symbolic link`); }
+    if (stat.isSymbolicLink()) throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is a symbolic link`);
     else if (!stat.isDirectory() || !owner) throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is not a directory owned by us or root`);
     else if ((stat.mode & 0o022) !== 0 && !(stat.uid === 0 && (stat.mode & 0o1000) !== 0)) {
       throw new MeshBackendRefusedError(`--scratch-parent chain: ${current} is writable by group or others (mode ${(stat.mode & 0o7777).toString(8)})`);
@@ -220,28 +221,60 @@ const assertSafeChain = (directory: string): void => {
 /**
  * smarty-dev#9404 (pi-fabric#884 round 1): the scratch copy a reader's proof imports. Created here, so it is provably a
  * copy and not a live mesh: a fresh mkdtemp (0700) in a parent whose whole chain no other uid can change, held by a
- * no-follow fd and re-checked (same dev and ino) before it is reported. ponytail: the import itself uses the path;
- * a fresh 0700 directory inside a chain no other uid can write cannot be replaced by them (sticky /tmp included).
+ * no-follow fd. Everything after mkdtemp goes through that fd (`/proc/self/fd/<fd>`, pi-fabric#884 round 2): the
+ * copy, the import and the cleanup, so a swap of the path cannot redirect them; the path is re-checked against the
+ * fd before the import and before it is reported.
  */
-const makeScratchCopy = (stateJson: string, parent: string | undefined): { root: string; fd: number } => {
+const MAX_SCRATCH_SOURCE_BYTES = 64 * 1024 * 1024;
+interface Scratch { root: string; fd: number; pinned: string }
+const makeScratchCopy = (stateJson: string, parent: string | undefined): Scratch => {
   if (process.platform === "win32" || typeof process.getuid !== "function") throw new MeshBackendRefusedError("--scratch-proof-from needs POSIX ownership (not on this platform)");
   const base = parent ?? os.tmpdir();
   assertSafeChain(base);
   const source = fs.openSync(stateJson, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   let bytes: Buffer;
   try {
-    if (!fs.fstatSync(source).isFile()) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is not a regular file`);
+    const stat = fs.fstatSync(source);
+    if (!stat.isFile()) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is not a regular file`);
+    if (stat.size > MAX_SCRATCH_SOURCE_BYTES) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} is larger than 64 MiB (${stat.size} bytes)`);
     bytes = fs.readFileSync(source);
+    if (bytes.length > MAX_SCRATCH_SOURCE_BYTES) throw new MeshBackendRefusedError(`--scratch-proof-from ${stateJson} grew past 64 MiB while it was read`);
   } finally { fs.closeSync(source); }
   const root = fs.mkdtempSync(path.join(base, "fabric-scratch-proof-"));
   const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  const pinned = `/proc/self/fd/${fd}`;
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o700) throw new MeshBackendRefusedError(`scratch directory ${root} is not our private directory`);
-    const copy = fs.openSync(path.join(root, "state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    const through = fs.statSync(pinned, { throwIfNoEntry: false });
+    if (!through || through.dev !== stat.dev || through.ino !== stat.ino) throw new MeshBackendRefusedError("--scratch-proof-from needs /proc/self/fd to pin its scratch directory");
+    const copy = fs.openSync(path.join(pinned, "state.json"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
     try { fs.writeFileSync(copy, bytes); fs.fsyncSync(copy); } finally { fs.closeSync(copy); }
-  } catch (error) { fs.closeSync(fd); fs.rmSync(root, { recursive: true, force: true }); throw error; }
-  return { root, fd };
+  } catch (error) {
+    const warnings: string[] = [];
+    removeScratch({ root, fd, pinned }, warnings);
+    throw Object.assign(error as Error, { cleanupWarnings: warnings });
+  }
+  return { root, fd, pinned };
+};
+/**
+ * Remove the scratch directory through its held fd (pi-fabric#884 round 2): each entry under the pinned directory, then
+ * the directory itself only while its path still names the one we hold. Every failure is a warning; closes the fd.
+ */
+const removeScratch = (scratch: Scratch, warnings: string[]): boolean => {
+  try {
+    for (const name of fs.readdirSync(scratch.pinned)) {
+      try { fs.rmSync(path.join(scratch.pinned, name), { recursive: true, force: true }); }
+      catch (error) { warnings.push(`could not remove ${scratch.root}/${name}: ${(error as Error).message}`); }
+    }
+    if (!sameScratch(scratch.root, scratch.fd)) warnings.push(`did not remove ${scratch.root}: the path no longer names the scratch directory this process made`);
+    else {
+      try { fs.rmdirSync(scratch.root); }
+      catch (error) { warnings.push(`could not remove the scratch directory ${scratch.root}: ${(error as Error).message}`); }
+    }
+  } catch (error) { warnings.push(`could not clean the scratch directory ${scratch.root}: ${(error as Error).message}`); }
+  finally { try { fs.closeSync(scratch.fd); } catch { /* closed */ } }
+  return warnings.length === 0;
 };
 /** The scratch path still names the directory this process made and holds. */
 const sameScratch = (root: string, fd: number): boolean => {
@@ -250,12 +283,18 @@ const sameScratch = (root: string, fd: number): boolean => {
 };
 
 /** `import --scratch-proof-from` (smarty-dev#9404): the gate is skipped only on the copy this process made. */
-const scratchProofImport = async (options: Options, io: { census?: MeshWriterCensus; options?: Partial<MeshBackendOptions> },
+const scratchProofImport = async (options: Options, io: { census?: MeshWriterCensus; options?: Partial<MeshBackendOptions>;
+  afterScratch?: (root: string) => void },
   write: (text: string) => void, warn: (text: string) => void): Promise<number> => {
   const alarms: MeshBackendAlarm[] = [];
-  let scratch: { root: string; fd: number } | undefined;
+  let scratch: Scratch | undefined;
+  let cleanupWarnings: string[] = [];
   try {
-    scratch = makeScratchCopy(options.scratchProofFrom!, options.scratchParent);
+    try { scratch = makeScratchCopy(options.scratchProofFrom!, options.scratchParent); }
+    catch (error) { cleanupWarnings = (error as { cleanupWarnings?: string[] }).cleanupWarnings ?? []; throw error; }
+    io.afterScratch?.(scratch.root);
+    // Before the gate-skipped import: the path must still name the directory we hold (the import uses the fd anyway).
+    if (!sameScratch(scratch.root, scratch.fd)) throw new MeshBackendRefusedError(`the scratch directory ${scratch.root} changed before the import`);
     const library: MeshBackendOptions = {
       ...io.options, lockProtocol: options.lockProtocol,
       onAlarm: (alarm) => { alarms.push(alarm); warn(`fabric-mesh-backend: ALARM ${alarm.code}: ${alarm.message}\n`); },
@@ -263,6 +302,10 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
       onAdvisory: (advisory) => { warn(`fabric-mesh-backend: ${describeCensusAdvisory(advisory)}\n`); io.options?.onAdvisory?.(advisory); },
       ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
     };
+    // ponytail: the import takes the PATH: the SQLite state refuses a symlink root, and /proc/self/fd/<fd> is one.
+    // Safe from other uids: no symlink anywhere in the chain, every parent ours or root's and not writable by others
+    // (a sticky /tmp lets only the owner rename our entry), and the directory is our 0700 one, checked against
+    // the held fd just above and again just below. The copy and the cleanup go through the fd.
     const result: Record<string, unknown> = { ...(await importMeshState(scratch.root, library)) };
     if (!sameScratch(scratch.root, scratch.fd)) throw new MeshBackendRefusedError(`the scratch directory ${scratch.root} changed during the import`);
     fs.closeSync(scratch.fd);
@@ -272,16 +315,12 @@ const scratchProofImport = async (options: Options, io: { census?: MeshWriterCen
   } catch (error) {
     const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
     const message = error instanceof Error ? error.message : String(error);
-    let removed = false;
-    if (scratch) {
-      // Ours and fresh: nothing else is in it. Removed only while the name still holds the directory we made.
-      try { if (sameScratch(scratch.root, scratch.fd)) { fs.rmSync(scratch.root, { recursive: true, force: true }); removed = true; } }
-      catch (cleanupError) { warn(`fabric-mesh-backend: could not remove the scratch directory ${scratch.root}: ${(cleanupError as Error).message}\n`); }
-      finally { fs.closeSync(scratch.fd); }
-    }
+    // Ours and fresh: nothing else is in it. Removed through the held fd; every failure warns (never silently).
+    const removed = scratch ? removeScratch(scratch, cleanupWarnings) : false;
+    for (const text of cleanupWarnings) warn(`fabric-mesh-backend: ${text}\n`);
     if (options.json) {
       write(`${JSON.stringify({ command: "import", ok: false, refused, scratchProof: false, code: (error as { code?: unknown }).code, error: message,
-        ...(scratch ? { root: scratch.root, removed } : {}), alarms }, null, 2)}\n`);
+        ...(scratch ? { root: scratch.root, removed } : {}), ...(cleanupWarnings.length ? { cleanupWarnings } : {}), alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: import ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;
@@ -405,6 +444,8 @@ export const main = async (argv: string[], io: {
   builtinReaders?: readonly InstalledReader[];
   /** Extra library options (tests: onStep, open). */
   options?: Partial<MeshBackendOptions>;
+  /** Tests: runs between the scratch mkdtemp and the gate-skipped import (pi-fabric#884 round 2). */
+  afterScratch?: (root: string) => void;
 } = {}): Promise<number> => {
   const write = io.stdout ?? ((text: string) => void process.stdout.write(text));
   const warn = io.stderr ?? ((text: string) => void process.stderr.write(text));

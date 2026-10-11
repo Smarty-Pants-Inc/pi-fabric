@@ -886,11 +886,12 @@ export class MeshBackgroundQueue {
 
 /** Long-lived owners refresh `heartbeatAt` this often. */
 export const OWNER_HEARTBEAT_INTERVAL_MS = 10_000;
-/** A heartbeat older than this proves the owner dead. */
+/** A heartbeat older than this is stale: the owner is unknown, never proven dead. */
 export const OWNER_HEARTBEAT_TTL_MS = 45_000;
 /**
  * Short-lived locks carry no heartbeat. Across namespaces their creation time
- * stands in for one, so a crashed foreign holder cannot strand a lock forever.
+ * stands in for one; past this hold ceiling the holder is unknown, not dead,
+ * so only its own namespace (signal probe or PID-reuse check) can reap it.
  */
 export const SHORT_LOCK_MAX_HOLD_MS = 10 * 60_000;
 // Linux reports process start in clock ticks since boot; the wall-clock
@@ -1120,11 +1121,13 @@ export const ownerLiveness = (
     return "alive";
   }
   // Another namespace, host, or boot: the signal answer means nothing here.
+  // A missed heartbeat is only absence of evidence, never confirmed death:
+  // a paused owner holds no fencing token and may resume and write again.
   if (options.heartbeatAt !== undefined) {
     const now = (probes.now ?? Date.now)();
     return now - options.heartbeatAt <= (options.heartbeatTtlMs ?? OWNER_HEARTBEAT_TTL_MS)
       ? "alive"
-      : "dead";
+      : "unknown";
   }
   // No process outlives its kernel boot (containers share the host's boot id).
   if (
@@ -1157,8 +1160,8 @@ export const lockOwnerLiveness = (
 
 /**
  * Runs `refresh(now)` on an unref'd interval until the returned stop function
- * is called. Refresh failures are swallowed: a missed beat only ages the
- * record toward the TTL.
+ * is called. Refresh failures are swallowed: an expired remote heartbeat
+ * makes the owner unknown, not dead.
  */
 export const startOwnerHeartbeat = (
   refresh: (heartbeatAt: number) => void,
@@ -1168,7 +1171,7 @@ export const startOwnerHeartbeat = (
     try {
       refresh(Date.now());
     } catch {
-      // The next beat retries; a stale heartbeat is the failure signal.
+      // The next beat retries; a stale remote heartbeat cannot prove death.
     }
   }, intervalMs);
   timer.unref?.();

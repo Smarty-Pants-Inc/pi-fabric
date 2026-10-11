@@ -140,9 +140,9 @@ judges an owner as follows:
   `EPERM` alive). On Linux, a different `/proc/<pid>/stat` start time for the
   same PID means reuse, so the owner is dead.
 - Another namespace, host or boot: only a heartbeat decides. A fresh heartbeat
-  is alive, a stale one is dead, and none is `unknown`. On the same host, a
-  different boot id with no heartbeat is dead, since no process outlives its
-  boot.
+  is alive; a stale one or none is `unknown`, because a paused owner holds no
+  fencing token and may resume. On the same host, a different boot id with no
+  heartbeat is dead, since no process outlives its boot.
 - Records without identity fields keep the earlier signal-probe behaviour.
 
 `unknown` is never treated as death. A lock whose owner might be alive is not

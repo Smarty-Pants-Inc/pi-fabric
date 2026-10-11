@@ -24,21 +24,33 @@ const resolvePath = (value: string, base: string): string => {
     : trimmed.startsWith("file://") ? fileURLToPath(trimmed) : trimmed;
   return path.resolve(base, expanded);
 };
-const matches = (file: string, pattern: string, base: string, exact = false): boolean => {
-  const normalized = pattern.replace(/^\.\//, "").split(path.sep).join("/");
-  const candidates = [path.relative(base, file), file, ...(exact ? [] : [path.basename(file)])].map(value => value.split(path.sep).join("/"));
-  return candidates.some(value => exact ? value === normalized : minimatch(value, normalized));
+/** Pi matches settings filters against the path as listed or as reached
+ * through a selected directory (relative to the filter base, absolute, and
+ * basename for globs), never its symlink target. Exclusions additionally match
+ * the canonical file (relative to the canonical base, absolute, basename), so
+ * an exclusion written against a symlink target also holds: stricter than Pi,
+ * never looser. Inclusions stay exactly Pi's, so no file loads that Pi leaves
+ * disabled.
+ */
+const matches = (file: string, pattern: string, base: string, exact = false, exclusion = false): boolean => {
+  const posix = (value: string): string => value.split(path.sep).join("/");
+  const normalized = posix(pattern.replace(/^\.\//, ""));
+  const views: Array<[string, string]> = [[file, base]];
+  if (exclusion) views.push([real(file), real(base)]);
+  return views.some(([target, root]) => [path.relative(root, target), target, ...(exact ? [] : [path.basename(target)])].map(posix)
+    .some(value => exact ? value === normalized : minimatch(value, normalized)));
 };
-const filter = (files: string[], patterns: string[], base: string): string[] => {
+/** Pi's applyPatterns for one file: includes, then `!` excludes, `+` exact
+ * force-includes and `-` exact force-excludes. */
+const enabledBy = (file: string, patterns: string[], base: string): boolean => {
   const includes = patterns.filter(value => !override(value));
-  return files.filter(file => {
-    let enabled = !includes.length || includes.some(pattern => matches(file, pattern, base));
-    if (patterns.some(value => value.startsWith("!") && matches(file, value.slice(1), base))) enabled = false;
-    if (patterns.some(value => value.startsWith("+") && matches(file, value.slice(1), base, true))) enabled = true;
-    if (patterns.some(value => value.startsWith("-") && matches(file, value.slice(1), base, true))) enabled = false;
-    return enabled;
-  });
+  let enabled = !includes.length || includes.some(pattern => matches(file, pattern, base));
+  if (patterns.some(value => value.startsWith("!") && matches(file, value.slice(1), base, false, true))) enabled = false;
+  if (patterns.some(value => value.startsWith("+") && matches(file, value.slice(1), base, true))) enabled = true;
+  if (patterns.some(value => value.startsWith("-") && matches(file, value.slice(1), base, true, true))) enabled = false;
+  return enabled;
 };
+interface Resource { file: string; enabled: boolean }
 
 /** The selected profile's settings.json exists but cannot be read or parsed.
  * An opaque launcher runs with --no-extensions, so continuing would start the
@@ -66,7 +78,6 @@ export class ProfileSettingsError extends Error {
  * be read or are not a JSON object throw {@link ProfileSettingsError}.
  */
 export const resolveProfileExtensions = (pinnedFabricPath: string, environment: NodeJS.ProcessEnv = process.env): ProfileExtensions => {
-  const paths: string[] = [];
   const warnings = new Map<string, string>();
   const warn = (entry: string, reason: string): void => { if (!warnings.has(entry)) warnings.set(entry, `Profile extension ${entry} skipped: ${reason}`); };
   let profile: string;
@@ -77,7 +88,7 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
   try { text = fs.readFileSync(settingsFile, "utf8"); }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return { paths, names: [], warnings: [] }; // No profile config: nothing to replay.
+    if (code === "ENOENT") return { paths: [], names: [], warnings: [] }; // No profile config: nothing to replay.
     throw new ProfileSettingsError(settingsFile, `cannot be read${typeof code === "string" && /^E[A-Z0-9]+$/.test(code) ? ` (${code})` : ""}`);
   }
   let parsed: unknown;
@@ -120,7 +131,7 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
       const stat = fs.statSync(file);
       if (stat.isFile()) {
         if (!/\.(?:[cm]?[jt]s)$/.test(file)) { warn(entry, "not an extension file"); return []; }
-        return [real(file)];
+        return [file]; // Filter on the listed/reached path; canonicalize only for identity.
       }
       if (!stat.isDirectory()) { warn(entry, "not a file or directory"); return []; }
       const pkg = manifest(file);
@@ -167,7 +178,9 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
         return targets.flatMap(target => collect(target, key));
       } catch { warn(key, "invalid extension path or pattern"); return []; }
     });
-    return filter(found, entries.filter(override), base);
+    // Pi drops manifest-disabled files before user filters see them.
+    const patterns = entries.filter(override);
+    return found.filter(file => enabledBy(file, patterns, base));
   };
   const extensions = strings(settings.extensions, "extensions");
   const explicit = extensions.flatMap((value, index) => {
@@ -176,7 +189,9 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
     try { return collect(resolvePath(value, profile), `extensions[${index}]`); }
     catch { warn(`extensions[${index}]`, "invalid extension path"); return []; }
   });
-  paths.push(...filter(explicit, extensions.filter(value => override(value) || glob(value)), profile));
+  const selectors = extensions.filter(value => override(value) || glob(value));
+  const topLevel: Resource[] = explicit.map(file => ({ file, enabled: enabledBy(file, selectors, profile) }));
+  const packageResources: Resource[] = [];
   const installedPath = (source: string): string => {
     if (source.startsWith("npm:")) {
       const spec = source.slice(4).trim();
@@ -237,24 +252,38 @@ export const resolveProfileExtensions = (pinnedFabricPath: string, environment: 
       else if (record(item) || ["skills", "prompts", "themes"].some(type => fs.existsSync(path.join(root, type)))) found = [];
       else found = collect(root, entry);
       if (rootStat.isDirectory() && record(item) && item.autoload === false) {
-        // Pi applies a delta in order: an unmentioned resource is not enabled,
+        // Pi applies a delta in order: an unmentioned resource is not listed,
         // and the last matching plain/glob or +/-/! pattern wins.
         const patterns = Array.isArray(item.extensions) ? item.extensions as string[] : [];
-        found = found.filter(file => {
-          let enabled = false;
-          for (const value of patterns) {
-            const target = override(value) ? value.slice(1) : value;
-            if (matches(file, target, root, value.startsWith("+") || value.startsWith("-"))) enabled = !value.startsWith("-") && !value.startsWith("!");
-          }
-          return enabled;
-        });
+        const delta = new Map<string, boolean>();
+        for (const value of patterns) {
+          const target = override(value) ? value.slice(1) : value;
+          const exclusion = value.startsWith("-") || value.startsWith("!");
+          for (const file of found) if (matches(file, target, root, value.startsWith("+") || value.startsWith("-"), exclusion)) delta.set(file, !exclusion);
+        }
+        packageResources.push(...[...delta].map(([file, enabled]) => ({ file, enabled })));
       } else if (rootStat.isDirectory() && record(item) && Array.isArray(item.extensions)) {
+        // An empty list disables every extension of the package, like Pi.
         const patterns = item.extensions as string[];
-        found = patterns.length ? filter(found, patterns, root) : [];
-      }
-      paths.push(...found);
+        packageResources.push(...found.map(file => ({ file, enabled: patterns.length > 0 && enabledBy(file, patterns, root) })));
+      } else packageResources.push(...found.map(file => ({ file, enabled: true })));
     } catch { warn(entry, "missing, unreadable or invalid package"); }
   }
-  const unique = [...new Set(paths)].filter(file => !isFabric(file));
-  return { paths: unique, names: unique.map(file => path.basename(file)), warnings: [...warnings.values()] };
+  // Pi's resource ledger: the first entry per listed path wins (packages are
+  // listed before top-level settings), top-level settings outrank packages,
+  // then the first-ranked entry per canonical file decides it, enabled or not.
+  // A disabled alias therefore also suppresses a lower-ranked enabled alias.
+  const listed = new Map<string, Resource & { rank: number }>();
+  for (const [rank, resources] of [[4, packageResources], [2, topLevel]] as const) {
+    for (const resource of resources) if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank });
+  }
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  for (const { file, enabled } of [...listed.values()].sort((a, b) => a.rank - b.rank)) {
+    const canonical = real(file);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    if (enabled && !isFabric(canonical)) paths.push(canonical);
+  }
+  return { paths, names: paths.map(file => path.basename(file)), warnings: [...warnings.values()] };
 };

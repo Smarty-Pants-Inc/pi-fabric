@@ -68,6 +68,18 @@ const shim = (f: ReturnType<typeof fixture>, target: string) => {
   fs.chmodSync(file, 0o700); return file;
 };
 const events = (file: string) => fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));
+const nativeEnabled = async (f: ReturnType<typeof fixture>) => {
+  const settings = SettingsManager.create(f.root, f.profile, { projectTrusted: false });
+  const native = await new DefaultPackageManager({ cwd: f.root, agentDir: f.profile, settingsManager: settings }).resolve(() => Promise.resolve("skip"));
+  return new Set(native.extensions.filter(resource => resource.enabled).map(resource => fs.realpathSync(resource.path)));
+};
+/** real-ext/{a,b}.ts reached through a directory symlink at `at` (root-relative). */
+const linkedDirectory = (f: ReturnType<typeof fixture>, at: string) => {
+  const a = f.file("real-ext/a.ts"); const b = f.file("real-ext/b.ts"); const link = path.join(f.root, at);
+  fs.mkdirSync(path.dirname(link), { recursive: true }); fs.symlinkSync(path.dirname(a), link, "junction");
+  return { a, b, link };
+};
+const sorted = (values: readonly string[]) => [...values].sort();
 
 describe("opaque profile extension resolution", () => {
   it("matches native Pi explicit path bases, directory/manifest discovery and exclusions, without auto-discovery", async () => {
@@ -146,6 +158,81 @@ describe("opaque profile extension resolution", () => {
       expect(actual.warnings).toEqual([]);
     }
     expect(profileResult(f).paths).toEqual([one, two]);
+  });
+  it("excludes a file by its alias path through a symlinked directory, like Pi", async () => {
+    const f = fixture(); const { a, link } = linkedDirectory(f, "profile/linked");
+    for (const exclusion of ["!linked/b.ts", "!linked/b.*", `!${path.join(link, "b.ts")}`, "-linked/b.ts", `-${path.join(link, "b.ts")}`]) {
+      f.settings({ extensions: ["linked", exclusion] });
+      const actual = profileResult(f);
+      expect(actual, exclusion).toEqual({ paths: [a], names: ["a.ts"], warnings: [] });
+      expect(new Set(actual.paths), exclusion).toEqual(await nativeEnabled(f));
+    }
+  });
+  it("excludes a file by its alias path in a package whose extensions directory is a symlink, like Pi", async () => {
+    const f = fixture(); const { a } = linkedDirectory(f, "package/extensions");
+    f.file("package/package.json", JSON.stringify({ name: "guards" }));
+    for (const item of [
+      { source: "../package", extensions: ["extensions/*.ts", "!extensions/b.ts"] },
+      { source: "../package", extensions: ["!extensions/b.ts"] },
+      { source: "../package", extensions: ["-extensions/b.ts"] },
+      { source: "../package", autoload: false, extensions: ["extensions/*.ts", "!extensions/b.ts"] },
+      { source: "../package", autoload: false, extensions: ["extensions/*.ts", "-extensions/b.ts"] },
+    ]) {
+      f.settings({ packages: [item] });
+      const actual = profileResult(f);
+      expect(actual.paths, JSON.stringify(item)).toEqual([a]);
+      expect(new Set(actual.paths), JSON.stringify(item)).toEqual(await nativeEnabled(f));
+    }
+  });
+  it("also excludes a symlinked file by its canonical path: stricter than Pi, never looser", async () => {
+    const f = fixture(); const { a, b } = linkedDirectory(f, "profile/linked");
+    for (const exclusion of [`!${b}`, "!../real-ext/b.ts", "!../real-ext/b.*", `-${b}`, "-../real-ext/b.ts"]) {
+      f.settings({ extensions: ["linked", exclusion] });
+      const actual = profileResult(f);
+      expect(actual.paths, exclusion).toEqual([a]);
+      // Pi matches filters only against the listed path, so it would still load b.
+      const native = await nativeEnabled(f);
+      expect(native.has(b), exclusion).toBe(true); expect(actual.paths.every(file => native.has(file)), exclusion).toBe(true);
+    }
+    f.file("package/package.json", JSON.stringify({ name: "guards" }));
+    fs.symlinkSync(path.dirname(a), path.join(f.root, "package/extensions"), "junction");
+    for (const item of [{ source: "../package", extensions: [`!${b}`] }, { source: "../package", autoload: false, extensions: ["extensions/*.ts", `-${b}`] }]) {
+      f.settings({ packages: [item] });
+      expect(profileResult(f).paths, JSON.stringify(item)).toEqual([a]);
+    }
+  });
+  it("keeps inclusions through a symlinked directory exactly Pi's", async () => {
+    const f = fixture(); const { a, b } = linkedDirectory(f, "profile/linked");
+    const cases: Array<[string[], string[]]> = [
+      [["linked"], [a, b]],
+      [["linked", "linked/a.*"], [a]],
+      [["linked", "!*.ts", "+linked/b.ts"], [b]],
+      // Pi never matches inclusions against the symlink target, so neither do we.
+      [["linked", "../real-ext/a.*"], []],
+      [["linked", "!*.ts", `+${b}`], []],
+    ];
+    for (const [extensions, expected] of cases) {
+      f.settings({ extensions });
+      const actual = profileResult(f);
+      expect(sorted(actual.paths), extensions.join(" ")).toEqual(sorted(expected));
+      expect(new Set(actual.paths), extensions.join(" ")).toEqual(await nativeEnabled(f));
+    }
+  });
+  it("dedupes by canonical path after filtering: the first-ranked entry decides, like Pi", async () => {
+    const f = fixture(); const { a, b } = linkedDirectory(f, "profile/linked");
+    // The excluded alias is listed first, so it suppresses the target path listed later.
+    f.settings({ extensions: ["linked", "../real-ext", "!linked/b.ts"] });
+    let actual = profileResult(f);
+    expect(sorted(actual.paths)).toEqual([a]); expect(new Set(actual.paths)).toEqual(await nativeEnabled(f));
+    // Top-level settings outrank packages: an alias exclusion there wins over a package that enables the file.
+    f.file("package/package.json", JSON.stringify({ name: "guards", pi: { extensions: ["../real-ext/b.ts"] } }));
+    f.settings({ extensions: ["linked", "!linked/b.ts"], packages: ["../package"] });
+    actual = profileResult(f);
+    expect(sorted(actual.paths)).toEqual([a]); expect(new Set(actual.paths)).toEqual(await nativeEnabled(f));
+    // An unexcluded path listed first decides instead, exactly as in Pi.
+    f.settings({ extensions: ["../real-ext", "linked", "!linked/b.ts"] });
+    actual = profileResult(f);
+    expect(sorted(actual.paths)).toEqual(sorted([a, b])); expect(new Set(actual.paths)).toEqual(await nativeEnabled(f));
   });
   it("excludes Fabric packages, direct files and symlink aliases but retains unrelated checkout hooks", () => {
     const f = fixture(); const other = f.file("foreign/dist/index.js");

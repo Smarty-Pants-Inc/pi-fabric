@@ -354,6 +354,13 @@ replay project resources, and its pinned Fabric extension loads separately.
 Explicitly disabled extensions and resident startup probes do not replay profile
 hooks.
 
+Include and exclude filters match each extension's path as listed, or as reached
+through a selected directory, exactly as Pi matches them, even when that
+directory is a symlink. Exclusions also match the symlink target's path, so an
+exclusion written against the target holds too. Each file is then passed once:
+as in Pi, its highest-ranked entry decides whether it loads, and an excluded
+entry is not overridden by a lower-ranked entry for the same file.
+
 The worker log's `fabric_profile_extensions` event records extension basenames,
 `loadedCount` (paths supplied to Pi), and `skippedCount`. Missing or invalid
 entries are skipped independently with one counted `worker_warning` per entry;

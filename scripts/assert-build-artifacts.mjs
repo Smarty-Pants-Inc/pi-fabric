@@ -109,7 +109,16 @@ if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.joi
 if (process.platform === "linux") {
   // The native helpers are the twice-built, byte-identical outputs recorded in the manifest (build-landlock.mjs).
   const manifest = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
-  if (!/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? ""))) throw new Error(`Native manifest names no gcc or clang compiler: ${manifest.compiler}`);
+  // smarty-dev#8121: the pinned zig (native/toolchain.json), or an unpinned host gcc/clang.
+  const pinned = manifest.toolchain === "pinned" && /^zig \d+\.\d+\.\d+ \(/.test(String(manifest.compiler ?? ""));
+  if (!pinned && (manifest.toolchain !== "unpinned" || !/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? "")))) {
+    throw new Error(`Native manifest names no pinned zig and no unpinned gcc or clang compiler: ${manifest.toolchain} ${manifest.compiler}`);
+  }
+  // CI and release builds ship the helpers: only a local development build may stay on the host compiler.
+  if (!pinned && (process.env.CI === "true" || process.env.FABRIC_NATIVE_CC_PINNED === "1")) {
+    throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
+  }
+  if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
   for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {

@@ -383,7 +383,7 @@ export class FabricRuntimeState {
     return idle && !idle() ? undefined : batch;
   }
 
-  /** The host's gated idle wake for records (F21); unset, the watchdog starts no turn. */
+  /** The host's gated idle wake (root inbox, then records; F21, #792); unset, it starts no turn. */
   recordsWake: (() => Promise<void>) | undefined;
 
   /** The records addressed to this root past its processing cursor (smarty-dev#754 C4). */
@@ -736,7 +736,13 @@ export class FabricRuntimeState {
           initialMeshError = undefined;
           throw error;
         }
-        await initializeMeshActivation();
+        const deferred = !meshActivationReady;
+        try { await initializeMeshActivation(); } finally {
+          // An idle Main wakes only on an events.jsonl change or a known deadline (#792), and its
+          // start-up wake found the inbox fenced. Now that this retry opened it, request the same
+          // idle wake once, so inbox work queued meanwhile drains without another event.
+          if (deferred && rootInbox && this.#meshActivationReady()) void this.recordsWake?.().catch(() => undefined);
+        }
       },
       presencePass: async () => {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,

@@ -58,7 +58,8 @@
  * cadence and the restart cadence are one number, and it is set by volume AND age: the autocheckpoint at
  * `walAutocheckpointPages`, plus, after a COMMIT, one PASSIVE when frames were written since the last backfill and that
  * backfill is older than `walSyncMaxAgeMs` (30 s; by stat only: state.db's mtime is the last backfill, the WAL's the
- * last frame). A power loss still drops only commits no checkpoint synced (NORMAL's contract), now at most 4,000
+ * last frame; a due age sync that finds this store's writers waiting is deferred to the moment the queue drains or to
+ * the commit after three deferrals, never dropped, and never runs inside a transaction). A power loss still drops only commits no checkpoint synced (NORMAL's contract), now at most 4,000
  * frames AND, while commits continue, at most ~30 s of them (before: 1,000 frames and no time bound; the tail after
  * the last commit stays unsynced until the next checkpoint, as before: nothing polls). `sync()` is unchanged.
  *
@@ -553,6 +554,8 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 24 * 1024 * 1024;
 const DEFAULT_WAL_SYNC_MAX_AGE_MS = 30_000;
 // The age check (two stats) runs at most this often per store, after a COMMIT.
 const AGE_CHECK_MS = 1_000;
+// A due age sync deferred because this store's writers are waiting runs anyway on the commit after this many deferrals.
+const AGE_SYNC_MAX_SKIPS = 3;
 const SLOW_COMMIT_MS = 50;
 const CHECKPOINT_SUMMARY_MS = 60_000;
 type CheckpointVia = "explicit" | "maintainer" | "emergency" | "reset" | "cap" | "age" | "sync";
@@ -761,6 +764,8 @@ export class SqliteStateStore {
   readonly #walSyncMaxAgeMs: number;
   #lastAgeCheck = 0;
   #ageSyncing = false;
+  #ageDue = false;
+  #ageSkips = 0;
   #lastPassiveLog = -1;
   readonly #checkpointLog: CheckpointLogLevel;
   #window = newCheckpointWindow(Date.now());
@@ -1463,25 +1468,50 @@ export class SqliteStateStore {
   // the last backfill and that backfill is older than walSyncMaxAgeMs. state.db is only written by a checkpoint's backfill (WAL mode),
   // right after that checkpoint's WAL fsync, so its mtime is the last sync; the WAL's mtime is the last frame. Stat
   // only (never an fd on the database files). Scheduled after the writer's continuation, like the emergency path.
+  // A due sync is remembered (#ageDue) until it runs: a persistent writer queue must not starve it (review on adddb81d).
   #syncByAge(): void {
-    if (this.#walSyncMaxAgeMs <= 0 || this.#ageSyncing) return;
-    const now = Date.now();
-    if (now - this.#lastAgeCheck < AGE_CHECK_MS) return;
-    this.#lastAgeCheck = now;
+    if (this.#walSyncMaxAgeMs <= 0) return;
+    if (!this.#ageDue) {
+      const now = Date.now();
+      if (now - this.#lastAgeCheck < AGE_CHECK_MS) return;
+      this.#lastAgeCheck = now;
+      if (!this.#ageSyncDue(now)) return;
+      this.#ageDue = true;
+      this.#ageSkips = 0;
+    }
+    this.#scheduleAgeSync();
+  }
+
+  #ageSyncDue(now: number): boolean {
     try {
       const database = fs.statSync(this.file, { throwIfNoEntry: false });
       const wal = fs.statSync(`${this.file}-wal`, { throwIfNoEntry: false });
-      if (!database || !wal || wal.size === 0 || wal.mtimeMs <= database.mtimeMs || now - database.mtimeMs < this.#walSyncMaxAgeMs) return;
-    } catch { return; }
+      return !!database && !!wal && wal.size > 0 && wal.mtimeMs > database.mtimeMs && now - database.mtimeMs >= this.#walSyncMaxAgeMs;
+    } catch { return false; }
+  }
+
+  // Runs the due PASSIVE on the event loop, never inside a transaction (the writer lock; smarty-dev#6100, #869). This
+  // PASSIVE delays the store's waiting writers, so while any wait it is deferred, not dropped: it is retried when the
+  // queue drains (#leaveWriteQueue) and by every commit, and the commit after AGE_SYNC_MAX_SKIPS deferrals runs it anyway.
+  #scheduleAgeSync(): void {
+    if (!this.#ageDue || this.#ageSyncing) return;
     this.#ageSyncing = true;
     void new Promise<void>((resolve) => setImmediate(resolve))
-      // A store with a write waiting defers to a later commit (as #resetWal): this PASSIVE runs on the event loop.
       .then(() => {
-        if (this.#closed || this.#inTransaction || this.#db.isTransaction || this.#writesWaiting > 0) { this.#lastAgeCheck = 0; return; }
-        this.#passive("age");
+        if (this.#closed || !this.#ageDue || this.#inTransaction || this.#db.isTransaction) return; // the commit retries
+        if (this.#writesWaiting > 0 && this.#ageSkips < AGE_SYNC_MAX_SKIPS) { this.#ageSkips += 1; return; }
+        this.#ageDue = false;
+        this.#ageSkips = 0;
+        if (this.#ageSyncDue(Date.now())) this.#passive("age"); // else a checkpoint (e.g. the autocheckpoint) synced meanwhile
       })
       .catch(() => { if (!this.#closed) this.#stats.checkpoints.failed += 1; })
       .finally(() => { this.#ageSyncing = false; });
+  }
+
+  // A writer leaves the in-process queue (it took the lock, or gave up). An empty queue runs a deferred age sync.
+  #leaveWriteQueue(): void {
+    this.#writesWaiting -= 1;
+    if (this.#writesWaiting === 0) this.#scheduleAgeSync();
   }
 
   stats(): SqliteStateStats {
@@ -1664,7 +1694,7 @@ export class SqliteStateStore {
             // checkpoint) never keeps the next waiter from contending.
             ticket?.close();
             ticket = undefined;
-            this.#writesWaiting -= 1;
+            this.#leaveWriteQueue();
             waiting = false;
             return this.#run(body);
           }
@@ -1687,7 +1717,7 @@ export class SqliteStateStore {
       }
     } finally {
       ticket?.close();
-      if (waiting) this.#writesWaiting -= 1;
+      if (waiting) this.#leaveWriteQueue();
     }
   }
 

@@ -844,6 +844,7 @@ export class StateProjector {
         const result = body();
         this.#db.exec("COMMIT");
         committed = true;
+        if (!this.#walDirty) this.#dirtySince = Date.now();
         this.#walDirty = true;
         return result;
       } finally {

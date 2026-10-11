@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StateProjector } from "../src/mesh/state-projector.js";
-import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#6100 round 2: every complete checkpoint lets the next writer restart the WAL and fsync its header under
@@ -50,6 +50,55 @@ describe("SQLite mesh checkpoint cadence (smarty-dev#6100 round 2)", () => {
     expect(timing.passive.maxMs).toBeGreaterThanOrEqual(0);
     expect(store.stats().lastCheckpoint).toBeUndefined(); // the age sync is a bare PASSIVE, not checkpoint()
   }, 20_000);
+
+  // Review on adddb81d (P1): a due age sync that found writers waiting was retried only by a later commit's own check,
+  // which again found them waiting, so a writer queue that never drains starved it; at a low frame rate the 4,000-page
+  // autocheckpoint is minutes away, so nothing synced. Here the queue never drains: right after each store commit (before
+  // the age sync's setImmediate), another connection takes the writer lock for 80 ms, so all three store writers are
+  // waiting at every commit. ~12 commits/s of one small put: far below the autocheckpoint in the run.
+  it("a steady writer queue for > 30 s still gets the age PASSIVE: unsynced frames stay within walSyncMaxAgeMs", async () => {
+    const root = tempRoot("age-queue");
+    const store = await openStore(root, { checkpointLog: "off" }); // default walSyncMaxAgeMs 30 s, autocheckpoint 4,000 pages
+    const file = path.join(root, "state.db");
+    const holder = openNodeSqlite(file);
+    let release: NodeJS.Timeout | undefined;
+    const hold = (): void => {
+      if (release) return;
+      holder.exec("BEGIN IMMEDIATE");
+      release = setTimeout(() => { release = undefined; holder.exec("COMMIT"); }, 80);
+    };
+    const until = Date.now() + 36_000;
+    let commits = 0;
+    const writer = async (id: number): Promise<void> => {
+      for (let i = 0; Date.now() < until; i += 1) {
+        await store.put({ key: `w/${id}`, value: i, identity });
+        commits += 1;
+        hold(); // a microtask after this COMMIT: the other writers, and this one next, wait behind it
+      }
+    };
+    // Unsynced-frame age: frames are in the WAL after the last backfill (state.db's mtime), so the oldest is at most this old.
+    let maxUnsyncedMs = 0;
+    const sample = (): void => {
+      const database = fs.statSync(file);
+      const wal = fs.statSync(`${file}-wal`, { throwIfNoEntry: false });
+      if (wal && wal.size > 0 && wal.mtimeMs > database.mtimeMs) maxUnsyncedMs = Math.max(maxUnsyncedMs, Date.now() - database.mtimeMs);
+    };
+    const sampler = setInterval(sample, 100);
+    try { await Promise.all([0, 1, 2].map(writer)); }
+    finally {
+      clearInterval(sampler);
+      if (release) clearTimeout(release);
+      if (holder.isTransaction) holder.exec("ROLLBACK");
+      holder.close();
+    }
+    sample();
+    const stats = store.stats();
+    expect(commits).toBeGreaterThan(200);
+    expect(stats.maxWaitMs).toBeGreaterThan(50); // the writers did queue
+    expect(stats.checkpointTiming.passive.count).toBeGreaterThanOrEqual(1); // the age sync (nothing else runs a PASSIVE here)
+    // walSyncMaxAgeMs + the 1 s check spacing + up to 4 commits of deferral (~0.4 s) + sampling slack.
+    expect(maxUnsyncedMs).toBeLessThan(32_500);
+  }, 60_000);
 
   it("walSyncMaxAgeMs 0 disables the age sync", async () => {
     const root = tempRoot("age-off");

@@ -143,9 +143,10 @@ export const pidNamespaceVerdict = (recordNs: string | null, ownNs: string | und
  * Linux filesystems that live on ONE host (pi-fabric#923 round 3, fabric-store decision). A live VM snapshot clone can
  * reproduce the whole (machine, boot, namespace) identity, but two clones can share a mesh root only on SHARED storage.
  * So pid evidence is allowed only when the root is on one of these local types: ext2/3/4, xfs, btrfs, tmpfs, zfs,
- * overlay, f2fs. Anything else (nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, unknown) is unproven.
+ * f2fs. Anything else (overlay, nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, unknown) is unproven.
  */
-const LOCAL_LINUX_FILESYSTEMS = new Set([0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0x794C7630, 0xF2F52010]);
+// Round 4: overlay (0x794C7630) is NOT here: its backing filesystem is not checked, so it is unproven.
+const LOCAL_LINUX_FILESYSTEMS = new Set([0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0xF2F52010]);
 let filesystemTypeOverride: { type: number | undefined } | undefined;
 /** Test seam: pretend the root's `statfs` type is `type` (undefined: unreadable); `reset` restores the real one. */
 export const localFilesystemTestHooks = {
@@ -160,9 +161,15 @@ export const localFilesystemTestHooks = {
 export const onLocalFilesystem = (root: string): boolean => {
   if (filesystemTypeOverride) return filesystemTypeOverride.type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(filesystemTypeOverride.type);
   if (process.platform !== "linux") return false;
+  // Round 4: the type of the PINNED root. Node has no fstatfs, so statfs goes through the held fd's /proc entry: a
+  // swap of the path after the open cannot change the answer. Anything unreadable is unproven.
+  let fd = -1;
   let type: number | undefined;
-  try { type = Number(fs.statfsSync(root).type); } catch { type = undefined; }
-  return type !== undefined && LOCAL_LINUX_FILESYSTEMS.has(type);
+  try {
+    fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW ?? 0));
+    type = Number(fs.statfsSync(`/proc/self/fd/${fd}`).type);
+  } catch { type = undefined; } finally { if (fd >= 0) try { fs.closeSync(fd); } catch { /* closed */ } }
+  return type !== undefined && Number.isFinite(type) && LOCAL_LINUX_FILESYSTEMS.has(type);
 };
 
 /**

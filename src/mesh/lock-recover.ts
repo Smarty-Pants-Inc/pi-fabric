@@ -36,6 +36,8 @@ export interface MeshLockRecoverOptions {
   alive?: (pid: number) => boolean;
   /** The audit file's bound before it rotates (default 1 MiB). */
   auditMaxBytes?: number;
+  /** Test seam: the platform the audit rules follow (default `process.platform`). */
+  platform?: NodeJS.Platform;
 }
 
 const AUDIT_MAX_BYTES = 1024 * 1024;
@@ -44,7 +46,17 @@ const AUDIT_MAX_BYTES = 1024 * 1024;
  * descriptor must be a regular file, ours, mode 0600. Past `maxBytes` it rotates once (`.1`, the previous one
  * replaced), so the audit is bounded to two files. Any failure refuses the recovery, before anything is renamed.
  */
-const appendAudit = (file: string, line: string, maxBytes: number): void => {
+const appendAudit = (file: string, line: string, maxBytes: number, platform: NodeJS.Platform = process.platform): void => {
+  if (platform === "win32") {
+    // pi-fabric#923 round 4: Windows has no O_NOFOLLOW, and an lstat-then-open can be raced. Fail closed: the audit is
+    // only ever CREATED, exclusively (wx); an existing audit file is never appended to. The operator moves it aside
+    // (keeping it) before the next recovery on that root.
+    try { fs.writeFileSync(file, line, { flag: "wx", mode: 0o600 }); }
+    catch (error) {
+      throw new MeshLockRecoverRefusedError(`the audit ${file} ${(error as NodeJS.ErrnoException).code === "EEXIST" ? "already exists; on Windows it is only created, never appended: move it aside (keep it) and run again" : `could not be created (${(error as Error).message})`}; nothing was recovered`);
+    }
+    return;
+  }
   const open = (extra: number): number => {
     const noFollow = fs.constants.O_NOFOLLOW;
     // Without O_NOFOLLOW (Windows), refuse a symlink seen by lstat right before the open.
@@ -96,19 +108,22 @@ export interface MeshLockRecoverResult {
 
 export interface LockRecoverAudit {
   at: string; root: string; lock: string; mode: "safe" | "unsafe"; holder: string; holderPid: number; holderNamespace: string | null;
-  verdict: PidNamespaceVerdict; operator: { uid: number | null; user: string; pid: number; ppid: number; parentCommand: string; host: string };
+  verdict: PidNamespaceVerdict; operator: { uid: number | null; user: string; pid: number; ppid: number; parentExecutable: string; host: string };
 }
 
-/** The parent process's command line: who ran the recovery (Linux /proc; elsewhere unknown, never guessed). */
-const parentCommand = (): string => {
-  try { return fs.readFileSync(`/proc/${process.ppid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" "); }
+/**
+ * The parent process's EXECUTABLE path: who ran the recovery (Linux /proc/<ppid>/exe; elsewhere unknown, never
+ * guessed). Never its command line: arguments can carry secrets (pi-fabric#923 round 4).
+ */
+const parentExecutable = (): string => {
+  try { return fs.readlinkSync(`/proc/${process.ppid}/exe`); }
   catch { return "unknown"; }
 };
 const operator = (): LockRecoverAudit["operator"] => {
   let user = "unknown";
   try { user = os.userInfo().username; } catch { /* no passwd entry */ }
   return { uid: typeof process.getuid === "function" ? process.getuid() : null, user, pid: process.pid, ppid: process.ppid,
-    parentCommand: parentCommand(), host: os.hostname() };
+    parentExecutable: parentExecutable(), host: os.hostname() };
 };
 
 const alive = (pid: number): boolean => {
@@ -158,9 +173,9 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, holder: options.holder, holderPid: pid,
     holderNamespace: namespace, verdict, operator: operator() };
   // The audit is written BEFORE the rename: a recovery that happened is always on record. A failed audit refuses.
-  appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, options.auditMaxBytes ?? AUDIT_MAX_BYTES);
+  appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, options.auditMaxBytes ?? AUDIT_MAX_BYTES, options.platform);
   const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
   fs.renameSync(lock, fence);
   return { recovered: true, mode, lock, fence, holderPid: pid, holderNamespace: namespace, verdict, audit,
-    ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent "${audit.operator.parentCommand}", host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
+    ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
 };

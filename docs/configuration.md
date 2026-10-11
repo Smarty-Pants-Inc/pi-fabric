@@ -745,8 +745,14 @@ Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on it
 - **Precondition: a mesh root lives on ONE host's local filesystem** (pi-fabric#923 round 3). A live VM snapshot clone
   can reproduce the whole namespace id, but two clones can share a root only over shared storage. So pid evidence is
   used only when the root is on a known local filesystem:
-  - **Linux:** `statfs` type ext2/3/4, xfs, btrfs, tmpfs, zfs, overlay or f2fs.
-  - **Anything else is unproven:** nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, an unknown type.
+  - **Linux:** `statfs` type ext2/3/4, xfs, btrfs, tmpfs, zfs or f2fs, read through the held root fd
+    (`/proc/self/fd/N`). overlay is not on the list: its backing filesystem is not checked.
+  - **Not detected: one disk attached to two hosts at once** (a multi-attach block volume, a shared SAN LUN) and
+    mounted with one of those filesystems. The type looks local, but two hosts share the root. Such a mount is
+    unsupported (these filesystems are corrupted by it anyway). It is an accepted security gap, smarty-dev#9813
+    (fabric-store, 2026-10-11), whose holder-lease design closes it.
+  - **Anything else is unproven:** overlay, nfs, cifs/smb, 9p, virtiofs, fuse, ceph, gfs2, ocfs2, an unknown or
+    unreadable type.
   - **macOS fails closed:** Node exposes only `statfs`'s numeric `f_type`, which macOS does not keep stable. A crashed
     holder there needs `--unsafe-holder-stopped`.
   - **Windows fails closed** (below).
@@ -759,9 +765,11 @@ Protocol 3 (smarty-dev#9569) is protocol 2 plus the holder's PID namespace on it
     root and the token shell-quoted: `fabric-mesh-backend lock-recover --root 'DIR' --lock mesh|custody --holder 'TOKEN'`.
     That command acts only on a holder of its own namespace whose pid is gone; run it inside the holder's namespace.
   - Its labelled `--unsafe-holder-stopped` override recovers on the operator's word that the holder is stopped,
-    prints an ALARM, and appends an audit line naming the operator (uid, user, pid, parent command line, host) to
-    `<root>/lock-recoveries.jsonl`. The audit is opened without following a symlink and must be a private (0600)
-    regular file of this user. It rotates once at 1 MiB (`.1`). If it cannot be written, nothing is recovered.
+    prints an ALARM, and appends an audit line naming the operator (uid, user, pid, parent pid and executable, host) to
+    `<root>/lock-recoveries.jsonl`. It records the parent's executable path and pid, never its command line. The
+    audit is opened without following a symlink and must be a private (0600) regular file of this user. It rotates
+    once at 1 MiB (`.1`). On Windows it is only ever created exclusively: an existing audit file refuses the next
+    recovery until it is moved aside. If it cannot be written, nothing is recovered.
 - **Rollout:**
   - Old releases accept only 4- or 5-field (custody: 7-field) records, so they can never reclaim a protocol-3
     record.

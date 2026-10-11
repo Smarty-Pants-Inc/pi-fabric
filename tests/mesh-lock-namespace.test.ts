@@ -163,7 +163,8 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
       expect(refused.foreignCode).toBe("FABRIC_MESH_LOCK_UNPROVEN_HOLDER");
       // The error and the ALARM line name the lock and the exact recovery command.
       const token = record.split("\n")[0]!;
-      expect(refused.recovery).toBe(`fabric-mesh-backend lock-recover --root '${root}' --lock mesh --holder '${token}'`);
+      expect(refused.recoveryArgv).toEqual(["fabric-mesh-backend", "lock-recover", "--root", root, "--lock", "mesh", "--holder", token]);
+      expect(refused.recovery).toContain(`--lock mesh --holder ${token}`);
       expect(refused.message).toContain(path.join(root, ".lock"));
       expect(warn.mock.calls.flat().join("\n")).toMatch(/\[pi-fabric\] ALARM FABRIC_MESH_LOCK_UNPROVEN_HOLDER: .*lock-recover/);
       expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
@@ -175,7 +176,8 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
       const audit = JSON.parse(fs.readFileSync(path.join(root, "lock-recoveries.jsonl"), "utf8").trim()) as { mode: string; holder: string; operator: Record<string, unknown> };
       expect(audit).toMatchObject({ mode: "unsafe", holder: token, operator: { pid: process.pid, ppid: process.ppid, host: os.hostname() } });
       expect(audit.operator.user).toEqual(expect.any(String));
-      expect(audit.operator.parentCommand).toEqual(expect.any(String));
+      expect(audit.operator.parentExecutable).toEqual(expect.any(String));
+      expect(audit.operator).not.toHaveProperty("parentCommand");
     } finally { holder.kill(); }
   });
 
@@ -194,7 +196,7 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
   });
 
   it.each([
-    ["nfs", 0x6969], ["cifs/smb", 0xFF534D42], ["9p (WSL, VM shares)", 0x01021997], ["virtiofs", 0x6A656A63], ["fuse", 0x65735546],
+    ["overlay (its backing is not checked)", 0x794C7630], ["nfs", 0x6969], ["cifs/smb", 0xFF534D42], ["9p (WSL, VM shares)", 0x01021997], ["virtiofs", 0x6A656A63], ["fuse", 0x65735546],
     ["ceph", 0x00C36400], ["gfs2", 0x01161970], ["ocfs2", 0x7461636F], ["unreadable", undefined],
   ] as const)("pi-fabric#923 round 3: a dead holder of OUR namespace on a %s root is NOT reclaimed (a VM clone with our identity can share it)", async (_name, type) => {
     const own = ns();
@@ -214,15 +216,40 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     localFilesystemTestHooks.reset();
     // This test host's TMPDIR: ext4 on the fleet's Linux hosts (local), so pid evidence is allowed there; never off Linux.
     if (process.platform !== "linux") expect(onLocalFilesystem(os.tmpdir())).toBe(false);
-    for (const local of [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0x794C7630, 0xF2F52010]) {
+    for (const local of [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0xF2F52010]) {
       localFilesystemTestHooks.set(local);
       expect(onLocalFilesystem("/any")).toBe(true);
     }
+    localFilesystemTestHooks.set(0x794C7630);
+    expect(onLocalFilesystem("/any")).toBe(false); // overlay
   });
 
-  it("pi-fabric#923 round 2: the printed recovery command shell-quotes the root and the token from disk", () => {
+  it.runIf(process.platform === "linux")("pi-fabric#923 round 4: statfs runs on the PINNED root (its /proc/self/fd entry), never on the path; unreadable is unproven", () => {
+    localFilesystemTestHooks.reset();
+    const root = tempRoot();
+    const local = [0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0xF2F52010].includes(Number(fs.statfsSync(root).type));
+    expect(onLocalFilesystem(root)).toBe(local); // the real answer for this host's TMPDIR
+    const spied = vi.spyOn(fs, "statfsSync");
+    onLocalFilesystem(root);
+    expect(spied.mock.calls.map(([target]) => String(target))).toEqual([expect.stringMatching(/^\/proc\/self\/fd\/\d+$/)]);
+    expect(spied.mock.calls.map(([target]) => String(target))).not.toContain(root);
+    spied.mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
+    expect(onLocalFilesystem(root)).toBe(false);
+    // A root that is a symlink is not followed (O_NOFOLLOW): unproven.
+    spied.mockRestore();
+    const link = path.join(tempRoot(), "link");
+    fs.symlinkSync(root, link);
+    expect(onLocalFilesystem(link)).toBe(false);
+  });
+
+  it("pi-fabric#923 round 4: the recovery command is quoted for the platform's shell (POSIX and PowerShell), and given as argv", async () => {
+    const { renderRecoveryCommand } = await import("../src/core/atomic-write.js");
     const refused = new MeshLockForeignHolderError(" (x)", 1, 0, "unproven", "", "/srv/it's here/.lock", "tok'$(touch pwned)");
-    expect(refused.recovery).toBe("fabric-mesh-backend lock-recover --root '/srv/it'\\''s here' --lock mesh --holder 'tok'\\''$(touch pwned)'");
+    expect(refused.recoveryArgv).toEqual(["fabric-mesh-backend", "lock-recover", "--root", "/srv/it's here", "--lock", "mesh", "--holder", "tok'$(touch pwned)"]);
+    expect(renderRecoveryCommand(refused.recoveryArgv, "linux"))
+      .toBe("fabric-mesh-backend lock-recover --root '/srv/it'\\''s here' --lock mesh --holder 'tok'\\''$(touch pwned)'");
+    expect(renderRecoveryCommand(["fabric-mesh-backend", "lock-recover", "--root", "C:\\Users\\o'neil\\mesh", "--holder", "t'k"], "win32"))
+      .toBe("fabric-mesh-backend lock-recover --root 'C:\\Users\\o''neil\\mesh' --holder 't''k'");
   });
 
   it("never reclaims a dead holder of another namespace: an operator recovers it", async () => {
@@ -365,6 +392,39 @@ describe("fabric-mesh-backend lock-recover (smarty-dev#9569 D2): safe form, labe
     expect(refused.code).toBe(3);
     expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(record);
   });
+
+  it("pi-fabric#923 round 4: on Windows the audit is only created exclusively; an existing one refuses (nothing renamed)", async () => {
+    const { recoverMeshLock, MeshLockRecoverRefusedError } = await import("../src/mesh/lock-recover.js");
+    const own = ns();
+    pidNamespaceTestHooks.set(own);
+    const root = tempRoot();
+    const first = meshRecord(deadPid(), own);
+    plant(path.join(root, ".lock"), first);
+    await expect(recoverMeshLock(root, { lock: "mesh", holder: first.split("\n")[0]!, platform: "win32" })).resolves.toMatchObject({ recovered: true });
+    const second = meshRecord(deadPid(), own);
+    plant(path.join(root, ".lock"), second);
+    const refused = await recoverMeshLock(root, { lock: "mesh", holder: second.split("\n")[0]!, platform: "win32" }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(MeshLockRecoverRefusedError);
+    expect((refused as Error).message).toMatch(/already exists; on Windows it is only created, never appended/);
+    expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe(second); // refused before the rename
+    expect(fs.readFileSync(path.join(root, "lock-recoveries.jsonl"), "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it.runIf(process.platform === "linux" && fs.existsSync(path.join(process.cwd(), "dist/mesh/mesh-backend-cli.js")))(
+    "pi-fabric#923 round 4: a secret in the parent's command line appears in neither the audit nor the output (built CLI)", async () => {
+      const root = tempRoot();
+      const record = meshRecord(deadPid(), container(4026539999)); // foreign to the child: only the unsafe override acts
+      plant(path.join(root, ".lock"), record);
+      const script = path.join(root, "run.mjs");
+      fs.writeFileSync(script, `import { main } from ${JSON.stringify(path.join(process.cwd(), "dist/mesh/mesh-backend-cli.js"))};\n` +
+        `process.exitCode = await main(["lock-recover", "--root", ${JSON.stringify(root)}, "--lock", "mesh", "--holder", ${JSON.stringify(record.split("\n")[0])}, "--unsafe-holder-stopped", "--json"]);\n`);
+      // The parent is a shell whose OWN arguments carry the secret; `; :` keeps it from exec-ing into node.
+      const result = childProcess.spawnSync("/bin/sh", ["-c", `"${process.execPath}" "$1"; :`, "sh", script, "--api-token=SECRET-923-r4"],
+        { encoding: "utf8", timeout: 30_000 });
+      const audit = fs.readFileSync(path.join(root, "lock-recoveries.jsonl"), "utf8");
+      expect(audit).toMatch(/"parentExecutable":"[^"]*sh"/);
+      for (const text of [audit, result.stdout, result.stderr]) expect(text).not.toContain("SECRET-923-r4");
+    });
 
   it("pi-fabric#923 round 2: the audit fails closed (nothing renamed) on a symlink to /dev/null or a 0666 file, and rotates at its cap", async () => {
     const { recoverMeshLock, MeshLockRecoverRefusedError } = await import("../src/mesh/lock-recover.js");

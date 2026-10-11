@@ -682,15 +682,15 @@ export class MeshLockForeignHolderError extends MeshLockTimeoutError {
   readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
   /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
   readonly recovery: string;
+  /** The same command as an argument vector: the safe form for a program to run. */
+  readonly recoveryArgv: string[];
   constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
     readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
     super(holder, attempts, maxGapMs);
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
     const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
-    // pi-fabric#923: the root and the token come from disk: POSIX shell single-quoted, so a copied command cannot run
-    // anything else.
-    const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-    this.recovery = `fabric-mesh-backend lock-recover --root ${quote(path.dirname(lockPath))} --lock ${kind} --holder ${quote(holderToken)}`;
+    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", holderToken];
+    this.recovery = renderRecoveryCommand(this.recoveryArgv);
     const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
       : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
     this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
@@ -698,6 +698,15 @@ export class MeshLockForeignHolderError extends MeshLockTimeoutError {
     this.name = "MeshLockForeignHolderError";
   }
 }
+
+/**
+ * The recovery command for this platform's shell (pi-fabric#923 round 4). The root and the token come from disk, so
+ * each argument is single-quoted: POSIX (`'` becomes `'\''`) or PowerShell on Windows (`'` becomes `''`). A copied
+ * command then runs nothing else.
+ */
+export const renderRecoveryCommand = (argv: string[], platform: NodeJS.Platform = process.platform): string =>
+  argv.map(value => /^[A-Za-z0-9._/=+-]+$/.test(value) ? value // plain words stay bare (the command name too)
+    : platform === "win32" ? `'${value.replace(/'/g, "''")}'` : `'${value.replace(/'/g, "'\\''")}'`).join(" ");
 
 const alarmedHolders = new Set<string>();
 /**

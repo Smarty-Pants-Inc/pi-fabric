@@ -220,6 +220,146 @@ describe("lock events: rotation across processes", () => {
     expect(fs.existsSync(lock)).toBe(false);
     expect(events.errors).toBe(0);
   });
+
+  // PR #905 Windows CI: a rename or an append racing another process's handle on events.jsonl fails
+  // with EPERM/EBUSY/EACCES there. Simulated on any OS: a refused rename skips the rotation, a refused
+  // append retries against the current file with a bounded backoff; no line is lost.
+  const oversized = (root: string): string => {
+    fs.mkdirSync(path.join(root, "lock-stats"), { mode: 0o700 });
+    const file = eventsFile(root);
+    fs.writeFileSync(file, `${"x".repeat(4000)}\n`, { mode: 0o600 });
+    return file;
+  };
+  /** heldMs of the event lines, skipping the oversized filler. */
+  const heldOf = (file: string): unknown[] => fs.readFileSync(file, "utf8").split("\n")
+    .filter((line) => line.startsWith("{")).map((line) => (JSON.parse(line) as LockEvent).heldMs);
+  const refuse = (code: string): Error => Object.assign(new Error(`${code}: injected`), { code });
+
+  it("win32: a rename refused while another process holds the file skips the rotation; no line is lost", () => {
+    const sleeps: number[] = [];
+    const events = createLockEvents("1", { rotateBytes: 4096, platform: "win32", sleep: (ms) => sleeps.push(ms) })!;
+    const root = temp();
+    const file = oversized(root);
+    const original = fs.renameSync;
+    let refusals = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(to).endsWith(`${LOCK_EVENTS_FILE}.1`) && refusals < 3) throw refuse(["EPERM", "EBUSY", "EACCES"][refusals++]!);
+      original(from, to);
+    }) as typeof fs.renameSync);
+    for (const heldMs of [2_001, 2_002, 2_003]) events.held(root, "mesh-lock", "publish", heldMs);
+    expect(refusals).toBe(3);
+    expect(fs.existsSync(`${file}.1`)).toBe(false); // every rotation skipped ...
+    expect(heldOf(file)).toEqual([2_001, 2_002, 2_003]); // ... no line lost
+    expect(fs.readdirSync(path.dirname(file))).toEqual([LOCK_EVENTS_FILE]); // the rotation lock was released
+    events.held(root, "mesh-lock", "publish", 2_004); // the window closed: this rotation succeeds
+    expect(heldOf(`${file}.1`)).toEqual([2_001, 2_002, 2_003]);
+    expect(readEvents(file).map((event) => event.heldMs)).toEqual([2_004]);
+    expect(events.errors).toBe(0);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("win32: an append refused with EPERM/EBUSY/EACCES/ENOENT retries the current file with a bounded backoff", () => {
+    const sleeps: number[] = [];
+    const warnings: string[] = [];
+    const events = createLockEvents("1", { platform: "win32", sleep: (ms) => sleeps.push(ms), warn: (message) => warnings.push(message) })!;
+    const root = temp();
+    const file = eventsFile(root);
+    const original = fs.openSync;
+    let refusals: string[] = [];
+    let opens = 0;
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === file) {
+        opens++;
+        const code = refusals.shift();
+        if (code) throw refuse(code);
+      }
+      return (original as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+    refusals = ["EPERM", "EBUSY", "EACCES", "ENOENT"]; // four refusals, the fifth try lands
+    events.held(root, "mesh-lock", "publish", 3_001);
+    expect(opens).toBe(5);
+    expect(sleeps).toEqual([10, 20, 30, 40]);
+    expect(readEvents(file).map((event) => event.heldMs)).toEqual([3_001]);
+    expect(events.errors).toBe(0);
+    // Refused for longer than the bound: exactly five tries, then one counted failure.
+    opens = 0;
+    sleeps.length = 0;
+    refusals = Array.from({ length: 50 }, () => "EBUSY");
+    events.held(root, "mesh-lock", "publish", 3_002);
+    expect(opens).toBe(5);
+    expect(sleeps).toEqual([10, 20, 30, 40]);
+    expect(events.errors).toBe(1);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("EBUSY: injected");
+    refusals = [];
+    events.held(root, "mesh-lock", "publish", 3_003);
+    expect(readEvents(file).map((event) => event.heldMs)).toEqual([3_001, 3_003]);
+  });
+
+  it("linux: unchanged, an EPERM append or rename counts at once; ENOENT is retried once without a delay", () => {
+    const sleeps: number[] = [];
+    const events = createLockEvents("1", { rotateBytes: 4096, platform: "linux", sleep: (ms) => sleeps.push(ms), warn: () => undefined })!;
+    const root = temp();
+    const file = oversized(root);
+    const originalOpen = fs.openSync;
+    const originalRename = fs.renameSync;
+    let refusals: string[] = [];
+    let opens = 0;
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === file) {
+        opens++;
+        const code = refusals.shift();
+        if (code) throw refuse(code);
+      }
+      return (originalOpen as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+    let renameRefusals = 1;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (renameRefusals-- > 0) throw refuse("EPERM");
+      originalRename(from, to);
+    }) as typeof fs.renameSync);
+    events.held(root, "mesh-lock", "publish", 4_001); // the rename's EPERM is an append failure (as before)
+    expect(events.errors).toBe(1);
+    refusals = ["EPERM"];
+    opens = 0;
+    events.held(root, "mesh-lock", "publish", 4_002);
+    expect(opens).toBe(1);
+    expect(events.errors).toBe(2);
+    refusals = ["ENOENT"];
+    opens = 0;
+    events.held(root, "mesh-lock", "publish", 4_003); // rotates, then lands in the new file
+    expect(opens).toBe(3); // the refused open, then the retry's open and its reopen after the rotation
+    expect(events.errors).toBe(2);
+    expect(readEvents(file).map((event) => event.heldMs)).toEqual([4_003]);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("a newer, smaller file whose id matches the rotated one (id reuse or a Windows id collision) is never renamed over .1", () => {
+    const events = createLockEvents("1", { rotateBytes: 4096 })!;
+    const root = temp();
+    const file = oversized(root);
+    const rotatedAway = `${"y".repeat(10)}\n`;
+    const original = fs.lstatSync;
+    let raced = false;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      if (String(target) !== file || raced) return original(target, options);
+      raced = true;
+      // Another process rotated the oversized file away and a newer one took the name; its file id
+      // compares equal to the one this appender saw.
+      const seen = original(file, { bigint: true });
+      fs.renameSync(file, `${file}.1`);
+      fs.writeFileSync(file, rotatedAway, { mode: 0o600 });
+      return Object.assign(original(file, { bigint: true }), { dev: seen.dev, ino: seen.ino });
+    }) as typeof fs.lstatSync);
+    events.held(root, "mesh-lock", "publish", 5_001);
+    expect(raced).toBe(true);
+    expect(fs.readFileSync(`${file}.1`, "utf8")).toBe(`${"x".repeat(4000)}\n`); // the rotated file survived
+    const [kept, line, ...rest] = fs.readFileSync(file, "utf8").split("\n");
+    expect(`${kept}\n`).toBe(rotatedAway); // the newer file was not renamed: the line was appended to it
+    expect(JSON.parse(line!)).toMatchObject({ kind: "held", heldMs: 5_001 });
+    expect(rest).toEqual([""]);
+    expect(events.errors).toBe(0);
+  });
 });
 
 describe("lock events in one process", () => {

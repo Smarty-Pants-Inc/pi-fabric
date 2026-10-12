@@ -505,6 +505,18 @@ const APPEND_FLAGS = process.platform === "win32" ? "a"
   : fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0);
 const ROTATE_LOCK_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+/**
+ * Windows: a rename, open or lstat that races another process's handle on events.jsonl (or a name
+ * left delete-pending by a rename) fails transiently with one of these. Never a lost line: a refused
+ * rename skips the rotation, a refused append retries.
+ */
+const WIN32_TRANSIENT_CODES: ReadonlySet<unknown> = new Set(["EPERM", "EBUSY", "EACCES"]);
+/** Windows: tries per line against the current events.jsonl before the append counts as failed. */
+export const LOCK_EVENTS_APPEND_TRIES_WIN32 = 5;
+/** Windows: the backoff before retry N is N times this (10, 20, 30, 40 ms: at most 100 ms per line). */
+export const LOCK_EVENTS_APPEND_RETRY_MS = 10;
+/** A synchronous bounded sleep (the appender is synchronous inside the lock path). */
+const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
 interface ProcessLockEvents {
   /** Registry generation. Keep the event API and line shape stable; hand over before changing them. */
@@ -542,7 +554,14 @@ export const lockEventLine = (event: LockEvent): string => {
  * reloads like the recorder: on unless PI_FABRIC_LOCK_STATS=0. No timer, file or descriptor is held.
  */
 export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
-  options: { warn?: (message: string) => void; rotateBytes?: number } = {}): LockEvents | undefined => {
+  options: {
+    warn?: (message: string) => void;
+    rotateBytes?: number;
+    /** Tests: the platform whose rename/append semantics apply (default process.platform). */
+    platform?: NodeJS.Platform;
+    /** Tests: the synchronous backoff sleep (default Atomics.wait). */
+    sleep?: (ms: number) => void;
+  } = {}): LockEvents | undefined => {
   const existing = eventsGlobals[eventsKey];
   if (existing) return existing.events;
   if (lockStatsDisabled(setting)) {
@@ -552,6 +571,9 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const host = lockStatsHost();
   const rotateBytes = Math.max(1, options.rotateBytes ?? LOCK_EVENTS_ROTATE_BYTES);
   const warn = options.warn ?? warnPrivately;
+  const windows = (options.platform ?? process.platform) === "win32";
+  const sleep = options.sleep ?? sleepSync;
+  const transient = (error: unknown): boolean => windows && WIN32_TRANSIENT_CODES.has(errorCodeOf(error));
   let errors = 0;
   let unwarned = 0;
   let warnedAt = Number.NEGATIVE_INFINITY;
@@ -569,10 +591,12 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     try { warn(`mesh lock events: ${count} append error(s) since the last warning; last: ${error instanceof Error ? error.message : String(error)}`); }
     catch { /* Diagnostics only. */ }
   };
-  const open = (file: string): { descriptor: number; stat: fs.Stats } => {
+  // BigInt stats: a Windows (NTFS) file id is 64 bits and above 2^53 once its sequence number
+  // passes 31, so as a Number two different files can compare equal (nodejs/node#12115).
+  const open = (file: string): { descriptor: number; stat: fs.BigIntStats } => {
     const descriptor = fs.openSync(file, APPEND_FLAGS, 0o600);
     try {
-      const stat = fs.fstatSync(descriptor);
+      const stat = fs.fstatSync(descriptor, { bigint: true });
       if (!stat.isFile()) throw new Error(`${file} is not a regular file`);
       return { descriptor, stat };
     } catch (error) { fs.closeSync(descriptor); throw error; }
@@ -586,12 +610,17 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       checkStatsDirectory(directory);
       const file = path.join(directory, LOCK_EVENTS_FILE);
       const data = Buffer.from(lockEventLine(event));
-      try { appendOnce(file, data); }
-      catch (error) {
-        // A concurrent rotation moved the name between our open and our rename check: append once
-        // more against the current events.jsonl (O_APPEND|O_CREAT). A second failure is counted.
-        if (errorCodeOf(error) !== "ENOENT") throw error;
-        appendOnce(file, data);
+      // A concurrent rotation moved the name between our open and our rename check (ENOENT): append
+      // once more against the current events.jsonl (O_APPEND|O_CREAT). Windows: also EPERM/EBUSY/
+      // EACCES while another process holds or renames the file, up to LOCK_EVENTS_APPEND_TRIES_WIN32
+      // tries with a short growing backoff. The last failure is counted.
+      const tries = windows ? LOCK_EVENTS_APPEND_TRIES_WIN32 : 2;
+      for (let attempt = 1; attempt <= tries; attempt++) {
+        try { appendOnce(file, data); return; }
+        catch (error) {
+          if (attempt === tries || (errorCodeOf(error) !== "ENOENT" && !transient(error))) throw error;
+          if (windows) sleep(LOCK_EVENTS_APPEND_RETRY_MS * attempt);
+        }
       }
     } catch (error) { failed(error); }
   };
@@ -612,17 +641,23 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
   /**
    * Renames the oversized file `seen` to `.1` under the rotation lock, only if the name still holds
    * that inode: an appender holding a stale lstat can never rename a newer file over `.1`. Busy lock:
-   * skip (the holder rotates; this line lands in whichever file the name holds next).
+   * skip (the holder rotates; this line lands in whichever file the name holds next). The inode is
+   * compared exactly (BigInt), and the name must still hold at least the bytes seen: a reused or
+   * colliding file id on a smaller, newer file never renames it over `.1`. Windows: a rename (or
+   * lstat) refused because another process holds the file skips this rotation; the file stays
+   * oversized until a later rotation succeeds.
    */
-  const rotate = (file: string, seen: fs.Stats): void => {
+  const rotate = (file: string, seen: fs.BigIntStats): void => {
     const lock = path.join(path.dirname(file), LOCK_EVENTS_ROTATE_LOCK);
     const held = takeRotateLock(lock);
     if (held === undefined) return;
     try {
-      let current: fs.Stats;
-      try { current = fs.lstatSync(file); }
-      catch (error) { if (errorCodeOf(error) === "ENOENT") return; throw error; }
-      if (current.dev === seen.dev && current.ino === seen.ino) fs.renameSync(file, `${file}.1`);
+      let current: fs.BigIntStats;
+      try { current = fs.lstatSync(file, { bigint: true }); }
+      catch (error) { if (errorCodeOf(error) === "ENOENT" || transient(error)) return; throw error; }
+      if (current.dev !== seen.dev || current.ino !== seen.ino || current.size < seen.size) return;
+      try { fs.renameSync(file, `${file}.1`); }
+      catch (error) { if (!transient(error)) throw error; }
     } finally {
       try { fs.closeSync(held); } catch { /* Closed either way. */ }
       try { fs.unlinkSync(lock); } catch { /* A stale-lock breaker may have removed it. */ }
@@ -631,7 +666,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const appendOnce = (file: string, data: Buffer): void => {
     let { descriptor, stat } = open(file);
     try {
-      if (stat.size > 0 && stat.size + data.length > rotateBytes) {
+      if (stat.size > 0n && stat.size + BigInt(data.length) > BigInt(rotateBytes)) {
         // Closed first, so the rename also works on Windows.
         fs.closeSync(descriptor);
         descriptor = -1;

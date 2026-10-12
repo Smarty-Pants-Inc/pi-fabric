@@ -15,27 +15,43 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
  * At every crash point exactly one registry row, or the intent snapshot, names the actor.
  */
 export type ActorAdoptionPhase = "prepared" | "copied" | "removed" | "added";
+export type ActorAdoptionScope = "project" | "session";
 
+/**
+ * The intent names roots only by id and scope. Recovery never takes a filesystem path from
+ * the intent file: both actor roots come from the resolver, which derives them from the
+ * config-verified resident configurations (this host's own root and the dead root's).
+ */
 export interface ActorAdoptionIntent {
   format: 1;
   actorId: string;
   fromRootId: string;
   intoRootId: string;
-  sourceActorRoot: string;
-  targetActorRoot: string;
+  scope: ActorAdoptionScope;
   /** The adopted row (rootId = intoRootId), committed to the target registry. */
   row: Record<string, unknown> & { id: string };
   phase: ActorAdoptionPhase;
   createdAt: number;
 }
 
+export interface ActorAdoptionRoots { sourceActorRoot: string; targetActorRoot: string }
+
+/** Configured actor roots per scope for a (dead root, live root) pair; throws when either root is not config-verified. */
+export type ActorAdoptionRootResolver = (fromRootId: string, intoRootId: string) => Record<ActorAdoptionScope, ActorAdoptionRoots>;
+
+/** A tampered, foreign or unverifiable adoption intent: refused before any registry or filesystem operation. */
+export class ActorAdoptionIntentError extends Error {
+  override readonly name = "ActorAdoptionIntentError";
+}
+
 export interface ActorAdoptionMove {
   actorId: string;
   fromRootId: string;
   intoRootId: string;
-  sourceActorRoot: string;
-  targetActorRoot: string;
+  scope: ActorAdoptionScope;
   intentFile: string;
+  /** The config-verified roots; the move and any recovery use only these. */
+  resolveRoots: ActorAdoptionRootResolver;
   /** Re-run under the registry fences immediately before the commit; throw to refuse. */
   check?: (row: Record<string, unknown> & { id: string }) => void;
   /** Test hook: throwing here simulates a crash right after the named phase. */
@@ -48,6 +64,25 @@ export const actorAdoptionIntentPath = (residencyRoot: string, actorId: string):
   path.join(residencyRoot, "adoptions", `${actorId}.json`);
 
 const ACTOR_ID = /^[a-f0-9]{32}$/;
+const SCOPES: readonly ActorAdoptionScope[] = ["project", "session"];
+
+/** Resolve, then realpath the deepest existing ancestor (an actor root may not exist yet). */
+export const canonicalActorRoot = (root: string): string => {
+  const resolved = path.resolve(root);
+  const rest: string[] = [];
+  let existing = resolved;
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(existing), ...rest.reverse()); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      const parent = path.dirname(existing);
+      if (parent === existing) return resolved;
+      rest.push(path.basename(existing));
+      existing = parent;
+    }
+  }
+};
 
 export const adoptedActorRow = (row: Record<string, unknown> & { id: string }, fromRootId: string,
   intoRootId: string, now = Date.now()): Record<string, unknown> & { id: string } => {
@@ -64,21 +99,66 @@ const writeIntent = (file: string, intent: ActorAdoptionIntent): void => {
   writeJsonAtomic(file, intent, { space: 2, durable: true });
 };
 
-const readIntent = (file: string): ActorAdoptionIntent | undefined => {
-  let parsed: ActorAdoptionIntent;
-  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")) as ActorAdoptionIntent; }
+const assertIntentFile = (file: string, actorId: unknown): void => {
+  if (typeof actorId !== "string" || !ACTOR_ID.test(actorId)) {
+    throw new ActorAdoptionIntentError(`Invalid actor id in adoption intent ${file}`);
+  }
+  if (path.basename(file) !== `${actorId}.json`) {
+    throw new ActorAdoptionIntentError(`Adoption intent ${file} does not match its adoption id ${actorId}`);
+  }
+};
+
+const verifiedRoots = (file: string, resolveRoots: ActorAdoptionRootResolver, fromRootId: string, intoRootId: string) => {
+  let roots: Record<ActorAdoptionScope, ActorAdoptionRoots>;
+  try { roots = resolveRoots(fromRootId, intoRootId); }
+  catch (error) {
+    if (error instanceof ActorAdoptionIntentError) throw error;
+    throw new ActorAdoptionIntentError(`Adoption intent ${file} names roots that are not config-verified: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return roots;
+};
+
+/** A recorded legacy path equals the configured root exactly (as recorded: resolved, or its realpath). */
+const legacyMatches = (recorded: unknown, configured: string): boolean =>
+  typeof recorded === "string" && (recorded === path.resolve(configured) || recorded === canonicalActorRoot(configured));
+
+interface VerifiedIntent { intent: ActorAdoptionIntent; roots: ActorAdoptionRoots }
+
+/** Every check runs before any registry or filesystem operation; any mismatch fails closed. */
+const readIntent = (file: string, resolveRoots: ActorAdoptionRootResolver): VerifiedIntent | undefined => {
+  let parsed: ActorAdoptionIntent & { sourceActorRoot?: unknown; targetActorRoot?: unknown; scope?: unknown };
+  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")) as typeof parsed; }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new Error(`Unreadable actor adoption intent ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new ActorAdoptionIntentError(`Unreadable actor adoption intent ${file}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (parsed?.format !== 1 || typeof parsed.actorId !== "string" || !ACTOR_ID.test(parsed.actorId) ||
-      typeof parsed.fromRootId !== "string" || typeof parsed.intoRootId !== "string" ||
-      typeof parsed.sourceActorRoot !== "string" || typeof parsed.targetActorRoot !== "string" ||
+  if (typeof parsed !== "object" || parsed === null) throw new ActorAdoptionIntentError(`Invalid actor adoption intent ${file}`);
+  assertIntentFile(file, parsed.actorId);
+  if (parsed.format !== 1 || typeof parsed.fromRootId !== "string" || !parsed.fromRootId ||
+      typeof parsed.intoRootId !== "string" || !parsed.intoRootId || parsed.fromRootId === parsed.intoRootId ||
       typeof parsed.row !== "object" || parsed.row === null || parsed.row.id !== parsed.actorId ||
       parsed.row.rootId !== parsed.intoRootId) {
-    throw new Error(`Invalid actor adoption intent ${file}`);
+    throw new ActorAdoptionIntentError(`Invalid actor adoption intent ${file}`);
   }
-  return parsed;
+  const roots = verifiedRoots(file, resolveRoots, parsed.fromRootId, parsed.intoRootId);
+  const legacy = parsed.sourceActorRoot !== undefined || parsed.targetActorRoot !== undefined;
+  const matches = (scope: ActorAdoptionScope) => legacyMatches(parsed.sourceActorRoot, roots[scope].sourceActorRoot) &&
+    legacyMatches(parsed.targetActorRoot, roots[scope].targetActorRoot);
+  let scope: ActorAdoptionScope | undefined;
+  if (parsed.scope !== undefined) {
+    if (!SCOPES.includes(parsed.scope as ActorAdoptionScope)) throw new ActorAdoptionIntentError(`Invalid adoption scope in ${file}`);
+    scope = parsed.scope as ActorAdoptionScope;
+    if (legacy && !matches(scope)) throw new ActorAdoptionIntentError(`Adoption intent ${file} names actor roots other than the configured ones`);
+  } else {
+    // A pre-fix intent recorded paths: accepted only when they are exactly the configured roots.
+    if (!legacy) throw new ActorAdoptionIntentError(`Adoption intent ${file} names no scope`);
+    scope = SCOPES.find(matches);
+    if (!scope) throw new ActorAdoptionIntentError(`Adoption intent ${file} names actor roots other than the configured ones`);
+  }
+  const { sourceActorRoot: _source, targetActorRoot: _target, ...rest } = parsed;
+  return { intent: { ...rest, scope }, roots: {
+    sourceActorRoot: canonicalActorRoot(roots[scope].sourceActorRoot),
+    targetActorRoot: canonicalActorRoot(roots[scope].targetActorRoot) } };
 };
 
 const copyActorDirectory = (source: string, target: string): void => {
@@ -96,15 +176,15 @@ const removeStaging = (target: string): void => {
 };
 
 /** Call with both registry fences held. */
-const recoverLocked = (intentFile: string, intent: ActorAdoptionIntent, source: ActorRegistryStore,
+const recoverLocked = (intentFile: string, intent: ActorAdoptionIntent, roots: ActorAdoptionRoots, source: ActorRegistryStore,
   target: ActorRegistryStore): ActorAdoptionRecovery => {
   const id = intent.actorId;
-  const shared = samePath(intent.sourceActorRoot, intent.targetActorRoot);
+  const shared = samePath(roots.sourceActorRoot, roots.targetActorRoot);
   const sourceRows = source.records();
   const targetRows = shared ? sourceRows : target.records();
   const sourceRow = sourceRows.find((row) => row.id === id);
   const targetRow = targetRows.find((row) => row.id === id);
-  const targetDir = path.join(intent.targetActorRoot, id), sourceDir = path.join(intent.sourceActorRoot, id);
+  const targetDir = path.join(roots.targetActorRoot, id), sourceDir = path.join(roots.sourceActorRoot, id);
   let outcome: ActorAdoptionRecovery;
   if (targetRow?.rootId === intent.intoRootId) {
     // Committed. A source duplicate of the dead lineage must never run again.
@@ -128,25 +208,31 @@ const recoverLocked = (intentFile: string, intent: ActorAdoptionIntent, source: 
   return outcome;
 };
 
-const stores = (intent: Pick<ActorAdoptionIntent, "sourceActorRoot" | "targetActorRoot">) => {
-  const source = new ActorRegistryStore(intent.sourceActorRoot);
-  const target = samePath(intent.sourceActorRoot, intent.targetActorRoot) ? source : new ActorRegistryStore(intent.targetActorRoot);
+const stores = (roots: ActorAdoptionRoots) => {
+  const source = new ActorRegistryStore(roots.sourceActorRoot);
+  const target = samePath(roots.sourceActorRoot, roots.targetActorRoot) ? source : new ActorRegistryStore(roots.targetActorRoot);
   return { source, target };
 };
 
 /** Finish or undo an interrupted move. Safe to run any number of times. */
-export const recoverActorAdoption = async (intentFile: string): Promise<ActorAdoptionRecovery> => {
-  const pending = readIntent(intentFile);
+export const recoverActorAdoption = async (intentFile: string, resolveRoots: ActorAdoptionRootResolver): Promise<ActorAdoptionRecovery> => {
+  const pending = readIntent(intentFile, resolveRoots);
   if (!pending) return "none";
-  const { source, target } = stores(pending);
+  const { source, target } = stores(pending.roots);
   return ActorRegistryStore.withLocks([source, target], () => {
-    const intent = readIntent(intentFile);
-    return intent ? recoverLocked(intentFile, intent, source, target) : "none";
+    const current = readIntent(intentFile, resolveRoots);
+    if (!current) return "none";
+    if (!samePath(current.roots.sourceActorRoot, pending.roots.sourceActorRoot) ||
+        !samePath(current.roots.targetActorRoot, pending.roots.targetActorRoot)) {
+      throw new ActorAdoptionIntentError(`Adoption intent ${intentFile} changed its roots under the registry fences`);
+    }
+    return recoverLocked(intentFile, current.intent, current.roots, source, target);
   });
 };
 
 /** Recover every intent under a residency root's adoptions directory. */
-export const recoverActorAdoptions = async (residencyRoot: string): Promise<Record<string, ActorAdoptionRecovery>> => {
+export const recoverActorAdoptions = async (residencyRoot: string,
+  resolveRoots: ActorAdoptionRootResolver): Promise<Record<string, ActorAdoptionRecovery>> => {
   const directory = path.join(residencyRoot, "adoptions");
   let names: string[] = [];
   try { names = fs.readdirSync(directory); } catch (error) {
@@ -155,7 +241,7 @@ export const recoverActorAdoptions = async (residencyRoot: string): Promise<Reco
   }
   const results: Record<string, ActorAdoptionRecovery> = {};
   for (const name of names.filter((entry) => /^[a-f0-9]{32}\.json$/.test(entry)).sort()) {
-    results[name.slice(0, -5)] = await recoverActorAdoption(path.join(directory, name));
+    results[name.slice(0, -5)] = await recoverActorAdoption(path.join(directory, name), resolveRoots);
   }
   return results;
 };
@@ -164,8 +250,13 @@ export const recoverActorAdoptions = async (residencyRoot: string): Promise<Reco
 export const moveActorCustody = async (move: ActorAdoptionMove): Promise<Record<string, unknown> & { id: string }> => {
   if (!ACTOR_ID.test(move.actorId)) throw new Error(`Invalid Fabric actor id: ${move.actorId}`);
   if (move.fromRootId === move.intoRootId) throw new Error("An actor cannot be adopted into its own root");
-  await recoverActorAdoption(move.intentFile);
-  const { source, target } = stores(move);
+  if (!SCOPES.includes(move.scope)) throw new Error(`Invalid adoption scope: ${String(move.scope)}`);
+  assertIntentFile(move.intentFile, move.actorId);
+  await recoverActorAdoption(move.intentFile, move.resolveRoots);
+  const configured = verifiedRoots(move.intentFile, move.resolveRoots, move.fromRootId, move.intoRootId)[move.scope];
+  const roots: ActorAdoptionRoots = { sourceActorRoot: canonicalActorRoot(configured.sourceActorRoot),
+    targetActorRoot: canonicalActorRoot(configured.targetActorRoot) };
+  const { source, target } = stores(roots);
   const shared = source === target;
   return ActorRegistryStore.withLocks([source, target], () => {
     const id = move.actorId;
@@ -178,15 +269,15 @@ export const moveActorCustody = async (move: ActorAdoptionMove): Promise<Record<
     if (row.residency !== "durable") throw new Error(`Fabric actor ${id} is not durable`);
     if (row.removal !== undefined) throw new Error(`Fabric actor ${id} has a pending removal`);
     const targetRows = shared ? sourceRows : target.records();
-    const targetDir = path.join(move.targetActorRoot, id), sourceDir = path.join(move.sourceActorRoot, id);
+    const targetDir = path.join(roots.targetActorRoot, id), sourceDir = path.join(roots.sourceActorRoot, id);
     if (!shared && (targetRows.some((candidate) => candidate.id === id) || fs.existsSync(targetDir))) {
       throw new Error(`The live root's registry already holds Fabric actor ${id}`);
     }
     move.check?.(row);
     const adopted = adoptedActorRow(row, move.fromRootId, move.intoRootId);
+    // Root ids and scope only: never a path a later recovery could be steered by.
     const intent: ActorAdoptionIntent = { format: 1, actorId: id, fromRootId: move.fromRootId,
-      intoRootId: move.intoRootId, sourceActorRoot: path.resolve(move.sourceActorRoot),
-      targetActorRoot: path.resolve(move.targetActorRoot), row: adopted, phase: "prepared", createdAt: Date.now() };
+      intoRootId: move.intoRootId, scope: move.scope, row: adopted, phase: "prepared", createdAt: Date.now() };
     writeIntent(move.intentFile, intent);
     move.fault?.("prepared");
     if (!shared) {

@@ -19,7 +19,8 @@ interface ResidentHostLaunchContext {
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
-import { actorAdoptionIntentPath, moveActorCustody, recoverActorAdoptions, type ActorAdoptionPhase } from "./actor-adoption.js";
+import { actorAdoptionIntentPath, ActorAdoptionIntentError, moveActorCustody, recoverActorAdoptions, type ActorAdoptionPhase,
+  type ActorAdoptionRootResolver } from "./actor-adoption.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -696,7 +697,7 @@ export class ResidentHost {
       // terminal retention after readiness. Failed sinks retain their sources.
       // smarty-dev#5919: finish or undo an interrupted adoption before the registries load,
       // so a committed move loads as this root's own lineage. Failure keeps the intent.
-      try { await recoverActorAdoptions(this.config.residencyRoot); }
+      try { await recoverActorAdoptions(this.config.residencyRoot, this.#adoptionRoots); }
       catch (error) { console.warn(`[pi-fabric] actor adoption recovery: ${errorMessage(error)}`); }
       this.#initialize();
       fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
@@ -1748,8 +1749,9 @@ export class ResidentHost {
         const evidence = readResidentOperatorEvidence(this.config, this.mesh);
         assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
         // A retry after an interrupted adoption finds the actor already released here.
+        // A partly released actor resumes every incomplete step; only a complete release returns early.
         const releasedBefore = this.actors.list().filter(actor => actor.residency === "durable" &&
-          (actor.id === command.id || actor.name === command.id) && this.actors.releasedForAdoption(actor.id));
+          (actor.id === command.id || actor.name === command.id) && this.actors.releasingForAdoption(actor.id));
         const actor = releasedBefore.length === 1 && !this.actors.listOwned().some(owned => owned.id === releasedBefore[0]!.id)
           ? releasedBefore[0]! : this.#operatorActorTarget(command.id);
         if (command.dryRun === true || this.actors.releasedForAdoption(actor.id)) {
@@ -1842,6 +1844,31 @@ export class ResidentHost {
     return candidates[0]!;
   }
 
+  /** smarty-dev#5919: the dead root's resident configuration, only when it names that root in this mesh. */
+  #adoptionSourceConfig(fromRootId: string): ResidentHostConfig | undefined {
+    const config = readJson<ResidentHostConfig>(path.join(residentRoot(this.config.meshRoot, fromRootId), "config.json"));
+    return config && config.rootId === fromRootId && typeof config.meshRoot === "string" &&
+      path.resolve(config.meshRoot) === path.resolve(this.config.meshRoot) && typeof config.actorRoot === "string" &&
+      (config.sessionActorRoot === undefined || typeof config.sessionActorRoot === "string") ? config : undefined;
+  }
+
+  /**
+   * smarty-dev#5919: the only source of adoption actor roots. The target is this host's own
+   * configured root; the source is the dead root's verified configuration. An intent's
+   * recorded paths are never used.
+   */
+  readonly #adoptionRoots: ActorAdoptionRootResolver = (fromRootId, intoRootId) => {
+    if (intoRootId !== this.config.rootId) {
+      throw new ActorAdoptionIntentError(`Adoption intent targets root ${intoRootId}, not this root ${this.config.rootId}`);
+    }
+    if (fromRootId === intoRootId) throw new ActorAdoptionIntentError("An actor cannot be adopted into its own root");
+    const deadConfig = this.#adoptionSourceConfig(fromRootId);
+    if (!deadConfig) throw new ActorAdoptionIntentError(`No verified resident configuration for dead root ${fromRootId} in this mesh`);
+    const dead = residentActorRoots(deadConfig), live = residentActorRoots(this.config);
+    return { project: { sourceActorRoot: dead.project, targetActorRoot: live.project },
+      session: { sourceActorRoot: dead.session, targetActorRoot: live.session } };
+  };
+
   /** smarty-dev#5919: an adoption target must be a live Main's root: a live lease and root participant. */
   #assertAdoptionTarget(): void {
     const own = readResidentOperatorEvidence(this.config, this.mesh);
@@ -1887,7 +1914,7 @@ export class ResidentHost {
     }
     if (command.fromRootId === this.config.rootId) throw new Error("An actor cannot be adopted into its own root");
     // An interrupted earlier move finishes (or rolls back) before any new decision.
-    const recovered = await recoverActorAdoptions(this.config.residencyRoot);
+    const recovered = await recoverActorAdoptions(this.config.residencyRoot, this.#adoptionRoots);
     const liveRoots = residentActorRoots(this.config);
     // A move an earlier attempt committed (or this recovery rolled forward) is loaded now;
     // a retry of that same adoption then reports it instead of failing on the moved row.
@@ -1909,11 +1936,8 @@ export class ResidentHost {
     }
     this.#assertAdoptionTarget();
     const deadConfigPath = path.join(residentRoot(this.config.meshRoot, command.fromRootId), "config.json");
-    const deadConfig = readJson<ResidentHostConfig>(deadConfigPath);
-    if (!deadConfig || deadConfig.rootId !== command.fromRootId || typeof deadConfig.meshRoot !== "string" ||
-        path.resolve(deadConfig.meshRoot) !== path.resolve(this.config.meshRoot) || typeof deadConfig.actorRoot !== "string") {
-      throw new Error(`No resident configuration for dead root ${command.fromRootId} in this mesh`);
-    }
+    const deadConfig = this.#adoptionSourceConfig(command.fromRootId);
+    if (!deadConfig) throw new Error(`No resident configuration for dead root ${command.fromRootId} in this mesh`);
     const evidence = readResidentOperatorEvidence(deadConfig, this.mesh);
     assertResidentOperatorConfirmed(evidence, command.confirmDeadRoot, command.dryRun === true);
     const deadRoots = residentActorRoots(deadConfig);
@@ -1939,7 +1963,8 @@ export class ResidentHost {
       return { format: RESIDENT_HOST_FORMAT, requestId, ok: true, operatorEvidence: evidence,
         adoption: { ...adoption, ...(publishedBy ? { publishedBy } : {}) }, completedAt: Date.now() };
     }
-    await moveActorCustody({ ...adoption, intentFile: actorAdoptionIntentPath(this.config.residencyRoot, row.id),
+    await moveActorCustody({ actorId: row.id, fromRootId: command.fromRootId, intoRootId: this.config.rootId, scope,
+      intentFile: actorAdoptionIntentPath(this.config.residencyRoot, row.id), resolveRoots: this.#adoptionRoots,
       check: (fencedRow) => {
         this.#assertAdoptionTarget();
         assertResidentOperatorConfirmed(readResidentOperatorEvidence(deadConfig, this.mesh), command.confirmDeadRoot);

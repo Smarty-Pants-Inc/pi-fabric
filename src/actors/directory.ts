@@ -138,6 +138,7 @@ export class ActorDirectory extends ActorManager {
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
   override releaseForAdoption(...args: Parameters<ActorManager["releaseForAdoption"]>): ReturnType<ActorManager["releaseForAdoption"]> { return this.#isPrimary(args[0]) ? super.releaseForAdoption(...args) : this.#secondary.releaseForAdoption(...args); }
   override releasedForAdoption(id: string): boolean { return super.releasedForAdoption(id) || this.#secondary.releasedForAdoption(id); }
+  override releasingForAdoption(id: string): boolean { return super.releasingForAdoption(id) || this.#secondary.releasingForAdoption(id); }
   /** The adopted row's scope selects the registry that now names this root. */
   override acceptAdoption(id: string, scope: FabricActorStorageScope = this.#defaultScope): FabricActorInfo {
     return scope === this.#defaultScope ? super.acceptAdoption(id) : this.#secondary.acceptAdoption(id);

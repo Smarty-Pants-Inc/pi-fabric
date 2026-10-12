@@ -579,6 +579,10 @@ const preparationTimedOut = (error: unknown): boolean => {
   return false;
 };
 
+/** smarty-dev#5919: the steps of a release for adoption, tracked so a retry resumes every incomplete one. */
+export type AdoptionReleaseStep = "ceded" | "stopped" | "queueSaved" | "historySaved" | "presenceWithdrawn";
+const ADOPTION_RELEASE_STEPS: readonly AdoptionReleaseStep[] = ["ceded", "stopped", "queueSaved", "historySaved", "presenceWithdrawn"];
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
@@ -668,6 +672,8 @@ export class ActorManager {
     | undefined;
   readonly #locallyCreated = new Set<string>();
   readonly #ceded = new Set<string>();
+  /** smarty-dev#5919: the completed steps of each release for adoption (a retry resumes the rest). */
+  readonly #adoptionRelease = new Map<string, Set<AdoptionReleaseStep>>();
   // smarty-dev#5919: presence this host withdraws once, after releasing an actor for adoption.
   readonly #withdrawnPresence = new Set<string>();
   readonly #ownership = new Map<string, boolean>();
@@ -1295,43 +1301,75 @@ export class ActorManager {
    * adopter takes over through adoptedFrom), and this host withdraws its presence once and
    * never republishes it. The registry row is not edited here: the adopter moves custody.
    */
-  async releaseForAdoption(id: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
-    const actor = this.#requireOwnedActor(id);
+  async releaseForAdoption(id: string, beforeCommit?: (id: string) => void,
+    options: { fault?: (step: AdoptionReleaseStep) => void } = {}): Promise<FabricActorInfo> {
+    // A release that a failed step interrupted is resumed, not restarted: the actor is
+    // already ceded (so no longer owned), and every incomplete step runs again.
+    const progress = this.#releasing(id) ? this.#adoptionRelease.get(id) : undefined;
+    const actor = progress ? this.#requireActor(id) : this.#requireOwnedActor(id);
     if (actor.residency !== "durable") throw new Error(`Fabric actor ${actor.id} is not durable`);
     beforeCommit?.(actor.id);
-    this.#ceded.add(actor.id);
-    this.#ownership.set(actor.id, false);
-    const running = this.#runningActor(actor.id);
-    for (const target of new Set([actor, ...(running ? [running] : [])])) {
-      this.#markOwnershipAbort(target);
-      target.abortController?.abort();
-    }
-    if (running?.inFlightRun) await this.agents.stop(running.inFlightRun.id).catch(() => undefined);
-    await running?.drain?.catch(() => undefined);
-    this.#park(actor, this.#takeQueued(actor), `Fabric actor ${actor.name} (${actor.id}) was released for adoption by another root`);
-    if (!this.#persistQueue(actor.id, true) && this.#persistent) {
-      throw new Error(`Fabric actor ${actor.id} queue could not be saved for adoption`);
-    }
-    if (actor.status !== "stopped") actor.status = "idle";
-    actor.updatedAt = Date.now();
+    const done = progress ?? new Set<AdoptionReleaseStep>();
+    const step = async (name: AdoptionReleaseStep, run: () => unknown): Promise<void> => {
+      if (done.has(name)) return;
+      options.fault?.(name);
+      await run();
+      done.add(name);
+    };
+    await step("ceded", () => {
+      this.#ceded.add(actor.id);
+      this.#ownership.set(actor.id, false);
+      this.#adoptionRelease.set(actor.id, done);
+    });
+    await step("stopped", async () => {
+      const running = this.#runningActor(actor.id);
+      for (const target of new Set([actor, ...(running ? [running] : [])])) {
+        this.#markOwnershipAbort(target);
+        target.abortController?.abort();
+      }
+      if (running?.inFlightRun) await this.agents.stop(running.inFlightRun.id).catch(() => undefined);
+      await running?.drain?.catch(() => undefined);
+    });
+    await step("queueSaved", () => {
+      this.#park(actor, this.#takeQueued(actor), `Fabric actor ${actor.name} (${actor.id}) was released for adoption by another root`);
+      if (!this.#persistQueue(actor.id, true) && this.#persistent) {
+        throw new Error(`Fabric actor ${actor.id} queue could not be saved for adoption`);
+      }
+      if (actor.status !== "stopped") actor.status = "idle";
+      actor.updatedAt = Date.now();
+    });
     // The adopter moves the committed row: flush this lineage's final history first.
-    const live = this.#actors.get(actor.id) ?? actor;
-    await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live, releasing: live });
-    this.#withdrawnPresence.add(actor.id);
-    if (this.#presencePublisher) {
-      await this.#presencePublisher.refresh();
-      if (this.#withdrawnPresence.has(actor.id)) throw new Error(`Fabric actor ${actor.id} presence withdrawal is pending; retry`);
-    } else {
-      await this.mesh.delete({ key: this.#presenceKey(actor.id) });
-      this.#withdrawnPresence.delete(actor.id);
-    }
+    await step("historySaved", async () => {
+      const live = this.#actors.get(actor.id) ?? actor;
+      await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live, releasing: live });
+    });
+    await step("presenceWithdrawn", async () => {
+      this.#withdrawnPresence.add(actor.id);
+      if (this.#presencePublisher) {
+        await this.#presencePublisher.refresh();
+        if (this.#withdrawnPresence.has(actor.id)) throw new Error(`Fabric actor ${actor.id} presence withdrawal is pending; retry`);
+      } else {
+        await this.mesh.delete({ key: this.#presenceKey(actor.id) });
+        this.#withdrawnPresence.delete(actor.id);
+      }
+    });
     this.#emitChange();
     return this.#publicInfo(actor);
   }
 
-  /** smarty-dev#5919: this process released the actor for adoption (a retry is idempotent). */
+  /** smarty-dev#5919: this process completed every release step for adoption (a retry is idempotent). */
   releasedForAdoption(id: string): boolean {
-    return this.#ceded.has(id) && this.#actors.has(id);
+    const done = this.#adoptionRelease.get(id);
+    return this.#releasing(id) && done !== undefined && ADOPTION_RELEASE_STEPS.every(step => done.has(step));
+  }
+
+  /** smarty-dev#5919: a release for adoption started here (possibly incomplete; a retry resumes it). */
+  releasingForAdoption(id: string): boolean {
+    return this.#releasing(id);
+  }
+
+  #releasing(id: string): boolean {
+    return this.#ceded.has(id) && this.#actors.has(id) && this.#adoptionRelease.has(id);
   }
 
   /**
@@ -1344,6 +1382,7 @@ export class ActorManager {
     if (!record || record.rootId !== this.#rootId) throw new Error(`Fabric actor ${id} is not adopted by this root`);
     this.#displacedLineages.delete(id);
     this.#ceded.delete(id);
+    this.#adoptionRelease.delete(id);
     const stale = this.#actors.get(id);
     if (stale) {
       this.#markOwnershipAbort(stale);

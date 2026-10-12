@@ -11,7 +11,9 @@ import { writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { actorAdoptionIntentPath, moveActorCustody, recoverActorAdoption, type ActorAdoptionPhase } from "../src/residency/actor-adoption.js";
+import { actorAdoptionIntentPath, ActorAdoptionIntentError, moveActorCustody, recoverActorAdoption, recoverActorAdoptions,
+  type ActorAdoptionPhase } from "../src/residency/actor-adoption.js";
+import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { projectOf } from "../src/topology/project-identity.js";
 
@@ -235,6 +237,40 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
     } finally { await f.close(); }
   }, 60_000);
 
+  it.each(["stopped", "queueSaved", "historySaved", "presenceWithdrawn"] as const)(
+    "a release that fails at %s resumes every incomplete step on retry: nothing stays published, the queue is intact", async step => {
+      const f = await fixture();
+      try {
+        const actor = await f.create("resumed");
+        f.dead!.actors.tell(actor.id, "HANG while released");
+        await waitFor(() => f.dead!.actors.status(actor.id).status === "running");
+        f.dead!.actors.tell(actor.id, "queued while released");
+        await f.dead!.participants.refresh();
+        expect(f.live.participants.get(actor.id, Date.now(), { fresh: true })?.ownerHostId).toBe(f.dead!.hostId);
+        await expect(f.dead!.actors.releaseForAdoption(actor.id, undefined,
+          { fault: failed => { if (failed === step) throw new Error(`release fault at ${failed}`); } }))
+          .rejects.toThrow(`release fault at ${step}`);
+        expect(f.dead!.actors.releasingForAdoption(actor.id)).toBe(true);
+        expect(f.dead!.actors.releasedForAdoption(actor.id)).toBe(false);
+        // The retry through the dead root's channel resumes, never reports the partial release as done.
+        const retried = await new ResidentActorClient(f.meshRoot, f.deadConfig.rootId)
+          .releaseActor(actor.id, { confirmDeadRoot: f.deadConfig.rootId });
+        expect(retried).toMatchObject({ ok: true, actor: { id: actor.id } });
+        expect(f.dead!.actors.releasedForAdoption(actor.id)).toBe(true);
+        await f.dead!.participants.refresh();
+        expect(f.live.participants.get(actor.id, Date.now(), { fresh: true })?.ownerHostId).not.toBe(f.dead!.hostId);
+        const actorDir = path.join(f.deadConfig.actorRoot, actor.id);
+        const queued = fs.readdirSync(actorDir).filter(name => /^queue-.*\.json$/.test(name))
+          .map(name => fs.readFileSync(path.join(actorDir, name), "utf8")).join("\n");
+        expect(queued).toContain("HANG while released");
+        expect(queued).toContain("queued while released");
+        const adopted = await f.adopt(actor.id);
+        expect(adopted).toMatchObject({ code: 0, err: "" });
+        expect(f.live.actors.owns(actor.id)).toBe(true);
+        expect(f.dead!.actors.owns(actor.id)).toBe(false);
+      } finally { await f.close(); }
+    }, 60_000);
+
   it("a crash after a committed phase is recovered by the next adopt through the live host channel", async () => {
     const f = await fixture();
     try {
@@ -344,13 +380,22 @@ describe("two-phase actor custody move (smarty-dev#5919)", () => {
     fs.writeFileSync(path.join(source, id, "queue-cursor.json"), JSON.stringify({ format: 1, items: [{ id: "q1" }] }));
     store.write([row, other], { durable: true });
     const intentFile = path.join(root, "residency", "adoptions", `${id}.json`);
+    // The configured roots: the only roots a move or recovery may use.
+    const roots = (fromRootId: string, intoRootId: string) => {
+      if (fromRootId !== "session:dead" || intoRootId !== "session:live") {
+        throw new ActorAdoptionIntentError(`foreign roots ${fromRootId} -> ${intoRootId}`);
+      }
+      const pair = { sourceActorRoot: source, targetActorRoot: target };
+      return { project: pair, session: pair };
+    };
+    const recover = (file = intentFile) => recoverActorAdoption(file, roots);
     const move = (fault?: ActorAdoptionPhase) => moveActorCustody({ actorId: id, fromRootId: "session:dead", intoRootId: "session:live",
-      sourceActorRoot: source, targetActorRoot: target, intentFile,
+      scope: "project", resolveRoots: roots, intentFile,
       ...(fault ? { fault: (phase: ActorAdoptionPhase) => { if (phase === fault) throw new Error(`crash after ${phase}`); } } : {}) });
     /** Every registry row naming the actor: exactly one at every crash point (or the intent). */
     const named = () => [...new Set([source, target])].flatMap(dir => new ActorRegistryStore(dir).records()
       .filter(candidate => candidate.id === id).map(candidate => ({ dir, rootId: candidate.rootId, row: candidate })));
-    return { root, source, target, intentFile, move, named, store, close: () => fs.rmSync(root, { recursive: true, force: true }) };
+    return { root, source, target, intentFile, move, recover, roots, named, store, close: () => fs.rmSync(root, { recursive: true, force: true }) };
   };
 
   const committed = (s: ReturnType<typeof seed>) => {
@@ -384,8 +429,8 @@ describe("two-phase actor custody move (smarty-dev#5919)", () => {
       const during = s.named();
       expect(during.length).toBeLessThanOrEqual(1);
       if (during.length === 0) expect(JSON.parse(fs.readFileSync(s.intentFile, "utf8")).row).toMatchObject({ id, rootId: "session:live" });
-      expect(await recoverActorAdoption(s.intentFile)).toBe(outcome);
-      expect(await recoverActorAdoption(s.intentFile)).toBe("none");
+      expect(await s.recover()).toBe(outcome);
+      expect(await s.recover()).toBe("none");
       if (outcome === "rolledBack") {
         expect(s.named()).toMatchObject([{ dir: s.source, rootId: "session:dead" }]);
         expect(fs.existsSync(path.join(s.source, id, "session.jsonl"))).toBe(true);
@@ -394,6 +439,82 @@ describe("two-phase actor custody move (smarty-dev#5919)", () => {
         // The authorized retry then completes the move.
         await s.move();
       }
+      committed(s);
+    } finally { s.close(); }
+  });
+
+  /** Every path under the fixture root with its bytes: a refused recovery changes none of them. */
+  const tree = (root: string) => Object.fromEntries((fs.readdirSync(root, { recursive: true }) as string[]).sort().map(entry => {
+    const file = path.join(root, entry);
+    return [entry, fs.statSync(file).isFile() ? fs.readFileSync(file, "utf8") : "dir"];
+  }));
+  type Intent = Record<string, unknown> & { row: Record<string, unknown> };
+
+  it("writes an intent that names roots by id and scope only, never by path", async () => {
+    const s = seed(false);
+    try {
+      await expect(s.move("copied")).rejects.toThrow("crash after copied");
+      const intent = JSON.parse(fs.readFileSync(s.intentFile, "utf8")) as Intent;
+      expect(intent).toMatchObject({ actorId: id, fromRootId: "session:dead", intoRootId: "session:live", scope: "project" });
+      expect(Object.keys(intent)).not.toContain("sourceActorRoot");
+      expect(Object.keys(intent)).not.toContain("targetActorRoot");
+    } finally { s.close(); }
+  });
+
+  it.each([
+    ["a foreign target root", (intent: Intent) => ({ ...intent, intoRootId: "session:foreign", row: { ...intent.row, rootId: "session:foreign" } })],
+    ["a foreign source root", (intent: Intent) => ({ ...intent, fromRootId: "session:foreign" })],
+    ["a foreign legacy source path", (intent: Intent, s: ReturnType<typeof seed>) => {
+      const { scope: _scope, ...legacy } = intent;
+      return { ...legacy, sourceActorRoot: path.join(s.root, "foreign"), targetActorRoot: path.resolve(s.target) };
+    }],
+    ["a foreign path beside its scope", (intent: Intent, s: ReturnType<typeof seed>) =>
+      ({ ...intent, sourceActorRoot: path.resolve(s.source), targetActorRoot: path.join(s.root, "foreign") })],
+    ["no scope and no paths", (intent: Intent) => { const { scope: _scope, ...rest } = intent; return rest; }],
+    ["a bad actor id", (intent: Intent) => ({ ...intent, actorId: "../escape", row: { ...intent.row, id: "../escape" } })],
+    ["another actor id than its file name", (intent: Intent) => ({ ...intent, actorId: "e".repeat(32), row: { ...intent.row, id: "e".repeat(32) } })],
+  ] as const)("a tampered intent with %s is refused with no filesystem change", async (_label, tamper) => {
+    const s = seed(false);
+    try {
+      fs.mkdirSync(path.join(s.root, "foreign", id), { recursive: true });
+      fs.writeFileSync(path.join(s.root, "foreign", id, "keep.txt"), "foreign data");
+      await expect(s.move("copied")).rejects.toThrow("crash after copied");
+      const intent = JSON.parse(fs.readFileSync(s.intentFile, "utf8")) as Intent;
+      fs.writeFileSync(s.intentFile, JSON.stringify(tamper(intent, s)));
+      const before = tree(s.root);
+      await expect(s.recover()).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      await expect(recoverActorAdoptions(path.join(s.root, "residency"), s.roots)).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      await expect(s.move()).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      expect(tree(s.root)).toEqual(before);
+      expect(fs.readFileSync(path.join(s.root, "foreign", id, "keep.txt"), "utf8")).toBe("foreign data");
+    } finally { s.close(); }
+  });
+
+  it("an intent under a file name other than its adoption id is refused with no filesystem change", async () => {
+    const s = seed(false);
+    try {
+      await expect(s.move("copied")).rejects.toThrow("crash after copied");
+      const text = fs.readFileSync(s.intentFile, "utf8");
+      const renamed = path.join(path.dirname(s.intentFile), `${"0".repeat(32)}.json`);
+      const unnamed = path.join(path.dirname(s.intentFile), "not-an-adoption.json");
+      fs.writeFileSync(renamed, text);
+      fs.writeFileSync(unnamed, text);
+      const before = tree(s.root);
+      await expect(s.recover(renamed)).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      await expect(s.recover(unnamed)).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      // The mismatched name sorts first: the scan stops there, before touching the genuine intent.
+      await expect(recoverActorAdoptions(path.join(s.root, "residency"), s.roots)).rejects.toBeInstanceOf(ActorAdoptionIntentError);
+      expect(tree(s.root)).toEqual(before);
+    } finally { s.close(); }
+  });
+
+  it("a pre-fix intent whose recorded paths equal the configured roots still recovers", async () => {
+    const s = seed(false);
+    try {
+      await expect(s.move("removed")).rejects.toThrow("crash after removed");
+      const { scope: _scope, ...intent } = JSON.parse(fs.readFileSync(s.intentFile, "utf8")) as Intent;
+      fs.writeFileSync(s.intentFile, JSON.stringify({ ...intent, sourceActorRoot: path.resolve(s.source), targetActorRoot: path.resolve(s.target) }));
+      expect(await s.recover()).toBe("rolledForward");
       committed(s);
     } finally { s.close(); }
   });

@@ -94,7 +94,7 @@ const RESPONSES = new Set(["openai-responses", "azure-openai-responses", "openai
 const opaqueKey = (item: unknown): string | undefined => {
   const r = item as Record<string, unknown> | null;
   return r && typeof r === "object" && !Array.isArray(r) && r.type === "reasoning" &&
-    typeof r.encrypted_content === "string" ? JSON.stringify([r.id ?? null, r.encrypted_content]) : undefined;
+    typeof r.id === "string" && typeof r.encrypted_content === "string" ? JSON.stringify([r.id, r.encrypted_content]) : undefined;
 };
 
 // ponytail: Pi catches extension exceptions and continues with the old context.

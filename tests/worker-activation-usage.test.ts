@@ -212,6 +212,35 @@ describe("activation window provider-usage anchor (smarty-dev#10560)", () => {
     }
   }, GUARD_MS);
 
+  it("R4: exempts opaque reasoning only under a string id; missing, null or non-string ids count in full", () => {
+    // Decision C: a hook probe, NOT E2E. Planned pinned-CLI full-worker test: tests/worker-activation-window.test.ts
+    // "native activation window" > "R4 counts non-string-id opaque reasoning in full" with
+    // PI_FABRIC_ACTIVATION_TEST_PI_BINARY and AgentManager.run({inferenceContext: "activation", transport: "process"})
+    // against a responses server whose turn-1 reasoning item has a missing/null/number/object/boolean id and
+    // 40,000 ciphertext chars (8k window): pass = CONTEXT_OVERFLOW with a refusal frame, no oversized turn-2
+    // body served; the string-id control completes with its replay served byte-exact (as in this suite).
+    const as = (id: unknown) => { const { id: _, ...rest } = R; return id === undefined ? rest : { ...rest, id }; };
+    const wide = { contextWindow: 16_000 }; // same model key: admits the unanchored ~10-11.4k full estimate
+    for (const id of [undefined, null, 7, { id: "rs_1" }, true]) {
+      const item = as(id);
+      // Report output: trustworthy same-model report whose response inventory names this item.
+      const out = run([{ op: "dispatch", payload: small() }, report(3_000, { content: [sig(item)] }),
+        { op: "dispatch", payload: { model: "m", input: [U, item] } }]);
+      refuses(out, 1);
+      expect(out.refusal.tokens).toBeGreaterThan(W);
+      // Direct wire: the earlier admitted input inventory, then a trustworthy report with no output reasoning.
+      refuses(run([{ op: "dispatch", model: wide, payload: { model: "m", input: [U, item] } }, report(3_000, { content: [] }),
+        { op: "dispatch", payload: { model: "m", input: [U, item] } }]), 1);
+    }
+    // Exact alias: response/wire item with a missing id, then the awaited callback sets id null.
+    refuses(run([{ op: "dispatch", payload: small() }, report(3_000, { content: [sig(as(undefined))] }),
+      { op: "dispatch", payload: { model: "m", input: [U, as(undefined)] }, mutate: { at: 1, set: { id: null } } }]), 1);
+    refuses(run([{ op: "dispatch", model: wide, payload: { model: "m", input: [U, as(undefined)] } }, report(3_000, { content: [] }),
+      { op: "dispatch", payload: { model: "m", input: [U, as(undefined)] }, mutate: { at: 1, set: { id: null } } }]), 1);
+    // String-id direct-wire control through the same window change.
+    admits(run([{ op: "dispatch", model: wide, payload: base() }, report(3_000, { content: [] }), { op: "dispatch", payload: base() }]), 2);
+  }, GUARD_MS);
+
   it("admits fresh provider reasoning and its byte-exact replay on all three Responses APIs", () => {
     for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) {
       const r = run([{ op: "dispatch", model: { api }, payload: small() }, report(3_000, { model: { api }, content: [sig(R)] }),

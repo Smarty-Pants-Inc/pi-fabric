@@ -1,3 +1,4 @@
+import { appendDeliveryOutcome, deliverySend, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -94,6 +95,7 @@ export interface ActorMessageBindingOptions {
   binding?: FabricActorRunBinding;
   /** Host-only ASK policy: Main's program ceiling ends observation, not accepted activation. */
   detachOnMainCeiling?: boolean;
+  outcomeSend?: DeliverySend;
   /**
    * Host stamp of a remote sender (control command, mesh event); null marks
    * an unstamped message from an older build. Omitted: this process sent it.
@@ -102,6 +104,8 @@ export interface ActorMessageBindingOptions {
 }
 
 interface ActorQueueItem {
+  outcomeSend?: DeliverySend;
+  supersededSends?: DeliverySend[];
   provenance?: FabricTurnProvenance | undefined;
   id: string;
   source: string;
@@ -632,6 +636,7 @@ export class ActorManager {
   readonly #inFlight = new Map<string, ActorQueueItem>();
   readonly #deferredHandoffs = new Map<string, ActorQueueItem[]>();
   readonly #pendingHandoffConsumption = new Map<string, Set<string>>();
+  readonly #pendingDeliveryOutcomes = new Map<string, DeliveryOutcomeRecord[]>();
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
@@ -959,6 +964,7 @@ export class ActorManager {
         for (const actor of this.#actors.values()) {
           if (this.#canManageCached(actor.id)) this.#expireActivationFilter(actor);
         }
+        this.#confirmDeliveryOutcomes();
         this.#flushFilterState();
         // Preserve deferred events while halted; fencing remains manager-owned.
         if (!this.#halted) this.#reconcileChildCompletions();
@@ -3200,6 +3206,9 @@ export class ActorManager {
       if (existing) {
         const previous = options.checkpoint ? { ...existing } : undefined;
         try {
+          existing.supersededSends = [...(existing.supersededSends ?? []), ...(existing.outcomeSend ? [existing.outcomeSend] : [])];
+          if (options.outcomeSend) existing.outcomeSend = options.outcomeSend;
+          else delete existing.outcomeSend;
           existing.payload = structuredClone(payload);
           if (sender) existing.sender = sender;
           else delete existing.sender;
@@ -3224,8 +3233,13 @@ export class ActorManager {
           }
           throw error;
         }
-        const persisted = options.checkpoint ? true : this.#persistQueue(actor.id);
+        // The merged item, with its superseded sends, is durable before their outcomes are recorded.
+        let persisted = options.checkpoint ? true : this.#persistQueue(actor.id);
         options.onAccepted?.();
+        if (existing.supersededSends?.length) {
+          this.#recordSuperseded(actor.id, existing);
+          persisted = this.#persistQueue(actor.id) || persisted;
+        }
         this.#ensureDrain(actor);
         // Memory already runs the merged item; an unacknowledged replay coalesces again.
         if (options.requirePersisted && this.#persistent && !persisted) throw new ActorQueueCheckpointError(actor);
@@ -3241,6 +3255,7 @@ export class ActorManager {
     const itemId = options.id ?? randomUUID();
     const item: ActorQueueItem = {
       id: itemId,
+      ...(options.outcomeSend ? { outcomeSend: options.outcomeSend } : {}),
       ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
       payload: structuredClone(payload),
@@ -3274,7 +3289,13 @@ export class ActorManager {
         if (options.holdWhenFull) {
           throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
         }
-        this.#recordDropped(actor, item, `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`);
+        if (options.outcomeSend?.mode !== "publish" && options.outcomeSend) {
+          throw new Error(`Fabric actor queue limit reached for ${actor.name} (${this.meshConfig.actorQueueLimit} and overflow ${this.#overflowCap()})`);
+        }
+        const full = `its queue (${this.meshConfig.actorQueueLimit}) and overflow (${this.#overflowCap()}) are full`;
+        // An addressed mesh event dropped here never reached the actor: its sender gets a failed outcome.
+        if (options.outcomeSend) this.#recordDeliveryOutcome(actor.id, options.outcomeSend, "failed", `dropped: queue full; ${full}`);
+        this.#recordDropped(actor, item, full);
         return item;
       }
       overflow.push(item);
@@ -4662,6 +4683,7 @@ export class ActorManager {
             wakeCause: fabricWakeCause(event.from, "mesh", event.topic, event.id),
             message,
             delivery: kind,
+            outcomeSend: { eventId: event.id, to: target, from: event.from.id, mode: kind },
             ...(event.data === undefined ? {} : { data: event.data }),
           });
         } catch {
@@ -4682,7 +4704,8 @@ export class ActorManager {
     }
     try {
       const actor = this.#requireActor(target);
-      this.tell(actor.id, message, event.data, { provenance, sender: event.sender ?? null });
+      this.tell(actor.id, message, event.data, { provenance, sender: event.sender ?? null,
+        outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: kind } });
     } catch {
       /* target lives in another process or is unknown — best-effort drop */
     }
@@ -4791,15 +4814,21 @@ export class ActorManager {
 
   #meshEnqueueOptions(actor: ManagedActor, event: MeshEvent) {
     const key = actor.coalesceKey ? meshScalarValue(event.data, actor.coalesceKey) : undefined;
+    // Recomputed on a dead-letter replay too, so a replayed addressed event keeps its outcome.
+    const addressed = event.to === actor.id || event.to === actor.name;
     return {
       ...(event.verification === "mesh" || event.verification === "bridge"
         ? { provenance: fabricTurnProvenance(event.from, "actor", event.verification, event.principal) } : {}),
       ownershipChecked: true,
       requirePersisted: true,
+      ...(addressed ? { outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: "publish" as const } } : {}),
       // A durable host never holds the shared cursor for one actor's full queue: past it, work
       // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
-      // which has no such file, keeps fleet.* work in the mesh until there is room (#754).
-      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+      // which has no such file, keeps unaddressed fleet.* work in the mesh until there is room (#754).
+      // Only fleet.*: #554 round 2 P2, a sick actor's full queue must not pin the shared cursor for
+      // everyone. An addressed event past the queue and overflow, on any topic (fleet.* included,
+      // PR #551 review P1), is dropped with one failed delivery outcome instead.
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") && !addressed ? { holdWhenFull: true } : {}),
       // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
       // so a joined key could merge two topics' subjects. Keeps the value's type.
       ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),
@@ -6287,6 +6316,8 @@ export class ActorManager {
         try {
           return [JSON.parse(JSON.stringify({
             id: item.id, source: item.source, payload: item.payload, createdAt: item.createdAt,
+            ...(item.outcomeSend ? { outcomeSend: item.outcomeSend } : {}),
+            ...(item.supersededSends?.length ? { supersededSends: item.supersededSends } : {}),
             activation: item.activation, binding: item.binding, bindingMode: item.bindingMode, bindingVersion: 2,
             principalLineageVersion: 1,
             ...(item.provenance ? { provenance: item.provenance } : {}),
@@ -6310,8 +6341,10 @@ export class ActorManager {
       });
       // What validWhile reads, so it judges the items the same way after a restart.
       const cancelledPredecessors = [...(this.#cancelledPredecessors.get(actorId) ?? [])];
+      const pendingDeliveryOutcomes = this.#pendingDeliveryOutcomes.get(actorId) ?? [];
       snapshot = {
         format: 1, items: records, latestActivationSequence: actor.latestActivationSequence,
+        ...(pendingDeliveryOutcomes.length ? { pendingDeliveryOutcomes } : {}),
         ...(processedKeys.length ? { processedKeys } : {}),
         mainRevision: this.#mainRevision, taskRevision: this.#taskRevision,
         ...(settledWindows.length ? { settledWindows } : {}),
@@ -6320,7 +6353,8 @@ export class ActorManager {
       };
       // Keep the obligation-free soft empty fast path. Durable empty state and
       // cancellation/predecessor fences require a file + namespace receipt.
-      if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length) {
+      if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length &&
+          !pendingDeliveryOutcomes.length) {
         fs.rmSync(file, { force: true });
       } else writeJsonAtomic(file, snapshot, { durable });
     } catch (error) {
@@ -6391,7 +6425,57 @@ export class ActorManager {
     } finally { fs.closeSync(fd); }
   }
 
+  #confirmDeliveryOutcomes(): void {
+    for (const actorId of this.#pendingDeliveryOutcomes.keys()) this.#flushDeliveryOutcomes(actorId);
+    for (const [actorId, item] of this.#inFlight) {
+      if (!item.outcomeSend) continue;
+      const runId = this.#actors.get(actorId)?.inFlightRun?.id;
+      if (!runId) continue;
+      try {
+        const run = this.agents.status(runId);
+        if (!("toolCalls" in run)) continue; // A queued handle is not inference evidence.
+        if (!(run.inferenceStarted ?? (run.status === "completed" || run.toolCalls > 0))) continue;
+        this.#recordDeliveryOutcome(actorId, item.outcomeSend, "delivered", "consumed by actor inference as itself");
+        delete item.outcomeSend;
+        this.#persistQueue(actorId, true);
+      } catch { /* Preserve the original send and retry on the next owner poll. */ }
+    }
+  }
+
+  #recordDeliveryOutcome(actorId: string, send: DeliverySend, outcome: DeliveryOutcome, reason: string): void {
+    const pending = this.#pendingDeliveryOutcomes.get(actorId) ?? [];
+    if (!pending.some(record => record.eventId === send.eventId && record.to === send.to && record.from === send.from && record.mode === send.mode && record.outcome === outcome)) {
+      pending.push({ ...send, outcome, reason, at: Date.now() });
+      this.#pendingDeliveryOutcomes.set(actorId, pending);
+      this.#persistQueue(actorId, true);
+    }
+    this.#flushDeliveryOutcomes(actorId);
+  }
+
+  #flushDeliveryOutcomes(actorId: string): void {
+    const pending = this.#pendingDeliveryOutcomes.get(actorId);
+    if (!pending) return;
+    while (pending.length) {
+      const record = pending[0]!;
+      try { appendDeliveryOutcome(this.mesh.root, record, record.outcome, record.reason, record.at); }
+      catch { return; } // Retained in the queue envelope, independently of runnable work.
+      pending.shift();
+    }
+    this.#pendingDeliveryOutcomes.delete(actorId);
+    this.#persistQueue(actorId, true);
+  }
+
+  #recordSuperseded(actorId: string, item: ActorQueueItem): void {
+    for (const send of item.supersededSends ?? []) this.#recordDeliveryOutcome(actorId, send, "superseded", "replaced by a newer message for the same key before delivery");
+    delete item.supersededSends;
+  }
+
   #finishInFlight(actorId: string, item: ActorQueueItem, consumed: boolean, completed: boolean): void {
+    this.#recordSuperseded(actorId, item);
+    if (consumed && item.outcomeSend) {
+      this.#recordDeliveryOutcome(actorId, item.outcomeSend, "delivered", "consumed by actor inference as itself");
+      delete item.outcomeSend;
+    }
     if (this.#inFlight.get(actorId) === item) this.#inFlight.delete(actorId);
     const cancelled = this.#cancelledInFlight.get(actorId);
     cancelled?.delete(item.id);
@@ -6487,12 +6571,24 @@ export class ActorManager {
   #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
-      format?: unknown; items?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
+      format?: unknown; items?: unknown; pendingDeliveryOutcomes?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
       processedKeys?: unknown;
       settledWindows?: unknown; cancelled?: unknown; cancelledPredecessors?: unknown;
     };
     const records = saved.format === 1 ? saved.items : undefined;
     if (!Array.isArray(records)) return;
+    if (Array.isArray(saved.pendingDeliveryOutcomes)) {
+      const pending = this.#pendingDeliveryOutcomes.get(actor.id) ?? [];
+      for (const raw of saved.pendingDeliveryOutcomes) {
+        const send = deliverySend(raw); const record = raw as DeliveryOutcomeRecord;
+        if (!send || !["delivered", "superseded", "failed", "unknown"].includes(record.outcome) ||
+          typeof record.reason !== "string" || !Number.isFinite(record.at)) continue;
+        if (!pending.some(item => item.eventId === send.eventId && item.outcome === record.outcome && item.to === send.to && item.from === send.from && item.mode === send.mode)) {
+          pending.push({ ...send, outcome: record.outcome, reason: record.reason, at: record.at });
+        }
+      }
+      if (pending.length) this.#pendingDeliveryOutcomes.set(actor.id, pending);
+    }
     if (actor.residency === "durable" && actor.dedupeKey && Array.isArray(saved.processedKeys)) {
       // Predecessor history precedes locally completed work; never let an old
       // handoff evict a newer local completion. Legacy snapshots have no history.
@@ -6616,6 +6712,8 @@ export class ActorManager {
       if (provenance && value.principalLineageVersion !== 1) delete provenance.principal;
       const item = {
         id: value.id,
+        ...(deliverySend(value.outcomeSend) ? { outcomeSend: deliverySend(value.outcomeSend) } : {}),
+        ...(Array.isArray(value.supersededSends) ? { supersededSends: value.supersededSends.flatMap(send => deliverySend(send) ? [deliverySend(send)!] : []) } : {}),
         source: value.source,
         payload: value.payload,
         createdAt: value.createdAt,
@@ -7265,7 +7363,11 @@ export class ActorManager {
       }
       const newer = this.#newerEvent(item, first);
       this.#replaceSettledDelivery(actor.id, first, newer ? item.settledDeliveryId : first.settledDeliveryId, this.#settledDeliveryReceipts(item));
+      const replaced = newer ? first.outcomeSend : item.outcomeSend;
+      first.supersededSends = [...(first.supersededSends ?? []), ...(item.supersededSends ?? []), ...(replaced ? [replaced] : [])];
       if (newer) {
+        if (item.outcomeSend) first.outcomeSend = item.outcomeSend;
+        else delete first.outcomeSend;
         first.payload = item.payload;
         first.provenance = item.provenance ? structuredClone(item.provenance) : undefined;
         if (item.images) first.images = item.images;
@@ -7289,7 +7391,11 @@ export class ActorManager {
       else this.#overflow.delete(actor.id);
       this.#refill(actor);
     }
-    if (changed) this.#persistQueue(actor.id);
+    if (changed) {
+      this.#persistQueue(actor.id);
+      for (const item of kept.values()) this.#recordSuperseded(actor.id, item);
+      this.#persistQueue(actor.id);
+    }
   }
 
   // The queue and its overflow, emptied, in run order.

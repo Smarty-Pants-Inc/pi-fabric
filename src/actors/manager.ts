@@ -304,11 +304,11 @@ const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
  * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
  * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
 export const MESH_RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1_000;
-/** The daily mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
- * verifiedRemove (smarty-dev#7916); the hold, epoch and state.json gates still refuse on doubt. Off Linux the CLI's
- * gate refuses --apply (smarty-dev#7858). Its JSON report is written atomically, never through a link. */
+/** The daily mesh retention sweep's CLI argv: a dry run. The CLI refuses --apply until every destructive callback
+ * acts through a held directory fd (smarty-dev#7916 PR-b), so the sweep only reports. Its JSON report is written
+ * atomically, never through a link. */
 export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
-  [meshRoot, "--apply", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
+  [meshRoot, "--dry-run", "--runs-older-than", String(runsOlderThanMs), "--report", path.join(meshRoot, ".mesh-retention-report.json")];
 /** Retry delay for presence writes that failed on a contended mesh lock (smarty-dev#448). */
 const PRESENCE_RETRY_MS = 5_000;
 /** Presence carries no lease (owner liveness is the host lease), so a full heartbeat

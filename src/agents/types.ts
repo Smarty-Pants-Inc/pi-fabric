@@ -321,6 +321,8 @@ export interface AgentRunResult extends AgentRunRecord {
 
 export interface AgentHandleInfo {
   finalAnswerReceipt?: { id: string; recordedAt: number };
+  /** smarty-dev#9855: on a waiting spawn, the admission permits unknown-outcome launches still hold. */
+  heldPermits?: number;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
@@ -558,6 +560,17 @@ export interface FabricAgentLog {
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
+
+/** smarty-dev#9855: held admission permits reached half of maxConcurrent. */
+export interface AgentAdmissionAlarm {
+  heldPermits: number;
+  maxConcurrent: number;
+  at: number;
+  message: string;
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
+  kind?: "recovered-answer-save-failed";
+  runId?: string;
+}
 
 export interface AgentFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";

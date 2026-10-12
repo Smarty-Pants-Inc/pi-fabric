@@ -124,6 +124,88 @@ const settle = (directory: string, run: EnodevRun, terminal: Record<string, unkn
 };
 
 /**
+ * smarty-dev#9855 part A: a launch of THIS manager whose exit is ENODEV-unconfirmed, proven gone (the ENODEV marker,
+ * its own process record, its worker gone, pid-reuse safe). No actor or activation fact: the caller owns the run
+ * (it holds its admission permit). Settles it: a terminal record that has one keeps it; otherwise completed with the
+ * saved answer, else failed lost. Marker removed last. Undefined keeps the veto (and the caller keeps the permit).
+ */
+/** What the MANAGER recorded about a launched worker (never the worker-writable status file): pid and /proc birth. */
+export interface OwnedProcess { pid: number; started?: string }
+
+/** The manager's own record of `pid` now: its start time when it can be read (Linux /proc), for pid-reuse checks. */
+export const ownedProcess = (sessionId: unknown): OwnedProcess | undefined => {
+  const pid = Number(sessionId);
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return undefined;
+  const started = processStartTime(pid);
+  return { pid, ...(started !== undefined ? { started } : {}) };
+};
+
+/**
+ * pi-fabric#939 round 1: proven gone from the manager's OWN record only. The recorded pid is not alive, or it is
+ * alive with a different start time (reused). A live pid with no recorded birth is not proven gone.
+ */
+export const ownedProcessGone = (owned: OwnedProcess): boolean => {
+  if (!processAlive(owned.pid)) return true;
+  const current = processStartTime(owned.pid);
+  return owned.started !== undefined && current !== undefined && current !== owned.started;
+};
+
+/** The worker's saved answer for run `directory` (its settlement.json receipt for exactly this run), else undefined. */
+export const savedEnodevAnswer = (directory: string): string | undefined => {
+  const id = path.basename(directory);
+  const settlement = readJson(path.join(directory, "settlement.json"));
+  return settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
+    typeof settlement.text === "string" ? settlement.text : undefined;
+};
+
+/**
+ * pi-fabric#939 round 3 (SEC 1): the exact gate, checked BEFORE anything is delivered or written. The manager's own
+ * pid record proves the worker gone, the run carries the exact ENODEV marker, and its status record is this process
+ * run. A missing, malformed or other-reason marker, or a foreign status record, keeps the veto. Returns the record.
+ */
+export const provenGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined): Record<string, unknown> | undefined => {
+  if (!owned || !ownedProcessGone(owned)) return undefined;
+  const id = path.basename(directory);
+  const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+  if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
+  const record = readJson(path.join(directory, "status.json"));
+  return record && record.id === id && record.transport === "process" ? record : undefined;
+};
+
+/** The terminal record settleGoneEnodevLaunch writes for a proven-gone run, WITHOUT writing it (round 5: save first). */
+export const goneEnodevOutcome = (directory: string, record: Record<string, unknown>): AgentRunResult => {
+  const id = path.basename(directory);
+  const text = savedEnodevAnswer(directory);
+  const terminal = record.status !== "running" && record.status !== "queued" ? {}
+    : text !== undefined ? { status: "completed", text }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
+  return { ...record, id, ...terminal, finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now() } as unknown as AgentRunResult;
+};
+
+/**
+ * Settles a launch proven gone (provenGoneEnodevLaunch). `settledHere` names a run THIS manager already settled through
+ * #912's recovery (its marker is gone by that settle): only then does a missing marker count, and nothing is written.
+ */
+export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined, settledHere = false): AgentRunResult | undefined => {
+  const id = path.basename(directory);
+  const statusFile = path.join(directory, "status.json");
+  if (settledHere) {
+    if (!owned || !ownedProcessGone(owned)) return undefined;
+    return readJson(statusFile) as unknown as AgentRunResult | undefined ?? ({ id } as unknown as AgentRunResult);
+  }
+  const record = provenGoneEnodevLaunch(directory, owned);
+  if (!record) return undefined;
+  const settlement = readJson(path.join(directory, "settlement.json"));
+  const text = settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
+    typeof settlement.text === "string" ? settlement.text : undefined;
+  const run: EnodevRun = { id, statusFile, record, activationId: "", ...(text === undefined ? {} : { text }) };
+  const terminal = record.status !== "running" && record.status !== "queued" ? {}
+    : text !== undefined ? { status: "completed", text }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
+  return settle(directory, run, terminal);
+};
+
+/**
  * The saved answer for this restored actor activation when every fact above holds, WITHOUT settling: the marker and
  * the record stay until the actor delivered it and commits (settleEnodevRun), so a delivery its ownership check
  * refuses keeps both for the next owner (pi-fabric#912 round 3).

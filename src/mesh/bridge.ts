@@ -14,6 +14,7 @@ import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
+import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -1920,7 +1921,7 @@ export class MeshBridge {
           let spending = 0;
           let spendingBytes = 0;
           let bytes = 0;
-          for (const candidate of page.events.slice(index, index + 256)) {
+          for (const candidate of page.events.slice(index, index + BRIDGE_BATCH_MAX_EVENTS)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
@@ -1965,6 +1966,9 @@ export class MeshBridge {
               for (const id of ids) seen.delete(id);
               this.#reportUnaddressed();
               index += committed.length - 1;
+              // Locks are released and the durable prefix is checkpointed. Yield a real event-loop
+              // turn (not a microtask) before reacquiring, so local writers and transport I/O run.
+              await new Promise<void>(resolve => setImmediate(resolve));
               continue;
             }
           }
@@ -2052,6 +2056,8 @@ export class MeshBridge {
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
             seen.delete(event.id);
             this.#reportUnaddressed();
+            // Legacy/singleton drains must also give waiting writers a turn after checkpoint.
+            await new Promise<void>(resolve => setImmediate(resolve));
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;

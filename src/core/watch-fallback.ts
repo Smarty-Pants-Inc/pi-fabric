@@ -12,7 +12,10 @@
 export function isWatchLimitError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const { code, syscall, message } = error as NodeJS.ErrnoException;
-  if (code !== "ENOSPC") return typeof message === "string" && /file watchers/i.test(message);
+  // The message is only a fallback for a codeless error (some runtimes, wrapped errors). A
+  // coded error is classified by its code: an EACCES that mentions the watcher is not the limit.
+  if (code === undefined) return typeof message === "string" && /file watchers/i.test(message);
+  if (code !== "ENOSPC") return false;
   // A watch error is the only ENOSPC fs.watch can raise; accept a missing syscall (Bun, mocks)
   // but never relabel a write/open ENOSPC, which is genuinely out of space.
   return syscall === undefined || syscall === "watch" || syscall === "inotify_add_watch";

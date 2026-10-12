@@ -57,6 +57,11 @@ describe("watch ENOSPC (smarty-dev#5247)", () => {
     expect(isWatchLimitError(diskFull())).toBe(false);
     expect(isWatchLimitError(Object.assign(new Error("EACCES"), { code: "EACCES", syscall: "watch" }))).toBe(false);
     expect(isWatchLimitError(undefined)).toBe(false);
+    // Message text classifies only a codeless error; a coded error is classified by its code.
+    expect(isWatchLimitError(new Error("System limit for number of file watchers reached"))).toBe(true);
+    const eacces = Object.assign(new Error("EACCES: permission denied, file watchers unavailable, watch '/x'"), { code: "EACCES", syscall: "watch" });
+    expect(isWatchLimitError(eacces)).toBe(false);
+    expect(watchFallbackMessage("m", "/x", eacces, 50)).not.toContain("inotify");
     expect(watchFallbackMessage("m", "/x", watchLimit("/x"), 50)).toContain(CAUSE);
     expect(watchFallbackMessage("m", "/x", watchLimit("/x"), 50)).toContain("fs.inotify.max_user_watches");
     expect(watchFallbackMessage("m", "/x", diskFull(), 50)).not.toContain("inotify");

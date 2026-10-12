@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { main } from "../src/actors-cli.js";
+import { main, OfflineAdoptionUnsupportedError } from "../src/actors-cli.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -175,7 +175,9 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
     } finally { await f.close(); }
   }, 60_000);
 
-  it("adopts offline from a dead root whose resident host is down, under its host fence", async () => {
+  // POSIX-only: the offline path holds the dead host's flock fences, which Windows lacks; there the CLI refuses
+  // with OfflineAdoptionUnsupportedError (next test), as main's offline remove refuses off Linux.
+  it.skipIf(process.platform === "win32")("adopts offline from a dead root whose resident host is down, under its host fence", async () => {
     const f = await fixture();
     try {
       const actor = await f.create("offline");
@@ -188,6 +190,21 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
       expect(f.live.actors.messages(actor.id).map(message => message.id)).toEqual(history);
       await steerFromNewRoot(f, actor.id, "steer offline adoptee");
     } finally { await f.close(); }
+  }, 60_000);
+
+  it("on Windows an offline adopt refuses with a typed error before any fence or registry change", async () => {
+    const f = await fixture();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      const actor = await f.create("windows");
+      await f.stopDead();
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      let refused: Awaited<ReturnType<typeof f.adopt>>;
+      try { refused = await f.adopt(actor.id); } finally { Object.defineProperty(process, "platform", platform); }
+      expect(refused).toMatchObject({ code: 1, out: "", err: `fabric-actors: ${new OfflineAdoptionUnsupportedError().message}\n` });
+      expect(f.rows(f.deadConfig.actorRoot).filter(row => row.id === actor.id)).toMatchObject([{ rootId: f.deadConfig.rootId }]);
+      expect(f.live.actors.owns(actor.id)).toBe(false);
+    } finally { Object.defineProperty(process, "platform", platform); await f.close(); }
   }, 60_000);
 
   it("refuses on a live old root (lease veto), on missing or mismatched confirmation, and into a root without a live Main", async () => {
@@ -238,7 +255,9 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
   }, 60_000);
 });
 
-describe("fabric-actors adopt: the source project fails closed (smarty-dev#5919)", () => {
+// POSIX-only: every case adopts offline (dead host down) under its flock fences, which Windows lacks; there the
+// CLI refuses with OfflineAdoptionUnsupportedError before the source-project checks (tested above).
+describe.skipIf(process.platform === "win32")("fabric-actors adopt: the source project fails closed (smarty-dev#5919)", () => {
   const here = projectOf(process.cwd());
   /** Offline dead root (host down), so only the test edits its registry row and config. */
   const offline = async () => {

@@ -93,10 +93,22 @@ const ownerAlive = (directory: string): boolean => {
 };
 
 /**
+ * smarty-dev#5919: offline adoption (the dead root's resident host is down) holds that host's POSIX flock
+ * fences; Windows has no flock, so there it refuses before any lock or registry access, as offline remove does.
+ */
+export class OfflineAdoptionUnsupportedError extends Error {
+  constructor() {
+    super("Offline adoption needs the dead root's POSIX flock host fence, which Windows lacks; refusing while its resident host is down");
+    this.name = "OfflineAdoptionUnsupportedError";
+  }
+}
+
+/**
  * smarty-dev#5919: prove a dead root's resident host is not running and keep it from
  * starting while the registry is edited offline: hold its startup claim and host fence.
  */
 async function fenceStoppedHost(directory: string): Promise<() => void> {
+  if (process.platform === "win32") throw new OfflineAdoptionUnsupportedError();
   const held: number[] = [];
   const release = () => { for (const fd of held.splice(0)) { try { fs.closeSync(fd); } catch { /* already closed */ } } };
   try {

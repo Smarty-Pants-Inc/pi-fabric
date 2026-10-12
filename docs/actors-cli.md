@@ -118,7 +118,9 @@ work in its queue file, flushes the row and withdraws its presence). If it is
 down, the CLI proves it is not running and holds its `host-fence-establish.lock`
 and `host.lock` for the whole operation, so it cannot restart while its registry
 is edited offline. The live host (`adoptActor`) then moves the row under the
-registry locks and loads the actor.
+registry locks and loads the actor. Windows has no POSIX flock, so there the
+offline path refuses (`OfflineAdoptionUnsupportedError`) before any lock or
+registry access, as offline remove does off Linux.
 
 The move is two-phase with an intent file at
 `<live residency>/adoptions/<actorId>.json`: intent, copy of the actor

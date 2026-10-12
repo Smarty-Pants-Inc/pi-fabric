@@ -1970,11 +1970,13 @@ describe("ParticipantDirectory reads", () => {
     await reader.start();
     const prefixes = ["topology/participants/", "sessions/", "actors/"];
     const preparation = shared.mock.calls.filter(([prefix, options]) => prefixes.includes(prefix!) && options?.snapshot);
-    expect(preparation.map(([prefix]) => prefix)).toEqual(prefixes);
+    // smarty-dev#7978: the compatibility liveness probe (#legacyRenewalsRequired) reads the same pinned
+    // snapshot without copies too, so every prefix is read shared, from one snapshot.
+    expect(new Set(preparation.map(([prefix]) => prefix))).toEqual(new Set(prefixes));
     expect(new Set(preparation.map(([, options]) => options!.snapshot)).size).toBe(1);
-    // Compatibility liveness probes still scan sessions/participants separately; the large
-    // retained actor payloads must never be copied by this heartbeat preparation.
-    expect(cloned.mock.calls.filter(([prefix]) => prefix === "actors/")).toEqual([]);
+    // Neither the preparation nor the liveness probes copy entries: the large retained actor
+    // payloads, and every host, session and participant entry, are never cloned by this heartbeat.
+    expect(cloned.mock.calls.filter(([prefix]) => ["actors/", "sessions/", "topology/participants/", "topology/hosts/"].includes(prefix!))).toEqual([]);
     expect(reader.mesh.get(actorKey, { fresh: true })?.value).toEqual({ id: "actor", instructions: "x".repeat(30_000) });
     cloned.mockRestore(); shared.mockRestore();
   });

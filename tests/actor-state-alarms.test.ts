@@ -7,6 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import * as processIdentity from "../src/residency/process-identity.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 
 // smarty-dev#9332: actor states that cannot act raise fabric.alarm.actor-activation (same envelope, ownerRoot routing),
 // evaluated on the existing retention sweep (retentionSweepMs, no new timer), re-alarmed once per 6 h slot.
@@ -293,4 +294,100 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       expect(stat.slice(stat.indexOf(")") + 2).trim().split(/\s+/)[19]).not.toBe(fields[19]);
     } finally { child.kill("SIGKILL"); }
   });
+
+  // smarty-dev#10067 P2-1: a native close is seen before the monitor marks executionExited.
+  it("a worker whose transport closed is not open, even before executionExited; with its pid reused the run alarms", async () => {
+    vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined); // off Linux: no start time
+    const s = setup();
+    const launch = ProcessTransport.prototype.launch;
+    let handle: Awaited<ReturnType<typeof launch>> | undefined;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, ...args) {
+      handle = await launch.apply(this, args);
+      return handle;
+    });
+    const run = await s.agents.spawn({ task: "HANG", transport: "process" });
+    await waitFor(() => handle !== undefined && s.agents.workerIdentity(run.id)?.open === true);
+    const pid = s.agents.workerIdentity(run.id)!.pid;
+    let atClose: ReturnType<AgentManager["workerIdentity"]> | "unset" = "unset";
+    const closed = handle!.closed!.then(() => { atClose = s.agents.workerIdentity(run.id); });
+    process.kill(pid, "SIGKILL");
+    await closed;
+    // The moment the close is observable, before the monitor reacts: the handle is not open.
+    expect(atClose).toMatchObject({ pid, open: false });
+    // The actor decision on that identity, with the pid now naming another live process: worker-unverified, alarmed.
+    const actor = await s.actors.create({ name: "reused", instructions: "Run", coalesce: false });
+    await s.actors.tell(actor.id, "HANG_WITH_PROGRESS reused");
+    await waitFor(() => !!s.actors.status(actor.id).inFlightRun);
+    const runId = s.actors.status(actor.id).inFlightRun!.id;
+    await waitFor(() => fs.existsSync(path.join(s.agents.runDirectory(runId)!, "status.json")));
+    const real = s.agents.workerIdentity.bind(s.agents);
+    vi.spyOn(s.agents, "workerIdentity").mockImplementation(id => id === runId ? { ...(atClose as object), pid: process.pid } as ReturnType<typeof real> : real(id));
+    try {
+      s.clock.skew = 31 * MINUTE;
+      await waitFor(() => s.alarms("actor-run-stuck", actor.id).length === 1);
+      expect(s.alarms("actor-run-stuck", actor.id)[0]!.data).toMatchObject({ reason: "worker-unverified", runId });
+    } finally {
+      vi.mocked(s.agents.workerIdentity).mockRestore();
+      await s.agents.stop(runId).catch(() => undefined);
+      await s.actors.stop(actor.id).catch(() => undefined);
+    }
+  }, 60_000);
+
+  // smarty-dev#10067 P2-2: the streak alarm and the early unknown-block alarm carry the fixed code, not lastError.
+  it("a lastError with a path or a secret never appears in the blocked alarms (streak and early unknown)", async () => {
+    const s = setup();
+    const leak = "Error: open /home/paul/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
+    vi.spyOn(s.agents, "run").mockRejectedValue(new Error(leak));
+    const early = await s.actors.create({ name: "early", instructions: "Run", responseMode: "text" });
+    const streak = await s.actors.create({ name: "streak", instructions: "Run", responseMode: "text" });
+    await s.actors.ask(early.id, "go").catch(() => undefined);
+    for (let run = 0; run < 3; run++) await s.actors.ask(streak.id, "go").catch(() => undefined);
+    await waitFor(() => s.alarms("actor-activation-blocked", streak.id).length === 1);
+    s.clock.skew = 30 * MINUTE + 1_000;
+    await waitFor(() => s.alarms("actor-activation-blocked", early.id).length === 1);
+    for (const alarm of [...s.alarms("actor-activation-blocked", streak.id), ...s.alarms("actor-activation-blocked", early.id)]) {
+      const text = JSON.stringify(alarm.data);
+      for (const secret of ["/home/", "Bearer", "sk-abcdef", "secret.json"]) expect(text).not.toContain(secret);
+      expect(alarm.data).toMatchObject({ reason: "unknown", code: "unknown" });
+    }
+  }, 60_000);
+
+  // smarty-dev#10067 P2-3: the worker-written status is allowlisted.
+  it("an unknown worker status value becomes unknown in the alarm hint", async () => {
+    const f = await stuckFixture();
+    const real = f.s.agents.workerIdentity.bind(f.s.agents);
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: 2147483647, startTime: "1", open: true } : real(id));
+    const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
+    fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "ok /home/paul/x Bearer y" }));
+    try {
+      const data = await f.expectAlarm("worker-gone");
+      expect(data.workerStatusHint).toEqual({ untrusted: true, status: "unknown" });
+    } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+  }, 60_000);
+
+  // smarty-dev#8903: the publish is idempotent per slot, so a crash between it and the `published` mark sends one alarm.
+  it("a crash after the re-alarm publish and before the published mark: a later sweep takes the claim over and the owner gets ONE alarm", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "blocked", instructions: "Respond.", responseMode: "directive" });
+    for (let run = 0; run < 3; run++) await s.actors.ask(actor.id, "FAIL_DIRECTIVE").catch(() => undefined);
+    await waitFor(() => s.alarms("actor-activation-blocked", actor.id).length === 1); // the streak alarm
+    const repeats = () => s.alarms("actor-activation-blocked", actor.id).filter(event => (event.data as { repeat?: boolean }).repeat);
+    const put = s.mesh.put.bind(s.mesh);
+    let crashed = 0;
+    vi.spyOn(s.mesh, "put").mockImplementation(async (input) => {
+      // The process dies after its publish: the `published` mark is never written.
+      if (input.key === actorAlarmKey(actor.id, "actor-activation-blocked") && (input.value as { state?: string }).state === "published") {
+        crashed++;
+        throw new Error("crashed before the published mark");
+      }
+      return put(input);
+    });
+    s.clock.skew = 2 * HOUR + 1_000;
+    await waitFor(() => repeats().length === 1 && crashed === 1);
+    expect(s.mesh.get(actorAlarmKey(actor.id, "actor-activation-blocked"))?.value).toMatchObject({ state: "pending", slot: 0 });
+    s.clock.skew += 5 * MINUTE + 1_000; // the pending claim is overdue: a later sweep takes it over and publishes again
+    await waitFor(() => crashed === 2);
+    await settle();
+    expect(repeats()).toHaveLength(1);
+  }, 60_000);
 });

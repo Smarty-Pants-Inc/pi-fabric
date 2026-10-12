@@ -1242,7 +1242,7 @@ export class AgentManager {
     return pending;
   }
 
-  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined }>();
+  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined; closed: boolean }>();
 
   /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
    * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
@@ -1251,8 +1251,10 @@ export class AgentManager {
     const managed = this.#runs.get(runId);
     const identity = managed?.transport ? this.#workerIdentities.get(managed.transport) : undefined;
     if (!managed || !identity) return undefined;
-    const open = !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
-    return { ...identity, open };
+    // A closed native handle is not open, even before the monitor marks executionExited (smarty-dev#10067 P2-1): its
+    // pid may already name another process. A handle with no close notification is indeterminate: not open.
+    const open = managed.transport.closed !== undefined && !identity.closed && !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
+    return { pid: identity.pid, startTime: identity.startTime, open };
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
@@ -1267,7 +1269,12 @@ export class AgentManager {
       // The launched worker's identity, from this host's own spawn (never the worker's status file): its pid and
       // kernel start time, read now, while this process still holds the unreaped child (smarty-dev#9332).
       const pid = transport.kind === "process" ? Number(transport.sessionId) : NaN;
-      if (Number.isSafeInteger(pid) && pid > 1) this.#workerIdentities.set(transport, { pid, startTime: processStartTime(pid) });
+      if (Number.isSafeInteger(pid) && pid > 1) {
+        const identity = { pid, startTime: processStartTime(pid), closed: false };
+        this.#workerIdentities.set(transport, identity);
+        // Registered first, at launch: it runs before any monitor reaction to the close. A rejection proves nothing.
+        void transport.closed?.then(() => { identity.closed = true; }, () => undefined);
+      }
       return transport;
     } finally {
       this.#launches.delete(pending);

@@ -7,7 +7,7 @@
 // expected sha256 for that toolchain. Without it the host's gcc or clang builds them, marked unpinned.
 // Either way the flags are fixed (CFLAGS, LDFLAGS and compiler search variables are ignored).
 import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -29,6 +29,18 @@ const zigLink = (arch) => ["cc", "-target", `${arch}-linux-musl`, "-static", "-n
 const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
 
 /** Returns the sha256 of each helper ({} off Linux): build.mjs embeds them into the bundle. */
+/**
+ * smarty-dev#8145: the lease probe refuses a helper or gate bundle that another user could change (any
+ * group/other-writable entry on its chain up to the package root), so the build strips group/other write
+ * from everything it wrote under `dir`, whatever the umask. Run it last (scripts/build.mjs).
+ */
+export function stripGroupOtherWrite(dir) {
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink()) return;
+  if (stat.mode & 0o022) chmodSync(dir, stat.mode & 0o7755);
+  if (stat.isDirectory()) for (const name of readdirSync(dir)) stripGroupOtherWrite(join(dir, name));
+}
+
 export function buildLandlock() {
   if (process.platform !== "linux") return {};
   const root = resolve(".");
@@ -96,4 +108,4 @@ function buildHelpers(compiler, pinned, recordedFlags, build, arch) {
   return helpers;
 }
 
-if (process.argv[1]?.endsWith("build-landlock.mjs")) buildLandlock();
+if (process.argv[1]?.endsWith("build-landlock.mjs")) { buildLandlock(); stripGroupOtherWrite("dist/native"); }

@@ -40,9 +40,27 @@ export const assertShellToolPermitted = (name: string, powershell: FabricPowerSh
   if (name === "powershell" && powershell !== "allow") throw new Error(POWERSHELL_REFUSED_MESSAGE);
 };
 
+/** The refusal for any tool_call hook attempt to change a shell call's tool identity (smarty-dev#8606). */
+export const SHELL_IDENTITY_REFUSED =
+  "a tool_call hook tried to change the shell call's tool identity (type, toolName or toolCallId); every guard must judge the call as the tool that runs it";
+
+// The event keys that name the call. Pi's runner hands the same event object to
+// every tool_call handler in turn (ExtensionRunner.emitToolCall), so an earlier
+// hook that renamed the tool (say toolName "bash" to "read") would make a later
+// bash guard skip the call while Fabric still ran the shell command, and a hook
+// that renamed and later restored it would leave no trace in the final value.
+const IDENTITY_KEYS = ["type", "toolName", "toolCallId"] as const;
+const IDENTITY_WRITE_ERROR = /\b(?:read only property|redefine property|delete property)\b:? '?(?:type|toolName|toolCallId)\b/;
+
 /**
  * Emit one tool_call event; reports whether any hook replaced event.input or
  * changed any of its values (compared by value, nested objects included).
+ *
+ * The event's identity (type, toolName, toolCallId) is bound read-only and
+ * non-configurable for the whole dispatch, so no hook can change what a later
+ * hook sees: an assignment throws in strict mode (refusing the call) and is
+ * ignored otherwise, and redefining or deleting the key throws. input stays
+ * writable; its changes are detected and refused by the caller.
  */
 const emitToolCall = async (
   runner: ToolCallRunner,
@@ -50,10 +68,33 @@ const emitToolCall = async (
   toolName: string,
   toolCallId: string,
   input: Record<string, unknown>,
+  blocked: string,
 ) => {
   const judged = JSON.stringify(input);
-  const event = { type: "tool_call" as const, toolName, toolCallId, input };
-  const preflight = await runAbortable(signal, () => runner.emitToolCall(event));
+  const identity = { type: "tool_call" as const, toolName, toolCallId };
+  const event = { input } as { readonly type: "tool_call"; readonly toolName: string; readonly toolCallId: string; input: Record<string, unknown> };
+  for (const key of IDENTITY_KEYS) {
+    Object.defineProperty(event, key, { value: identity[key], writable: false, configurable: false, enumerable: true });
+  }
+  let preflight: Awaited<ReturnType<ToolCallRunner["emitToolCall"]>>;
+  try {
+    preflight = await runAbortable(signal, () => runner.emitToolCall(event));
+  } catch (error) {
+    // A strict-mode hook's write to a bound key throws out of Pi's dispatch;
+    // the call is refused either way, this only names the reason.
+    if (error instanceof TypeError && IDENTITY_WRITE_ERROR.test(error.message)) {
+      throw new Error(`${blocked}: ${SHELL_IDENTITY_REFUSED}`, { cause: error });
+    }
+    throw error;
+  }
+  // Defense in depth: the binding above makes this unreachable, but a shell
+  // call whose identity is not the one every hook was shown never runs.
+  for (const key of IDENTITY_KEYS) {
+    const descriptor = Object.getOwnPropertyDescriptor(event, key);
+    if (!descriptor || descriptor.value !== identity[key] || descriptor.writable || descriptor.configurable) {
+      throw new Error(`${blocked}: ${SHELL_IDENTITY_REFUSED}`);
+    }
+  }
   return { preflight, rewritten: event.input !== input || JSON.stringify(input) !== judged };
 };
 
@@ -102,7 +143,7 @@ export const preflightShellCall = async (call: ShellCallPreflight): Promise<Reco
   assertShellToolPermitted(name, call.powershell);
   const blocked = call.blocked || `Pi tool ${name} was blocked`;
   const judge = async (toolName: string, id: string, input: Record<string, unknown>): Promise<void> => {
-    const { preflight, rewritten } = await emitToolCall(runner, signal, toolName, id, input);
+    const { preflight, rewritten } = await emitToolCall(runner, signal, toolName, id, input, blocked);
     if (preflight?.block) {
       call.onBlock?.();
       throw new Error(preflight.reason || blocked);

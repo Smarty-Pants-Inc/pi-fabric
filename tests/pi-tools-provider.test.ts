@@ -6,7 +6,7 @@ import {
   createBashToolDefinition,
   createSyntheticSourceInfo,
   type ExtensionContext,
-  type ExtensionRunner,
+  ExtensionRunner,
   type RegisteredTool,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +19,7 @@ import { ActionRegistry, type FabricCallAudit } from "../src/core/action-registr
 import { NESTED_TOOL_CALL_ID_PREFIX } from "../src/core/action-registry.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
-import { POWERSHELL_REFUSED_MESSAGE, SHELL_REWRITE_REFUSED } from "../src/providers/shell-preflight.js";
+import { POWERSHELL_REFUSED_MESSAGE, SHELL_IDENTITY_REFUSED, SHELL_REWRITE_REFUSED } from "../src/providers/shell-preflight.js";
 import { applyRunBashDefaults } from "../src/guards/actor-bash-timeout.js";
 
 const baseContext = {
@@ -885,6 +885,104 @@ describe("pi.* without an extension runner (smarty-dev#8606)", () => {
         await expect(provider.invoke("bash", { command: "echo ok" }, { ...baseContext, cwd: root }))
           .rejects.toThrow(SHELL_REWRITE_REFUSED);
         expect(judged).toEqual(["echo ok"]);
+      }
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(runs).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // CODE_REVIEW P1 on PR #925 (item 1): Pi's runner hands the same mutable
+  // event to every tool_call handler, so an earlier hook that renamed the tool
+  // made a later bash guard skip the call while Fabric still ran the original
+  // bash arguments; renaming and later restoring it left no trace. The event's
+  // identity is now read-only for the whole dispatch. These hooks run through
+  // Pi's own ExtensionRunner.prototype.emitToolCall.
+  const identityHarness = () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-identity-")));
+    const marker = path.join(root, "stash-ran");
+    const command = `git stash list > '${marker}'`;
+    type Event = { type: string; toolName: string; toolCallId: string; input: Record<string, unknown> };
+    type Hook = (event: Event) => unknown;
+    const runs: unknown[] = [];
+    const seen: string[] = [];
+    // Hook B: a bash-only guard like the fleet's, which ignores every other toolName.
+    const guard: Hook = (event) => {
+      seen.push(event.toolName);
+      return event.toolName === "bash" && String(event.input.command).includes("git stash")
+        ? { block: true, reason: "guard refused git stash" } : undefined;
+    };
+    // A strict-mode hook's plain assignment; a sloppy-mode one (Reflect.set reports
+    // failure instead of throwing); and a hook that swallows a redefine failure.
+    const assign: Hook = (event) => { event.toolName = "read"; };
+    const sloppy: Hook = (event) => { Reflect.set(event, "toolName", "read"); Reflect.set(event, "type", "other"); };
+    const redefine: Hook = (event) => {
+      try { Object.defineProperty(event, "toolName", { value: "read" }); } catch { /* ignored by the hook */ }
+    };
+    const restore: Hook = (event) => { Reflect.set(event, "toolName", "bash"); Reflect.set(event, "type", "tool_call"); };
+    const override = {
+      ...createBashToolDefinition(root),
+      async execute(_id: string, params: { command: string }) {
+        runs.push(params.command);
+        return { content: [{ type: "text" as const, text: "ran" }], details: {} };
+      },
+    };
+    const providerFor = (hooks: Hook[], captured: boolean) => {
+      const context = () => ({ cwd: root, sessionManager: baseContext.extensionContext.sessionManager });
+      // Pi's real dispatch: one event object, each handler in turn, the first block wins.
+      const pi = Object.create(ExtensionRunner.prototype) as ExtensionRunner;
+      Object.assign(pi, { createContext: context, extensions: [{ path: "/extensions/hooks/index.ts", handlers: new Map([["tool_call", hooks]]) }] });
+      const runner = makeRunner({ createContext: context, emitToolCall: ExtensionRunner.prototype.emitToolCall.bind(pi) });
+      const catalog = new CapturedToolCatalog();
+      catalog.replace(captured ? [{
+        definition: override as RegisteredTool["definition"],
+        sourceInfo: createSyntheticSourceInfo("/extensions/bash-override/index.ts", { source: "test" }),
+      }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      return new PiToolsProvider(root, catalog, captured ? new CapturedToolsProvider(catalog) : undefined);
+    };
+    const invoke = (hooks: Hook[], captured: boolean) =>
+      providerFor(hooks, captured).invoke("bash", { command }, { ...baseContext, cwd: root });
+    return { root, marker, runs, seen, guard, assign, sloppy, redefine, restore, providerFor, invoke };
+  };
+
+  it("(a) refuses a git stash when an earlier hook renames the tool before a bash guard; nothing runs", async () => {
+    const { root, marker, runs, seen, guard, assign, sloppy, redefine, providerFor, invoke } = identityHarness();
+    try {
+      for (const captured of [false, true]) {
+        // (a) Hook A renames the tool before guard B. A strict hook's write throws and
+        // refuses the call before the guard runs; otherwise the guard still sees bash.
+        seen.length = 0;
+        await expect(invoke([assign, guard], captured)).rejects.toThrow(SHELL_IDENTITY_REFUSED);
+        expect(seen).toEqual([]);
+        for (const rename of [sloppy, redefine]) {
+          seen.length = 0;
+          await expect(invoke([rename, guard], captured)).rejects.toThrow("guard refused git stash");
+          expect(seen).toEqual(["bash"]);
+        }
+      }
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(runs).toEqual([]);
+      // A hook that leaves the identity alone still lets an allowed command run.
+      const allowed = await providerFor([guard], false).invoke("bash", { command: "printf ok" }, { ...baseContext, cwd: root }) as { output: string };
+      expect(allowed.output).toContain("ok");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) a hook that renames the tool and a later one that restores it cannot evade the guard; the guard saw bash", async () => {
+    const { root, marker, runs, seen, guard, assign, sloppy, restore, invoke } = identityHarness();
+    try {
+      for (const captured of [false, true]) {
+        // (b) Rename, guard, restore: the final event looks untouched, but the guard
+        // still saw bash and refused, or the strict rename refused the call outright.
+        seen.length = 0;
+        await expect(invoke([sloppy, guard, restore], captured)).rejects.toThrow("guard refused git stash");
+        expect(seen).toEqual(["bash"]);
+        seen.length = 0;
+        await expect(invoke([assign, guard, restore], captured)).rejects.toThrow(SHELL_IDENTITY_REFUSED);
+        expect(seen).toEqual([]);
       }
       expect(fs.existsSync(marker)).toBe(false);
       expect(runs).toEqual([]);

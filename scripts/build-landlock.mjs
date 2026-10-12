@@ -14,6 +14,13 @@ import { spawnSync } from "node:child_process";
 import { nativeArch, pinnedTarball, TOOLCHAIN, withPinnedZig } from "./native-toolchain.mjs";
 
 export const NATIVE_HELPERS = ["fabric-landlock", "fabric-mesh-lease"];
+// smarty-dev#7858: the Windows verified-removal helper, cross-built by the pinned zig (on Linux, shipped in the
+// package; on the Windows CI job, with the pinned Windows zig in FABRIC_WIN_ZIG). One expected sha256 for both.
+export const WINDOWS_HELPER = "fabric-win-remove.exe";
+const winCompile = (root) => ["cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2", "-g0", "-Wall", "-Wextra", "-Werror",
+  "-municode", "-s", `-ffile-prefix-map=${root}=.`];
+const winBuild = (zig, env, root) => (source, output) =>
+  spawnSync(zig, [...winCompile(root), source, "-ladvapi32", "-o", output], { encoding: "utf8", env });
 
 const flags = (root) => [
   "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
@@ -42,6 +49,14 @@ export function stripGroupOtherWrite(dir) {
 }
 
 export function buildLandlock() {
+  if (process.platform === "win32" && process.env.FABRIC_WIN_ZIG) {
+    const zig = process.env.FABRIC_WIN_ZIG;
+    const zigVersion = spawnSync(zig, ["version"], { encoding: "utf8" }).stdout?.trim();
+    if (zigVersion !== TOOLCHAIN.zig.version) throw new Error(`FABRIC_WIN_ZIG ${zig} is not zig ${TOOLCHAIN.zig.version} (${zigVersion})`);
+    const env = { ...process.env, SOURCE_DATE_EPOCH: "0" };
+    return buildHelpers(`zig ${zigVersion} (windows host)`, true, winCompile("<root>"), undefined, "x86_64",
+      { name: WINDOWS_HELPER, build: winBuild(zig, env, resolve(".")) }, []);
+  }
   if (process.platform !== "linux") return {};
   const root = resolve(".");
   const env = { ...process.env, SOURCE_DATE_EPOCH: "0", LC_ALL: "C" };
@@ -59,7 +74,7 @@ export function buildLandlock() {
         const compiled = spawnSync(zig, [...zigCompile(root, arch), source, "-o", `${output}.o`], { encoding: "utf8", env: pinnedEnv });
         return compiled.status !== 0 || compiled.error ? compiled
           : spawnSync(zig, [...zigLink(arch), `${output}.o`, "-o", output], { encoding: "utf8", env: pinnedEnv });
-      }, arch);
+      }, arch, { name: WINDOWS_HELPER, build: winBuild(zig, pinnedEnv, root) });
     });
   }
   if (process.env.FABRIC_NATIVE_CC_PINNED === "1") throw new Error(`FABRIC_NATIVE_CC_PINNED=1 but ${tarball.reason}`);
@@ -75,10 +90,11 @@ export function buildLandlock() {
   return buildHelpers(compiler, false, flags("<root>"), (source, output) => spawnSync(cc, [...flags(root), source, "-o", output], { encoding: "utf8", env }), arch);
 }
 
-function buildHelpers(compiler, pinned, recordedFlags, build, arch) {
+function buildHelpers(compiler, pinned, recordedFlags, build, arch, windows, linuxHelpers = NATIVE_HELPERS) {
   mkdirSync("dist/native", { recursive: true });
   const helpers = {};
-  for (const helper of NATIVE_HELPERS) {
+  for (const helper of [...linuxHelpers, ...windows ? [windows.name] : []]) {
+    const windowsHelper = helper === windows?.name;
     const hashes = [];
     const outputs = [];
     try {
@@ -86,7 +102,7 @@ function buildHelpers(compiler, pinned, recordedFlags, build, arch) {
         const dir = mkdtempSync(join(tmpdir(), `fabric-native-${helper}-${attempt}-`));
         outputs.push(dir);
         const output = join(dir, helper);
-        const result = build(`native/${helper}.c`, output);
+        const result = (windowsHelper ? windows.build : build)(`native/${windowsHelper ? helper.replace(/\.exe$/, "") : helper}.c`, output);
         if (result.error || result.status !== 0) {
           throw new Error(`${helper} build failed: install a Linux C compiler and Linux syscall headers (x86_64/aarch64). ${result.error?.message || result.stderr}`);
         }
@@ -94,7 +110,7 @@ function buildHelpers(compiler, pinned, recordedFlags, build, arch) {
       }
       if (hashes[0] !== hashes[1]) throw new Error(`${helper} is not reproducible: two builds differ (${hashes[0]} vs ${hashes[1]}) with ${compiler}`);
       // The pinned toolchain has one known output per architecture: any other bytes fail the build.
-      const expected = pinned ? TOOLCHAIN.expected[arch]?.[helper] : undefined;
+      const expected = pinned ? (windowsHelper ? TOOLCHAIN.expected.windows?.[helper] : TOOLCHAIN.expected[arch]?.[helper]) : undefined;
       if (pinned && expected !== hashes[0]) {
         throw new Error(`${helper} sha256 ${hashes[0]} is not the expected ${expected} for ${compiler} (native/toolchain.json)`);
       }

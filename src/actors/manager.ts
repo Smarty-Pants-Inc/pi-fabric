@@ -523,6 +523,10 @@ const restoredEventsDropped = (value: unknown): { eventsDropped?: NonNullable<Ma
   return { eventsDropped: { since: episode.since!, count: episode.count!, at: episode.at!, reason: episode.reason.slice(0, 80),
     ...(typeof episode.runId === "string" ? { runId: episode.runId } : {}), eventRef } };
 };
+/** The once-publication key of one alarm slot: sha256(kind, actorId, since, slot) (smarty-dev#8903). */
+export const actorAlarmDedupeKey = (kind: ActorAlarmKind, actorId: string, since: number, slot: number): string =>
+  `actor-alarm:${createHash("sha256").update([kind, actorId, String(since), String(slot)].join("\0")).digest("hex")}`;
+const RUN_STATUSES: ReadonlySet<string> = new Set(["queued", "running", "completed", "failed", "stopped", "timed_out"]);
 /** A durable or supervisor actor stopped for longer than this alarms (smarty-dev#9332). */
 export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 /** An activation block with an unclassified cause (code "unknown") alarms once it is this old, after one failure. */
@@ -4100,7 +4104,9 @@ export class ActorManager {
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code, class: activationBlockClass(code), classification,
+      // The fixed code, never the raw error text (paths, secrets): smarty-dev#10067 P2-2. The text stays in the actor's
+      // own messages and run records, and in the Main notice above.
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: code, code, class: activationBlockClass(code), classification,
         since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
         ...(actor.activationBlocked?.retryAt !== undefined ? { retryAt: actor.activationBlocked.retryAt } : {}),
         routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
@@ -4934,7 +4940,7 @@ export class ActorManager {
     const slot = early ? -1 : actorAlarmSlot(now, blocked.since, ACTOR_BLOCK_REALARM_AFTER_MS);
     if (slot === undefined) return;
     this.#alarmActorState(actor, "actor-activation-blocked", blocked.since, slot, now, () => ({
-      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.code, code: blocked.code,
       classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
       pendingEffects: "reconcile-required", ...(early ? { early: true } : { repeat: true }), blockedForMs: age }),
       () => this.#actors.get(actor.id)?.activationBlocked?.since === blocked.since);
@@ -5007,7 +5013,9 @@ export class ActorManager {
   #runStatusHint(runId: string): { workerStatusHint?: { untrusted: true; status: unknown } } {
     const directory = this.agents.runDirectory(runId);
     const record = directory ? readRunRecord(path.join(directory, "status.json")) : undefined;
-    return record ? { workerStatusHint: { untrusted: true, status: typeof record.status === "string" ? record.status.slice(0, 40) : null } } : {};
+    // Allowlisted (smarty-dev#10067 P2-3): a worker-written value outside the known run statuses is "unknown".
+    const status = typeof record?.status === "string" && RUN_STATUSES.has(record.status) ? record.status : "unknown";
+    return record ? { workerStatusHint: { untrusted: true, status } } : {};
   }
 
   /** p95 wall time of the actor's archived finished runs (runs/<id>/status.json), when it has any. */
@@ -5086,9 +5094,13 @@ export class ActorManager {
         await release();
         return;
       }
-      // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
+      // Publish directly: #publishNotification resolves even when its attempt failed and dropped. The publish itself
+      // is idempotent per (kind, actor, episode, slot) through the mesh's durable dedupe receipt (smarty-dev#8903):
+      // a crash after it and before the claim is marked published lets a later sweep take the claim over, and its
+      // publish returns the first event instead of appending a second alarm.
       try {
-        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data });
+        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
+          dedupeKey: actorAlarmDedupeKey(kind, actor.id, since, slot) });
       } catch {
         await release();
         return;

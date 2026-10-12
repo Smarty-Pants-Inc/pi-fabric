@@ -293,6 +293,8 @@ export class FabricRuntimeState {
   // Each initialize() starts a new epoch. Sources and closures built by an older epoch never
   // read the live ctx again, even after the runtime is rebound to a successor session.
   #epoch = 0;
+  /** The initialize() epoch that built #participants. */
+  #participantsEpoch = -1;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -500,6 +502,9 @@ export class FabricRuntimeState {
   /** Rebinds session-bound background reads to this ctx while `current()` holds (smarty-dev#5962). */
   bindLifecycle(context: ExtensionContext, current: () => boolean): void {
     this.#binding = { context, current };
+    // A live successor binding re-arms this epoch's own single heartbeat; a retired epoch's
+    // suspended directory is never resumed (smarty-dev#10004).
+    if (this.#participantsEpoch === this.#epoch && this.lifecycleCurrent) this.#participants?.resume();
   }
 
   /** False once the bound lifecycle retired: background ticks must skip, not read a stale ctx. */
@@ -557,6 +562,9 @@ export class FabricRuntimeState {
     this.#meshActivationReady = () => false;
     const epoch = this.#epoch;
     this.#binding = undefined;
+    // The retired epoch's heartbeat stops now, before teardown awaits: it never ticks again,
+    // even while quiesce/close still publish explicitly (smarty-dev#10004).
+    this.#participants?.suspend();
     const live = this.#liveReads(epoch);
     const predecessor = this.#mainAgent?.local && this.#mainAgent.sessionId && this.#mesh
       ? { id: this.#mainAgent.id, sessionId: this.#mainAgent.sessionId, meshRoot: this.#mesh.root, cwd: this.#mainAgent.cwd } : undefined;
@@ -823,6 +831,7 @@ export class FabricRuntimeState {
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
     let inboxMaintenance: MainInboxMaintenance | undefined;
+    this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       beforePublication: async () => {
         // Hand the early acquisition failure to start() once, without another inline
@@ -2019,6 +2028,8 @@ export class FabricRuntimeState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#meshActivationReady = () => false;
+    // The session lifecycle retired: stop the background heartbeat before any teardown await.
+    this.#participants?.suspend();
     try {
       await this.#shutdownSteps(reason, targetSessionFile);
     } catch (error) {

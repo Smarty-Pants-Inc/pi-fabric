@@ -1544,8 +1544,9 @@ export class ActorManager {
 
   /**
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
-   * accepted queue and overflow immediately, without touching an in-flight run. Per-filter telemetry
-   * resets; legacy lifetime count is kept.
+   * ordinary queue and overflow immediately, without touching an in-flight run. Interval-managed
+   * agent_settled deliveries recheck at arrival, their trailing boundary and dequeue. Per-filter
+   * telemetry resets; legacy lifetime count is kept.
    */
   async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
@@ -4387,6 +4388,9 @@ export class ActorManager {
     if (!actor.activationFilter) return;
     let skipped = 0;
     const keep = (item: ActorQueueItem): boolean => {
+      // Interval-managed settles have their own arrival/trailing rechecks. Leave admitted
+      // deliveries for the head skip; counting them here also counts a held window's history.
+      if (item.source === "host:agent_settled" && (actor.activation?.minIntervalMs ?? 0) > 0) return true;
       const ruleId = this.#filteredBy(actor, item);
       if (!ruleId) return true;
       this.#recordFiltered(actor, item, ruleId);

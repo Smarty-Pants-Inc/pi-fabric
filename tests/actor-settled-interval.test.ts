@@ -1717,10 +1717,59 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(admitted().map((message) => (message.data as { marker: string }).marker)).toEqual(["leading", "keep"]);
     expect(actors.status(actor.id).filterSkipped.count).toBe(2);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "now-filtered" });
-    await actors.setActivationFilter(actor.id, [{ id: "new-filter", source: ["host:agent_settled"] }]);
+    const changed = await actors.setActivationFilter(actor.id, [{ id: "new-filter", source: ["host:agent_settled"] }]);
+    expect(changed).toMatchObject({ queued: 2, filterSkipped: { count: 0 } });
     vi.advanceTimersByTime(1_000);
     expect(admitted()).toHaveLength(2);
-    expect(actors.status(actor.id).filterSkipped.count).toBe(1);
+    expect(actors.status(actor.id)).toMatchObject({ queued: 2, filterSkipped: { count: 1 } });
+    vi.advanceTimersByTime(2_000);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(1); // The trailing slot was consumed once.
+  });
+
+  it.each([false, true])("prunes ordinary queued events without consuming an interval-managed held settle (coalesce=%s)", async (coalesce) => {
+    const { actors, actor, root } = await timedActor(1_000, undefined, coalesce);
+    await actors.setEvents(actor.id, ["agent_settled", "tool_error"]);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "held" });
+    actors.dispatchHostEvent("tool_error", { marker: "ordinary" });
+    const directory = path.join(root, "actors", actor.id);
+    const queueFile = path.join(directory, fs.readdirSync(directory).find(file => file.startsWith("queue-"))!);
+    const snapshot = () => JSON.parse(fs.readFileSync(queueFile, "utf8")) as {
+      items: Array<{ id: string; source: string; payload: { marker: string } }>;
+      settledWindows?: Array<{ pending: { payload: { marker: string }; deliveryId: string } }>;
+    };
+    const before = snapshot();
+    const changed = await actors.setActivationFilter(actor.id, [
+      { id: "settles", source: ["host:agent_settled"] },
+      { id: "errors", source: ["host:tool_error"] },
+    ]);
+    expect(changed).toMatchObject({ queued: 1, filterSkipped: { count: 1 } });
+    expect(snapshot().items).toEqual(before.items.filter(item => item.source === "host:agent_settled"));
+    expect(snapshot().settledWindows).toEqual(before.settledWindows); // Preserve pending custody and receipt.
+    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
+      .toEqual(["filtered: errors"]);
+    vi.advanceTimersByTime(1_000);
+    expect(actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 2 } });
+    expect(snapshot().settledWindows ?? []).toEqual([]);
+    vi.advanceTimersByTime(2_000);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(2);
+    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
+      .toEqual(["filtered: errors", "filtered: settles"]);
+    actors.resumeAfterRelease();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 3 } }); // Leading skips once at dequeue.
+    expect(actors.messages(actor.id).filter(message => message.direction === "out")).toEqual([]); // No worker launched.
+  });
+
+  it("still prunes ordinary agent_settled queue items when no minimum interval is configured", async () => {
+    const { actors, actor } = await timedActor(0);
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "first" });
+    actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "second" });
+    expect(actors.status(actor.id).queued).toBe(2);
+    const changed = await actors.setActivationFilter(actor.id, [{ id: "settles", source: ["host:agent_settled"] }]);
+    expect(changed).toMatchObject({ queued: 0, filterSkipped: { count: 2 } });
+    vi.advanceTimersByTime(2_000);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(2);
   });
 
   it("clones latest payload/images and retains the existing queue coalescing contract", async () => {

@@ -166,6 +166,62 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  nats-state-conformance:
+    # The StateBackend contract suites on a real nats-server (smarty-dev#7504 phase 2): JetStream with
+    # sync_interval always (the backend refuses a server that does not fsync every write) and an http
+    # monitor port (read for /varz). NATS_SERVER_REQUIRED=1 fails the job if the server is missing, so it
+    # never passes by skipping. Separate from `check`; not a required check.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install pinned NATS server
+        # The same pinned download as the JetStream event-log job (feat/nats-event-log).
+        shell: bash
+        run: |
+          version=2.14.7
+          archive="nats-server-v${version}-linux-amd64.tar.gz"
+          release="https://github.com/nats-io/nats-server/releases/download/v${version}"
+          stage="$RUNNER_TEMP/nats-release"
+          mkdir -p "$stage"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/SHA256SUMS" "$release/SHA256SUMS"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$stage/$archive" "$release/$archive"
+          (
+            cd "$stage"
+            awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
+            # Also bind the release asset to the locally qualified v2.14.7 bytes.
+            printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$archive" | sha256sum --check --strict -
+            tar -xzf "$archive"
+          )
+          echo "NATS_BIN=$stage/nats-server-v${version}-linux-amd64/nats-server" >> "$GITHUB_ENV"
+      - name: Start nats-server (loopback, JetStream sync always, monitor port)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/nats-store"
+          printf 'listen: 127.0.0.1:4222\nhttp: 127.0.0.1:8222\njetstream {\n  store_dir: "%s"\n  sync_interval: always\n}\n' \
+            "$RUNNER_TEMP/nats-store" > "$RUNNER_TEMP/nats.conf"
+          nohup "$NATS_BIN" -c "$RUNNER_TEMP/nats.conf" > "$RUNNER_TEMP/nats.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -fsS 'http://127.0.0.1:8222/healthz?js-enabled-only=true' > /dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:8222/varz | grep -q '"sync_always": *true'
+      - name: StateBackend conformance on nats
+        env:
+          NATS_SERVER_REQUIRED: '1'
+          NATS_SERVER_URL: nats://127.0.0.1:4222
+          NATS_MONITOR_URL: http://127.0.0.1:8222
+        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/nats.log"
+
   mesh-lock-bench:
     # The mesh lock benchmark ratchet (smarty-dev#6676, docs/mesh-lock-bench.md): fails a >10%
     # regression of the deterministic per-op lock metrics against bench/mesh-lock-baseline.json.

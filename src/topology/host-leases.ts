@@ -370,6 +370,32 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
 // Parsed files by directory and name, reused while a file's identity and timestamps are unchanged.
 const cache = new Map<string, LeaseSlots>();
 
+// smarty-dev#7978: the directory listing, reused while the directory's stamp is unchanged. Every
+// writer adds, replaces or removes a lease by a directory entry (writeJsonAtomic's rename, the
+// unlease rename, rmSync), which moves the directory's mtime/ctime; an in-place rewrite does not,
+// so every listed file is still stat'ed and re-read on its own change. A directory whose mtime is
+// at least DIR_TICK_MS old when listed cannot change again within the same timestamp tick, so an
+// unchanged stamp later means an unchanged listing (as participant-files.ts). Windows does not move
+// a directory's mtime reliably on a replace: it always lists.
+const DIR_TICK_MS = 100;
+interface LeaseListing { dev: bigint; ino: bigint; mtimeNs: bigint; ctimeNs: bigint; listedAt: number; names: readonly string[] }
+const listings = new Map<string, LeaseListing>();
+
+const leaseNames = (dir: string, uncached: boolean): readonly string[] => {
+  if (uncached || process.platform === "win32") {
+    listings.delete(dir);
+    return fs.readdirSync(dir);
+  }
+  const stat = fs.statSync(dir, { bigint: true });
+  const known = listings.get(dir);
+  if (known && known.dev === stat.dev && known.ino === stat.ino && known.mtimeNs === stat.mtimeNs &&
+    known.ctimeNs === stat.ctimeNs && known.listedAt - Number(known.mtimeNs / 1_000_000n) >= DIR_TICK_MS) return known.names;
+  const listedAt = Date.now();
+  const names = fs.readdirSync(dir);
+  listings.set(dir, { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs, listedAt, names });
+  return names;
+};
+
 /** Every host's file lease, by host id. Unreadable or misnamed files are skipped. */
 /**
  * `problems`, when given, collects every lease file or directory that exists but could not be
@@ -382,9 +408,9 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
     const code = (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
     if (code !== "ENOENT") problems?.push(`${file}: ${code}`);
   };
-  let names: string[];
+  let names: readonly string[];
   try {
-    names = fs.readdirSync(dir);
+    names = leaseNames(dir, problems !== undefined);
   } catch (error) {
     failed(dir, error);
     return new Map();

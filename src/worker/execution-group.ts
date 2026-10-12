@@ -33,38 +33,48 @@ const descendantWalkAvailable = (): boolean => {
   return childrenAvailable;
 };
 
-/** Direct children of pid across all of its threads; [] once pid is gone. */
-const childrenOf = (pid: number): number[] => {
+/** Direct children of pid across all of its threads. vanished is true when pid
+ * (or one of its threads) disappeared during the read: its children may then
+ * have been re-parented out of the tree, so the list is not complete. */
+const childrenOf = (pid: number): { pids: number[]; vanished: boolean } => {
   let threads: string[];
   try { threads = fs.readdirSync(`/proc/${pid}/task`); }
-  catch (error) { if (gone(error)) return []; throw error; }
-  return threads.flatMap(thread => {
+  catch (error) { if (gone(error)) return { pids: [], vanished: true }; throw error; }
+  let vanished = false;
+  const pids = threads.flatMap(thread => {
     try {
       return fs.readFileSync(`/proc/${pid}/task/${thread}/children`, "utf8").split(" ").filter(Boolean).map(Number);
     } catch (error) {
-      if (gone(error)) return [];
+      if (gone(error)) { vanished = true; return []; }
       throw error;
     }
   });
+  return { pids, vanished };
 };
 
 /** Every live process reachable from roots by parent links (roots included).
- * truncated is true when WALK_LIMIT stopped the walk with unvisited pids still
- * queued: members is then a partial view and must never be treated as complete. */
-const descendants = (roots: Iterable<number>): { members: Member[]; truncated: boolean } => {
+ * incomplete is true when members is a partial view that must never be trusted:
+ * WALK_LIMIT stopped the walk with unvisited pids still queued, or a non-leader
+ * node vanished (ENOENT/ESRCH) before its stat or children were read, so its
+ * children were re-parented away from the walked tree (to init or a subreaper).
+ * A vanished leader keeps its existing handling: the exit handler adopts. */
+const descendants = (leader: number, roots: Iterable<number>): { members: Member[]; incomplete: boolean } => {
   const seen = new Set<number>();
   const found: Member[] = [];
   const queue = [...roots];
+  let vanished = false;
   while (queue.length && seen.size < WALK_LIMIT) {
     const pid = queue.shift()!;
     if (seen.has(pid)) continue;
     seen.add(pid);
     const value = member(pid);
-    if (!value) continue;
+    if (!value) { if (pid !== leader) vanished = true; continue; }
     found.push(value);
-    queue.push(...childrenOf(pid));
+    const children = childrenOf(pid);
+    if (children.vanished && pid !== leader) vanished = true;
+    queue.push(...children.pids);
   }
-  return { members: found, truncated: queue.some(pid => !seen.has(pid)) };
+  return { members: found, incomplete: vanished || queue.some(pid => !seen.has(pid)) };
 };
 
 /** The legacy host-wide scan: every process on the host. Only used as the
@@ -117,13 +127,14 @@ export const executionGroup = (child: ChildProcess) => {
     else {
       // Walk the leader's tree plus every member seen last time, so an orphan
       // already recorded stays tracked after reparenting out of that tree.
-      const walk = descendants([pid, ...previous]);
+      const walk = descendants(pid, [pid, ...previous]);
       current = inGroup(walk.members);
       // A vanished member may have orphaned unrecorded children, an empty walk
-      // is about to latch, and a walk cut off at WALK_LIMIT omitted members:
-      // only then confirm with one host-wide scan. Never trust a partial walk.
+      // is about to latch, and an incomplete walk (cut off at WALK_LIMIT, or a
+      // non-leader node vanished mid-walk) omitted members: only then confirm
+      // with one host-wide scan. Never trust a partial walk.
       const now = new Set(current.map(value => value.pid));
-      if (walk.truncated || !current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());
+      if (walk.incomplete || !current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());
     }
     previous = new Set(current.map(value => value.pid));
     if (!current.length) { empty = true; return []; }

@@ -172,6 +172,39 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     expect(new Set(all)).toEqual(new Set([...processes].filter(([, row]) => row.group === 100).map(([pid]) => pid)));
   });
 
+  it.each([
+    ["its stat", "/proc/101/task/101/children"],
+    ["its task children", "/proc/102/stat"],
+  ])("runs the full /proc scan when a newly found descendant vanishes before %s is read", (_phase, vanishAfter) => {
+    const { processes, group, readdir, read } = setup();
+    const scans = () => readdir.mock.calls.filter(([dir]) => String(dir) === "/proc").length;
+    processes.set(101, { started: "child-birth", group: 100, parent: 100 });
+    group.observe();
+    expect(scans()).toBe(0);
+    // 102 is new (never recorded) and 103 is its child, also in the group.
+    processes.set(102, { started: "mid-birth", group: 100, parent: 101 });
+    processes.set(103, { started: "orphan-birth", group: 100, parent: 102 });
+    const base = read.getMockImplementation()!;
+    let armed = true;
+    read.mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      const out = base(...args);
+      // 102 is queued (or already stat'd), then exits: 103 is re-parented to init.
+      if (armed && String(args[0]) === vanishAfter) {
+        armed = false;
+        processes.delete(102);
+        processes.set(103, { started: "orphan-birth", group: 100, parent: 1 });
+      }
+      return out;
+    });
+    // The walk never reaches 103; only the full scan can find the orphan.
+    expect(group.members().sort()).toEqual([100, 101, 103]);
+    expect(armed).toBe(false);
+    expect(scans()).toBe(1);
+    // Recorded now, the orphan is walked from previous: no vanishing, no scan.
+    expect(group.members().sort()).toEqual([100, 101, 103]);
+    expect(scans()).toBe(1);
+  });
+
   it("refuses a group whose recorded member moved to a foreign group", () => {
     const { processes, group, kill } = setup();
     processes.set(100, { started: "leader-birth", group: 200 });

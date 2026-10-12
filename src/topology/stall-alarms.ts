@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { SessionReceiptManager } from "../core/session-receipts.js";
-import { confirmedMainInboxIds } from "./root-inbox.js";
+import { confirmedMainInboxIds } from "./root-inbox-shared.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -141,6 +141,75 @@ export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity
       data: { rootId, firstAbsentAt: since, byKind, byStatus } });
   }
 };
+
+/** Held messages one alarm lists by id; its heldCount still counts them all. */
+const PROVIDER_DEAD_LISTED_MESSAGES = 50;
+/** Alarms per mesh publishBatch call; the loop publishes batches until every address is covered. */
+const PROVIDER_DEAD_ALARM_BATCH = 50;
+
+/**
+ * smarty-dev#8742: a Main whose provider rejects every request as non-retryable reaches ops at
+ * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to the sender
+ * of every held message (Main holds up to 200), one inbox.age.alarm per address however many of
+ * its messages are held. PR #841 review: no held message's sender is left for the age pass.
+ * An address's alarm reuses the age pass's dedupe key for its first held message, so it crosses
+ * the existing mesh bridge to remote senders and the age pass never repeats it; the age pass
+ * still reports that address's other messages if they stay unread past mesh.undeliveredAlarmMs.
+ */
+export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
+  const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];
+  const fields = providerDeadAlarmFields(event);
+  const reason = fields.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${fields.error})`;
+  for (const to of owners) await mesh.publish({
+    topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
+    dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
+    text: `Main ${rootId} ${reason}: ${fields.cause}; ${event.held.length} held message(s) unread`,
+    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_LISTED_MESSAGES), heldCount: event.held.length } });
+  // Deduplicated per address: each sender once, listing its own held messages; owners list all.
+  const byAddress = new Map<string, Array<ProviderDeadAlarmEvent["held"][number]>>();
+  for (const item of event.held) {
+    for (const to of new Set([item.from, ...owners])) {
+      const items = byAddress.get(to);
+      if (items) items.push(item); else byAddress.set(to, [item]);
+    }
+  }
+  const alarms = [...byAddress].map(([to, items]) => {
+    const first = items[0]!;
+    return { topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to, dedupeKey: `inbox-age:${first.id}:${to}`,
+      text: items.length === 1 ? `Undelivered Main message ${first.id} to ${rootId}: ${reason}`
+        : `${items.length} undelivered Main messages to ${rootId}, first ${first.id}: ${reason}`,
+      data: { messageId: first.id, rootId, sentAt: first.sentAt, reason: "provider-dead", error: fields.error,
+        messageIds: items.slice(0, PROVIDER_DEAD_LISTED_MESSAGES).map(item => item.id), heldCount: items.length } };
+  });
+  // A batch may commit only a prefix: continue from the first uncommitted alarm.
+  for (let next = 0; next < alarms.length;) {
+    const committed = await mesh.publishBatch(alarms.slice(next, next + PROVIDER_DEAD_ALARM_BATCH));
+    if (!committed.length) throw new Error("Provider-dead alarm batch committed nothing");
+    next += committed.length;
+  }
+};
+
+/** What a provider-dead alarm may carry: the shape of FabricMainProviderDeadEvent, nothing else. */
+export interface ProviderDeadAlarmEvent {
+  kind?: "non-retryable" | "unclassified";
+  error: string; status?: number; type?: string; code?: string; failures?: number;
+  since: string; cause: string;
+  held: ReadonlyArray<{ id: string; from: string; sentAt: number }>;
+}
+
+/**
+ * smarty-dev#8742 security review: alarm data is an explicit allowlist (status, known type, fixed
+ * code, Fabric's own cause), so a field an event happens to carry can never ride along to ops.owner,
+ * held messages' senders or the mesh bridge. Provider message text is never one of them.
+ */
+export const providerDeadAlarmFields = (event: Omit<ProviderDeadAlarmEvent, "held">) => ({
+  kind: event.kind ?? "non-retryable", error: event.error, since: event.since, cause: event.cause,
+  ...(event.status === undefined ? {} : { status: event.status }),
+  ...(event.type === undefined ? {} : { type: event.type }),
+  ...(event.code === undefined ? {} : { code: event.code }),
+  ...(event.failures === undefined ? {} : { failures: event.failures }),
+});
 
 export class MainInboxMaintenance {
   readonly #receipts = new Map<string, SessionReceiptManager>();

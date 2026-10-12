@@ -1,10 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
-import { writeJsonAtomic } from "../core/atomic-write.js";
+import { syncDirectoryChain } from "../core/atomic-write.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
 import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
+import { closeDirectory, openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
+
+/** 0700 every directory of a copied tree, each through its own O_NOFOLLOW fd after fstat proves it ours; a link, a
+ * file or a foreign entry is skipped, never followed (pi-fabric#875 round 1 P1-2). */
+const closeDirectories = (directory: string, depth = 0): void => {
+  if (depth > 64 || !closeDirectory(directory)) return;
+  for (const name of fs.readdirSync(directory)) closeDirectories(path.join(directory, name), depth + 1);
+};
 
 export const ACTOR_MESSAGE_HISTORY_LIMIT = 100;
 
@@ -86,28 +94,63 @@ export class ActorLogStore {
   async retainRun(actor: ActorLogTarget, runId: string, runDirectory: string | undefined): Promise<void> {
     if (!runDirectory || !fs.existsSync(runDirectory)) return;
     const dest = path.join(path.dirname(actor.sessionFile), "runs", runId);
-    fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
-    const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
-    if (fs.existsSync(receipt)) {
-      const archivedReceipt = path.join(dest, "route-dispatch-receipt.json");
-      const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
-      const source = readRouteDispatchReceipt(receipt);
-      if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
-      // Durable archive confirmation precedes source cleanup (F2 custody).
-      writeJsonAtomic(archivedReceipt, source, { durable: true });
+    // pi-fabric#875 round 2 P1-b: the archive destination is created or validated BEFORE anything is copied, by the
+    // trusted descriptor walk (private-dir.ts), and every copy goes through the held descriptor's path. A symlinked,
+    // foreign or group/other-writable step anywhere in the chain refuses the archive: the run stays unarchived (its
+    // source is untouched) and one line says why.
+    let held: PrivateDirectory;
+    // The anchor is the mesh root (the parent of the `actors` directory the session file lies in), else the actor's own
+    // directory: our own group-writable containers below it are tightened on first use (pi-fabric#875 round 3).
+    const sessionDirectory = path.dirname(path.resolve(actor.sessionFile));
+    const actorsAt = sessionDirectory.lastIndexOf(`${path.sep}actors${path.sep}`);
+    const anchor = actorsAt > 0 ? sessionDirectory.slice(0, actorsAt) : sessionDirectory;
+    try { held = openPrivateDir(dest, anchor); }
+    catch (error) {
+      console.warn(`[pi-fabric] actor run ${runId} not archived: ${(error as Error).message}`);
+      return;
     }
-    for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
-      const src = path.join(runDirectory, file);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, file));
-    }
-    const nested = path.join(runDirectory, "nested");
-    if (fs.existsSync(nested)) {
-      try {
-        fs.cpSync(nested, path.join(dest, "nested"), { recursive: true });
-      } catch {
-        /* best-effort recursive run retention */
+    try {
+      const receipt = path.join(runDirectory, "route-dispatch-receipt.json");
+      if (fs.existsSync(receipt)) {
+        const { readRouteDispatchReceipt } = await import("../agents/model-route.js");
+        const source = readRouteDispatchReceipt(receipt);
+        if (!source || source.runId !== runId) throw new Error("Mismatched route dispatch receipt");
+        // Durable archive confirmation precedes source cleanup (F2 custody): the file and the held directory are
+        // fsynced through their fds, then the chain above by path, which must still name the held directory.
+        if (!writeArchiveFile(held, "route-dispatch-receipt.json", { bytes: Buffer.from(JSON.stringify(source)) }, true)) {
+          throw new Error(`Archive entry ${path.join(dest, "route-dispatch-receipt.json")} exists and is not our regular file`);
+        }
+        const named = fs.statSync(dest), opened = fs.statSync(held.path);
+        if (named.dev !== opened.dev || named.ino !== opened.ino) throw new Error(`Archive directory ${dest} changed while it was held`);
+        syncDirectoryChain(dest);
       }
-    }
+      // pi-fabric#875 round 4 SEC P1: no path write into the archive. Each entry is created O_EXCL|O_NOFOLLOW through
+      // the held fd, or replaced by rename only when it is our own regular file; anything else (a symlink planted while
+      // a healed directory was writable) refuses that entry, with one line, and the source is untouched.
+      for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+        const src = path.join(runDirectory, file);
+        if (!fs.existsSync(src)) continue;
+        try {
+          if (!writeArchiveFile(held, file, { source: src })) console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} exists and is not our regular file; not written`);
+        } catch (error) { console.warn(`[pi-fabric] actor run ${runId}: archive entry ${file} not written: ${(error as Error).message}`); }
+      }
+      const nested = path.join(runDirectory, "nested");
+      if (fs.existsSync(nested)) {
+        try {
+          // Copied only into a nested/ directory this archive creates now (fresh, 0700): never into existing entries.
+          fs.mkdirSync(path.join(held.path, "nested"), { mode: 0o700 });
+          fs.chmodSync(path.join(held.path, "nested"), 0o700); // our fresh directory; a umask 0400 left 0300 (unopenable)
+          if (!closeDirectory(path.join(held.path, "nested"))) throw new Error("the new nested directory is not ours");
+          fs.cpSync(nested, path.join(held.path, "nested"), { recursive: true });
+          // cpSync keeps the source's modes; a run made under umask 002 is 0775. Archived directories are 0700, like
+          // the archive itself (smarty-dev#9016), each through its own O_NOFOLLOW fd. Files keep their modes.
+          if (process.platform !== "win32") closeDirectories(path.join(held.path, "nested"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") console.warn(`[pi-fabric] actor run ${runId}: archive nested/ exists; not copied again`);
+          /* otherwise best-effort recursive run retention */
+        }
+      }
+    } finally { held.close(); }
     this.pruneRuns(actor);
   }
 

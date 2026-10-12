@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
@@ -444,6 +444,42 @@ sys.stdin.readline()`;
     } finally { await holder.release(); }
   });
 
+  // pi-fabric#881 (SEC + Astra P1): a lock-free, non-dumpable opener landing between the probe's F_UNLCK and its close
+  // used to merge into the probe's still-unread IN_OPEN. The probe now reads its own IN_OPEN before the lease, so this
+  // open is a new event. End to end through the operator's bin; the helper's test pause point places the open there.
+  it.skipIf(binSkip !== "")(`end to end: a lock-free opener between the probe's F_UNLCK and its close is refused${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const pause = tempDir("pause");
+    const child = spawn(process.execPath, [BIN, "cutover", "--root", root, "--accept-unready", "factory,fabric@unknown"], {
+      env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "", FABRIC_MESH_LEASE_TEST_PAUSE_AFTER_UNLCK: pause }, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", (data: Buffer) => { stderr += String(data); });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const started = Date.now();
+    while (!fs.existsSync(path.join(pause, "paused"))) {
+      if (Date.now() - started > 20_000) throw new Error(`the helper never paused after F_UNLCK: ${stderr}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const holder = await pythonHolder(path.join(root, "state.db"), "nondumpable");
+    try {
+      fs.writeFileSync(path.join(pause, "go"), "");
+      expect(await exited, stderr).toBe(3);
+      expect(stderr).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (1 open(s) since the lease probe; smarty-dev#8116))`);
+    } finally { await holder.release(); }
+  }, 60_000);
+
+  // pi-fabric#881: if the probe's own IN_OPEN never arrives, nothing can be counted exactly: fail closed.
+  it.skipIf(leaseSkip !== "")(`fails closed when the probe's own IN_OPEN is not seen${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    vi.stubEnv("FABRIC_MESH_LEASE_TEST_IGNORE_PROBE_OPEN", "1");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): unexpected helper output: unwatched ${root}/state.db)`);
+      expect(await backendOf(root)).toBe("importing");
+    } finally { vi.unstubAllEnvs(); }
+  }, 60_000);
+
   it.skipIf(binSkip !== "")(`end to end through the operator's bin: a lock-free holder refuses, without it the switch is ready${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
     const root = await crashedImport();
     // The operator's entry point (package bin -> dist), as a child; the real census, fd scan, /proc/locks and lease probe.
@@ -707,6 +743,281 @@ for (let i = 0; ; i++) {
     const ready = cli();
     expect(ready.status, ready.stderr).toBe(0);
   });
+
+  // smarty-dev#8116: a holder that opens AFTER the fenced lease probe and before the commit. The python3 child
+  // waits for a trigger file, so the switch's own onStep (between its open of state.db and the commit) runs it.
+  const lateHolder = async (file: string, mode: "open" | "link"): Promise<{ trigger: () => void; release: () => Promise<void> }> => {
+    const scratch = tempDir("late");
+    const code = `
+import ctypes, os, sys, time
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+print("ready", flush=True)
+while not os.path.exists(sys.argv[2] + "/go"): time.sleep(0.005)
+if sys.argv[3] == "link":
+    os.link(sys.argv[1], sys.argv[2] + "/alias"); fd = os.open(sys.argv[2] + "/alias", os.O_RDWR); os.unlink(sys.argv[2] + "/alias")
+else:
+    fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+open(sys.argv[2] + "/opened", "w").close()
+sys.stdin.readline()`;
+    const child = spawn("python3", ["-c", code, file, scratch, mode], { stdio: ["pipe", "pipe", "inherit"] });
+    await new Promise<void>((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error("python3 holder not ready within 10 s")), 10_000);
+      child.stdout!.once("data", () => { clearTimeout(deadline); resolve(); });
+    });
+    const trigger = (): void => {
+      fs.writeFileSync(path.join(scratch, "go"), "");
+      const until = Date.now() + 10_000;
+      while (!fs.existsSync(path.join(scratch, "opened"))) {
+        if (Date.now() > until) throw new Error("late holder did not open");
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    };
+    const release = (): Promise<void> => new Promise((resolve) => {
+      if (child.exitCode !== null) { resolve(); return; }
+      const deadline = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5_000);
+      child.once("exit", () => { clearTimeout(deadline); resolve(); });
+      child.stdin!.end("\n");
+    });
+    return { trigger, release };
+  };
+  // pi-fabric#881 (Astra P1): no netting of closes. Two foreign processes open state.db back to back inside the window
+  // and one closes again: the other still holds it, so the switch refuses (an open is never cancelled by a close).
+  it.skipIf(leaseSkip !== "")(`refuses two back-to-back foreign openers of which one closes again${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const file = path.join(root, "state.db");
+    const holder = await lateHolder(file, "open");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => {
+          holder.trigger();
+          spawnSync("python3", ["-c", "import os, sys; os.close(os.open(sys.argv[1], os.O_RDONLY))", file], { timeout: 10_000 });
+        } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${file} (2 open(s) since the lease probe; smarty-dev#8116))`);
+    } finally { await holder.release(); }
+  });
+
+  // pi-fabric#881 (Astra P2 #3): nothing is subtracted for the parent: a dup() by the parent plus a foreign opener
+  // reports every open, and the verdict (opens > probed) refuses.
+  it.skipIf(leaseSkip !== "")(`a dup by the parent plus a foreign opener is refused, never subtracted${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, () => {
+    const dir = tempDir("dup");
+    const file = path.join(dir, "state.db");
+    fs.writeFileSync(file, "x", { mode: 0o600 });
+    // python3 is the PARENTPID: it starts the helper, opens the file once and dup()s it; a foreign child opens it too.
+    const script = `
+import os, subprocess, sys, time
+helper, file, control = sys.argv[1], sys.argv[2], sys.argv[3]
+out = open(control + ".out", "w")
+child = subprocess.Popen([helper, "--watch", str(os.getpid()), control, file], stdout=out, pass_fds=())
+while "watching" not in open(control + ".out").read(): time.sleep(0.01)
+fd = os.open(file, os.O_RDWR); os.dup(fd)
+foreign = subprocess.Popen([sys.executable, "-c", "import os, sys, time; os.open(sys.argv[1], os.O_RDONLY); print('ready', flush=True); time.sleep(30)", file], stdout=subprocess.PIPE)
+foreign.stdout.readline()
+open(control + "/go1", "w").close()
+while "end 1" not in open(control + ".out").read(): time.sleep(0.01)
+print(open(control + ".out").read(), flush=True)
+foreign.kill(); child.kill()`;
+    const control = path.join(dir, "control");
+    fs.mkdirSync(control, { mode: 0o700 });
+    const result = spawnSync("python3", ["-c", script, leaseHelperPath(), file, control], { encoding: "utf8", timeout: 30_000 });
+    // opens: the probe's own, the parent's one open, the foreign open; own: ONE description although two fds.
+    // opens: the probe's own, the parent's open (its dup makes no event), the foreign open: 3 > PROBED 1, refused.
+    expect(result.stdout, result.stderr).toContain(`opens 3 1 ${file}\n`);
+  });
+
+  // pi-fabric#881: the window ends BEFORE the switch's first own open of the files, so no own open can merge with a
+  // foreign one inside it (by construction): the report is taken before SQLite opens state.db.
+  it.skipIf(leaseSkip !== "")(`takes the watch's final report before the switch's first own open of the files${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const order: string[] = [];
+    // Every own open of a watched file: Node's fs opens (the create, the pinned fd) and SQLite's (the opener).
+    const openSync = fs.openSync;
+    const spy = vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (/state\.db(-wal|-shm)?$/.test(String(file))) order.push(`open ${path.basename(String(file))}`);
+      return (openSync as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { afterReport: () => { order.push("report"); } },
+      options: { open: (file: string) => { order.push(`open ${path.basename(file)}`); return openNodeSqlite(file); } } });
+    expect(result.code, result.err).toBe(0);
+    spy.mockRestore();
+    expect(order[0]).toBe("report");
+    expect(order.filter(step => step === "report")).toHaveLength(1);
+    expect(order.slice(1).every(step => step.startsWith("open "))).toBe(true);
+  });
+
+  const lateCases = [
+    { name: "state.db", mode: "open", why: "1 open(s) since the lease probe" },
+    // -shm does not exist at the probe: the foreign holder creates it inside the window, seen by name.
+    { name: "state.db-shm", mode: "open", why: "1 open(s) since the lease probe" },
+    // A hard link elsewhere, opened and removed again: the inode watch still sees the open.
+    { name: "state.db", mode: "link", why: "opened through another name (a hard link) since the lease probe" },
+  ] as const;
+  for (const late of lateCases) {
+    it.skipIf(leaseSkip !== "")(`refuses a lock-free, non-dumpable holder that opens ${late.name} (${late.mode}) after the lease probe and before the commit (smarty-dev#8116)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      if (late.name === "state.db-shm") expect(fs.existsSync(path.join(root, late.name))).toBe(false);
+      const holder = await lateHolder(path.join(root, late.name), late.mode);
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          leaseProbe: { beforeReport: () => holder.trigger() } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:${late.name} (unidentified holder of ${root}/${late.name} (${late.why}; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { await holder.release(); }
+      // Without the late holder the same switch is ready: its own SQLite fds are not holders.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+      expect(await backendOf(root)).toBe("sqlite");
+    });
+  }
+
+  // smarty-dev#9473: a mode, owner or link-count change (IN_ATTRIB) on a watched component fails closed like an open.
+  const attribCases = [
+    { name: "a chmod of state.db", change: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o640),
+      undo: (root: string) => fs.chmodSync(path.join(root, "state.db"), 0o600) },
+    // Only the inode watch sees this: the new name is in a directory nobody watches.
+    { name: "a hard link to state.db in an unwatched directory", change: (root: string) => fs.linkSync(path.join(root, "state.db"), path.join(root, "..", `${path.basename(root)}-link`)),
+      undo: (root: string) => fs.rmSync(path.join(root, "..", `${path.basename(root)}-link`), { force: true }) },
+  ] as const;
+  for (const attrib of attribCases) {
+    it.skipIf(leaseSkip !== "")(`refuses ${attrib.name} after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const mode = fs.statSync(path.join(root, "state.db")).mode & 0o777;
+      try {
+        const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+          leaseProbe: { beforeReport: () => attrib.change(root) } });
+        expect(result.code, result.err).toBe(3);
+        expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${root}/state.db (its mode, owner or link count changed since the lease probe; smarty-dev#8116))`);
+        expect(await backendOf(root)).toBe("importing");
+      } finally { attrib.undo(root); fs.chmodSync(path.join(root, "state.db"), mode); }
+      // Without the change the same switch is ready.
+      const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+      expect(ready.code, ready.err).toBe(0);
+    });
+  }
+
+  // pi-fabric#881 Astra round 4 (P1): a hard link out, the original name unlinked, then the retained link opened before
+  // the final report. The inode stays alive with no IN_DELETE_SELF; the removed name must not end counting silently.
+  it.skipIf(leaseSkip !== "")(`refuses a state.db whose name is unlinked while a hard link elsewhere is opened (pi-fabric#881 round 4)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const db = path.join(root, "state.db");
+    const link = path.join(root, "..", `${path.basename(root)}-retained`);
+    let fd: number | undefined;
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => { fs.linkSync(db, link); fs.unlinkSync(db); fd = fs.openSync(link, "r+"); } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease:state.db (unidentified holder of ${db} (its name was removed since the lease probe (a hard link may keep the inode open); smarty-dev#8116))`);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      fs.rmSync(link, { force: true });
+    }
+    // Refused, never committed: the switch record ends in a refused outcome. (The old store lived on only through the
+    // retained link: exactly the detached store the rule refuses to switch away from. The ready path is the tests above.)
+    expect(records(root).at(-1)).toMatchObject({ phase: "outcome", ok: false, refused: true });
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses a chmod of a watched state-shadow/ after the lease probe (smarty-dev#9473)${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => fs.chmodSync(shadow, 0o750) } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a watched directory's mode, owner or link count changed (smarty-dev#8116)");
+    expect(await backendOf(root)).toBe("importing");
+    fs.chmodSync(shadow, 0o700);
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
+  // smarty-dev#8116 review round 1 (SEC P1): a watched directory swapped for a new one during the window. The new
+  // state-shadow/ (and any SQLite file in it) is unwatched, so the counts are void: refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a watched state-shadow/ is moved away and replaced after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const shadow = path.join(root, "state-shadow");
+    fs.mkdirSync(shadow, { mode: 0o700 });
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => {
+        fs.renameSync(shadow, path.join(root, "state-shadow.old"));
+        fs.mkdirSync(shadow, { mode: 0o700 });
+        fs.writeFileSync(path.join(shadow, "state.db"), "");
+      } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a watched directory or file moved, deleted or replaced (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+    // With the directory left alone the same switch is ready.
+    const ready = await run(["cutover", "--root", root], { procScan: { listPids: () => [] } });
+    expect(ready.code, ready.err).toBe(0);
+  });
+
+  // The real helper: a state-shadow/ that did not exist at the probe appears during the window (unwatched): refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a state-shadow/ appears after the lease probe${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    expect(fs.existsSync(path.join(root, "state-shadow"))).toBe(false);
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => { fs.mkdirSync(path.join(root, "state-shadow"), { mode: 0o700 }); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+    expect(await backendOf(root)).toBe("importing");
+  });
+
+  // pi-fabric#881 review round 2 (SEC P1): the missing state-shadow/ appears as a SYMLINK to a directory elsewhere, and
+  // a holder opens state.db through it; or a pre-made directory is renamed into place. Both refuse.
+  it.skipIf(leaseSkip !== "")(`refuses when a missing state-shadow/ appears as a symlink and a holder opens state.db through it${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const outside = tempDir("outside");
+    fs.writeFileSync(path.join(outside, "state.db"), "");
+    const holder = await lateHolder(path.join(root, "state-shadow", "state.db"), "open");
+    try {
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+        leaseProbe: { beforeReport: () => {
+          fs.symlinkSync(outside, path.join(root, "state-shadow"));
+          holder.trigger();
+        } } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain("holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): the lease watch reported a new state-shadow directory (smarty-dev#8116))");
+      expect(await backendOf(root)).toBe("importing");
+    } finally { await holder.release(); }
+  });
+
+  it.skipIf(leaseSkip !== "")(`refuses when a pre-made directory is renamed into place as state-shadow/${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+    const root = await crashedImport();
+    const premade = path.join(root, "premade");
+    fs.mkdirSync(premade, { mode: 0o700 });
+    fs.writeFileSync(path.join(premade, "state.db"), "");
+    const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] },
+      leaseProbe: { beforeReport: () => { fs.renameSync(premade, path.join(root, "state-shadow")); } } });
+    expect(result.code, result.err).toBe(3);
+    expect(result.err).toContain("the lease watch reported a new state-shadow directory (smarty-dev#8116)");
+  });
+
+  // ponytail: an inotify queue overflow needs root (fs.inotify.max_queued_events); a fake helper with a matching
+  // digest stands in for the helper's report, so the gate's handling of it is what this proves.
+  for (const report of ["overflow", "silent"] as const) {
+    it.skipIf(leaseSkip !== "")(`fails closed when the lease watch reports ${report}${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
+      const root = await crashedImport();
+      const helper = path.join(tempDir("fake"), "fabric-mesh-lease");
+      fs.writeFileSync(helper, `#!/bin/sh
+if [ "$1" = --watch ]; then control=$3; shift 3; fi
+for f in "$@"; do if [ -e "$f" ]; then echo "free $f"; else echo "absent $f"; fi; done
+[ -n "$control" ] || exit 0
+echo watching
+while [ ! -e "$control/go1" ]; do sleep 0.01; done
+${report === "silent" ? "" : `echo ${report}; echo "end 1"`}
+exec sleep 30
+`, { mode: 0o700 });
+      const expectedDigest = createHash("sha256").update(fs.readFileSync(helper)).digest("hex");
+      const started = Date.now();
+      const result = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper, expectedDigest } });
+      expect(result.code, result.err).toBe(3);
+      expect(result.err).toContain(`holder@lease-probe (state.db lease probe unavailable (smarty-dev#7936): ${report === "overflow"
+        ? "the lease watch reported lost events (inotify queue overflow)" : "the lease watch did not report"} (smarty-dev#8116))`);
+      expect(await backendOf(root)).toBe("importing");
+      if (report === "silent") expect(Date.now() - started).toBeLessThan(30_000);
+    }, 60_000);
+  }
 
   it.skipIf(leaseSkip !== "")(`fails closed on helper integrity: a tampered helper, even with a matching forged manifest.json${leaseSkip ? ` (skipped: ${leaseSkip})` : ""}`, async () => {
     const root = await crashedImport();

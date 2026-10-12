@@ -58,6 +58,8 @@ const lazyEntryPoints = [
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
   "src/fabric-runtime-state.ts",
+  "src/provider-error-class.ts",
+  "src/topology/root-inbox-context.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
@@ -98,11 +100,14 @@ const lazyEntryPoints = [
   "src/worker/options.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
+  "src/worker/profile-extensions.ts",
   "src/worker/task-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
+  // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
+  "src/mesh/state-backend-nats-client.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

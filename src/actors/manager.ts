@@ -32,7 +32,7 @@ import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
-import { claimMeshRetentionSweep, pruneActorSessionBackups } from "../storage/retention.js";
+import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -74,7 +74,7 @@ import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import { ModelRoutePinError } from "../core/model-refresh.js";
-import { classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES } from "./activation-failure.js";
+import { activationBlockClass, classifyActivationFailure, TRANSIENT_ACTIVATION_BLOCK_CODES, type ActivationBlockClass } from "./activation-failure.js";
 
 export interface ActorModelRouteInput {
   routeClass: string; protected: unknown; pinModel: unknown; pinThinking: unknown; modelReason?: string;
@@ -119,6 +119,8 @@ interface ActorQueueItem {
   executionStarted?: boolean;
   /** Unlaunched preparation failures, independent of the crash/drop budget (#3167). */
   preparationAttempts?: number;
+  /** Already retried once on a fresh session after a context overflow (smarty-dev#3238). */
+  overflowRetried?: boolean;
   /** A run a restart interrupted: restored ahead of the queue, beyond its limit (#878). */
   resumed?: boolean;
   /** Unread outcome retained as context, never as a runnable activation. */
@@ -273,9 +275,11 @@ const MAIN_REVISION_EVENTS: ReadonlySet<FabricActorHostEvent> = new Set([
 ]);
 const ORPHAN_ADOPTION_RETRY_MS = 30_000;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-/** One mesh-wide run-retention sweep per mesh per hour, whichever owner claims it (smarty-dev#3252). */
-const MESH_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
-/** The hourly mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
+/** One mesh-wide run-retention sweep per mesh per day, whichever owner claims it (smarty-dev#3252). Daily, not hourly
+ * (smarty-dev#7916, measured on Ryzen 1 2026-10-11: each sweep took 30-35 min at ~0.7 core, so hourly cost ~0.4 core
+ * on average). It collects runs older than the 7-day archive TTL, so a daily cadence loses nothing. */
+export const MESH_RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+/** The daily mesh retention sweep's CLI argv: --apply, now that every deleter it reaches removes through
  * verifiedRemove (smarty-dev#7916); the hold, epoch and state.json gates still refuse on doubt. Off Linux the CLI's
  * gate refuses --apply (smarty-dev#7858). Its JSON report is written atomically, never through a link. */
 export const meshRetentionSweepArgs = (meshRoot: string, runsOlderThanMs: number): string[] =>
@@ -438,6 +442,42 @@ const ACTOR_PREPARATION_MAX_RETRIES = 3;
 /** Callerless preparation backoff, in multiples of the 5 s base: 5 s, 15 s, 60 s, then 5 min. */
 export const ACTOR_PREPARATION_BACKOFF = [1, 3, 12, 60] as const;
 export const FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC = "fabric.alarm.actor-activation";
+/** The mesh retention sweep did not run: its single-flight lock state was uncertain (pi-fabric#883). */
+export const FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC = "fabric.alarm.retention-sweep-lock";
+/** smarty-dev#3238: a carried session at or past this share of its model window resets at the next run boundary. */
+export const ACTOR_CONTEXT_RESET_RATIO = 0.8;
+/** One explicit notice per event that overflowed a fresh session, on the actor's own output path. */
+export const ACTOR_ACTIVATION_OVERFLOW_KIND = "actor.activation.overflow";
+/** A failed run the worker typed CONTEXT_OVERFLOW, carried to the drain's failure notice (smarty-dev#3238). */
+class ActorContextOverflowError extends Error {}
+export const ACTOR_ACTIVATION_OVERFLOW_REASON = "no verdict (context overflow)";
+const refRecord = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const refValue = (...values: unknown[]): string | number | undefined => {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+    if (typeof value === "string" && value) return value.slice(0, 300);
+  }
+  return undefined;
+};
+/** The triggering event's address for an overflow notice: its topic, key and ref/PR number when present. */
+export const actorEventRef = (item: { id: string; source: string; payload: unknown; coalesceKey?: string }): Record<string, string | number> => {
+  const event = refRecord(item.payload) ?? {};
+  const data = refRecord(event.data) ?? {};
+  const hook = refRecord(data.payload) ?? {};
+  const pull = refRecord(hook.pull_request) ?? refRecord(data.pull_request) ?? refRecord(data.pullRequest);
+  const issue = refRecord(hook.issue) ?? refRecord(data.issue);
+  const pr = refValue(pull?.number, data.pr, data.prNumber, issue?.pull_request ? issue.number : undefined, hook.number, data.number);
+  const entries: Array<[string, string | number | undefined]> = [
+    ["source", item.source], ["itemId", item.id],
+    ["topic", refValue(event.topic)], ["kind", refValue(event.kind)], ["eventId", refValue(event.id)],
+    ["key", refValue(item.coalesceKey, data.key, event.key)],
+    ["repository", refValue(data.repository, refRecord(hook.repository)?.full_name, data.repo)],
+    ["pr", pr], ["issue", pr === undefined ? refValue(issue?.number) : undefined],
+    ["ref", refValue(data.ref, hook.ref, pull?.html_url, issue?.html_url, data.url)],
+  ];
+  return Object.fromEntries(entries.filter((entry): entry is [string, string | number] => entry[1] !== undefined));
+};
 /** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
 export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
@@ -452,15 +492,19 @@ export const ACTOR_BLOCK_REALARM_EVERY_MS = 6 * 60 * 60 * 1000;
 /** A `pending` re-alarm claim older than this was left by a crash: a later sweep takes it over.
  * Far above a publish's bounded mesh-lock wait (10 s), so a live slow publish is not doubled. */
 export const ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS = 5 * 60 * 1000;
-/** smarty-dev#8487: a transient activation failure blocks routing only for a bounded
- * backoff, doubling with each consecutive failure up to the cap; a later run that
- * completes still clears it. Only explicitly transient causes expire (see
- * ./activation-failure.ts); permanent, security and unrecognised failures need an
- * operator or a completed run, as before. */
-export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MS = 5 * 60 * 1000;
+/** smarty-dev#8487, smarty-dev#6509: a transient activation failure blocks routing only for a
+ * cooldown (actors.transientBlockCooldownMs, default 10 min). Then the block expires, the actor
+ * is routable again and its next activation is the probe. A transient failure of that probe
+ * blocks again with the backoff doubled, up to the cap (actors.transientBlockMaxMs, default
+ * 60 min); a run that completes clears it. Only explicitly transient causes expire (see
+ * ./activation-failure.ts); permanent, security and unrecognised failures need an operator, a
+ * completed run or a re-created actor, as before. */
+export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MS = 10 * 60 * 1000;
 export const ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS = 60 * 60 * 1000;
-export const activationBlockBackoffMs = (count: number): number => Math.min(ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS,
-  ACTOR_TRANSIENT_BLOCK_BACKOFF_MS * 2 ** Math.min(16, Math.max(0, Math.floor(count) - 1)));
+/** The backoff after count consecutive failed probes; also bounds a legacy record without retryAt. */
+export const activationBlockBackoffMs = (count: number, base = ACTOR_TRANSIENT_BLOCK_BACKOFF_MS,
+  max = ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS): number => Math.min(Math.max(base, max),
+  base * 2 ** Math.min(16, Math.max(0, Math.floor(count) - 1)));
 /** When a transient block stops gating routing; undefined for a block only a completed run clears.
  * A record from an older writer has no retryAt: its episode start bounds it instead. */
 const activationBlockExpiresAt = (blocked: { code: string; since: number; count: number; retryAt?: number }): number | undefined =>
@@ -469,18 +513,33 @@ const activationBlockExpired = (blocked: Parameters<typeof activationBlockExpire
   const at = blocked ? activationBlockExpiresAt(blocked) : undefined;
   return at !== undefined && now >= at;
 };
-type ActivationBlock = { reason: string; code: string; since: number; count: number; retryAt?: number; classification: string };
+/** class is derived from code (never trusted from a stored record); blockedAt is the latest failure;
+ * a transient block carries backoffMs (its current cooldown) and retryAt (its expiry). */
+type ActivationBlock = { reason: string; code: string; class: ActivationBlockClass; since: number; blockedAt: number; count: number;
+  retryAt?: number; backoffMs?: number; classification: string };
+/** Codes whose stored classification carries no evidence a newer rule could overturn into a
+ * permanent cause: a fail-closed "unknown" (its full failure was already scanned for a permanent
+ * cause and had none) and the fixed "failing-preparation" text (a preparation timeout is
+ * transient since smarty-dev#6509). Re-derived from the stored reason on load, so an actor an
+ * older host blocked for good on a transient cause recovers after an upgrade without a re-create. */
+const REDERIVED_BLOCK_CODES: ReadonlySet<string> = new Set(["unknown", "failing-preparation"]);
+const finitePositive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
 /** A stored block without a classification comes from an older writer: re-derive its class from
  * its stored reason with today's rules, so only a recognisably transient one can expire. */
 const restoredActivationBlock = (stored: { reason: string; code: string; since: number; count: number;
-  retryAt?: unknown; classification?: unknown }): ActivationBlock => {
-  const derived = typeof stored.classification === "string"
-    ? { code: stored.code, classification: stored.classification }
-    : (({ code, classification }) => ({ code, classification: `${classification} (re-derived from an older record's stored reason)` }))(
-      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" }));
-  return { reason: stored.reason, code: derived.code, since: stored.since, count: stored.count, classification: derived.classification,
-    ...(TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code) && typeof stored.retryAt === "number" && Number.isFinite(stored.retryAt)
-      ? { retryAt: stored.retryAt } : {}) };
+  retryAt?: unknown; classification?: unknown; blockedAt?: unknown; backoffMs?: unknown }): ActivationBlock => {
+  const rederive = typeof stored.classification !== "string" || REDERIVED_BLOCK_CODES.has(stored.code);
+  const derived = !rederive ? { code: stored.code, classification: stored.classification as string }
+    : (({ code, classification }) => ({ code, classification: code === stored.code && typeof stored.classification === "string"
+      ? stored.classification : `${classification} (re-derived from an older record's stored reason)` }))(
+      classifyActivationFailure({ lastError: stored.reason, preparation: stored.code === "failing-preparation" ||
+        stored.code === "preparation-timeout" }));
+  const transient = TRANSIENT_ACTIVATION_BLOCK_CODES.has(derived.code);
+  return { reason: stored.reason, code: derived.code, class: activationBlockClass(derived.code), since: stored.since,
+    blockedAt: finitePositive(stored.blockedAt) ? stored.blockedAt : stored.since, count: stored.count,
+    classification: derived.classification,
+    ...(transient && finitePositive(stored.retryAt) ? { retryAt: stored.retryAt } : {}),
+    ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent };
 
@@ -500,6 +559,15 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
+/** smarty-dev#6509: a preparation failure that only ran out of time (its own deadline, the
+ * model/auth launch deadline, or a mesh lock wait) blocks as transient, never for good. */
+const preparationTimedOut = (error: unknown): boolean => {
+  for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
+    if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || isMeshLockTimeout(cause)) return true;
+  }
+  return false;
+};
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
@@ -511,6 +579,11 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
+  // smarty-dev#3238: each actor's last run context use. An overflow retry's fresh session is derived
+  // from its durable queue item (overflowRetried), so a restart before the reset still resets.
+  readonly #lastContextUsage = new Map<string, { tokens: number; contextWindow: number }>();
+  readonly #transientBlockCooldownMs: number;
+  readonly #transientBlockMaxMs: number;
   // smarty-dev#6144 review round 3: read at every drain, never captured, so a live config reload that
   // enables or removes agents.wakeText applies to the next activation (removal revokes at once).
   readonly #wakeTextPolicy: () => FabricWakeTextConfig | undefined;
@@ -655,6 +728,9 @@ export class ActorManager {
   #registryFingerprint: string | undefined;
   #savedActors: { owned: string; critical: string; fingerprint: string | undefined } | undefined;
   readonly #lazyMessages = new WeakMap<ManagedActor, Record<string, unknown>>();
+  // smarty-dev#8487: a legacy row's binding verified at load against this owner's
+  // effective run binding. A derived view only: never saved, rechecked on each read.
+  readonly #restoredBindings = new WeakMap<ManagedActor, FabricActorRunBinding>();
   readonly #unarchivedMessages = new WeakMap<ManagedActor, FabricActorMessage[]>();
   readonly #resetMessages = new WeakSet<ManagedActor>();
   #registrySaveTimer: NodeJS.Timeout | undefined;
@@ -732,6 +808,10 @@ export class ActorManager {
       retention?: FabricRetentionConfig;
       /** Reset an actor's session at a run boundary past this size; 0 disables (smarty-dev#1439). */
       maxSessionBytes?: number;
+      /** First cooldown of a transient activation block, and the cap its doubling backoff reaches
+       * (actors.transientBlockCooldownMs / transientBlockMaxMs; smarty-dev#6509). */
+      transientBlockCooldownMs?: number | undefined;
+      transientBlockMaxMs?: number | undefined;
       /**
        * Host-only agents.wakeText: hydrate projected GitHub webhook text from the local receipt (smarty-dev#6144).
        * A resolver is read at every activation drain, so a live config reload enables or revokes it at once;
@@ -756,6 +836,10 @@ export class ActorManager {
     this.#releasePaused = options.releasePaused ?? false;
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
+    this.#transientBlockCooldownMs = finitePositive(options.transientBlockCooldownMs)
+      ? Math.floor(options.transientBlockCooldownMs) : ACTOR_TRANSIENT_BLOCK_BACKOFF_MS;
+    this.#transientBlockMaxMs = Math.max(this.#transientBlockCooldownMs, finitePositive(options.transientBlockMaxMs)
+      ? Math.floor(options.transientBlockMaxMs) : ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS);
     const wakeText = options.wakeText;
     this.#wakeTextPolicy = typeof wakeText === "function" ? wakeText : () => wakeText;
     this.#mainAgent = options.mainAgent;
@@ -1506,15 +1590,24 @@ export class ActorManager {
       waiters.forEach((waiter) => waiter.reject(error));
       return undefined;
     }
-    let trigger: "requested" | "size" | undefined = waiters ? "requested" : undefined;
+    let trigger: "requested" | "size" | "context" | undefined = waiters ? "requested" : undefined;
     if (!trigger && this.#maxSessionBytes > 0) {
       try {
         if (fs.statSync(live.sessionFile).size > this.#maxSessionBytes) trigger = "size";
       } catch { /* no session file yet */ }
     }
+    // smarty-dev#3238: a carried session that the last run left (nearly) full, or that holds history
+    // while the next event is an overflow retry, starts the next run fresh. The retry is read from the
+    // persisted queue item, never an in-memory marker, so a restart between the queue checkpoint and
+    // this archive still retries on a fresh session; a session already fresh is not archived again.
+    const usage = this.#lastContextUsage.get(live.id);
+    const overflowRetry = !trigger && actor.queue[0]?.overflowRetried === true &&
+      this.#sessionCarriedHistory(live, this.#sessionBytes(live.sessionFile));
+    if (!trigger && (overflowRetry || (usage !== undefined && this.#carriesSession(live) &&
+      usage.tokens >= usage.contextWindow * ACTOR_CONTEXT_RESET_RATIO))) trigger = "context";
     if (!trigger) return undefined;
     try {
-      this.#archiveSession(live, trigger);
+      this.#archiveSession(live, trigger, overflowRetry);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       waiters?.forEach((waiter) => waiter.reject(failure));
@@ -1530,7 +1623,7 @@ export class ActorManager {
   }
 
   // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
-  #archiveSession(actor: ManagedActor, trigger: "requested" | "size"): void {
+  #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
       throw new Error(`Cannot rotate actor ${actor.name} while an activation is in flight`);
@@ -1566,6 +1659,8 @@ export class ActorManager {
     this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
+    const usage = this.#lastContextUsage.get(actor.id);
+    this.#lastContextUsage.delete(actor.id);
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
       id: randomUUID(),
@@ -1576,8 +1671,11 @@ export class ActorManager {
       createdAt: Date.now(),
       reason: trigger === "size"
         ? `session reset (size limit): ${bytes} bytes > ${this.#maxSessionBytes}`
+        : trigger === "context"
+        ? overflow ? "session reset (context overflow): retrying the event once on a fresh session"
+          : `session reset (context window): last run used ${usage?.tokens} of ${usage?.contextWindow} tokens`
         : "session reset (requested)",
-      data: { sessionReset: { trigger, bytes, archived } },
+      data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow, ...(usage ? { contextUsage: usage } : {}) } : {}) } },
     });
   }
 
@@ -3407,6 +3505,8 @@ export class ActorManager {
           // Admission is held, but no child writer has launched yet. Repair/create
           // the native session before handing its path to the process.
           this.#ensurePiSession(actor);
+          // smarty-dev#3238: what the session held at launch, read only if this run overflows.
+          const sessionBytesBefore = this.#sessionBytes(actor.sessionFile);
           if (actor.preparing) actor.preparing.phase = "launch";
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           const result = await this.agents.run(
@@ -3479,11 +3579,47 @@ export class ActorManager {
             throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
+          if (result.contextUsage) this.#lastContextUsage.set(actor.id, { ...result.contextUsage });
           if (actor.runner === "claude" && result.runnerSessionId) {
             actor.runnerSessionId = result.runnerSessionId;
             await this.#saveActors();
           }
           if (result.status !== "completed") {
+            // smarty-dev#3238 round 2: only the worker's typed code, set from a structured overflow
+            // signal, retries or reports an overflow; error text that quotes the phrase never does.
+            const contextOverflow = result.errorCode === "CONTEXT_OVERFLOW" && !abortController.signal.aborted && !runStopped;
+            // smarty-dev#3238 round 3: a retry replays the whole event. Once a tool has run, its side
+            // effects may already have happened, and nothing makes a replay idempotent: retry only a
+            // run that executed no tool call (the worker counts each tool_execution_start).
+            const toolsRan = result.toolCalls !== 0;
+            if (contextOverflow && !toolsRan && !item.overflowRetried && !this.#closing && (actor.status as string) !== "stopped" &&
+                this.#sessionCarriedHistory(actor, sessionBytesBefore)) {
+              // smarty-dev#3238: carried history left this event no room. Reset the session at this
+              // boundary and run the same event once more, ahead of newer work, on a fresh session.
+              item.overflowRetried = true;
+              item.executionStarted = false;
+              handoffConsumed = false;
+              // Transfer ownership before cleanup can yield: never both in flight and queued (#3167).
+              this.#inFlight.delete(actor.id);
+              actor.queue.unshift(item);
+              this.#persistQueue(actor.id, true);
+              this.#recordMessage(this.#liveActor(actor), {
+                id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+                createdAt: Date.now(), reason: "context overflow on a carried session: resetting it and retrying the event once",
+                data: { contextOverflow: { retry: true, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
+              });
+              continue;
+            }
+            if (contextOverflow && toolsRan) {
+              // Settles exactly like a fresh-session overflow (notice, alarm, failed activation); say why.
+              this.#recordMessage(this.#liveActor(actor), {
+                id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
+                createdAt: Date.now(),
+                reason: `context overflow after ${Number.isFinite(result.toolCalls) ? result.toolCalls : "unknown"} tool call(s): not retrying the event, a replay could repeat their side effects`,
+                data: { contextOverflow: { retry: false, toolCalls: result.toolCalls, runId: result.id, error: result.error, eventRef: actorEventRef(item) } },
+              });
+            }
+            if (contextOverflow) this.#publishActivationOverflow(actor, item, result.id, result.error ?? "");
             if (actor.responseMode === "directive") {
               // A failed directive run is non-fatal: stay silent and keep the
               // actor ambient instead of erroring out. Record the run error for
@@ -3505,9 +3641,11 @@ export class ActorManager {
               };
               this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
-              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false, result.warnings);
+              this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false,
+                contextOverflow, result.warnings);
               continue;
             }
+            if (contextOverflow) throw new ActorContextOverflowError(result.error || `Actor run ${result.status}`);
             throw new Error(result.error || `Actor run ${result.status}`);
           }
           const message = this.#outgoingMessage(actor, item, result);
@@ -3616,7 +3754,8 @@ export class ActorManager {
               retryDelay = this.#preparationRetryMs * ACTOR_PREPARATION_BACKOFF[
                 Math.min(item.preparationAttempts, ACTOR_PREPARATION_BACKOFF.length) - 1]!;
               if (item.preparationAttempts > ACTOR_PREPARATION_MAX_RETRIES) {
-                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER, true);
+                this.#noteFailedActivation(actor, message, runId, false, ACTOR_FAILURE_NOTICE_AFTER,
+                  preparationTimedOut(error) ? "timeout" : true);
               }
             }
             retryDrain = true;
@@ -3635,7 +3774,8 @@ export class ActorManager {
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
-            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0);
+            retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
+            false, error instanceof ActorContextOverflowError);
         } finally {
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
@@ -3718,10 +3858,58 @@ export class ActorManager {
     }
   }
 
+  // smarty-dev#3238: a full-history Pi actor carries its session into every run. An activation
+  // window never shows the model that history, so a reset cannot free its context.
+  #carriesSession(actor: ManagedActor): boolean {
+    return actor.runner === "pi" && actor.inferenceContext !== "activation";
+  }
+
+  #sessionBytes(file: string): number {
+    try { return fs.statSync(file).size; } catch { return 0; }
+  }
+
+  // Whether the first `bytes` of the session (what it held at launch; Pi only appends) hold a
+  // conversation entry. The first one follows the header, so this rarely reads past one chunk.
+  #sessionCarriedHistory(actor: ManagedActor, bytes: number): boolean {
+    if (!this.#carriesSession(actor) || bytes <= 0) return false;
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(actor.sessionFile, "r");
+      const chunk = Buffer.alloc(Math.min(bytes, 64 * 1024));
+      let carry = "";
+      for (let offset = 0; offset < bytes;) {
+        const read = fs.readSync(fd, chunk, 0, Math.min(chunk.length, bytes - offset), offset);
+        if (read <= 0) break;
+        offset += read;
+        const text = carry + chunk.toString("utf8", 0, read);
+        if (/"type"\s*:\s*"message"/.test(text)) return true;
+        carry = text.slice(-32);
+      }
+    } catch { /* unreadable: treat it as fresh, which never retries */ }
+    finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* closed */ } }
+    return false;
+  }
+
+  // smarty-dev#3238: an event that overflowed a fresh session gets no verdict. Say so explicitly, once,
+  // on the actor's own output path, so its owner or the factory can report it where the event came from.
+  #publishActivationOverflow(actor: ManagedActor, item: ActorQueueItem, runId: string | undefined, error: string): void {
+    const eventRef = actorEventRef(item);
+    const where = eventRef.pr !== undefined ? ` for PR ${eventRef.repository ? `${eventRef.repository}#` : "#"}${eventRef.pr}`
+      : eventRef.topic ? ` for ${eventRef.topic}${eventRef.kind ? ` ${eventRef.kind}` : ""}` : "";
+    void this.#publishNotification({
+      topic: "fabric.actor.output",
+      kind: ACTOR_ACTIVATION_OVERFLOW_KIND,
+      from: { id: actor.id, name: actor.name, kind: "actor", sessionId: this.sessionId },
+      text: `${actor.name}: ${ACTOR_ACTIVATION_OVERFLOW_REASON}${where}.`,
+      data: { actorId: actor.id, actorName: actor.name, eventRef, reason: ACTOR_ACTIVATION_OVERFLOW_REASON,
+        ...(runId ? { runId } : {}), error: (error.split("\n").map((line) => line.trim()).find(Boolean) ?? error).slice(0, 300) },
+    }).catch(() => undefined);
+  }
+
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
-  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0, preparation = false,
-    evidence?: readonly string[]): void {
+  #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
+    preparation: boolean | "timeout" = false, contextOverflowCode = false, evidence?: readonly string[]): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -3738,16 +3926,33 @@ export class ActorManager {
       !/^\s*(?:\[pi-fabric\]\s*)?(?:warning\b|Pi does not advertise\b)/i.test(line));
     const lastError = lines.filter(line => /\berror\b|\bfailed\b|\bexited\b|Context exceeds window/i.test(line)).at(-1)
       ?? lines.at(-1) ?? "Unknown activation failure";
+    // smarty-dev#3238 round 2: context-overflow comes only from the run's typed CONTEXT_OVERFLOW code.
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
-    const { code, transient, classification } = classifyActivationFailure({ lastError, error, evidence, preparation });
+    const classified = contextOverflowCode && !preparation
+      ? { code: "context-overflow", transient: false, classification: "permanent: context window exceeded (typed CONTEXT_OVERFLOW run code)" }
+      : classifyActivationFailure({ lastError, error, evidence,
+        preparation: preparation === true, preparationTimeout: preparation === "timeout" });
+    // Error text that only quotes "Context exceeds window" stays blocked (never expires), but it is not an overflow.
+    const { code, transient, classification } = classified.code === "context-overflow" && !contextOverflowCode
+      ? { code: "unknown", transient: false,
+        classification: `fail-closed: overflow text without the run's typed CONTEXT_OVERFLOW code (${classified.classification})` }
+      : classified;
     const reason = lastError.slice(0, 300);
     const previous = actor.activationBlocked;
     const now = Date.now();
     const count = previous?.code === code ? previous.count + 1 : 1;
+    // A transient failure (smarty-dev#8487, smarty-dev#6509) gates routing for a cooldown, not
+    // forever. Only a failed probe, the first failure after an earlier transient block expired,
+    // doubles it (to the cap); a further failure inside the window restarts the same cooldown, so
+    // a burst of queued events failing in one outage does not escalate to the cap at once.
+    const previousBackoff = previous && TRANSIENT_ACTIVATION_BLOCK_CODES.has(previous.code)
+      ? previous.backoffMs ?? activationBlockBackoffMs(previous.count, this.#transientBlockCooldownMs, this.#transientBlockMaxMs)
+      : undefined;
+    const backoffMs = previousBackoff === undefined ? this.#transientBlockCooldownMs
+      : activationBlockExpired(previous, now) ? Math.min(this.#transientBlockMaxMs, previousBackoff * 2) : previousBackoff;
     actor.activationBlocked = {
-      reason, code, since: previous?.code === code ? previous.since : now, count, classification,
-      // A transient failure (smarty-dev#8487) gates routing for a doubling backoff, not forever.
-      ...(transient ? { retryAt: now + activationBlockBackoffMs(count) } : {}),
+      reason, code, class: activationBlockClass(code), since: previous?.code === code ? previous.since : now, blockedAt: now, count,
+      classification, ...(transient ? { retryAt: now + backoffMs, backoffMs } : {}),
     };
     this.#armActivationBlockExpiry(actor, now);
     actor.updatedAt = now;
@@ -3775,8 +3980,9 @@ export class ActorManager {
     }
     void this.#publishNotification({
       topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity,
-      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code, classification,
+      data: { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason, code, class: activationBlockClass(code), classification,
         since: actor.activationBlocked?.since, count: actor.activationBlocked?.count,
+        ...(actor.activationBlocked?.retryAt !== undefined ? { retryAt: actor.activationBlocked.retryAt } : {}),
         routingStatus: this.#publicInfo(actor).status, pendingEffects: "reconcile-required", ...(runId ? { runId } : {}) },
     }).catch(() => undefined);
     try {
@@ -4534,26 +4740,48 @@ export class ActorManager {
 
   /**
    * Runs of dead, removed or unloaded actors have no live owner to prune them (smarty-dev#3252,
-   * #5652). Whichever owner claims the mesh's hourly slot starts the retention CLI as a detached,
-   * niced process. It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
+   * #5652). Whichever owner claims the mesh's daily slot starts the retention CLI as a detached,
+   * niced process that holds the sweep lock for its whole life (single flight, pi-fabric#883: the kernel releases it
+   * on exit or crash). An uncertain lock state never sweeps: one log line and one mesh alarm, and the next tick
+   * retries. Linux only: off Linux the CLI refuses --apply (smarty-dev#7858), so there is nothing to sweep.
+   * It applies (smarty-dev#7916): terminal runs older than the actor archive TTL are removed
    * through verifiedRemove, behind the hold, epoch and state.json gates.
    */
   async #startMeshRetentionSweep(): Promise<void> {
     const script = this.#meshRetentionSweepPath;
     const meshRoot = this.mesh.root;
     const relative = path.relative(path.join(meshRoot, "actors"), this.#actorRoot);
-    if (!script || relative.startsWith("..") || path.isAbsolute(relative)) return;
+    if (!script || relative.startsWith("..") || path.isAbsolute(relative) || process.platform !== "linux" || this.#closing) return;
     try {
       const [runtime, ...args] = await scriptSpawnArgs(script,
         meshRetentionSweepArgs(meshRoot, this.#logs.retention.actorRunArchiveMs));
-      if (this.#closing || !claimMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS)) return;
-      const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true });
-      child.on("error", () => undefined);
-      if (child.pid) {
-        try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
-      }
-      child.unref();
+      if (this.#closing) return;
+      const now = Date.now();
+      const outcome = await startLockedMeshRetentionSweep(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, (lock) => {
+        // The sweep inherits the locked descriptor as fd 3 and holds the lock until it exits.
+        const child = spawn(runtime!, args, { env: childProcessEnvironment(), detached: true,
+          stdio: ["ignore", "ignore", "ignore", lock], windowsHide: true });
+        child.on("error", () => undefined);
+        if (child.pid) {
+          recordMeshRetentionSweeper(meshRoot, MESH_RETENTION_SWEEP_INTERVAL_MS, child.pid, now); // diagnostics only
+          try { os.setPriority(child.pid, 19); } catch { /* best effort */ }
+        }
+        child.unref();
+      }, now, () => !this.#closing);
+      if (typeof outcome === "object") this.#alarmSweepLock(meshRoot, outcome.uncertain);
+      // smarty-dev#9508: only a successful acquire proves the lock works again; "busy" proves nothing about it.
+      else if (outcome === "started" || outcome === "claimed") this.#sweepLockAlarmed = false;
     } catch { /* the next slot retries */ }
+  }
+
+  #sweepLockAlarmed = false;
+  // Fail closed (pi-fabric#883): skipping a daily sweep is safe. One alarm until a lock is taken again.
+  #alarmSweepLock(meshRoot: string, reason: string): void {
+    if (this.#sweepLockAlarmed) return;
+    this.#sweepLockAlarmed = true;
+    console.warn(`[pi-fabric] mesh retention sweep skipped: its lock state is uncertain (${reason})`);
+    void this.mesh.publish({ topic: FABRIC_RETENTION_SWEEP_LOCK_ALARM_TOPIC, kind: "retention-sweep-lock-uncertain", from: this.identity,
+      data: { meshRoot, reason } }).catch(() => undefined);
   }
 
   // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
@@ -5496,6 +5724,7 @@ export class ActorManager {
     // previously loaded actor). Publish owned presence through the existing
     // retry queue after loading the complete registry, without rewriting it.
     for (const actor of loaded) {
+      this.#restoreLoadedBinding(actor);
       if (this.#ownershipDecision(actor.id)) this.#pendingPresence.add(actor.id);
     }
     this.#schedulePresenceRetry();
@@ -5614,6 +5843,7 @@ export class ActorManager {
             launchEvidenceVersion: 1,
             executionStarted: item.executionStarted === true,
             preparationAttempts: item.preparationAttempts ?? 0,
+            ...(item.overflowRetried ? { overflowRetried: true } : {}),
             ...(item === inFlight || item.resumed ? { resumed: true } : {}),
             ...(item.deferredHandoff ? { deferredHandoff: true } : {}),
           }))];
@@ -5938,6 +6168,7 @@ export class ActorManager {
         launchEvidenceVersion: 1,
         executionStarted: false, // this restoration has not launched a new worker
         preparationAttempts: counter(value.preparationAttempts),
+        ...((value as { overflowRetried?: unknown }).overflowRetried === true ? { overflowRetried: true } : {}),
       } as ActorQueueItem & { attempts: number };
       if (deferredHandoff) {
         if (!this.#childCompletionStore(actor).retained(value.id, this.#logs.retention.actorRunArchiveMs)) continue;
@@ -6012,6 +6243,50 @@ export class ActorManager {
     };
   }
 
+  /**
+   * smarty-dev#8487 (pi-fabric#843 review): a registry row without a run binding
+   * (written before #7682 or rebuilt by an older runtime) may advertise its persisted
+   * model/thinking only when they EXACTLY equal what an owner-defaults run here would
+   * pin: this owning root's session overlay applied (#runBinding), then the selector
+   * admitted and canonicalized as a run does (#resolvedRunBinding). A foreign root
+   * cannot see the owner's overlay, and a route-class actor's model is chosen per run;
+   * a mismatch, refusal, or resolver error leaves the binding unknown (fail closed).
+   */
+  #restoreLoadedBinding(actor: ManagedActor): void {
+    if (actor.resolvedBinding || !actor.model || actor.routeClass !== undefined || actor.rootId !== this.#rootId) return;
+    const effective = this.#runBinding(actor);
+    const thinking = effective.thinking ?? this.agents.config.thinking;
+    if (effective.model !== actor.model || thinking !== (actor.thinking ?? this.agents.config.thinking)) return;
+    const candidate: FabricActorRunBinding = { model: actor.model,
+      ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}), thinking };
+    const settle = (resolved: FabricActorRunBinding, deferred: boolean): void => {
+      // A canonical selector other than the persisted one (alias, retarget) runs another model.
+      if (resolved.model !== candidate.model) return;
+      if (deferred && (this.#closing || this.#actors.get(actor.id) !== actor || actor.resolvedBinding ||
+        !this.#sameRunBinding(actor, candidate))) return;
+      this.#restoredBindings.set(actor, candidate);
+      // A synchronous result precedes this load's own presence publication.
+      if (deferred) void this.#publishBindingView(actor).catch(() => undefined);
+    };
+    let resolving: FabricActorRunBinding | Promise<FabricActorRunBinding>;
+    try { resolving = this.#resolvedRunBinding(actor, effective); } catch { return; }
+    if (resolving instanceof Promise) void resolving.then((resolved) => settle(resolved, true), () => undefined);
+    else settle(resolving, false);
+  }
+
+  /** Whether an owner-defaults run here would still pin exactly this (pre-resolution) binding. */
+  #sameRunBinding(actor: ManagedActor, binding: FabricActorRunBinding): boolean {
+    const now = this.#runBinding(actor);
+    return now.model === binding.model && now.modelReason === binding.modelReason &&
+      (now.thinking ?? this.agents.config.thinking) === binding.thinking;
+  }
+
+  /** A restored legacy binding, unknown again once an owner overlay or default diverges. */
+  #restoredBinding(actor: ManagedActor): FabricActorRunBinding | undefined {
+    const restored = this.#restoredBindings.get(actor);
+    return restored && this.#sameRunBinding(actor, restored) ? restored : undefined;
+  }
+
   #rememberResolvedBinding(actor: ManagedActor, binding: FabricActorRunBinding): void {
     const live = this.#actors.get(actor.id);
     // Model admission may await while a registry reload replaces the executing
@@ -6032,7 +6307,7 @@ export class ActorManager {
     const session = registryView ? undefined : this.#bindings.get(actor.id);
     // Shared observers cannot know a legacy row's last admitted binding. An
     // omitted model/thinking means unknown, not this reader's session overlay.
-    const effective = registryView ? actor.resolvedBinding ?? {} : this.#runBinding(actor);
+    const effective = registryView ? actor.resolvedBinding ?? this.#restoredBinding(actor) ?? {} : this.#runBinding(actor);
     // An expired transient block no longer gates routing; its history stays visible (smarty-dev#8487).
     const blockExpired = activationBlockExpired(actor.activationBlocked);
     return {
@@ -6054,7 +6329,8 @@ export class ActorManager {
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status: actor.status === "stopped" ? "stopped"
         : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
-        ? actor.activationBlocked?.code === "failing-preparation" ? "failing-preparation" : "failed" : actor.preparing
+        ? actor.activationBlocked?.code === "failing-preparation" || actor.activationBlocked?.code === "preparation-timeout"
+          ? "failing-preparation" : "failed" : actor.preparing
         ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status,
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
@@ -6111,7 +6387,9 @@ export class ActorManager {
         : {}),
       ...(actor.activationBlocked ? blockExpired
         ? { activationBlockExpired: { lastBlockedReason: actor.activationBlocked.reason, code: actor.activationBlocked.code,
-          classification: actor.activationBlocked.classification, since: actor.activationBlocked.since, count: actor.activationBlocked.count,
+          class: actor.activationBlocked.class, classification: actor.activationBlocked.classification, since: actor.activationBlocked.since,
+          blockedAt: actor.activationBlocked.blockedAt, count: actor.activationBlocked.count,
+          ...(actor.activationBlocked.backoffMs !== undefined ? { backoffMs: actor.activationBlocked.backoffMs } : {}),
           expiredAt: activationBlockExpiresAt(actor.activationBlocked)! } }
         : { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.validWhile ? { validWhile: structuredClone(actor.validWhile) } : {}),

@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
 import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
@@ -8,6 +8,8 @@ import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
 import type {
+  ContextEvent,
+  ContextEventResult,
   ExtensionAPI,
   ExtensionContext,
   MessageUpdateEvent,
@@ -429,6 +431,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.ensure(context);
       await state.reportMainProviderError(message);
     },
+    ownsNonRetryable: () => state.initialized && state.mainOwnsProviderRecovery(),
   });
   pi.on("input", (event) => {
     if ((event as { source?: string }).source !== "extension") escapeLatched = false;
@@ -494,6 +497,13 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
     observations: new SessionObservationCache(),
   });
   let entropyCaches = createEntropyCaches();
+  // smarty-dev#8881: AgentSession.dispose() invalidates extension contexts without emitting session_shutdown
+  // (pi-coding-agent docs/sdk.md), and Pi exposes no dispose hook; every getter of a stale context throws.
+  // A compile scheduled by a disposed session stops before it reads or writes the agent dir, which may
+  // already be the next session's.
+  const contextLive = (context: ExtensionContext): boolean => {
+    try { void context.hasUI; return true; } catch { return false; }
+  };
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -509,7 +519,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
   ): Promise<void> => {
     const current = (): boolean =>
       !signal.aborted && epoch === entropyLifecycleEpoch && state.initialized &&
-      state.config.entropy.compile;
+      state.config.entropy.compile && contextLive(context);
     if (!current()) return;
     const agentDir = resolveAgentDir();
     const cwd = state.cwd ?? context.cwd;
@@ -587,7 +597,7 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         }
         await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
-        if (request.signal.aborted) return;
+        if (request.signal.aborted || !contextLive(request.context)) return;  // shutdown or dispose
         console.warn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
@@ -1113,6 +1123,8 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       await state.ensure(context); // Failure is first use, never an eager idle import.
       await state.publishOpsEvent(COMPACTION_FAILED_ALARM, COMPACTION_FAILED_ALARM, data);
     },
+    // No agent_settled follows a retry on an idle Main: its end wakes Main for a completion (smarty-dev#9271).
+    retryEnded: () => state.completionIdleSignal(),
   });
 
   // Deterministic, LLM-free compaction is registered unconditionally and is
@@ -1137,7 +1149,11 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
         : DEFAULT_FABRIC_CONFIG.compaction.tokenThresholds[modelKey],
   });
 
-  pi.on("context", (event, context) => {
+  // The root inbox context filter (smarty-dev#8962) loads at the first request whose context holds
+  // an inbox message, not at startup; without one it has nothing to cut. Once loaded it runs on
+  // every request, synchronously.
+  let inboxContext: typeof import("./topology/root-inbox-context.js") | undefined;
+  const projectContext = (event: ContextEvent, context: ExtensionContext): ContextEventResult | undefined => {
     const sessionId = context.sessionManager.getSessionId();
     const pendingContinuation = state.initialized
       ? state.prewalk.pendingContinuationMessage(sessionId)
@@ -1155,8 +1171,21 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       continuation.messages,
       state.initialized && state.prewalk.isArmed(sessionId),
     );
-    let changed = continuation.changed || planning.changed;
-    const messages = planning.messages.map((message) => {
+    // Each root inbox event reaches the model once (smarty-dev#8962), including copies Pi queued
+    // before the ack: later copies are cut, and acked events whose consuming copy was compacted away.
+    const filter = inboxContext;
+    const inbox = filter ? filter.filterRootInboxContext(planning.messages, {
+      acked: (id, sequence) => state.initialized && state.rootInboxAcked(id, sequence),
+      compactedCopies: () => {
+        try {
+          return filter.rootInboxCompactedCopies(context.sessionManager.getBranch?.() ?? []);
+        } catch {
+          return new Map();
+        }
+      },
+    }) : { messages: planning.messages, changed: false };
+    let changed = continuation.changed || planning.changed || inbox.changed;
+    const messages = inbox.messages.map((message) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
         const content = expandSkillDirMarkersInSkillBlock(message.content);
@@ -1176,6 +1205,16 @@ export default async function piFabric(pi: ExtensionAPI, options: { managedHost?
       return messageChanged ? { ...message, content } : message;
     });
     return changed ? { messages } : undefined;
+  };
+  pi.on("context", (event, context) => {
+    // Nothing is projected before the load, so the request is projected once, after it.
+    if (inboxContext || !event.messages.some((message) => (message as { customType?: unknown }).customType === ROOT_INBOX_CUSTOM_TYPE)) {
+      return projectContext(event, context);
+    }
+    return import("./topology/root-inbox-context.js").then((module) => {
+      inboxContext = module;
+      return projectContext(event, context);
+    });
   });
 
   pi.on("before_agent_start", async (event, context) => {

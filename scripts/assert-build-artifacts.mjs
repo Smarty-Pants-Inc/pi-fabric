@@ -87,6 +87,7 @@ const lazy = [
   "worker/options.js",
   "worker/recovery-watchdog.js",
   "worker/retry-profile.js",
+  "worker/profile-extensions.js",
   "worker/task-entry.js",
   "worker/run-log.js",
   "worker/run-record.js",
@@ -109,7 +110,16 @@ if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.joi
 if (process.platform === "linux") {
   // The native helpers are the twice-built, byte-identical outputs recorded in the manifest (build-landlock.mjs).
   const manifest = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
-  if (!/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? ""))) throw new Error(`Native manifest names no gcc or clang compiler: ${manifest.compiler}`);
+  // smarty-dev#8121: the pinned zig (native/toolchain.json), or an unpinned host gcc/clang.
+  const pinned = manifest.toolchain === "pinned" && /^zig \d+\.\d+\.\d+ \(/.test(String(manifest.compiler ?? ""));
+  if (!pinned && (manifest.toolchain !== "unpinned" || !/^(gcc version |(\S+ )?clang version )/.test(String(manifest.compiler ?? "")))) {
+    throw new Error(`Native manifest names no pinned zig and no unpinned gcc or clang compiler: ${manifest.toolchain} ${manifest.compiler}`);
+  }
+  // CI and release builds ship the helpers: only a local development build may stay on the host compiler.
+  if (!pinned && (process.env.CI === "true" || process.env.FABRIC_NATIVE_CC_PINNED === "1")) {
+    throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
+  }
+  if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
   // smarty-dev#8145: the lease probe refuses a helper or gate bundle whose chain up to the package root
   // another user can write: the package root, and everything in dist/, ours, no group/other write, no symlink.
   const owned = (file, label) => {
@@ -216,7 +226,7 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
-for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
+for (const forbidden of ["src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"']) {
   if (initialSource.includes(forbidden)) {
     throw new Error(`Startup static graph contains lazy module marker: ${forbidden}`);
   }

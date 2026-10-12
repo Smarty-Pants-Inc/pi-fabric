@@ -32,6 +32,7 @@ import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
+import { preparedNatsStateBackend } from "./state-backend-nats.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
 import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteDeltaKey, type SqliteStateDelta, type SqliteStateExport,
@@ -166,6 +167,10 @@ export interface StateBackendDiagnostics {
   divergentKeys?: string[];
   /** shadow/sqlite: the SQLite database file. */
   database?: string;
+  /** nats: the stream, the projector's applied and known sequences, the stream status, CAS retries. */
+  nats?: { stream: string; appliedSeq: number; knownSeq: number; status: string; casRetries: number;
+    /** The last complete snapshot's end sequence (0: none), snapshots this host took, purge gaps it reloaded from. */
+    snapshotSeq: number; snapshots: number; resyncs: number; resyncing: boolean; failure?: string };
 }
 
 /** One divergence: the key, and what each side holds (undefined: absent). */
@@ -386,7 +391,11 @@ export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendF
   file: { create: (context, options) => new StateFile(context, options) },
   sqlite: { unavailable: sqliteRefusal, create: (context, options) => new SqliteStateBackend(context, options) },
   shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
-  nats: { create: () => { throw new MeshStateBackendNotBuiltError("nats", "fabric-v2's JetStream state store (pi-fabric#708) has not landed"); } },
+  // smarty-dev#7504: the factory is synchronous, the NATS connection and the stream replay are not. A host prepares
+  // the backend first (`openNatsStateBackend`); an unprepared root refuses, never falls back.
+  nats: { create: (context) => preparedNatsStateBackend(context.root) ?? (() => {
+    throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
+  })() },
 };
 
 /**

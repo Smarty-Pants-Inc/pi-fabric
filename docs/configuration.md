@@ -345,7 +345,9 @@ where absent values do not participate. Outside interactive Main, orchestration 
     "rootGoneTtlMs": 7200000
   },
   "actors": {
-    "maxSessionBytes": 20971520
+    "maxSessionBytes": 20971520,
+    "transientBlockCooldownMs": 600000,
+    "transientBlockMaxMs": 3600000
   }
 }
 ```
@@ -589,6 +591,8 @@ Run housekeeping begins on actual agent storage use (not manager startup), conti
 
 For a one-time **offline** mesh compaction, run `node dist/storage/retention-cli.js <mesh-root> --dry-run` (the default): it lists eligible paths and before/after bytes without creating or changing files. `--apply` performs the same compaction and backup pruning; normal expiry ages remain unchanged. The sweep requires existing Linux host flocks and proven-dead diagnostic holders, and skips live, legacy, unfenced or unreadable custody. Actors must belong to a fenced resident root; latest-run references and malformed-session recovery backups remain protected.
 
+Persistent actor hosts also start this CLI themselves, **once a day per mesh**, with `--apply --runs-older-than <retention.actorRunArchiveMs>`. Whichever host claims the day's slot file (`<mesh>/.mesh-retention-sweep-<day>.json`) runs it as a detached, niced process. Single flight is a kernel lock: the host takes an exclusive non-blocking `flock` on `<mesh>/.mesh-retention-sweep.lock` before it claims the slot, and hands the locked descriptor to the sweep, which holds it until it exits (a crash releases it). While a sweep holds the lock, no new sweep starts. If the lock state is uncertain (for example `flock` is missing), no sweep runs: the host logs one line and publishes one `fabric.alarm.retention-sweep-lock` event. Linux only; elsewhere the CLI refuses `--apply`.
+
 ### Temporary output and reader scratch
 
 New model-output spills and shell logs use private directories with a versioned `.fabric-scratch.json` ownership marker. They expire 24 hours after completion; oldest eligible caches may be removed sooner above **128 MiB or 256 items**, pooled across these two classes. Completed output is protected for its first hour. These aggregate limits are **soft** while files are active/recent or cannot be safely attributed. Model-output artifacts remain complete (not truncated). Their links are temporary.
@@ -821,6 +825,8 @@ credential: this process then publishes nudges and raises alarms), `alarmTo`,
 configuration, never a caller's. It needs the mesh. See [records](records.md).
 
 ## Actors
+
+`actors.transientBlockCooldownMs` (default `600000`, 10 minutes; from 1000 to 86400000) is how long a transient activation block gates routing. Transient blocks come from provider stream errors, timeouts, and preparation or lock timeouts. After the cooldown, the actor is routable again and its next activation is a probe. Each transient failure of a probe doubles the backoff, up to `actors.transientBlockMaxMs` (default `3600000`, 60 minutes). Hard blocks, such as credentials, configuration or a model that is not allowed, never expire. See [actor activation blocks](agents.md) (smarty-dev#6509).
 
 `actors.maxSessionBytes` limits the size of a persistent actor's Pi session file, in bytes. The default is `20971520` (20 MiB). Set it to `0` to disable the limit. Before a run starts, Fabric checks the session file. A larger file gets the same reset as `agents.resetSession()`, with trigger `size`: Fabric archives the file and the run starts a fresh session. So Fabric never starts a run that must compact a session past the limit. Durable actors use the same setting. See [fresh actor sessions](agents.md#fresh-actor-sessions).
 

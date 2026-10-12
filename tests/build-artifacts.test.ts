@@ -20,8 +20,10 @@ const fixture = (): string => {
   }
   return dir;
 };
-const rejected = (dir: string, reason: string): void => {
-  const result = spawnSync(process.execPath, [path.join(dir, "scripts/assert-build-artifacts.mjs")], { encoding: "utf8", timeout: 20_000 });
+const assertBuild = (dir: string, env: NodeJS.ProcessEnv = process.env) =>
+  spawnSync(process.execPath, [path.join(dir, "scripts/assert-build-artifacts.mjs")], { encoding: "utf8", timeout: 20_000, env });
+const rejected = (dir: string, reason: string, env?: NodeJS.ProcessEnv): void => {
+  const result = assertBuild(dir, env);
   expect(result.error).toBeUndefined();
   expect(result.status).toBe(1);
   expect(result.stderr).toContain(reason);
@@ -67,6 +69,20 @@ describe("published build artifact guards", () => {
     fs.chmodSync(path.join(dir, "dist/mesh/mesh-backend-cli.js"), 0o644);
     fs.symlinkSync(os.tmpdir(), path.join(dir, "dist/native/elsewhere"));
     rejected(dir, "dist/native/elsewhere must not be a symlink");
+  });
+  // smarty-dev#8121: CI and release builds ship the helpers, so they must come from the pinned toolchain.
+  it.runIf(process.platform === "linux")("rejects unpinned native helpers under CI or FABRIC_NATIVE_CC_PINNED=1, and only warns locally", () => {
+    const dir = fixture();
+    const file = path.join(dir, "dist/native/manifest.json");
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")),
+      compiler: "gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1)", toolchain: "unpinned" }));
+    const { CI: _ci, FABRIC_NATIVE_CC_PINNED: _pinned, ...local } = process.env;
+    rejected(dir, "Native helpers are unpinned", { ...local, CI: "true" });
+    rejected(dir, "Native helpers are unpinned", { ...local, FABRIC_NATIVE_CC_PINNED: "1" });
+    // Locally it only warns and goes on (this copied tree then stops later, at its missing node_modules).
+    const result = assertBuild(dir, local);
+    expect(result.stderr).toContain("native helpers are UNPINNED");
+    expect(result.stderr).not.toContain("Native helpers are unpinned");
   });
   it("rejects a stale bundled receipt", () => {
     const dir = fixture();

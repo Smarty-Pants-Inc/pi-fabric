@@ -57,7 +57,7 @@ describe("published build artifact guards", () => {
   it.each(["yaml", "pi-fabric-worker-sdk"])("rejects eager %s in the actual extension entry", (dependency) => {
     const dir = fixture();
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
-    expect(manifest.pi.extensions).toEqual(["./dist/extension-bootstrap.js"]);
+    expect(manifest.pi.extensions).toEqual(["./dist/index.js"]);
     fs.appendFileSync(path.join(dir, manifest.pi.extensions[0]), `\nimport "${dependency}";\n`);
     rejected(dir, `Startup eagerly imports optional dependency ${dependency}`);
   });

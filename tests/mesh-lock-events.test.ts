@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -356,6 +357,49 @@ describe("lock events in one process", () => {
     expect(Buffer.byteLength(line)).toBeLessThanOrEqual(LOCK_EVENT_MAX_LINE_BYTES);
     expect(line.endsWith("\n")).toBe(true);
     expect(JSON.parse(line)).toMatchObject({ holder: { pid: 1 }, waiter: { pid: 2 } });
+  });
+
+  // Review round 3 P2: on a full-budget SQLite timeout the waiter leaves the FIFO before the
+  // diagnostic /proc/locks read and the append, so slow diagnostics never keep its ticket at the head.
+  it("SQLite wait-timeout: the FIFO ticket is closed before the holder lookup and the event append", async () => {
+    const { events, SqliteStateStore: Store } = await load();
+    const { MeshLockTicket } = await import("../src/mesh/lock-queue.js");
+    const root = temp();
+    const order: string[] = [];
+    const close = MeshLockTicket.prototype.close;
+    vi.spyOn(MeshLockTicket.prototype, "close").mockImplementation(function (this: InstanceType<typeof MeshLockTicket>) {
+      order.push("ticket.close");
+      return close.call(this);
+    });
+    const waitTimeout = events.waitTimeout.bind(events);
+    vi.spyOn(events, "waitTimeout").mockImplementation((...args: Parameters<LockEvents["waitTimeout"]>) => {
+      order.push("event.append");
+      return waitTimeout(...args);
+    });
+    const store = await Store.open(root, 64 * 1024, 1_000, { lockTimeoutMs: 200, fifoAfterMs: 0 });
+    const holder = new (process.getBuiltinModule("node:sqlite").DatabaseSync)(store.file, { timeout: 0 });
+    const readFileSync = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (file === "/proc/locks") order.push("proc-locks");
+      return (readFileSync as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports(); // wal-readers reads through the node:fs namespace
+    try {
+      holder.exec("BEGIN IMMEDIATE");
+      await expect(store.put({ key: "w/1", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    } finally {
+      vi.mocked(fs.readFileSync).mockRestore();
+      syncBuiltinESMExports();
+      holder.exec("ROLLBACK");
+      holder.close();
+      store.close();
+    }
+    expect(order).toContain("ticket.close"); // the waiter had joined the FIFO
+    expect(order.filter((step) => step === "event.append")).toHaveLength(1);
+    const lastClose = order.lastIndexOf("ticket.close");
+    expect(lastClose).toBeLessThan(order.indexOf("event.append"));
+    if (process.platform === "linux") expect(lastClose).toBeLessThan(order.lastIndexOf("proc-locks"));
+    expect(readEvents(eventsFile(root))).toMatchObject([{ kind: "wait-timeout", store: "sqlite", class: "put/delete" }]);
   });
 
   it("a failing append never affects the lock: counted, warned at most once a minute", async () => {

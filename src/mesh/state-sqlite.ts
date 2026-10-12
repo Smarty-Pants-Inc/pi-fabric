@@ -1641,6 +1641,10 @@ export class SqliteStateStore {
           this.#flushCheckpointWindow();
           // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
           // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
+          // Leave the FIFO first: the /proc/locks read and the append must not keep this timed-out
+          // ticket at the head (pi-fabric#905 review round 3).
+          ticket?.close();
+          ticket = undefined;
           if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }

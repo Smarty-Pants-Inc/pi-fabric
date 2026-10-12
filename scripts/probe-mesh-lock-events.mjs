@@ -10,7 +10,10 @@
 //   mesh-lock: an exclusive() holds .lock; an exclusive() with a shorter budget gives up with
 //              FABRIC_MESH_LOCK_TIMEOUT.
 // and asserts that each timeout (and the long hold) landed in <root>/lock-stats/events.jsonl with
-// the v:1 line shape documented in docs/mesh-lock-stats.md, with no append errors.
+// the v:1 line shape documented in docs/mesh-lock-stats.md, with no append errors, and that each
+// wait-timeout event's timestamp (`at`) is within 1 s of the induced timeout (smarty-dev#9290). The
+// induced timeout's time is measured in the waiter: the wall-clock time its acquisition started plus
+// the budget it was given, i.e. when its lock wait expired. The probe prints both times and the delta.
 //
 //   node scripts/probe-mesh-lock-events.mjs [--release DIR] [--dir TMP] [--hold-ms 1500] [--timeout-ms 300] [--json]
 //
@@ -18,8 +21,8 @@
 // script). TMP (default os.tmpdir()) holds the private root; SQLite state refuses a root below a
 // group- or other-writable ancestor without the sticky bit, so pick one without (/tmp is fine).
 // The workers run with PI_FABRIC_LOCK_STATS unset, so the release default applies.
-// Exit status: 0 pass; 1 gate failed (roll back: no event for an induced timeout, a wrong shape, or
-// failed appends); 2 invalid run or bad usage.
+// Exit status: 0 pass; 1 gate failed (roll back: no event for an induced timeout, an event more than
+// 1 s from it, a wrong shape, or failed appends); 2 invalid run or bad usage.
 import { fork } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -39,6 +42,8 @@ const HELD_KEYS = ["v", "at", "kind", "store", "class", "heldMs", "holder"];
 const TIMEOUT_KEYS = ["v", "at", "kind", "store", "class", "waitedMs", "holder", "waiter"];
 const HOLDER_KEYS = ["pid", "process", "op", "host"];
 const WAITER_KEYS = ["pid", "process", "op"];
+// smarty-dev#9290 acceptance: the wait-timeout event lands within 1 s of the induced timeout.
+const EVENT_LATENCY_LIMIT_MS = 1_000;
 
 const usage = (message) => {
   console.error(`probe-mesh-lock-events: ${message}`);
@@ -97,12 +102,17 @@ const worker = async (role, options) => {
         if (Date.now() > deadline) throw new Error("the holder never took the lock");
         await new Promise((resolve) => setTimeout(resolve, 2));
       }
+      // The induced timeout's own time: when this wait's budget expires, on the wall clock that
+      // stamps events (`at` is Date.now() at append).
+      result.waitStartedAt = Date.now();
+      result.inducedTimeoutAt = result.waitStartedAt + options.timeoutMs;
       const started = performance.now();
       try {
         if (storeKind === "sqlite") await store.put({ key: "probe/waiter", value: 1, identity: identityOf(role) });
         else await store.exclusive(() => undefined, options.timeoutMs);
         result.outcome = "acquired";
       } catch (error) {
+        result.errorAt = Date.now();
         result.outcome = "error";
         result.code = error?.code ?? error?.name;
         result.busyCode = error?.busyCode;
@@ -190,14 +200,25 @@ const checkEvents = (storeKind, observed, events, options, problems) => {
     // Linux names the holder (.lock owner record; SQLite through /proc/locks).
     if (process.platform === "linux" && timeout.holder?.pid !== observed.holder.childPid) fail(`wait-timeout names holder pid ${timeout.holder?.pid}, not ${observed.holder.childPid}`);
   }
+  // The event must land within 1 s of the induced timeout (smarty-dev#9290), not merely by the end.
+  let timing;
+  if (Number.isInteger(observed.waiter.inducedTimeoutAt)) {
+    const eventAt = Number.isInteger(timeout?.at) ? timeout.at : null;
+    timing = { inducedTimeoutAt: observed.waiter.inducedTimeoutAt, waiterErrorAt: observed.waiter.errorAt ?? null, eventAt,
+      deltaMs: eventAt === null ? null : eventAt - observed.waiter.inducedTimeoutAt, limitMs: EVENT_LATENCY_LIMIT_MS };
+    if (timing.deltaMs === null) fail(`no wait-timeout event time to compare with the induced timeout at ${iso(timing.inducedTimeoutAt)}`);
+    else if (Math.abs(timing.deltaMs) > EVENT_LATENCY_LIMIT_MS) fail(`the wait-timeout event at ${iso(eventAt)} is ${signed(timing.deltaMs)} ms from the induced timeout at ${iso(timing.inducedTimeoutAt)} (limit ${EVENT_LATENCY_LIMIT_MS} ms)`);
+  } else fail("the waiter recorded no induced-timeout time");
   const [hold] = held;
   if (hold) {
     if (!sameKeys(hold, HELD_KEYS) || hold.v !== 1) fail(`held shape: ${JSON.stringify(hold)}`);
     if (!sameKeys(hold.holder, HOLDER_KEYS) || hold.holder.pid !== observed.holder.childPid || hold.holder.op !== hold.class) fail(`held holder: ${JSON.stringify(hold.holder)}`);
     if (!Number.isInteger(hold.heldMs) || hold.heldMs < options.holdMs * 0.9) fail(`held heldMs ${hold.heldMs} < ${options.holdMs}`);
   }
-  return { timeout, held: hold };
+  return { timing, timeout, held: hold };
 };
+const iso = (ms) => new Date(ms).toISOString();
+const signed = (ms) => (ms >= 0 ? `+${ms}` : String(ms));
 
 const main = async (options) => {
   if (!fs.existsSync(path.join(options.release, "dist/mesh.js"))) usage(`${options.release}/dist/mesh.js does not exist (build first, or pass --release)`);
@@ -226,6 +247,10 @@ const main = async (options) => {
     console.log(`mesh lock events probe (${options.release}): ${report.verdict.toUpperCase()}`);
     for (const [storeKind, entry] of Object.entries(report.scenarios)) {
       console.log(`  ${storeKind}: waiter ${entry.waiter.busyCode ?? entry.waiter.code ?? "acquired"} after ${entry.waiter.waitedMs} ms`);
+      if (entry.timing) {
+        const { inducedTimeoutAt, eventAt, deltaMs, limitMs } = entry.timing;
+        console.log(`    induced timeout at ${iso(inducedTimeoutAt)} (${inducedTimeoutAt}); event at ${eventAt === null ? "none" : `${iso(eventAt)} (${eventAt})`}; delta ${deltaMs === null ? "n/a" : `${signed(deltaMs)} ms`} (limit ±${limitMs} ms)`);
+      }
       if (entry.timeout) console.log(`    ${JSON.stringify(entry.timeout)}`);
       if (entry.held) console.log(`    ${JSON.stringify(entry.held)}`);
     }

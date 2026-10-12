@@ -117,7 +117,10 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     expect(s.alarms("actor-activation-blocked", actor.id)[1]!.data).toMatchObject({ repeat: true });
   }, 60_000);
 
-  it("actor-run-stuck: an in-flight run older than 30 min whose run directory is gone alarms; a live one does not", async () => {
+  // actor-run-stuck (pi-fabric#944 round 1): liveness only from this host's own record of the launched worker (pid plus
+  // /proc start time at spawn), never from the worker-writable status.json; anything unproven fails toward the alarm.
+  // Two real hanging runs: "stuck" gets the fault, "live" stays healthy (the counterexample, never alarmed).
+  const stuckFixture = async () => {
     const s = setup();
     const stuck = await s.actors.create({ name: "stuck", instructions: "Run", coalesce: false });
     const live = await s.actors.create({ name: "live", instructions: "Run", coalesce: false });
@@ -126,27 +129,87 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     await waitFor(() => !!s.actors.status(stuck.id).inFlightRun && !!s.actors.status(live.id).inFlightRun);
     const runId = s.actors.status(stuck.id).inFlightRun!.id;
     const directory = s.agents.runDirectory(runId)!;
-    await waitFor(() => fs.existsSync(path.join(directory, "status.json")));
-    fs.renameSync(directory, `${directory}.gone`); // the run's directory disappears; the actor still records the run
-    try {
-    s.clock.skew = 29 * MINUTE;
-    await settle();
-    expect(s.alarms("actor-run-stuck", stuck.id)).toHaveLength(0);
-    s.clock.skew = 31 * MINUTE;
-    await waitFor(() => s.alarms("actor-run-stuck", stuck.id).length === 1);
-    expect(s.alarms("actor-run-stuck", stuck.id)[0]!.data).toMatchObject({ runId, ownerRoot: "session:test",
-      reason: expect.stringContaining("missing"), thresholdMs: 30 * MINUTE });
-    await settle();
-    expect(s.alarms("actor-run-stuck", stuck.id)).toHaveLength(1);
-    expect(s.alarms("actor-run-stuck", live.id)).toHaveLength(0); // its worker and directory are there
-    } finally {
-      fs.renameSync(`${directory}.gone`, directory); // so the teardown can stop the worker
+    await waitFor(() => fs.existsSync(path.join(directory, "status.json")) &&
+      fs.existsSync(path.join(s.agents.runDirectory(s.actors.status(live.id).inFlightRun!.id)!, "status.json")));
+    const owned = s.agents.workerIdentity(runId)!;
+    expect(owned).toMatchObject({ pid: expect.any(Number), startTime: expect.any(String) });
+    const stuckAlarms = () => s.alarms("actor-run-stuck", stuck.id);
+    const teardown = async () => {
       // A run that did work detaches on an actor stop (fake-worker HANG_WITH_PROGRESS): end the runs themselves.
       for (const id of [stuck.id, live.id]) {
         const inFlight = s.actors.status(id).inFlightRun?.id;
         if (inFlight) await s.agents.stop(inFlight).catch(() => undefined);
         await s.actors.stop(id).catch(() => undefined);
       }
-    }
+    };
+    /** Past the threshold, the stuck run alarms once with `reason`; the healthy run never does. */
+    const expectAlarm = async (reason: string) => {
+      s.clock.skew = 29 * MINUTE;
+      await settle();
+      expect(stuckAlarms()).toHaveLength(0);
+      s.clock.skew = 31 * MINUTE;
+      await waitFor(() => stuckAlarms().length === 1);
+      const data = stuckAlarms()[0]!.data as Record<string, unknown>;
+      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE });
+      await settle();
+      expect(stuckAlarms()).toHaveLength(1);
+      expect(s.alarms("actor-run-stuck", live.id)).toHaveLength(0);
+      return data;
+    };
+    return { s, runId, directory, owned, teardown, expectAlarm, stuckAlarms };
+  };
+  // The dead worker of (a), and (c)'s live process with a different start time: real processes, not invented pids.
+  const deadPid = async (): Promise<number> => {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await new Promise(resolve => child.once("exit", resolve));
+    return child.pid!;
+  };
+
+  it("actor-run-stuck (d): a missing run directory alarms with the generic run-dir-missing reason and no path", async () => {
+    const f = await stuckFixture();
+    fs.renameSync(f.directory, `${f.directory}.gone`);
+    try {
+      const data = await f.expectAlarm("run-dir-missing");
+      expect(JSON.stringify(data)).not.toContain(path.dirname(f.directory));
+    } finally { fs.renameSync(`${f.directory}.gone`, f.directory); await f.teardown(); }
+  }, 60_000);
+
+  it("actor-run-stuck (a): a forged running status.json does not hide a dead owned worker", async () => {
+    const f = await stuckFixture();
+    const pid = await deadPid();
+    // The host's record names a worker that has exited; the status file claims it is running.
+    const real = f.s.agents.workerIdentity.bind(f.s.agents);
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid, startTime: "1" } : real(id));
+    const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
+    fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "running", sessionId: String(process.pid) }));
+    try {
+      const data = await f.expectAlarm("worker-gone");
+      expect(data.workerStatusHint).toEqual({ untrusted: true, status: "running" });
+    } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+  }, 60_000);
+
+  it("actor-run-stuck (b): a malformed status.json past the threshold alarms as worker-unverified", async () => {
+    const f = await stuckFixture();
+    fs.writeFileSync(path.join(f.directory, "status.json"), "{\"status\":\"runn");
+    try { await f.expectAlarm("worker-unverified"); } finally { await f.teardown(); }
+  }, 60_000);
+
+  it("actor-run-stuck (c): a live pid whose start time is not the recorded one (pid reuse) alarms", async () => {
+    const f = await stuckFixture();
+    // This process is alive, but it is not the worker the host launched: its start time differs.
+    const real = f.s.agents.workerIdentity.bind(f.s.agents);
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: process.pid, startTime: "1" } : real(id));
+    try { await f.expectAlarm("worker-pid-reused"); } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+  }, 60_000);
+
+  it("actor-run-stuck: an absent status record inside the startup window gives no alarm; past the threshold it alarms", async () => {
+    const f = await stuckFixture();
+    fs.rmSync(path.join(f.directory, "status.json"));
+    try {
+      await settle(); // a fresh run, no status record yet
+      expect(f.stuckAlarms()).toHaveLength(0);
+      await f.expectAlarm("worker-unverified");
+    } finally { await f.teardown(); }
   }, 60_000);
 });

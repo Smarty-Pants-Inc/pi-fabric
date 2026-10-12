@@ -36,7 +36,8 @@ import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRe
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
+import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
+import { processStartTime } from "../residency/process-identity.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -4854,11 +4855,11 @@ export class ActorManager {
     const run = actor.inFlightRun;
     if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
       const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
-      const gone = this.#runGone(run.id);
-      if (now - run.startedAt > threshold && gone) {
+      const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
+      if (gone) {
         this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, actorAlarmSlot(now, run.startedAt, threshold), now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: gone, runId: run.id,
-          since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold }),
+          since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold, ...this.#runStatusHint(run.id) }),
           () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id);
       }
     }
@@ -4867,20 +4868,34 @@ export class ActorManager {
   }
 
   /** Why an in-flight run's worker is gone, or undefined while it can still be running. */
+  /**
+   * Why a run past its stuck threshold is not proven to be running (a fixed reason code), or undefined while it is.
+   * Liveness comes only from this host's own record of the launched worker (AgentManager.workerIdentity: the pid and
+   * kernel start time read at spawn), never from the worker-writable status.json. Fail toward the alarm: anything
+   * this host cannot prove (no live handle, no local process, no start time, an unreadable /proc) is
+   * "worker-unverified" (pi-fabric#944 round 1).
+   */
   #runGone(runId: string): string | undefined {
     const directory = this.agents.runDirectory(runId);
-    if (!directory) return "run is not known to this host (no live handle)";
-    if (!fs.existsSync(directory)) return `run directory ${directory} is missing`;
-    // Read the worker's own status file (no AgentManager side effects from a sweep): a terminal status, or a
-    // process worker whose recorded pid no longer exists, is gone. No status yet is a starting worker.
-    const record = readRunRecord(path.join(directory, "status.json"));
-    if (!record) return undefined;
-    if (record.status !== "running" && record.status !== "queued") return `worker is gone (run ${record.status})`;
-    const pid = record.transport === "process" ? Number(record.sessionId) : NaN;
-    if (Number.isSafeInteger(pid) && pid > 1) {
-      try { process.kill(pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return `worker pid ${pid} is gone`; }
-    }
-    return undefined;
+    if (!directory) return "worker-unverified";
+    if (!fs.existsSync(directory)) return "run-dir-missing";
+    // TODO(pi-fabric#939): use its OwnedProcess {pid, /proc start time} once it lands; this is the same field-22
+    // comparison, done locally.
+    const worker = this.agents.workerIdentity(runId);
+    if (!worker || worker.startTime === undefined) return "worker-unverified";
+    const current = processStartTime(worker.pid);
+    if (current === undefined) return processIsAlive(worker.pid) ? "worker-unverified" : "worker-gone";
+    if (current !== worker.startTime) return "worker-pid-reused";
+    // The launched worker is alive. Past the threshold (far beyond any startup window) it must also have written a
+    // readable status record; an absent or corrupt one fails toward the alarm. A readable one never clears a dead worker.
+    return readRunRecord(path.join(directory, "status.json")) ? undefined : "worker-unverified";
+  }
+
+  /** The worker's own status.json, as an UNTRUSTED hint for the alarm data only (never a liveness decision). */
+  #runStatusHint(runId: string): { workerStatusHint?: { untrusted: true; status: unknown } } {
+    const directory = this.agents.runDirectory(runId);
+    const record = directory ? readRunRecord(path.join(directory, "status.json")) : undefined;
+    return record ? { workerStatusHint: { untrusted: true, status: typeof record.status === "string" ? record.status.slice(0, 40) : null } } : {};
   }
 
   /** p95 wall time of the actor's archived finished runs (runs/<id>/status.json), when it has any. */

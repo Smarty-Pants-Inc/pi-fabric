@@ -14,7 +14,7 @@
  *   4. Keep state.json at `state.json.nats-cutover-<E+1>`, install the NATS moved marker over state.json, then
  *      publish `import-commit{E+1}`.
  * Rerun after a crash: without the marker, the same source (G0 equals the `import-begin` record) resumes: chunks
- * already stored must match byte for byte, the rest are published; a changed source refuses (use a fresh stream).
+ * already stored must match byte for byte, the rest are published; a changed source refuses (delete the root's stream on the server first).
  * With the marker, the stream is verified against the kept copy and committed (or found committed).
  *
  * Rollback (nats -> file), under the fence: publish `retire{E+1}` with the expected last sequence (every later nats
@@ -63,8 +63,6 @@ export interface MeshNatsMigrationOptions {
   tls?: NatsTlsFiles;
   /** Host-only: accept a server that does not report `sync_always` (as openNatsStateBackend). */
   acceptPeriodicSync?: boolean;
-  /** The stream; default `natsStreamName(root)`. A rerun must name the same one (the marker records it). */
-  stream?: string;
   /** The state size bound (as both stores). Default 32 MiB. */
   maxStateBytes?: number;
   /** The most stream messages one projection replays. Default 1,000,000. */
@@ -238,9 +236,10 @@ const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersi
     }
     return await holdMeshFence(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_LOCK_MS }, async () => {
       const marker = readMeshStateNatsMarker(root);
-      const stream = marker?.natsStream ?? options.stream ?? natsStreamName(root);
-      if (marker && options.stream !== undefined && options.stream !== marker.natsStream) {
-        throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not ${options.stream}`);
+      // The stream is the root's, as the backend opens it (pi-fabric#937: no override, so two roots never share one).
+      const stream = natsStreamName(root);
+      if (marker && marker.natsStream !== stream) {
+        throw new MeshBackendRefusedError(`Fabric mesh state.json says the state is on NATS stream ${marker.natsStream}, not this root's ${stream}`);
       }
       const subject = `${stream}.state`;
       // The backend's subjects and message cap (pi-fabric#907): the root's open refuses a stream without max_msg_size.
@@ -351,7 +350,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       if (projection.status !== "importing" || projection.epoch !== epoch || recorded?.type !== "import-begin"
         || recorded.digest !== digest || recorded.generation !== generation || head > 1 + chunks.length) {
         throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is not empty and holds no unfinished import of this state.json `
-          + `(${projection.status} at epoch ${projection.epoch}, ${head} messages): name a fresh stream`);
+          + `(${projection.status} at epoch ${projection.epoch}, ${head} messages): delete stream ${stream} on the server first (an import never purges)`);
       }
     }
     for (const [index, chunk] of chunks.entries()) {
@@ -359,7 +358,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       if (seq <= head) {
         const stored = await port.getMessage(stream, seq);
         if (!stored || Buffer.compare(Buffer.from(stored.data), Buffer.from(chunk)) !== 0) {
-          throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} message ${seq} is not chunk ${index} of this import: name a fresh stream`);
+          throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} message ${seq} is not chunk ${index} of this import: delete stream ${stream} on the server first (an import never purges)`);
         }
         continue;
       }
@@ -374,7 +373,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     options.onStep?.("nats-import-verify");
     const again = readSource(statePath, options);
     if (meshSnapshotDigest(again) !== digest || (typeof again.readGeneration === "string" ? again.readGeneration : "") !== generation) {
-      throw new MeshBackendRefusedError("Fabric mesh state.json changed during the NATS import (a writer ignored .lock); rerun with a fresh stream");
+      throw new MeshBackendRefusedError("Fabric mesh state.json changed during the NATS import (a writer ignored .lock); delete this root's NATS stream on the server, then rerun");
     }
     // Keep the source (the rerun's and the operator's reference), then the marker, then the commit.
     keepCopy(root, path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`), source, digest, options);

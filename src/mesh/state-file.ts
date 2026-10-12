@@ -4,6 +4,7 @@ import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, 
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { removeJudged } from "./judged-remove.js";
 import path from "node:path";
 import childProcess from "node:child_process";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
@@ -667,6 +668,7 @@ export class StateFile implements StateBackend {
         if (!Number.isSafeInteger(pid) || pid === process.pid) continue;
         const file = path.join(this.root, entry.name);
         try {
+          const judged = fs.lstatSync(file); // smarty-dev#8907: the stale prepared inode judged below is the one removed
           let dead = false;
           try { process.kill(pid, 0); }
           catch (error) {
@@ -674,11 +676,10 @@ export class StateFile implements StateBackend {
             dead = true;
           }
           if (!dead) {
-            const modifiedAt = fs.statSync(file).mtimeMs;
+            const modifiedAt = judged.mtimeMs;
             if (now - modifiedAt <= PREPARED_REUSE_AGE_MS || !processStartedAfter(pid, modifiedAt)) continue;
           }
-          fs.unlinkSync(file);
-          removed++;
+          if (removeJudged(file, judged, "mesh-prepared-state")) removed++;
         } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
       }
     } catch { /* Best-effort cleanup; ordinary state operations retain their own errors. */ }

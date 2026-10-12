@@ -1,6 +1,7 @@
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readJudged, removeJudged } from "./judged-remove.js";
 import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -181,7 +182,9 @@ export const pruneDeadCensusRecords = (root: string): void => {
     if (!/^\d+-\d+\.json$/.test(name.slice(prefix.length))) continue;
     const file = path.join(directory, name);
     try {
-      if (censusRecordPrunable(JSON.parse(fs.readFileSync(file, "utf8")), host)) fs.rmSync(file, { force: true });
+      // smarty-dev#8907: the record judged dead is the inode removed; a record swapped in meanwhile stays.
+      const { text, stat } = readJudged(file);
+      if (censusRecordPrunable(JSON.parse(text), host)) removeJudged(file, stat, "mesh-census-prune");
     } catch { /* unreadable or already gone: left to the next prune */ }
   }
 };
@@ -206,6 +209,8 @@ const censusDirectoryIdentity = (directory: string, create = true): string => {
 const prunedCensusRoots = new Set<string>();
 /** This process's census records by directory identity: the file and its stores still open. */
 const ownCensusRecords = new Map<string, { file: string; stores: number }>();
+// ponytail (smarty-dev#8907): no judgment, so nothing to verify. This process removes the record it wrote under
+// its own pid-and-start name, which no other writer uses.
 const removeOwnCensusRecords = (): void => {
   for (const { file } of ownCensusRecords.values()) try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
 };

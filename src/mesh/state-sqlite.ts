@@ -1897,6 +1897,9 @@ export const tryLockFile = (file: string, staleMs: number, token: string, hooks:
         try { currentRecord = fs.readFileSync(file, "utf8"); } catch { /* gone: already reclaimed */ }
         if (current === undefined || current.ino !== stat.ino || current.dev !== stat.dev || current.mtimeMs !== stat.mtimeMs
           || currentRecord !== record) return false; // already reclaimed, and maybe held by a successor: never touch it
+        // ponytail (smarty-dev#8907): this cannot race, so it needs no verifiedRemove. A new holder creates the lock
+        // file only exclusively (O_EXCL), so it cannot replace this name while it exists. The only other remover is a
+        // reclaimer, and the claim held here excludes it. The judged inode is still the one unlinked.
         try { fs.unlinkSync(file); } catch { return false; }
       } finally { removeOwnedFile(claim, token); }
     }
@@ -1965,6 +1968,8 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
   try {
     const flag = path.join(dir, name);
     const current = fs.lstatSync(flag, { throwIfNoEntry: false });
+    // ponytail (smarty-dev#8907): a flag's name is its writer's unique token, so no other writer creates or replaces
+    // it, and the claim excludes a second reclaimer. The checked inode is the one unlinked.
     if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) fs.unlinkSync(flag);
   } catch { /* already gone */ } finally { removeOwnedFile(claim, token); }
 };

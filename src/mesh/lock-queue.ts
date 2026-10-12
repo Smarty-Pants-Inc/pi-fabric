@@ -114,6 +114,8 @@ export class MeshLockTicket {
     try {
       const stat = fs.statSync(file);
       if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) return true;
+      // ponytail (smarty-dev#8907): ticket names are unique and never reused (see above), so nothing can be swapped
+      // in under this name between the judgment and the unlink.
       fs.unlinkSync(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

@@ -281,13 +281,17 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
         const seen = fs.lstatSync(file);
         if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
         // Temporaries and graveyards have unique names that no writer refreshes.
-        if (!name.endsWith(".json")) { fs.unlinkSync(file); continue; }
+        // smarty-dev#8907: temporaries, too, go through the graveyard check below, so only the aged inode is removed.
+        // ponytail: this file stays self-contained (lock-stats is loaded across release generations from one copied
+        // file), so it uses its own existing rename-aside proof rather than importing verifiedRemove.
         // Never unlink a stats file by name (smarty-dev#7879): its writer may refresh it by rename
         // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
         // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
         // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
         // works on NTFS too), then drop the graveyard name either way.
         const grave = `${file}.prune-${process.pid}`;
+        // ponytail (smarty-dev#8907): this path already proves the inode itself. It renames the file aside, then compares
+        // dev, ino and mtime, and restores a swapped file.
         fs.renameSync(file, grave);
         const moved = fs.lstatSync(grave);
         if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {

@@ -378,6 +378,8 @@ export class MeshLock {
           current.mtimeMs !== stat.mtimeMs || readOwner() !== undefined) return false;
         // Native emptiness is the final fence, including against an initializer that
         // publishes and enters while this recoverer is paused at the removal syscall.
+        // ponytail (smarty-dev#8907): rmdir removes only an EMPTY directory, and every owner publishes non-empty, so a
+        // swapped-in live lock makes this fail rather than vanish. No verifiedRemove is needed.
         fs.rmdirSync(this.#lockPath);
         // Retain a nonempty recovery receipt, without ever renaming a live canonical.
         // Inode reuse may revisit the same receipt; that must not undo successful recovery.

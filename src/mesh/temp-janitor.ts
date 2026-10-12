@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { removeJudged } from "./judged-remove.js";
 import path from "node:path";
 
 /** A staged state temp is reclaimable only when this old (smarty-dev#6622). */
@@ -45,8 +46,8 @@ export const sweepAbandonedStateTemporaries = (
     try {
       const stat = fs.lstatSync(file);
       if (!stat.isFile() || now - stat.mtimeMs <= minAgeMs) continue;
-      fs.rmSync(file, { force: true });
-      removed.push(name);
+      // smarty-dev#8907: only the abandoned inode judged here goes.
+      if (removeJudged(file, stat, "mesh-temp-janitor")) removed.push(name);
     } catch {
       // Renamed or removed meanwhile.
     }

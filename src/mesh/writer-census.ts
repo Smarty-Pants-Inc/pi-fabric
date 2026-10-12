@@ -9,6 +9,7 @@
  * Nothing may block, permit or change behaviour on this report.
  */
 import fs from "node:fs";
+import { readJudged, removeJudged } from "./judged-remove.js";
 import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
@@ -209,12 +210,14 @@ export function censusSync(root: string): WriterCensusReport {
       // Anything else (a live writer's write in flight, a renamed record) hides a writer: unknown.
       const temporary = name.startsWith(ownPrefix) ? /^(\d+)-\d+\.json\.[0-9a-f]+\.tmp$/.exec(name.slice(ownPrefix.length)) : null;
       if (temporary && !processAlive(Number(temporary[1]))) {
-        try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+        // smarty-dev#8907: judged by name and pid; the inode removed is the one seen here.
+        try { removeJudged(path.join(directory, name), fs.lstatSync(path.join(directory, name)), "mesh-census-temp"); } catch { /* best effort */ }
       } else add({ source: "process-record", name, reason: `${path.join(directory, name)}: not a census record` });
       continue;
     }
     let text: string;
-    try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
+    let judged: fs.Stats;
+    try { ({ text, stat: judged } = readJudged(path.join(directory, name))); }
     catch (error) {
       // Removed since the listing (its writer exited): gone. Any other read failure is unknown.
       if (errno(error) !== "ENOENT") {
@@ -232,7 +235,8 @@ export function censusSync(root: string): WriterCensusReport {
       continue;
     }
     if (censusRecordPrunable(fields, host)) {
-      try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      // smarty-dev#8907: only the record judged dead goes; a live writer's record swapped in meanwhile stays.
+      removeJudged(path.join(directory, name), judged, "mesh-census-prune");
       continue;
     }
     const record = fields as unknown as MeshWriterRecord;

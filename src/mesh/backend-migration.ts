@@ -83,6 +83,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readJudged, removeJudged } from "./judged-remove.js";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
 import { storageRevision } from "../verified/storage.js";
@@ -578,9 +579,12 @@ const readFile = (root: string, options: MeshBackendOptions): FencedFile =>
  */
 const dropBlankStateFile = (root: string): void => {
   const file = path.join(root, STATE_JSON);
-  const stat = fs.statSync(file, { throwIfNoEntry: false });
-  if (!stat?.isFile() || stat.size > 4096 || fs.readFileSync(file, "utf8").trim() !== "") return;
-  fs.rmSync(file, { force: true });
+  const seen = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!seen?.isFile() || seen.size > 4096) return;
+  // smarty-dev#8907: the blank file judged here is the inode removed; a state file written meanwhile stays.
+  const { text, stat } = readJudged(file);
+  if (text.trim() !== "") return;
+  removeJudged(file, stat, "mesh-migration-blank-state");
 };
 
 const fileEpochOf = (state: FencedFile): number => (state.backendEpoch === undefined ? 0 : storageRevision(state.backendEpoch));
@@ -627,7 +631,11 @@ const fsyncDirectory = (directory: string): void => {
 
 const removeStaleTemps = (root: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (name.startsWith(TEMP_PREFIX) && name.endsWith(".tmp")) fs.rmSync(path.join(root, name), { force: true });
+    if (!name.startsWith(TEMP_PREFIX) || !name.endsWith(".tmp")) continue;
+    // smarty-dev#8907: the stale temp judged here (by name, under the migration fence) is the inode removed.
+    const file = path.join(root, name);
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (stat) removeJudged(file, stat, "mesh-migration-temp");
   }
 };
 
@@ -921,7 +929,11 @@ const ROLLBACK_TEMP = /^state\.json\.rollback-\d+\.tmp$/;
 
 const removeRollbackTemps = (root: string, keep?: string): void => {
   for (const name of fs.readdirSync(root)) {
-    if (ROLLBACK_TEMP.test(name) && name !== keep) fs.rmSync(path.join(root, name), { force: true });
+    if (!ROLLBACK_TEMP.test(name) || name === keep) continue;
+    // smarty-dev#8907: the stale rollback temp judged here (by name, under the migration fence) is the inode removed.
+    const file = path.join(root, name);
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (stat) removeJudged(file, stat, "mesh-rollback-temp");
   }
 };
 

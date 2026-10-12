@@ -2,6 +2,7 @@ import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.
 import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { readJudged, removeJudged } from "./judged-remove.js";
 import path from "node:path";
 import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -352,6 +353,8 @@ export class EventLog {
     return event;
   }
 
+  // ponytail (smarty-dev#8907): intents are removed under the append lock that any same-key writer must take
+  // before it replaces the intent, so no swap can come between the judgment and this unlink.
   #removeDedupeIntent(file: string): void {
     fs.rmSync(file, { force: true });
     syncPathNamespace(path.dirname(file));
@@ -1320,21 +1323,22 @@ export class EventLog {
     if (reserve && count <= limit) return count;
     const candidates = receipts.filter(name => !pending.has(name.slice(0, -".json".length))).map(name => {
       const file = path.join(directory, name);
-      const event = JSON.parse(fs.readFileSync(file, "utf8")) as MeshEvent;
+      const { text, stat } = readJudged(file); // smarty-dev#8907: the receipt judged expired is the inode removed
+      const event = JSON.parse(text) as MeshEvent;
       if (typeof event.dedupeKey !== "string" || this.#dedupePath(event.dedupeKey, ".json") !== file ||
           typeof event.id !== "string" || !Number.isSafeInteger(event.sequence) ||
           !Number.isFinite(event.createdAt)) {
         throw new Error("Invalid event publication receipt");
       }
-      return { file, createdAt: event.createdAt, sequence: event.sequence };
+      return { file, stat, createdAt: event.createdAt, sequence: event.sequence };
     });
     candidates.sort((a, b) => a.createdAt - b.createdAt || a.sequence - b.sequence || a.file.localeCompare(b.file));
     const now = Date.now();
     try {
       for (const receipt of candidates) {
         if (now - receipt.createdAt < this.#dedupeReceiptTtlMs && count <= limit) break;
-        fs.rmSync(receipt.file, { force: true });
-        count--;
+        // A receipt a same-key publish replaced since the judgment is a new receipt: it stays.
+        if (removeJudged(receipt.file, receipt.stat, "mesh-dedupe-receipt")) count--;
       }
     } finally {
       // Persist removals once per pass, including any completed before a later unlink failed.

@@ -169,12 +169,12 @@ const MAX_WIN_ENTRIES = 4096;
 /** The helper, when present and its bytes equal the digest embedded at build time; else undefined (fail closed).
  * ponytail: hash, then exec by path (Windows has no fd exec): a same-user rewrite in between is the accepted
  * smarty-dev#7800 class, as for the lease helper. Located beside the bundle (dist/<dir>/ or dist/) or from src/. */
-let helperFound: { file: string | undefined } | undefined;
 export const windowsRemoveHelper = (): string | undefined => {
   // os.type() names the real OS: tests that force process.platform to win32 on Linux keep main's Windows paths.
   if (process.platform !== "win32" || os.type() !== "Windows_NT") return undefined;
-  // Looked up and hashed once per process (pi-fabric#913 Windows CI): not once per removal.
-  return (helperFound ??= { file: findWindowsRemoveHelper() }).file;
+  // Hashed again before each spawn (pi-fabric#913 round 4 P2): only the operator's sweep spawns it, so the cost is
+  // per CLI removal, not per resident run.
+  return findWindowsRemoveHelper();
 };
 const findWindowsRemoveHelper = (): string | undefined => {
   let expected: string | undefined;
@@ -210,14 +210,22 @@ const windowsEntries = (target: string, judged: fs.Stats): Array<{ file: string;
   if (fs.lstatSync(target).mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
   return entries;
 };
+/** The judged last-write time as a Windows FILETIME (100 ns since 1601): libuv derives mtimeNs from it exactly. */
+const fileTime = (stat: fs.BigIntStats): string => (stat.mtimeNs / 100n + 116_444_736_000_000_000n).toString(16);
+/** The helper kept an entry refreshed after its judgment (same id, new time or size): a final-check keep. */
+class Kept extends Refusal {}
 const windowsRemove = (helper: string, entries: Array<{ file: string; stat: fs.BigIntStats }>, dryRun: boolean): void => {
-  const args = entries.flatMap(({ file, stat }) => [stat.isDirectory() ? "d" : "f", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)]);
+  // pi-fabric#913 round 4: the judged time and size go along, and the helper compares them on its handle.
+  const args = entries.flatMap(({ file, stat }) => [stat.isDirectory() ? "d" : "f", stat.dev.toString(16), stat.ino.toString(16),
+    fileTime(stat), stat.size.toString(16), path.toNamespacedPath(file)]);
+  if (windowsRemoveHelper() !== helper) refuse("the Windows removal helper no longer matches its digest"); // re-hashed per spawn
   const result = spawnSync(helper, dryRun ? ["--dry-run", ...args] : args, { encoding: "utf8", timeout: 60_000, windowsHide: true });
   const line = (result.stdout ?? "").split(/\r?\n/)[0] ?? "";
   if (result.status === 0 && /^ok \d+/.test(line)) return;
-  const match = /^(refused|failed) (-?\d+) (.+)$/.exec(line);
+  const match = /^(refused|failed|kept) (-?\d+) (.+)$/.exec(line);
   if (!match) refuse(`the Windows removal helper failed (${result.error?.message ?? `exit ${String(result.status)}`})`);
   const entry = entries[Number(match![2])]?.file ?? "the helper";
+  if (match![1] === "kept") throw new Kept(`kept by the final check (${entry} ${match![3]})`);
   refuse(match![1] === "refused" ? `${match![3]} (${entry}); nothing is deleted` : `removal failed at ${entry} (${match![3]})`);
 };
 
@@ -265,17 +273,21 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       const grave = path.join(path.dirname(target), `.retention-graveyard-${process.pid}-${randomUUID()}`);
       fs.renameSync(target, grave);
       const moved = entries.map(({ file, stat }) => ({ file: grave + file.slice(target.length), stat }));
+      let kept: string | undefined;
       try { windowsRemove(windowsHelper, moved, true); }
-      catch (error) { return no(`${error instanceof Refusal ? error.message : code(error)} (swapped during removal; left at ${grave})`, grave); }
+      catch (error) {
+        if (!(error instanceof Kept)) return no(`${error instanceof Refusal ? error.message : code(error)} (swapped during removal; left at ${grave})`, grave);
+        kept = error.message; // refreshed since judgment: moved back below, like a final-check keep
+      }
       let keep: boolean;
-      try { keep = !options.proceed(); } catch { keep = true; }
+      try { keep = kept !== undefined || !options.proceed(); } catch { keep = true; }
       if (keep) {
         // ponytail: lstat, then rename back (Windows rename replaces): a same-user create in between is the
         // smarty-dev#7800 class; the Linux path has the same check-then-move.
         try { fs.lstatSync(target); return no("kept by the final check; name is taken, left in the graveyard", grave); }
         catch { /* the name is free */ }
         try { fs.renameSync(grave, target); } catch (error) { return no(`kept by the final check; move back failed (${code(error)}), left in the graveyard`, grave); }
-        return no("kept by the final check");
+        return no(kept ?? "kept by the final check");
       }
       try { windowsRemove(windowsHelper, moved, false); }
       catch (error) { return no(`${error instanceof Refusal ? error.message : code(error)}; the rest is left in the graveyard`, grave); }

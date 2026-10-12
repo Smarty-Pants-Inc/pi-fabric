@@ -18,6 +18,10 @@ afterEach(() => {
 });
 const tempDir = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-win-remove-")); dirs.push(dir); return dir; };
 const ids = (file: string) => { const stat = fs.lstatSync(file, { bigint: true }); return [stat.dev.toString(16), stat.ino.toString(16)]; };
+/** One helper entry: KIND VOLUME INDEX MTIME (FILETIME) SIZE PATH, all from one bigint lstat. */
+const entryArgs = (file: string, kind?: "f" | "d") => { const stat = fs.lstatSync(file, { bigint: true });
+  return [kind ?? (stat.isDirectory() ? "d" : "f"), stat.dev.toString(16), stat.ino.toString(16),
+    (stat.mtimeNs / 100n + 116_444_736_000_000_000n).toString(16), stat.size.toString(16), path.toNamespacedPath(file)]; };
 
 describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
@@ -52,17 +56,63 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     expect(fs.readdirSync(dir)).toEqual(["events.jsonl"]);
   });
 
+  // pi-fabric#913 round 4 (Astra P1): a file refreshed between the scan and the helper's open keeps its id; its
+  // last-write time or size no longer matches the judged ones, so the helper keeps it.
+  it("keeps a file refreshed after the scan with the same id (new time, or new size)", () => {
+    const dir = tempDir();
+    const file = path.join(dir, "events.jsonl");
+    fs.writeFileSync(file, "judged\n");
+    const id = ids(file);
+    // Same size, later time.
+    verifiedRemoveTestHooks.beforeHelper = () => {
+      fs.writeFileSync(file, "fresh!\n");
+      const later = new Date(Date.now() + 10_000);
+      fs.utimesSync(file, later, later);
+    };
+    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test" }))
+      .toEqual({ removed: false, reason: `kept by the final check (${file} modified since judgment)` });
+    expect(fs.readFileSync(file, "utf8")).toBe("fresh!\n");
+    expect(ids(file)).toEqual(id);
+    // Larger, through the final-check path (moved off its name first): kept and moved back.
+    verifiedRemoveTestHooks.beforeHelper = () => { fs.appendFileSync(file, "more\n"); };
+    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", proceed: () => true }))
+      .toMatchObject({ removed: false, reason: expect.stringContaining("modified since judgment") });
+    expect(fs.readFileSync(file, "utf8")).toBe("fresh!\nmore\n");
+    expect(fs.readdirSync(dir)).toEqual(["events.jsonl"]);
+  });
+
+  // While the helper holds a judged file (validated, before the deletes), nobody can write it.
+  it("denies a write to a judged file between validation and the delete", async () => {
+    const dir = tempDir();
+    const file = path.join(dir, "events.jsonl");
+    fs.writeFileSync(file, "judged\n");
+    const pause = tempDir();
+    const child = spawn(windowsRemoveHelper()!, entryArgs(file), { env: { ...process.env, FABRIC_WIN_REMOVE_TEST_PAUSE: pause }, windowsHide: true });
+    let stdout = "";
+    child.stdout!.on("data", (data: Buffer) => { stdout += String(data); });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const started = Date.now();
+    while (!fs.existsSync(path.join(pause, "paused"))) {
+      if (Date.now() - started > 20_000) throw new Error(`the helper never paused: ${stdout}`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    expect(() => fs.writeFileSync(file, "refresh\n")).toThrow();
+    fs.writeFileSync(path.join(pause, "go"), "");
+    expect(await exited, stdout).toBe(0);
+    expect(fs.existsSync(file)).toBe(false);
+  }, 60_000);
+
   it("keeps a file whose id changed after it was judged", () => {
     const dir = tempDir();
     const file = path.join(dir, "old.bak");
     fs.writeFileSync(file, "judged");
     const judged = fs.lstatSync(file);
-    const [volume, index] = ids(file);
+    const judgedArgs = entryArgs(file);
     fs.unlinkSync(file);
     fs.writeFileSync(file, "replacement");
     expect(verifiedRemove(file, judged, { deleter: "test" })).toMatchObject({ removed: false, reason: expect.stringContaining("replaced since judgment") });
     // The helper itself, given the judged id for the replaced name, refuses on the handle.
-    const helper = spawnSync(windowsRemoveHelper()!, ["f", volume!, index!, path.toNamespacedPath(file)], { encoding: "utf8", windowsHide: true });
+    const helper = spawnSync(windowsRemoveHelper()!, judgedArgs, { encoding: "utf8", windowsHide: true });
     expect({ status: helper.status, line: helper.stdout.trim() }).toEqual({ status: 3, line: "refused 0 file id changed since judgment" });
     expect(fs.readFileSync(file, "utf8")).toBe("replacement");
   });
@@ -92,9 +142,7 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     const tree = path.join(parent, "run");
     fs.mkdirSync(path.join(tree, "nested"), { recursive: true });
     fs.writeFileSync(path.join(tree, "nested", "events.jsonl"), "{}\n");
-    const entry = (file: string) => { const stat = fs.lstatSync(file, { bigint: true });
-      return [stat.isDirectory() ? "d" : "f", stat.dev.toString(16), stat.ino.toString(16), path.toNamespacedPath(file)]; };
-    const args = [path.join(tree, "nested", "events.jsonl"), path.join(tree, "nested"), tree].flatMap(entry);
+    const args = [path.join(tree, "nested", "events.jsonl"), path.join(tree, "nested"), tree].flatMap(file => entryArgs(file));
     const pause = tempDir();
     const child = spawn(windowsRemoveHelper()!, args, { env: { ...process.env, FABRIC_WIN_REMOVE_TEST_PAUSE: pause }, windowsHide: true });
     let stdout = "";
@@ -140,8 +188,7 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     fs.symlinkSync(path.dirname(outside), junction, "junction");
     expect(verifiedRemove(tree, fs.lstatSync(tree), { deleter: "test" })).toMatchObject({ removed: false, reason: expect.stringContaining("reparse point") });
     // The helper opens the junction itself (FILE_FLAG_OPEN_REPARSE_POINT) and refuses it.
-    const [volume, index] = ids(junction);
-    const helper = spawnSync(windowsRemoveHelper()!, ["d", volume!, index!, path.toNamespacedPath(junction)], { encoding: "utf8", windowsHide: true });
+    const helper = spawnSync(windowsRemoveHelper()!, entryArgs(junction, "d"), { encoding: "utf8", windowsHide: true });
     expect({ status: helper.status, line: helper.stdout.trim() }).toEqual({ status: 3, line: "refused 0 a reparse point" });
     expect(fs.readFileSync(outside, "utf8")).toBe("keep");
     expect(fs.existsSync(junction)).toBe(true);

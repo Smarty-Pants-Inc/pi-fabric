@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: MIT
- * fabric-win-remove [--dry-run] KIND VOLUME INDEX PATH ... (smarty-dev#7858): verified removal on Windows.
- * Each entry is KIND ("f" file, "d" directory), the judged VOLUME serial and file INDEX (hex), and the PATH.
+ * fabric-win-remove [--dry-run] KIND VOLUME INDEX MTIME SIZE PATH ... (smarty-dev#7858): verified removal on Windows.
+ * Each entry is KIND ("f" file, "d" directory), the judged VOLUME serial and file INDEX, the judged last-write
+ * time (a FILETIME) and SIZE (all hex), and the PATH. A FILE is opened without FILE_SHARE_WRITE too, so nobody can
+ * write it while we hold it, and its last-write time and size must equal the judged ones (pi-fabric#913 round 4):
+ * a file refreshed after the judgment, with the same id, is kept ("kept I modified since judgment", exit 4).
+ * ponytail: a directory's own time is not compared; a child added to it after the walk makes its delete fail.
  * Entries come children first; the LAST is the judged target and every other PATH lies below it. Every entry is
  * opened with FILE_FLAG_OPEN_REPARSE_POINT (a reparse point is opened as itself, never followed) and
  * FILE_FLAG_BACKUP_SEMANTICS, and ALL are verified on their handles before any is deleted: not a reparse point,
@@ -13,7 +17,8 @@
  * validation and the deletes. Then each is deleted BY HANDLE (FileDispositionInfoEx with POSIX semantics, else
  * FileDispositionInfo), so a name swapped after the check is never touched. An ancestor or entry already open by
  * someone with delete access cannot be held: the removal is refused (fail closed). One stdout line: "ok N", or "refused I REASON" for entry I
- * (nothing deleted), or "failed I REASON" during deletion. Exit: 0 ok, 3 refused, 2 failed or usage.
+ * (nothing deleted), "kept I REASON" (nothing deleted), or "failed I REASON" during deletion. Exit: 0 ok, 3
+ * refused, 4 kept, 2 failed or usage.
  *
  * fabric-win-remove --private VOLUME INDEX PATH (pi-fabric#913 P1): a private record (a retention approval or the
  * mesh state): the same open and id, owner and reparse checks, and no SID but ours, SYSTEM or Administrators may
@@ -31,6 +36,8 @@
 typedef struct { HANDLE handle; int directory; } Entry;
 static Entry entries[MAX_ENTRIES];
 static PSID user, owner;
+static const char MODIFIED[] = "modified since judgment";
+#define FIELDS 6
 
 static unsigned long long hex(const wchar_t *text, int *ok) {
     unsigned long long value = 0;
@@ -64,12 +71,18 @@ static int trusted(PSID sid) {
 }
 
 /* Open without following a reparse point and check kind, id and owner; NULL and *why set when refused. */
-static HANDLE openJudged(const wchar_t *path, DWORD access, int directory, const wchar_t *volumeText, const wchar_t *indexText, const char **why) {
-    int okVolume, okIndex;
+/* With mtimeText and sizeText (a removal), a FILE is held without FILE_SHARE_WRITE and its last-write time and size
+ * must be the judged ones: else *why is MODIFIED. */
+static HANDLE openJudged(const wchar_t *path, DWORD access, int directory, const wchar_t *volumeText, const wchar_t *indexText,
+    const wchar_t *mtimeText, const wchar_t *sizeText, const char **why) {
+    int okVolume, okIndex, okTime = 1, okSize = 1;
     unsigned long long volume = hex(volumeText, &okVolume), index = hex(indexText, &okIndex);
-    if (!okVolume || !okIndex) { *why = "usage"; return NULL; }
-    /* No FILE_SHARE_DELETE (pi-fabric#913 round 2): while we hold it, nobody can rename or delete it. */
-    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+    unsigned long long mtime = mtimeText ? hex(mtimeText, &okTime) : 0, size = sizeText ? hex(sizeText, &okSize) : 0;
+    if (!okVolume || !okIndex || !okTime || !okSize) { *why = "usage"; return NULL; }
+    int judgedFile = mtimeText && directory == 0;
+    /* No FILE_SHARE_DELETE (pi-fabric#913 round 2): while we hold it, nobody can rename or delete it; a judged
+     * file not FILE_SHARE_WRITE either (round 4): nobody can write it after its time and size are checked. */
+    HANDLE handle = CreateFileW(path, access, FILE_SHARE_READ | (judgedFile ? 0 : FILE_SHARE_WRITE), NULL, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (handle == INVALID_HANDLE_VALUE) { *why = "open failed"; return NULL; }
     BY_HANDLE_FILE_INFORMATION info;
@@ -80,6 +93,8 @@ static HANDLE openJudged(const wchar_t *path, DWORD access, int directory, const
         : directory >= 0 && !!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != directory ? "type changed since judgment"
         : info.dwVolumeSerialNumber != volume || ((unsigned long long)info.nFileIndexHigh << 32 | info.nFileIndexLow) != index
           ? "file id changed since judgment"
+        : judgedFile && (((unsigned long long)info.ftLastWriteTime.dwHighDateTime << 32 | info.ftLastWriteTime.dwLowDateTime) != mtime ||
+            ((unsigned long long)info.nFileSizeHigh << 32 | info.nFileSizeLow) != size) ? MODIFIED
         : GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &fileOwner, NULL, NULL, NULL, &descriptor) != ERROR_SUCCESS
           ? "owner unreadable"
         : !fileOwner || !(EqualSid(fileOwner, user) || EqualSid(fileOwner, owner)) ? "not owned by this user" : NULL;
@@ -152,7 +167,7 @@ int wmain(int argc, wchar_t **argv) {
     if (!user || !owner) { printf("failed -1 token\n"); return 2; }
     const char *why = NULL;
     if (argc == 5 && wcscmp(argv[1], L"--private") == 0) {
-        HANDLE handle = openJudged(argv[4], READ_CONTROL | FILE_READ_ATTRIBUTES, 0, argv[2], argv[3], &why);
+        HANDLE handle = openJudged(argv[4], READ_CONTROL | FILE_READ_ATTRIBUTES, 0, argv[2], argv[3], NULL, NULL, &why);
         if (!handle) return fail("refused", 0, why, 3);
         why = privateDacl(handle);
         CloseHandle(handle);
@@ -160,26 +175,26 @@ int wmain(int argc, wchar_t **argv) {
     }
     int first = 1, dry = 0;
     if (argc > 1 && wcscmp(argv[1], L"--dry-run") == 0) { dry = 1; first = 2; }
-    int count = (argc - first) / 4;
-    if (count < 1 || count > MAX_ENTRIES || (argc - first) % 4 != 0) { printf("failed -1 usage\n"); return 2; }
-    if ((why = holdAncestors(argv[first + 4 * (count - 1) + 3]))) return fail("refused", count - 1, why, 3);
+    int count = (argc - first) / FIELDS;
+    if (count < 1 || count > MAX_ENTRIES || (argc - first) % FIELDS != 0) { printf("failed -1 usage\n"); return 2; }
+    if ((why = holdAncestors(argv[first + FIELDS * (count - 1) + 5]))) return fail("refused", count - 1, why, 3);
     for (int i = 0; i < count; i++) {
-        wchar_t **arg = argv + first + 4 * i;
+        wchar_t **arg = argv + first + FIELDS * i;
         int directory = wcscmp(arg[0], L"d") == 0;
         if (!directory && wcscmp(arg[0], L"f") != 0) return fail("failed", i, "usage", 2);
-        HANDLE handle = openJudged(arg[3], DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES, directory, arg[1], arg[2], &why);
-        if (!handle) return fail("refused", i, why, 3);
+        HANDLE handle = openJudged(arg[5], DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES, directory, arg[1], arg[2], arg[3], arg[4], &why);
+        if (!handle) return why == MODIFIED ? fail("kept", i, why, 4) : fail("refused", i, why, 3);
         entries[i].handle = handle;
         entries[i].directory = directory;
     }
     /* Bind every descendant to the judged tree: its final path is the target's final path plus its relative name. */
     static wchar_t top[32768], final[32768];
-    const wchar_t *topPath = argv[first + 4 * (count - 1) + 3];
+    const wchar_t *topPath = argv[first + FIELDS * (count - 1) + 5];
     size_t topLength = wcslen(topPath);
     DWORD length = GetFinalPathNameByHandleW(entries[count - 1].handle, top, 32768, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (length == 0 || length >= 32768) return fail("refused", count - 1, "final path unreadable", 3);
     for (int i = 0; i < count - 1; i++) {
-        const wchar_t *path = argv[first + 4 * i + 3];
+        const wchar_t *path = argv[first + FIELDS * i + 5];
         if (wcsncmp(path, topPath, topLength) != 0 || path[topLength] != L'\\') return fail("failed", i, "usage: not below the target", 2);
         DWORD got = GetFinalPathNameByHandleW(entries[i].handle, final, 32768, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         if (got == 0 || got >= 32768) return fail("refused", i, "final path unreadable", 3);

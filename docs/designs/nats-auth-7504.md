@@ -298,3 +298,30 @@ chart (nats-io/k8s) and NACK (nats-io/nack), same config shape and creds split. 
 - **Security pass `nats-auth-7504-security`**, by a reviewer who is not the designer or the challenger, before any
   fleet root switches: this note, the encoder, the permission templates, the #907 text change (G-4), and the
   T2, T4, T5, T10 and T11 results.
+
+## fabric-store decisions on revision 1 (10-12 05:20Z)
+
+The design is accepted as the R1 basis. A named security pass on this note runs next, in place of the skipped challenge round 2. No fleet traffic and no 1Password items are created before it passes.
+
+- **D1 accepted.** Children inherit the parent's user in R1; per-child users move to phase C.
+- **D2 accepted.** If T2 can't bind exact streams: block the fleet switch, try the whole-name tag, and only then take the org-wide trust trade-off to Paul.
+- **D3 accepted.** Self-hosted keys on the user's own disk, as a documented product mode (S1, approver fabric-store; Paul's own words: "scale all the way down to a single machine"). It is never a fleet file class.
+- **D4: the encoder is decided at G-7, leaning toward the recommendation.** The own encoder (~80 lines over `@nats-io/nkeys`) wins only if its output matches `nsc describe` and nats-server accepts it, in a test. The `ponytail:` comment says why `@nats-io/jwt` (pre-1.0) is not used. If G-7 finds `@nats-io/jwt` sound and maintained, it is used instead.
+- **D5 accepted.** mesh-bridge carries no NATS root in R1.
+- **D6 accepted.** A hard 7-day cutoff, the lame-duck runbook, and replicas 3 (Q6). Renewal moves to phase C.
+- **Q3:** fail closed, as written now. No per-host bootstrap creds file.
+- **Q4:** no cache for `nats-admin`. During a 1Password outage, the response to a leak is lame duck or stopping the node over ssh (runbook row). A cached operator-signing-key file on Ryzen 1 is a worse risk than a delayed revoke.
+- **Q5:** routes use **mutual TLS with known-URL checking** (`verify_cert_and_check_known_urls` on the route block) plus the tailnet ACL, which limits 6222 to the 3 nodes. There is no route password, so there is no new secret on the nodes beyond F1. T1 adds one more check: a 4th tailnet host with a valid certificate cannot join as a route.
+- **Q6:** replicas 3 are required before the fleet switch (G-6, unchanged).
+
+**Phasing, for the S8 date (logins ready for the direct-route S8 run by 10-13 12:00Z):**
+- **Phase 1, for S8:**
+  - `fabric nats mint`;
+  - the server config generator (operator mode, full resolver, route mTLS);
+  - `init --local` with an embedded single node;
+  - T1, T2, T4, T5, T6, T8.
+  - S8 uses minted test users only, never a fleet root.
+- **Phase 2, before any fleet root switches:**
+  - FD 3 delivery and the launch graph (T10, T11);
+  - G-1, G-2 (the maintainer compaction job), G-3, G-4;
+  - the reader-proof binding (section 7, #9834).

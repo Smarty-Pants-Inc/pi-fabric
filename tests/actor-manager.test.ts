@@ -3829,7 +3829,8 @@ describe("ActorManager", () => {
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason, code });
+    // smarty-dev#10067 P2-2: the owner alarm carries the fixed code, not the error text; the Main notice keeps the text.
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason: code, code });
     expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
     expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
   });

@@ -675,6 +675,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!current()) return false;
     if (outcome.status === "compiled" && outcome.artifact) {
+      // Proof-checked plans are usable now, before the persist waits on another process's compiled.lock (its retry
+      // budget is timer-bound and slow on Windows); the persisted file replaces it below once saved.
+      if (current()) setActiveCompiledSurface(outcome.artifact);
       try {
         const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
         if (current()) {
@@ -691,9 +694,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         }
       } catch (error) {
         if (!(error instanceof FileLockTimeoutError)) throw error;
-        // Proof-checked plans are usable now; durable persistence can catch up
-        // later without blocking this session on another process's writer.
-        if (current()) setActiveCompiledSurface(outcome.artifact);
+        // Already active (above); durable persistence catches up later without blocking this session.
         retry = true;
       }
     }

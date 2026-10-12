@@ -36,7 +36,8 @@ import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRe
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { scriptSpawnArgs } from "../agents/transports/process-utils.js";
+import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
+import { processStartTime } from "../residency/process-identity.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
 import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
@@ -211,6 +212,10 @@ interface ManagedActor {
   activationBlocked?: ActivationBlock;
   /** Durable alarm deduplication for the uninterrupted activation failure streak. */
   failureStreak?: { count: number; notified: boolean };
+  /** Events its activations dropped with no retry since the last completed run (smarty-dev#9332). */
+  eventsDropped?: { since: number; count: number; at: number; reason: string; runId?: string; eventRef: Record<string, string | number> };
+  /** When the actor last stopped (smarty-dev#9332: the actor-stopped alarm's episode). */
+  stoppedAt?: number;
   validWhile?: FabricActorValidWhileSource;
   records?: FabricActorRecordsOptions;
   /** The creating principal's scope; absent for unscoped actors. */
@@ -497,6 +502,33 @@ export const actorEventRef = (item: { id: string; source: string; payload: unkno
 };
 /** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
 export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
+/** The kinds of fabric.alarm.actor-activation: a blocked activation (pi-fabric#735) and the states that cannot act (smarty-dev#9332). */
+export type ActorAlarmKind = "actor-activation-blocked" | "actor-stopped" | "actor-event-dropped" | "actor-run-stuck";
+export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-blocked", "actor-stopped", "actor-event-dropped", "actor-run-stuck"];
+/** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
+export const actorAlarmKey = (actorId: string, kind: ActorAlarmKind): string =>
+  kind === "actor-activation-blocked" ? actorRealarmKey(actorId) : `actors/realarm/${actorId}/${kind}`;
+/** An alarm episode's slot at `now`: the first opens `after` the episode began (`since`), then one per
+ * ACTOR_BLOCK_REALARM_EVERY_MS (6 h). Undefined before the first. */
+const actorAlarmSlot = (now: number, since: number, after: number): number | undefined =>
+  now - since < after ? undefined : Math.floor((now - since - after) / ACTOR_BLOCK_REALARM_EVERY_MS);
+/** A persisted dropped-event episode (smarty-dev#9332), validated on restore; anything malformed is dropped. */
+const restoredEventsDropped = (value: unknown): { eventsDropped?: NonNullable<ManagedActor["eventsDropped"]> } => {
+  const episode = value as Partial<NonNullable<ManagedActor["eventsDropped"]>> | undefined;
+  if (!episode || !Number.isFinite(episode.since) || !Number.isSafeInteger(episode.count) || episode.count! < 1 ||
+      !Number.isFinite(episode.at) || typeof episode.reason !== "string" || typeof episode.eventRef !== "object" ||
+      episode.eventRef === null || Array.isArray(episode.eventRef)) return {};
+  const eventRef = Object.fromEntries(Object.entries(episode.eventRef)
+    .filter((entry): entry is [string, string | number] => typeof entry[1] === "string" || typeof entry[1] === "number"));
+  return { eventsDropped: { since: episode.since!, count: episode.count!, at: episode.at!, reason: episode.reason.slice(0, 80),
+    ...(typeof episode.runId === "string" ? { runId: episode.runId } : {}), eventRef } };
+};
+/** A durable or supervisor actor stopped for longer than this alarms (smarty-dev#9332). */
+export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
+/** An activation block with an unclassified cause (code "unknown") alarms once it is this old, after one failure. */
+export const ACTOR_UNKNOWN_BLOCK_ALARM_AFTER_MS = 30 * 60 * 1000;
+/** An in-flight run is stuck past max(this, 2x the actor's p95 run time) when its worker is gone. */
+export const ACTOR_RUN_STUCK_MIN_MS = 30 * 60 * 1000;
 /** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
@@ -2380,6 +2412,7 @@ export class ActorManager {
     // agents.stop/remove: an explicit stop is terminal, never restarted at a session start (smarty-dev#9241).
     actor.stopReason = "explicit";
     actor.updatedAt = Date.now();
+    actor.stoppedAt = actor.updatedAt;
     // Explicit stop wins over an ownership abort: do not park/retry the abandoned activation.
     if (actor.abortController) actor.cancelAbort = actor.abortController;
     delete actor.ownershipAbort;
@@ -2784,7 +2817,7 @@ export class ActorManager {
       } else {
         await this.mesh.delete({ key: cleanup.presenceKey });
       }
-      await this.mesh.delete({ key: actorRealarmKey(cleanup.id) }).catch(() => undefined);
+      for (const kind of ACTOR_ALARM_KINDS) await this.mesh.delete({ key: actorAlarmKey(cleanup.id, kind) }).catch(() => undefined);
       if (cleanup.lastRunId) await this.agents.cleanup(cleanup.lastRunId).catch(() => ({ cleaned: false }));
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
@@ -3686,6 +3719,9 @@ export class ActorManager {
               item.resolve?.(structuredClone(silent));
               this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false,
                 contextOverflow, result.warnings);
+              if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
+                this.#noteDroppedEvent(actor, item, reason, result.id);
+              }
               continue;
             }
             if (contextOverflow) throw new ActorContextOverflowError(result.error || `Actor run ${result.status}`);
@@ -3697,6 +3733,7 @@ export class ActorManager {
           // Only a completed run whose output is a valid message ends a failure streak: a
           // run that keeps returning an invalid directive is failing too.
           delete actor.failureStreak;
+          delete actor.eventsDropped;
           if (actor.activationBlocked) {
             delete actor.activationBlocked;
             this.#armActivationBlockExpiry(actor);
@@ -3767,6 +3804,7 @@ export class ActorManager {
             this.#clearSettledWindows(actor.id);
             actor.status = "stopped";
             actor.stopReason = "directive";
+            actor.stoppedAt = Date.now();
             this.#takeQueued(actor).forEach((queued) =>
               queued.reject?.(
                 new Error(
@@ -3851,6 +3889,10 @@ export class ActorManager {
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
             false, error instanceof ActorContextOverflowError);
+          // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
+          if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
+            this.#noteDroppedEvent(actor, item, message, runId);
+          }
         } finally {
           if (capabilityLease) {
             if (!workerLaunched) await this.#prepare(actor, "capability-release", () => capabilityLease!.release())
@@ -4881,24 +4923,144 @@ export class ActorManager {
   }
 
   // The streak alarm fires once; a block that persists for days must keep alarming (smarty-dev#7782).
-  // One durable mesh claim per actor gates each 6 h slot of a block episode, across managers,
-  // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes.
+  // A block with an unclassified cause (code "unknown") that has not reached the streak alarm (fewer than three
+  // failures) alarms once at 30 min, as slot -1 of the same claim (smarty-dev#9332); the 2 h + 6 h repeats follow.
   #realarmBlockedActivation(actor: ManagedActor, now: number): void {
     const blocked = actor.activationBlocked;
-    if (!blocked || now - blocked.since < ACTOR_BLOCK_REALARM_AFTER_MS) return;
-    const slot = Math.floor((now - blocked.since - ACTOR_BLOCK_REALARM_AFTER_MS) / ACTOR_BLOCK_REALARM_EVERY_MS);
-    const key = actorRealarmKey(actor.id);
+    if (!blocked) return;
+    const age = now - blocked.since;
+    const early = blocked.code === "unknown" && !actor.failureStreak?.notified &&
+      age >= ACTOR_UNKNOWN_BLOCK_ALARM_AFTER_MS && age < ACTOR_BLOCK_REALARM_AFTER_MS;
+    const slot = early ? -1 : actorAlarmSlot(now, blocked.since, ACTOR_BLOCK_REALARM_AFTER_MS);
+    if (slot === undefined) return;
+    this.#alarmActorState(actor, "actor-activation-blocked", blocked.since, slot, now, () => ({
+      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
+      classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
+      pendingEffects: "reconcile-required", ...(early ? { early: true } : { repeat: true }), blockedForMs: age }),
+      () => this.#actors.get(actor.id)?.activationBlocked?.since === blocked.since);
+  }
+
+  /**
+   * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
+   * (fabric.alarm.actor-activation, ownerRoot routing), evaluated on the existing retention sweep, no new timer:
+   * - actor-stopped: a durable or supervisor actor stopped for over 10 min and not removed;
+   * - actor-run-stuck: an in-flight run older than max(30 min, 2x the actor's p95 run time) whose run directory is
+   *   missing or whose worker is gone;
+   * - actor-event-dropped: re-alarmed here while its episode lasts (raised first at the drop itself).
+   */
+  #alarmActorStates(actor: ManagedActor, now: number): void {
+    if (actor.status === "stopped" && !actor.removal && (actor.residency === "durable" || actor.supervisorFor)) {
+      const since = actor.stoppedAt ?? actor.updatedAt;
+      const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
+      this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
+        actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
+        ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
+        ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
+        since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
+        () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
+          (current.stoppedAt ?? current.updatedAt) === since; });
+    }
+    const run = actor.inFlightRun;
+    if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
+      const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
+      const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
+      if (gone) {
+        this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, actorAlarmSlot(now, run.startedAt, threshold), now, () => ({
+          actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: gone, runId: run.id,
+          since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold, ...this.#runStatusHint(run.id) }),
+          () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id);
+      }
+    }
+    const dropped = actor.eventsDropped;
+    if (dropped) this.#alarmDroppedEvents(actor, dropped, now);
+  }
+
+  /** Why an in-flight run's worker is gone, or undefined while it can still be running. */
+  /**
+   * Why a run past its stuck threshold is not proven to be running (a fixed reason code), or undefined while it is.
+   * Liveness comes only from this host's own record of the launched worker (AgentManager.workerIdentity: the pid and
+   * kernel start time read at spawn), never from the worker-writable status.json. Fail toward the alarm: anything
+   * this host cannot prove (no live handle, no local process, no start time, an unreadable /proc) is
+   * "worker-unverified" (pi-fabric#944 round 1).
+   */
+  #runGone(runId: string): string | undefined {
+    const directory = this.agents.runDirectory(runId);
+    if (!directory) return "worker-unverified";
+    if (!fs.existsSync(directory)) return "run-dir-missing";
+    // TODO(pi-fabric#939): use its OwnedProcess {pid, /proc start time} once it lands; this is the same field-22
+    // comparison, done locally.
+    const worker = this.agents.workerIdentity(runId);
+    if (!worker) return "worker-unverified";
+    const current = worker.startTime === undefined ? undefined : processStartTime(worker.pid);
+    if (current === undefined) {
+      // No start time to compare (off Linux, or /proc unreadable): this host's own open transport handle for the
+      // run, with its pid alive, is the proof (pi-fabric#944 round 2). No open handle as well: unverified.
+      if (!processIsAlive(worker.pid)) return "worker-gone";
+      if (!worker.open) return "worker-unverified";
+    } else if (current !== worker.startTime) return "worker-pid-reused";
+    // The launched worker is alive. Past the threshold (far beyond any startup window) it must also have written a
+    // readable status record; an absent or corrupt one fails toward the alarm. A readable one never clears a dead worker.
+    return readRunRecord(path.join(directory, "status.json")) ? undefined : "worker-unverified";
+  }
+
+  /** The worker's own status.json, as an UNTRUSTED hint for the alarm data only (never a liveness decision). */
+  #runStatusHint(runId: string): { workerStatusHint?: { untrusted: true; status: unknown } } {
+    const directory = this.agents.runDirectory(runId);
+    const record = directory ? readRunRecord(path.join(directory, "status.json")) : undefined;
+    return record ? { workerStatusHint: { untrusted: true, status: typeof record.status === "string" ? record.status.slice(0, 40) : null } } : {};
+  }
+
+  /** p95 wall time of the actor's archived finished runs (runs/<id>/status.json), when it has any. */
+  #p95RunMs(actor: ManagedActor): number | undefined {
+    const durations: number[] = [];
+    for (const runId of this.#logs.retainedRunIds(actor).slice(-200)) {
+      const record = readRunRecord(path.join(path.dirname(actor.sessionFile), "runs", runId, "status.json"));
+      if (record && Number.isFinite(record.startedAt) && Number.isFinite(record.finishedAt) && record.finishedAt! >= record.startedAt) {
+        durations.push(record.finishedAt! - record.startedAt);
+      }
+    }
+    if (!durations.length) return undefined;
+    durations.sort((a, b) => a - b);
+    return durations[Math.min(durations.length - 1, Math.ceil(durations.length * 0.95) - 1)];
+  }
+
+  /** An activation dropped its event with no retry (smarty-dev#9332): one failure alarms; the episode lasts until a run completes. */
+  #noteDroppedEvent(actor: ManagedActor, item: ActorQueueItem, reason: string, runId: string | undefined): void {
+    if (this.#halted || this.#closing) return;
+    const now = Date.now();
+    const previous = actor.eventsDropped;
+    // A fixed failure code, never the raw error text (paths, secrets): pi-fabric#944 round 2.
+    const code = classifyActivationFailure({ lastError: reason, error: reason }).code;
+    const dropped = { since: previous?.since ?? now, count: (previous?.count ?? 0) + 1, at: now, reason: code,
+      ...(runId ? { runId } : {}), eventRef: actorEventRef(item) };
+    actor.eventsDropped = dropped;
+    this.#alarmDroppedEvents(actor, dropped, now);
+  }
+
+  #alarmDroppedEvents(actor: ManagedActor, dropped: NonNullable<ManagedActor["eventsDropped"]>, now: number): void {
+    this.#alarmActorState(actor, "actor-event-dropped", dropped.since, actorAlarmSlot(now, dropped.since, 0), now, () => ({
+      actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: dropped.reason, count: dropped.count,
+      since: dropped.since, lastDroppedAt: dropped.at, eventRef: dropped.eventRef, ...(dropped.runId ? { runId: dropped.runId } : {}),
+      pendingEffects: "reconcile-required" }),
+      () => this.#actors.get(actor.id)?.eventsDropped?.since === dropped.since);
+  }
+
+  // One durable mesh claim per actor and kind gates each 6 h slot of an episode (since), across managers,
+  // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes (smarty-dev#7782).
+  // Slots: see actorAlarmSlot.
+  #alarmActorState(actor: ManagedActor, kind: ActorAlarmKind, since: number, slot: number | undefined, now: number,
+    describe: () => Record<string, unknown>, current: () => boolean): void {
+    if (slot === undefined) return;
+    const key = actorAlarmKey(actor.id, kind);
     // A `pending` claim whose publish is overdue no longer covers its slot (smarty-dev#7905).
     const covers = (entry: MeshStateEntry | undefined): boolean => {
       const claimed = entry?.value as { since?: unknown; slot?: unknown; state?: unknown; at?: unknown } | undefined;
-      return claimed?.since === blocked.since && typeof claimed.slot === "number" && claimed.slot >= slot &&
+      return claimed?.since === since && typeof claimed.slot === "number" && claimed.slot >= slot &&
         !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
     };
     if (covers(this.mesh.get(key))) return;
-    const data = { actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: blocked.reason, code: blocked.code,
-      classification: blocked.classification, since: blocked.since, count: blocked.count, routingStatus: this.#publicInfo(actor).status,
-      pendingEffects: "reconcile-required", repeat: true, blockedForMs: now - blocked.since };
-    const claimed = { since: blocked.since, slot, at: now, owner: this.identity.id, state: "pending" };
+    const data = describe();
+    const claimed = { since, slot, at: now, owner: this.identity.id, state: "pending" };
     void (async () => {
       // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
       // tombstone, so a claim removed when an earlier block cleared can be taken again.
@@ -4920,13 +5082,13 @@ export class ActorManager {
       // takes over after the publish timeout. Never publish for a block that cleared or changed
       // episode, or a claim another sweep took over meanwhile (smarty-dev#7905). ponytail: an unchanged
       // version means the same slot and owner; any rewrite of the key bumps it.
-      if (this.#actors.get(actor.id)?.activationBlocked?.since !== blocked.since || this.mesh.get(key)?.version !== claim.version) {
+      if (!current() || this.mesh.get(key)?.version !== claim.version) {
         await release();
         return;
       }
       // Publish directly: #publishNotification resolves even when its attempt failed and dropped.
       try {
-        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind: "actor-activation-blocked", from: this.identity, data });
+        await this.mesh.publish({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data });
       } catch {
         await release();
         return;
@@ -4960,6 +5122,7 @@ export class ActorManager {
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
           this.#realarmBlockedActivation(actor, now);
+          this.#alarmActorStates(actor, now);
           this.#logs.pruneRuns(actor, now);
           const keepIds = new Set([this.#inFlight.get(actor.id), ...actor.queue,
             ...(this.#overflow.get(actor.id) ?? []), ...(this.#parked.get(actor.id) ?? [])]
@@ -5264,6 +5427,7 @@ export class ActorManager {
       instructions: actor.instructions,
       status: actor.status,
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
+      ...(actor.status === "stopped" && actor.stoppedAt !== undefined ? { stoppedAt: actor.stoppedAt } : {}),
       events: actor.events,
       topics: actor.topics,
       delivery: actor.delivery,
@@ -5307,6 +5471,7 @@ export class ActorManager {
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
+      ...(actor.eventsDropped ? { eventsDropped: structuredClone(actor.eventsDropped) } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       ...(actor.records ? { records: { ...actor.records } } : {}),
       ...(actor.principalScope ? { principalScope: actor.principalScope } : {}),
@@ -5816,6 +5981,7 @@ export class ActorManager {
           typeof record.failureStreak?.notified === "boolean"
           ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
+        ...restoredEventsDropped((source as { eventsDropped?: unknown }).eventsDropped),
         ...(records ? { records } : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }
@@ -5830,6 +5996,8 @@ export class ActorManager {
         updatedAt: restarted ? Date.now() : typeof record.updatedAt === "number" ? record.updatedAt : Date.now(),
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(stopReason ? { stopReason } : {}),
+        ...(status === "stopped" && Number.isFinite((source as { stoppedAt?: unknown }).stoppedAt)
+          ? { stoppedAt: (source as { stoppedAt: number }).stoppedAt } : {}),
         ...(status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
             typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)

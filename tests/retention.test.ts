@@ -25,6 +25,11 @@ import {
 const roots: string[] = [];
 const HOUR = 60 * 60 * 1_000;
 const DAY = 24 * HOUR;
+// Latest platform decision: verifiedRemove deletes (and compacts) only on Linux; elsewhere it refuses before any
+// deletion and never invokes main's path fallback. Delete-only cases run on Linux; the platform refusal itself is
+// covered by tests/verified-remove-platform-refusal.test.ts.
+const verifiedDeletes = process.platform === "linux";
+const deleteIt = it.skipIf(!verifiedDeletes);
 
 const temporaryDirectory = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-retention-test-"));
@@ -45,7 +50,7 @@ afterEach(() => {
 });
 
 describe("persistent archive custody", () => {
-  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
+  deleteIt.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
     const directory = temporaryDirectory();
     writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
     const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
@@ -95,7 +100,7 @@ describe("persistent archive custody", () => {
       expect(runTreeResourceVeto(parent, 0, () => true, true)).toMatch(/inspection was incomplete/);
     } finally { probe.mockRestore(); }
   });
-  it("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
+  deleteIt("vetoes ancestor/orphan deletion until offline recovery commits the full actor outcome", () => {
     const temp = temporaryDirectory();
     const root = path.join(temp, "pi-fabric-runs-recovery");
     const parent = path.join(root, "parent");
@@ -149,6 +154,7 @@ describe("owned follow-up retention artifacts", () => {
     expect(canRemoveTerminalRun(p.run)).toBe(true);
     expect(canRemoveManagedRunRoot(p.root)).toBe(true);
     const result = sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 });
+    if (!verifiedDeletes) { expect(result.removedRuns).toEqual([]); expect(fs.existsSync(p.run)).toBe(true); return; }
     expect(result.removedRuns).toContain(p.run);
     expect(fs.existsSync(p.root)).toBe(false);
   });
@@ -158,6 +164,7 @@ describe("owned follow-up retention artifacts", () => {
     expect(canRemoveTerminalRun(p.run)).toBe(true);
     expect(canRemoveManagedRunRoot(p.root)).toBe(true);
     const result = sweepTempRunRoots({ tempRoot: p.temp, now: 100_000, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 1 });
+    if (!verifiedDeletes) { expect(result.removedRuns).toEqual([]); expect(fs.existsSync(p.run)).toBe(true); return; }
     expect(result.removedRuns).toContain(p.run);
     expect(fs.existsSync(p.root)).toBe(false);
   });
@@ -377,7 +384,7 @@ describe("shared run-tree exit veto", () => {
 describe("safe run roots", () => {
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
-  it.each(["closed", "orphan"])("R3 collects owned route sessions and dispatch receipts in expired %s roots without weakening fences", kind => {
+  deleteIt.each(["closed", "orphan"])("R3 collects owned route sessions and dispatch receipts in expired %s roots without weakening fences", kind => {
     const tempRoot = temporaryDirectory();
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + kind);
     for (const name of ["done", "pending", "live", "unresolved"]) {
@@ -431,7 +438,8 @@ describe("safe run roots", () => {
       expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true })).toEqual([]);
       expect(sweep(tempRoot)).toEqual({ removedRuns: [], removedRoots: [] });
       expect(canRemoveTerminalRun(run, undefined, true)).toBe(true);
-      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual([run]);
+      // Off Linux even a dry run refuses (no deletion authority there).
+      expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: DAY, now: 100 * DAY, dryRun: true, acceptPidReuse: true })).toEqual(verifiedDeletes ? [run] : []);
       expect(fs.existsSync(writer)).toBe(true);
     } finally { birth.mockRestore(); }
   });
@@ -486,7 +494,7 @@ describe("safe run roots", () => {
     expect(fs.readFileSync(path.join(incomplete, "task.txt"), "utf8")).toBe("incomplete launch");
     // A host-wide shutdown marker is not a persisted receipt for this worker.
     writeStatus(incomplete, { status: "failed", actorId: "actor-1", transport: "process", sessionId: "2147483647", finishedAt: 1 });
-    expect(sweep(tempRoot, 6 * HOUR + 1).removedRuns).toEqual([incomplete]);
+    expect(sweep(tempRoot, 6 * HOUR + 1).removedRuns).toEqual(verifiedDeletes ? [incomplete] : []);
     expect(fs.existsSync(active)).toBe(true);
   });
 
@@ -516,7 +524,7 @@ describe("terminal run event log retention", () => {
     return dir;
   };
 
-  it.each(["completed", "failed", "stopped", "timed_out"])("bounds an old %s archive to the default tail, keeps status/reply and never rewrites it twice", (status) => {
+  deleteIt.each(["completed", "failed", "stopped", "timed_out"])("bounds an old %s archive to the default tail, keeps status/reply and never rewrites it twice", (status) => {
     const runsDirectory = path.join(temporaryDirectory(), "actors", "project", "a", "runs");
     const dir = make(runsDirectory, "old", { status, finishedAt: DAY });
     const statusBefore = fs.readFileSync(path.join(dir, "status.json"));
@@ -597,7 +605,7 @@ describe("terminal run event log retention", () => {
     } finally { changed.mockRestore(); }
   });
 
-  it("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
+  deleteIt("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
     const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 3 * DAY })).toBe(false);
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, expired: () => true })).toBe(false);
@@ -649,6 +657,7 @@ describe("temporal retention", () => {
       writeStatus(path.join(runRoot, "lost"), { status: "failed", transport: "process", sessionId: "2147483647", finishedAt: 1, updatedAt: 1 });
     }
     const unmarked = sweep(tempRoot);
+    if (!verifiedDeletes) { expect(unmarked).toEqual({ removedRoots: [], removedRuns: [] }); return; }
     expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
     expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
   });
@@ -673,7 +682,7 @@ describe("temporal retention", () => {
     expect(hasUnresolvedWorker(path.join(orphaned, "parent"))).toBe(true);
   });
 
-  it("removes dead temporary run roots after six hours", () => {
+  deleteIt("removes dead temporary run roots after six hours", () => {
     const tempRoot = temporaryDirectory();
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "dead");
     fs.mkdirSync(runRoot);
@@ -701,7 +710,7 @@ describe("temporal retention", () => {
     expect(fs.existsSync(runRoot)).toBe(false);
   });
 
-  it("sweeps a host at most once per interval, and again once the marker is stale (smarty-dev#2010)", () => {
+  deleteIt("sweeps a host at most once per interval, and again once the marker is stale (smarty-dev#2010)", () => {
     const tempRoot = temporaryDirectory();
     const deadRoot = (name: string): string => {
       const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + name);
@@ -728,7 +737,7 @@ describe("temporal retention", () => {
     expect(sweepAt(2 * DAY).removedRoots).toEqual([third]);
   });
 
-  it("collects expired actor runs with worker reply and overflow files, still vetoed by unknown files (smarty-dev#2010)", () => {
+  deleteIt("collects expired actor runs with worker reply and overflow files, still vetoed by unknown files (smarty-dev#2010)", () => {
     const tempRoot = temporaryDirectory();
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "actor");
     markRunRootActive(runRoot, 1);
@@ -767,10 +776,10 @@ describe("temporal retention", () => {
     // A spent budget visits nothing; an unbounded sweep collects the run once it is due.
     expect(sweepAt(3 * DAY, 0).removedRuns).toEqual([]);
     expect(fs.existsSync(run)).toBe(true);
-    expect(sweepAt(3 * DAY).removedRuns).toEqual([run]);
+    expect(sweepAt(3 * DAY).removedRuns).toEqual(verifiedDeletes ? [run] : []);
   });
 
-  describe("a deadline crossed mid-walk (smarty-dev#2010 review)", () => {
+  describe.skipIf(!verifiedDeletes)("a deadline crossed mid-walk (smarty-dev#2010 review)", () => {
     const budgetSweep = (tempRoot: string, budgetMs?: number) => sweepTempRunRoots({
       tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY,
       ...(budgetMs !== undefined ? { budgetMs } : {}),
@@ -843,7 +852,7 @@ describe("temporal retention", () => {
     expect(fs.existsSync(liveRoot)).toBe(true);
   });
 
-  it("expires terminal one-shot runs from gracefully retained roots after 24 hours", () => {
+  deleteIt("expires terminal one-shot runs from gracefully retained roots after 24 hours", () => {
     const tempRoot = temporaryDirectory();
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
     markRunRootActive(runRoot, 1);
@@ -868,7 +877,7 @@ describe("temporal retention", () => {
     expect(fs.existsSync(fresh)).toBe(true);
   });
 
-  it("expires actor archives after seven days while preserving the latest run", () => {
+  deleteIt("expires actor archives after seven days while preserving the latest run", () => {
     const root = temporaryDirectory();
     const runsDirectory = path.join(root, "runs");
     const expired = path.join(runsDirectory, "expired");

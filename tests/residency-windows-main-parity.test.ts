@@ -54,7 +54,9 @@ describe("forced-win32 parity with main 9387af87 (Windows V2: smarty-dev#5132)",
     console.info("main-parity bounded: statusReads=5, lines=20, replacements=0");
   });
 
-  it("compacts all 130 runs in one main sweep, including >64-entry trees", () => {
+  // Latest platform decision: off Linux verifiedRemove never runs main's path fallback, so the main sweep still
+  // recovers every outcome but keeps every original log (no tail is published; nothing is replaced).
+  it("recovers all 130 runs in one main sweep, including >64-entry trees, and keeps every original log", () => {
     const root = fixture();
     const runs = Array.from({ length: 130 }, (_, index) => makeRun(root, `run-${index}`));
     for (let i = 0; i < 65; i++) fs.writeFileSync(path.join(runs[0]!, `oversized-event-prefix-${i}.txt`), "keep");
@@ -65,12 +67,12 @@ describe("forced-win32 parity with main 9387af87 (Windows V2: smarty-dev#5132)",
       expect(collector.due(now)).toBe(false); expect(recovered).toBe(130);
       for (const run of runs) {
         const lines = fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n");
-        expect(lines).toHaveLength(201);
-        expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
-        expect(JSON.parse(lines[1]!)).toEqual({ sequence: 201 });
-        expect(JSON.parse(lines[200]!)).toEqual({ sequence: 400 });
+        expect(lines).toHaveLength(401);
+        expect(JSON.parse(lines[0]!)).toEqual({ sequence: 0 });
+        expect(JSON.parse(lines[400]!)).toEqual({ sequence: 400 });
+        expect(fs.readdirSync(run).filter(name => name.endsWith(".tmp") || name.startsWith(".retention-graveyard-"))).toEqual([]);
       }
-      console.info("main-parity sweep: recovered=130, compacted=130, lines=201, first=201, last=400");
+      console.info("forced-win32 sweep: recovered=130, compacted=0, lines=401 (fallback never invoked)");
     } finally { collector.close(); }
   });
 

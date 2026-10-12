@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import { fabricDataRoot } from "./temp-root.js";
 import path from "node:path";
-import { verifiedRemove } from "./verified-remove.js";
 
 export const SCRATCH_OWNER_FILE = ".fabric-scratch.json";
 export const SCRATCH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -168,6 +167,9 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       continue;
     }
     try {
+      // The synchronous remover is shared with lazy retention paths; importing it at first removal keeps its
+      // tree verification and native-helper code out of registration and idle startup (smarty-dev#7916).
+      const { verifiedRemove } = await import("./verified-remove.js");
       // Recheck identity, contents and liveness, not merely that a directory exists.
       if (!unchanged(candidate.root, ownedStat(candidate.directory))) continue;
       const names = await fs.promises.readdir(candidate.directory);
@@ -175,8 +177,8 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) continue;
       if (candidate.owner.closedAt === undefined && processAlive(candidate.owner.pid)) continue;
       if (candidate.childPid !== undefined && processAlive(candidate.childPid)) continue;
-      // smarty-dev#7916: only the judged root inode and a tree of our own entries; off Linux main's removal
-      // (smarty-dev#7858). No getuid on Linux means no ownership proof: nothing is removed.
+      // smarty-dev#7916: only the judged root inode and snapshotted tree of our own entries. The helper refuses
+      // without uid proof on every platform; path-based fallbacks have no deletion authority.
       const directory = candidate.directory;
       if (!verifiedRemove(directory, candidate.root, { deleter: "sweepScratch",
         fallback: () => { fs.rmSync(directory, { recursive: true, force: true }); return true; } }).removed) continue;

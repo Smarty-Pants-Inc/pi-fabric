@@ -102,8 +102,12 @@ it.each(["native", "win32"])("completed-but-not-cleaned durable agents release a
     const ids = fixture.creationIds("spawnBound");
     expect(ids).toHaveLength(3);
     const now = Math.max(...ids.map(id => fixture.ack(id).acknowledgedAt)) + RESIDENT_REQUEST_RETENTION_MS + 1;
-    await fixture.scan(now, () => ids.every(id => !fixture.retained(id)));
-    expect(ids.filter(fixture.retained)).toEqual([]);
+    // Latest platform decision: only Linux deletes through verifiedRemove; a forced or native win32 collection
+    // refuses (no path fallback), so every decision is kept and nothing else changes.
+    const deletes = platform === "native" && process.platform === "linux";
+    if (deletes) await fixture.scan(now, () => ids.every(id => !fixture.retained(id)));
+    else await fixture.scan(now);
+    expect(ids.filter(fixture.retained)).toEqual(deletes ? [] : ids);
     for (const handle of handles) {
       // Collection releases exchange capacity, NOT result/output ownership.
       expect(fixture.client.hasAgent(handle.id)).toBe(true);

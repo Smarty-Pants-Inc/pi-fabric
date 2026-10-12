@@ -14,6 +14,7 @@ beforeEach(() => setWindowsVerifiedRemoval(true));
 afterEach(() => {
   setWindowsVerifiedRemoval(false);
   delete verifiedRemoveTestHooks.beforeHelper;
+  delete verifiedRemoveTestHooks.beforeOpen;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 const tempDir = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-win-remove-")); dirs.push(dir); return dir; };
@@ -22,37 +23,55 @@ const ids = (file: string) => { const stat = fs.lstatSync(file, { bigint: true }
 const entryArgs = (file: string, kind?: "f" | "d") => { const stat = fs.lstatSync(file, { bigint: true });
   return [kind ?? (stat.isDirectory() ? "d" : "f"), stat.dev.toString(16), stat.ino.toString(16),
     (stat.mtimeNs / 100n + 116_444_736_000_000_000n).toString(16), stat.size.toString(16), path.toNamespacedPath(file)]; };
+// Latest platform decision: verifiedRemove refuses before any deletion or helper dispatch where getuid/geteuid are
+// absent, as on real Windows. The helper itself stays covered below by direct invocations.
+const NO_UID = "file ownership cannot be proven on this platform (no getuid); nothing is deleted";
+/** verifiedRemove on real Windows: the no-getuid refusal, with no hook dispatched and no final check run. */
+const refusesWithoutUid = (target: string, judged: fs.Stats, options: { freed?: number; proceed?: () => boolean } = {}) => {
+  const dispatched: string[] = [];
+  verifiedRemoveTestHooks.beforeOpen = () => { dispatched.push("beforeOpen"); };
+  verifiedRemoveTestHooks.beforeHelper = () => { dispatched.push("beforeHelper"); };
+  let checked = 0;
+  const proceed = options.proceed ? () => { checked++; return options.proceed!(); } : undefined;
+  expect(verifiedRemove(target, judged, { deleter: "test", ...(options.freed === undefined ? {} : { freed: options.freed }),
+    ...(proceed ? { proceed } : {}) })).toEqual({ removed: false, reason: NO_UID });
+  expect({ dispatched, checked }).toEqual({ dispatched: [], checked: 0 });
+};
 
 describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
     expect(windowsRemoveHelper()).toMatch(/fabric-win-remove\.exe$/);
   });
 
-  it("removes our own file and a directory tree by handle", () => {
+  // verifiedRemove refuses (no getuid) and leaves both untouched; the helper itself removes them by handle.
+  it("verifiedRemove refuses our own file and tree without getuid; the helper removes them by handle", () => {
     const dir = tempDir();
     const file = path.join(dir, "old.bak");
     fs.writeFileSync(file, "x".repeat(10));
-    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test" })).toEqual({ removed: true, bytes: 10 });
+    refusesWithoutUid(file, fs.lstatSync(file));
+    expect(fs.readFileSync(file, "utf8")).toBe("x".repeat(10));
+    const fileHelper = spawnSync(windowsRemoveHelper()!, entryArgs(file), { encoding: "utf8", windowsHide: true });
+    expect({ status: fileHelper.status, line: fileHelper.stdout.trim() }).toEqual({ status: 0, line: "ok 1 removed" });
     expect(fs.existsSync(file)).toBe(false);
     const tree = path.join(dir, "run");
     fs.mkdirSync(path.join(tree, "nested"), { recursive: true });
     fs.writeFileSync(path.join(tree, "nested", "events.jsonl"), "{}\n");
-    expect(verifiedRemove(tree, fs.lstatSync(tree), { deleter: "test" })).toMatchObject({ removed: true });
+    refusesWithoutUid(tree, fs.lstatSync(tree));
+    expect(fs.readFileSync(path.join(tree, "nested", "events.jsonl"), "utf8")).toBe("{}\n");
+    const args = [path.join(tree, "nested", "events.jsonl"), path.join(tree, "nested"), tree].flatMap(entry => entryArgs(entry));
+    const treeHelper = spawnSync(windowsRemoveHelper()!, args, { encoding: "utf8", windowsHide: true });
+    expect({ status: treeHelper.status, line: treeHelper.stdout.trim() }).toEqual({ status: 0, line: "ok 3 removed" });
     expect(fs.existsSync(tree)).toBe(false);
   });
 
-  // pi-fabric#913 Windows CI: a caller's final check runs with the target off its name, as on Linux, so a compaction
-  // can publish its new tail there; a kept target goes back to its name.
-  it("runs the final check with the target moved off its name, and moves a kept target back", () => {
+  // Without getuid, verifiedRemove never moves the target off its name and never runs the caller's final check.
+  it("refuses without getuid before the final check: the target stays on its name, unchanged", () => {
     const dir = tempDir();
     const file = path.join(dir, "events.jsonl");
     fs.writeFileSync(file, "old events\n");
-    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", freed: 4,
-      proceed: () => { fs.writeFileSync(file, "tail\n", { flag: "wx" }); return true; } })).toEqual({ removed: true, bytes: 4 });
-    expect(fs.readFileSync(file, "utf8")).toBe("tail\n");
-    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", proceed: () => false }))
-      .toMatchObject({ removed: false, reason: "kept by the final check" });
-    expect(fs.readFileSync(file, "utf8")).toBe("tail\n");
+    refusesWithoutUid(file, fs.lstatSync(file), { freed: 4, proceed: () => { fs.writeFileSync(file, "tail\n", { flag: "wx" }); return true; } });
+    refusesWithoutUid(file, fs.lstatSync(file), { proceed: () => false });
+    expect(fs.readFileSync(file, "utf8")).toBe("old events\n");
     expect(fs.readdirSync(dir)).toEqual(["events.jsonl"]);
   });
 
@@ -63,20 +82,22 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     const file = path.join(dir, "events.jsonl");
     fs.writeFileSync(file, "judged\n");
     const id = ids(file);
+    // verifiedRemove refuses without getuid, before the helper; the helper itself keeps refreshed files (exit 4).
+    refusesWithoutUid(file, fs.lstatSync(file));
     // Same size, later time.
-    verifiedRemoveTestHooks.beforeHelper = () => {
-      fs.writeFileSync(file, "fresh!\n");
-      const later = new Date(Date.now() + 10_000);
-      fs.utimesSync(file, later, later);
-    };
-    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test" }))
-      .toEqual({ removed: false, reason: `kept by the final check (${file} modified since judgment)` });
+    const judgedArgs = entryArgs(file);
+    fs.writeFileSync(file, "fresh!\n");
+    const later = new Date(Date.now() + 10_000);
+    fs.utimesSync(file, later, later);
+    const timed = spawnSync(windowsRemoveHelper()!, judgedArgs, { encoding: "utf8", windowsHide: true });
+    expect({ status: timed.status, line: timed.stdout.trim() }).toEqual({ status: 4, line: "kept 0 modified since judgment" });
     expect(fs.readFileSync(file, "utf8")).toBe("fresh!\n");
     expect(ids(file)).toEqual(id);
-    // Larger, through the final-check path (moved off its name first): kept and moved back.
-    verifiedRemoveTestHooks.beforeHelper = () => { fs.appendFileSync(file, "more\n"); };
-    expect(verifiedRemove(file, fs.lstatSync(file), { deleter: "test", proceed: () => true }))
-      .toMatchObject({ removed: false, reason: expect.stringContaining("modified since judgment") });
+    // Larger.
+    const sizedArgs = entryArgs(file);
+    fs.appendFileSync(file, "more\n");
+    const sized = spawnSync(windowsRemoveHelper()!, sizedArgs, { encoding: "utf8", windowsHide: true });
+    expect({ status: sized.status, line: sized.stdout.trim() }).toEqual({ status: 4, line: "kept 0 modified since judgment" });
     expect(fs.readFileSync(file, "utf8")).toBe("fresh!\nmore\n");
     expect(fs.readdirSync(dir)).toEqual(["events.jsonl"]);
   });
@@ -110,7 +131,7 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     const judgedArgs = entryArgs(file);
     fs.unlinkSync(file);
     fs.writeFileSync(file, "replacement");
-    expect(verifiedRemove(file, judged, { deleter: "test" })).toMatchObject({ removed: false, reason: expect.stringContaining("replaced since judgment") });
+    refusesWithoutUid(file, judged);
     // The helper itself, given the judged id for the replaced name, refuses on the handle.
     const helper = spawnSync(windowsRemoveHelper()!, judgedArgs, { encoding: "utf8", windowsHide: true });
     expect({ status: helper.status, line: helper.stdout.trim() }).toEqual({ status: 3, line: "refused 0 file id changed since judgment" });
@@ -119,17 +140,20 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
 
   // pi-fabric#913 (Astra P1): an ancestor in the judged tree swapped for a junction AFTER the walk and before the
   // helper opens the entries: the helper opens the junction itself and refuses; nothing is deleted anywhere.
+  // verifiedRemove refuses without getuid first; the swap is then proven against the helper directly.
   it("refuses an ancestor swapped for a junction after the walk, and deletes nothing", () => {
     const dir = tempDir();
     const tree = path.join(dir, "run");
     const nested = path.join(tree, "nested");
     fs.mkdirSync(nested, { recursive: true });
     fs.writeFileSync(path.join(nested, "events.jsonl"), "{}\n");
-    verifiedRemoveTestHooks.beforeHelper = () => {
-      fs.renameSync(nested, `${nested}.real`);
-      fs.symlinkSync(`${nested}.real`, nested, "junction");
-    };
-    expect(verifiedRemove(tree, fs.lstatSync(tree), { deleter: "test" })).toMatchObject({ removed: false, reason: expect.stringContaining("reparse point") });
+    refusesWithoutUid(tree, fs.lstatSync(tree));
+    const args = [path.join(nested, "events.jsonl"), nested, tree].flatMap(entry => entryArgs(entry));
+    fs.renameSync(nested, `${nested}.real`);
+    fs.symlinkSync(`${nested}.real`, nested, "junction");
+    const helper = spawnSync(windowsRemoveHelper()!, args, { encoding: "utf8", windowsHide: true });
+    expect(helper.status, helper.stdout).toBe(3);
+    expect(helper.stdout.trim()).toMatch(/^refused \d+ .*reparse point/);
     expect(fs.readFileSync(path.join(`${nested}.real`, "events.jsonl"), "utf8")).toBe("{}\n");
     expect(fs.existsSync(tree)).toBe(true);
   });
@@ -186,7 +210,7 @@ describe.skipIf(process.platform !== "win32")("Windows verified removal (smarty-
     fs.mkdirSync(tree);
     const junction = path.join(tree, "link");
     fs.symlinkSync(path.dirname(outside), junction, "junction");
-    expect(verifiedRemove(tree, fs.lstatSync(tree), { deleter: "test" })).toMatchObject({ removed: false, reason: expect.stringContaining("reparse point") });
+    refusesWithoutUid(tree, fs.lstatSync(tree));
     // The helper opens the junction itself (FILE_FLAG_OPEN_REPARSE_POINT) and refuses it.
     const helper = spawnSync(windowsRemoveHelper()!, entryArgs(junction, "d"), { encoding: "utf8", windowsHide: true });
     expect({ status: helper.status, line: helper.stdout.trim() }).toEqual({ status: 3, line: "refused 0 a reparse point" });

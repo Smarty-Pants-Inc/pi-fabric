@@ -7,6 +7,9 @@ import { closeScratch, createScratch, SCRATCH_OWNER_FILE, sweepScratch } from ".
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
 
 const HOUR = 3_600_000;
+// Latest platform decision: verifiedRemove deletes only on Linux; elsewhere the same eligible roots are kept (no
+// path fallback is invoked). Planning and dry runs are unchanged everywhere.
+const verifiedDeletes = process.platform === "linux";
 const roots: string[] = [];
 const sandbox = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-test-"));
@@ -60,7 +63,8 @@ describe("managed scratch retention", () => {
     const options = { tempRoot, now: 30 * HOUR + 1 };
     expect((await sweepScratch({ ...options, dryRun: true })).eligible).toEqual([old]);
     expect(fs.existsSync(old)).toBe(true);
-    expect((await sweepScratch(options)).removed).toEqual([old]);
+    expect((await sweepScratch(options)).removed).toEqual(verifiedDeletes ? [old] : []);
+    expect(fs.existsSync(old)).toBe(!verifiedDeletes);
     for (const file of [young, active, unrelated]) expect(fs.existsSync(file)).toBe(true);
   });
 
@@ -71,8 +75,9 @@ describe("managed scratch retention", () => {
     const recent = fixture(tempRoot, "output", { closedAt: 2 * HOUR });
     const active = fixture(tempRoot, "output");
     const checkpoint = fixture(tempRoot, "checkpoint");
-    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxItems: 3 })).removed).toEqual([old]);
-    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxBytes: 0 })).removed).toEqual([newer]);
+    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxItems: 3 })).removed).toEqual(verifiedDeletes ? [old] : []);
+    expect((await sweepScratch({ tempRoot, now: 2 * HOUR + 1, maxBytes: 0 })).removed).toEqual(verifiedDeletes ? [newer] : []);
+    if (!verifiedDeletes) for (const file of [old, newer]) expect(fs.existsSync(file)).toBe(true);
     for (const file of [recent, active, checkpoint]) expect(fs.existsSync(file)).toBe(true);
   });
 
@@ -86,7 +91,8 @@ describe("managed scratch retention", () => {
     expect(fs.readFileSync(path.join(orphan, SCRATCH_OWNER_FILE), "utf8")).toBe(before);
     expect((await sweepScratch({ tempRoot, now: 40 * HOUR })).removed).toEqual([]);
     expect((await sweepScratch({ tempRoot, now: 45 * HOUR })).removed).toEqual([]);
-    expect((await sweepScratch({ tempRoot, now: 46 * HOUR })).removed).toEqual([orphan]);
+    expect((await sweepScratch({ tempRoot, now: 46 * HOUR })).removed).toEqual(verifiedDeletes ? [orphan] : []);
+    expect(fs.existsSync(orphan)).toBe(!verifiedDeletes);
   });
 
   it("protects shell children even after their host dies", async () => {

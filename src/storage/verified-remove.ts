@@ -12,17 +12,21 @@ import { fileURLToPath } from "node:url";
  * 1. Open the parent O_DIRECTORY|O_NOFOLLOW and the target O_PATH|O_NOFOLLOW (|O_DIRECTORY for a directory) through
  *    the parent's fd, fstat it: uid must be geteuid, dev/ino and type must equal the judged stat, and its mtime must
  *    be unchanged (the age re-check: a refreshed target is not the judged one).
- * 2. Walk the whole tree through fds; every entry must be ours. Any doubt: nothing is changed. A dry run stops here,
- *    so it runs the same judgment and verification as an apply, minus the rename and the delete.
- * 3. Rename it into a same-directory graveyard (`.retention-graveyard-<pid>`), fstat it there again (dev/ino/uid).
- *    A mismatch leaves it in the graveyard, reported, and deletes nothing.
- * 4. `proceed()` (a caller's last check, for example a registry re-read) may keep it: it is moved back.
- * 5. Remove it directory-relative, entry by entry, each verified again before its unlink or rmdir.
+ * 2. Walk the whole tree through fds; every entry must be ours. The walk keeps a snapshot of every entry (dev/ino/uid/
+ *    type/mtime and each directory's exact name set). Any doubt: nothing is changed. A dry run stops here, so it runs
+ *    the same judgment and verification as an apply, minus the rename and the delete.
+ * 3. Rename it into a same-directory graveyard (`.retention-graveyard-<pid>`) and revalidate the whole snapshot there
+ *    (mtime too: a rename keeps it), deleting nothing. A mismatch leaves it in the graveyard, reported.
+ * 4. `proceed()` (a caller's last check, for example a registry re-read) may keep it: it is moved back. Otherwise the
+ *    whole snapshot is revalidated again, deleting nothing.
+ * 5. Remove it directory-relative, entry by entry, each compared with its snapshot again before its unlink or rmdir.
+ *    A name not in the snapshot never gets deletion authority. Before an rmdir only identity/owner/type are compared
+ *    (our own child removals change its mtime).
  *
  * Directory-relative operations go through `/proc/self/fd/<fd>/<name>` (Node has no unlinkat or renameat; the same
- * pin as mesh/fence-lock.ts). Where that is unavailable (not Linux: macOS, Windows), a deleter that main already ran
- * in-process passes its unchanged main-branch removal as `fallback`, so nothing regresses there; without a fallback
- * nothing is deleted. The verified path off Linux is carried by smarty-dev#7858.
+ * pin as mesh/fence-lock.ts). Off Linux, or without getuid/geteuid (on any platform, Windows included), nothing is
+ * deleted: the `fallback` option is kept for source compatibility and never invoked. smarty-dev#7858 carries the
+ * verified path off Linux.
  * Every directory in the tree must be ours and closed (no group/other write), checked at the walk and again at each
  * removal step: no other uid can then change any entry, by path (the 0700 graveyard blocks it) or through a
  * descriptor opened earlier (write permission follows the current mode, which only the owner or root can change).
@@ -31,6 +35,8 @@ import { fileURLToPath } from "node:url";
  */
 
 export type VerifiedRemoveResult = { removed: true; bytes: number } | { removed: false; reason: string; graveyard?: string };
+/** The judged state of one tree entry. `children` (directories only) is the exact name set seen at judgment. */
+type Snap = { dev: number; ino: number; uid: number; kind: string; mtimeMs: number; children?: Map<string, Snap> | undefined };
 
 /** Per-deleter counts for the retention CLI's report: removed (or, in a dry run, would be), bytes, refusals by reason.
  * ponytail: a module-level tally the one-shot CLI turns on; in-process sweeps leave it off and pay nothing. */
@@ -39,13 +45,15 @@ export interface DeleterTally {
   /** Bytes held by refused targets, by reason, where the deleter measured them. */
   refusedBytes: Record<string, number>;
   examples: Record<string, string[]>;
+  /** Graveyard paths of refused targets left moved there (callers may discard `result.graveyard`). */
+  graveyards?: string[];
 }
 let tally: Record<string, DeleterTally> | undefined;
 export const startRemovalTally = (): Record<string, DeleterTally> => (tally = {});
 export const stopRemovalTally = (): void => { tally = undefined; };
 
 /** smarty-dev#7858: Windows verified removal (the native helper) is on only where it is switched on: the operator's
- * `retention --apply` sweep. In-process sweeps keep main's path-based fallback.
+ * `retention --apply` sweep. verifiedRemove reaches it only where getuid/geteuid exist (never on Windows today).
  * ponytail: one helper process per removal costs tens of ms on Windows; resident sweeps of thousands of runs, and
  * their per-run metadata budget (actor-manager-startup #4250), cannot carry that (pi-fabric#913 Windows CI). */
 let windowsVerified = false;
@@ -96,67 +104,87 @@ const same = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino ===
  * group write bit (the ACL mask), so it is refused too. (pi-fabric#850 round 1 P1.) */
 const closed = (stat: fs.Stats): boolean => (stat.mode & 0o022) === 0;
 const kind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
-/** The judged inode, ours, same type, same mtime. `moved`: after the rename only dev/ino/uid/type are compared. */
-const verify = (file: string, judged: fs.Stats, uid: number, moved = false): void => {
+/** The judged inode, ours, same type, same mtime (also after the graveyard move: a rename keeps the mtime). */
+const verify = (file: string, judged: fs.Stats, uid: number): void => {
   const stat = fdStat(file, judged.isDirectory());
   if (stat.isSymbolicLink()) refuse("target is a symbolic link");
   if (stat.uid !== uid) refuse("target is not owned by this user");
   if (!same(stat, judged)) refuse("target inode was replaced since judgment");
   if (kind(stat) !== kind(judged)) refuse("type changed since judgment");
-  if (!moved && stat.mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
+  if (stat.mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
   if (stat.isDirectory() && !closed(stat)) refuse("a directory in the tree is writable by group or others");
 };
 const open = (file: string): number => {
   try { return fs.openSync(file, O_PATH | NOFOLLOW | DIRECTORY); }
   catch (error) { return refuse(`open failed (${code(error)})`); }
 };
-/** Every entry below `fd` must be ours; directories are entered only through an fd whose fstat matches the lstat. */
-const verifyTree = (fd: number, uid: number, depth: number): number => {
+const snapOf = (stat: fs.Stats, children?: Map<string, Snap>): Snap =>
+  ({ dev: stat.dev, ino: stat.ino, uid: stat.uid, kind: kind(stat), mtimeMs: stat.mtimeMs, children });
+/** Identity, owner and type; with `mtime` also the judged mtime. */
+const matches = (stat: fs.Stats, snap: Snap, mtime = true): boolean => stat.dev === snap.dev && stat.ino === snap.ino &&
+  stat.uid === snap.uid && kind(stat) === snap.kind && (!mtime || stat.mtimeMs === snap.mtimeMs);
+const sameNames = (names: string[], children: Map<string, Snap>): void => {
+  if (names.length !== children.size || names.some(name => !children.has(name))) refuse("the tree's entries changed since judgment");
+};
+/** Enter directory `name` below `fd` through an fd whose fstat is the snapshotted directory (owner, type, identity,
+ * mtime) and closed (no group/other write). */
+const enter = (fd: number, name: string, snap: Snap, body: (child: number) => void): void => {
+  const child = open(at(fd, name));
+  try {
+    const opened = fs.fstatSync(child);
+    if (!matches(opened, snap)) refuse("an entry in the tree changed since judgment");
+    if (!closed(opened)) refuse("a directory in the tree is writable by group or others");
+    body(child);
+  } finally { fs.closeSync(child); }
+};
+/** Every entry below `fd` must be ours; each is recorded in `children`; directories are entered only through an fd
+ * whose fstat matches the lstat. Returns the regular-file bytes. */
+const verifyTree = (fd: number, uid: number, depth: number, children: Map<string, Snap>): number => {
   if (depth > MAX_DEPTH) refuse("tree is too deep");
   let bytes = 0;
   for (const name of fs.readdirSync(at(fd))) {
     const stat = fs.lstatSync(at(fd, name));
     if (stat.uid !== uid) refuse("an entry in the tree is not owned by this user");
-    if (!stat.isDirectory()) { bytes += stat.isFile() ? stat.size : 0; continue; }
-    const child = open(at(fd, name));
-    try {
-      const opened = fs.fstatSync(child);
-      if (!same(opened, stat)) refuse("an entry in the tree changed during the walk");
-      if (!closed(opened)) refuse("a directory in the tree is writable by group or others");
-      bytes += verifyTree(child, uid, depth + 1);
-    } finally { fs.closeSync(child); }
+    if (!stat.isDirectory()) { children.set(name, snapOf(stat)); bytes += stat.isFile() ? stat.size : 0; continue; }
+    const snap = snapOf(stat, new Map());
+    children.set(name, snap);
+    enter(fd, name, snap, child => { bytes += verifyTree(child, uid, depth + 1, snap.children!); });
   }
   return bytes;
+};
+/** The full no-delete revalidation: the exact name sets and every entry's dev/ino/uid/type/mtime. */
+const recheckTree = (fd: number, children: Map<string, Snap>, depth: number): void => {
+  if (depth > MAX_DEPTH) refuse("tree is too deep");
+  const names = fs.readdirSync(at(fd));
+  sameNames(names, children);
+  for (const name of names) {
+    const snap = children.get(name)!;
+    if (!matches(fs.lstatSync(at(fd, name)), snap)) refuse("an entry in the tree changed since judgment");
+    if (snap.children) enter(fd, name, snap, child => recheckTree(child, snap.children!, depth + 1));
+  }
 };
 /** Remove `name` below `parent`, each entry verified again; unlink and rmdir never follow a link.
  * Binding (pi-fabric#850 round 1 P1): `parent` is an fd on a directory proven ours and closed (no group/other write)
  * when it was opened, and checked again here, so between this lstat and the unlink no other uid can create, replace
  * or rename an entry in it, even through a descriptor opened before the move (write permission is checked against
  * the current mode). The whole tree also sits below our 0700 graveyard, so no other uid can reach it by path. The
- * name-based unlink is therefore exposed only to our own uid (which already owns every entry) and root. */
-const removeTree = (parent: number, name: string, uid: number, depth: number): void => {
+ * name-based unlink is therefore exposed only to our own uid (which already owns every entry) and root: the check
+ * before each unlink/rmdir is not atomic with it. Only snapshotted names are removed. */
+const removeTree = (parent: number, name: string, snap: Snap, uid: number, depth: number): void => {
   if (depth > MAX_DEPTH) refuse("tree is too deep");
   const held = fs.fstatSync(parent);
   if (held.uid !== uid || !closed(held)) refuse("a directory in the tree is writable by group or others");
-  const stat = fs.lstatSync(at(parent, name));
-  if (stat.uid !== uid) refuse("an entry in the tree is not owned by this user");
-  if (!stat.isDirectory()) { fs.unlinkSync(at(parent, name)); return; }
-  const fd = open(at(parent, name));
-  try {
-    if (!same(fs.fstatSync(fd), stat)) refuse("an entry in the tree changed during removal");
-    for (const child of fs.readdirSync(at(fd))) removeTree(fd, child, uid, depth + 1);
-  } finally { fs.closeSync(fd); }
+  if (!matches(fs.lstatSync(at(parent, name)), snap)) refuse("an entry in the tree changed since judgment");
+  if (!snap.children) { fs.unlinkSync(at(parent, name)); return; }
+  const children = snap.children;
+  enter(parent, name, snap, fd => {
+    const names = fs.readdirSync(at(fd));
+    sameNames(names, children);
+    for (const child of names) removeTree(fd, child, children.get(child)!, uid, depth + 1);
+  });
+  // Our own child removals changed its mtime: identity, owner and type only.
+  if (!matches(fs.lstatSync(at(parent, name)), snap, false)) refuse("an entry in the tree changed since judgment");
   fs.rmdirSync(at(parent, name));
-};
-
-/** Regular-file bytes below a path, by lstat (no link followed); for the off-Linux report only. */
-const pathBytes = (file: string, depth = 0): number => {
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isDirectory()) return stat.isFile() ? stat.size : 0;
-    if (depth >= MAX_DEPTH) return 0;
-    return fs.readdirSync(file).reduce((sum, name) => sum + pathBytes(path.join(file, name), depth + 1), 0);
-  } catch { return 0; }
 };
 
 // smarty-dev#7858: Windows verified removal through the native helper (native/fabric-win-remove.c). It opens every
@@ -245,8 +273,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   dryRun?: boolean;
   /** The caller's last check, after the move and its re-verify, right before the delete. False keeps it (moved back). */
   proceed?: () => boolean;
-  /** Not Linux only: main's unchanged path-based removal (smarty-dev#7858 carries the verified path there). Returns
-   * whether it removed the target. Never used on Linux. */
+  /** Kept for source compatibility only: never invoked. Off Linux nothing is deleted (smarty-dev#7858). */
   fallback?: () => boolean;
   /** Bytes this removal frees, when not the whole target (a compaction replaces it with a smaller tail). */
   freed?: number;
@@ -254,9 +281,14 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   const { deleter } = options;
   const no = (reason: string, graveyard?: string): VerifiedRemoveResult => {
     countRefusal(deleter, reason, target);
+    if (graveyard !== undefined && tally) (entry(deleter).graveyards ??= []).push(graveyard);
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
-  // smarty-dev#7858: on Windows with the verified helper, it takes the place of main's path-based fallback.
+  // No ownership proof without getuid/geteuid: nothing is deleted on any platform, Windows included.
+  if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
+    return no("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
+  }
+  // smarty-dev#7858: on Windows with the verified helper (unreachable while getuid is required).
   const windowsHelper = windowsVerified ? windowsRemoveHelper() : undefined;
   if (windowsHelper) {
     if (!judged) return no("no judged stat");
@@ -297,25 +329,13 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
     }
   }
-  if (process.platform !== "linux" && options.fallback) {
-    // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2). The size
-    // walk runs only for a report: in-process sweeps keep main's filesystem cost (actor-manager-startup #4250 guard).
-    const bytes = options.freed ?? (tally ? pathBytes(target) : 0);
-    if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
-    let removed = false;
-    try { removed = options.fallback(); } catch { /* main's best effort */ }
-    if (!removed) return no("removal failed (main's path on this platform)");
-    countRemoval(deleter, bytes);
-    return { removed: true, bytes };
-  }
-  if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
-    return no("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
-  }
+  // The path-based fallback is never invoked (the latest platform decision): off Linux nothing is deleted.
   if (process.platform !== "linux") return no("directory-relative removal needs Linux /proc/self/fd; nothing is deleted");
   if (!judged) return no("no judged stat");
   const name = path.basename(target);
   if (!name || name === "." || name === ".." || path.dirname(target) === target) return no("invalid target name");
   let parent: number | undefined, grave: number | undefined, graveName: string | undefined, moved: string | undefined;
+  let graveStat: fs.Stats | undefined;
   try {
     verifiedRemoveTestHooks.beforeOpen?.(target);
     const uid = process.geteuid();
@@ -328,11 +348,12 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     catch { return no("/proc/self/fd is unavailable; nothing is deleted"); }
     verify(at(parent, name), judged, uid);
     let bytes = judged.isFile() ? judged.size : 0;
+    const snap = snapOf(judged, judged.isDirectory() ? new Map() : undefined);
     if (judged.isDirectory()) {
       const fd = open(at(parent, name));
       try {
         if (!same(fs.fstatSync(fd), judged)) refuse("target inode was replaced since judgment");
-        bytes = verifyTree(fd, uid, 0);
+        bytes = verifyTree(fd, uid, 0, snap.children!);
       } finally { fs.closeSync(fd); }
     } else if (!judged.isFile()) refuse("target is not a regular file or directory");
     if (options.freed !== undefined) bytes = options.freed;
@@ -342,13 +363,18 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     try { fs.mkdirSync(at(parent, graveName), { mode: 0o700 }); }
     catch (error) { if (code(error) !== "EEXIST") throw error; }
     grave = open(at(parent, graveName));
-    const graveStat = fs.fstatSync(grave);
-    if (graveStat.uid !== uid || (graveStat.mode & 0o077) !== 0) { grave = (fs.closeSync(grave), undefined); return no("graveyard is not our private directory"); }
+    graveStat = fs.fstatSync(grave);
+    if (graveStat.uid !== uid || (graveStat.mode & 0o077) !== 0) { grave = (fs.closeSync(grave), undefined); graveStat = undefined; return no("graveyard is not our private directory"); }
     const entryName = `${name}.${randomUUID()}`;
     fs.renameSync(at(parent, name), at(grave, entryName));
     moved = entryName;
     const graveyard = path.join(path.dirname(target), graveName, moved);
-    try { verify(at(grave, moved), judged, uid, true); }
+    // The full no-delete revalidation of the snapshot, below the private graveyard.
+    const recheck = (): void => {
+      verify(at(grave!, moved!), judged, uid);
+      if (snap.children) enter(grave!, moved!, snap, fd => recheckTree(fd, snap.children!, 1));
+    };
+    try { recheck(); }
     catch (error) {
       // Whatever we moved is not the judged inode: it stays in the graveyard, untouched and reported.
       const reason = error instanceof Refusal ? error.message : `verify failed (${code(error)})`;
@@ -357,6 +383,14 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     }
     let keep: boolean;
     try { keep = options.proceed ? !options.proceed() : false; } catch { keep = true; }
+    // A keep also needs a fresh snapshot: file rollback unlinks the graveyard hardlink, so it must not gain
+    // authority to unlink a replacement or refreshed entry merely because the caller vetoed removal.
+    try { recheck(); }
+    catch (error) {
+      const reason = error instanceof Refusal ? error.message : `verify failed (${code(error)})`;
+      moved = undefined;
+      return no(`${reason} (changed during removal; left in the graveyard)`, graveyard);
+    }
     if (keep) {
       // Back to its name, never over anything that appeared there: link fails on EEXIST; a directory moves back
       // only while the name is absent. Otherwise it stays in the graveyard and is reported.
@@ -376,7 +410,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
         return no(`kept by the final check; move back failed (${code(error)}), left in the graveyard`, graveyard);
       }
     }
-    try { removeTree(grave, moved, uid, 0); }
+    try { removeTree(grave, moved, snap, uid, 0); }
     catch (error) {
       const reason = error instanceof Refusal ? error.message : `removal failed (${code(error)})`;
       moved = undefined;
@@ -389,9 +423,15 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
   } finally {
     if (grave !== undefined) fs.closeSync(grave);
-    // An empty graveyard goes; one that holds a reported entry stays (rmdir fails closed on any entry).
+    // An empty graveyard goes; one that holds a reported entry stays (rmdir fails closed on any entry). The name is
+    // removed only while it is still the container we opened (dev/ino/uid/directory/private): a replacement stays.
     if (parent !== undefined) {
-      if (graveName !== undefined && moved === undefined) { try { fs.rmdirSync(at(parent, graveName)); } catch { /* holds a reported entry */ } }
+      if (graveName !== undefined && moved === undefined && graveStat !== undefined) {
+        try {
+          const now = fs.lstatSync(at(parent, graveName));
+          if (now.isDirectory() && same(now, graveStat) && now.uid === graveStat.uid && (now.mode & 0o077) === 0) fs.rmdirSync(at(parent, graveName));
+        } catch { /* holds a reported entry, or gone */ }
+      }
       fs.closeSync(parent);
     }
   }

@@ -244,8 +244,9 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(fs.readdirSync(parent)).toEqual([]);
   });
 
-  // pi-fabric#850 round 1 P2: off Linux, main's removal is counted like the verified path.
-  it("off Linux, a dry run counts main's removal with its bytes and changes nothing", async () => {
+  // Latest platform decision (supersedes pi-fabric#850 round 1 P2): off Linux the path fallback is never invoked, so
+  // even a dry run refuses: no removal is counted, and nothing changes.
+  it("off Linux, a dry run refuses, counts no removal, never runs the fallback, and changes nothing", async () => {
     const { verifiedRemove, startRemovalTally, stopRemovalTally } = await import("../src/storage/verified-remove.js");
     const target = run(path.join(tmp("fabric-vr-darwin-"), "old"));
     const before = shape(target);
@@ -255,9 +256,9 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     let fallbackRan = false;
     try {
       const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", dryRun: true, fallback: () => (fallbackRan = true) });
-      expect(result).toMatchObject({ removed: true, bytes: expect.any(Number) });
-      expect((result as { bytes: number }).bytes).toBeGreaterThan(LOG.length);
-      expect(tally.test).toMatchObject({ removed: 1, bytes: (result as { bytes: number }).bytes });
+      expect(result).toMatchObject({ removed: false, reason: expect.stringContaining("nothing is deleted") });
+      expect(tally.test?.removed ?? 0).toBe(0);
+      expect(tally.test?.bytes ?? 0).toBe(0);
     } finally { stopRemovalTally(); Object.defineProperty(process, "platform", platform); }
     expect(fallbackRan).toBe(false);
     expect(shape(target)).toEqual(before);

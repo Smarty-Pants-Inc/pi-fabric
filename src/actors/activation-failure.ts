@@ -144,9 +144,12 @@ export const classifyActivationFailure = (input: {
   const permanent = permanentAnywhere(input);
   if (permanent) return permanent;
   const line = withoutModelText(input.lastError);
-  if (/Activation window lost current activation messages/i.test(line)) {
+  // smarty-dev#9890: every terminal "Activation window lost …" (its messages, history boundary,
+  // system records or authorized compaction) is one transient class; the next run rebuilds the window.
+  const windowLost = /Activation window lost\b[^\n]*/i.exec(line);
+  if (windowLost) {
     return { code: "activation-window-lost", transient: true,
-      classification: "transient: activation window lost its current messages" };
+      classification: `transient: activation window lost (matched ${quote(windowLost[0])})` };
   }
   if (/Child Pi exited before requested model admission completed/i.test(line)) {
     return { code: "child-exit-before-admission", transient: true,

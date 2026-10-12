@@ -490,6 +490,85 @@ describe("actor session reset (smarty-dev#1439)", () => {
     expect(backups(actor.sessionFile!)).toEqual([]);
   });
 
+  // smarty-dev#9890: an explicit reset is the documented repair, but a hard activation block survived it.
+  describe("hard activation block (smarty-dev#9890)", () => {
+    const AUTH = "Error: 401 Unauthorized: invalid x-api-key";
+    const presence = (mesh: MeshStore, id: string) => mesh.get(`actors/test/${id}`)?.value as Record<string, unknown> | undefined;
+    const block = async (actors: ActorManager, agents: AgentManager, id: string, times = 3) => {
+      for (let n = 0; n < times; n++) {
+        vi.mocked(agents.run).mockRejectedValueOnce(new Error(AUTH));
+        await expect(actors.ask(id, "activate")).rejects.toThrow(AUTH);
+        await waitFor(() => !actors.status(id).inFlightRun && !actors.status(id).preparing);
+      }
+    };
+
+    it("an immediate reset clears a hard block, republishes presence, and the next item runs", async () => {
+      const { actors, agents, mesh, runs } = setup();
+      const actor = await actors.create({ name: "hard-reset", instructions: "Work." });
+      await block(actors, agents, actor.id);
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+      await waitFor(() => presence(mesh, actor.id)?.status === "failed");
+      const info = await actors.resetSession(actor.id);
+      expect(info).toMatchObject({ status: "idle" });
+      expect(info).not.toHaveProperty("activationBlocked");
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlocked");
+      const before = runs.length;
+      await expect(actors.ask(actor.id, "next item")).resolves.toMatchObject({ direction: "out" });
+      expect(runs.length - before).toBe(1);
+      await waitFor(() => actors.status(actor.id).status === "idle");
+    });
+
+    it("a deferred reset clears the hard block its in-flight run left", async () => {
+      const { actors, agents, mesh } = setup();
+      const actor = await actors.create({ name: "deferred-hard-reset", instructions: "Work." });
+      await block(actors, agents, actor.id, 2);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      vi.mocked(agents.run).mockImplementationOnce(async () => { entered = true; await gate; throw new Error(AUTH); });
+      const failing = actors.ask(actor.id, "held failure").catch((error: Error) => error);
+      await waitFor(() => entered);
+      const reset = actors.resetSession(actor.id);
+      release();
+      expect(await failing).toBeInstanceOf(Error);
+      await expect(reset).resolves.toMatchObject({ id: actor.id, status: "idle" });
+      expect(actors.status(actor.id)).not.toHaveProperty("activationBlocked");
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlocked");
+    });
+
+    it("a failed reset keeps the hard block", async () => {
+      const { actors, agents } = setup();
+      const actor = await actors.create({ name: "failed-reset", instructions: "Work." });
+      await actors.ask(actor.id, "seed session");
+      await block(actors, agents, actor.id);
+      const rename = fs.renameSync.bind(fs);
+      const spy = vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+        if (source === actor.sessionFile) throw Object.assign(new Error("cannot archive"), { code: "EACCES" });
+        return rename(source, target);
+      });
+      try {
+        await expect(actors.resetSession(actor.id)).rejects.toThrow("cannot archive");
+      } finally { spy.mockRestore(); }
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+    });
+
+    it("an automatic size rotation keeps the hard block", async () => {
+      const { actors, agents, runs, hold } = setup({ maxSessionBytes: 64 });
+      const actor = await actors.create({ name: "size-rotation", instructions: "Work." });
+      await actors.ask(actor.id, "grow the session");
+      await block(actors, agents, actor.id, 1);
+      const release = hold();
+      const next = actors.ask(actor.id, "after rotation");
+      try {
+        await waitFor(() => runs.at(-1)?.task.includes("after rotation") === true);
+        expect(resets(actors, actor.id).at(-1)).toMatchObject({ data: { sessionReset: { trigger: "size" } } });
+        expect(actors.status(actor.id)).toMatchObject({ activationBlocked: { code: "auth", class: "hard" } });
+      } finally { release(); await next.catch(() => undefined); }
+    });
+  });
+
   it("reads actors.maxSessionBytes from config, 20 MiB by default", () => {
     expect(DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes).toBe(20 * 1024 * 1024);
     expect(normalizeFabricConfig({ actors: { maxSessionBytes: 0 } }).actors.maxSessionBytes).toBe(0);

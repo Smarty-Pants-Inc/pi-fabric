@@ -26,11 +26,17 @@
  * SQLite's own busy handler would freeze the caller's event loop and is unfair (sleep-and-poll with
  * growing sleeps). `busy_timeout` is clamped to <= 5 ms (default 2 ms); a busy `BEGIN IMMEDIATE` is
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
- * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 0).
- * Fairness (smarty-dev#9805): a newcomer that finds anyone queued takes its ticket before its first attempt, so it
- * never barges the head, and the head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it
- * synchronously, so it is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Only a writer that finds the queue empty tries once directly (the uncontended path: one readdir). The wait honours `writeSignal`, the
- * `withTryLock` budget and `lockTimeoutMs`, and times out with the existing `MeshLockTimeoutError`.
+ * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
+ * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
+ * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms.
+ * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
+ * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
+ * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
+ * attempt) starved next to those barging writers (smarty-dev#10391), so it is opt-in. A waiter passes a head whose
+ * heartbeat stalled (its event loop blocked, or it stopped attempting) as soon as the stall bound shows it, not only
+ * past 80% of its budget: the ticket closes at BEGIN IMMEDIATE, so a stale head here never holds the lock.
+ * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`, and times out with the existing
+ * `MeshLockTimeoutError`.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
  * never torn; a process crash loses nothing committed; an OS crash or power loss can drop the most
@@ -377,7 +383,8 @@ export interface SqliteStateStoreOptions {
   lockTimeoutMs?: number;
   /** SQLite's synchronous busy handler, clamped to 0..5 ms. Default 2 ms. */
   busyTimeoutMs?: number;
-  /** A waiter older than this joins the advisory FIFO ticket queue. Default 0 (smarty-dev#9805: no barging window). */
+  /** A waiter older than this joins the advisory FIFO ticket queue. Default 25 ms, the contest of releases before
+   * pi-fabric#936 (smarty-dev#10516). 0 is strict FIFO (smarty-dev#9805): a newcomer queues before its first attempt. */
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
@@ -764,7 +771,7 @@ export class SqliteStateStore {
     this.#maxTombstones = Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES));
     this.#lockTimeoutMs = Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     this.#busyTimeoutMs = clampBusy(options.busyTimeoutMs);
-    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 0);
+    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 25);
     this.#lockHeldEventMs = lockHeldEventThreshold(options.lockHeldEventMs);
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
@@ -1607,9 +1614,10 @@ export class SqliteStateStore {
     let waiting = true;
     this.#writesWaiting += 1;
     try {
-      // smarty-dev#9805: a newcomer that finds anyone queued queues behind them, never barging the FIFO head. Inside
-      // the try (pi-fabric#936 round 3): the finally always releases the ticket and #writesWaiting.
-      if (this.#queueBusy()) {
+      // smarty-dev#9805, strict FIFO only (fifoAfterMs 0, smarty-dev#10516): a newcomer that finds anyone queued
+      // queues behind them, never barging the FIFO head. Inside the try (pi-fabric#936 round 3): the finally always
+      // releases the ticket and #writesWaiting.
+      if (this.#fifoAfterMs === 0 && this.#queueBusy()) {
         ticket = this.#ticket(Math.max(0, deadline - started));
         if (ticket) this.#stats.fifoJoins += 1;
       }
@@ -1709,7 +1717,7 @@ export class SqliteStateStore {
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {
-    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs); }
+    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs, { passStalledHead: true }); }
     catch { return undefined; } // Advisory only: an unusable queue leaves the plain jittered contest.
   }
 

@@ -30,7 +30,7 @@ const spin = (ms) => { const began = performance.now(); while (performance.now()
 // Writes in a tight loop, each holding the lock `holdMs`; reports its max wait, max hold, event-loop p99 and checkpoints.
 const WRITER = `
 const [root, go, index, writes, holdMs] = process.argv.slice(1);
-const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 60_000 });
+const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 60_000, fifoAfterMs: 0 }); // strict FIFO
 fs.writeFileSync(path.join(root, "ready-" + index), "");
 while (!fs.existsSync(go)) await new Promise(r => setTimeout(r, 2));
 const loop = monitorEventLoopDelay({ resolution: 1 });
@@ -89,7 +89,8 @@ describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)("SQLit
     roots.push(parent);
     const root = path.join(parent, "mesh"); // its queue namespace lives in this private parent, not the shared tmpdir
     fs.mkdirSync(root, { mode: 0o700 });
-    const store = await SqliteStateStore.open(root, 65536, 1000, { initialize: "create" });
+    // Strict FIFO (fifoAfterMs 0): every write consults the queue.
+    const store = await SqliteStateStore.open(root, 65536, 1000, { initialize: "create", fifoAfterMs: 0 });
     const queue = meshLockQueueDirectory(path.join(root, "state.db"));
     const namespace = path.dirname(queue);
     fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
@@ -104,6 +105,58 @@ describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)("SQLit
       store.close();
     }
   });
+});
+
+describe.skipIf(process.platform === "win32")("SQLite mesh writers next to older releases (smarty-dev#10516)", () => {
+  const identity = { id: "tester", name: "tester", kind: "agent" as const };
+  // A private parent holds the queue namespace. The receipt is a live head (this process's pid) that heartbeats only
+  // when the test refreshes its mtime, as a head whose event loop is blocked never does.
+  const queuedRoot = async (): Promise<{ root: string; receipt: string }> => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-sqlite-mixed-"));
+    roots.push(parent);
+    const root = path.join(parent, "mesh");
+    fs.mkdirSync(root, { mode: 0o700 });
+    (await SqliteStateStore.open(root, 65536, 1000, { initialize: "create" })).close();
+    const queue = meshLockQueueDirectory(path.join(root, "state.db"));
+    fs.mkdirSync(queue, { recursive: true, mode: 0o700 });
+    const receipt = path.join(queue, `${"1".padStart(24, "0")}-${process.pid}-00000000-0000-0000-0000-000000000000`);
+    fs.writeFileSync(receipt, "");
+    return { root, receipt };
+  };
+
+  it("by default a writer contends before it queues (8d0af4b0's contest); fifoAfterMs 0 queues first", async () => {
+    const { root } = await queuedRoot();
+    const contest = await SqliteStateStore.open(root, 65536, 1000);
+    const strict = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 500, fifoAfterMs: 0 });
+    try {
+      // The lock is free: the default takes it at its first attempt, with no ticket, whoever is queued.
+      await contest.put({ key: "m/contest", value: 1, identity });
+      expect(contest.stats().fifoJoins).toBe(0);
+      // Strict FIFO queues behind the receipt and waits for it (here: until it is judged stalled).
+      const began = Date.now();
+      await strict.put({ key: "m/strict", value: 1, identity });
+      expect(Date.now() - began).toBeGreaterThanOrEqual(150);
+      expect(strict.stats().fifoJoins).toBe(1);
+    } finally { contest.close(); strict.close(); }
+  });
+
+  it("a waiter passes a stalled head after the stall bound, not at 80% of its budget, and never a head that heartbeats", async () => {
+    const { root, receipt } = await queuedRoot();
+    // A 10 s budget: the stall bound is 1 s and the 80% fallback 8 s.
+    const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 10_000, fifoAfterMs: 0 });
+    const heartbeat = setInterval(() => { const now = Date.now() / 1000; fs.utimesSync(receipt, now, now); }, 50);
+    try {
+      const began = Date.now();
+      setTimeout(() => clearInterval(heartbeat), 2_500); // the head's event loop blocks from here on
+      await store.put({ key: "m/passed", value: 1, identity });
+      const waited = Date.now() - began;
+      // Held back while the head heartbeat (2.5 s), passed one stall bound (1 s) later; before: at 8 s, then the
+      // last 2 s of the budget in the plain contest.
+      expect(waited).toBeGreaterThanOrEqual(3_300);
+      expect(waited).toBeLessThan(6_500);
+      expect(store.stats()).toMatchObject({ fifoJoins: 1, lockTimeouts: 0 });
+    } finally { clearInterval(heartbeat); store.close(); }
+  }, 30_000);
 });
 
 describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smarty-dev#9805)", () => {
@@ -151,7 +204,7 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
     await waitFor(() => fs.existsSync(path.join(root, "held")), "the holder");
     const single = `
       const [root, index] = process.argv.slice(1);
-      const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 60_000 });
+      const store = await SqliteStateStore.open(root, 65536, 1000, { lockTimeoutMs: 60_000, fifoAfterMs: 0 });
       fs.writeFileSync(path.join(root, "ready-" + index), "");
       let at = 0;
       await store.writeBatch({ identity, ops: [], prepare: () => { at = Date.now(); return [{ kind: "put", key: "w/" + index, value: 1 }]; } });

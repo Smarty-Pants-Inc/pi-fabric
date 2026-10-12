@@ -158,22 +158,33 @@ export const savedEnodevAnswer = (directory: string): string | undefined => {
     typeof settlement.text === "string" ? settlement.text : undefined;
 };
 
-export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined): AgentRunResult | undefined => {
-  // Worker-writable files (status.json, the marker) only select WHAT to write; whether the worker is gone comes
-  // from the manager's own pid record. No own record: never proven gone, the permit stays.
+/**
+ * pi-fabric#939 round 3 (SEC 1): the exact gate, checked BEFORE anything is delivered or written. The manager's own
+ * pid record proves the worker gone, the run carries the exact ENODEV marker, and its status record is this process
+ * run. A missing, malformed or other-reason marker, or a foreign status record, keeps the veto. Returns the record.
+ */
+export const provenGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined): Record<string, unknown> | undefined => {
   if (!owned || !ownedProcessGone(owned)) return undefined;
   const id = path.basename(directory);
-  const markerFile = path.join(directory, UNRESOLVED_WORKER_FILE);
-  const marker = readJson(markerFile);
-  const statusFile = path.join(directory, "status.json");
-  // Already settled by #912's own recovery (delivered or lost): its proof stands; nothing more to write.
-  if (marker === undefined && !fs.existsSync(markerFile)) {
-    const done = readJson(statusFile);
-    return done?.id === id && (done.enodevDelivered === true || done.settledLost === true) ? done as unknown as AgentRunResult : undefined;
-  }
+  const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
   if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
-  const record = readJson(statusFile);
-  if (!record || record.id !== id || record.transport !== "process") return undefined;
+  const record = readJson(path.join(directory, "status.json"));
+  return record && record.id === id && record.transport === "process" ? record : undefined;
+};
+
+/**
+ * Settles a launch proven gone (provenGoneEnodevLaunch). `settledHere` names a run THIS manager already settled through
+ * #912's recovery (its marker is gone by that settle): only then does a missing marker count, and nothing is written.
+ */
+export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined, settledHere = false): AgentRunResult | undefined => {
+  const id = path.basename(directory);
+  const statusFile = path.join(directory, "status.json");
+  if (settledHere) {
+    if (!owned || !ownedProcessGone(owned)) return undefined;
+    return readJson(statusFile) as unknown as AgentRunResult | undefined ?? ({ id } as unknown as AgentRunResult);
+  }
+  const record = provenGoneEnodevLaunch(directory, owned);
+  if (!record) return undefined;
   const settlement = readJson(path.join(directory, "settlement.json"));
   const text = settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
     typeof settlement.text === "string" ? settlement.text : undefined;

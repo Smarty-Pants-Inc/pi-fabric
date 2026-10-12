@@ -42,8 +42,10 @@ const setup = (maxConcurrent = 20, onAdmissionAlarm?: (alarm: unknown) => void) 
       const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
       workers.push(worker);
       children.push(worker);
+      // placement.ts's obligation: the pid it launched and that process's own close event
+      const closed = new Promise<void>(resolve => worker.once("exit", () => resolve()));
       throw Object.assign(new Error(ENODEV), { launchOutcome: "unknown",
-        ...(options.ownPid === false ? {} : { cleanupPending: true, transport: "process", sessionId: String(worker.pid) }) });
+        ...(options.ownPid === false ? {} : { cleanupPending: true, transport: "process", sessionId: String(worker.pid), closed }) });
     });
     const ids: string[] = [];
     for (let index = 0; index < count; index++) {
@@ -63,13 +65,58 @@ const setup = (maxConcurrent = 20, onAdmissionAlarm?: (alarm: unknown) => void) 
   return { root, manager, unknownLaunches };
 };
 
+/** A real worker process; `closed` resolves on its exit (the transport's own close event). */
+const liveWorker = () => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
+  children.push(child);
+  let alive = true;
+  const closed = new Promise<void>(resolve => child.once("exit", () => { alive = false; resolve(); }));
+  return { child, closed, alive: () => alive,
+    exit: async () => { if (alive) { child.kill("SIGKILL"); await closed; } } };
+};
+
+/**
+ * A launched (managed) run whose contact is lost with `reason` (default the ENODEV observation failure), with the
+ * worker's saved answer. `closedWhileAlive`: the transport reports the run closed at once while its pid still lives.
+ */
+const lostContactRun = async (options: { reason?: string; closedWhileAlive?: boolean; failCompletedSaves?: { on: boolean } } = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
+  roots.push(root);
+  const settledResults: Array<{ id: string; status: string; text?: string }> = [];
+  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true }, {
+    workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    onSettled: result => {
+      if (result.status === "completed" && options.failCompletedSaves?.on) throw new Error("archive or routing failed");
+      settledResults.push({ id: result.id, status: result.status, ...(result.text ? { text: result.text } : {}) });
+    },
+  });
+  managers.push(manager);
+  const worker = liveWorker();
+  const reason = options.reason ?? ENODEV;
+  const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValueOnce({
+    kind: "process", sessionId: String(worker.child.pid), stop: async () => undefined, closed: worker.closed,
+    isAlive: async () => !options.closedWhileAlive && worker.alive(),
+    lostContact: () => (options.closedWhileAlive || !worker.alive() ? reason : undefined),
+  } as never);
+  const handle = await manager.spawn({ task: "lost contact", transport: "process" });
+  launch.mockRestore();
+  const directory = path.join(root, handle.id);
+  fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id: handle.id, name: "lost contact", task: "lost contact",
+    status: "running", runner: "pi", transport: "process", sessionId: String(worker.child.pid), cwd: process.cwd(), startedAt: Date.now(),
+    updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+  fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: handle.id, outcome: "completed", text: "SAVED" }));
+  const saved = () => settledResults.filter(result => result.id === handle.id && result.status === "completed");
+  return { manager, root, handle, directory, worker, saved };
+};
+
 describe("held admission permits (smarty-dev#9855)", () => {
   onLinux("20 unknown launches hold every permit; once they are proven gone, the 21st spawn is admitted", async () => {
     const { root, manager, unknownLaunches } = setup();
     const { ids, exit } = await unknownLaunches(20);
     expect(manager.heldPermits()).toBe(20);
-    await exit();
+    // The first worker saved its answer before it exited.
     fs.writeFileSync(path.join(root, ids[0]!, "settlement.json"), JSON.stringify({ version: 1, runId: ids[0], outcome: "completed", text: "SAVED" }));
+    await exit();
     const next = await manager.spawn({ task: "21st", transport: "process" });
     expect(next.status).not.toBe("queued"); // on 3f975f48 it waits behind 20 leaked permits forever
     expect(manager.heldPermits()).toBe(0);
@@ -160,36 +207,14 @@ describe("held admission permits (smarty-dev#9855)", () => {
 // then is the permit released.
 describe("a lost-contact run's saved answer", () => {
   onLinux("reaches the spawner exactly once before its permit is released", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
-    roots.push(root);
-    const settledResults: Array<{ id: string; status: string; text?: string }> = [];
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true }, {
-      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
-      onSettled: result => settledResults.push({ id: result.id, status: result.status, ...(result.text ? { text: result.text } : {}) }),
-    });
-    managers.push(manager);
-    const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
-    children.push(worker);
-    let alive = true;
-    worker.once("exit", () => { alive = false; });
-    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValueOnce({
-      kind: "process", sessionId: String(worker.pid), isAlive: async () => alive, stop: async () => undefined,
-      lostContact: () => (alive ? undefined : ENODEV),
-    } as never);
-    const handle = await manager.spawn({ task: "lost contact", transport: "process" });
-    launch.mockRestore();
-    const directory = path.join(root, handle.id);
-    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id: handle.id, name: "lost contact", task: "lost contact",
-      status: "running", runner: "pi", transport: "process", sessionId: String(worker.pid), cwd: process.cwd(), startedAt: Date.now(),
-      updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
-    fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: handle.id, outcome: "completed", text: "SAVED" }));
-    await new Promise(resolve => { worker.once("exit", resolve); worker.kill("SIGKILL"); });
+    const { manager, handle, worker, saved } = await lostContactRun();
+    await worker.exit();
     const first = await manager.wait(handle.id, { timeoutMs: 15_000 });
     expect(first.status).not.toBe("completed"); // settled without the answer: the exit was unconfirmed
-    expect(manager.heldPermits()).toBe(1);
-    const saved = () => settledResults.filter(result => result.id === handle.id && result.status === "completed");
-    expect(saved()).toHaveLength(0);
-    const next = await manager.spawn({ task: "next", transport: "process" }); // releases: delivers first
+    // The worker is already gone when the hold begins (round 3): delivered first, then released, with no new spawn.
+    await vi.waitFor(() => expect(manager.heldPermits()).toBe(0), { timeout: 5_000, interval: 20 });
+    expect(saved()).toEqual([{ id: handle.id, status: "completed", text: "SAVED" }]);
+    const next = await manager.spawn({ task: "next", transport: "process" });
     expect(saved()).toEqual([{ id: handle.id, status: "completed", text: "SAVED" }]);
     expect(manager.status(handle.id)).toMatchObject({ status: "completed", text: "SAVED" });
     expect(manager.heldPermits()).toBe(0);
@@ -198,6 +223,96 @@ describe("a lost-contact run's saved answer", () => {
     await manager.stop(next.id).catch(() => undefined);
     await manager.spawn({ task: "again", transport: "process" }).then(again => manager.stop(again.id)).catch(() => undefined);
     expect(saved()).toHaveLength(1);
+  }, 60_000);
+
+  // pi-fabric#939 round 3 SEC 1: nothing is delivered or released before the exact gate holds.
+  onLinux("another unresolved reason: no delivery, the permit stays", async () => {
+    const { manager, handle, worker, saved } = await lostContactRun({ reason: "server unreachable; worker may still run" });
+    await worker.exit();
+    await manager.wait(handle.id, { timeoutMs: 15_000 });
+    const probe = await manager.spawn({ task: "probe", transport: "process" }); // an admission pass
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(saved()).toHaveLength(0);
+    expect(manager.heldPermits()).toBe(1);
+    expect(probe.status).toBe("queued");
+    await manager.stop(probe.id).catch(() => undefined);
+  }, 60_000);
+
+  onLinux("a missing marker: no delivery, the permit stays, even when the worker exits", async () => {
+    const { manager, handle, directory, worker, saved } = await lostContactRun({ closedWhileAlive: true });
+    await manager.wait(handle.id, { timeoutMs: 15_000 });
+    await vi.waitFor(() => expect(manager.heldPermits()).toBe(1), { timeout: 5_000, interval: 20 });
+    fs.rmSync(path.join(directory, "unresolved-worker.json"), { force: true });
+    await worker.exit(); // its close event re-checks
+    const probe = await manager.spawn({ task: "probe", transport: "process" }); // and an admission pass
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(saved()).toHaveLength(0);
+    expect(manager.heldPermits()).toBe(1);
+    await manager.stop(probe.id).catch(() => undefined);
+  }, 60_000);
+
+  // SEC 2: prove, save, mark completed, release. A failed save keeps it unmarked and retried, then delivered once.
+  onLinux("a failed save keeps the permit and retries the delivery; then it is delivered once and released", async () => {
+    const failing = { on: true };
+    const { manager, handle, directory, worker, saved } = await lostContactRun({ failCompletedSaves: failing });
+    await worker.exit();
+    await manager.wait(handle.id, { timeoutMs: 15_000 });
+    const probe = await manager.spawn({ task: "probe", transport: "process" }); // a pass whose save fails
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(saved()).toHaveLength(0);
+    expect(manager.heldPermits()).toBe(1);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).not.toBe("completed");
+    await manager.stop(probe.id).catch(() => undefined);
+    failing.on = false;
+    const next = await manager.spawn({ task: "retry", transport: "process" }); // the next pass
+    expect(saved()).toEqual([{ id: handle.id, status: "completed", text: "SAVED" }]);
+    expect(manager.heldPermits()).toBe(0);
+    expect(next.status).not.toBe("queued");
+    await manager.stop(next.id).catch(() => undefined);
+  }, 60_000);
+});
+
+// pi-fabric#939 round 3 P1-a: a spawn already waiting is admitted when a held launch becomes provably gone, with no
+// other spawn or settle to trigger the check.
+describe("a waiting spawn", () => {
+  onLinux("is admitted once the held launch it waits behind is proven gone", async () => {
+    const { manager, unknownLaunches } = setup(1);
+    const { exit } = await unknownLaunches(1);
+    const waiter = await manager.spawn({ task: "waiter", transport: "process" });
+    expect(waiter.status).toBe("queued");
+    await exit();
+    await vi.waitFor(() => expect(manager.status(waiter.id).status).not.toBe("queued"), { timeout: 12_000, interval: 50 });
+    expect(manager.heldPermits()).toBe(0);
+    await manager.stop(waiter.id).catch(() => undefined);
+  }, 30_000);
+});
+
+// pi-fabric#939 round 3 P1-b: after a relaunch, the proof must be against the REPLACEMENT worker's pid.
+describe("a relaunched run", () => {
+  onLinux("keeps its permit while the replacement lives, though the first worker is gone; releases it when the replacement is gone", async () => {
+    const { manager } = setup(1);
+    const first = liveWorker(), second = liveWorker();
+    let launches = 0;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async () => {
+      launches++;
+      if (launches === 1) return { kind: "process", sessionId: String(first.child.pid), isAlive: async () => first.alive(),
+        stop: async () => undefined, closed: first.closed, lostContact: () => undefined } as never;
+      // The replacement's observation fails (ENODEV) and its transport reports it closed while its pid still lives.
+      return { kind: "process", sessionId: String(second.child.pid), isAlive: async () => false, stop: async () => undefined,
+        closed: second.closed, lostContact: () => ENODEV } as never;
+    });
+    const handle = await manager.spawn({ task: "relaunched", transport: "process" });
+    await first.exit(); // the first attempt dies without a result: a startup retry launches the replacement
+    await vi.waitFor(() => expect(launches).toBe(2), { timeout: 15_000, interval: 50 });
+    await vi.waitFor(() => expect(manager.heldPermits()).toBe(1), { timeout: 15_000, interval: 50 });
+    const waiter = await manager.spawn({ task: "waiter", transport: "process" });
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(manager.heldPermits()).toBe(1); // the old pid is gone, the replacement lives: not proven gone
+    expect(manager.status(waiter.id).status).toBe("queued");
+    await second.exit();
+    await vi.waitFor(() => expect(manager.heldPermits()).toBe(0), { timeout: 12_000, interval: 50 });
+    await manager.stop(waiter.id).catch(() => undefined);
+    await manager.stop(handle.id).catch(() => undefined);
   }, 60_000);
 });
 

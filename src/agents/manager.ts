@@ -18,7 +18,7 @@ import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/a
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, ownedProcessGone, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -326,6 +326,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   ownProcess?: OwnedProcess;
   /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
   recoveredAnswer?: boolean;
+  /** Round 3: that delivery's save succeeded; only its completed mark is left. */
+  recoveredSaved?: boolean;
   id: string;
   name: string;
   task: string;
@@ -746,6 +748,8 @@ export class AgentManager {
   readonly #previousRuns = new Map<string, AgentRunResult>();
   #enodevRuns: string[] | undefined;
   readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
+  /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
+  readonly #enodevSettledHere = new Set<string>();
   readonly #foregroundPrepared = new Set<string>();
   readonly #pendingAbandonment = new Set<string>();
   readonly #foregroundDelivered = new Set<string>();
@@ -1655,6 +1659,10 @@ export class AgentManager {
           // No exact handle means no safe retry or exit receipt. Preserve the
           // permit and actor/queue join rather than rejecting into another writer.
           this.#checkHeldPermits();
+          queueMicrotask(() => this.#releaseProvenGone()); // already gone when the hold began: free it now
+          // pi-fabric#939 round 3: event-driven, no polling. The launched process's own close event re-checks the
+          // proof; a release wakes the admission waiters through the semaphore.
+          void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
           return this.#queuedInfo(queued);
         }
         release();
@@ -1773,7 +1781,8 @@ export class AgentManager {
     let released = 0;
     for (const queued of this.#queued.values()) {
       if (!queued.heldPermit) continue;
-      const settled = settleGoneEnodevLaunch(path.join(this.#runRoot, queued.info.id), queued.ownProcess);
+      const settled = settleGoneEnodevLaunch(path.join(this.#runRoot, queued.info.id), queued.ownProcess,
+        this.#enodevSettledHere.has(queued.info.id));
       if (!settled) continue;
       const permit = queued.heldPermit;
       delete queued.heldPermit;
@@ -1791,10 +1800,14 @@ export class AgentManager {
     }
     for (const managed of this.#runs.values()) {
       if (!managed.heldPermit || !managed.settled) continue;
-      if (!managed.ownProcess || !ownedProcessGone(managed.ownProcess)) continue;
-      // pi-fabric#939 round 2: a saved answer the spawner never got goes through the normal completion path FIRST
-      // (status record, onSettled with its archive, the background notice), once; only then is the permit released.
-      if (!this.#deliverRecoveredAnswer(managed)) continue;
+      // pi-fabric#939 round 3: the record must be the CURRENT attempt's (a relaunch replaces it), and the exact gate
+      // (own pid gone, exact ENODEV marker, this process run) holds BEFORE anything is delivered or written.
+      if (!managed.ownProcess || String(managed.ownProcess.pid) !== managed.transport.sessionId) continue;
+      const record = provenGoneEnodevLaunch(managed.runDirectory, managed.ownProcess);
+      if (!record) continue;
+      // Then prove, save, mark completed, release: a saved answer the spawner never got goes through its completion
+      // path first (round 2), once; any failure keeps the permit and is retried.
+      if (!this.#deliverRecoveredAnswer(managed, record)) continue;
       if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
       const permit = managed.heldPermit;
       delete managed.heldPermit;
@@ -1814,16 +1827,24 @@ export class AgentManager {
    * the completed result through the spawner's completion path. True when there is nothing to deliver or it was
    * delivered (now or before: managed.recoveredAnswer makes it once); false keeps the permit for a later retry.
    */
-  #deliverRecoveredAnswer(managed: ManagedAgent): boolean {
+  #deliverRecoveredAnswer(managed: ManagedAgent, record: Record<string, unknown>): boolean {
     if (managed.recoveredAnswer) return true;
+    // A pending save (of the original settlement or of this recovery) is checked BEFORE any fast path (SEC 2).
+    const pending = managed.settlementSaveFailure;
     const text = savedEnodevAnswer(managed.runDirectory);
-    const settled = readRecord(managed.statusFile) ?? managed.latestRecord;
-    if (text === undefined || !settled || settled.status === "completed") return true;
-    const { error: _error, ...rest } = settled as AgentRunResult;
+    if (text === undefined || record.status === "completed") {
+      return pending ? this.#saveSettledResult(managed, pending.result) : true;
+    }
+    const { error: _error, ...rest } = record as unknown as AgentRunResult;
     const recovered = { ...rest, status: "completed", text, enodevDelivered: true,
-      finishedAt: settled.finishedAt ?? Date.now(), updatedAt: Date.now() } as AgentRunResult;
+      finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now(), updatedAt: Date.now() } as AgentRunResult;
+    // Save (deliver) first; only a saved delivery is marked completed. A failed save leaves the record unmarked, so
+    // the next pass retries the delivery; a failed mark after a save re-marks without saving again.
+    if (!managed.recoveredSaved) {
+      if (!this.#saveSettledResult(managed, recovered)) return false;
+      managed.recoveredSaved = true;
+    }
     try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
-    if (!this.#saveSettledResult(managed, recovered)) return false;
     managed.recoveredAnswer = true;
     managed.latestRecord = compactUiRecord(recovered);
     managed.latestUiRecord = managed.latestRecord;
@@ -2553,6 +2574,7 @@ export class AgentManager {
     if (!pending) return false;
     this.#enodevCommits.delete(runId);
     const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (result) this.#enodevSettledHere.add(runId);
     if (!result) return false;
     this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
     this.#previousRuns.set(result.id, structuredClone(result));
@@ -2572,6 +2594,7 @@ export class AgentManager {
     for (const directory of this.#enodevRuns) {
       const activationId = settleLostEnodevRun(directory, actorId, pending);
       if (activationId === undefined) continue;
+      this.#enodevSettledHere.add(path.basename(directory));
       this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
       this.#retentionRevision++;
       if (enodevDelivered(directory, path.basename(directory), activationId)) {
@@ -3496,10 +3519,15 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      // pi-fabric#939 round 3: the old attempt's pid proves nothing about the replacement. No attempt's pid is known
+      // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
+      delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
       // Stop receipts belong to one transport attempt, not the run id. Install
       // the replacement and its fresh custody together, after launch resolves.
       managed.transport = transport;
+      const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
+      if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
       delete managed.processStop;
       delete managed.processStopPending;
@@ -3870,6 +3898,10 @@ export class AgentManager {
       managed.heldPermit ??= once(managed.release);
       managed.release = () => {};
       this.#checkHeldPermits();
+      queueMicrotask(() => this.#releaseProvenGone()); // after settlement completes below: deliver, then release
+      // Event-driven (round 3): the current attempt's own close event re-checks; its pid record matches this transport.
+      const transport = managed.transport;
+      void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
     }
     if (!managed.finalAnswer && managed.transport.kind === "process" && process.platform === "win32" &&
         managed.transport.waitForClose && !managed.lostContact && !managed.processStop) {

@@ -566,7 +566,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   it.each(["rejection", "abort"] as const)("rechecks dormancy after a presence refresh %s clears live Main protection", async outcome => {
     const { root, config, host } = fixture();
     const wake = await import("../src/residency/wake.js");
-    const error = Object.assign(new Error(`presence refresh ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error" });
+    // #893 logs a presence failure by code or class only; a distinct code proves which error arrived.
+    const error = Object.assign(new Error(`presence refresh ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error",
+      code: `PRESENCE_REFRESH_${outcome.toUpperCase()}` });
     let mainLive = true;
     let fail: (() => void) | undefined;
     let update: Promise<unknown> | undefined;
@@ -593,7 +595,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       mainLive = false;
       fail!();
       await update;
-      expect(warn).toHaveBeenCalledWith(`[pi-fabric] host actor presence: ${error.message}`);
+      expect(warn).toHaveBeenCalledWith(`[pi-fabric] host actor presence: ${error.code}`);
       await until(() => host.actors.status(actor.id).status === "dormant");
       expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
     } finally { if (update) { fail?.(); await update; } vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
@@ -601,7 +603,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
 
   it.each(["rejection", "abort"] as const)("preserves a presence refresh %s when idle-check scheduling throws", async outcome => {
     const { root, config, host } = fixture();
-    const error = Object.assign(new Error(`original presence ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error" });
+    // The scheduler error has no code, so the logged code identifies the original refresh error (#893 redaction).
+    const error = Object.assign(new Error(`original presence ${outcome}`), { name: outcome === "abort" ? "AbortError" : "Error",
+      code: `ORIGINAL_PRESENCE_${outcome.toUpperCase()}` });
     const schedulerError = new Error("idle-check scheduler failure");
     let fail: (() => void) | undefined;
     let update: Promise<unknown> | undefined;
@@ -626,7 +630,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       // The host reports B once, while the actor manager still receives and reports A.
       expect(warn.mock.calls).toEqual([
         [`[pi-fabric] resident idle check scheduling failed: ${String(schedulerError)}`],
-        [`[pi-fabric] host actor presence: ${error.message}`],
+        [`[pi-fabric] host actor presence: ${error.code}`],
       ]);
       // #7988: the failed enqueue must not latch #idleCheckQueued forever.
       protection.mockRestore();

@@ -68,8 +68,12 @@ async function run(
     sourceInfo: createSyntheticSourceInfo("/extensions/bash-override/index.ts", { source: "test" }),
   }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
   const registry = new ActionRegistry();
-  registry.register(new PiToolsProvider(cwd, options.noRunner ? undefined : catalog, new CapturedToolsProvider(catalog),
-    { powerShellToolDefinitionFactory, allowUnhookedTools: options.noRunner === true }));
+  // pi-fabric#925: pi.powershell is refused unless the host profile opts in. The providers read that
+  // opt-in per call through getPowerShellPolicy (production wires it to executor.powershell); this
+  // settle test exercises the opted-in path.
+  const getPowerShellPolicy = options.tool === "powershell" ? () => "allow" as const : undefined;
+  registry.register(new PiToolsProvider(cwd, options.noRunner ? undefined : catalog, new CapturedToolsProvider(catalog, { getPowerShellPolicy }),
+    { powerShellToolDefinitionFactory, allowUnhookedTools: options.noRunner === true, getPowerShellPolicy }));
   const config = structuredClone(DEFAULT_FABRIC_CONFIG);
   config.executor.runtime = runtime;
   config.approvals.execute = options.approvalDenied ? "deny" : "allow";

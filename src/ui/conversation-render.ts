@@ -191,11 +191,14 @@ export class FabricConversationTranscriptRenderer {
     this.invalidate();
   }
 
+  render(transcript: NativeConversationTranscript, width: number, options: FabricConversationTranscriptRenderOptions, ownership?: "copy"): string[];
+  render(transcript: NativeConversationTranscript, width: number, options: FabricConversationTranscriptRenderOptions, ownership: "borrow"): readonly string[];
   render(
     transcript: NativeConversationTranscript,
     width: number,
     options: FabricConversationTranscriptRenderOptions,
-  ): string[] {
+    ownership: "copy" | "borrow" = "copy",
+  ): readonly string[] {
     if (this.disposed || width <= 0) return [];
     width = Math.max(1, width);
     // Revisions are reader-local, and a participant can roll to a new activation.
@@ -231,8 +234,14 @@ export class FabricConversationTranscriptRenderer {
     }
     for (const row of this.rows) {
       if (row.lines && !row.dynamic) continue;
-      row.lines = row.render(width);
-      this.frameLines = undefined;
+      const lines = row.render(width);
+      if (!row.lines || !sameItems(row.lines, lines)) {
+        // Dynamic renderers still run every frame, but unchanged image/spinner
+        // output must not rebuild the entire retained transcript. Snapshot their
+        // rows in case a custom component reuses and mutates its output array.
+        row.lines = row.dynamic ? lines.slice() : lines;
+        this.frameLines = undefined;
+      }
     }
     const flags = `${transcript.hasMore}:${transcript.hasNewer}`;
     if (!this.frameLines || flags !== this.frameFlags) {
@@ -255,8 +264,10 @@ export class FabricConversationTranscriptRenderer {
       this.frameLines = lines;
       this.frameFlags = flags;
     }
-    // The public result is mutable; callers must not be able to corrupt cached rows.
-    return this.frameLines.slice();
+    // The view borrows an immutable snapshot for indexed scrolling/selection.
+    // Ordinary callers keep their mutable defensive copy. Never mutate a borrowed
+    // frame: all invalidation paths replace it, preserving pinned selections.
+    return ownership === "borrow" ? this.frameLines : this.frameLines.slice();
   }
 
   private reconcileRows(

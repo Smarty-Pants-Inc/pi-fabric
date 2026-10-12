@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
+import { messageTargetArgs } from "../src/providers/agents-provider.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
 import { GUEST_TYPE_DECLARATIONS, guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import { GUEST_SETUP, QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
@@ -23,6 +24,69 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  it.each(["send", "steer"])("repairs agents.%s targets without relaxing the existing guard", method => {
+    expect(messageTargetArgs(method, { to: "session:peer", message: "HOLD", priority: "interrupt" }))
+      .toEqual({ id: "session:peer", message: "HOLD", priority: "interrupt" });
+    expect(() => messageTargetArgs(method, { id: "session:peer", to: "session:other", message: "HOLD" })).toThrow("two targets");
+    expect(() => messageTargetArgs(method, { sessionId: "peer", message: "HOLD" })).toThrow("has no sessionId field");
+  });
+  it.each([false, true])("types and registers interrupt-priority send/steer (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    for (const method of ["send", "steer"]) {
+      const code = `return await agents.${method}({ id: "session:peer", message: "HOLD", priority: "interrupt" });`;
+      expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+      const bad = `return await agents.${method}({ id: "session:peer", message: "HOLD", priority: "urgent" });`;
+      expect(typeCheckFabricCode(bad, declarations, true).errors.map(error => error.message)).toEqual([
+        expect.stringContaining('not assignable to type')]);
+      const descriptor = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === method)!;
+      expect(descriptor.inputSchema.properties).toHaveProperty("priority", { type: "string", enum: ["interrupt"],
+        description: expect.any(String) });
+    }
+    expect(typeCheckFabricCode('await agents.followUp({ id: "peer", message: "later", priority: "interrupt" });', declarations, true).errors.length).toBeGreaterThan(0);
+  });
+  it("bridges agents.send priority to the public provider, without extra authority", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute('return await agents.send({ id: "session:peer", message: "HOLD", priority: "interrupt" });',
+      async (ref, args) => { calls.push({ ref, args }); return { queued: true }; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.send", args: { id: "session:peer", message: "HOLD", priority: "interrupt" } }]);
+  });
+
+  it.each([false, true])("types records-backed validity and registers the option (fullCodeMode=%s)", fullCodeMode => {
+    const code = `return agents.create({ name: "org", instructions: "Work.", records: { topic: "org.records", maxEntries: 32, maxAgeMs: 21_600_000 },
+      validWhile: ({ activation, current }) => {
+        if (activation.kind !== "mesh" || typeof activation.data?.key !== "string") return true;
+        const record = current.records?.get(activation.data.key);
+        const at: string | undefined = record?.at;
+        const fresh: boolean | undefined = record?.fresh;
+        return fresh !== true || record?.state !== "answered";
+      } });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "create")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.records).toMatchObject({ type: "object", required: ["topic"], additionalProperties: false,
+      properties: { maxAgeMs: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 21_600_000 } } });
+    expect(typeCheckFabricCode(`await agents.create({ name: "bad", instructions: "Work.", validWhile: ({ current }) => {
+      current.records?.set("key", { state: "open" }); return true; } });`, guestTypeDeclarations(fullCodeMode), true).errors.map(e => e.message))
+      .toEqual([expect.stringContaining("Property 'set' does not exist")]);
+  });
+
+  it.each([false, true])("types and registers spawn complexity hints (fullCodeMode=%s)", fullCodeMode => {
+    for (const complexity of ["simple", "normal", "complex", "delicate"]) {
+      expect(typeCheckFabricCode(`return await agents.spawn({ task: "work", complexity: "${complexity}" });`, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    }
+    expect(typeCheckFabricCode('return await agents.spawn({ task: "work", complexity: "unknown" });', guestTypeDeclarations(fullCodeMode), true).errors).not.toEqual([]);
+    const schema = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "spawn")!.inputSchema as { properties: Record<string, unknown> };
+    expect(schema.properties.complexity).toMatchObject({ type: "string", enum: ["simple", "normal", "complex", "delicate"] });
+  });
+
+  it.each([false, true])("types opt-in actor occurrence dedupe (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "alarm", instructions: "Handle alarms", residency: "durable", topics: ["ops.owner"], dedupeKey: "data.key", coalesceKey: "payload.number", activation: { minIntervalMs: 1000 } }); return { dedupeKey: actor.dedupeKey, activation: actor.activation };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode(`await agents.create({ name: "bad", instructions: "x", dedupeKey: 42 });`, guestTypeDeclarations(fullCodeMode), true).errors)
+      .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });

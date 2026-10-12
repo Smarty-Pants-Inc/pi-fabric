@@ -247,7 +247,7 @@ describe("worker kernel contract", () => {
     });
     const sessionFile = path.join(root, "session.jsonl");
     const result: AgentRunResult = await manager.run({
-      task: "probe", transport: "process",
+      task: "probe", runner: "pi", transport: "process",
       ...(request.kernel ? { kernel: request.kernel } : {}),
       ...(request.recursive ? { recursive: true } : {}),
       ...(request.extensions === false ? { extensions: false } : {}),

@@ -18,11 +18,17 @@ export interface JournalState {
 export interface JournalBase {
   generation: string | undefined;
   identity: string | undefined;
+  /** The base file's stat stamp, chained into the next (format-2) record as previousStamp. */
+  stamp: string | undefined;
   hash: string | undefined;
   versionKeys: string[];
   tombstoneOrder: string;
+  /** The base tombstone keys, so a commit can publish a small patch instead of the whole order. */
+  tombstoneKeys?: readonly string[] | undefined;
 }
 export interface JournalCursor { inode: string; offset: number }
+/** A followed endpoint whose canonical payload hash was not checked yet (non-authoritative read). */
+export interface JournalEndpoint { generation: string; chainHash: string; identity: string; payloadHash: unknown }
 const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
 const MAX_RECORD_BYTES = 256 * 1024;
 const journalPath = (root: string): string => path.join(root, "state.read-journal.jsonl");
@@ -35,6 +41,81 @@ const uuid = (value: unknown): value is string => typeof value === "string" &&
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const own = (object: object, key: string): boolean => Object.hasOwn(object, key);
+
+/*
+ * Kernel ctime witness (smarty-dev#4250, pi-fabric#560).
+ *
+ * Problem: an authoritative read must bind a journal-followed terminal endpoint to the bytes of
+ * state.json (security review of #560, P2). Hashing the 4-5 MB payload once per change in every
+ * idle reader (lifecycle broker, residency drain, heartbeat, inbox) costs ~3.9 MB/s per reader.
+ *
+ * Witness: right after the canonical writer renames state.json into place, still under the mesh
+ * lock, it records (dev, ino, size, ctimeNs, mtimeNs) of its own inode (fstat on a descriptor
+ * opened on the staged file before the rename) together with the payload hash it just wrote, the
+ * chain hash and the generation, in the read signal
+ * (state.read-signal.json, header first). A reader fstats the descriptor it opened (never the
+ * path) and, on an exact tuple match with a witness for the same generation, chain hash and
+ * chain-bound payload hash, accepts that payload hash without reading state.json. Any mismatch,
+ * a missing, damaged or old-format signal, or Windows (where a user process can set the change
+ * time) falls back to the full streaming hash: fail closed.
+ *
+ * Why the tuple binds the bytes: user processes cannot set ctime. utimes/futimens set only
+ * atime/mtime, and every write, truncate, chmod, link or rename updates ctime; a replacement is a
+ * new inode. So "same dev+ino, same size, same ctimeNs" means no change since the writer's stat.
+ * The copied-marker replacement (new inode), an mtime-restored replacement (ctime/inode differ)
+ * and an in-place rewrite with the mtime restored (ctime differs) are all detected.
+ *
+ * Trust model, stated precisely:
+ *  - A same-UID process can rewrite any file here, but cannot forge a kernel ctime without root or
+ *    a system clock change. The tuple therefore proves "unchanged since the writer recorded it"
+ *    against every writer that does not also rewrite the witness: legacy Pi writers, restores,
+ *    sync tools, editors and the copied-marker forger of the P2 review (which rewrites the
+ *    journal's terminal record but cannot make the witness match a new ctime).
+ *  - The witness itself is a same-UID file. A forger who rewrites state.json AND the signal's
+ *    witness to the new tuple is accepted: readers that follow the journal then serve the chain
+ *    state while a canonical parse serves the forged bytes. This is a divergence, not an
+ *    escalation: the same principal can already write any state (with a self-consistent header and
+ *    chain), replace this package's code or ptrace the reader, so no file-based binding can
+ *    exclude it. The full re-hash excluded only the divergence, at ~3.9 MB/s per idle reader.
+ *  - Timestamp granularity: kernels before 6.13 (no multigrain timestamps) stamp ctime from the
+ *    coarse clock (one timer tick, 1-4 ms). A same-size IN-PLACE rewrite (no Pi writer does that:
+ *    they rename) that lands in the same tick as the writer's rename keeps the tuple. Rename-based
+ *    replacements are always detected (new inode).
+ */
+const WITNESS_HEADER = /^\{"generation":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})","witness":(\{[^{}]{1,1024}\})/;
+const WITNESS_HEADER_BYTES = 1536;
+/** The kernel tuple of a just-renamed state.json plus the hashes its writer just wrote. */
+export interface StateWitness { dev: string; ino: string; size: string; ctimeNs: string; mtimeNs: string; chainHash: string; payloadHash: string }
+const tupleOf = (stat: fs.BigIntStats) => ({ dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+  ctimeNs: String(stat.ctimeNs), mtimeNs: String(stat.mtimeNs) });
+/** Writer side, under the mesh lock right after the rename. Undefined where ctime is not a kernel witness. */
+export const stateWitnessOf = (stat: fs.BigIntStats, chainHash: string, payloadHash: string): StateWitness | undefined =>
+  process.platform === "win32" || typeof stat.ctimeNs !== "bigint" || stat.ctimeNs <= 0n || stat.ino <= 0n
+    ? undefined : { ...tupleOf(stat), chainHash, payloadHash };
+export const sameWitnessTuple = (stat: fs.BigIntStats, witness: StateWitness): boolean => {
+  const tuple = tupleOf(stat);
+  return tuple.dev === witness.dev && tuple.ino === witness.ino && tuple.size === witness.size &&
+    tuple.ctimeNs === witness.ctimeNs && tuple.mtimeNs === witness.mtimeNs;
+};
+/** Reader side: the signal's witness when it names exactly this fstat tuple, else undefined (fall back). */
+export const readStateWitness = (root: string, stat: fs.BigIntStats): (StateWitness & { generation: string }) | undefined => {
+  if (process.platform === "win32" || typeof stat.ctimeNs !== "bigint" || stat.ctimeNs <= 0n || stat.ino <= 0n) return undefined;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(path.join(root, "state.read-signal.json"), "r");
+    const buffer = Buffer.allocUnsafe(WITNESS_HEADER_BYTES);
+    const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const match = WITNESS_HEADER.exec(buffer.toString("utf8", 0, read));
+    if (!match) return undefined;
+    const witness: unknown = JSON.parse(match[2]!);
+    if (!record(witness) || !["dev", "ino", "size", "ctimeNs", "mtimeNs"].every(key => typeof witness[key] === "string" && /^\d+$/.test(witness[key] as string)) ||
+      typeof witness.chainHash !== "string" || !/^[0-9a-f]{64}$/.test(witness.chainHash) ||
+      typeof witness.payloadHash !== "string" || !/^[0-9a-f]{64}$/.test(witness.payloadHash)) return undefined;
+    const parsed = witness as unknown as StateWitness;
+    return sameWitnessTuple(stat, parsed) ? { ...parsed, generation: match[1]! } : undefined;
+  } catch { return undefined; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
+};
 
 /** Nanosecond metadata includes rename/in-place identity, not just lossy mtime milliseconds.
  * Usable Windows file ids and change/creation times need no payload read. Adapters without
@@ -55,13 +136,54 @@ export const stateReadIdentity = (file: string, maxBytes = Number.POSITIVE_INFIN
   } catch { return undefined; }
 };
 
-export const journalBase = (state: JournalState, file: string): JournalBase => ({
+export const journalBase = (state: JournalState, file: string, stamp: string | undefined): JournalBase => ({
   generation: uuid(state.readGeneration) ? state.readGeneration : undefined,
   identity: stateReadIdentity(file),
+  stamp,
   hash: state.readJournalHash,
   versionKeys: Object.keys(state.versions ?? {}),
   tombstoneOrder: JSON.stringify(state.tombstoneOrder),
+  tombstoneKeys: state.tombstoneOrder?.slice(),
 });
+
+/** The journal's current end, captured BEFORE a canonical full read (or by the writer under the
+ * lock right after its append): every record for a later generation lies at or past it. */
+export const journalCursorOf = (root: string): JournalCursor | undefined => {
+  try {
+    const stat = fs.statSync(journalPath(root));
+    return { inode: `${stat.dev}:${stat.ino}`, offset: stat.size };
+  } catch (error) {
+    // Absent: any journal created later holds only later records ("" follows it from 0).
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { inode: "", offset: 0 } : undefined;
+  }
+};
+
+interface TombstonePatch { remove: string[]; append: string[] }
+/** Delta encoding of a tombstone order change: keep the base order minus `remove`, then
+ * `append`. Undefined when the change is not that shape (callers publish the full order). */
+const tombstonePatch = (base: readonly string[], next: readonly string[]): TombstonePatch | undefined => {
+  const index = new Map<string, number>();
+  base.forEach((key, i) => { if (!index.has(key)) index.set(key, i); });
+  if (index.size !== base.length || new Set(next).size !== next.length) return undefined;
+  const kept = new Set<string>();
+  let position = -1, split = 0;
+  for (; split < next.length; split++) {
+    const at = index.get(next[split]!);
+    if (at === undefined || at <= position) break;
+    kept.add(next[split]!); position = at;
+  }
+  const append = next.slice(split);
+  if (append.some(key => kept.has(key))) return undefined;
+  return { remove: base.filter(key => !kept.has(key)), append };
+};
+const applyTombstonePatch = (base: readonly string[], patch: unknown): string[] | undefined => {
+  if (!record(patch) || !Array.isArray(patch.remove) || !Array.isArray(patch.append) ||
+    [...patch.remove, ...patch.append].some(key => typeof key !== "string")) return undefined;
+  const remove = new Set(patch.remove as string[]);
+  if (remove.size !== patch.remove.length || (patch.remove as string[]).some(key => !base.includes(key))) return undefined;
+  const next = [...base.filter(key => !remove.has(key)), ...(patch.append as string[])];
+  return new Set(next).size === next.length ? next : undefined;
+};
 
 /** Verify the hash committed in the delta body against canonical bytes, NOT the sidecar's
  * self-checksum. Only the second-field readJournalHash is excluded to avoid self-reference;
@@ -81,6 +203,15 @@ const verifyCanonicalPayload = (root: string, generation: string, chainHash: str
     const generationField = `{"readGeneration":"${generation}"`;
     const prefix = Buffer.from(`${generationField},"readJournalHash":"${chainHash}"`);
     const physical = identityOf(stat);
+    // Kernel witness (see above): the writer's own record that THIS inode, unchanged since its
+    // stat (same ctime), carries exactly this generation, chain head and payload hash.
+    if (physical === identity) {
+      const witness = readStateWitness(root, stat);
+      if (witness && witness.generation === generation && witness.chainHash === chainHash && witness.payloadHash === expected) {
+        fs.closeSync(fd); fd = undefined;
+        return stateReadIdentity(file) === identity; // the path still names the witnessed inode
+      }
+    }
     if (physical !== identity) {
       // A no-file-id Windows adapter uses the conservative content identity. Only
       // that recovery path needs a full path read, with no handle retained across it.
@@ -110,13 +241,17 @@ const verifyCanonicalPayload = (root: string, generation: string, chainHash: str
   finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
 };
 
-interface PreparedStateJournal { hash: string; text: string }
+/** One bounded pass over the canonical payload for an endpoint an authoritative read now needs. */
+export const verifyStateJournalEndpoint = (root: string, endpoint: JournalEndpoint): boolean =>
+  verifyCanonicalPayload(root, endpoint.generation, endpoint.chainHash, endpoint.identity, endpoint.payloadHash);
+
+interface PreparedStateJournal { hash: string; text: string; payloadHash: string }
 /** Prepare a hash chain before the canonical rename. Its hash is committed IN state.json's
  * bounded header, so a forged/self-checksummed sidecar cannot supply fresh authority. */
 export const prepareStateJournal = (state: JournalState, base: JournalBase | undefined,
   changedKeys: readonly string[], encodedEntries: ReadonlyMap<string, { entry: Buffer }>, canonicalPayload: Buffer): PreparedStateJournal | undefined => {
   try {
-    if (!base?.generation || !base.identity || !uuid(state.readGeneration)) return undefined;
+    if (!base?.generation || !base.identity || !base.stamp || !uuid(state.readGeneration)) return undefined;
     // Reuse the exact canonical entry bytes: neither chain hashing nor publication should
     // traverse changed payloads again (including large batches and UTF-8/escaped keys).
     const entries: Record<string, string> = Object.create(null);
@@ -127,40 +262,54 @@ export const prepareStateJournal = (state: JournalState, base: JournalBase | und
     }
     for (const key of base.versionKeys) if (!own(state.versions ?? {}, key)) versions[key] = null;
     const { entries: _entries, versions: _versions, readGeneration: _generation, readJournalHash: _hash, tombstoneOrder, ...envelope } = state;
-    const head = JSON.stringify({ format: 1, previous: base.generation, previousIdentity: base.identity, previousHash: base.hash ?? null,
-      generation: state.readGeneration, canonicalPayloadHash: digest(canonicalPayload), envelope });
+    // Format 2 chains the predecessor's whole endpoint: its physical identity AND its stat stamp
+    // are inside this record's hash, which the canonical header commits. A record's own endpoint
+    // is only known after the rename, so the terminal endpoint is bound by its payload hash.
+    const payloadHash = digest(canonicalPayload);
+    const head = JSON.stringify({ format: 2, previous: base.generation, previousIdentity: base.identity, previousStamp: base.stamp,
+      previousHash: base.hash ?? null, generation: state.readGeneration, canonicalPayloadHash: payloadHash, envelope });
     const members = Object.keys(entries).map(key => `${JSON.stringify(key)}:${entries[key]}`).join(",");
     const tombstones = JSON.stringify(tombstoneOrder);
+    // A changed order is published as a patch when that is smaller: a delete or a recreate
+    // must not repeat every retained tombstone key. Format-1 readers reject format 2 and fall
+    // back to the canonical read; format-1 records of older writers stay readable.
+    const patch = tombstones === base.tombstoneOrder || !base.tombstoneKeys ? undefined
+      : tombstonePatch(base.tombstoneKeys, tombstoneOrder ?? []);
+    const patchText = patch && JSON.stringify(patch);
+    const usePatch = patchText !== undefined && patchText.length < (tombstones ?? "[]").length;
     const text = `${head.slice(0, -1)},"entries":{${members}},"versions":${JSON.stringify(versions)}` +
-      (tombstones === base.tombstoneOrder ? "" : `,"tombstoneOrder":${tombstones ?? "[]"}`) + "}";
+      (tombstones === base.tombstoneOrder ? "" : usePatch ? `,"tombstonePatch":${patchText}` : `,"tombstoneOrder":${tombstones ?? "[]"}`) + "}";
     if (Buffer.byteLength(text) > MAX_RECORD_BYTES - 1024) return undefined;
-    return { hash: digest(text), text };
+    return { hash: digest(text), text, payloadHash };
   } catch { return undefined; }
 };
 
 /** Called after canonical rename under the existing lock. Missing/capped/failed publication
  * breaks the chain; readers fall back. Atomic rotation bounds history, with no extra timer/lock. */
-export const appendStateJournal = (root: string, prepared: PreparedStateJournal | undefined, stamp: string): void => {
+export const appendStateJournal = (root: string, prepared: PreparedStateJournal | undefined, stamp: string): JournalCursor | undefined => {
   try {
-    if (!prepared) return;
+    if (!prepared) return undefined;
     const identity = stateReadIdentity(path.join(root, "state.json"));
-    if (!identity) return;
+    if (!identity) return undefined;
     const delta = `${prepared.text.slice(0, -1)},"identity":${JSON.stringify(identity)},"stamp":${JSON.stringify(stamp)}}`;
     const line = `{"checksum":"${digest(delta)}","delta":${delta}}\n`;
-    if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return;
+    if (Buffer.byteLength(line) > MAX_RECORD_BYTES) return undefined;
     const file = journalPath(root);
     let size = 0;
     try { size = fs.statSync(file).size; } catch { /* absent */ }
     if (size + Buffer.byteLength(line) > MAX_JOURNAL_BYTES) writeFileAtomic(file, line);
     else fs.appendFileSync(file, line, { mode: 0o600 });
-  } catch { /* A sidecar cannot reject or hide a canonical commit. */ }
+    // Under the lock: the end of this commit's own record, for the writer's cached snapshot.
+    return journalCursorOf(root);
+  } catch { return undefined; /* A sidecar cannot reject or hide a canonical commit. */ }
 };
 
 /** Incremental replay pinned to the actual canonical payload. Terminal metadata alone is
  * untrusted: its chain-bound payload hash must match bytes read from the pinned canonical
  * descriptor. Missing/failed bindings fall back. Existing opaque snapshots stay immutable. */
 export const replayStateJournal = (root: string, base: JournalState, generation: string, identity: string,
-  stamp: string, baseIdentity: string | undefined, canonicalHash: string | undefined, cursor?: JournalCursor): { state: JournalState; cursor: JournalCursor } | undefined => {
+  stamp: string, baseIdentity: string | undefined, canonicalHash: string | undefined, cursor?: JournalCursor,
+  verify = true, baseStamp?: string): { state: JournalState; cursor: JournalCursor; pending?: JournalEndpoint } | undefined => {
   let fd: number | undefined;
   try {
     if (!uuid(base.readGeneration) || base.readGeneration === generation || !canonicalHash) return undefined;
@@ -168,13 +317,18 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
     const stat = fs.fstatSync(fd);
     const inode = `${stat.dev}:${stat.ino}`;
     if (stat.size > MAX_JOURNAL_BYTES) return undefined;
-    const offset = cursor?.inode === inode && cursor.offset <= stat.size ? cursor.offset : 0;
+    // Follow by offset from an anchored base (a canonical full read, this writer's commit or an
+    // earlier verified replay): only appended bytes are read and each record's link is checked.
+    // A rotated/absent cursor replays from the start and re-verifies the canonical payload once.
+    const followed = cursor !== undefined && (cursor.inode === inode ? cursor.offset <= stat.size : cursor.inode === "");
+    const offset = followed && cursor.inode === inode ? cursor.offset : 0;
+    if (offset === stat.size) return undefined; // nothing appended: the canonical read decides
     const buffer = Buffer.allocUnsafe(stat.size - offset);
     if (fs.readSync(fd, buffer, 0, buffer.length, offset) !== buffer.length) return undefined;
     const text = buffer.toString("utf8");
     if (!text.endsWith("\n")) return undefined;
     let state = base, last: Record<string, unknown> | undefined;
-    let previousIdentity = baseIdentity;
+    let previousIdentity = baseIdentity, previousStamp = baseStamp;
     let consumed = 0;
     for (const line of text.slice(0, -1).split("\n")) {
       const bytes = Buffer.byteLength(line);
@@ -190,9 +344,11 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
       }
       const { identity: _identity, stamp: _stamp, ...body } = delta;
       const hash = digest(JSON.stringify(body));
-      if (delta.previousHash !== (state.readJournalHash ?? null) || delta.previousIdentity !== previousIdentity || delta.format !== 1 || !uuid(delta.generation) || !record(delta.envelope) ||
+      if (delta.previousHash !== (state.readJournalHash ?? null) || delta.previousIdentity !== previousIdentity ||
+        (delta.format !== 1 && delta.format !== 2) || (delta.format === 1 && (own(delta, "tombstonePatch") || own(delta, "previousStamp"))) ||
+        (delta.format === 2 && (previousStamp === undefined || delta.previousStamp !== previousStamp)) || !uuid(delta.generation) || !record(delta.envelope) ||
         ![1, 2].includes(delta.envelope.format as number) || !record(delta.entries) || !record(delta.versions) ||
-        ["entries", "versions", "readGeneration", "readJournalHash", "tombstoneOrder"].some(key => own(delta.envelope as object, key))) return undefined;
+        ["entries", "versions", "readGeneration", "readJournalHash", "tombstoneOrder", "tombstonePatch"].some(key => own(delta.envelope as object, key))) return undefined;
       const entries = { ...state.entries }, versions = { ...state.versions };
       for (const [key, entry] of Object.entries(delta.entries)) {
         if (entry === null) delete entries[key];
@@ -209,22 +365,33 @@ export const replayStateJournal = (root: string, base: JournalState, generation:
           Object.defineProperty(versions, key, { value: version, enumerable: true, configurable: true, writable: true });
         }
       }
-      const tombstones = delta.tombstoneOrder ?? state.tombstoneOrder;
+      const tombstones = own(delta, "tombstonePatch")
+        ? applyTombstonePatch(state.tombstoneOrder ?? [], delta.tombstonePatch) ?? null
+        : delta.tombstoneOrder ?? state.tombstoneOrder;
       if (tombstones !== undefined && (!Array.isArray(tombstones) || tombstones.some(key => typeof key !== "string"))) return undefined;
       state = { ...delta.envelope, format: delta.envelope.format as 1 | 2, readGeneration: delta.generation, readJournalHash: hash,
         entries, versions, ...(tombstones === undefined ? {} : { tombstoneOrder: tombstones as string[] }) };
       last = delta;
       previousIdentity = typeof delta.identity === "string" ? delta.identity : undefined;
+      previousStamp = typeof delta.stamp === "string" ? delta.stamp : undefined;
       if (state.readGeneration === generation) break;
     }
     if (!last || state.readGeneration !== generation || state.readJournalHash !== canonicalHash || last.identity !== identity || last.stamp !== stamp) return undefined;
-    if (!verifyCanonicalPayload(root, generation, canonicalHash, identity, last.canonicalPayloadHash)) return undefined;
+    // The terminal hash is bound to the canonical header and every record links to its
+    // predecessor's hash, identity and (format 2) stamp. The terminal record's OWN endpoint is
+    // only known after the rename, so only the payload hash binds a copied-marker replacement
+    // there. Every authoritative caller (verify) and every replay without an anchor (rotation,
+    // first follow) checks it now; only an explicitly display-only, anchored follow may return
+    // the endpoint as pending, which is never served to an authoritative read unbound.
+    const endpoint: JournalEndpoint = { generation, chainHash: canonicalHash, identity, payloadHash: last.canonicalPayloadHash };
+    const checked = verify || !followed;
+    if (checked && !verifyStateJournalEndpoint(root, endpoint)) return undefined;
     // The descriptor must still contain exactly the captured prefix (no in-place truncation).
     const after = fs.fstatSync(fd);
     if (after.ino !== stat.ino || after.size < stat.size) return undefined;
     // The captured journal can include a later writer's record. Advance only through the
     // endpoint actually replayed, so the next read cannot skip that unconsumed UTF-8 tail.
-    return { state, cursor: { inode, offset: offset + consumed } };
+    return { state, cursor: { inode, offset: offset + consumed }, ...(checked ? {} : { pending: endpoint }) };
   } catch { return undefined; }
   finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* best effort */ } }
 };

@@ -157,6 +157,9 @@ export class FabricDashboard implements Component, Focusable {
   private readonly onGlobalDeliveryPolicy:
     | ((actorId: string, delivery: FabricActorDelivery, triggerTurn: boolean) => void)
     | undefined;
+  private readonly onGlobalEvents:
+    | ((globalActorId: string, events: FabricActorHostEvent[]) => void)
+    | undefined;
   private readonly onActorTools: ((actorId: string, tools: string[]) => void) | undefined;
   private readonly actorDefaultTools: string[];
   private readonly onClearMessages: ((actorId: string) => void) | undefined;
@@ -223,6 +226,7 @@ export class FabricDashboard implements Component, Focusable {
         delivery: FabricActorDelivery,
         triggerTurn: boolean,
       ) => void;
+      onGlobalEvents?: (globalActorId: string, events: FabricActorHostEvent[]) => void;
       onActorTools?: (actorId: string, tools: string[]) => void;
       actorDefaultTools?: string[];
       onClearMessages?: (actorId: string) => void;
@@ -252,6 +256,7 @@ export class FabricDashboard implements Component, Focusable {
     this.onActorModel = options.onActorModel;
     this.onActorThinking = options.onActorThinking;
     this.onActorEvents = options.onActorEvents;
+    this.onGlobalEvents = options.onGlobalEvents;
     this.onActorDeliveryPolicy = options.onActorDeliveryPolicy;
     this.onGlobalDeliveryPolicy = options.onGlobalDeliveryPolicy;
     this.onActorTools = options.onActorTools;
@@ -412,7 +417,9 @@ export class FabricDashboard implements Component, Focusable {
         }
       } else if (data === "v") {
         const detail = allEntities.find((entity) => entity.id === this.detailId);
-        if (
+        if (detail?.kind === "globalActor") {
+          this.openEventsPicker(detail);
+        } else if (
           detail &&
           detail.kind === "actor" &&
           detail.status !== "stopped" &&
@@ -651,6 +658,9 @@ export class FabricDashboard implements Component, Focusable {
         ) {
           this.detailId = selected.id;
           this.openDeliveryPicker(selected);
+        } else if (data === "v" && selected.kind === "globalActor") {
+          this.detailId = selected.id;
+          this.openEventsPicker(selected);
         } else if (
           data === "v" &&
           selected.kind === "actor" &&
@@ -1102,14 +1112,18 @@ export class FabricDashboard implements Component, Focusable {
   }
 
   private openEventsPicker(entity: Entity): void {
-    if (entity.kind !== "actor" || entity.value.local === false || !this.onActorEvents) return;
+    let callback: ((id: string, events: FabricActorHostEvent[]) => void) | undefined;
+    if (entity.kind === "globalActor") callback = this.onGlobalEvents;
+    else if (entity.kind === "actor" && entity.value.local !== false) callback = this.onActorEvents;
+    if (!callback || (entity.kind !== "actor" && entity.kind !== "globalActor")) return;
     const actor = entity.value;
+    const label = entity.kind === "actor" ? "actor" : "template";
     this.modal.openPicker("events", actor.name, (close) => new FabricHostEventSelector({
       theme: this.theme,
       currentValue: actor.events,
-      headerText: `Host events for actor "${actor.name}". Toggle with space, Enter to apply, Esc to cancel.`,
+      headerText: `Host events for ${label} "${actor.name}". Toggle with space, Enter to apply, Esc to cancel.`,
       onSelect: (events) => {
-        this.onActorEvents!(actor.id, events);
+        callback(actor.id, events);
         close();
       },
       onCancel: () => close(),
@@ -1461,6 +1475,7 @@ export class FabricDashboard implements Component, Focusable {
     if (entity.kind === "globalActor") {
       const actions = [
         this.onGlobalDeliveryPolicy ? "y delivery policy" : undefined,
+        this.onGlobalEvents ? "v events" : undefined,
         this.onGlobalInstructions ? "i instructions" : undefined,
         this.onImportActor ? "p import" : undefined,
         this.onRemoveGlobalActor ? "d delete" : undefined,
@@ -1708,6 +1723,7 @@ export class FabricDashboard implements Component, Focusable {
     if (entity.kind === "globalActor") {
       const actions = [
         this.onGlobalDeliveryPolicy ? "y delivery policy" : undefined,
+        this.onGlobalEvents ? "v events" : undefined,
         this.onGlobalInstructions ? "i instructions" : undefined,
         this.onImportActor ? "p import" : undefined,
         this.onRemoveGlobalActor ? "d delete" : undefined,

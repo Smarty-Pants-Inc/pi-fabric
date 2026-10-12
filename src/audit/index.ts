@@ -1,3 +1,11 @@
+// Assessment runtime guards live on the lazy `pi-fabric/assessment` subpath;
+// the root keeps only their types so the projection stays off the startup graph.
+export type {
+  FabricAssessmentOperationV1,
+  FabricAssessmentSourceV1,
+  FabricAssessmentTraceV1,
+  FabricAssessmentUsageV1,
+} from "./assessment.js";
 export {
   FABRIC_EXECUTION_DETAILS_MAX_BYTES,
   createFabricPersistedExecutionDetails,

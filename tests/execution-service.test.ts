@@ -12,6 +12,7 @@ import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { FabricActionDescriptor, FabricProvider } from "../src/protocol.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 const cpythonAvailable = spawnSync("python3", ["-I", "-B", "-c", "import sys"]).status === 0;
 const montyAvailable = await import("@pydantic/monty/node").then(() => true, () => false);
@@ -154,7 +155,7 @@ return { scheduled, tail: "still ran" };
       const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prewalk-"));
       try {
         const registry = new ActionRegistry();
-        registry.register(new PiToolsProvider(cwd, undefined, undefined));
+        registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
         const config = structuredClone(DEFAULT_FABRIC_CONFIG);
         config.executor.runtime = runtime;
         if (runtime === "node-process") {
@@ -200,7 +201,7 @@ return "complete outer result";
     try {
       fs.writeFileSync(path.join(cwd, "sample.txt"), "fabric works\n", "utf8");
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const config = structuredClone(DEFAULT_FABRIC_CONFIG);
       config.approvals.read = "allow";
       const service = new FabricExecutionService(registry, config);
@@ -429,7 +430,7 @@ return "done";
   it("attaches image blocks to the audit for a single nested image read", async () => {
     const cwd = process.cwd();
     const registry = new ActionRegistry();
-    registry.register(new PiToolsProvider(cwd, undefined, undefined));
+    registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
     config.approvals.read = "allow";
     const service = new FabricExecutionService(registry, config);
@@ -457,7 +458,7 @@ return "done";
     try {
       fs.writeFileSync(path.join(cwd, "sample.txt"), "native\n", "utf8");
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const config = structuredClone(DEFAULT_FABRIC_CONFIG);
       config.fullCodeMode = false;
       config.approvals.read = "allow";
@@ -479,19 +480,19 @@ return {
       });
       expect(metadata.success).toBe(true);
       expect(metadata.value).toMatchObject({
-        providers: [],
+        providers: [{ name: "native" }],
         catalog: {
           kind: "pi-fabric.capability-catalog",
           complete: true,
-          totalActions: 0,
-          indexedActions: 0,
-          providers: [],
+          totalActions: 7,
+          indexedActions: 7,
+          providers: [{ name: "native" }],
           root: {
             key: "capability:fabric",
             description: expect.stringContaining("not historical session evidence"),
           },
         },
-        search: [],
+        search: [{ ref: "native.load" }],
       });
 
       const direct = await service.execute({
@@ -536,7 +537,7 @@ return {
     try {
       fs.writeFileSync(path.join(cwd, "sample.txt"), "dashboard\n", "utf8");
       const registry = new ActionRegistry();
-      registry.register(new PiToolsProvider(cwd, undefined, undefined));
+      registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
       const config = structuredClone(DEFAULT_FABRIC_CONFIG);
       config.approvals.read = "allow";
       const activity = new FabricActivityStore();

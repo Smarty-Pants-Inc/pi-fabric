@@ -66,7 +66,7 @@ const stateEntry = (entry: MeshStateEntry): FabricUiStateEntry => {
   };
 };
 
-/** Poll-only memoization. Event-driven refreshes and dispatch bypass this cache. */
+/** Optional memoization for snapshot consumers; controller event refreshes bypass this cache. */
 export class FabricDashboardSnapshotCache {
   private inputs: unknown;
   private snapshot: FabricDashboardSnapshot | undefined;
@@ -109,8 +109,11 @@ export const createDashboardSnapshot = (
     typeof state.agents.listForUi === "function"
       ? state.agents.listForUi()
       : state.agents.list();
-  // Observe externally owned domains on every poll, including remote lease
-  // expiry and model/usage updates that need not emit a local manager event.
+  // Observe externally owned domains on each event or explicit view refresh.
+  // Quiet remote lease/model changes are picked up on the next notification or view opening.
+  // smarty-dev#4250: these three mesh reads only FEED the dashboard (nothing here routes,
+  // admits or writes), so they are displayOnly: `background` makes the participant directory
+  // read displayOnly, and the state listing opts in directly. Deciders keep bound reads.
   const participants = typeof state.participantInfos === "function"
     ? state.participantInfos({ scope: "project", background: true }) : [];
   const actorRecords = state.actors.list();
@@ -119,7 +122,7 @@ export const createDashboardSnapshot = (
   const globalActors = state.globalActors.list();
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
-  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true }) : [];
+  const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200, { background: true, displayOnly: true }) : [];
   const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
   const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
     globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };
@@ -253,14 +256,21 @@ export const createDashboardSnapshot = (
         : agent;
     });
   const localAgentIds = new Set(localAgents.map((agent) => agent.id));
+  // Fork (smarty-dev#2004, #142 F3): the dashboard topology shows peer
+  // sessions' agents from the project directory; the widget alone narrows to
+  // this session's work (smarty-dev#1089). Upstream's snapshot-level root
+  // filter would drop peers from the topology, so only its provider rows are
+  // taken here.
   const remoteAgents: FabricUiAgent[] = participants
-    .filter((participant) => participant.kind === "agent" && !localAgentIds.has(participant.id))
+    .filter((participant) =>
+      (participant.kind === "agent" || participant.kind === "provider") &&
+      !localAgentIds.has(participant.id))
     .map((participant) => ({
       id: participant.id,
       name: participant.name,
       status: participant.status,
-      runner: participant.runner,
-      transport: participant.transport,
+      ...(participant.runner ? { runner: participant.runner } : {}),
+      transport: participant.provider ? `provider ${participant.provider}` : participant.transport,
       cwd: participant.cwd ?? "",
       ...(participant.model ? { model: participant.model } : {}),
       ...(participant.thinking ? { thinking: participant.thinking } : {}),

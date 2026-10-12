@@ -37,7 +37,7 @@ a deferred stopped-actor exchange. The separate legacy policy below grants
 **no deletion authority**.
 An interrupted proof resumes at its failed predicate, not at the initial status
 read. Each predicate can retry on two later ticks; timed-out units veto the
-current snapshot and retry on the next completed delta pass rather than becoming
+current snapshot and retry on the next completed delta pass; they never become
 60-second cached ownership facts. Oversized tree-proof units are retained without
 starving later entries.
 Pending full-result custody records have **no** 1-MiB protocol cutoff: recovery
@@ -84,7 +84,7 @@ bundle append, manifest or deletion transaction in this worker anymore.
 The hot `runs/` directory shrinks, reducing startup and sweep work. **Total disk
 usage does not shrink.** Deletion is cut from this PR: a follow-up needs an
 independently reviewed opaque-custody proof or an owner-run offline step that
-actually discharges outstanding custody. More `/proc` visibility is not that proof.
+discharges outstanding custody. More `/proc` visibility is not that proof.
 
 ## Policy and live writers
 
@@ -125,7 +125,7 @@ original path** must not lose that path. These guards remain:
 - Fresh tree identity and reference-generation checks bracket the move. If known
   custody appears after rename, move back without overwriting an existing run ID.
   A conflicting ID or namespace fault leaves the moved bytes retained and reports
-  an error rather than destroying either copy.
+  an error and never destroys either copy.
 
 The guards are conservative protection for known live/path-based owners, **not**
 a claim that all potential writers are discoverable. Unknown descriptor custody

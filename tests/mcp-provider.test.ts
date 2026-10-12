@@ -6,6 +6,8 @@ import { describe, expect, it } from "vitest";
 import type { FabricMcpConfig } from "../src/config.js";
 import { McpDescriptorCacheStore } from "../src/providers/mcp-descriptor-cache.js";
 import { McpProvider } from "../src/providers/mcp-provider.js";
+import { PiNativeMcpTools } from "../src/providers/pi-native-mcp.js";
+import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 
 const context: FabricInvocationContext = {
@@ -93,6 +95,51 @@ const countLines = (countFile: string): string[] =>
     : [];
 
 describe("McpProvider", () => {
+  it("preserves legacy cache entries while borrowed, but never resurrects removed definitions on opt-out", async () => {
+    const directory = temporaryDirectory();
+    const countFile = path.join(directory, "cache-ownership.log");
+    const configPath = writeTwoServerConfig({ directory, countFile });
+    const store = new McpDescriptorCacheStore(path.join(directory, "cache.json"));
+    const load = async (nativeServers: string[], revalidate: "all" | "changed") => {
+      const provider = new McpProvider(directory, { ...cacheConfig(configPath, { revalidate }), nativeServers }, {
+        cache: store, ...(nativeServers.length ? { native: new PiNativeMcpTools(new CapturedToolCatalog(), nativeServers, 5_000) } : {}),
+      });
+      try { await provider.list({}, context); await provider.settle(); return await provider.list({}, context); }
+      finally { await provider.close(); }
+    };
+    await load([], "changed");
+    const original = (await store.load())!.servers["fal-ai"];
+    await load(["fal-ai"], "all");
+    expect((await store.load())!.servers["fal-ai"]).toEqual(original);
+    expect(countLines(countFile).filter(name => name === "fal-ai")).toHaveLength(1);
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    delete config.mcpServers["fal-ai"];
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    await load(["fal-ai"], "changed");
+    expect((await store.load())!.servers["fal-ai"]).toBeUndefined();
+    expect((await load([], "changed")).some(tool => tool.name.startsWith("fal-ai."))).toBe(false);
+  }, 30_000);
+
+  it.each([false, true])("never connects selected Pi-owned servers through mcporter (cache=%s)", async (enabled) => {
+    const directory = temporaryDirectory();
+    const countFile = path.join(directory, "tools-list.log");
+    const configPath = writeTwoServerConfig({ directory, countFile });
+    const native = new PiNativeMcpTools(new CapturedToolCatalog(), ["fal-ai"], 5_000);
+    const provider = new McpProvider(directory, { ...cacheConfig(configPath, { enabled, revalidate: "all" }), nativeServers: ["fal-ai"] }, { native });
+    try {
+      const listed = await provider.list({}, context);
+      await provider.settle();
+      expect(listed.some(tool => tool.name.startsWith("fal-ai."))).toBe(false);
+      expect(countLines(countFile)).toEqual(["test"]);
+      await expect(provider.invoke("fal-ai.echo-value", { value: "no fallback" }, context)).rejects.toThrow("no mcporter fallback");
+      const servers = await provider.invoke("$servers", {}, context) as Array<{ name: string; transport: string }>;
+      expect(servers.filter(server => server.name === "fal-ai")).toEqual([expect.objectContaining({ name: "fal-ai", transport: "pi" })]);
+      await provider.invoke("$reload", {}, context);
+      await provider.settle();
+      expect(countLines(countFile).every(name => name === "test")).toBe(true);
+    } finally { await provider.close(); }
+  }, 30_000);
+
   it("discovers and calls a stdio server through mcporter", async () => {
     const directory = temporaryDirectory();
     const countFile = path.join(directory, "tools-list.log");

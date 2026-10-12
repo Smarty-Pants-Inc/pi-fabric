@@ -11,6 +11,7 @@ import type {
   FabricPeerInfo,
 } from "../topology/types.js";
 import type { AgentUsage } from "../agents/types.js";
+import type { FabricAgentRunner } from "../config.js";
 
 export type FabricUiMain = FabricMainAgentInfo;
 export type FabricUiPeer = FabricPeerInfo;
@@ -19,7 +20,7 @@ export interface FabricUiAgent {
   id: string;
   name: string;
   status: string;
-  runner?: "pi" | "claude" | "veda";
+  runner?: FabricAgentRunner;
   residency?: FabricParticipantResidency;
   transport: string;
   cwd: string;

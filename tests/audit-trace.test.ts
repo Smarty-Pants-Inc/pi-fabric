@@ -14,10 +14,18 @@ import {
   type FabricExecutionFailureStageV1,
 } from "../src/audit/trace.js";
 import { FabricActivityStore } from "../src/activity/store.js";
+import { projectFabricAuditArgs } from "../src/audit/projection.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import type { FabricProvider } from "../src/protocol.js";
+
+describe("agent message audit parity", () => {
+  it.each(["agents.send", "agents.steer"])("retains only the target for %s", ref => {
+    expect(projectFabricAuditArgs(ref, { id: "session:receiver", message: "private HOLD", priority: "interrupt", data: { private: true } }).value)
+      .toEqual({ id: "session:receiver" });
+  });
+});
 
 const descriptor = {
   name: "echo",
@@ -319,7 +327,7 @@ return true;
       },
     });
     const timed = serviceFor(waitingProvider);
-    timed.service.config.executor.timeoutMs = 40;
+    timed.service.config.executor.timeoutMs = 1_000;
     const timedResult = await execute(
       timed.service,
       timed.context,
@@ -331,9 +339,13 @@ return true;
       failureStage: "invoke",
     });
 
-    const aborted = serviceFor(waitingProvider);
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new Error("cancel-secret")), 30);
+    const aborted = serviceFor(demoProvider({
+      async list() {
+        queueMicrotask(() => controller.abort(new Error("cancel-secret")));
+        return new Promise(() => undefined);
+      },
+    }));
     const abortedResult = await execute(
       aborted.service,
       aborted.context,

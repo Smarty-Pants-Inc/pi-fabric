@@ -85,7 +85,8 @@ export interface JevRunInfo {
   error?: string;
   evaluations: number;
   toolCalls: number;
-  usage: { input_tokens: number; output_tokens: number };
+  /** Null means unknown billed usage, never zero. Further inference is blocked. */
+  usage: { input_tokens: number | null; output_tokens: number | null };
   events: JevEvent[];
   nextSequence: number;
   logs: string[];

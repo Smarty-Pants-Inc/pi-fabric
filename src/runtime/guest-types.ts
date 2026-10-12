@@ -1,4 +1,5 @@
 import type { FabricDynamicGuestDeclarations } from "../protocol.js";
+import { NATIVE_CODEMODE_TYPES } from "./native-codemode-types.js";
 import { JEV_GUEST_DECLARATIONS } from "../jev/guest-types.js";
 
 // These names and compatibility fields are the single source of truth for
@@ -30,10 +31,11 @@ export const PI_CORE_NUMERIC_FIELDS = {
 } as const;
 
 export const GUEST_TYPE_DECLARATIONS = `
+${NATIVE_CODEMODE_TYPES}
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type FabricTransport = "auto" | "process" | "tmux" | "screen" | "localterm" | "herdr";
-type FabricAgentRunner = "pi" | "claude" | "veda";
+type FabricAgentRunner = "pi-durable" | "pi" | "claude" | "veda" | (string & {});
 type FabricKernel = "typescript" | "python";
 type FabricThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 interface FabricActionEffect {
@@ -62,8 +64,10 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
-  /** Required placement capabilities; any unmet need keeps process tasks local. */
+  /** Required placement capabilities; local always pins to Main, and unmet needs stay local. */
   needs?: string[];
+  /** Up to 64 absolute selected-host inputs, each at most 4096 UTF-8 bytes and without NUL. */
+  requires?: string[];
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
@@ -72,6 +76,8 @@ interface FabricAgentRequest {
   modelReason?: string;
   persona?: string;
   thinking?: FabricThinking;
+  /** Child thinking bounds; must lie inside this session's bounds. Levels outside are clamped. */
+  thinkingBounds?: FabricThinkingBounds;
   tools?: string[];
   timeoutMs?: number;
   /** Unix niceness 0-19 for the child and its tools; only raises agents.nice. */
@@ -81,6 +87,17 @@ interface FabricAgentRequest {
   /** Filesystem execution directory; relative paths resolve from the parent agent cwd. */
   cwd?: string;
   worktree?: boolean;
+  /** Shell command run in the new worktree before launch. */
+  worktreeSetup?: string;
+  /** Pi only. branch: fork this conversation (last completed turn); snippet: prefix recent messages. */
+  seed?: "task" | "branch" | "snippet";
+  seedMessages?: number;
+  /** Pi only write confinement; bash needs shell: "unconfined". */
+  readOnly?: boolean;
+  writableRoots?: string[];
+  shell?: "deny" | "unconfined";
+  /** Narrow the host-issued scope; omitted inherits it. Refused when this session is unscoped. */
+  scope?: { grants: { resource: string; actions: ("read" | "write" | "execute")[] }[] };
   schema?: Record<string, unknown>;
   /** Extra child system instructions; supported by session and durable runs. */
   systemPrompt?: string;
@@ -88,6 +105,8 @@ interface FabricAgentRequest {
   instructions?: string;
   timeout_ms?: number;
   residency?: FabricParticipantResidency;
+  /** Opt in to session persistence for hook-based observability and external trace ingestion. */
+  persistSession?: boolean;
 }
 interface FabricHandoffCall {
   readonly ref: string;
@@ -188,14 +207,16 @@ interface FabricParticipantInfo {
   interactive?: boolean;
   /** Reserved remote Main setter advertisement; currently false/absent. */
   mainBindings?: boolean;
-  kind: FabricParticipantKind;
+  kind: FabricParticipantKind | "provider";
   rootId: string;
   ownerHostId: string;
   ownerIdentityId: string;
+  ownerIncarnation?: string;
   parentId?: string;
   name: string;
   status: string;
-  runner: FabricAgentRunner;
+  runner?: FabricAgentRunner;
+  provider?: string;
   transport: FabricTransport | "host";
   capabilities: FabricParticipantCapability[];
   cwd?: string;
@@ -277,7 +298,22 @@ interface FabricLifecycleSubscription {
   lastEventId?: string;
   lastError?: string;
 }
+interface FabricTargetTerminalError extends Error {
+  readonly code: "FABRIC_TARGET_TERMINAL";
+  readonly targetId: string;
+  readonly finalAnswerReceiptId: string;
+}
+interface FabricTargetTerminalNotice {
+  code: "FABRIC_TARGET_TERMINAL";
+  targetId: string;
+  messageId: string;
+  delivery: "steer" | "followUp";
+  finalAnswerReceiptId: string;
+  sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
+}
 interface FabricAgentHandle {
+  /** Durable answer boundary; does not confirm native worker/tree exit. */
+  finalAnswerReceipt?: { id: string; recordedAt: number };
   /** Canonical Fabric release actually selected for this process child. */
   fabricRelease?: string;
   followUpDeliveries?: FabricFollowUpDelivery[];
@@ -305,6 +341,8 @@ interface FabricAgentHandle {
   generation?: number;
   model?: string;
   thinking?: FabricThinking;
+  /** Present only when the requested level was clamped into thinking bounds. */
+  requestedThinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
   sessionId?: string;
@@ -349,6 +387,11 @@ interface FabricAgentResult extends FabricAgentHandle {
   pendingMessages?: { steering: string[]; followUp: string[] };
   currentToolStartedAt?: number;
   followUpDeliveries?: FabricFollowUpDelivery[];
+  /** worktree: true runs; worktree stays the path. */
+  worktreeResult?: {
+    path: string; branch?: string; baseRef?: string; changedFiles: string[];
+    diffstat: { files: number; insertions: number; deletions: number }; kept: boolean; diffError?: string;
+  };
 }
 interface FabricModelInfo {
   runner?: FabricAgentRunner;
@@ -463,6 +506,7 @@ interface FabricActionSearchEnvelope {
   backend: FabricActionSearchBackend;
 }
 interface FabricToolsApi {
+  [name: string]: any;
   providers(): Promise<Array<{ name: string; description: string }>>;
   catalog(args?: { provider?: string; limit?: number }): Promise<FabricCapabilityCatalog>;
   /**
@@ -475,7 +519,7 @@ interface FabricToolsApi {
   describe(args: { ref: string }): Promise<FabricAction>;
   call(args: { ref: string; args?: Record<string, unknown> }): Promise<unknown>;
   progress(args: { message: string }): Promise<void>;
-  models(): Promise<FabricModelInfo[]>;
+  models: FabricNativeModels;
 }
 interface FabricCapturedToolResult {
   content: Array<{ type: string; text?: string; [key: string]: unknown }>;
@@ -592,7 +636,12 @@ type PiShellOptions = {
   monitor?: { delivery: "ui" | "wake"; timeoutMs?: number; intervalMs?: number; match?: string };
   cwd?: string; workdir?: string; directory?: string; workingDirectory?: string;
 };
-type PiBashOptions = PiShellOptions;
+type PiBashOptions = PiShellOptions & {
+  /** Owned by an external jev-fabric store (macOS/Linux): keeps running if Pi exits and reattaches on resume. Implies background. */
+  durable?: boolean;
+  /** Durable only: on exit publish {kind ?? "task.completed", data:{taskId, exitCode, description?}}. */
+  notify?: { topic: string; kind?: string };
+};
 type PiPowerShellOptions = PiShellOptions;
 type PiGrepOptions = { path?: string; glob?: string; globPattern?: string; ignoreCase?: boolean; ic?: boolean; caseInsensitive?: boolean; literal?: boolean; context?: number; ctx?: number; limit?: number; max?: number };
 type PiFindOptions = { path?: string; limit?: number; max?: number };
@@ -679,10 +728,13 @@ interface FabricActorHostSignal {
 type FabricActorActivation =
   | { readonly kind: "hostEvent"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly event: FabricActorHostEvent; readonly mainRevision: number; readonly taskRevision: number; readonly signal?: FabricActorHostSignal }
   | { readonly kind: "direct"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number }
-  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string };
+  | { readonly kind: "mesh"; readonly id: string; readonly source: string; readonly sequence: number; readonly createdAt: number; readonly topic: string; readonly data?: any };
+interface FabricActorRecordsOptions { topic: string; maxEntries?: number; maxAgeMs?: number }
+interface FabricActorRecord { readonly state: "held" | "waited" | "answered" | "open"; readonly at: string; readonly fresh: boolean }
+interface FabricActorRecordsView { readonly get: (key: string) => Readonly<FabricActorRecord> | undefined }
 interface FabricActorValidityFacts {
   readonly activation: Readonly<FabricActorActivation>;
-  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number }>;
+  readonly current: Readonly<{ latestActivationSequence: number; mainRevision: number; taskRevision: number; idle: boolean; now: number; records?: FabricActorRecordsView }>;
 }
 type FabricActorValidityDecision = boolean | { valid: boolean; reason?: string };
 type FabricActorBindingScope = "session" | "project";
@@ -708,6 +760,11 @@ interface FabricActorActivationSkipRule {
 }
 type FabricActorActivationFilter = Array<"hold" | "never-message-events" | FabricActorActivationSkipRule>;
 type FabricActorValidWhile = (facts: Readonly<FabricActorValidityFacts>) => FabricActorValidityDecision;
+/** Leading plus latest-trailing admission for host agent_settled only, per actor/source session. */
+interface FabricActorActivationPolicy {
+  /** Non-negative safe integer milliseconds; omitted activation or 0 is off. Pending retains its original boundary on restart. */
+  minIntervalMs: number;
+}
 /** Exactly one instruction source; file bytes are verified on the owning host. */
 type FabricActorInstructionsSource =
   | { instructions: string; instructionsFile?: never; sha256?: never }
@@ -725,6 +782,11 @@ interface FabricActorRequestBase {
   coalesce?: boolean;
   /** Dotted path into a mesh event's data; a queued event with the same value is replaced. */
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
+  /** Immediate leading agent_settled plus latest trailing at the original boundary; other kinds unaffected. */
+  activation?: FabricActorActivationPolicy;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
   /** Per-activation shadow routing; requires explicit model/thinking. */
@@ -746,6 +808,8 @@ interface FabricActorRequestBase {
   requires?: Array<string | { ref: string; optional?: boolean }>;
   inferenceContext?: "full-history" | "activation";
   validWhile?: FabricActorValidWhile;
+  /** Bounded host projection; default 512 entries, cap 4096, maxAgeMs default 6 h. Unknown is undefined. */
+  records?: FabricActorRecordsOptions;
   residency?: FabricParticipantResidency;
 }
 type FabricActorRequest = FabricActorRequestBase & FabricActorInstructionsSource & (
@@ -766,12 +830,16 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
   runner: FabricAgentRunner;
   activationFilterError?: string;
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
-type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed";
+type FabricActorStatus = "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
 interface FabricActorInfo {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -797,6 +865,10 @@ interface FabricActorInfo {
   triggerTurn: boolean;
   coalesce: boolean;
   coalesceKey?: string;
+  /** Opt-in occurrence path into the full mesh event (e.g. data.key); persistent durable
+   * actors skip the last 256 successful keys across restart. Independent of coalesceKey. */
+  dedupeKey?: string;
+  activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
@@ -820,15 +892,33 @@ interface FabricActorInfo {
   requirements?: Array<{ ref: string; optional?: boolean }>;
   capabilityDigest?: string;
   missingCapabilities?: string[];
-  /** Persistent reason an activation is blocked; cleared after a later successful activation. */
-  activationBlocked?: { reason: string; code: string; since: number; count: number };
+  /** Persistent reason an activation is blocked; cleared after a later successful activation.
+   * class is "transient" or "hard"; classification says why. Only a transient code
+   * (provider-transient, activation-window-lost, child-exit-before-admission, preparation-timeout)
+   * carries backoffMs and retryAt, its expiry: from then on the block no longer gates routing and is
+   * reported as activationBlockExpired instead, and the next activation is its probe
+   * (smarty-dev#8487, smarty-dev#6509). Credential, permission, security-policy, quota,
+   * invalid-request, context-overflow, failing-preparation and unknown are hard and stay blocked.
+   * since starts the same-code streak; blockedAt is its latest failure. */
+  activationBlocked?: { reason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number; count: number;
+    retryAt?: number; backoffMs?: number; classification?: string };
+  /** History of a transient block whose cooldown ended; the next activation is its probe.
+   * A transient failure of the probe blocks again with the backoff doubled (to the cap); a
+   * completed run clears it. */
+  activationBlockExpired?: { lastBlockedReason: string; code: string; class?: "transient" | "hard"; since: number; blockedAt?: number;
+    count: number; backoffMs?: number; expiredAt: number; classification?: string };
   inferenceContext?: "full-history" | "activation";
   validWhile?: { version: 1; source: string };
+  records?: FabricActorRecordsOptions;
   residency: FabricParticipantResidency;
   queued: number;
   messages: number;
   createdAt: number;
   updatedAt: number;
+  /** Stopped only: explicit (agents.stop/remove), directive (its own stop) or host-exit (its session Main exited; that session's restart revives it). */
+  stopReason?: "explicit" | "directive" | "host-exit";
+  /** Fenced terminal foreign session-root record; never grants adoption. Its own session's restart revives it. */
+  sessionOrphan?: { oldRoot: string; oldHost: string; lastUpdated: number; orphanedAt: number; reason: string; leadName?: string; role?: string; alarmPublishedAt?: number };
   /** Last settled run, not the run currently in flight. */
   lastRunId?: string;
   /** Accepted activation without a worker: bounded setup, or waiting for admission. */
@@ -908,7 +998,10 @@ type FabricMessageArgs = FabricMessageTarget & {
   /** Remote retry key (1-200 chars): reuse with unchanged input after FABRIC_PARTICIPANT_STALE. */
   idempotencyKey?: string;
 };
-type FabricMessageSteerArgs = FabricMessageArgs;
+type FabricMessageSteerArgs = FabricMessageArgs & {
+  /** Main only: preempt a running tool via native abort, then steer. No tool retry. */
+  priority?: "interrupt";
+};
 type FabricActorMessageArgs = FabricMessageArgs & { model?: string; thinking?: FabricThinking };
 interface FabricFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";
@@ -962,7 +1055,7 @@ interface FabricAgentsApi {
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
   resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
-  spawn(args: FabricAgentRequest & { pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
+  spawn(args: FabricAgentRequest & { complexity?: "simple" | "normal" | "complex" | "delicate"; pinModel?: string; pinThinking?: FabricThinking }): Promise<FabricAgentHandle & { routeDecision?: { model: string; effort: FabricThinking; confidence: number | null; probability: number | null; reasonCode: string; decisionId: string } }>;
   /** Bounded by timeoutMs (default and at most 5 min): a child still running keeps running and reports on completion. */
   wait(args: FabricAgentTargetArgs & { timeoutMs?: number }): Promise<FabricAgentResult>;
   /** Alias for wait. */
@@ -970,7 +1063,11 @@ interface FabricAgentsApi {
   status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
-  self(): Promise<FabricParticipantInfo>;
+  /** lineage mirrors PI_FABRIC_LINEAGE in child workers. */
+  self(): Promise<FabricParticipantInfo & { lineage?: {
+    version: 1; rootSessionId: string; parentSessionId?: string; parentRunId?: string;
+    runId: string; depth: number; childIndex: number; worker: true;
+  } }>;
   main(): Promise<FabricMainAgentInfo>;
   /** Immediate spawning participant; main is the root, not an actor spawner. Address it with id: "spawner". */
   spawner(): Promise<{ id: string; kind: "main" | "agent" | "actor"; runId?: string }>;
@@ -1023,6 +1120,9 @@ interface FabricAgentsApi {
   ask(id: string, message: string): Promise<FabricActorMessage>;
   tell(args: FabricActorMessageArgs): Promise<FabricMessageDelivery>;
   tell(id: string, message: string): Promise<FabricMessageDelivery>;
+  /** Alias of steer; uses the same authority and default delivery. */
+  send(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
+  send(id: string, message: string): Promise<FabricMessageDelivery>;
   steer(args: FabricMessageSteerArgs): Promise<FabricMessageDelivery>;
   steer(id: string, message: string): Promise<FabricMessageDelivery>;
   followUp(args: FabricMessageArgs & { deadlineMs?: number }): Promise<FabricMessageDelivery>;
@@ -1123,7 +1223,14 @@ interface FabricMeshEvent {
   text?: string;
   data?: unknown;
   createdAt: number;
+  /** External grant post: untrusted data. */
+  origin?: "external"; untrusted?: true; grantId?: string;
+  scheduled?: { dueAt: number; key?: string };
+  /** Host-stamped publisher authority: unscoped "host" or a scope principal. */
+  sender?: { authority: "host" } | { authority: "scope"; principalId: string; digest: string };
 }
+type FabricMeshSchedule = Omit<FabricMeshEvent, "sequence" | "origin" | "untrusted" | "grantId" | "scheduled"> & { key?: string; dueAt: number };
+interface FabricMeshGrant { grantId: string; topic: string; kind?: string; createdAt: number; expiresAt: number; uses: number; maxUses: number; createdBy: FabricMeshIdentity }
 interface FabricMeshStateEntry<T = unknown> {
   key: string;
   value: T;
@@ -1135,6 +1242,14 @@ interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
   /** An unverified-ids notice is advisory; it is also appended to the durable event text. */
   publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent & { notice?: string }>;
+  /** Schedules instead: notBefore (epoch ms/ISO) or afterMs, ≤366 days; key replaces. */
+  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; notBefore?: number | string; afterMs?: number; key?: string }): Promise<FabricMeshSchedule & { scheduled: true }>;
+  scheduled(args?: { topic?: string; limit?: number }): Promise<FabricMeshSchedule[]>;
+  unschedule(args: { key: string }): Promise<{ removed: boolean }>;
+  /** External post token, shown once. ttlMs 1 min..30 days; uses 1..10000, default 1. */
+  grant(args: { topic: string; ttlMs: number; uses?: number; kind?: string }): Promise<FabricMeshGrant & { token: string; command: string }>;
+  revoke(args: { grantId: string }): Promise<{ revoked: boolean }>;
+  grants(): Promise<FabricMeshGrant[]>;
   read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;
@@ -1383,6 +1498,9 @@ interface FabricStateVerificationResult {
   reportingError?: string;
   evidenceDigest: string;
   resultDigest: string;
+  binding?: Record<string, string>;
+  observed?: { commit?: string; dirty?: boolean };
+  requestedBy?: "program" | "host";
 }
 interface FabricStateApi {
   transition(args: FabricStateTransitionArgs): Promise<{ event: FabricMeshEvent; head: unknown }>;
@@ -1399,7 +1517,7 @@ interface FabricStateApi {
     certifications: unknown[];
   }>;
   complexity(args?: { files?: string[]; paths?: string[] }): Promise<{ files: FabricStateComplexityFile[]; netDelta: number }>;
-  verify(args?: { labels?: string[]; includeArchived?: boolean; timeoutMs?: number; label?: string }): Promise<FabricStateVerificationResult>;
+  verify(args?: { labels?: string[]; includeArchived?: boolean; timeoutMs?: number; label?: string; binding?: Record<string, string> }): Promise<FabricStateVerificationResult>;
   goal(args: { check: string; description?: string; command?: string; cmd?: string; predicate?: string }): Promise<FabricMeshStateEntry<{ check: string; description?: string }>>;
   checkGoal(args?: { timeoutMs?: number }): Promise<{
     passed: boolean;
@@ -1500,6 +1618,7 @@ interface FabricCompactPendingIntent {
   requestedBy: string;
   requestedAt: number;
 }
+type FabricCompactionOwner = "fabric" | "pi" | "external" | "none";
 interface FabricCompactLastCommit {
   at: number;
   requestedBy: string;
@@ -1633,6 +1752,65 @@ interface FabricCacheApi {
   release(args: { id: string }): Promise<{ released: boolean; cleanupError: string | null }>;
 }
 
+interface FabricThinkingBounds { min?: FabricThinking; max?: FabricThinking }
+interface FabricThinkingOverride {
+  level: FabricThinking;
+  scope: "turn" | "turns" | "session";
+  remainingTurns?: number;
+  reason?: string;
+  setAt: number;
+}
+interface FabricThinkingStatus {
+  level: FabricThinking;
+  available: FabricThinking[];
+  bounds: { min: FabricThinking; max: FabricThinking };
+  baseline: FabricThinking;
+  override?: FabricThinkingOverride;
+}
+interface FabricThinkingApi {
+  status(): Promise<FabricThinkingStatus>;
+  set(args: { level: FabricThinking; scope?: "turn" | "turns" | "session"; turns?: number; reason?: string }): Promise<FabricThinkingStatus & { clamped?: true; requested?: FabricThinking }>;
+  reset(): Promise<FabricThinkingStatus>;
+}
+
+interface FabricDecision {
+  id: string; kind: "approval" | "question" | "escalation"; title: string; body?: string;
+  options?: Array<{ id: string; label: string }>; input: "text" | "confirm" | "select" | "editor";
+  raisedBy: { participantId: string; runId?: string; sessionId?: string };
+  holder: string; createdAt: number; deadline?: number; onExpire: "cancel" | "default" | "escalate"; defaultOptionId?: string;
+  escalation?: { chain: string[]; hop: number; hopTimeoutMs: number; onFinal: "cancel" | "default" };
+  history?: Array<{ holder: string; until: number; reason: "expired" | "escalated"; text?: string; by?: string }>;
+  status: "open" | "answered" | "expired" | "cancelled";
+  answer?: { optionId?: string; text?: string; answeredBy: string; via: string; at: number };
+}
+interface FabricDecisionsApi {
+  raise(args: { title: string; kind?: FabricDecision["kind"]; body?: string; options?: Array<{ id: string; label: string }>; input?: FabricDecision["input"]; holder?: string; deadline?: number; timeoutMs?: number; onExpire?: "cancel" | "default" | "escalate"; defaultOptionId?: string; escalation?: { chain?: string[]; hopTimeoutMs?: number; onFinal?: "cancel" | "default" } }): Promise<{ id: string }>;
+  wait(args: { id: string; timeoutMs?: number }): Promise<FabricDecision>;
+  list(args?: { status?: FabricDecision["status"]; holder?: string; limit?: number }): Promise<FabricDecision[]>;
+  answer(args: { id: string; optionId?: string; text?: string }): Promise<FabricDecision>;
+  escalate(args: { id: string; reason?: string }): Promise<FabricDecision>;
+  cancel(args: { id: string }): Promise<FabricDecision>;
+}
+
+type FabricProgramStatus = "candidate" | "promoted" | "retired";
+interface FabricProgramSummary {
+  /** name@digest12 */
+  ref: string; name: string; digest: string; kind: "fabric" | "jev"; kernel?: "typescript" | "python";
+  description?: string; createdAt: number; status: FabricProgramStatus;
+}
+interface FabricProgramRecord extends FabricProgramSummary {
+  version: 1; code?: string; jevProgram?: Record<string, unknown>; inputSchema?: Record<string, unknown>; trial?: unknown;
+}
+interface FabricProgramsApi {
+  /** Always saved as a candidate; identical content returns the same ref. */
+  save(args: { name: string; kind?: "fabric" | "jev"; kernel?: "typescript" | "python"; code?: string; jevProgram?: Record<string, unknown>; description?: string; inputSchema?: Record<string, unknown> }): Promise<{ ref: string; digest: string }>;
+  list(args?: { name?: string; status?: FabricProgramStatus }): Promise<FabricProgramSummary[]>;
+  /** ref: name (latest promoted, else latest candidate), name@<digest prefix >= 12>, or a full digest. */
+  get(args: { ref: string }): Promise<FabricProgramRecord>;
+  /** Runs nested with this program's capabilities; args.input becomes the saved program's input global. */
+  run<T = unknown>(args: { ref: string; input?: unknown; requirePromoted?: boolean }): Promise<T>;
+}
+
 interface FabricCompactApi {
   request(args?: {
     reason?: string;
@@ -1642,7 +1820,27 @@ interface FabricCompactApi {
     instruction?: string;
     requested_by?: string;
   }): Promise<{ requested: true; intent: FabricCompactPendingIntent }>;
-  status(): Promise<{ pending?: FabricCompactPendingIntent; last?: FabricCompactLastCommit }>;
+  status(): Promise<{
+    pending?: FabricCompactPendingIntent;
+    last?: FabricCompactLastCommit;
+    lastAuto?: { at: number; trigger: "headroom" | "tokens" | "ratio"; committed: boolean };
+    owner: FabricCompactionOwner;
+    outputReserveTokens: number;
+  }>;
+  /** Read-only context pressure; never compacts. */
+  pressure(): Promise<{
+    tokens: number | null;
+    contextWindow: number | null;
+    fraction: number | null;
+    headroomTokens: number | null;
+    band: "ok" | "warn" | "urgent" | "unknown";
+    outputReserveTokens: number;
+    thresholdFraction?: number;
+    thresholdTokens?: number;
+    owner: FabricCompactionOwner;
+  }>;
+  /** Persistent carry-forward focus rendered in every Fabric summary until cleared; no args reads. */
+  carry(args?: { items?: string[]; add?: string[]; remove?: string[]; clear?: boolean }): Promise<{ items: string[] }>;
   cancel(): Promise<{ cancelled: true }>;
 }
 
@@ -1653,6 +1851,8 @@ interface FabricPrewalkFileIdentityStatus {
   stale: boolean;
 }
 interface FabricPrewalkApi {
+  /** Only when Fabric's armed advisory or checkpoint requests an executor handoff plan.
+   * Not a task planner, checklist, or acceptance-ledger store; unavailable otherwise. */
   plan(args: {
     outcome: string;
     steps: string[];
@@ -1690,7 +1890,8 @@ interface FabricWorkflowPhaseInput extends FabricWorkflowPhaseOptions {
   name: string;
 }
 interface FabricWorkflowItem {
-  id: string;
+  /** Stable id, 1-128 chars of [A-Za-z0-9._:/-]; omitted ids become item-<n> per invocation. */
+  id?: string;
   label: string;
   status?: FabricActivityStatus;
   phase?: string;
@@ -1700,6 +1901,8 @@ interface FabricWorkflowItem {
   total?: number;
   completed?: number;
   data?: unknown;
+  /** Plain JSON object (<= 2 KiB) carried only on the host pi-fabric:workflow-item:v1 event. */
+  meta?: Record<string, unknown>;
 }
 interface FabricWorkflowApi {
   agent<T = string>(prompt: string, options?: FabricWorkflowAgentOptions): Promise<T>;
@@ -1715,6 +1918,8 @@ interface FabricWorkflowApi {
   budget: { total: number; spent(): number; remaining(): number };
 }
 declare const tools: FabricToolsApi;
+declare const nativeTools: Record<string, (args?: Record<string, unknown>) => Promise<any>>;
+declare const fabric: { readonly tools: FabricToolsApi };
 declare const pi: PiToolsApi;
 declare const extensions: FabricExtensionsApi;
 declare const agents: FabricAgentsApi;
@@ -1726,6 +1931,9 @@ declare const schema: FabricSchemaApi;
 declare const components: FabricComponentsApi;
 declare const compact: FabricCompactApi;
 declare const cache: FabricCacheApi;
+declare const thinking: FabricThinkingApi;
+declare const decisions: FabricDecisionsApi;
+declare const programs: FabricProgramsApi;
 declare const prewalk: FabricPrewalkApi;
 ${JEV_GUEST_DECLARATIONS}
 declare const council: FabricCouncilApi;
@@ -1738,7 +1946,7 @@ declare function phase(name: string, options?: FabricWorkflowPhaseOptions): Prom
 declare function phase(input: FabricWorkflowPhaseInput): Promise<{ name: string; index: number; id?: string }>;
 declare function log(...values: unknown[]): void;
 declare const budget: FabricWorkflowApi["budget"];
-type FabricRlmRequest = Omit<FabricAgentRequest, "runner" | "recursive"> & { runner?: "pi" };
+type FabricRlmRequest = Omit<FabricAgentRequest, "runner" | "recursive"> & { runner?: "pi" | "pi-durable" };
 declare const rlm: { query(args: FabricRlmRequest): Promise<FabricAgentResult> };
 interface FabricConsole {
   log(...args: unknown[]): void;

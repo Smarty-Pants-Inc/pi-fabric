@@ -1,5 +1,6 @@
 import { FABRIC_ACTOR_HOST_EVENTS } from "../actors/types.js";
 import { AGENT_WAIT_MAX_MS } from "../agents/wait-bound.js";
+import { MAX_AGENT_REQUIRED_INPUTS, MAX_AGENT_REQUIRED_INPUT_BYTES } from "../host-compatibility.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
 import {
   MAX_COMPACTION_INSTRUCTIONS_CHARS,
@@ -9,14 +10,19 @@ import {
 import { FABRIC_LIFECYCLE_EVENTS } from "../lifecycle/types.js";
 import type { FabricActionDescriptor } from "../protocol.js";
 
+// RUNNER_ID_PATTERN (src/agents/runner-registry.ts) as source text; kept in sync by a test.
+const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
+
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
   name: { type: "string" },
-  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities; any unmet need keeps process tasks local and is audited." },
+  needs: { type: "array", items: { type: "string", minLength: 1 }, description: "Required placement target capabilities, NFKC-normalized then lowercased and split on commas/Unicode White_Space; tokens must match [a-z0-9._-], canonical local always pins to the Main host, and any unmet need stays local and is audited." },
+  requires: { type: "array", maxItems: MAX_AGENT_REQUIRED_INPUTS, items: { type: "string", minLength: 1, maxLength: MAX_AGENT_REQUIRED_INPUT_BYTES }, description: "Literal absolute selected-host input paths, each at most 4096 UTF-8 bytes, without dot/dot-dot segments, line breaks or control characters. Local process spawns check existence before starting; unsupported transports refuse requires with AgentInputError; remote launches preflight via repeated --require PATH arguments." },
   runner: {
     type: "string",
-    enum: ["pi", "claude", "veda"],
-    description: "Execution harness. Defaults to agents.runner.",
+    pattern: RUNNER_ID_SOURCE,
+    maxLength: 64,
+    description: "Execution harness: pi (default), pi-durable (opt-in isolated durable Pi host), claude, veda, or a runner registered through pi-fabric/runners. Defaults to agents.runner.",
   },
   kernel: {
     type: "string",
@@ -47,12 +53,27 @@ const runProperties = {
     type: "string",
     enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   },
+  thinkingBounds: {
+    type: "object",
+    properties: {
+      min: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+      max: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+    },
+    additionalProperties: false,
+    description: "Optional child thinking bounds; must lie inside this session's bounds (omitted ends inherit). Child Fabric sessions never widen them. thinking outside the effective bounds is clamped and reported as requestedThinking.",
+  },
   tools: { type: "array", items: { type: "string" } },
   nice: {
     type: "integer",
     minimum: 0,
     maximum: 19,
     description: "Unix niceness for this child and its tools. Only raises agents.nice, never lowers it.",
+  },
+  bashIdleSeconds: {
+    type: "integer",
+    minimum: 0,
+    maximum: MAX_ACTOR_BASH_TIMEOUT_S,
+    description: "Pi runs: kill a blocking bash call after this many seconds with no output (default 180), also when the call sets its own timeout; 0 = no idle limit.",
   },
   timeoutMs: {
     type: "number",
@@ -66,10 +87,58 @@ const runProperties = {
     description: "Filesystem execution directory for leaf or recursive Pi runs; relative paths resolve from the caller cwd. Does not change project/mesh ownership or grant target project trust.",
   },
   worktree: { type: "boolean" },
+  worktreeSetup: {
+    type: "string",
+    maxLength: 8192,
+    description: "Shell command run in a new worktree before the child starts; overrides agents.worktree.setup. Non-zero exit fails the run.",
+  },
+  seed: {
+    type: "string",
+    enum: ["task", "branch", "snippet"],
+    description: "Child context (Pi only). task (default): the task alone. branch: a non-blocking fork of this conversation up to its last completed turn, then the task. snippet: the last seedMessages user/assistant texts prefixed to the task.",
+  },
+  seedMessages: { type: "integer", minimum: 1, maximum: 50, description: "snippet only; default 12" },
+  readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
+  writableRoots: {
+    type: "array",
+    items: { type: "string", maxLength: 4096 },
+    maxItems: 32,
+    description: "Pi only: confine write/edit to these directories (relative to the child cwd; default the cwd). Shell is refused unless shell: \"unconfined\".",
+  },
+  scope: {
+    type: "object",
+    properties: {
+      grants: {
+        type: "array",
+        maxItems: 64,
+        items: {
+          type: "object",
+          properties: {
+            resource: { type: "string", minLength: 3, maxLength: 512 },
+            actions: { type: "array", minItems: 1, maxItems: 3, items: { type: "string", enum: ["read", "write", "execute"] } },
+          },
+          required: ["resource", "actions"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["grants"],
+    additionalProperties: false,
+    description: "Narrow this session's host-issued scope for the child (each grant must be covered by a parent grant; resource <ns>:<path>, <ns>:<path>/*, <ns>:<path>/**, <ns>:*). Omit to inherit it; refused in an unscoped session.",
+  },
+  shell: {
+    type: "string",
+    enum: ["deny", "unconfined"],
+    description: "With a write policy, bash is refused by default; unconfined allows it and is not a sandbox",
+  },
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
   systemPrompt: {
     type: "string",
     description: "Optional extra system prompt body for this child run. Pi runners merge it below component guidance and forward it via --system-prompt; Claude runners receive it via --append-system-prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+  },
+  persistSession: {
+    type: "boolean",
+    description: "Claude runner only: persist the Claude Code transcript for hook-based observability. Defaults to false.",
   },
 };
 
@@ -122,6 +191,7 @@ const spawnSchema = {
   ...runSchema,
   properties: {
     ...runProperties, residency: residencySchema,
+    complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },
@@ -374,7 +444,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     inputSchema: {
       type: "object",
       properties: {
-        runner: { type: "string", enum: ["pi", "claude", "veda"] },
+        runner: { type: "string", pattern: RUNNER_ID_SOURCE, maxLength: 64 },
         refresh: { type: "boolean" },
       },
       additionalProperties: false,
@@ -444,6 +514,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         triggerTurn: { type: "boolean" },
         coalesce: { type: "boolean" },
         coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
+        dedupeKey: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$", description: "Opt-in occurrence path into the full mesh event (such as data.key). Persistent durable actors skip the last 256 successfully completed keys across restart. Never inferred from coalesceKey." },
+        activation: {
+          type: "object",
+          description: "Optional minimum interval per actor/source session for host agent_settled only. First is admitted immediately; the latest event inside the interval is admitted once at the original window end, without sliding the deadline. Persistent pending delivery survives manager close/restart and is restored on start, re-armed if not yet due. Stop, removal, redefinition or halt drops it. Omitted or 0 is off.",
+          properties: { minIntervalMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER } },
+          required: ["minIntervalMs"],
+          additionalProperties: false,
+        },
         activationFilter: activationFilterSchema,
         routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
@@ -479,6 +557,17 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
               },
             ],
           },
+        },
+        records: {
+          type: "object",
+          description: "Host-maintained records topic for validWhile; default 512 entries (cap 4096), maxAgeMs defaults to 6 h; unknown records fail open.",
+          properties: {
+            topic: { type: "string", pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$" },
+            maxEntries: { type: "integer", minimum: 1 },
+            maxAgeMs: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, default: 21_600_000 },
+          },
+          required: ["topic"],
+          additionalProperties: false,
         },
         validWhile: {
           type: "object",
@@ -533,7 +622,8 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     description: "Queue a message through a persistent actor's live owner without waiting. Optional model/thinking values apply only to this activation.",
     inputSchema: {
       type: "object",
-      properties: actorInvocationProperties,
+      properties: { ...actorInvocationProperties,
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on an outcome-unknown or FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
     },
@@ -542,10 +632,11 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "steer",
     description:
-      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. The stable id alias main targets the root user-facing Pi session. Non-local targets route over the project mesh.",
+      "Steer Main, a running one-shot agent between turns, or a persistent actor through its mailbox. Optional priority interrupt requires owning-root/supervisor or host allowlist authority, aborts at most once per Main turn, and has a 60-second sender cooldown. It delivers the steer next without retrying the tool. Default delivery is unchanged. Non-local targets route over the project mesh.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" }, message: { type: "string" }, data: {},
+        priority: { type: "string", enum: ["interrupt"], description: "Main only; separate interrupt authority required. One abort per turn, 60-second sender cooldown. Abort its tool, then deliver the steer next." },
         idempotencyKey: { type: "string", minLength: 1, maxLength: 200, description: "For remote messages, reuse the same key and unchanged input on a FABRIC_PARTICIPANT_STALE retry." } },
       required: ["id", "message"],
       additionalProperties: false,
@@ -921,6 +1012,9 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
 ];
+
+// send is the public steer spelling; both use the same validation, routing and authority.
+AGENTS_ACTION_DESCRIPTORS.push({ ...AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "steer")!, name: "send" });
 
 // Explicit spelling for callers; keep create as the backwards-compatible API.
 AGENTS_ACTION_DESCRIPTORS.push({

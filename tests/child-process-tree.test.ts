@@ -6,14 +6,17 @@ const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn }));
 const fakeChild = () => Object.assign(new EventEmitter(), { pid: 1234, kill: vi.fn() });
 const spyAlarm = () => vi.spyOn(process, "emitWarning").mockImplementation(() => {});
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllEnvs(); });
 
 describe("owned Windows taskkill close obligation", () => {
   it("targets only the owned PID/tree and joins successful helper close", async () => {
+    vi.stubEnv("PI_FABRIC_LANDLOCK_ESCAPE", "1");
+    // #738: helpers inherit ordinary values, never host-owned Landlock controls.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PI_FABRIC_LANDLOCK_")));
     const child = fakeChild(); const killer = fakeChild(); spawn.mockReturnValue(killer);
     let joined = false;
     const pending = terminateWindowsTree(child as unknown as ChildProcess).then(() => { joined = true; });
-    expect(spawn).toHaveBeenCalledWith("taskkill", ["/pid", "1234", "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    expect(spawn).toHaveBeenCalledWith("taskkill", ["/pid", "1234", "/T", "/F"], { env, windowsHide: true, stdio: "ignore" });
     await Promise.resolve(); expect(joined).toBe(false);
     killer.emit("close", 0); await pending;
     expect(joined).toBe(true); expect(child.kill).not.toHaveBeenCalled();

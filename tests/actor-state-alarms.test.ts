@@ -204,7 +204,9 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     try { await f.expectAlarm("worker-unverified"); } finally { await f.teardown(); }
   }, 60_000);
 
-  it("actor-run-stuck (c): a live pid whose start time is not the recorded one (pid reuse) alarms", async () => {
+  // A kernel start time exists only where processStartTime reads /proc (Linux, its own platform check). Off Linux there is
+  // nothing to compare, and the run is judged by the open owned handle ("no start time (as off Linux)" below).
+  it.skipIf(process.platform !== "linux")("actor-run-stuck (c): a live pid whose start time is not the recorded one (pid reuse) alarms", async () => {
     const f = await stuckFixture();
     // This process is alive, but it is not the worker the host launched: its start time differs.
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
@@ -277,7 +279,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     expect(s.alarms("actor-event-dropped", actor.id)[0]!.data).toMatchObject({ reason: expect.stringMatching(/^[a-z-]+$/) });
   }, 60_000);
 
-  it("processStartTime counts field 22 from after the LAST ')' (a comm with spaces and parentheses)", async () => {
+  it.skipIf(process.platform !== "linux")("processStartTime counts field 22 from after the LAST ')' (a comm with spaces and parentheses)", async () => {
     const { spawn } = await import("node:child_process");
     const child = spawn(process.execPath, ["-e", "process.title = 'a) b (c'; setTimeout(() => {}, 10_000); process.stdout.write('ready')"], { stdio: ["ignore", "pipe", "ignore"] });
     try {

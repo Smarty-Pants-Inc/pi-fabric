@@ -103,7 +103,8 @@ export class MeshLockTicket {
 
   /** True when this waiter may probe .lock: it is the head, or admission is closed/fell back.
    * Non-heads stat only their predecessor's receipt (never .lock/owner) and list the queue only
-   * when that receipt goes, or once past the fallback point to judge the head's progress. */
+   * when that receipt goes, or once past the fallback point (with `passStalledHead`, at most once
+   * per heartbeat interval at any time) to judge the head's progress. */
   mayContend(): boolean {
     if (this.#closed) return true;
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.

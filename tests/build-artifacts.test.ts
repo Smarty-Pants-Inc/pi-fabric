@@ -93,7 +93,9 @@ describe("published build artifact guards", () => {
   });
   it("rejects an eager extractive engine implementation", () => {
     const dir = fixture();
-    fs.appendFileSync(path.join(dir, "dist/extension-bootstrap.js"), "\n// src/memory/extractive-index.ts\n");
+    // The entry Pi loads (package.json pi.extensions), not a fixed file (pi-fabric#982).
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+    fs.appendFileSync(path.join(dir, manifest.pi.extensions[0]), "\n// src/memory/extractive-index.ts\n");
     rejected(dir, "Startup static graph contains lazy module marker: src/memory/extractive-index.ts");
   });
   it("rejects a missing generated ABI declaration", () => {

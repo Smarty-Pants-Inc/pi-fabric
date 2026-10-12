@@ -265,14 +265,17 @@ describe("originating principal relay (#821)", () => {
     h.input(receipt({ v: 1, channel: "voice", principal }));
     const notice = vi.spyOn(messageNotice, "outgoingMessageNotice").mockResolvedValue({ text: "hello\nnotice", notice: "unverified ids: test" });
     const provider = new MeshProvider(mesh, h.identity, {} as any);
+    // Due well after the schedule is written: store.schedule releases anything already due at write time, so a 1 ms
+    // schedule raced the release below on a loaded host. The release is driven by its explicit `now`, not a wall clock.
+    const afterMs = 60_000;
     const scheduled = await provider.invoke("publish", {
-      topic: "fleet.work.task", to: "session:receiver", text: "hello", afterMs: 1, key: "later", principal: forged,
+      topic: "fleet.work.task", to: "session:receiver", text: "hello", afterMs, key: "later", principal: forged,
     }, invocation(h)) as any;
     expect(notice).toHaveBeenCalledOnce();
     expect(scheduled).toMatchObject({ scheduled: true, key: "later", principal, text: "hello\nnotice", notice: "unverified ids: test" });
+    expect(mesh.read({ topic: "fleet.work.task" })).toEqual([]); // still pending
     nextTurnOf(h);
-    await new Promise(resolve => setTimeout(resolve, 5));
-    const [event] = await mesh.releaseDueSchedules();
+    const [event] = await mesh.releaseDueSchedules(Date.now() + afterMs + 1);
     expect(event).toMatchObject({ to: "session:receiver", text: "hello\nnotice", principal, scheduled: { key: "later" } });
     expect(mesh.read({ topic: "fleet.work.task" })[0]?.principal).toEqual(principal);
   });

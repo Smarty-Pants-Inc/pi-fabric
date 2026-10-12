@@ -283,6 +283,10 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-recover",
+      // Same-child recovery, not the run deadline: on a loaded Windows runner the worker and
+      // fake Pi startup can use most of the shared 2s budget before the 25 ms recovery fires.
+      // Same room as kill-worker below; the outcome checks are unchanged.
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("completed");
         expect(r.error).toBeUndefined();

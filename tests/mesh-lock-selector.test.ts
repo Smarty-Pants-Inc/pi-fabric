@@ -140,32 +140,37 @@ describe("startup mesh lock selector", () => {
     await plane.close();
   });
 
-  it.each([0, 3, null, "2", false, 1.5])("rejects unsupported selection %s in config and store construction", (invalid) => {
-    expect(() => normalizeFabricConfig({ mesh: { lockProtocol: invalid } })).toThrow("mesh.lockProtocol must be 1 or 2");
-    expect(() => store({ lockProtocol: invalid as 1 })).toThrow("mesh.lockProtocol must be 1 or 2");
+  it.each([0, 4, null, "2", false, 1.5])("rejects unsupported selection %s in config and store construction", (invalid) => {
+    expect(() => normalizeFabricConfig({ mesh: { lockProtocol: invalid } })).toThrow("mesh.lockProtocol must be 1, 2 or 3");
+    expect(() => store({ lockProtocol: invalid as 1 })).toThrow("mesh.lockProtocol must be 1, 2 or 3");
+  });
+
+  it("accepts protocol 3 (smarty-dev#9569: the holder's PID namespace) in config and store construction", () => {
+    expect(normalizeFabricConfig({ mesh: { lockProtocol: 3 } }).mesh.lockProtocol).toBe(3);
+    expect(store({ lockProtocol: 3 }).lockProtocol).toBe(3);
   });
 
   it("rejects invalid persisted selection", () => {
     const cwd = root();
     const agentDir = root();
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { lockProtocol: 3 } }));
-    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: true })).toThrow("mesh.lockProtocol must be 1 or 2");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { lockProtocol: 4 } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: true })).toThrow("mesh.lockProtocol must be 1, 2 or 3");
   });
 
   it.each(["run", "agent"])("standalone %s rejects invalid protocol before any transport or service", async (mode) => {
-    const flags = ["--mesh", root(), "--lock-protocol", "3"];
+    const flags = ["--mesh", root(), "--lock-protocol", "4"];
     const args = mode === "agent" ? ["--peer", "remote"] : ["--name", "local", "--remote", "remote", "--cursor", path.join(root(), "cursor")];
     const beforeTerm = process.listeners("SIGTERM");
     const beforeInt = process.listeners("SIGINT");
     try {
-      await expect(main([mode, ...flags, ...args])).rejects.toThrow("--lock-protocol must be 1 or 2");
+      await expect(main([mode, ...flags, ...args])).rejects.toThrow("--lock-protocol must be 1, 2 or 3");
     } finally {
       for (const listener of process.listeners("SIGTERM")) if (!beforeTerm.includes(listener)) process.removeListener("SIGTERM", listener);
       for (const listener of process.listeners("SIGINT")) if (!beforeInt.includes(listener)) process.removeListener("SIGINT", listener);
     }
   });
 
-  it.each([undefined, "1", "2"])("standalone run accepts startup selection %s without launching a transport", async (selected) => {
+  it.each([undefined, "1", "2", "3"])("standalone run accepts startup selection %s without launching a transport", async (selected) => {
     const flags = new Map([["mesh", root()], ["name", "local"], ["remote", "remote"], ["cursor", path.join(root(), "cursor")]]);
     if (selected !== undefined) flags.set("lock-protocol", selected);
     const controller = new AbortController();

@@ -72,7 +72,7 @@ if (args.worker) {
       }
       loop.disable();
       const stats = store.stats();
-      process.send({ group: args.worker, index: Number(args.index), commits, timeouts, waits, headBlocks,
+      process.send({ group: args.worker, index: Number(args.index), blocker, commits, timeouts, waits, headBlocks,
         loopP99Ms: loop.percentile(99) / 1e6, fifoJoins: stats.fifoJoins, busyRetries: stats.busyRetries });
     } catch (error) { process.send({ error: String(error.stack ?? error) }); process.exitCode = 1; }
     store.close();
@@ -124,13 +124,19 @@ if (args.worker) {
     const r1 = x => Math.round(x * 10) / 10;
     const sum = (rows, key) => rows.reduce((s, r) => s + r[key], 0);
     const result = { label: args.label ?? groups.map(g => `${g.label}x${g.n}`).join('+'), seconds, budgetMs, ...profile, groups: {} };
+    const waitMs = rows => {
+      const waits = rows.flatMap(r => r.waits);
+      return { p50: r1(q(waits, .5)), p99: r1(q(waits, .99)), max: r1(q(waits, 1)), mean: r1(waits.reduce((s, w) => s + w, 0) / Math.max(1, waits.length)) };
+    };
     for (const group of groups) {
       const mine = reports.filter(r => r.group === group.label);
-      const waits = mine.flatMap(r => r.waits);
+      // `steady`: the writers that never block, so a blocker's own lost time does not hide what the queue did to them.
+      const steady = mine.filter(r => !r.blocker);
       result.groups[group.label] = { checkout: group.dir, processes: group.n, commits: sum(mine, 'commits'), timeouts: sum(mine, 'timeouts'),
-        timeoutsPerProcess: mine.map(r => r.timeouts), headBlocks: sum(mine, 'headBlocks'),
-        waitMs: { p50: r1(q(waits, .5)), p99: r1(q(waits, .99)), max: r1(q(waits, 1)), mean: r1(waits.reduce((s, w) => s + w, 0) / Math.max(1, waits.length)) },
-        loopP99Ms: r1(Math.max(...mine.map(r => r.loopP99Ms))), fifoJoins: sum(mine, 'fifoJoins') };
+        timeoutsPerProcess: mine.map(r => r.timeouts), headBlocks: sum(mine, 'headBlocks'), waitMs: waitMs(mine),
+        loopP99Ms: r1(Math.max(...mine.map(r => r.loopP99Ms))), fifoJoins: sum(mine, 'fifoJoins'),
+        ...steady.length < mine.length ? { steady: { processes: steady.length, commits: sum(steady, 'commits'), timeouts: sum(steady, 'timeouts'),
+          waitMs: waitMs(steady) } } : {} };
     }
     const text = JSON.stringify(result);
     if (args.out) fs.writeFileSync(args.out, text + '\n');

@@ -208,14 +208,32 @@ const sweep = async (meshRoot: string, options: {
   // #9160: each direct actors/ entry's lstat type, dev and ino (never mtime: actor activity must not stop the sweep),
   // taken before discovery so a swap during or after the walk differs. undefined: unknown listing or stat (fail closed).
   const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
+  // #10635: a listed entry gone at its lstat (ENOENT) re-lists, at most 3 listings per call. Gone and staying gone is a
+  // benign removal. Every identity seen within this call is kept and compared with all later reads: a different one is
+  // a replacement (undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
+  // against the sweep's first-ever identities. Any other error, or a third listing with a vanished entry, is unknown.
   const entries = (): Map<string, string> | undefined => {
-    try {
-      if (absent(actorsRoot)) return new Map();
-      return new Map(fs.readdirSync(actorsRoot).map(name => {
-        const stat = fs.lstatSync(path.join(actorsRoot, name));
-        return [name, `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`] as const;
-      }));
-    } catch { return undefined; }
+    const seen = new Map<string, string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (absent(actorsRoot)) return new Map();
+        const current = new Map<string, string>();
+        let vanished = false;
+        for (const name of fs.readdirSync(actorsRoot)) {
+          let stat: fs.Stats;
+          try { stat = fs.lstatSync(path.join(actorsRoot, name)); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+            vanished = true; continue;
+          }
+          const identity = `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
+          if (seen.has(name) && seen.get(name) !== identity) return undefined;
+          seen.set(name, identity); current.set(name, identity);
+        }
+        if (!vanished) return current;
+      } catch { return undefined; }
+    }
+    return undefined;
   };
   let listing = entries();
   if (!listing) throw new Error(`Actor references are uncertain: ${actorsRoot}`);

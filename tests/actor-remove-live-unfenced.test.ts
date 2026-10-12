@@ -41,22 +41,22 @@ describe("live actor remove without the Main publication fence", () => {
   }, 60_000);
 
   // A restarted owner (finishPendingRemovals) with pre-change state: only an explicit false finishes on its own.
-  for (const [label, shape, flag, kept] of [
-    ["a pre-change cleanup marker (no operatorCheck field)", "marker", undefined, true],
-    ["a pre-change accepted-removal record (no operatorCheck field)", "record", undefined, true],
-    ["a cleanup marker with a non-boolean operatorCheck", "marker", "no", true],
-    ["a cleanup marker with an explicit operatorCheck: false", "marker", false, false],
+  for (const [label, shape, flag, kept, residency] of [
+    ["a pre-change cleanup marker (no operatorCheck field)", "marker", undefined, true, "durable"],
+    ["a pre-change accepted-removal record (no operatorCheck field)", "record", undefined, true, "durable"],
+    ["a cleanup marker with a non-boolean operatorCheck", "marker", "no", true, "durable"],
+    ["a cleanup marker with an explicit operatorCheck: false", "marker", false, false, "durable"],
   ] as const) {
     it(`after an upgrade, ${label} ${kept ? "keeps the tree until an operator rerun" : "still finishes on its own"}`, async () => {
       const f = await fixture();
       let restarted: ResidentHost | undefined;
       try {
-        const name = `upgrade-${shape}-${String(flag)}`;
+        const name = `upgrade-${shape}-${String(flag)}-${residency}`;
         const actor = await actorWithTree(f, name);
         // The upgrade: the old host is gone (a crash) leaving its pending removal; a new one starts on the root and
         // finishes what it inherits.
         await f.killResident();
-        await pendingRemoval(f, actor, name, shape, flag);
+        await pendingRemoval(f, actor, name, shape, flag, residency);
         restarted = new ResidentHost(f.config, () => {});
         await restarted.start(); // its start finishes inherited removals in the background
         const host = restarted;

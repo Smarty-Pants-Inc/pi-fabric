@@ -6474,6 +6474,31 @@ describe("#169 round 1 removal safety", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
+  // pi-fabric#952 round 4: a marker's residency is not a trusted record. A durable actor's pending removal whose
+  // marker says "session" (no operatorCheck) keeps its tree: by marker alone (row revoked) and with the registry row.
+  it.each(["revoked row, marker only", "durable registry row with a removal record"] as const)(
+    "a durable actor's removal whose marker says session keeps its tree on restart (%s)", async (shape) => {
+      const { actors, root, mesh, identity, agents, meshConfig } = setup(true);
+      const actor = await actors.create({ name: "mislabelled", instructions: "Work." });
+      await actors.stop(actor.id);
+      await actors.close();
+      const actorRoot = path.join(root, "actors");
+      const dir = path.join(actorRoot, actor.id);
+      fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+      const registryPath = path.join(actorRoot, "actors.json");
+      const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+      registry.actors = shape === "revoked row, marker only" ? []
+        : registry.actors.map((row: Record<string, unknown>) => ({ ...row, residency: "durable", removal: { requestedAt: Date.now() } }));
+      fs.writeFileSync(registryPath, JSON.stringify(registry));
+      fs.writeFileSync(path.join(actorRoot, `removal-${actor.id}.json`), JSON.stringify({ id: actor.id, sessionDir: dir,
+        presenceKey: `actors/test/${actor.id}`, owner: { name: "mislabelled", rootId: identity.id, residency: "session", requestedAt: Date.now() } }));
+      const restarted = new ActorManager("different", identity, mesh, meshConfig, agents, () => {}, { actorRoot, persistent: true });
+      actorManagers.push(restarted);
+      await restarted.finishPendingRemovals();
+      expect(fs.existsSync(dir), "the durable actor's tree").toBe(true);
+      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+    });
+
   it.each(["null", "invalid JSON", "symlink"])("recovers a valid cleanup independently of a preceding %s marker", async (bad) => {
     const { actors, root, identity, mesh, meshConfig, agents } = setup(true);
     const actor = await actors.create({ name: "healthy", instructions: "Work." });

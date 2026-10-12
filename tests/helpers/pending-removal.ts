@@ -18,7 +18,7 @@ export const actorWithTree = async (f: DeadRootFixture, name: string): Promise<{
  * must be gone already: its close saves its own registry view).
  */
 export const pendingRemoval = async (f: DeadRootFixture, actor: { id: string; dir: string }, name: string,
-  shape: "marker" | "record", operatorCheck?: unknown): Promise<void> => {
+  shape: "marker" | "record", operatorCheck?: unknown, markerResidency: "durable" | "session" = "durable"): Promise<void> => {
   const store = new ActorRegistryStore(f.config.actorRoot);
   await store.withLock(() => {
     const rows = store.snapshot().actors as Array<Record<string, unknown> & { id: string }>;
@@ -28,7 +28,8 @@ export const pendingRemoval = async (f: DeadRootFixture, actor: { id: string; di
   if (shape === "marker") {
     fs.writeFileSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`), JSON.stringify({
       id: actor.id, sessionDir: actor.dir, presenceKey: `actors/${f.config.sessionId}/${actor.id}`,
-      owner: { name, rootId: f.config.rootId, residency: "durable", requestedAt: Date.now() },
+      // The marker's residency is not trusted (pi-fabric#952 round 4): a test may mislabel it.
+      owner: { name, rootId: f.config.rootId, residency: markerResidency, requestedAt: Date.now() },
       ...(operatorCheck === undefined ? {} : { operatorCheck }) }));
   }
 };

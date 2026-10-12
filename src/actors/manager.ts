@@ -2765,7 +2765,8 @@ export class ActorManager {
       : { removed: true };
   }
 
-  async #finishCleanup(cleanup: RemovalCleanup): Promise<RemovalResult> {
+  /** `sessionActor`: the TRUSTED record (the registry-loaded actor, never the marker) says this is a session actor. */
+  async #finishCleanup(cleanup: RemovalCleanup, sessionActor = false): Promise<RemovalResult> {
     // A prepared marker (or a transient hole in the actor map) is not a revocation receipt.
     if (!this.#revoked.has(cleanup.id) || !this.#registryRevoked(cleanup.id)) {
       throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
@@ -2773,7 +2774,7 @@ export class ActorManager {
     try {
       await this.#joinStoppedRun(cleanup.id);
       await this.#bindings.delete(cleanup.id);
-      await this.#deleteActorTree(cleanup);
+      await this.#deleteActorTree(cleanup, sessionActor);
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
         if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
@@ -2799,7 +2800,7 @@ export class ActorManager {
    * and runs the removal's own check, then deletes. A root Main that restarts after the operator's check either
    * published first (the check sees it and the tree is kept) or is refused until the delete is done.
    */
-  async #deleteActorTree(cleanup: RemovalCleanup): Promise<void> {
+  async #deleteActorTree(cleanup: RemovalCleanup, sessionActor: boolean): Promise<void> {
     const check = async () => {
       if (!this.#registryRevoked(cleanup.id)) throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
       await this.#removalChecks.get(cleanup.id)?.();
@@ -2808,8 +2809,11 @@ export class ActorManager {
     // An operator remove whose check did not survive a host restart: keep the tree until an operator remove runs the
     // dead-root check again (an automatic re-check after a restart is smarty-dev#10051).
     // Fail closed: only an explicit false, or a session actor, needs no check. An operator remove exists only for a
-    // durable actor (host.ts), so a session actor's removal never carries one; an unknown residency needs the check.
-    if (cleanup.operatorCheck !== false && cleanup.owner?.residency !== "session" && !this.#removalChecks.has(cleanup.id)) {
+    // durable actor (host.ts), so a session actor's removal never carries one. "Session" comes from the trusted record
+    // only (pi-fabric#952 round 4): the registry-loaded actor, and the marker must not say otherwise; a marker alone
+    // (no trusted record), or a mismatch, needs the check.
+    const session = sessionActor && (cleanup.owner?.residency ?? "session") === "session";
+    if (cleanup.operatorCheck !== false && !session && !this.#removalChecks.has(cleanup.id)) {
       throw new Error("the operator's dead-root check was lost with a host restart; the tree is kept until " +
         "`fabric-actors remove --confirm-dead-root` runs it again");
     }
@@ -2868,7 +2872,7 @@ export class ActorManager {
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
     }
-    return this.#finishCleanup(cleanup);
+    return this.#finishCleanup(cleanup, actor.residency === "session");
   }
 
   /** Reversible activation gate. It never aborts a worker or consumes mesh input. */

@@ -14,6 +14,7 @@ import { assertResidentWakeConfig, canonicalResidentWakeConfig, ResidentWakeConf
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
+import { readResidentIdleExit } from "./idle-exit.js";
 import { assertNoWatchdogCustody, watchdogCustodyPath } from "./watchdog-custody.js";
 import {
   HANDOVER_STARTUP_MS, residentLaunchSpec, validateLaunchSpec, assertHandoverTopology, assertPreviousLaunchSpec, assertAutomaticReleaseRecovery,
@@ -65,6 +66,7 @@ interface Attempt {
   stop?: Promise<void>;
   seenOwner: boolean;
   claimedOwner: boolean;
+  ownerToken?: string;
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
   stderr: string;
@@ -271,6 +273,10 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     trace("launcher-deferred", { reason: "existing handover custody" }); return;
   }
   const config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath);
+  if (readResidentIdleExit(root, config.rootId)) {
+    trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
+    return;
+  }
   // Windows has no POSIX birth/session evidence or report-signal recovery.
   // Keep ordinary native child supervision/shutdown, but never enter watchdog custody.
   const watchdogSupported = process.platform !== "win32";
@@ -354,6 +360,10 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     void attempt.native.exit.then(({ code, signal }) => {
       // #2010: after a clean owned release this directory may already belong
       // to the next generation. Do not make a late diagnostic mutation there.
+      // A very short configured idle window can release before our first owner sample.
+      const idleExit = readResidentIdleExit(root, launchConfig.rootId);
+      if (code === 0 && !signal && idleExit?.pid === child.pid &&
+          (!attempt.ownerToken || idleExit?.token === attempt.ownerToken)) return;
       if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
@@ -373,6 +383,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
+    if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }
   };
   const assertFenceFree = async (inode: fs.Stats): Promise<void> => {
@@ -585,6 +596,14 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       }
       const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
+      const idleExit = readResidentIdleExit(root, config.rootId);
+      if (!plan && exit.code === 0 && !exit.signal && idleExit && idleExit.pid === attempt.child.pid &&
+          (!attempt.ownerToken || idleExit.token === attempt.ownerToken)) {
+        // The host has released this directory: another generation may already own it.
+        // Like every other clean child exit, never make a late diagnostic mutation (#2010).
+        process.exitCode = 0;
+        return;
+      }
       if (!plan || !inode) {
         if (!attempt.seenOwner) writeFailure(root, attempt.stderr.trim() || `Pi resident host exited (${exit.signal ?? exit.code ?? "unknown"})`);
         process.exitCode = exit.code ?? 1;

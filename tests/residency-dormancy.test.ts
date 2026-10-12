@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, RESIDENT_IDLE_EXIT_MS } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { retainResidentProcessWork } from "../src/residency/process-work.js";
@@ -82,8 +82,10 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       await host.start();
-      const now = Date.now();
-      vi.spyOn(Date, "now").mockImplementation(() => now + 31_000);
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      await sleep(150); // An empty dead-root host retires after its continuous window (#683).
+      now += RESIDENT_IDLE_EXIT_MS + 1_000;
       await until(() => idle.mock.calls.length === 1);
       expect(warn).not.toHaveBeenCalled();
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }

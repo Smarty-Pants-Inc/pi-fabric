@@ -56,6 +56,7 @@ import {
   FabricToolLifecycle,
   FabricToolOwnership,
   fabricToolPlacement,
+  hostToolVisibility,
   ownsFabricToolSource,
 } from "./core/tool-ownership.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
@@ -300,8 +301,12 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   );
   const pendingHandoffs = new Map<string, PendingFabricHandoff>();
   const toolOwnership = new FabricToolOwnership(pi);
+  // Tools an extension hid from Pi stay out of every Fabric listing, prompt and
+  // invocation, including while Fabric owns the model's tools (smarty-dev#5492).
+  capturedTools.setHostVisibility(hostToolVisibility(pi));
   const fabricUi = new FabricUiController(state, codePreviewSettings, {
-    getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.get(name)?.definition,
+    // Rendering past calls needs the definition even when the tool is now hidden.
+    getToolDefinition: (name) => name === "fabric_exec" ? fabricTool : capturedTools.getRegistered(name)?.definition,
     get markdownTransformers() { return capturedTools.runner?.getMarkdownTransformers(); },
     getMessageRenderer: (type) => capturedTools.runner?.getMessageRenderer(type),
   });
@@ -320,7 +325,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const hiddenCapturedToolNames = (): Set<string> => {
     const visible = new Set(capturePolicy().keepVisible);
     return new Set(
-      capturedTools.list().map((entry) => entry.name).filter((name) => !visible.has(name)),
+      capturedTools.listRegistered().map((entry) => entry.name).filter((name) => !visible.has(name)),
     );
   };
   // Pi auto-activates tools that newly appear in the registry on every tool
@@ -464,6 +469,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     initialPolicy: inactiveCapturePolicy,
     onCatalogRefresh: () => {
       scheduleOwnershipReassert();
+      // Pi settles the active set after the registry callback; re-read it then.
+      queueMicrotask(() => capturedTools.revalidateHostVisibility());
     },
   });
   registerHandoffCompletionRenderer(pi);
@@ -1556,7 +1563,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     ) {
       return;
     }
-    const names = rewritableHiddenCapturedToolNames(hiddenCapturedToolNames());
+    // Only tools Fabric routes; an extension-hidden tool is not reachable (smarty-dev#5492).
+    const offered = new Set(capturedTools.list().map((entry) => entry.name));
+    const names = rewritableHiddenCapturedToolNames(
+      [...hiddenCapturedToolNames()].filter((name) => offered.has(name)),
+    );
     if (names.length === 0) return;
     const mentioned = proxyContractMentionsInSkills(
       event.prompt,
@@ -1665,6 +1676,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   let foregroundNoticeSession: string | undefined;
   pi.on("before_agent_start", (_event, context) => {
     reassertToolOwnership();
+    // An extension may have hidden or re-offered tools since the last turn.
+    capturedTools.revalidateHostVisibility();
     const foreground = state.foregroundTools();
     if (foreground.refused.length === 0) return;
     const sessionId = context.sessionManager?.getSessionId?.() ?? "";

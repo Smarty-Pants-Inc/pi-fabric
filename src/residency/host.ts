@@ -1631,13 +1631,20 @@ export class ResidentHost {
     } catch {
       // Unreadable schedules neither keep the host alive nor stop it.
     }
+    // Main's rule holds pending schedules for durable participants. A dormant durable actor is
+    // one too: only this host's due timer releases its schedule, and the delivery wakes it.
+    let durableParticipants = activeActor || activeAgent;
+    if (!durableParticipants && nextScheduleDueAt !== undefined) {
+      try { durableParticipants = this.actors.hasDurableActor(); }
+      catch { durableParticipants = true; } // Unknown ownership is not permission to drop a schedule.
+    }
     const decision = residentIdleDecision({
       now,
       idleSince: this.#idleSince ?? now,
       activeActor: activeActor || retirementBlocked,
       activeAgent,
       pendingRequest,
-      durableParticipants: activeActor || activeAgent,
+      durableParticipants,
       nextScheduleDueAt,
       idleExitMs: durableActor ? IDLE_EXIT_MS : this.#residentIdleExitMs,
     });

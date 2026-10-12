@@ -407,6 +407,46 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("keeps the host alive for a dormant actor's pending schedule, wakes it once at the due time, then idle-exits", async () => {
+    const { root, host, idle } = fixture();
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    const seen: string[] = [];
+    try {
+      await host.start();
+      fakeRun(host, async task => { if (task.includes("dormant-due")) seen.push(task); });
+      const actor = await host.actors.create({ name: "scheduled-listener", instructions: "process", residency: "durable", topics: ["test.scheduled"] });
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      expect(host.actors.hasActiveDurableActor()).toBe(false);
+      vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+      const from = { id: "scheduler", name: "scheduler", kind: "main" as const };
+      await host.mesh.schedule({ topic: "test.scheduled", from, data: { mark: "dormant-due" }, dueAt: Date.now() + 60_000, key: "dormant-due" });
+      // Past the 30 s dormant idle window but before the due time: the pending schedule holds the host.
+      offset = 31_000;
+      await sleep(1_500);
+      expect(idle).not.toHaveBeenCalled();
+      expect(host.actors.status(actor.id).status).toBe("dormant");
+      expect(host.mesh.scheduled()).toHaveLength(1);
+      expect(seen).toEqual([]);
+      // Bring the same schedule due in 2 s; the host's existing due timer releases it.
+      await host.mesh.schedule({ topic: "test.scheduled", from, data: { mark: "dormant-due" }, dueAt: Date.now() + 2_000, key: "dormant-due" });
+      await sleep(1_000);
+      expect(seen).toEqual([]);
+      expect(idle).not.toHaveBeenCalled();
+      await until(() => seen.length === 1, 8_000);
+      expect(host.mesh.scheduled()).toEqual([]);
+      await until(() => host.actors.status(actor.id).status === "dormant");
+      await sleep(300);
+      expect(seen).toHaveLength(1);
+      expect(idle).not.toHaveBeenCalled();
+      // No pending schedule: the host idle-exits as before.
+      offset += 31_000;
+      await until(() => idle.mock.calls.length === 1);
+      expect(idle.mock.calls[0]?.[0]).toBe("dormant");
+      expect(seen).toHaveLength(1);
+    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
+
   it("never makes a session-scoped durable actor dormant; it stays idle as before #774", async () => {
     const { root, host } = fixture();
     try {

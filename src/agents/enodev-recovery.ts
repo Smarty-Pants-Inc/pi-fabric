@@ -172,6 +172,16 @@ export const provenGoneEnodevLaunch = (directory: string, owned: OwnedProcess | 
   return record && record.id === id && record.transport === "process" ? record : undefined;
 };
 
+/** The terminal record settleGoneEnodevLaunch writes for a proven-gone run, WITHOUT writing it (round 5: save first). */
+export const goneEnodevOutcome = (directory: string, record: Record<string, unknown>): AgentRunResult => {
+  const id = path.basename(directory);
+  const text = savedEnodevAnswer(directory);
+  const terminal = record.status !== "running" && record.status !== "queued" ? {}
+    : text !== undefined ? { status: "completed", text }
+    : { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV) and no answer was saved" };
+  return { ...record, id, ...terminal, finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now() } as unknown as AgentRunResult;
+};
+
 /**
  * Settles a launch proven gone (provenGoneEnodevLaunch). `settledHere` names a run THIS manager already settled through
  * #912's recovery (its marker is gone by that settle): only then does a missing marker count, and nothing is written.

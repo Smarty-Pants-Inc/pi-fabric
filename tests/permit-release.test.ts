@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import type { AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { admissionAlarmRecipient } from "../src/topology/stall-alarms.js";
@@ -24,11 +25,12 @@ const children: ChildProcess[] = [];
 afterEach(() => { for (const child of children.splice(0)) child.kill("SIGKILL"); });
 const onLinux = process.platform === "linux" ? it : it.skip;
 
-const setup = (maxConcurrent = 20, onAdmissionAlarm?: (alarm: unknown) => void) => {
+const setup = (maxConcurrent = 20, onAdmissionAlarm?: (alarm: unknown) => void, onSettled?: (result: AgentRunResult) => void) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
   roots.push(root);
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent, budgetUsd: 0, retainRuns: true }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, ...(onAdmissionAlarm ? { onAdmissionAlarm } : {}),
+    ...(onSettled ? { onSettled } : {}),
   });
   managers.push(manager);
   /**
@@ -308,6 +310,72 @@ describe("a recovered answer whose save fails", () => {
     expect(manager.status(waiter.id).status).toBe("queued");
     expect(alarms.filter(alarm => alarm.kind === "recovered-answer-save-failed")).toHaveLength(1);
     await manager.stop(waiter.id).catch(() => undefined);
+  }, 60_000);
+});
+
+// pi-fabric#939 round 5: an unknown launch's outcome is saved and routed BEFORE its marker is settled and its permit
+// released; until then the marker, custody and permit stay.
+describe("a held unknown launch's outcome", () => {
+  const held = (failing: { on: boolean }) => {
+    const delivered: string[] = [];
+    const alarms: Array<{ kind?: string; runId?: string }> = [];
+    const env = setup(1, alarm => alarms.push(alarm as { kind?: string }), result => {
+      if (result.status === "completed" && failing.on) throw new Error("route save failed");
+      if (result.status === "completed" && result.text === "SAVED") delivered.push(String(result.text));
+    });
+    return { ...env, delivered, alarms };
+  };
+  const marker = (root: string, id: string) => fs.existsSync(path.join(root, id, "unresolved-worker.json"));
+
+  onLinux("a route save that fails keeps the marker and the permit; the retry delivers it once, with one alarm", async () => {
+    const failing = { on: true };
+    const { root, manager, unknownLaunches, delivered, alarms } = held(failing);
+    const { ids, exit } = await unknownLaunches(1);
+    fs.writeFileSync(path.join(root, ids[0]!, "settlement.json"), JSON.stringify({ version: 1, runId: ids[0], outcome: "completed", text: "SAVED" }));
+    const waiter = await manager.spawn({ task: "waiter", transport: "process" });
+    await exit();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(delivered).toEqual([]);
+    expect(marker(root, ids[0]!)).toBe(true); // a30ec88f removed it before the save
+    expect(manager.heldPermits()).toBe(1);
+    expect(manager.status(waiter.id).status).toBe("queued");
+    failing.on = false;
+    await vi.waitFor(() => expect(delivered).toEqual(["SAVED"]), { timeout: 10_000, interval: 50 }); // the bounded retry
+    await vi.waitFor(() => expect(manager.status(waiter.id).status).not.toBe("queued"), { timeout: 5_000, interval: 50 });
+    expect(marker(root, ids[0]!)).toBe(false);
+    expect(alarms.filter(alarm => alarm.kind === "recovered-answer-save-failed")).toEqual([expect.objectContaining({ runId: ids[0] })]);
+    await manager.stop(waiter.id).catch(() => undefined);
+  }, 60_000);
+
+  onLinux("a failure before the route save (crash point): nothing is lost; marker, answer and permit stay", async () => {
+    const { root, manager, unknownLaunches, delivered } = held({ on: true });
+    const { ids, exit } = await unknownLaunches(1);
+    fs.writeFileSync(path.join(root, ids[0]!, "settlement.json"), JSON.stringify({ version: 1, runId: ids[0], outcome: "completed", text: "SAVED" }));
+    await exit();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(delivered).toEqual([]);
+    expect(marker(root, ids[0]!)).toBe(true);
+    expect(fs.existsSync(path.join(root, ids[0]!, "settlement.json"))).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(root, ids[0]!, "status.json"), "utf8")).status).toBe("running");
+    expect(manager.heldPermits()).toBe(1);
+  }, 60_000);
+
+  onLinux("a failure after the route save, before the marker settles (crash point): delivered once, then settled", async () => {
+    const { root, manager, unknownLaunches, delivered } = held({ on: false });
+    const { ids, exit } = await unknownLaunches(1);
+    fs.writeFileSync(path.join(root, ids[0]!, "settlement.json"), JSON.stringify({ version: 1, runId: ids[0], outcome: "completed", text: "SAVED" }));
+    const rmSync = fs.rmSync.bind(fs);
+    let crashes = 1;
+    const spy = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target).endsWith("unresolved-worker.json") && crashes-- > 0) throw new Error("crash before the marker settles");
+      return rmSync(target, options);
+    });
+    await exit();
+    await vi.waitFor(() => expect(delivered).toEqual(["SAVED"]), { timeout: 5_000, interval: 20 });
+    await vi.waitFor(() => expect(marker(root, ids[0]!)).toBe(false), { timeout: 10_000, interval: 50 }); // the retry settles it
+    expect(manager.heldPermits()).toBe(0);
+    expect(delivered).toEqual(["SAVED"]); // not delivered again
+    spy.mockRestore();
   }, 60_000);
 });
 

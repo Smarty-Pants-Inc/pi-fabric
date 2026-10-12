@@ -22,7 +22,10 @@ export class CacheLeases {
   #cleanupError: string | null = null;
   #closed = false;
 
-  constructor(private readonly pi: ExtensionAPI, private readonly sessionId: string) {}
+  // Full code mode keeps tools active but hides declarations, so the declared
+  // foreground set is a fence input beside the active names.
+  constructor(private readonly pi: ExtensionAPI, private readonly sessionId: string,
+    private readonly foregroundTools: () => readonly string[] = () => []) {}
 
   supported(context: ExtensionContext): boolean {
     return typeof (context as NativeWarmingContext).acquireCacheWarming === "function";
@@ -34,7 +37,7 @@ export class CacheLeases {
     return createHash("sha256").update(JSON.stringify([
       context.sessionManager.getSessionId(), context.model?.provider, context.model?.id,
       context.thinkingLevel ?? this.pi.getThinkingLevel(), context.getSystemPrompt(),
-      [...this.pi.getActiveTools()].sort(),
+      [...this.pi.getActiveTools()].sort(), [...this.foregroundTools()].sort(),
     ])).digest("hex");
   }
 

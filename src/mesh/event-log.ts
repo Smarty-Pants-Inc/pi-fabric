@@ -1,4 +1,5 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
+import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -36,10 +37,28 @@ export interface MeshEvent {
   to?: string;
   text?: string;
   data?: unknown;
+  /** Set on events appended through a scoped external grant (`pi-fabric mesh post`). */
+  origin?: "external";
+  untrusted?: true;
+  grantId?: string;
+  /** Set on events released from a pending schedule; the event id is the schedule id. */
+  scheduled?: { dueAt: number; key?: string };
+  /** Host-stamped authority of the publishing process; absent from older builds and grant posts. */
+  sender?: FabricMessageSender;
   createdAt: number;
 }
 
 export interface MeshPublishInput {
+  /** Host-internal fixed event id (a released schedule keeps its schedule id). */
+  id?: string;
+  /** Host-internal provenance fields (upstream grants, schedules and sender stamps). */
+  origin?: "external";
+  untrusted?: true;
+  grantId?: string;
+  scheduled?: { dueAt: number; key?: string };
+  sender?: FabricMessageSender;
+  /** A tighter per-event byte ceiling than the store's own. */
+  maxEventBytes?: number;
   topic: string;
   /** Host-only durable publication receipt; model-authored provider calls cannot supply it. */
   dedupeKey?: string;
@@ -567,6 +586,15 @@ export class EventLog {
     const verificationOf = (eventData: unknown): MeshEvent["verification"] =>
       input.from.verified === "bridge" ? "bridge"
         : eventData && typeof eventData === "object" && "bridge" in eventData ? undefined : "mesh";
+    // Optional provenance follows data, before createdAt, in the event and its pre-encoded line alike.
+    const provenance: Partial<Pick<MeshEvent, "origin" | "untrusted" | "grantId" | "scheduled" | "sender">> = {
+      ...(input.origin ? { origin: input.origin } : {}),
+      ...(input.untrusted ? { untrusted: true as const } : {}),
+      ...(input.grantId ? { grantId: input.grantId } : {}),
+      ...(input.scheduled ? { scheduled: { ...input.scheduled } } : {}),
+      ...(input.sender ? { sender: jsonClone(input.sender) } : {}),
+    };
+    const maxEventBytes = Math.min(this.maxEventBytes, input.maxEventBytes ?? this.maxEventBytes);
     let encoded: { key: string; fields: string; bytes: number; chars: number; verification: MeshEvent["verification"] } | undefined;
     if (!stamp) {
       const verification = verificationOf(fixedData);
@@ -578,6 +606,7 @@ export class EventLog {
         ...(input.to ? { to: input.to } : {}),
         ...(input.text !== undefined ? { text: input.text } : {}),
         ...(fixedData !== undefined ? { data: fixedData } : {}),
+        ...provenance,
       }).slice(1, -1)}`;
       encoded = { key, fields, verification, bytes: Buffer.byteLength(key + fields, "utf8"), chars: key.length + fields.length };
     }
@@ -639,7 +668,7 @@ export class EventLog {
         const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
         const verification = encoded ? encoded.verification : verificationOf(eventData);
         const event: MeshEvent = {
-          id: randomUUID(),
+          id: input.id ?? randomUUID(),
           ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
           sequence,
           topic: input.topic,
@@ -650,6 +679,7 @@ export class EventLog {
           ...(input.to ? { to: input.to } : {}),
           ...(input.text !== undefined ? { text: input.text } : {}),
           ...(eventData !== undefined ? { data: eventData } : {}),
+          ...provenance,
           createdAt,
         };
         // The stitched parts (id, sequence, createdAt) are ASCII: one byte per character.
@@ -657,8 +687,8 @@ export class EventLog {
           ? `{"id":${JSON.stringify(event.id)}${encoded.key},"sequence":${sequence}${encoded.fields},"createdAt":${createdAt}}`
           : JSON.stringify(event);
         const bytes = encoded ? encoded.bytes + line.length - encoded.chars : Buffer.byteLength(line, "utf8");
-        if (bytes > this.maxEventBytes) {
-          throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
+        if (bytes > maxEventBytes) {
+          throw new Error(`Mesh event exceeds ${maxEventBytes} bytes`);
         }
         // One slot per key, including unresolved intents. Admission must fail closed BEFORE
         // reserving a sequence or appending (failed compaction cannot grow pending files).
@@ -727,6 +757,15 @@ export class EventLog {
       }
       return event;
     };
+  }
+
+  /**
+   * Host-internal: appends one unkeyed event under a `.lock` the caller already holds
+   * (schedule release, MeshStore.transact). Keyed (dedupe) publication keeps publish().
+   */
+  appendLocked(input: MeshPublishInput): MeshEvent {
+    if (input.dedupeKey) throw new Error("appendLocked does not take a dedupe key");
+    return this.#preparePublish(this.#capturePublication(input))();
   }
 
   async publish(input: MeshPublishInput): Promise<MeshEvent> {

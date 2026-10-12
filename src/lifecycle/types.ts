@@ -82,14 +82,17 @@ export interface FabricTokenUsagePayload {
   cost: number;
 }
 
+// Inlined RUNNER_ID_PATTERN (src/agents/runner-registry.ts): registered runner
+// ids pass without loading the registry.
+const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const runnerId = (value: unknown): FabricAgentRunner | undefined =>
+  typeof value === "string" && value.length <= 64 && RUNNER_ID_PATTERN.test(value) ? value : undefined;
+
 export const tokenUsagePayloadFromValue = (
   value: unknown,
 ): FabricTokenUsagePayload | undefined => {
   if (!isObject(value)) return undefined;
-  const runner =
-    value.runner === "pi" || value.runner === "claude" || value.runner === "veda"
-      ? value.runner
-      : undefined;
+  const runner = runnerId(value.runner);
   if (
     typeof value.runId !== "string" ||
     typeof value.name !== "string" ||
@@ -150,7 +153,7 @@ const participantKind = (value: unknown): FabricParticipantKind | undefined =>
 export const lifecycleSourceIdentity = (source: FabricLifecycleSource): MeshIdentity => ({
   id: source.id,
   name: source.name,
-  kind: source.kind === "root" ? "main" : source.kind,
+  kind: source.kind === "root" ? "main" : source.kind === "provider" ? "agent" : source.kind,
 });
 
 export const lifecycleEventFromMesh = (
@@ -168,10 +171,7 @@ export const lifecycleEventFromMesh = (
   }
   const source = event.data.source;
   const kind = participantKind(source.kind);
-  const runner =
-    source.runner === "pi" || source.runner === "claude" || source.runner === "veda"
-      ? source.runner
-      : undefined;
+  const runner = runnerId(source.runner);
   if (
     !kind ||
     !runner ||

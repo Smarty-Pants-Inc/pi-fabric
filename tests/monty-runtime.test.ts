@@ -52,6 +52,12 @@ describe.skipIf(Boolean(missing))(`MontyRuntime native 0.0.23${missing ? " (" + 
     });
   });
 
+  it("routes the thinking primitive through the same host bridge", async () => {
+    expect(await run('return await thinking.set(level="high", scope="turn")')).toMatchObject({
+      terminationReason: "completed", value: { ref: "thinking.set", args: { level: "high", scope: "turn" } },
+    });
+  });
+
   it("executes async bodies, normalizes nested dictionaries and starts fresh sessions", async () => {
     const runtime = new MontyRuntime();
     const result = await runtime.execute('local = 12\nreturn {"items": [1, {"nested": True}], "call": await schema.status()}', echo, options);

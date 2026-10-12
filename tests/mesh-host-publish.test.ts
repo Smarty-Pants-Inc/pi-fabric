@@ -230,11 +230,11 @@ describe.each(["file", "sqlite"] as const)("trusted host mesh publication (%s ba
     const h = await harness(backend);
     const publicActions = await h.provider.list({}, baseContext());
     expect(publicActions.some(action => action.name === "publishBatch")).toBe(false);
-    expect(publicActions.find(action => action.name === "publish")!.inputSchema).toEqual({
-      type: "object", properties: { topic: { type: "string" }, kind: { type: "string" },
-        to: { type: "string" }, text: { type: "string" }, data: {} },
-      required: ["topic"], additionalProperties: false,
-    });
+    // The public schema stays closed: no dedupe key. Upstream scheduling fields are public.
+    const publicPublish = publicActions.find(action => action.name === "publish")!.inputSchema as { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+    expect(publicPublish).toMatchObject({ type: "object", required: ["topic"], additionalProperties: false });
+    expect(Object.keys(publicPublish.properties).sort()).toEqual(["afterMs", "data", "key", "kind", "notBefore", "text", "to", "topic"]);
+    expect(publicPublish.properties).not.toHaveProperty("dedupeKey");
     const trusted = withFabricHostCaller(baseContext(), "github");
     expect((await h.provider.describe("publish", trusted))!.inputSchema).toMatchObject({ properties: { dedupeKey: { type: "string", minLength: 1, maxLength: 512 } }, additionalProperties: false });
     expect((await h.provider.describe("publishBatch", trusted))!.inputSchema).toMatchObject({ properties: { events: { minItems: 1, maxItems: 256,

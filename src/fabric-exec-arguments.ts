@@ -9,6 +9,9 @@ const OPTIONAL_FABRIC_EXEC_KEYS = [
   "tokenBudget",
   "agentBudget",
   "timeoutMs",
+  "timeout_ms",
+  "maxOutputTokens",
+  "max_output_tokens",
   "display",
 ] as const;
 
@@ -102,7 +105,7 @@ export const resolveFabricExecPayloads = (params: {
     ?? normalizeFabricExecStrings(params.strings, options.validate);
 
 export const prepareFabricExecArguments = (input: unknown, kernel: FabricKernel = "typescript"): unknown => {
-  if (typeof input === "string") return { code: kernel === "python" ? input : repairFabricGuestCode(input) };
+  if (typeof input === "string") return prepareFabricExecArguments({ code: input }, kernel);
   if (!isRecord(input)) return input;
 
   let prepared = input;
@@ -117,6 +120,25 @@ export const prepareFabricExecArguments = (input: unknown, kernel: FabricKernel 
   if (kernel === "typescript" && typeof prepared.code === "string") {
     const repaired = repairFabricGuestCode(prepared.code);
     if (repaired !== prepared.code) writable().code = repaired;
+  }
+
+  if (kernel === "typescript" && typeof prepared.code === "string") {
+    const match = /^\s*\/\/\s*@options:\s*([^\r\n]*)/.exec(prepared.code);
+    if (match) {
+      const options: unknown = JSON.parse(match[1]!);
+      if (!isRecord(options)) throw new Error("@options must be a JSON object");
+      for (const [key, value] of Object.entries(options)) {
+        if (key !== "timeout_ms" && key !== "max_output_tokens") throw new Error(`Unsupported @options key: ${key}`);
+        if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`${key} must be a positive integer`);
+        if (prepared[key] !== undefined && prepared[key] !== value) throw new Error(`Conflicting ${key} options`);
+        writable()[key] = value;
+      }
+    }
+  }
+  if (prepared.max_output_tokens != null) {
+    if (prepared.maxOutputTokens != null && prepared.maxOutputTokens !== prepared.max_output_tokens) throw new Error("Conflicting maxOutputTokens and max_output_tokens");
+    writable().maxOutputTokens = prepared.max_output_tokens;
+    delete writable().max_output_tokens;
   }
 
   for (const key of OPTIONAL_FABRIC_EXEC_KEYS) {

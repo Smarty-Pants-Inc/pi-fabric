@@ -341,3 +341,36 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
   });
 });
 }
+
+const directory = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-transport-"));
+  roots.push(root);
+  return root;
+};
+
+describe("process transport startup diagnostics", () => {
+  it("rejects a failed spawn without an unhandled child error", async () => {
+    const root = directory();
+    await expect(spawnDetached(path.join(root, "missing.mjs"), [], path.join(root, "missing-cwd"))).rejects.toThrow(/ENOENT/);
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+  // Upstream bounded stderr capture is not ported yet (smarty-dev#5776 follow-up): a piped stderr
+  // inherited by execution descendants would hold back the child "close" event our process-tree
+  // custody relies on. Unskip with the port.
+  it.skip("surfaces bounded stderr even when the worker cannot execute its bootstrap", async () => {
+    const root = directory();
+    const worker = path.join(root, "crash.mjs");
+    fs.writeFileSync(worker, 'process.stderr.write("x".repeat(60000) + "\\nworker-bootstrap-sentinel 界面\\n"); process.exitCode = 1;');
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 20000, sessionExport: false }, {
+      workerPath: worker, runRoot: path.join(root, "runs"), fullCodeMode: false,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "probe", transport: "process", extensions: false });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("worker stderr:");
+    expect(result.error).toContain("worker-bootstrap-sentinel 界面");
+    expect(result.error).not.toContain("�");
+    expect(result.error!.length).toBeLessThan(21000);
+  });
+});

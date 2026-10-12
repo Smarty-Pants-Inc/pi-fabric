@@ -19,7 +19,7 @@ describe("physical kernel skill trees", () => {
     const python = bundled("python");
     expect(ts.diagnostics).toEqual([]);
     expect(python.diagnostics).toEqual([]);
-    expect(ts.skills).toHaveLength(14);
+    expect(ts.skills).toHaveLength(15);
     expect(python.skills.map((s) => s.name).sort()).toEqual(ts.skills.map((s) => s.name).sort());
     for (const loaded of [ts, python]) {
       expect(loaded.skills.filter((s) => !s.disableModelInvocation).map((s) => s.name)).toEqual(["fabric-exec"]);
@@ -41,7 +41,7 @@ describe("physical kernel skill trees", () => {
         await loader.reload();
         loader.extendResources({ skillPaths: fabricSkillPaths(root, kernel).map((selected) => ({ path: selected, metadata: { source: "fabric", scope: "temporary", origin: "top-level" } })) });
         const loaded = loader.getSkills();
-        expect(loaded.skills).toHaveLength(14);
+        expect(loaded.skills).toHaveLength(15);
         expect(loaded.diagnostics).toEqual([]);
         const expand = (text: string): string => (AgentSession.prototype as unknown as { _expandSkillCommand(text: string): string })._expandSkillCommand.call({ resourceLoader: loader }, text);
         for (const name of ["fabric-exec", "fabric-advisor", "fabric-jev", "fabric-foreman"]) {

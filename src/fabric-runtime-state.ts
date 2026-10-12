@@ -83,7 +83,7 @@ import { RuntimeStateSpeculation } from "./runtime-state-speculation.js";
 import { schemaRefAllowedInEnforce } from "./schema/policy.js";
 import { actionApprovalOverride } from "./core/approval-overrides.js";
 import type { FabricSpeculationStreamTap } from "./speculation/stream-tap.js";
-import { MeshStore, type MeshIdentity } from "./mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshIdentity } from "./mesh/store.js";
 import { acquireMeshCustodyLock, meshCustodyMode } from "./mesh/custody-lock.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, isMeshLockTimeout } from "./core/atomic-write.js";
 import { DecisionStore } from "./decisions/store.js";
@@ -244,7 +244,8 @@ export class FabricRuntimeState {
   #mesh: MeshStore | undefined;
   #disposableMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
-  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor");
+  readonly #inboxRetry = new MeshBackgroundRetry("root inbox cursor")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.#mesh, from: this.#identity })));
   #identity: MeshIdentity | undefined;
   /** Durable decisions for headless approvals and routed child dialogs; mesh-enabled sessions only. */
   #decisions: DecisionStore | undefined;

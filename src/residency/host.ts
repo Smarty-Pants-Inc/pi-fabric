@@ -46,7 +46,7 @@ import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
@@ -261,7 +261,8 @@ export class ResidentHost {
   readonly #agentsPath: string;
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
-  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   // A delivery whose root is chosen on shared state is written after the commit that chose it
   // (smarty-dev#6477 R11); a crash in between leaves its row for the next flush to replay.
   #deliveryCommits!: CommitOutbox;
@@ -288,7 +289,8 @@ export class ResidentHost {
   #closed = false;
   #closePending: Promise<void> | undefined;
   #routeOwner?: ShadowRouteOwner;
-  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;

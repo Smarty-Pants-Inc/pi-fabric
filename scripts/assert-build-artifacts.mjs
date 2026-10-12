@@ -44,6 +44,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/per-call-route.js",
   "agents/spawn-router.js",
   "durable/worker-host.js",
   "native-discovery.js",
@@ -281,6 +282,9 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (initialSource.includes("src/agents/per-call-route.ts") || initialSource.includes("src/jev/gateway-transport.ts")) {
+  throw new Error("Per-call routing escaped into startup graph");
+}
 if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
   .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
   throw new Error("Spawn router adapter escaped into the eager/provider static graph");

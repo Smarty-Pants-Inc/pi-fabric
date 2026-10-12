@@ -26,7 +26,7 @@ const openProjector = async (root: string, options: Partial<StateProjectorOption
 };
 
 const openStore = async (root: string, databaseRoot = projectorDatabaseRoot(root)): Promise<SqliteStateStore> => {
-  const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000);
+  const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, databaseRoot === root ? {} : { initialize: "detached" });
   stores.push(store);
   return store;
 };
@@ -559,6 +559,55 @@ describe("state projector (sqlite, after cutover)", () => {
     await new Promise(resolve => setTimeout(resolve, 15));
     expect(await projector.tick()).toMatchObject({ role: "active", checkpoints: 2 });
     expect(authority.exportState().entries).toEqual({ ...before.entries, "k/after": authority.get("k/after") });
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // Only the moved marker a fresh root's initialisation leaves (smarty-dev#6477): the projector writes no state.json.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db" });
+  });
+
+  it.each(["exporting", "file"])("halts retired when meta.backend leaves sqlite (%s): no renewal, no checkpoint (smarty-dev#7064)", async backend => {
+    const root = tempRoot(`backend-${backend}`);
+    const authority = await openStore(root, root);
+    await authority.put({ key: "k/0", value: 0, identity });
+    const events: StateProjectorEvent[] = [];
+    // A short lease so the next tick would renew it, a short checkpoint period so it would checkpoint.
+    const projector = await openProjector(root, { mode: "sqlite", checkpointMs: 10, leaseMs: 100, onEvent: event => events.push(event) });
+    expect(await projector.tick()).toMatchObject({ role: "active", checkpoints: 1 });
+    const database = path.join(root, "state.db");
+    const leaseOf = (): string | undefined => {
+      const raw = openNodeSqlite(database);
+      try { return raw.prepare("SELECT value FROM meta WHERE name = 'projector.lease'").get()?.value as string | undefined; }
+      finally { raw.close(); }
+    };
+    const lease = leaseOf();
+    expect(lease).toBeDefined();
+    // A rollback flips the flag while the projector runs.
+    const raw = openNodeSqlite(database);
+    try { raw.prepare("UPDATE meta SET value = ? WHERE name = 'backend'").run(backend); } finally { raw.close(); }
+    await new Promise(resolve => setTimeout(resolve, 70));
+    const status = await projector.tick();
+    expect(status).toMatchObject({ role: "stopped", haltReason: "retired", checkpoints: 1 });
+    expect(events.some(event => event.type === "alarm" && event.alarm === "retired")).toBe(true);
+    // The lease is neither renewed nor rewritten: the retired database is left to the rollback.
+    expect(leaseOf()).toBe(lease);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(await projector.tick()).toMatchObject({ role: "stopped", haltReason: "retired", checkpoints: 1 });
+    expect(leaseOf()).toBe(lease);
+  });
+});
+
+// smarty-dev#7548: the projector's own connection goes through the one gate (state-gate.ts), like its store's:
+// a state.db replaced between the store's checks and that open is refused, never opened by path.
+describe.skipIf(process.platform !== "linux")("the projector connection's gate (smarty-dev#7548)", () => {
+  it("refuses a state.db swapped in before the projector's own open", async () => {
+    const root = tempRoot("gate-swap");
+    let opens = 0;
+    const open = (file: string) => {
+      if (++opens === 2) { // the projector connection, after the store's
+        fs.copyFileSync(file, `${file}.swap`);
+        fs.renameSync(`${file}.swap`, file); // another inode at the same name
+      }
+      return openNodeSqlite(file);
+    };
+    await expect(openProjector(root, { open })).rejects.toThrow(/opened a different file than the one checked/);
+    expect(opens).toBe(2);
   });
 });

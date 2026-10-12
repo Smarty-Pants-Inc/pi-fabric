@@ -8,9 +8,11 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, validateActorCoalesceKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
+import { normalizeActorRecords } from "./records.js";
 import type {
+  FabricActorActivationPolicy,
   FabricActorDelivery,
   FabricActorHostEvent,
   FabricActorRequest,
@@ -221,6 +223,9 @@ export class GlobalActorRegistry {
       responseMode: patch.responseMode ?? existing.responseMode,
       triggerTurn: patch.triggerTurn ?? existing.triggerTurn,
       coalesce: patch.coalesce ?? existing.coalesce,
+      ...(patch.activation !== undefined
+        ? { activation: patch.activation }
+        : existing.activation !== undefined ? { activation: existing.activation } : {}),
       ...(patch.residency !== undefined
         ? { residency: patch.residency }
         : existing.residency
@@ -254,6 +259,11 @@ export class GlobalActorRegistry {
           : existing.coalesceKey !== undefined
             ? { coalesceKey: existing.coalesceKey }
             : {}),
+      ...(patch.dedupeKey !== undefined
+        ? { dedupeKey: patch.dedupeKey }
+        : existing.dedupeKey !== undefined
+          ? { dedupeKey: existing.dedupeKey }
+          : {}),
       ...(patch.activationFilter === null
         ? {}
         : patch.activationFilter !== undefined
@@ -261,6 +271,7 @@ export class GlobalActorRegistry {
           : existing.activationFilter !== undefined && !this.#invalidFilters.has(existing.id)
             ? { activationFilter: existing.activationFilter }
             : {}),
+      ...(patch.records !== undefined ? { records: patch.records } : existing.records ? { records: existing.records } : {}),
       ...(patch.validWhile !== undefined
         ? { validWhile: patch.validWhile }
         : existing.validWhile
@@ -319,6 +330,7 @@ export class GlobalActorRegistry {
       coalesce: def.coalesce,
       ...(def.residency ? { residency: def.residency } : {}),
       runner: def.runner,
+      ...(def.kernel ? { kernel: def.kernel } : {}),
       ...(def.model ? { model: def.model } : {}),
       ...(def.modelReason !== undefined ? { modelReason: def.modelReason } : {}),
       ...(def.thinking ? { thinking: def.thinking } : {}),
@@ -331,10 +343,13 @@ export class GlobalActorRegistry {
       ...(typeof def.extensions === "boolean" ? { extensions: def.extensions } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
+      ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
+      ...(def.activation ? { activation: clone(def.activation) } : {}),
       ...(def.activationFilter !== undefined && !def.activationFilterError && !this.#invalidFilters.has(def.id)
         ? { activationFilter: clone(def.activationFilter) }
         : {}),
       ...(def.validWhile ? { validWhile: clone(def.validWhile) } : {}),
+      ...(def.records ? { records: clone(def.records) } : {}),
     };
     return request;
   }
@@ -365,14 +380,15 @@ export class GlobalActorRegistry {
     if (residency !== "session" && residency !== "durable") {
       throw new Error(`Invalid global actor residency: ${String(def.residency)}`);
     }
+    // Smarty fork: templates default to "pi" like agents.runner (upstream: pi-durable).
     const runner = def.runner ?? "pi";
-    if (runner !== "pi" && runner !== "claude") {
+    if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
       throw new Error(`Invalid global actor runner: ${String(def.runner)}`);
     }
     if (def.kernel !== undefined && def.kernel !== "inherit" && def.kernel !== "typescript" && def.kernel !== "python") {
       throw new Error(`Invalid Fabric actor kernel: ${String(def.kernel)}`);
     }
-    if (def.kernel && def.kernel !== "inherit" && (runner !== "pi" || def.extensions === false)) {
+    if (def.kernel && def.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || def.extensions === false)) {
       throw new Error("An explicit Fabric kernel requires a Pi actor with extensions enabled");
     }
     const model = typeof def.model === "string" && def.model.trim() ? def.model.trim() : undefined;
@@ -391,7 +407,10 @@ export class GlobalActorRegistry {
     const extensions = typeof def.extensions === "boolean" ? def.extensions : undefined;
     validateActorInferenceContext(def.inferenceContext, runner);
     validateActorCoalesceKey(def.coalesceKey);
+    validateActorDedupeKey(def.dedupeKey);
+    const activation = normalizeActorActivation(def.activation);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
+    const records = normalizeActorRecords(def.records);
     const requires = normalizeRequirements(def.requires);
     const validWhile = def.validWhile?.version === 1 &&
       typeof def.validWhile.source === "string" &&
@@ -425,8 +444,11 @@ export class GlobalActorRegistry {
       ...(requires && requires.length > 0 ? { requires } : {}),
       ...(def.inferenceContext !== undefined ? { inferenceContext: def.inferenceContext } : {}),
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
+      ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
+      ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
       ...(validWhile ? { validWhile } : {}),
+      ...(records ? { records } : {}),
     };
   }
 
@@ -517,9 +539,9 @@ export class GlobalActorRegistry {
         (delivery === "steer" || delivery === "followUp") && record.triggerTurn === true;
       const coalesce = record.coalesce !== false;
       const residency = record.residency === "durable" ? "durable" : "session";
-      const runner = record.runner === "claude" ? "claude" : "pi";
+      const runner = record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi";
       if (record.kernel !== undefined && record.kernel !== "inherit" && record.kernel !== "typescript" && record.kernel !== "python") continue;
-      if (record.kernel && record.kernel !== "inherit" && (runner !== "pi" || record.extensions === false)) continue;
+      if (record.kernel && record.kernel !== "inherit" && ((runner !== "pi" && runner !== "pi-durable") || record.extensions === false)) continue;
       const thinking: FabricThinking | undefined = isFabricThinking(record.thinking)
         ? record.thinking
         : undefined;
@@ -532,10 +554,15 @@ export class GlobalActorRegistry {
       const nice = typeof record.nice === "number" && Number.isFinite(record.nice) ? parseAgentNice(record.nice) : undefined;
       const extensions = typeof record.extensions === "boolean" ? record.extensions : undefined;
       let requires: FabricCapabilityRequirement[] | undefined;
+      let activation: FabricActorActivationPolicy | undefined;
+      try { activation = normalizeActorActivation(record.activation); } catch { /* unreadable policy is off */ }
+      let records: FabricActorRequest["records"];
       try {
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
+        validateActorDedupeKey(record.dedupeKey);
         requires = normalizeRequirements(record.requires);
+        records = normalizeActorRecords(record.records);
       } catch {
         continue;
       }
@@ -572,9 +599,12 @@ export class GlobalActorRegistry {
         ...(requires && requires.length > 0 ? { requires } : {}),
         ...(record.inferenceContext !== undefined ? { inferenceContext: record.inferenceContext } : {}),
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
+        ...(record.dedupeKey !== undefined ? { dedupeKey: record.dedupeKey } : {}),
+        ...(activation ? { activation } : {}),
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),
+        ...(records ? { records } : {}),
       };
       actors.set(def.id, def);
     }

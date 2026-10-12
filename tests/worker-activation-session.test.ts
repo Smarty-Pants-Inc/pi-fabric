@@ -56,7 +56,7 @@ describe("activation journal retention", () => {
       } } });
       const check = async () => {
         await bash.execute("probe", { command: "true" }, undefined, undefined,
-          { sessionManager: session } as unknown as ExtensionContext);
+          { sessionManager: session } as never);
         expect(session.getSessionId()).toBe(header.id);
         expect(observed.at(-1)).toBe(header.id);
       };

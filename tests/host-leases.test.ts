@@ -34,6 +34,39 @@ describe("host lease files on a transient read failure", () => {
     return { root, lease, failReads };
   };
 
+  it("round-trips UUID incarnation metadata and rejects malformed token fields", () => {
+    const { root, lease } = setup();
+    const current = { ...lease(1_000), startedAt: 1, incarnationToken: "655b0506-8a9c-4667-b87f-cc7779a22d06" };
+    writeHostLease(root, current);
+    expect(readHostLeaseCurrent(root, current.id)).toEqual(current);
+    expect(readHostLeases(root).get(current.id)).toEqual(current);
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    for (const incarnationToken of [null, 1, ""]) {
+      fs.writeFileSync(file, JSON.stringify({ format: 1, ...current, incarnationToken }));
+      expect(readHostLeaseCurrent(root, current.id)).toBeUndefined();
+    }
+  });
+  it("round-trips the optional reload marker without adding it to ordinary leases", () => {
+    const { root, lease } = setup();
+    const reload = { ...lease(1_000), reloadUntil: lease(1_000).expiresAt };
+    writeHostLease(root, reload);
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(reload);
+    expect(readHostLease(root, "host:a")).toEqual(reload);
+    expect(readHostLeases(root).get("host:a")).toEqual(reload);
+    writeHostLease(root, lease(2_000));
+    expect(readHostLeaseCurrent(root, "host:a")).toEqual(lease(2_000));
+  });
+
+  it.each(["invalid", null])("rejects a malformed reload marker (%s)", (reloadUntil) => {
+    const { root, lease } = setup();
+    writeHostLease(root, lease(1_000));
+    const file = path.join(root, "host-leases", fs.readdirSync(path.join(root, "host-leases"))[0]!);
+    fs.writeFileSync(file, JSON.stringify({ format: 1, ...lease(1_000), reloadUntil }));
+    expect(readHostLeaseCurrent(root, "host:a")).toBeUndefined();
+    expect(readHostLease(root, "host:a")).toBeUndefined();
+    expect(readHostLeases(root).size).toBe(0);
+  });
+
   it.each(["single", "all"])("reparses equal-size atomic replacements with preserved mtime through %s", (reader) => {
     const { root, lease } = setup();
     writeHostLease(root, lease(1_000));

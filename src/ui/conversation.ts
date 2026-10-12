@@ -22,6 +22,9 @@ import type { CodePreviewSettings } from "./code-preview.js";
 import type { NativeConversationTranscript } from "./conversation-native-reader.js";
 import { defaultConversationTarget } from "./conversation-targets.js";
 import { ConversationTextSelection } from "./conversation-selection.js";
+import { ConversationScrollbar } from "./conversation-scrollbar.js";
+import { ConversationLatest } from "./conversation-latest.js";
+import { isKittyImageLine, KittyViewport, type KittyViewportFrame } from "./kitty-viewport.js";
 import { appendConversationPrompt, conversationPromptHistory } from "./conversation-history.js";
 import { conversationAssistantText, conversationCommandCompletion, CONVERSATION_COMMAND_HELP } from "./conversation-commands.js";
 import { ConversationQueueStore } from "./conversation-queue-store.js";
@@ -48,7 +51,7 @@ export interface FabricConversationTarget {
   canStop: boolean;
   readOnlyReason?: string;
   stale?: boolean;
-  /** Latest activity timestamp; enables an unread marker in the target picker. */
+  /** Latest activity timestamp; orders the target picker and enables unread markers. */
   updatedAt?: number;
 }
 
@@ -234,7 +237,7 @@ const isMainTarget = (target: FabricConversationTarget | undefined): boolean =>
 
 interface PickerRow {
   target: FabricConversationTarget;
-  depth: number;
+  active: boolean;
 }
 
 export class FabricConversationView implements Component, Focusable {
@@ -244,11 +247,15 @@ export class FabricConversationView implements Component, Focusable {
   private readonly options: FabricConversationOptions;
   private readonly state: FabricConversationState;
   private readonly renderer: FabricConversationTranscriptRenderer;
+  private readonly scrollbar: ConversationScrollbar;
+  private readonly latest = new ConversationLatest();
+  private readonly imageViewport = new KittyViewport();
   private editor: BorderStatusEditor | undefined;
   private suspendedEditor: BorderStatusEditor | undefined;
   private editorEpoch = -1;
   private pickerInput: Input | undefined;
   private pickerRows: PickerRow[] = [];
+  private pickerOrder: { id: string; active: boolean }[] = [];
   private pickerSelectedId: string | undefined;
   private mode: "conversation" | "picker" = "conversation";
   private currentId: string | undefined;
@@ -258,7 +265,7 @@ export class FabricConversationView implements Component, Focusable {
   private stopConfirmId: string | undefined;
   private disposed = false;
   private lastBodyLength = 0;
-  private lastBody: string[] = [];
+  private lastBody: readonly string[] = [];
   private lastBodyBudget = 1;
   private editorTop = 0;
   private editorHeight = 0;
@@ -290,6 +297,7 @@ export class FabricConversationView implements Component, Focusable {
     this.theme = theme;
     this.options = options;
     this.state = options.state;
+    this.scrollbar = new ConversationScrollbar(theme, options.appearance?.scrollbar);
     this.updateTargets();
     this.renderer = new FabricConversationTranscriptRenderer(tui, theme, {
       ...options.rendererOptions,
@@ -330,6 +338,7 @@ export class FabricConversationView implements Component, Focusable {
     // including one rebuilt for a new epoch or a queue-row swap — inherits the
     // indicator that is live right now.
     editor.setWorkingStatusIndicator(this.working);
+    editor.topBorderBadge = (width) => this.targetBadge(width);
     editor.focused = this.focusState && this.mode === "conversation";
     if (!withHistory) return editor;
     editor.setAutocompleteProvider(conversationCommandCompletion(() =>
@@ -460,9 +469,29 @@ export class FabricConversationView implements Component, Focusable {
     if (this.disposed) return undefined;
     this.ensureEditorEpoch();
     this.updateTargets();
+    if (this.mode === "conversation" && !this.textSelection.dragging && this.latest.hit(event)) {
+      this.followLatest();
+      this.tui.requestRender();
+      return { handled: true };
+    }
+    if (this.mode === "conversation" && this.currentId && !this.textSelection.dragging &&
+      this.scrollbar.handleMouse(event, (position) => {
+        const entry = this.state.view(this.currentId!);
+        this.textSelection.clear();
+        entry.pageAnchor = undefined;
+        entry.anchorLength = undefined;
+        entry.scroll = position;
+        entry.following = position === Math.max(0, this.lastBodyLength - this.lastBodyBudget);
+      })) {
+      this.textSelection.clear();
+      this.tui.requestRender();
+      return { handled: true, capture: true };
+    }
     if (event.type === "wheel") {
-      if (this.mode === "picker") this.movePickerSelection((event.wheelDelta ?? 0) < 0 ? -1 : 1);
-      else this.scrollBy(event.wheelDelta ?? 0);
+      if (this.mode === "picker") {
+        this.refreshPicker();
+        this.movePickerSelection((event.wheelDelta ?? 0) < 0 ? -1 : 1);
+      } else this.scrollBy(event.wheelDelta ?? 0);
       this.tui.requestRender();
       return { handled: true };
     }
@@ -496,6 +525,7 @@ export class FabricConversationView implements Component, Focusable {
   }
 
   render(width: number): string[] {
+    this.latest.clear();
     if (this.disposed || width <= 0) return [];
     this.updateTargets();
     if (width !== this.selectionWidth) {
@@ -508,7 +538,8 @@ export class FabricConversationView implements Component, Focusable {
     const target = this.currentTarget();
     const queue = this.mode === "conversation" ? this.currentQueue() : undefined;
     this.observe();
-    const liveTranscriptLines = this.mode === "conversation" ? this.transcriptLines(width) : [];
+    const contentWidth = this.scrollbar.contentWidth(width);
+    const liveTranscriptLines = this.mode === "conversation" ? this.transcriptLines(contentWidth) : [];
     const transcriptLines = this.textSelection.source ?? liveTranscriptLines;
     let queueLines = queue?.render(width) ?? [];
     // Native components own their interior padding. Giving them the full width
@@ -530,7 +561,7 @@ export class FabricConversationView implements Component, Focusable {
       : [];
     remaining -= footer.length;
     const head: string[] = [];
-    if (remaining > 0) {
+    if (remaining > 0 && this.mode === "picker") {
       head.push(this.breadcrumbLine(width));
       remaining--;
     }
@@ -550,19 +581,31 @@ export class FabricConversationView implements Component, Focusable {
     remaining -= queueLines.length;
     this.editorTop = rows - editorLines.length - footer.length - hints.length;
     this.editorHeight = editorLines.length;
-    const body = remaining <= 0 ? [] : this.mode === "picker"
-      ? this.pickerLines(width, remaining)
-      : this.windowBody(transcriptLines, remaining, this.transcriptTail(width, remaining, editorShowsTopBorder));
+    const window = remaining > 0 && this.mode === "conversation"
+      ? this.windowBody(transcriptLines, remaining, this.transcriptTail(contentWidth, remaining, editorShowsTopBorder))
+      : undefined;
+    const body = window?.lines ?? (remaining > 0 ? this.pickerLines(width, remaining) : []);
     this.bodyTop = head.length;
     const scroll = this.currentId ? this.state.view(this.currentId).scroll : 0;
     this.bodyHeight = this.mode === "conversation" ? Math.max(0, Math.min(remaining, this.lastBody.length - scroll)) : 0;
+    const imageRows = window?.imageRows;
     if (this.textSelection.active) {
-      for (let row = 0; row < this.bodyHeight; row++) body[row] = this.textSelection.highlight(body[row]!, scroll + row, this.theme);
+      for (let row = 0; row < this.bodyHeight; row++) {
+        if (!imageRows?.has(row)) body[row] = this.textSelection.highlight(body[row]!, scroll + row, this.theme);
+      }
     }
     while (body.length < remaining) body.push("");
+    if (this.mode === "conversation" && remaining > 0) {
+      const entry = this.currentId ? this.state.view(this.currentId) : undefined;
+      this.scrollbar.sync(width, this.bodyTop, remaining, this.lastBodyLength, scroll, entry?.following ?? true,
+        () => { if (!this.disposed) this.tui.requestRender(); });
+      this.scrollbar.paint(body, imageRows);
+      this.latest.paint(body, width, this.bodyTop, !imageRows?.has(body.length - 1) && !!entry && (!entry.following || !!this.observedTranscript?.hasNewer),
+        this.scrollbar.visible, this.theme);
+    } else this.scrollbar.reset();
     return [...head, ...body.slice(0, remaining), ...queueLines, ...editorLines, ...footer, ...hints]
       .slice(0, rows)
-      .map((line) => visibleWidth(line) <= width ? line : truncateToWidth(line, width, ""));
+      .map((line) => isKittyImageLine(line) || visibleWidth(line) <= width ? line : truncateToWidth(line, width, ""));
   }
 
   /** Observe files without rendering native history; true means a visible change
@@ -646,6 +689,8 @@ export class FabricConversationView implements Component, Focusable {
   dispose(): void {
     if (this.currentId) this.state.queues.detach(this.currentId);
     this.disposed = true;
+    this.latest.clear();
+    this.scrollbar.reset();
     this.clearCommandNotification();
     this.copyVersion++;
     this.textSelection.clear();
@@ -658,6 +703,7 @@ export class FabricConversationView implements Component, Focusable {
     this.observedTranscript = undefined;
     this.lastBody = [];
     this.renderer.dispose();
+    this.imageViewport.clear();
     if (this.ownsMouseMode) {
       this.ownsMouseMode = false;
       this.tui.terminal.write("\x1b[?1002l\x1b[?1000l\x1b[?1006l");
@@ -693,6 +739,8 @@ export class FabricConversationView implements Component, Focusable {
     }
     const changed = this.currentId !== id;
     if (changed) {
+      this.latest.clear();
+      this.scrollbar.reset();
       this.clearCommandNotification();
       this.copyVersion++;
       this.textSelection.clear();
@@ -1221,6 +1269,7 @@ export class FabricConversationView implements Component, Focusable {
   }
 
   private followLatest(): void {
+    this.latest.clear();
     this.textSelection.clear();
     if (!this.currentId) return;
     this.options.loadLatest(this.currentId);
@@ -1231,6 +1280,8 @@ export class FabricConversationView implements Component, Focusable {
   }
 
   private openPicker(): void {
+    this.latest.clear();
+    this.scrollbar.reset();
     this.clearCommandNotification();
     this.copyVersion++;
     this.textSelection.clear();
@@ -1241,6 +1292,14 @@ export class FabricConversationView implements Component, Focusable {
     this.pickerInput.onSubmit = () => this.pickSelected();
     if (this.editor) this.editor.focused = false;
     this.pickerSelectedId = this.currentId ?? this.nonMainTargets()[0]?.id;
+    // Freeze membership, groups and recency for this visit. Live metadata still
+    // refreshes, but completions, new runs and search cannot reshuffle the list.
+    this.pickerOrder = [...this.targetsById.values()]
+      .map((target) => ({ target, active: isMainTarget(target) || (!target.stale && isActiveStatus(target.status)) }))
+      .sort((left, right) => Number(right.active) - Number(left.active) ||
+        (right.target.updatedAt ?? 0) - (left.target.updatedAt ?? 0))
+      .map(({ target, active }) => ({ id: target.id, active }));
+    this.pickerKey = "";
     this.refreshPicker();
   }
 
@@ -1248,6 +1307,7 @@ export class FabricConversationView implements Component, Focusable {
     this.mode = "conversation";
     this.pickerInput = undefined;
     this.pickerRows = [];
+    this.pickerOrder = [];
     this.pickerKey = "";
     this.pickerSelectedId = undefined;
     if (this.editor) this.editor.focused = this.focusState;
@@ -1258,35 +1318,16 @@ export class FabricConversationView implements Component, Focusable {
     const key = JSON.stringify([this.targetsKey, search]);
     if (key === this.pickerKey) return;
     this.pickerKey = key;
-    const rows: PickerRow[] = [];
-    const targets = this.currentTargets();
-    const children = new Map<string, FabricConversationTarget[]>();
-    for (const target of targets) {
-      if (!target.parentId) continue;
-      const siblings = children.get(target.parentId) ?? [];
-      siblings.push(target);
-      children.set(target.parentId, siblings);
-    }
-    const roots = targets.filter(
-      (target) => !target.parentId || !this.targetsById.has(target.parentId),
-    );
-    roots.sort((left, right) =>
-      Number(isMainTarget(right)) - Number(isMainTarget(left)),
-    );
-    const visited = new Set<string>();
-    const pushTree = (target: FabricConversationTarget, depth: number): void => {
-      if (visited.has(target.id)) return;
-      visited.add(target.id);
-      rows.push({ target, depth });
-      for (const child of children.get(target.id) ?? []) pushTree(child, depth + 1);
-    };
-    for (const root of roots) pushTree(root, 0);
-    for (const orphan of targets) {
-      if (!visited.has(orphan.id)) rows.push({ target: orphan, depth: 0 });
-    }
-    const filtered = search.trim()
-      ? fuzzyFilter(rows, search, (row) => `${row.target.kind} ${row.target.name} ${row.target.id}`)
-      : rows;
+    const rows: PickerRow[] = this.pickerOrder.flatMap(({ id, active }) => {
+      const target = this.targetById(id);
+      return target ? [{ target, active }] : [];
+    });
+    const matches = search.trim()
+      ? new Set(fuzzyFilter(rows, search, (row) => `${row.target.kind} ${row.target.name} ${row.target.id}`)
+        .map((row) => row.target.id))
+      : undefined;
+    // Fuzzy matching decides membership, not rank: keep the frozen group order.
+    const filtered = matches ? rows.filter((row) => matches.has(row.target.id)) : rows;
     this.pickerRows = filtered;
     // Selection identity is the target id, stable across roster updates.
     if (!filtered.some((row) => row.target.id === this.pickerSelectedId)) {
@@ -1321,6 +1362,7 @@ export class FabricConversationView implements Component, Focusable {
   }
 
   private handlePickerInput(data: string): void {
+    this.refreshPicker();
     const input = this.pickerInput;
     if (!input) {
       this.closePicker();
@@ -1351,6 +1393,22 @@ export class FabricConversationView implements Component, Focusable {
     // peek() only: listing targets must never create or evict drafts.
     const seen = this.state.peek(target.id)?.lastSeenUpdatedAt ?? 0;
     return target.updatedAt > seen;
+  }
+
+  private targetBadge(width: number): string {
+    const target = this.currentTarget();
+    const labelWidth = Math.max(0, width - 2);
+    const access = target?.readOnlyReason ? " · read-only" : "";
+    const name = target ? (isMainTarget(target) ? "Main" : safeText(target.name) || safeText(target.id)) : "Fabric";
+    // Drop ancestors before truncating the active target. Keep the access label
+    // when it fits alongside at least one cell of the target name.
+    const suffix = visibleWidth(access) + 1 <= labelWidth ? access : "";
+    const chain = this.breadcrumbLine(Number.MAX_SAFE_INTEGER);
+    const label = visibleWidth(chain) + visibleWidth(access) <= labelWidth
+      ? chain + this.theme.fg("warning", access)
+      : this.theme.fg("accent", truncateToWidth(name, Math.max(0, labelWidth - visibleWidth(suffix)), "…")) +
+        this.theme.fg("warning", suffix);
+    return this.theme.bg("selectedBg", ` ${label} `);
   }
 
   private breadcrumbLine(width: number): string {
@@ -1444,7 +1502,7 @@ export class FabricConversationView implements Component, Focusable {
     });
   }
 
-  private transcriptLines(innerWidth: number): string[] {
+  private transcriptLines(innerWidth: number): readonly string[] {
     const target = this.currentTarget();
     if (!target || !this.currentId) return [this.theme.fg("dim", "No target selected.")];
     const entry = this.state.view(this.currentId);
@@ -1457,7 +1515,7 @@ export class FabricConversationView implements Component, Focusable {
       outputPad: this.options.appearance?.outputPad ?? 1,
       ...(this.options.appearance?.codeBlockIndent !== undefined ? { codeBlockIndent: this.options.appearance.codeBlockIndent } : {}),
       codePreviewSettings: this.options.codePreviewSettings,
-    });
+    }, "borrow");
   }
 
   private transcriptTail(width: number, budget: number, editorVisible: boolean): string[] {
@@ -1478,7 +1536,7 @@ export class FabricConversationView implements Component, Focusable {
     return tail;
   }
 
-  private windowBody(body: string[], budget: number, tail: string[]): string[] {
+  private windowBody(body: readonly string[], budget: number, tail: string[]): KittyViewportFrame {
     this.lastBodyLength = body.length + tail.length;
     this.lastBody = body;
     this.lastBodyBudget = budget;
@@ -1499,9 +1557,9 @@ export class FabricConversationView implements Component, Focusable {
     // Slice the virtual body + tail without copying retained history per frame.
     const start = entry?.scroll ?? 0;
     const end = start + budget;
-    const lines = body.slice(start, end);
-    if (end > body.length) lines.push(...tail.slice(Math.max(0, start - body.length), end - body.length));
-    return lines;
+    const frame = this.imageViewport.slice(body, start, end);
+    if (end > body.length) frame.lines.push(...tail.slice(Math.max(0, start - body.length), end - body.length));
+    return frame;
   }
 
   private pickerLines(innerWidth: number, budget: number): string[] {
@@ -1515,18 +1573,38 @@ export class FabricConversationView implements Component, Focusable {
     }
     const rows = this.pickerRows;
     const selectedIndex = this.pickerSelectedIndex();
+    const entries: (PickerRow | string)[] = [];
+    let selectedLine = 0;
+    let previousGroup: boolean | undefined;
+    for (const row of rows) {
+      if (row.active !== previousGroup) entries.push(row.active ? "Active" : "Inactive");
+      previousGroup = row.active;
+      if (row.target.id === this.pickerSelectedId) selectedLine = entries.length;
+      entries.push(row);
+    }
     const listBudget = Math.max(1, budget - lines.length - 1);
-    const startIndex = Math.max(
+    let startIndex = Math.max(
       0,
-      Math.min(selectedIndex - Math.floor(listBudget / 2), rows.length - listBudget),
+      Math.min(selectedLine - Math.floor(listBudget / 2), entries.length - listBudget),
     );
-    const endIndex = Math.min(startIndex + listBudget, rows.length);
+    // Repeat the section label when scrolled into a group, without letting the
+    // extra header push the selected target out of a short viewport.
+    if (listBudget > 1 && typeof entries[startIndex] !== "string") {
+      startIndex = Math.max(startIndex, selectedLine - listBudget + 2);
+    }
+    const first = entries[startIndex];
+    const stickyHeader = listBudget > 1 && first !== undefined && typeof first !== "string";
+    if (stickyHeader) lines.push(this.theme.fg("muted", first.active ? "  Active" : "  Inactive"));
+    const endIndex = Math.min(startIndex + listBudget - Number(stickyHeader), entries.length);
     if (rows.length === 0) lines.push(this.theme.fg("muted", "  no matching targets"));
     for (let i = startIndex; i < endIndex; i++) {
-      const row = rows[i];
-      if (!row) continue;
+      const row = entries[i];
+      if (row === undefined) continue;
+      if (typeof row === "string") {
+        lines.push(this.theme.fg("muted", `  ${row}`));
+        continue;
+      }
       const selected = row.target.id === this.pickerSelectedId;
-      const indent = "  ".repeat(row.depth + 1);
       const marker = selected ? this.theme.fg("accent", "→ ") : "  ";
       const unread = this.isUnread(row.target) ? this.theme.fg("accent", " ●") : "";
       const label = isMainTarget(row.target)
@@ -1534,13 +1612,13 @@ export class FabricConversationView implements Component, Focusable {
         : `${safeText(row.target.name)} ${this.theme.fg("muted", `(${row.target.kind} · ${row.target.status})`)}`;
       lines.push(
         truncateToWidth(
-          `${indent}${marker}${selected ? this.theme.fg("accent", label) : label}${unread}`,
+          `  ${marker}${selected ? this.theme.fg("accent", label) : label}${unread}`,
           innerWidth,
           "",
         ),
       );
     }
-    if (rows.length > listBudget) {
+    if (entries.length > listBudget) {
       lines.push(this.theme.fg("muted", `  (${selectedIndex + 1}/${rows.length})`));
     }
     return lines.slice(0, budget);

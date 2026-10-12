@@ -97,6 +97,17 @@ describe("Fabric Escape ownership", () => {
     h.dispose();
   });
 
+  it("warns the person who pressed Escape when the halt was not saved", () => {
+    const h = harness();
+    h.options.halt.mockImplementation(() => { throw new Error("queue storage unavailable"); });
+    h.input("\x1b");
+    vi.advanceTimersByTime(60);
+    expect(h.notify).toHaveBeenCalledWith(
+      "Fabric: halt not saved; work may resume on restart: queue storage unavailable", "warning",
+    );
+    h.dispose();
+  });
+
   it("does not attach terminal input in RPC mode", () => {
     const onTerminalInput = vi.fn();
     const context = { mode: "rpc", ui: { onTerminalInput } } as unknown as ExtensionContext;

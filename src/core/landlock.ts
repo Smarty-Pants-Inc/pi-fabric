@@ -1,3 +1,4 @@
+import { bashProcessEnvironment, childProcessEnvironment } from "./atomic-write.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -10,12 +11,22 @@ export interface LandlockSettings {
   mode: "off" | "enforce";
   /** Host-only kill switch. Project settings cannot override it. */
   disabled: boolean;
+  /** Root-policy-only per-command escape grant. Absent/false means denied. */
+  allowEscape?: boolean;
 }
 
 const ESCAPE = /^\s*PI_FABRIC_LANDLOCK_ESCAPE=1[ \t]+/;
-export const landlockCommand = (command: string): { escape: boolean; command: string } => ({
-  escape: ESCAPE.test(command), command: command.replace(ESCAPE, ""),
-});
+let warnedEscapeDenied = false;
+export const landlockCommand = (command: string, allowEscape = false, environmentEscape = false): { escape: boolean; command: string } => {
+  let requested = environmentEscape;
+  // Consume every leading reserved assignment, never leave a second one for the shell.
+  while (ESCAPE.test(command)) { requested = true; command = command.replace(ESCAPE, ""); }
+  if (requested && allowEscape !== true && !warnedEscapeDenied) {
+    warnedEscapeDenied = true;
+    console.warn("[pi-fabric] PI_FABRIC_LANDLOCK_ESCAPE ignored: no valid root policy grants executor.landlock.allowEscape: true; command remains confined");
+  }
+  return { escape: requested && allowEscape === true, command };
+};
 
 /** No git process/hooks: only the lane's actual .git/commondir metadata. */
 const gitCommonDir = (cwd: string): string | undefined => {
@@ -188,7 +199,7 @@ export const groupOperations = (shell: string, args: string[]): BashOperations =
       exitHook = true; // as Pi does for its tracked detached children
       process.once("exit", () => { for (const pgid of foreground) try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } });
     }
-    const child = spawn(shell, [...args, command], { cwd, detached: true, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(shell, [...args, command], { cwd, detached: true, env: bashProcessEnvironment(env), stdio: ["ignore", "pipe", "pipe"] });
     const pgid = child.pid;
     // S5: kill/exit custody is established before any fallible observer (ledger) I/O.
     if (pgid) foreground.add(pgid);
@@ -449,12 +460,30 @@ export class LandlockBashConfinement {
   }
 
   operations(confined: BashOperations, unconfined: BashOperations, shell: string,
-    runDir: string, escape: boolean, originalCommand: string): BashOperations {
+    runDir: string, getSettings: () => LandlockSettings | undefined,
+    originalCommand?: string, commandPrefixes: readonly string[] = []): BashOperations {
     const grants = this.#grants(runDir);
     const lines = grants.map(({ dev, ino, real }) => `${dev}:${ino}:${real}`);
     return { exec: async (command, cwd, options) => {
       // Fence: no launch after close, even from delayed middleware.
       if (this.#closed) throw new Error("Landlock confinement is closed; refusing a late launch");
+      // All callers decide here, after spawnHook/middleware preparation. Never trust
+      // a provider-side escape boolean or pass a reserved assignment into the shell.
+      const requestedEnv = options.env ?? process.env;
+      const env: NodeJS.ProcessEnv = { ...childProcessEnvironment(requestedEnv), TMPDIR: this.#tmpdir };
+      // PID tracking and cooperative commandPrefix decoration precede the user
+      // command. Peel only exact host-supplied prefixes, then restore them after
+      // consuming the control assignment; never inspect arbitrary shell bodies.
+      let body = command;
+      let decoration = "";
+      for (const prefix of commandPrefixes) {
+        if (prefix && body.startsWith(prefix)) { decoration += prefix; body = body.slice(prefix.length); }
+      }
+      const decision = landlockCommand(body, getSettings()?.allowEscape, requestedEnv.PI_FABRIC_LANDLOCK_ESCAPE === "1");
+      const { escape } = decision;
+      const launchCommand = decoration + decision.command;
+      // Consume the control flag even for an authorized escape: descendants must
+      // not turn one granted command into implicit, recursively requested escapes.
       // Escape logging is mandatory and happens before spawn. Do not log command
       // text (it may contain secrets); record a digest and nested tool correlation.
       const auditDir = path.join(this.cwd, ".pi");
@@ -476,23 +505,19 @@ export class LandlockBashConfinement {
           fs.writeFileSync(auditFd, JSON.stringify({
             at: new Date().toISOString(), event: escape ? "escape" : "enforce",
             role: this.#role, cwd, runDir,
-            commandSha256: createHash("sha256").update(originalCommand).digest("hex"),
+            commandSha256: createHash("sha256").update(originalCommand ?? command).digest("hex"),
             ...(escape ? {} : { writes: grants.map(grant => grant.real) }),
           }) + "\n");
         } finally { fs.closeSync(auditFd); }
       } finally { fs.closeSync(directoryFd); }
-      const env: NodeJS.ProcessEnv = { ...options.env, TMPDIR: this.#tmpdir };
-      delete env.PI_FABRIC_LANDLOCK_ESCAPE;
-      delete env.PI_FABRIC_LANDLOCK_SHELL;
-      delete env.PI_FABRIC_LANDLOCK_WRITES;
       if (escape) {
         options.onData(Buffer.from(`[Landlock escape: unconfined command; recorded in ${auditPath}]\n`));
-        return this.#custody(this.#launch(unconfined, command, cwd, { ...options, env }, true));
+        return this.#custody(this.#launch(unconfined, launchCommand, cwd, { ...options, env }, true));
       }
       env.PI_FABRIC_LANDLOCK_SHELL = shell;
       // dev:ino:path — the helper binds each rule to this identity, not the name.
       env.PI_FABRIC_LANDLOCK_WRITES = lines.join("\n");
-      return this.#custody(this.#launch(confined, command, cwd, { ...options, env }, false));
+      return this.#custody(this.#launch(confined, launchCommand, cwd, { ...options, env }, false));
     } };
   }
 }

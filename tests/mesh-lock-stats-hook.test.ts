@@ -16,7 +16,9 @@ const temp = (): string => {
 const identity: MeshIdentity = { id: "main-1", name: "main", kind: "main" };
 const classes = (root: string) => {
   registry[lockKey]!.flush();
-  const summary = summarizeLockStats(root, readLockStats(root), { minutes: 2, now: Date.now() + 60_000 });
+  // The window ends one minute past now: a record stamped by a skewed test clock (below) can land in the
+  // next wall-clock minute when the test runs near a minute boundary (smarty-dev#7651).
+  const summary = summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 });
   return Object.fromEntries(summary.classes.map(row => [row.lockClass, row]));
 };
 // The test environment disables the recorder (PI_FABRIC_LOCK_STATS=0): load a store module that

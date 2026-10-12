@@ -10,11 +10,20 @@ import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol
 import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
 
+// Windows runs the legacy retention path (retentionV2Enabled() is false on win32), which applies
+// config.json policy edits only at its 60 s request-retention sample. Tests that depend on that
+// cadence run both paths on every platform, so a Windows-only difference shows up on Linux too.
+const platform = vi.hoisted(() => ({ retentionV2: process.platform !== "win32" }));
+vi.mock("../src/storage/retention-platform.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/storage/retention-platform.js")>()),
+  retentionV2Enabled: () => platform.retentionV2,
+}));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  platform.retentionV2 = process.platform !== "win32";
 });
 
 async function fixture(idleExitMs = RESIDENT_IDLE_EXIT_MS) {
@@ -154,7 +163,11 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     expect(actors).toHaveBeenLastCalledWith();
   });
 
-  it("0 disables even a dead and empty host, and accepted live policy edits can disable/re-enable", async () => {
+  it.each([
+    { retentionV2: true, name: "retention v2 (Linux, macOS)" },
+    { retentionV2: false, name: "legacy retention (Windows)" },
+  ])("0 disables even a dead and empty host, and accepted live policy edits can disable/re-enable: $name", async ({ retentionV2 }) => {
+    platform.retentionV2 = retentionV2;
     const f = await fixture(0);
     await f.advance(10 * RESIDENT_IDLE_EXIT_MS);
     expect(f.exited()).toBe(0);
@@ -171,6 +184,8 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     replacePolicy(2_000);
+    // Legacy retention applies the edit at its next 60 s sample; v2 within one maintenance tick.
+    if (!retentionV2) await f.advance(60_000);
     await f.advance(1_000);
     await f.advance(2_000);
     expect(f.exited()).toBe(1);

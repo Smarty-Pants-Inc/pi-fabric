@@ -10,13 +10,25 @@ import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import { readHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
+// Every presence value carries its absolute sessionFile and logDir, so its size grows
+// with TMPDIR depth (twice per path byte, and escaped separators on Windows). These
+// limits assumed at most 256 bytes for those two JSON strings; grow a limit by
+// exactly the excess a deeper isolated TMPDIR adds, never by a constant slack.
+const pathAwareLimit = (base: number, actorRoot: string, id = "0".repeat(32)): number => base + Math.max(0,
+  Buffer.byteLength(JSON.stringify(path.join(actorRoot, id, "session.jsonl")) + JSON.stringify(path.join(actorRoot, id, "runs")), "utf8") - 256);
+
 it("isolates a real 1024-byte legacy presence failure across startup and recovery without rapid retries", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ps-"));
+  const bad = "b".repeat(32), good = "a".repeat(32);
+  // "ok" fits the legacy 1024-byte boundary; "big" (12 topics) is ~570 path-independent
+  // bytes larger, so it exceeds the path-aware limit at any TMPDIR depth.
+  const actorRoot = path.join(root, "a");
+  const limit = pathAwareLimit(1024, actorRoot, good);
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
-    meshRoot: path.join(root, "m"), actorRoot: path.join(root, "a"), residencyRoot: path.join(root, "r"),
+    meshRoot: path.join(root, "m"), actorRoot, residencyRoot: path.join(root, "r"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 1024, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: limit, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   const registry = new ActorRegistryStore(config.actorRoot);
@@ -25,7 +37,6 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
     instructions: "wait", residency: "durable", runner: "pi", events: [], topics: subscriptions,
     status: "idle", delivery: "mailbox", triggerTurn: false, responseMode: "text", coalesce: true,
     requirements: [], createdAt: Date.now(), updatedAt: Date.now(), messages: [] });
-  const bad = "b".repeat(32), good = "a".repeat(32);
   registry.write([row(bad, "big", topics), row(good, "ok", [])]);
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   // Optimistic writes prepare outside custody; write() is the legacy writer.
@@ -40,13 +51,13 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
       const participantKey = "topology/participants/" + createHash("sha256").update(good).digest("hex");
       expect(readParticipantFile(config.meshRoot, participantKey)?.value).toMatchObject({ id: good });
       expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
-      expect(host.actors.status(bad).lastError).toContain("Actor presence omitted: Actor presence exceeds 1024 bytes");
+      expect(host.actors.status(bad).lastError).toContain(`Actor presence omitted: Actor presence exceeds ${limit} bytes`);
       expect(host.mesh.get(`actors/s/${bad}`)).toBeUndefined();
       expect(host.mesh.get(`actors/s/${good}`)?.value).toMatchObject({ id: good });
       expect(host.mesh.get(`actors/s/${good}`)?.value).not.toHaveProperty("ownershipToken");
       // Exercise the actual store limit, not an injected writeBatch rejection.
       await expect(host.mesh.put({ key: "proof/oversize", identity: host.identity,
-        value: host.actors.status(bad) })).rejects.toThrow("Mesh state value exceeds 1024 bytes");
+        value: host.actors.status(bad) })).rejects.toThrow(`Mesh state value exceeds ${limit} bytes`);
       const before = batch.mock.calls.length;
       puts.mockClear();
       await new Promise(resolve => setTimeout(resolve, 350));
@@ -72,14 +83,15 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
 
 it("rejects oversize create and configurable updates before committing actor state", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pa-"));
+  const limit = pathAwareLimit(2048, path.join(root, "a"));
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:s", sessionId: "s", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "m"), actorRoot: path.join(root, "a"), residencyRoot: path.join(root, "r"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    // The separate test above exercises the exact 1024-byte legacy boundary.
-    // Creation includes session/log paths; leave room for long isolated TMPDIRs
-    // here while still exercising real over-limit create/update rejection.
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: 2048, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    // The separate test above exercises the exact 1024-byte legacy boundary. Creation
+    // includes session/log paths: 2048 plus any deep-TMPDIR path excess still rejects
+    // the 40-topic create and the oversized tools update for real.
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, maxEventBytes: limit, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: "worker.js", fabricExtensionPath: "index.js", piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
   const host = new ResidentHost(config);
@@ -89,12 +101,12 @@ it("rejects oversize create and configurable updates before committing actor sta
     const onCommit = vi.fn(), beforeCommit = vi.fn();
     await expect(host.actors.create({ name: "big", instructions: "wait", residency: "durable",
       topics: Array.from({ length: 40 }, (_, i) => `fleet.work.project-${String(i).padStart(2, "0")}.observation`) },
-      { asRegistryOwner: true, onCommit, beforeCommit })).rejects.toThrow("Actor presence exceeds 2048 bytes");
+      { asRegistryOwner: true, onCommit, beforeCommit })).rejects.toThrow(`Actor presence exceeds ${limit} bytes`);
     expect(onCommit).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
     expect(registry.records()).toEqual([]);
     const actor = await host.actors.create({ name: "ok", instructions: "wait", residency: "durable" }, { asRegistryOwner: true });
     const before = registry.records();
-    await expect(host.actors.setTools(actor.id, ["x".repeat(config.mesh.maxEventBytes)])).rejects.toThrow("Actor presence exceeds 2048 bytes");
+    await expect(host.actors.setTools(actor.id, ["x".repeat(config.mesh.maxEventBytes)])).rejects.toThrow(`Actor presence exceeds ${limit} bytes`);
     expect(registry.records()).toEqual(before);
     expect(host.actors.status(actor.id).tools).toBeUndefined();
   } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }

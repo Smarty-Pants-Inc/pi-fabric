@@ -83,7 +83,10 @@ export class FabricProviderBindings {
     provider: FabricProvider,
     options: { overwrite?: boolean; staged?: boolean } = {},
   ): FabricComponentProviderLease {
-    if ([...this.#all.values()].some(binding => binding.provider === provider && binding.closeTask)) {
+    // A host-owned (excluded) generation never reaches provider.close(), so
+    // its instance may be remounted while that generation finishes closing.
+    if ([...this.#all.values()].some(binding =>
+      binding.provider === provider && binding.closeTask && !this.#excluded.has(binding.id))) {
       throw new Error("Cannot mount a provider instance whose close has begun");
     }
     const current = this.#current.get(provider.name);
@@ -171,9 +174,25 @@ export class FabricProviderBindings {
     return replaced;
   }
 
-  unregister(name: string): FabricProvider | undefined {
+  /** Withdraw the current binding: retire it and drop its owner hold, so
+   * retained generations drain under the normal lifecycle rules. `provider`
+   * and `generation` (number = generation, string = binding id) pin the target;
+   * a mismatch withdraws nothing. `keepProviderOpen` skips provider.close() for
+   * host-owned instances. */
+  unregister(
+    name: string,
+    options: { provider?: FabricProvider; generation?: number | string; keepProviderOpen?: boolean } = {},
+  ): FabricProvider | undefined {
     const binding = this.#current.get(name);
     if (!binding) return undefined;
+    if (options.provider !== undefined && binding.provider !== options.provider) return undefined;
+    if (
+      options.generation !== undefined &&
+      (typeof options.generation === "number" ? binding.generation : binding.id) !== options.generation
+    ) {
+      return undefined;
+    }
+    if (options.keepProviderOpen) this.#excluded.add(binding.id);
     this.retire(binding.id);
     void this.releaseOwner(binding.id).catch(() => undefined);
     return binding.provider;
@@ -246,7 +265,7 @@ export class FabricProviderBindings {
     const binding = this.#all.get(id);
     if (!binding) return;
     binding.closeError = error instanceof Error ? error.message : String(error);
-    this.#step(binding, { $: "Fail" });
+    this.#step(binding, { $: "Abort" });
     this.revoke(id);
   }
 
@@ -312,7 +331,7 @@ export class FabricProviderBindings {
   async #maybeClose(binding: FabricProviderBinding): Promise<void> {
     if (binding.closeTask) return binding.closeTask;
     // The reducer reserves Closing synchronously, before arbitrary callbacks.
-    if (this.#step(binding, { $: "Close" }) !== "StartClose") return;
+    if (this.#step(binding, { $: "Shut" }) !== "StartClose") return;
     binding.closeTask = Promise.resolve().then(async () => {
       try {
         const unsubscribe = binding.unsubscribeCatalog;

@@ -20,7 +20,7 @@ async function open(kind: string, root: string): Promise<Store> {
 const CHILD = `
 import { createJiti } from "jiti"; import { pathToFileURL } from "node:url"; import fs from "node:fs"; import path from "node:path";
 const jiti=createJiti(pathToFileURL(process.cwd()+"/index.js").href); const [mod,sql]=await Promise.all([jiti.import("./src/mesh/store.ts"),jiti.import("./src/mesh/state-sqlite.ts")]);
-const [kind,root,stage,id]=process.argv.slice(1); const identity={id:"crash",name:"crash",kind:"agent"}; const store=kind==="sqlite"?await sql.SqliteStateStore.open(root,65536,100,{lockTimeoutMs:5000}):new mod.MeshStore(root,65536,100);
+const [kind,root,stage,id]=process.argv.slice(1); const identity={id:"crash",name:"crash",kind:"agent"}; const store=kind==="sqlite"?await sql.SqliteStateStore.open(root,65536,100,{lockTimeoutMs:5000,initialize:"create"}):new mod.MeshStore(root,65536,100);
 const kill=()=>process.kill(process.pid,"SIGKILL"); const effectsDir=path.join(root,"effects"); fs.mkdirSync(effectsDir,{recursive:true});
 if(stage==="before-begin") kill();
 const fileRead=()=>{fs.readFileSync(path.join(root,"input.txt"),"utf8"); if(stage==="after-file-read")kill(); return "read";}; fileRead();

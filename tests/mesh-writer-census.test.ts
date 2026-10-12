@@ -268,7 +268,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 }, absent: "lockProtocol" },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 }, absent: "lockProtocol" },
     { label: "lock protocol 0", fields: { lockProtocol: 0 }, absent: "lockProtocol" },
     { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
     { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
@@ -291,7 +291,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 } },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 } },
     { label: "an unsupported backend", fields: { stateBackend: "redis" } },
   ])("drops lease writer metadata with $label", async ({ fields }) => {
     const mesh = root();
@@ -414,7 +414,8 @@ describe("mesh writer census", () => {
   it("opens a sqlite or shadow backend when the census record cannot be written (advisory, smarty-dev#6982)", async () => {
     const mkdir = vi.spyOn(fs, "mkdirSync");
     for (const stateBackend of ["sqlite", "shadow"] as const) {
-      // A fresh root per backend: the rollback fence (L2a) refuses shadow file writes once a root is sqlite.
+      // One root per backend: a sqlite store flags state.db backend=sqlite, which fences a later
+      // shadow (file-authority) writer of the same root (smarty-dev#6477 W1 file-write guard).
       const mesh = root();
       // A regular file where the record directory belongs: every attempt fails.
       fs.writeFileSync(path.join(mesh, ".writer-census"), "");
@@ -575,16 +576,19 @@ describe("mesh writer census", () => {
       },
       check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite",
         stateBackends: ["file", "sqlite"] })]) },
+    // The root check (pi-fabric#694) refuses a SQLite open through a symlinked root, and lstat reports a Windows
+    // junction as a link too (smarty-dev#7630), so no SQLite writer can exist behind an alias on any platform.
     { label: "round 4: a sqlite writer through a symlink alias outlives the root's store", reportsUnknown: false,
-      setup: async (mesh, close) => {
+      setup: async (mesh) => {
         const alias = path.join(root(), "alias");
         fs.symlinkSync(mesh, alias, process.platform === "win32" ? "junction" : "dir");
         const direct = new MeshStore(mesh, 4096, 100, { stateBackend: "file" });
-        const aliased = await sqliteStore(alias);
+        const aliased = new MeshStore(alias, 4096, 100, { stateBackend: "sqlite" });
+        await expect(aliased.put({ key: "census/probe", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringMatching(/symbolic link/) });
+        aliased.closeState();
         direct.closeState();
-        close.push(() => aliased.closeState());
       },
-      check: result => expect(ownWriter(result)).toEqual([expect.objectContaining({ stateBackend: "sqlite" })]) },
+      check: result => expect(ownWriter(result)).toEqual([]) },
     { label: "round 5: an unreadable census directory", reportsUnknown: true,
       setup: mesh => { writeRecord(mesh, { pid: process.pid, host: os.hostname(), startedAt: ownStartedAt() }); denyRead(path.join(mesh, ".writer-census")); } },
     { label: "round 5: an unreadable record", reportsUnknown: true,
@@ -776,7 +780,8 @@ describe("mesh writer census", () => {
   });
 
   it("is advisory: no exported gate and no verdict in the report (smarty-dev#6982)", async () => {
-    expect(Object.keys(writerCensus).sort()).toEqual(["census"]);
+    // censusSync is the same report, synchronous (the smarty-dev#7815 gate recomputes it under the fence).
+    expect(Object.keys(writerCensus).sort()).toEqual(["census", "censusSync"]);
     const mesh = root();
     fs.mkdirSync(path.join(mesh, ".lock"));
     fs.writeFileSync(path.join(mesh, ".lock", "owner"), `token\n${process.pid}\n${Date.now()}\n`);
@@ -790,7 +795,7 @@ describe("mesh writer census", () => {
 
   it("changes no store behaviour on unknown evidence, and nothing in src consumes the census", async () => {
     for (const stateBackend of ["file", "sqlite", "shadow"] as const) {
-      // A fresh root per backend: the rollback fence (L2a) refuses shadow file writes once a root is sqlite.
+      // One root per backend: sqlite flags state.db, which fences a later shadow writer (W1 guard).
       const mesh = root();
       fs.mkdirSync(path.join(mesh, ".writer-census"));
       fs.writeFileSync(path.join(mesh, ".writer-census", "torn.json"), "{");
@@ -802,13 +807,15 @@ describe("mesh writer census", () => {
         expect(store.get(`census/${stateBackend}`)?.value).toBe(1);
       } finally { store.closeState(); }
     }
-    // No startup, CLI or migration path imports the census: it can only be called for a report.
+    // No startup or migration path imports the census: it can only be called for a report. The one
+    // importer is the operator CLI, which only prints it as "advisory: N writers, M unknown" (org
+    // decision 10-08: the cutover is fenced on .lock and custody.lock, never on the census).
     const importers = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
       const file = path.join(dir, entry.name);
       if (entry.isDirectory()) return importers(file);
       return /\.[cm]?ts$/.test(entry.name) && file !== path.join("src", "mesh", "writer-census.ts") &&
         /writer-census\.js["']/.test(fs.readFileSync(file, "utf8")) ? [file] : [];
     });
-    expect(importers("src")).toEqual([]);
+    expect(importers("src")).toEqual([path.join("src", "mesh", "mesh-backend-cli.ts")]);
   });
 });

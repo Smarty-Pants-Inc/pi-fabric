@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { isMeshLockTimeout } from "../src/core/atomic-write.js";
+import { importMeshState } from "../src/mesh/backend-migration.js";
 import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -66,6 +67,8 @@ describe("sqlite state backend across processes", () => {
   it("four writers commit every update and none takes the mesh .lock", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-mp-"));
     roots.push(root);
+    // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
+    await importMeshState(root);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     const count = 40;
@@ -80,7 +83,8 @@ describe("sqlite state backend across processes", () => {
       expect(JSON.parse(result.stdout.trim())).toMatchObject({ lockAttempts: 0 });
     }
     expect(seen.filter(name => name.startsWith(".lock"))).toEqual([]);
-    expect(fs.existsSync(path.join(root, "state.json"))).toBe(false);
+    // The import left only the moved marker; no writer wrote state.json.
+    expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "sqlite" });
     try {
       expect(store.get("counter")?.value).toBe(4 * count);

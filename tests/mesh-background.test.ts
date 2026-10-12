@@ -261,6 +261,44 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     expect(journal[0]).toMatchObject({ label: "inbox", state: "outage", droppedOverflow: 1, droppedAfterRetries: 0, queued: 32 });
   });
 
+  // pi-fabric#893 Astra P1 (comment 6119182479): an overflow while the head's publish is in flight drops (and counts)
+  // that head; when the publish settles, the flush must not then remove the NEXT event unattempted.
+  it("loses no event when an overflow drops the in-flight head: each is attempted or counted as dropped", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const attempted: string[] = [];
+    let release!: () => void;
+    const first = new Promise<void>((resolve) => { release = resolve; });
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo((alarm) => {
+      attempted.push(JSON.stringify(alarm));
+      return attempted.length === 1 ? first : Promise.resolve(); // a delayed sink: the first publish hangs
+    });
+    // 16 outages (alarm and recovery) and one more alarm: 33 events, one over the cap of 32, while event 1 is in
+    // flight. The overflow drops event 1 itself (attempted, and counted).
+    for (let outage = 0; outage <= 16; outage++) {
+      retry.failure(busy());
+      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      retry.failure(busy());
+      if (outage < 16) retry.success(true);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    const raised = warn.mock.calls.map(([line]) => parse9729(String(line)))
+      .filter((alarm) => alarm !== undefined && alarm.reason !== "mesh-alarm-undeliverable")
+      .map((alarm) => JSON.stringify(alarm));
+    expect(raised).toHaveLength(33);
+    const dropped = warn.mock.calls.map(([line]) => parse9729(String(line))).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({ droppedOverflow: 1, droppedAfterRetries: 0, queued: 32 });
+    expect(attempted).toEqual([raised[0]]);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    await retry.flushAlarms();
+    // The one overflow drop was the in-flight event 1, already attempted: every one of the 33 was attempted.
+    expect(attempted).toEqual(raised);
+    for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) retry.success(true);
+    await retry.flushAlarms();
+  });
+
   it("drops an event after 8 failed attempts with one final journal line, and the queue empties", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

@@ -783,6 +783,8 @@ export const meshDeferredSummary = (error: unknown): string => {
     + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
 };
 
+type PendingAlarm = { alarm: MeshOutageAlarm; attempts: number; firstAt: number };
+
 /** Per-background-path outage state; no process-global handlers or foreground retry policy. */
 export class MeshBackgroundRetry {
   // smarty-dev#8825 outage alarm. Per instance by design: a restarted process starts a new 5-min window and
@@ -793,7 +795,7 @@ export class MeshBackgroundRetry {
   #outageSuccesses = 0;
   // Events not yet accepted by the sink, in order (the alarm, then its recovery). The publish can hit the same
   // outage: a rejected or throwing publish keeps its event, and the next failure() or success() retries it.
-  readonly #pendingAlarms: Array<{ alarm: MeshOutageAlarm; attempts: number; firstAt: number }> = [];
+  readonly #pendingAlarms: PendingAlarm[] = [];
   #flushing = false;
   #droppedOverflow = 0;
   #droppedExhausted = 0;
@@ -827,6 +829,13 @@ export class MeshBackgroundRetry {
     console.warn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
       droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }));
   }
+  /** Remove `head` by identity (pi-fabric#893 Astra P1): while its publish was awaited, an overflow in #raise may
+   * already have dropped (and counted) it, and the queue's first entry is then the NEXT, unattempted event. */
+  #removeHead(head: PendingAlarm): boolean {
+    const at = this.#pendingAlarms.indexOf(head);
+    if (at >= 0) this.#pendingAlarms.splice(at, 1);
+    return at >= 0;
+  }
   async #flushAlarms(): Promise<void> {
     if (this.#flushing) return;
     this.#flushing = true;
@@ -838,14 +847,12 @@ export class MeshBackgroundRetry {
         catch {
           // Kept for the next call, until its attempts or age run out: then dropped, and reported once.
           if (head.attempts >= MESH_ALARM_MAX_ATTEMPTS || performance.now() - head.firstAt >= MESH_ALARM_MAX_AGE_MS) {
-            this.#pendingAlarms.shift();
-            this.#droppedExhausted++;
-            this.#reportUndeliverable();
+            if (this.#removeHead(head)) { this.#droppedExhausted++; this.#reportUndeliverable(); } // else counted as overflow
             continue;
           }
           return;
         }
-        this.#pendingAlarms.shift();
+        this.#removeHead(head);
         this.#undeliverableReported = false;
       }
     } finally { this.#flushing = false; }

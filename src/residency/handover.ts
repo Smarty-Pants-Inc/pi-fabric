@@ -4,6 +4,7 @@ import path from "node:path";
 import { writeJsonAtomic, syncDirectoryChain } from "../core/atomic-write.js";
 import { findExecutable } from "../agents/transports/process-utils.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { fabricExtensionEntry } from "../core/fabric-entry.js";
 import type { ResidentActorCaller, ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 
 // Capability rollout is deliberately fail-closed: B cannot retrofit custody into
@@ -121,7 +122,7 @@ function artifactDigest(root: string): string {
 export function residentLaunchSpec(config: ResidentHostConfig, entry: string, runtime = process.execPath): ResidentLaunchSpec {
   const releaseRoot = path.resolve(path.dirname(entry), "../..");
   fixedFile(entry);
-  if (path.resolve(config.fabricExtensionPath) !== path.join(releaseRoot, "dist/index.js") ||
+  if (path.resolve(config.fabricExtensionPath) !== fabricExtensionEntry(releaseRoot) ||
       path.resolve(config.workerPath) !== path.join(releaseRoot, "dist/worker.js") ||
       path.resolve(entry) !== path.join(releaseRoot, "dist/residency/pi-entry.js")) {
     throw new Error("Resident launch specification mixes releases");

@@ -54,6 +54,7 @@ import { syncPathNamespace } from "./core/atomic-write.js";
 import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
+import { fabricExtensionEntry } from "./core/fabric-entry.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -456,7 +457,7 @@ const main = async (): Promise<void> => {
   // Keep the CLI lifecycle for activation/actors and SDK task retry semantics.
   let piReleaseSdk: string | undefined;
   const pinnedFabricExtension = options.fabricRelease
-    ? path.join(options.fabricRelease, "dist/index.js") : options.fabricExtensionPath;
+    ? fabricExtensionEntry(options.fabricRelease) : options.fabricExtensionPath;
   if (options.runner === "pi" && options.fabricExtensionPath && pinnedFabricExtension) {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
     const { resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");

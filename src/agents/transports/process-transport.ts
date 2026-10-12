@@ -9,6 +9,7 @@ import type {
 } from "../types.js";
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
+import { fabricExtensionEntry } from "../../core/fabric-entry.js";
 import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment } from "../task-environment.js";
@@ -34,7 +35,7 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   if (canonicalWorker !== path.join(parent, "dist/worker.js")) {
     return { workerPath, fabricRelease: parent };
   }
-  const fallback = { workerPath: canonicalWorker, fabricRelease: parent, extensionPath: path.join(parent, "dist/index.js") };
+  const fallback = { workerPath: canonicalWorker, fabricRelease: parent, extensionPath: fabricExtensionEntry(parent) };
   const current = activeFabricRoot(path.join(resolveAgentDir(), "settings.json"));
   if (!current || current === parent) return fallback;
   let version: unknown;
@@ -42,7 +43,7 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
     version = (JSON.parse(fs.readFileSync(path.join(current, "dist/worker-protocol.json"), "utf8")) as { version?: unknown }).version;
   } catch { /* Unversioned/malformed releases are not known-compatible. */ }
   const selectedWorker = path.join(current, "dist/worker.js");
-  const selectedExtension = path.join(current, "dist/index.js");
+  const selectedExtension = fabricExtensionEntry(current);
   if (version === WORKER_PROTOCOL_VERSION && regularFile(selectedWorker) && regularFile(selectedExtension)) {
     return { workerPath: selectedWorker, fabricRelease: current, extensionPath: selectedExtension };
   }

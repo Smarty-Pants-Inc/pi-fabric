@@ -7,6 +7,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { residentLaunchSpec, writeHandoverState, type ResidentHandoverPlan } from "../src/residency/handover.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
+import { fabricExtensionEntry } from "../src/core/fabric-entry.js";
 
 // Real parent/child attestation, not a process.ppid override in Vitest's process
 // facade. This keeps the same production identity checks on Ubuntu and forks.
@@ -20,7 +21,7 @@ describe.skipIf(process.platform !== "linux" || !fs.existsSync("dist/worker.js")
     const config: ResidentHostConfig = { format: 1, rootId: "session:bundled", sessionId: "bundled", cwd: root, projectRoot: root,
       meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"), fullCodeMode: true,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, timeoutMs: 1_000, nice: 19 }, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
-      workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve("dist/index.js"),
+      workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(path.resolve(".")),
       piBinary: path.resolve("tests/fixtures/resident-probe-pi.mjs"), claudeBinary: "missing-claude", vedaBinary: "missing-veda",
       kernel: "typescript", pythonRuntime: "monty",
       piModels: { available: [{ provider: "fixture", id: "bundled" }], aliases: {}, defaultModel: "fixture/bundled" } };

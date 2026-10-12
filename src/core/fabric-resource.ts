@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadedFabricRoot } from "./agent-dir.js";
+import { FABRIC_EXTENSION_ENTRY } from "./fabric-entry.js";
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 const canonical = (file: string): string => {
@@ -19,7 +20,7 @@ export const fabricResourceRoot = (file: string, type: ResourceType): string | u
   if (!root) return undefined;
   // The built and source Fabric entrypoints remain Fabric even if a manifest
   // only advertises the other one. Internal worker hooks are NOT entrypoints.
-  if (type === "extensions" && ["dist/index.js", "src/index.ts", "src/index.js"].some(entry => resource === canonical(path.join(root, entry)))) return root;
+  if (type === "extensions" && [FABRIC_EXTENSION_ENTRY, "dist/index.js", "src/index.ts", "src/index.js"].some(entry => resource === canonical(path.join(root, entry)))) return root;
   let entries: unknown;
   try {
     const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { pi?: Partial<Record<ResourceType, unknown>> };

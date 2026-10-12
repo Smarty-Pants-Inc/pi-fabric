@@ -9,6 +9,12 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
 import type { AgentHandleInfo } from "../src/agents/types.js";
+import { FABRIC_EXTENSION_ENTRY, fabricExtensionEntry } from "../src/core/fabric-entry.js";
+
+// pi-fabric#864: the child's Fabric entry must be the entry Pi itself loads from the package.
+// Read the real manifest so the transport and package.json cannot drift apart again.
+const PACKAGE_PI_EXTENSIONS = (JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as { pi: { extensions: string[] } }).pi.extensions;
+const PACKAGE_ENTRY = path.normalize(PACKAGE_PI_EXTENSIONS[0]!);
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -39,9 +45,10 @@ const fixture = (fullCodeMode = true) => {
   const release = (name: string, version: number | undefined = WORKER_PROTOCOL_VERSION) => {
     const directory = path.join(root, name);
     fs.mkdirSync(path.join(directory, "dist"), { recursive: true });
-    fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module" }));
+    fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module", pi: { extensions: PACKAGE_PI_EXTENSIONS } }));
     fs.writeFileSync(path.join(directory, "dist/worker.js"), worker);
     fs.writeFileSync(path.join(directory, "dist/index.js"), "export {};\n");
+    fs.writeFileSync(path.join(directory, PACKAGE_ENTRY), "export default function () {}\n");
     if (version !== undefined) fs.writeFileSync(path.join(directory, "dist/worker-protocol.json"), JSON.stringify({ version }));
     return directory;
   };
@@ -49,7 +56,7 @@ const fixture = (fullCodeMode = true) => {
   const select = (directory: string) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [{ source: directory }] }));
   select(parent);
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
-    workerPath: path.join(parent, "dist/worker.js"), fabricExtensionPath: path.join(parent, "dist/index.js"),
+    workerPath: path.join(parent, "dist/worker.js"), fabricExtensionPath: path.join(parent, PACKAGE_ENTRY),
     fullCodeMode, runRoot: path.join(root, "runs"),
   });
   managers.push(manager);
@@ -70,7 +77,7 @@ const probe = async (f: ReturnType<typeof fixture>, expected: string) => {
   expect(result.fabricRelease).toBe(expected);
   expect(JSON.parse(result.text)).toMatchObject({
     worker: pathToFileURL(path.join(expected, "dist/worker.js")).href,
-    extension: path.join(expected, "dist/index.js"), release: expected,
+    extension: path.join(expected, PACKAGE_ENTRY), release: expected,
   });
   return result;
 };
@@ -114,7 +121,7 @@ const args = new Map();`));
     expect(result.fabricRelease).toBe(current);
     expect(JSON.parse(result.text)).toMatchObject({
       worker: pathToFileURL(path.join(current, "dist/worker.js")).href,
-      extension: path.join(current, "dist/index.js"), release: current,
+      extension: path.join(current, PACKAGE_ENTRY), release: current,
     });
   });
 
@@ -124,7 +131,7 @@ const args = new Map();`));
     const alias = path.join(f.root, "parent-alias");
     fs.symlinkSync(f.parent, alias, "junction");
     const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
-      workerPath: path.join(alias, "dist/worker.js"), fabricExtensionPath: path.join(alias, "dist/index.js"),
+      workerPath: path.join(alias, "dist/worker.js"), fabricExtensionPath: path.join(alias, PACKAGE_ENTRY),
       fullCodeMode: true, runRoot: path.join(f.root, "alias-runs"),
     });
     managers.push(manager);
@@ -137,7 +144,7 @@ const args = new Map();`));
     const custom = path.join(f.parent, "custom-worker.mjs");
     fs.writeFileSync(custom, worker);
     const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
-      workerPath: custom, fabricExtensionPath: path.join(f.parent, "dist/index.js"),
+      workerPath: custom, fabricExtensionPath: path.join(f.parent, PACKAGE_ENTRY),
       fullCodeMode: true, runRoot: path.join(f.root, "custom-runs"),
     });
     managers.push(manager);
@@ -174,6 +181,24 @@ const args = new Map();`));
     expect(result.fabricRelease).toBe(current);
     expect(JSON.parse(result.text)).toMatchObject({ worker: pathToFileURL(path.join(current, "dist/worker.js")).href, release: current });
     expect(JSON.parse(result.text).extension).toBeUndefined();
+  });
+
+  it("launches every child with the package's own pi.extensions entry, never the dist/index.js library (pi-fabric#864)", async () => {
+    // Pi loads exactly one Fabric entry from the package; a second, different -e entry
+    // conflicts on fabric_exec and the child dies at load with zero tool calls.
+    expect(PACKAGE_PI_EXTENSIONS).toHaveLength(1);
+    expect(path.normalize(FABRIC_EXTENSION_ENTRY)).toBe(PACKAGE_ENTRY);
+    const f = fixture();
+    expect(fabricExtensionEntry(f.parent)).toBe(path.resolve(f.parent, PACKAGE_PI_EXTENSIONS[0]!));
+    const current = f.release("manifest-entry-current");
+    f.select(current);
+    const selected = JSON.parse((await probe(f, current)).text).extension as string;
+    expect(selected).toBe(path.resolve(current, PACKAGE_PI_EXTENSIONS[0]!));
+    expect(selected).not.toBe(path.join(current, "dist/index.js"));
+    f.select(f.release("manifest-entry-incompatible", WORKER_PROTOCOL_VERSION + 1));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fallback = JSON.parse((await probe(f, f.parent)).text).extension as string;
+    expect(fallback).toBe(path.resolve(f.parent, PACKAGE_PI_EXTENSIONS[0]!));
   });
 
   it("pins the selected extension even outside full-code/recursive mode", async () => {
@@ -230,7 +255,7 @@ const args = new Map();`));
     if (kind === "unversioned") fs.unlinkSync(manifest);
     if (kind === "malformed") fs.writeFileSync(manifest, "not-json");
     if (kind === "missing-worker") fs.unlinkSync(path.join(current, "dist/worker.js"));
-    if (kind === "missing-extension") fs.unlinkSync(path.join(current, "dist/index.js"));
+    if (kind === "missing-extension") fs.unlinkSync(path.join(current, PACKAGE_ENTRY));
     f.select(current);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await probe(f, f.parent);

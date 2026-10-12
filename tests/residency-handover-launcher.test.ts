@@ -13,6 +13,7 @@ import {
 } from "../src/residency/handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "../src/residency/protocol.js";
 import { launchLog, stopAllOwned } from "./helpers/owned-processes.js";
+import { fabricExtensionEntry } from "../src/core/fabric-entry.js";
 
 const cleanups = new Set<() => Promise<void>>();
 afterEach(async () => { await Promise.all([...cleanups].map((cleanup) => cleanup())); });
@@ -40,11 +41,11 @@ async function fixture(mode: "ready" | "exit" | "hang" | "fast-exit", killableMa
   const config: ResidentHostConfig = { format: 1, rootId: "session:supervised", sessionId: "supervised", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot, fullCodeMode: true,
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, nice: 19 }, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
-    workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: path.join(a, "dist/index.js"),
+    workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(a),
     piBinary: path.resolve("tests/fixtures/handover-pi.mjs"), claudeBinary: "fixture-claude", vedaBinary: "fixture-veda", kernel: "typescript", pythonRuntime: "monty",
     piModels: { available: [{ provider: "fixture", id: "A" }], aliases: {}, defaultModel: "fixture/A" } };
   const previous = residentLaunchSpec(config, path.join(a, "dist/residency/pi-entry.js"));
-  const target = residentLaunchSpec({ ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: path.join(b, "dist/index.js"),
+  const target = residentLaunchSpec({ ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(b),
     kernel: "python", pythonRuntime: "cpython", piModels: { available: [{ provider: "fixture", id: "B" }], aliases: {}, defaultModel: "fixture/B" } }, path.join(b, "dist/residency/pi-entry.js"));
   const configPath = path.join(residencyRoot, "config.json"); fs.writeFileSync(configPath, JSON.stringify(previous.config));
   const env = { ...process.env, ...ownership.env, PI_FABRIC_TEST_TARGET_MODE: mode };

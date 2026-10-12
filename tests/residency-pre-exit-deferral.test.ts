@@ -15,6 +15,7 @@ import { residentProcessAlive } from "../src/residency/process-identity.js";
 import { handoverPath, handoverCustodyPath, readHandoverJson, type ResidentHandoverState } from "../src/residency/handover.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "../src/residency/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { fabricExtensionEntry } from "../src/core/fabric-entry.js";
 import { launchLog, stopAllOwned } from "./helpers/owned-processes.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -65,7 +66,7 @@ fs.rmSync = function(file, options) {
       meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"), fullCodeMode: true,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: true, nice: 19 },
       mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
-      workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: path.join(a, "dist/index.js"),
+      workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(a),
       piBinary: path.resolve("tests/fixtures/resident-host-wire-pi.mjs"), claudeBinary: "missing-claude", vedaBinary: "missing-veda",
       piModels: { available: [{ provider: "fixture", id: "A" }], aliases: {}, defaultModel: "fixture/A" } };
     fs.mkdirSync(config.residencyRoot);
@@ -78,7 +79,7 @@ fs.rmSync = function(file, options) {
     await participants.start();
     const mainAgent = { id: identity.id, local: true } as FabricMainAgentTarget;
     const clientA = new ResidencyClient({ config, mesh, participants, mainAgent, hostPath: path.join(a, "dist/residency/launcher.js") });
-    const targetConfig = { ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: path.join(b, "dist/index.js") };
+    const targetConfig = { ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(b) };
     if (mode === "broken-script-B") {
       const broken = path.join(b, "pi-cli.mjs"); fs.writeFileSync(broken, "throw Error('normal B loader failure');"); targetConfig.piBinary = broken;
     }

@@ -187,6 +187,7 @@ const escapeXmlText = (value: string): string =>
 
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
+import { FABRIC_EXTENSION_ENTRY_FILE } from "./core/fabric-entry.js";
 
 // Loaded-code identity of this lazy runtime module. Stable-path lazy imports
 // keep their first evaluation for the life of the host process, so a hash
@@ -1317,7 +1318,7 @@ export class FabricRuntimeState {
             shadowRouting: { jev: structuredClone(this.#config.jev),
               networkAllowed: this.#config.approvals.network === "allow", schemaEnforced: enforceSchema },
             workerPath: this.#paths?.worker ?? fileURLToPath(new URL("./worker.js", import.meta.url)),
-            fabricExtensionPath: this.#paths?.extension ?? fileURLToPath(new URL("./index.js", import.meta.url)),
+            fabricExtensionPath: this.#paths?.extension ?? fileURLToPath(new URL(`./${FABRIC_EXTENSION_ENTRY_FILE}`, import.meta.url)),
             piBinary: resolvePiBinary(),
             claudeBinary:
               process.env.PI_FABRIC_CLAUDE_BINARY ?? this.#config.agents.claude.binary,

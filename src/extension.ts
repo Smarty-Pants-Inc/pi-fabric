@@ -123,6 +123,7 @@ import { captureLoadedFileIdentity } from "./build-identity.js";
 import { ownsRunReplyTool, REPLY_TOOL_NAME } from "./core/reply-tool-identity.js";
 import { readStoppedRuns, takeReloadStoppedNotice } from "./agents/stopped-runs.js";
 import { installSelfReload, reloadTargetUiHold, RELOAD_HELD_TOPIC, RELOADED_TOPIC, SELF_RELOAD_STATUS } from "./lifecycle/self-reload.js";
+import { FABRIC_EXTENSION_ENTRY_FILE } from "./core/fabric-entry.js";
 
 
 export const FABRIC_MANAGED_HOST_VERSION = 1;
@@ -139,7 +140,9 @@ export function createFabricExtension(entryUrl: string) {
 const FABRIC_EXTENSION_ENTRY_PATH = path.resolve(fileURLToPath(entryUrl));
 const FABRIC_ENTRY_DIR = path.dirname(FABRIC_EXTENSION_ENTRY_PATH);
 const FABRIC_RUNTIME_PATHS = {
-  extension: FABRIC_EXTENSION_ENTRY_PATH,
+  // Children, resident hosts and handover load the one entry Pi loads from the package
+  // manifest, even when this Main was loaded through the dist/index.js library entry.
+  extension: entryUrl.endsWith(".ts") ? FABRIC_EXTENSION_ENTRY_PATH : path.join(FABRIC_ENTRY_DIR, FABRIC_EXTENSION_ENTRY_FILE),
   worker: path.join(FABRIC_ENTRY_DIR, "worker.js"),
   residentHost: path.join(FABRIC_ENTRY_DIR, "residency", "launcher.js"),
   skills: path.resolve(FABRIC_ENTRY_DIR, "..", "skillsets"),

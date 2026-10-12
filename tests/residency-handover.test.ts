@@ -20,6 +20,7 @@ import {
   type ResidentHandoverState, type ResidentLauncherIdentity,
 } from "../src/residency/handover.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { FABRIC_EXTENSION_ENTRY, fabricExtensionEntry } from "../src/core/fabric-entry.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "../src/residency/protocol.js";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -31,7 +32,8 @@ function release(root: string, name: string): string {
   const dir = path.join(root, name);
   fs.mkdirSync(path.join(dir, "dist/residency"), { recursive: true });
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module" }));
-  fs.writeFileSync(path.join(dir, "dist/index.js"), "// immutable fixture extension\n");
+  fs.writeFileSync(path.join(dir, "dist/index.js"), "// immutable fixture library\n");
+  fs.writeFileSync(path.join(dir, FABRIC_EXTENSION_ENTRY), "// immutable fixture extension\n");
   fs.writeFileSync(path.join(dir, "dist/residency/pi-entry.js"), "// immutable fixture entry\n");
   // A no-inference probe has its own isolated status; business activations
   // still use the existing deterministic native fake-worker fixture.
@@ -65,7 +67,7 @@ async function fixture(protocolOnly = true) {
     // Keep proof trees stable while custody inspection runs; collection is tested separately.
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, budgetUsd: 0, notifyOnComplete: false, nice: 10 },
     mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
-    workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: path.join(a, "dist/index.js"),
+    workerPath: path.join(a, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(a),
     piBinary: process.execPath, claudeBinary: "fixture-missing-claude", vedaBinary: "fixture-missing-veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
@@ -79,7 +81,7 @@ async function fixture(protocolOnly = true) {
     startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
   await participants.start();
   const previous = residentLaunchSpec(config, path.join(a, "dist/residency/pi-entry.js"));
-  const targetConfig = { ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: path.join(b, "dist/index.js") };
+  const targetConfig = { ...config, workerPath: path.join(b, "dist/worker.js"), fabricExtensionPath: fabricExtensionEntry(b) };
   const target = residentLaunchSpec(targetConfig, path.join(b, "dist/residency/pi-entry.js"));
   const launcher: ResidentLauncherIdentity = { pid: process.pid, processStartTime: processStartTime(process.pid)!,
     token: "existing-launcher", entry: previous.entry, runtime: previous.runtime };
@@ -144,6 +146,17 @@ describe.skipIf(process.platform !== "linux")("resident release plan and idle-po
       expect(f.host.agents.listForUi()).toEqual([]);
       expect(f.idle).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); available.mockRestore(); await f.close(); }
+  });
+
+  it("pins the resident Fabric entry to the package's pi.extensions entry, never the dist/index.js library (pi-fabric#864)", async () => {
+    const f = await fixture(false);
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as { pi: { extensions: string[] } };
+      expect(manifest.pi.extensions.map(entry => path.normalize(entry))).toEqual([path.normalize(FABRIC_EXTENSION_ENTRY)]);
+      expect(f.previous.config.fabricExtensionPath).toBe(path.resolve(f.previous.releaseRoot, manifest.pi.extensions[0]!));
+      expect(() => residentLaunchSpec({ ...f.previous.config, fabricExtensionPath: path.join(f.previous.releaseRoot, "dist/index.js") }, f.previous.entry))
+        .toThrow(/mixes releases/);
+    } finally { await f.close(); }
   });
 
   it("freezes a missing absolute optional binary even if it is later installed", async () => {

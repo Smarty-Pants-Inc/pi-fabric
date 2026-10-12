@@ -7,6 +7,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
+import { FABRIC_EXTENSION_ENTRY, fabricExtensionEntry } from "../src/core/fabric-entry.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -31,9 +32,9 @@ it.each([
     const dir = path.join(root, name); fs.mkdirSync(dir);
     fs.cpSync(path.resolve("dist"), path.join(dir, "dist"), { recursive: true });
     fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
-    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module", pi: { extensions: ["dist/index.js"] } }));
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "pi-fabric", type: "module", pi: { extensions: [FABRIC_EXTENSION_ENTRY] } }));
     fs.writeFileSync(path.join(dir, "dist/worker-protocol.json"), JSON.stringify({ version: protocol }));
-    fs.writeFileSync(path.join(dir, "dist/index.js"), `import fs from 'node:fs'; export default function() { fs.appendFileSync(${JSON.stringify(marks)}, JSON.stringify({ name: ${JSON.stringify(name)}, path: import.meta.url, argv: process.argv }) + '\\n'); }`);
+    fs.writeFileSync(fabricExtensionEntry(dir), `import fs from 'node:fs'; export default function() { fs.appendFileSync(${JSON.stringify(marks)}, JSON.stringify({ name: ${JSON.stringify(name)}, path: import.meta.url, argv: process.argv }) + '\\n'); }`);
     return dir;
   };
   const parent = release("parent"); const incompatible = release("incompatible", WORKER_PROTOCOL_VERSION + 1); const changed = release("changed");
@@ -48,7 +49,7 @@ it.each([
   }
   const select = (dir: string) => fs.writeFileSync(settings, JSON.stringify({ packages: [dir], extensions: [other, caller, rejected], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }));
   select(incompatible);
-  if (change) fs.appendFileSync(path.join(parent, "dist/index.js"), `\nfs.writeFileSync(${JSON.stringify(settings)}, ${JSON.stringify(JSON.stringify({ packages: [changed], extensions: [other, caller, rejected], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }))});\n`);
+  if (change) fs.appendFileSync(fabricExtensionEntry(parent), `\nfs.writeFileSync(${JSON.stringify(settings)}, ${JSON.stringify(JSON.stringify({ packages: [changed], extensions: [other, caller, rejected], defaultProjectTrust: "always", enableInstallTelemetry: false, compaction: { enabled: false }, ...(entry === "cli" ? { retry: { enabled: false } } : {}) }))});\n`);
   const server = http.createServer((request, response) => {
     request.resume(); request.on("end", () => {
       response.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -67,7 +68,7 @@ it.each([
   const loaded = fs.readFileSync(marks, "utf8").trim().split("\n").map(line => JSON.parse(line));
   expect(new Set(loaded.map(row => row.name))).toEqual(new Set(["parent", "other", "caller-hook", "project-hook"]));
   const parentLoads = loaded.filter(row => row.name === "parent");
-  expect(parentLoads.every(row => row.path === pathToFileURL(path.join(parent, "dist/index.js")).href)).toBe(true);
+  expect(parentLoads.every(row => row.path === pathToFileURL(fabricExtensionEntry(parent)).href)).toBe(true);
   // All native Pi process tasks require the SDK final-answer durability/input
   // fence, even when legacy profile retry settings disable automatic recovery.
   expect(parentLoads.every(row => row.argv[1].endsWith(path.join("worker", "task-entry.js")))).toBe(true);

@@ -145,7 +145,11 @@ describe("native compiled actor activation-end result custody", () => {
       spawner: { id: actor.id, kind: "actor", runId: activation.id } });
     expect(store.pending().map(({ result }) => result.id)).toEqual(notify ? [childId] : []);
     // retainRuns:false removes execution artifacts only after production close
-    // has joined custody. This proves shutdown ran; process exit alone cannot.
+    // has joined custody. Nested artifacts belong to the enclosing run (upstream
+    // lineage), so the custody-checked cleanup of that run removes them. This
+    // proves shutdown ran; process exit alone cannot.
+    expect(path.dirname(saved.logFile!).startsWith(path.join(root, "runs", activation.id, "nested"))).toBe(true);
+    await agents.cleanup(activation.id);
     expect(fs.existsSync(path.dirname(saved.logFile!))).toBe(false);
     const restarted = makeOwner();
     cleanups.push(() => restarted.close());

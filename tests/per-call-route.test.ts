@@ -143,6 +143,8 @@ describe("per-call shadow ledger", () => {
     expect(fs.readdirSync(dir).sort()).toEqual(["per-call-routing.2026-10-01.jsonl", "per-call-routing.2026-10-05.jsonl",
       "per-call-routing.2026-10-06.jsonl", "unrelated.2026-01-01.jsonl"]);
     fs.writeFileSync(ledger, "{}\n");
+    // Pin the same-day mtime to `now`: the wall clock is not 2026-10-07 on every runner.
+    fs.utimesSync(ledger, now, now);
     expect(rotatePerCallLedger(ledger, now)).toBe(false);
     expect(fs.existsSync(ledger)).toBe(true);
   });

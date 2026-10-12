@@ -10,7 +10,7 @@ import { callProgram, jevContext, launch, setupJev } from "./jev-test-helpers.js
 const fixture = (fetcher: typeof fetch, overrides = {}) => {
   const jev = setupJev({ fullCodeMode: true, ...overrides }, fetcher);
   const jobs = new FabricShellJobStore();
-  jev.registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
+  jev.registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { allowUnhookedTools: true, shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
   jev.registry.register(new TasksProvider(jobs));
   return { ...jev, jobs, async close() { await jev.registry.close(); await jobs.close(); } };
 };

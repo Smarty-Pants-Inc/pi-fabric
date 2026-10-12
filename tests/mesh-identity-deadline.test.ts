@@ -100,10 +100,12 @@ describe("native identity cannot retain registry custody past a bounded mesh try
     const read = vi.spyOn(atomic, "processIncarnation").mockImplementation(() => slowRead(incarnation));
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
-    const exclusive = mesh.exclusive.bind(mesh);
-    const attempt = vi.spyOn(mesh, "exclusive").mockImplementation((operation, timeout) => {
+    // Adoption claims through a zero-wait state fence (smarty-dev#6477 L2b: withStateFence, a
+    // writeBatch under mesh.withTryLock), no longer mesh.exclusive: spy on the bounded try itself.
+    const tryLock = mesh.withTryLock.bind(mesh);
+    const attempt = vi.spyOn(mesh, "withTryLock").mockImplementation((operation, timeout) => {
       expect(fs.existsSync(path.join(actorRoot, "actors.json.lock", "owner"))).toBe(true);
-      expect(timeout).toBe(0); entered(); return exclusive(operation, timeout);
+      expect(timeout).toBe(0); entered(); return tryLock(operation, timeout);
     });
     const agentManager = new AgentManager(base, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(base, "runs"),
@@ -117,7 +119,11 @@ describe("native identity cannot retain registry custody past a bounded mesh try
       const begin = performance.now();
       await registry.withLock(() => registry.write(registry.records().map(row => ({ ...row, marker: "concurrent setter" }))));
       const registryBlockedMs = performance.now() - begin;
-      expect(registryBlockedMs).toBeLessThan(150);
+      // smarty-dev#7651: this wall-clock window also spans the successor's own startup work on the
+      // same event loop, so a descheduled CI runner can stretch it. The regression it guards is custody
+      // held across the 1200 ms identity read (also pinned structurally: zero-ms try, no read), so
+      // bound it below that read, not at a host-speed constant.
+      expect(registryBlockedMs).toBeLessThan(1200 / 2);
       expect(read).not.toHaveBeenCalled();
       expect(registry.records()[0]!.rootId).toBe("session:dead");
       intact(mesh, held);

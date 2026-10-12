@@ -29,13 +29,21 @@ export interface PriorityModelOutput {
   sections: readonly string[];
 }
 
+/** smarty-dev#6829: "committed" is the resident's request journal, not the registry save,
+ * which may still be vetoed and retrying. The structured state stays "committed" for
+ * back-compatibility; the visible wording says the mutation is accepted, not done. */
+export const residentReceiptState = (receipt: FabricResidentOutcomeReceipt): string =>
+  receipt.state === "committed"
+    ? `committed (accepted; ${receipt.entityKind === "actor" ? "registry save" : "publication"} pending)`
+    : receipt.state;
+
 export const formatResidentOutcomePriority = (receipts: readonly FabricResidentOutcomeReceipt[]): string => [
   receipts.some(receipt => receipt.expired)
     ? "ResidentRequestExpiredError: resident request expired; do not replay or reassign its work. Reconcile the original entity using the receipts below; expiry does not prove rejection or writer exit."
     : "ResidentOutcomeUnknownError: resident mutation outcome unknown; reconcile the receipts below.",
   "Do not retry or reassign this work. Check agents.actorStatus / agents.status / agents.list; publication may still be pending. Use agents.stop with the known ID once registered to cancel.",
   `Resident receipts (${receipts.length}):`,
-  ...receipts.map(receipt => `- state=${receipt.state}${receipt.expired ? ", expired=true" : ""}, operation=${receipt.operation}, requestId=${receipt.requestId}, ` +
+  ...receipts.map(receipt => `- state=${residentReceiptState(receipt)}${receipt.expired ? ", expired=true" : ""}, operation=${receipt.operation}, requestId=${receipt.requestId}, ` +
     `${receipt.entityKind}Id=${receipt.id ?? "not yet known"}, ownerHostId=${receipt.ownerHostId ?? "not yet known"}`),
 ].join("\n");
 

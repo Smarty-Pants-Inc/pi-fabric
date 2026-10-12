@@ -1,7 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { LiteralCallScanner } from "../src/speculation/scanner.js";
+import { TIER_A_SPECULATION_REFS } from "../src/speculation/eligibility.js";
 
 describe("LiteralCallScanner", () => {
+  it("recognizes every Tier-A namespace", () => {
+    for (const ref of TIER_A_SPECULATION_REFS) {
+      expect(new LiteralCallScanner().push(`await ${ref}({});`), ref).toEqual([{ ref, args: {} }]);
+    }
+  });
+
+  it("does not speculate on a shadowed mesh namespace", () => {
+    expect(new LiteralCallScanner().push('const mesh = other; mesh.scheduled({});')).toEqual([]);
+  });
+
   it("detects a single-object literal call", () => {
     const scanner = new LiteralCallScanner();
     const found = scanner.push('const a = await pi.read({ path: "src/index.ts" });');

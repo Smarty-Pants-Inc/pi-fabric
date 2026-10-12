@@ -34,23 +34,49 @@ const runThresholdCompact = (
   });
 });
 
-export const compactAtConfiguredThreshold = async (
+export type AutoCompactionTrigger = "headroom" | "tokens" | "ratio";
+
+// Headroom left in the window for the next response. `outputReserveTokens`
+// of 0 disables the trigger; unknown usage never triggers.
+export const outputReserveBreached = (
+  usage: { tokens: number | null; contextWindow: number } | undefined,
+  outputReserveTokens: number,
+): boolean =>
+  outputReserveTokens > 0
+  && usage !== undefined
+  && usage.tokens !== null
+  && Number.isFinite(usage.contextWindow)
+  && usage.contextWindow > 0
+  && usage.contextWindow - usage.tokens < outputReserveTokens;
+
+const autoCompactionTrigger = (
   context: ExtensionContext,
   config: FabricConfig,
-): Promise<boolean> => {
+): AutoCompactionTrigger | undefined => {
   const modelKey = modelCompactionKey(context.model);
   const usage = context.getContextUsage();
-  if (usage === undefined) return false;
+  if (usage === undefined) return undefined;
+
+  if (outputReserveBreached(usage, config.compaction.outputReserveTokens)) return "headroom";
 
   const tokenThreshold = configuredCompactionTokenThreshold(config, modelKey);
   if (tokenThreshold !== undefined) {
-    if (usage.tokens === null || usage.tokens < tokenThreshold) return false;
-    return runThresholdCompact(context);
+    return usage.tokens !== null && usage.tokens >= tokenThreshold ? "tokens" : undefined;
   }
 
   const threshold = configuredCompactionThreshold(config, modelKey);
-  if (threshold === undefined || usage.percent === null) return false;
-  if (usage.percent / 100 < threshold) return false;
+  if (threshold === undefined || usage.percent === null) return undefined;
+  return usage.percent / 100 >= threshold ? "ratio" : undefined;
+};
 
-  return runThresholdCompact(context);
+export const compactAtConfiguredThreshold = async (
+  context: ExtensionContext,
+  config: FabricConfig,
+  onTrigger?: (trigger: AutoCompactionTrigger, committed: boolean) => void,
+): Promise<boolean> => {
+  const trigger = autoCompactionTrigger(context, config);
+  if (trigger === undefined) return false;
+  const committed = await runThresholdCompact(context);
+  onTrigger?.(trigger, committed);
+  return committed;
 };

@@ -136,6 +136,7 @@ describe("persistent actor validWhile", () => {
       `return agents.create({
         name: "advisor",
         instructions: "Advise.",
+        records: { topic: "org.records", maxEntries: 32 },
         validWhile: ({ activation, current }) =>
           activation.kind !== "hostEvent" || activation.taskRevision === current.taskRevision,
       });`,
@@ -148,6 +149,7 @@ describe("persistent actor validWhile", () => {
     );
     expect(result.terminationReason).toBe("completed");
     expect(received?.validWhile).toMatchObject({ version: 1 });
+    expect(received?.records).toEqual({ topic: "org.records", maxEntries: 32 });
     expect((received?.validWhile as { source: string }).source).toContain("taskRevision");
   });
 

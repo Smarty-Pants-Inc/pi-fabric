@@ -11,9 +11,9 @@ const DEFAULT_LOCK_ATTEMPTS = 50;
 const DEFAULT_LOCK_DELAY_MS = 5;
 const DEFAULT_STALE_LOCK_MS = 30_000;
 
-import type { ExclusiveLockOptions } from "./atomic-write.js";
+import { FileLockTimeoutError, type ExclusiveLockOptions } from "./atomic-write.js";
 export type { ExclusiveLockOptions } from "./atomic-write.js";
-export { withExclusiveFileLock } from "./atomic-write.js";
+export { FileLockTimeoutError, withExclusiveFileLock } from "./atomic-write.js";
 
 const errorCode = (error: unknown): string | undefined =>
   typeof error === "object" && error !== null && "code" in error
@@ -108,13 +108,20 @@ export const withExclusiveFileLockAsync = async <T>(
             continue;
           }
         }
-      } catch {
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
         try {
           const first = await fs.promises.stat(lock);
           if (
             Date.now() - first.mtimeMs > staleMs &&
             await reapStaleLockAsync(lock, async (claimed) => {
               try {
+                try {
+                  await fs.promises.readFile(path.join(claimed, "owner"), "utf8");
+                  return false;
+                } catch (error) {
+                  if (errorCode(error) !== "ENOENT") return false;
+                }
                 return Date.now() - (await fs.promises.stat(claimed)).mtimeMs > staleMs;
               } catch {
                 return false;
@@ -131,7 +138,7 @@ export const withExclusiveFileLockAsync = async <T>(
       await sleepAsync(delayMs);
     }
   }
-  if (!acquired) throw new Error(options.timeoutMessage);
+  if (!acquired) throw new FileLockTimeoutError(options.timeoutMessage);
   try {
     return await operation();
   } finally {

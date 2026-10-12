@@ -69,7 +69,7 @@ Import `FabricCacheHoldResult` as a type from `pi-fabric/protocol`. Inspect its 
 
 ## Boundaries and future work
 
-Stable prompt construction already lives in [model-guidance components](components.md#prompt-cache-and-cold-prefill-behavior). Do not inject clocks, task state, or cache diagnostics into the stable prefix.
+Stable prompt construction already lives in [model-guidance components](components.md#prompt-cache-and-cold-prefill-behavior). Built-in provider guidance depends only on configuration and resolves from the first agent start, so it stays out of activation-timing churn. Do not inject clocks, task state, or cache diagnostics into the stable prefix.
 
 An actor activation reuses its session file and closes its Pi child after settlement, so a persistent actor transcript has no live Pi worker process to warm. Idle actor warming needs a separately designed live-runtime retention capability; this change does not keep children alive, alter durable residency, or route cache control across participants.
 

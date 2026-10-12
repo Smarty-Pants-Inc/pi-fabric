@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { terminatePosixGroup } from "../child-process-tree.js";
 import { runAbortable } from "../async-settlement.js";
@@ -25,6 +26,9 @@ export interface JevEvaluateOptions {
   /** Absolute deadline (epoch ms) for ALL of this request's work. It caps jev.requestTimeoutMs and is sent
    * to the gateway as `expiresAt`, so neither side keeps working (or charging) past the caller's decision. */
   deadline?: number;
+  /** Direct route only: send the model-resolved request through this dispatcher (a jev-fabric `serve`
+   * connection) instead of HTTPS. A gateway-bound client never reaches it. */
+  dispatch?: JevDispatch;
 }
 /** The effective absolute deadline: the request timeout, capped by the caller's own deadline. */
 export function jevDeadline(requestTimeoutMs: number, deadline?: number, now = Date.now()): number {
@@ -94,7 +98,7 @@ export class JevCredentials {
         // execFile does NOT support detached. spawn an argv command (no shell)
         // in its own POSIX group so stopping descendants cannot hit the host.
         child = spawn(file, args, {
-          detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+          env: childProcessEnvironment(), detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
         });
       } catch {
         reject(new Error("Jev credential resolver failed"));
@@ -156,6 +160,13 @@ export class JevCredentials {
   }
   clear(): void { this.#cached = undefined; }
 }
+/**
+ * Sends one validated, model-resolved request and returns the raw JSON answer.
+ * The default posts to the route over HTTPS; a jev-fabric `serve` connection
+ * can take its place. Either way the answer is checked again here.
+ */
+export type JevDispatch = (request: JevRequest & { model: string }, credential: string, signal: AbortSignal) => Promise<unknown>;
+
 export class JevClient {
   readonly credentials: JevCredentials;
   /** Actual operations, not the abort-raced waiters; host credential APIs may not cancel. */
@@ -183,6 +194,7 @@ export class JevClient {
   get viaGateway(): boolean { return this.#gateway !== undefined; }
   async evaluate(request: JevRequest, signal: AbortSignal, options: JevEvaluateOptions = {}): Promise<JevResponse> {
     checkRequest(request, this.config.maxRequestBytes);
+    const { dispatch } = options;
     const deadline = jevDeadline(this.config.requestTimeoutMs, options.deadline);
     if (this.#gateway) {
       if (options.use !== undefined && options.use !== this.#gateway.use) {
@@ -200,6 +212,15 @@ export class JevClient {
       void pending.then(() => this.#pendingCredentials.delete(pending), () => this.#pendingCredentials.delete(pending));
       return pending;
     });
+    if (dispatch) {
+      let answer: unknown;
+      try {
+        answer = await runAbortable(timedSignal, () => dispatch({ ...request, model }, key, timedSignal));
+      } catch (error) {
+        throw new Error(timedSignal.aborted ? "Jev request cancelled or timed out" : error instanceof Error ? error.message.slice(0, 500) : "Jev dispatch failed");
+      }
+      return checkResponse(answer, request);
+    }
     const body = jsonText({ ...request, model }, this.config.maxRequestBytes, "Jev request");
     let response: Response;
     try {
@@ -219,6 +240,7 @@ export class JevClient {
     if (!reader) throw new Error(`${this.route.label} returned an empty response`);
     const chunks: Uint8Array[] = [];
     let bytes = 0;
+    let parsed: unknown;
     try {
       for (;;) {
         const { value, done } = await runAbortable(timedSignal, () => reader.read());
@@ -227,9 +249,18 @@ export class JevClient {
         if (bytes > 1_048_576) throw new Error("oversize");
         chunks.push(value);
       }
-      return checkResponse(JSON.parse(Buffer.concat(chunks).toString("utf8")), request);
+      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      return checkResponse(parsed, request);
     } catch {
-      throw new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
+      const error = new Error(timedSignal.aborted ? "Jev response cancelled or timed out" : `${this.route.label} returned an invalid or oversized typed response`);
+      // A malformed answer was still billed: keep the reported usage so the caller
+      // can account it instead of treating the spend as unknown.
+      const usage = (parsed as { usage?: { input_tokens?: unknown; output_tokens?: unknown } } | undefined)?.usage;
+      if (usage && Number.isSafeInteger(usage.input_tokens) && Number.isSafeInteger(usage.output_tokens) &&
+          (usage.input_tokens as number) >= 0 && (usage.output_tokens as number) >= 0) {
+        Object.assign(error, { jevUsage: { input: usage.input_tokens as number, output: usage.output_tokens as number } });
+      }
+      throw error;
     } finally { await reader.cancel().catch(() => undefined); }
   }
   /** The gateway owns the key, the budget and the meter; Fabric sends the exact typed body and reads

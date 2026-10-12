@@ -61,16 +61,18 @@ describe("Security R3 S4 orphan adoption shutdown custody", () => {
     expect(JSON.parse(backlog).items).toEqual([expect.objectContaining({ id: accepted.messageId, source: "direct" })]);
     const entered = deferred(), release = deferred(), completed = deferred();
     const lock = ActorRegistryStore.prototype.withLock;
-    const exclusive = mesh.exclusive.bind(mesh);
+    const writeBatch = mesh.writeBatch.bind(mesh);
     const spy = fence === "registry"
       ? vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function<T>(this: ActorRegistryStore, operation: () => T | Promise<T>): Promise<T> {
         entered.resolve(); await release.promise;
         try { return await lock.call(this, operation) as T; } finally { completed.resolve(); }
       })
-      : vi.spyOn(mesh, "exclusive").mockImplementation(async operation => {
+      // Adoption's state fence (a no-op writeBatch, smarty-dev#6477 L2b), not exclusive().
+      : vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+        if (input.ops.length > 0 || !input.prepare || input.afterCommit) return writeBatch(input);
         expect(fs.existsSync(path.join(registry + ".lock", "owner"))).toBe(true);
         entered.resolve(); await release.promise;
-        try { return await exclusive(operation); } finally { completed.resolve(); }
+        try { return await writeBatch(input); } finally { completed.resolve(); }
       });
     const next = new ActorManager("successor", identity(successor), mesh, config, agents, vi.fn(), {
       actorRoot, persistent: true, rootId: successor, claimResidency: residency, project: root, role: "project-agent", adoptionGraceMs: 0,

@@ -355,7 +355,7 @@ describe("CompactController", () => {
     });
 
     // Newer Pi adds a required `outcome`; the assertion keeps this compiling on both.
-    const settled = { type: "agent_settled", outcome: "completed" } as Parameters<typeof runner.emit>[0];
+    const settled = { type: "agent_settled", outcome: "completed", aborted: false } as Parameters<typeof runner.emit>[0];
     const emitted = runner.emit(settled).then(() => {
       timeline.push("public:agent_settled");
     });

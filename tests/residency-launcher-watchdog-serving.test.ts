@@ -15,6 +15,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { FABRIC_EXTENSION_ENTRY } from "../src/core/fabric-entry.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -94,7 +95,7 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, identity.id), fullCodeMode: true,
       agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, notifyOnComplete: false, retainRuns: true, nice: 19, sessionExport: false, timeoutMs: 120_000 },
       mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
-      workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve("dist/index.js"),
+      workerPath: path.resolve("dist/worker.js"), fabricExtensionPath: path.resolve(FABRIC_EXTENSION_ENTRY),
       piBinary, claudeBinary: "missing-claude", vedaBinary: "missing-veda",
       piModels: { available: [{ provider: "watchdog-offline", id: "activation" }], aliases: {}, defaultModel: "watchdog-offline/activation" },
       watchdog: { intervalMs: 100, stallMs: 6_000, coldStartMs: 0 } };

@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ProfileSettingsError, resolveProfileExtensions } from "../src/worker/profile-extensions.js";
 import { resolveRetrySdk } from "../src/worker/retry-profile.js";
 import { recoveryTimeScale } from "../src/worker/recovery-watchdog.js";
+import { FABRIC_EXTENSION_ENTRY } from "../src/core/fabric-entry.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
@@ -45,8 +46,8 @@ const fixture = () => {
     const target = path.join(root, name); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, text); return target;
   };
   const settings = (value: unknown) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify(value));
-  const pinned = file("parent/dist/index.js");
-  file("parent/package.json", JSON.stringify({ name: "pi-fabric", type: "module", pi: { extensions: ["dist/index.js"] } }));
+  const pinned = file(path.join("parent", FABRIC_EXTENSION_ENTRY));
+  file("parent/package.json", JSON.stringify({ name: "pi-fabric", type: "module", pi: { extensions: [FABRIC_EXTENSION_ENTRY] } }));
   return { root, profile, file, settings, pinned };
 };
 const profileResult = (f: ReturnType<typeof fixture>) => resolveProfileExtensions(f.pinned, { PI_CODING_AGENT_DIR: f.profile });

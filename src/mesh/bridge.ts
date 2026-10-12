@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE } from "../core/atomic-write.js";
+import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -10,7 +10,7 @@ import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
@@ -118,12 +118,15 @@ export const isWorkTopic = (topic: unknown): topic is string => {
   return true;
 };
 
-/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), and owner wakes. */
-export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolean =>
+/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
+ * mesh-outage alarm and its recovery, only when addressed to one `session:<uuid>` (pi-fabric#893 rounds 4-5). */
+export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
   isWorkTopic(event.topic) ||
-  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
+  (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
+    isMeshAlarmTarget(event.to));
 
 /**
  * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
@@ -1006,7 +1009,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
   const principal = copyFabricPrincipal(input.principal);
-  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
+  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind, to })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
   if (!isIdentity(from)) throw new Error("Bridge publish has no sender identity");
@@ -2130,7 +2133,7 @@ export class MeshBridge {
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);
+              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {

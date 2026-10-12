@@ -22,7 +22,7 @@ import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from ".
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
 import { normalizeModelAliases, type FabricModelCandidate } from "../core/model-resolution.js";
@@ -39,6 +39,7 @@ import type { FabricActorInfo } from "../actors/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager } from "../agents/manager.js";
 import { terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
+import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
@@ -139,6 +140,23 @@ const readJson = <T>(filePath: string): T | undefined => {
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+// The resident host runs Pi with --no-extensions, so a custom runner is only
+// registered here when its residentModule is imported (once per process).
+const runnerModules = new Map<string, Promise<void>>();
+const loadRunnerModule = (specifier: string): Promise<void> => {
+  if (!/^(?:\/|[A-Za-z]:[\\/]|file:)/.test(specifier)) {
+    return Promise.reject(new Error(`Fabric runner module must be absolute: ${specifier}`));
+  }
+  const url = specifier.startsWith("file:") ? specifier : pathToFileURL(specifier).href;
+  let pending = runnerModules.get(url);
+  if (!pending) {
+    pending = import(url).then(() => undefined);
+    runnerModules.set(url, pending);
+    pending.catch(() => runnerModules.delete(url));
+  }
+  return pending;
+};
+
 export class ResidentHostAlreadyRunning extends Error {}
 
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
@@ -187,6 +205,30 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
   return config as ResidentHostConfig;
 };
 
+/**
+ * The resident host's idle rule. Live durable participants, queued work or a
+ * pending request keep it alive; pending mesh schedules do too while at least
+ * one durable participant could receive them, and `wakeAt` names the next due
+ * time so the host releases it on time. Without durable participants a
+ * schedule waits for the next Fabric process that touches the mesh.
+ */
+export const residentIdleDecision = (input: {
+  now: number;
+  idleSince: number;
+  activeActor: boolean;
+  activeAgent: boolean;
+  pendingRequest: boolean;
+  durableParticipants: boolean;
+  nextScheduleDueAt: number | undefined;
+  idleExitMs?: number;
+}): { busy: boolean; exit: boolean; wakeAt?: number } => {
+  const holdsSchedules = input.nextScheduleDueAt !== undefined && input.durableParticipants;
+  const wakeAt = holdsSchedules ? input.nextScheduleDueAt : undefined;
+  const busy = input.activeActor || input.activeAgent || input.pendingRequest || holdsSchedules;
+  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? IDLE_EXIT_MS);
+  return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
+};
+
 export class ResidentHost {
   readonly hostId: string;
   readonly identity: MeshIdentity;
@@ -226,6 +268,8 @@ export class ResidentHost {
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
+  #scheduleTimer: NodeJS.Timeout | undefined;
+  #scheduleWakeAt: number | undefined;
   #pollingRequests = false;
   // Boundary commands retain response custody without occupying serial admission.
   readonly #boundaryRequests = new Map<string, Promise<void>>();
@@ -651,6 +695,7 @@ export class ResidentHost {
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
       this.#recoverInterruptedRequests();
+      await this.#recoverHostedRuns();
       const firstSeenAgents = new Map<string, number>();
       this.participants.registerSource(() =>
         agentParticipantRecords(
@@ -787,6 +832,8 @@ export class ResidentHost {
     const routeClosed = this.#routeOwner?.close();
     if (this.#requestTimer) clearInterval(this.#requestTimer);
     this.#requestTimer = undefined;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
     if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
     this.#requestRetention.close();
@@ -895,7 +942,7 @@ export class ResidentHost {
           command.data,
           signal,
           { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id, undefined, { fresh: true })?.rootId) },
+            this.participants.get(from.id, undefined, { fresh: true })?.rootId), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -924,7 +971,7 @@ export class ResidentHost {
       await this.actors.resolveActivationBinding(command.targetId, options);
       if (this.#closed) return { accepted: false, error: HOST_CLOSING_RETRY };
       assertMeshConsumption(() => this.participants.canConsumeMesh());
-      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options });
+      const result = this.actors.tell(command.targetId, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (error instanceof MeshConsumptionPausedError) throw error;
@@ -1243,7 +1290,23 @@ export class ResidentHost {
       try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
       catch { return false; }
     });
-    if (activeActor || activeAgent || pendingRequest || this.#admissions) {
+    let nextScheduleDueAt: number | undefined;
+    try {
+      nextScheduleDueAt = this.mesh.nextScheduleDueAt();
+    } catch {
+      // Unreadable schedules neither keep the host alive nor stop it.
+    }
+    const decision = residentIdleDecision({
+      now,
+      idleSince: this.#idleSince,
+      activeActor,
+      activeAgent,
+      pendingRequest,
+      durableParticipants: activeActor || activeAgent,
+      nextScheduleDueAt,
+    });
+    this.#armScheduleWake(decision.wakeAt);
+    if (decision.busy || this.#admissions) {
       this.#idleSince = now;
       return;
     }
@@ -1254,6 +1317,24 @@ export class ResidentHost {
       return;
     }
     this.onIdle("idle-exit");
+  }
+
+  // Re-armed on every idle check: the due time of the earliest pending
+  // schedule, released here even if no actor monitor polls in time.
+  #armScheduleWake(wakeAt: number | undefined): void {
+    if (wakeAt === this.#scheduleWakeAt) return;
+    if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
+    this.#scheduleTimer = undefined;
+    this.#scheduleWakeAt = wakeAt;
+    if (wakeAt === undefined || this.#closed) return;
+    this.#scheduleTimer = setTimeout(() => {
+      this.#scheduleTimer = undefined;
+      this.#scheduleWakeAt = undefined;
+      void this.mesh.releaseDueSchedules().catch(() => undefined).finally(() => {
+        if (!this.#closed) this.#checkIdle();
+      });
+    }, Math.min(Math.max(0, wakeAt - Date.now()), 2_147_000_000));
+    this.#scheduleTimer.unref();
   }
 
   #trackPublication(promise: Promise<unknown>): void {
@@ -1527,6 +1608,7 @@ export class ResidentHost {
         if (
           command.request.residentStartupProbe ||
           command.request.sessionSeed ||
+          command.request.forkSeed ||
           command.request.sessionFile ||
           command.request.actorId ||
           command.request.actorName ||
@@ -1536,11 +1618,14 @@ export class ResidentHost {
         ) {
           throw new Error("Durable agents.spawn accepts only its public task and run settings");
         }
+        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
         // No executor fallback: revalidate the captured caller before the mutation fence.
         const caller = command.caller;
         const returnAddress = assertResidentTaskCaller(caller,
           caller && this.participants.get(caller.id, Date.now(), { fresh: true }), this.config.rootId);
         const handle = await this.agents.spawn({ ...command.request, residency: "durable" }, undefined, undefined, commit, undefined, undefined, undefined, returnAddress);
+        // spawn already validated the forwarded scope; record what the child received.
+        const scope = launchScope(command.request.scope, command.request.inheritedScope);
         const runDirectory = this.agents.runDirectory(handle.id);
         if (!runDirectory) {
           // Durable metadata currently requires an admitted run directory. Never
@@ -1558,6 +1643,8 @@ export class ResidentHost {
           runDirectory,
           handle: { ...handle, residency: "durable" },
           ...(worktreeGitRoot ? { worktreeGitRoot } : {}),
+          ...(command.runnerModule ? { runnerModule: command.runnerModule } : {}),
+          ...(scope ? { scope } : {}),
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -1742,6 +1829,29 @@ export class ResidentHost {
     else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
   }
 
+  /**
+   * Re-import the runner modules recorded for this host's durable runs, then
+   * re-attach their hosted runs from the persisted locators. A run whose
+   * runner cannot be loaded settles indeterminate; nothing is re-submitted.
+   */
+  async #recoverHostedRuns(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.#agentsPath).filter((entry) => entry.endsWith(".json"));
+    } catch {
+      entries = [];
+    }
+    const modules = new Set<string>();
+    for (const entry of entries) {
+      const metadata = readJson<ResidentAgentMetadata>(path.join(this.#agentsPath, entry));
+      if (metadata?.rootId === this.config.rootId && typeof metadata.runnerModule === "string") {
+        modules.add(metadata.runnerModule);
+      }
+    }
+    for (const module of modules) await loadRunnerModule(module).catch(() => undefined);
+    await this.agents.recoverHostedRuns().catch(() => []);
+  }
+
   #recoverInterruptedRequests(): void {
     let entries: string[];
     try {
@@ -1761,6 +1871,7 @@ export class ResidentHost {
         requestId,
         ok: false,
         error: "Fabric residency outcome is indeterminate after resident host restart",
+        outcome: "indeterminate",
         completedAt: Date.now(),
       };
       atomicWrite(path.join(this.#responsesPath, entry), response);

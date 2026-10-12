@@ -450,6 +450,14 @@ export class AtomicFileWriter {
   }
 }
 
+/** Contention is retryable; permission, I/O, and operation errors are not (upstream file-lock). */
+export class FileLockTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FileLockTimeoutError";
+  }
+}
+
 export interface ExclusiveLockOptions {
   directory: string;
   lockName: string;
@@ -570,7 +578,7 @@ export const withExclusiveFileLock = <T>(
       syncSleep(delayMs);
     }
   }
-  if (!acquired) throw new Error(options.timeoutMessage);
+  if (!acquired) throw new FileLockTimeoutError(options.timeoutMessage);
   try {
     return operation();
   } finally {

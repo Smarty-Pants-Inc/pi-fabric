@@ -17,6 +17,7 @@ describe.skipIf(!built)("entropy compile after session dispose (#8881)", () => {
   const roots: string[] = [];
   const saved = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
@@ -25,7 +26,7 @@ describe.skipIf(!built)("entropy compile after session dispose (#8881)", () => {
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const start = async () => {
+  const start = async (fakeTimers = false) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-dispose-")));
     roots.push(root);
     const agentDir = path.join(root, "agent");
@@ -53,8 +54,18 @@ describe.skipIf(!built)("entropy compile after session dispose (#8881)", () => {
       fauxAssistantMessage("done"),
     ]);
     const warn = vi.spyOn(console, "warn");
-    await session.prompt("work");
-    return { session, agentDir, nextAgentDir, warn };
+    if (!fakeTimers) {
+      await session.prompt("work");
+      return { session, agentDir, nextAgentDir, warn, elapsedMs: 0 };
+    }
+    // Fake setTimeout only (file I/O and setImmediate stay real): the run advances in 1 ms steps, so the delayed
+    // compile's clock is exactly what the run used, however slow the runner (#910 review).
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let done = false, elapsedMs = 0;
+    const running = session.prompt("work").finally(() => { done = true; });
+    while (!done && elapsedMs < 60_000) { await vi.advanceTimersByTimeAsync(1); elapsedMs++; }
+    await running;
+    return { session, agentDir, nextAgentDir, warn, elapsedMs };
   };
   const compileWarnings = (warn: { mock: { calls: unknown[][] } }): string[] =>
     warn.mock.calls.map((call: unknown[]) => String(call[0])).filter((line: string) => line.includes("entropy compile"));
@@ -70,10 +81,13 @@ describe.skipIf(!built)("entropy compile after session dispose (#8881)", () => {
   }, 60_000);
 
   it("a session disposed inside the compile delay runs no compile and touches no later agent dir", async () => {
-    const { session, nextAgentDir, warn } = await start();
+    const { session, nextAgentDir, warn, elapsedMs } = await start(true);
+    expect(elapsedMs).toBeLessThan(250);                  // the compile's 250 ms delay has not run out yet
+    expect(compileWarnings(warn)).toEqual([]);
     session.dispose();                                    // no session_shutdown, inside the 250 ms delay
     process.env.PI_CODING_AGENT_DIR = nextAgentDir;      // the next session's agent dir
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await vi.advanceTimersByTimeAsync(5_000);             // well past the delay: a surviving compile runs now
+    await new Promise((resolve) => setImmediate(resolve));
     expect(compileWarnings(warn)).toEqual([]);
     expect(fs.readdirSync(nextAgentDir)).toEqual([]);   // nothing read-then-written for the next session
   }, 60_000);

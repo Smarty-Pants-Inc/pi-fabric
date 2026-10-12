@@ -168,7 +168,9 @@ export interface StateBackendDiagnostics {
   /** shadow/sqlite: the SQLite database file. */
   database?: string;
   /** nats: the stream, the projector's applied and known sequences, the stream status, CAS retries. */
-  nats?: { stream: string; appliedSeq: number; knownSeq: number; status: string; casRetries: number; failure?: string };
+  nats?: { stream: string; appliedSeq: number; knownSeq: number; status: string; casRetries: number;
+    /** The last complete snapshot's end sequence (0: none), snapshots this host took, purge gaps it reloaded from. */
+    snapshotSeq: number; snapshots: number; resyncs: number; resyncing: boolean; failure?: string };
 }
 
 /** One divergence: the key, and what each side holds (undefined: absent). */

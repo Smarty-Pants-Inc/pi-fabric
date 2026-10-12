@@ -1,6 +1,6 @@
 # MCP surface — Python
 
-MCP is backed by mcporter discovery, OAuth cache, and pooled connections. All calls are awaited; arguments/results use native dictionaries. Discover uncertain schemas rather than guessing fields. Never launch another interpreter to call MCP.
+MCP defaults to mcporter discovery, OAuth cache, and pooled connections. Hosts may select exact Pi-owned servers with `mcp.nativeServers` without changing the guest API. All calls are awaited; arguments/results use native dictionaries. Discover uncertain schemas rather than guessing fields. Never launch another interpreter to call MCP.
 
 ```python
 result = await mcp.context7.resolve_library_id(libraryName="react", query="hooks")
@@ -20,4 +20,4 @@ return await mcp.call(server="my-server", tool="weird-tool-name", args={"q": "x"
 return await tools.describe(ref="mcp.context7.resolve_library_id")
 ```
 
-Inspect inputSchema first and outputSchema when supplied. `tools.search` discovers current refs; `tools.search(query=..., searchMode="semantic")` is opt-in Jev ranking (enable under /fabric settings → MCP; block individual cached servers there). `tools.call(ref=..., args=...)` invokes a computed one. `mcp.disableOAuth` permits cached credentials but prevents new interactive OAuth; calls respect mcp.callTimeoutMs. mcp.enabled=False disables this surface. Never expose credentials in model results.
+Inspect inputSchema first and outputSchema when supplied. `tools.search` discovers current refs; `tools.search(query=..., searchMode="semantic")` is opt-in Jev ranking (enable under /fabric settings → MCP; block individual cached servers there). `tools.call(ref=..., args=...)` invokes a computed one. Pi-owned servers have `transport: "pi"` in server metadata; manage them with Pi's `/mcp`, not `mcp.reload` or `mcp.register`. There is no automatic transport fallback. Native results keep Fabric's text/content/structuredContent shape after native middleware redaction. `mcp.disableOAuth` controls mcporter only; Pi owns native authentication. Calls respect mcp.callTimeoutMs. mcp.enabled=False disables this surface. Never expose credentials in model results.

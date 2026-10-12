@@ -1,3 +1,4 @@
+import { fabricToolLoadout } from "./core/tool-ownership.js";
 import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@earendil-works/pi-ai";
 import { Container, Text, type Component } from "@earendil-works/pi-tui";
@@ -162,6 +163,8 @@ export const createFabricExecTool = (
   pendingHandoffs: Map<string, PendingFabricHandoff>,
   decorateShell: FabricToolShellDecorator = withCodePreviewShell,
   toolDisplay?: FabricToolDisplayController,
+  // Host-owned tools the model keeps in exclusive modes (the run's fabric_reply, smarty-dev#967).
+  hostForeground: () => readonly string[] = () => [],
 ): ToolDefinition<any, any, any> => {
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
@@ -177,12 +180,24 @@ export const createFabricExecTool = (
   return decorateShell(
   defineTool({
     name: "fabric_exec",
+    // Native codemode-only hides direct tools. An orchestrator must stay model-only.
+    exposure: "model-only",
+    prepareLoadout: (loadout) => {
+      // SDK/CLI reload rebuilds the registry before session_start bootstraps
+      // the replacement extension. That transient loadout is not a request.
+      if (!state.bootstrapped) return undefined;
+      return fabricToolLoadout(
+        loadout,
+        state.config.fullCodeMode || state.config.schema.mode === "enforce",
+        [...state.foregroundTools(loadout.declared.map((tool) => tool.name)).tools, ...hostForeground()],
+      );
+    },
     label: "Fabric",
     description: python
       ? monty
         ? "Execute Python through Fabric's configured Monty sandbox. Monty runs a Python subset with VM resource limits, no native filesystem/network/environment access, and only host-mediated tools. Each invocation starts fresh. This is the exclusive model tool path in full code mode and Schema enforce mode."
         : "Execute Python through Fabric’s configured CPython kernel for Pi core tools, MCP, providers, discovery, and extensions. Each call uses a fresh process. Native execution is trusted code; Schema enforce requires OS isolation. This is the exclusive model tool path in full code mode and Schema enforce mode."
-      : "Execute type-checked TypeScript through Fabric's configured executor for Pi core tools, MCP, Fabric providers, discovery, and extensions. QuickJS is isolated by default; the optional Node/Bun process is an unsafe trusted-code escape hatch. In full code mode, and always in Schema enforce mode, this is the exclusive model tool path.",
+      : "Execute code through Fabric's TypeScript kernel: type-checked TypeScript by default, unmodified JavaScript with executor.codemodeProfile native. Both support nativeTools; native mode places Pi-compatible calls on tools and Fabric discovery on fabric.tools. Compose Pi core tools, MCP, Fabric providers, discovery, and extensions. QuickJS is isolated by default; the optional Node/Bun process is an unsafe trusted-code escape hatch. In full code mode, and always in Schema enforce mode, this is the exclusive model tool path.",
     promptSnippet:
       "Pi core tools, MCP, Fabric providers, discovery, and extensions",
     // Guidance follows the loaded mode (smarty-dev#459): orchestration-only programs have no
@@ -195,7 +210,7 @@ export const createFabricExecTool = (
         python
           ? "Search before reading with `await pi.grep(pattern=..., path=...)` or `await pi.find(pattern=..., path=...)`, then `await pi.read(path=..., offset=..., limit=...)`. Use Python dict syntax, `True`/`False`/`None`, and bounded searches; unbounded reads cap at 2000 lines or 50KB. Read continuation notices when needed."
           : "Search before reading: locate lines with `pi.grep`/`pi.find`, then `pi.read({path, offset, limit})` that range. Escape regex metacharacters, or use `literal:true` for exact punctuated text. Keep fan-out search limits small; widen only on misses. Unbounded reads cap at 2000 lines or 50KB; follow `Use offset=…` notices. Reserve whole-file reads for small files you will use in full.",
-        "For coding tasks, keep an acceptance ledger: turn the request into concrete checks, trace the relevant execution path before editing, implement end to end, then run targeted tests and direct behavioral probes. Mechanically confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger, escalating only for failures or cross-cutting risk; inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
+        "Keep the acceptance ledger in reasoning or concise progress notes (no tool call): define concrete checks, trace execution before editing, implement end to end, then run targeted tests and direct behavioral probes. Confirm requested public symbols, registrations, and configuration entries. Use the smallest checks that cover the ledger; escalate only for failures or cross-cutting risk. Inspect failures and iterate instead of rerunning unchanged passing checks. A build alone is not completion.",
         python
           ? "For test/probe nonzero exits, use `await pi.bash(command=..., settle=True)` and inspect the returned dict: `r['ok']`, `r['output']`, and `r.get('exitCode')`. Set shell `timeout` in seconds once for long suites. Return decisions and evidence rather than raw logs."
           : "Amortize round trips without inflating context: batch only independent, bounded work. Keep search→read and edit→verify sequential when an output determines the next action. Use `settle:true` for tests or probes whose nonzero result is evidence rather than an exceptional stop; for a known long suite, set `pi.bash` `timeout` in seconds once instead of retrying a timed-out call. Filter or summarize noisy command output inside the program and return decisions, failures, and evidence—not raw logs or unused intermediate results.",
@@ -224,9 +239,9 @@ export const createFabricExecTool = (
       code: Type.String({
         description: python
           ? monty
-            ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
-            : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
-          : "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `cache`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
+            ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
+            : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
+          : "TypeScript function body. Top-level await and return are supported. Globals include `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `cache`, `thinking`, `agents`, `mesh`, `print`, and `π`; full-code mode adds `pi` and `extensions`. `π` contains only the exact keys supplied by this call's `payloads`. See session guidance / `fabric-exec` skill for exact signatures.",
       }),
       payloads: Type.Optional(
         Type.Record(Type.String(), Type.String(), {
@@ -256,6 +271,9 @@ export const createFabricExecTool = (
             "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs and, in a Main, executor.mainMaxTimeoutMs",
         }),
       ),
+      timeout_ms: Type.Optional(Type.Integer({ minimum: 1, description: "Hard whole-script deadline in milliseconds; cannot be extended or paused, capped by executor.maxTimeoutMs." })),
+      maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Per-call output token budget (estimated at four characters per token), capped by executor.maxOutputChars." })),
+      max_output_tokens: Type.Optional(Type.Integer({ minimum: 1, description: "Alias of maxOutputTokens." })),
       display: Type.Optional(
         Type.Union([
           Type.Object(
@@ -278,7 +296,7 @@ export const createFabricExecTool = (
           }),
         ]),
       ),
-    }),
+    }, { additionalProperties: false }),
     // Pi validates custom-tool arguments before `tool_call` and `execute`, so
     // compatibility coercions for the model-facing boundary must live in the
     // official prepareArguments hook rather than execute-time fallbacks.
@@ -889,6 +907,7 @@ export const createFabricExecTool = (
         ...(tokenBudget !== undefined ? { tokenBudget } : {}),
         ...(params.agentBudget !== undefined ? { maxAgentCalls: params.agentBudget } : {}),
         ...(params.timeoutMs !== undefined ? { requestedTimeoutMs: params.timeoutMs } : {}),
+        ...(params.timeout_ms !== undefined ? { hardTimeoutMs: params.timeout_ms } : {}),
         ...(runDisplay
           ? {
               display: {
@@ -961,7 +980,7 @@ export const createFabricExecTool = (
       if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
       const fullRawOutput = fullSections.join("\n\n");
       const outputBudget = modelOutputBudget(
-        state.config.executor.maxOutputChars,
+        Math.min(state.config.executor.maxOutputChars, (params.maxOutputTokens ?? params.max_output_tokens ?? Infinity) * 4),
         result.success,
       );
       const outputWillTruncate = fullRawOutput.length > outputBudget;

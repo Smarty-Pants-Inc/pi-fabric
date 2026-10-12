@@ -102,6 +102,32 @@ class DeliveredDisplayIndex {
   }
 }
 
+/** Only earlier inbox carriers count; rendering the first carrier must not hide itself. */
+const priorInboxReceipts = (entries: readonly unknown[], message: IncomingMessage): Set<string> => {
+  const seen = new Set<string>();
+  for (const raw of entries) {
+    const entry = record(raw);
+    if (entry.type !== "custom_message" || entry.customType !== "pi-fabric-inbox") continue;
+    const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : entry.timestamp;
+    if (entry.details === message.details || (entry.content === message.content && at === message.timestamp)) break;
+    const ids = record(entry.details).ids;
+    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") seen.add(receipt("", "event", id));
+  }
+  return seen;
+};
+
+/** Inbox rows whose event id repeats within this carrier or an earlier one (smarty-dev#5518). */
+const repeatedInboxRows = (all: readonly Row[], prior: ReadonlySet<string>): Row[] => {
+  const seen = new Set<string>();
+  return all.filter(row => {
+    const id = row.attributes.id;
+    if (!id) return false;
+    if (seen.has(id) || prior.has(receipt("", "event", id))) return true;
+    seen.add(id);
+    return false;
+  });
+};
+
 const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: ReadonlySet<string>): Row[] => {
   if (message.customType !== "pi-fabric-inbox") return [...all];
   const carried = record(message.details).receipts;
@@ -109,7 +135,11 @@ const unseenRows = (message: IncomingMessage, all: readonly Row[], delivered: Re
   // Native inbox receipts group each event's identity/work receipts behind its event hash.
   // This lets mixed batches hide only duplicates, including deliveryId-only shadows.
   const boundaries = all.map(row => row.attributes.id ? receipts.indexOf(receipt("", "event", row.attributes.id)) : -1);
+  const seen = new Set<string>();
   return all.filter((row, index) => {
+    const eventId = row.attributes.id;
+    if (eventId && (seen.has(eventId) || delivered.has(receipt("", "event", eventId)))) return false;
+    if (eventId) seen.add(eventId);
     const start = boundaries[index]!;
     if (start >= 0) {
       const next = boundaries.slice(index + 1).find(value => value > start) ?? receipts.length;
@@ -159,9 +189,18 @@ export const registerIncomingMessageRenderers = (
   });
   for (const type of INCOMING_MESSAGE_TYPES) {
     pi.registerMessageRenderer(type, (message, options, theme) => {
-      if (options.expanded || !incomingMessagesCollapsed(mode())) return undefined;
+      const history = type === "pi-fabric-inbox" ? entries() : [];
+      const prior = priorInboxReceipts(history, message);
       const all = rows(message);
-      const visible = unseenRows(message, all, type === "pi-fabric-inbox" ? delivered.update(entries()) : new Set());
+      if (options.expanded || !incomingMessagesCollapsed(mode())) {
+        if (type !== "pi-fabric-inbox") return undefined;
+        // A repeated event id renders once; otherwise the native expanded rendering is unchanged.
+        const repeated = repeatedInboxRows(all, prior);
+        return repeated.length ? fullCarrier(message, repeated, theme) : undefined;
+      }
+      const receipts = new Set(type === "pi-fabric-inbox" ? delivered.update(history) : []);
+      for (const id of prior) receipts.add(id);
+      const visible = unseenRows(message, all, receipts);
       if (!visible.length) return { render: () => [], invalidate() {} };
       // A native carrier is the burst boundary. If it mixes a principal reply
       // with chatter, preserve the entire native rendering rather than clip it,

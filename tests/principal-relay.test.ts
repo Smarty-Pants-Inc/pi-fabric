@@ -254,7 +254,8 @@ describe("originating principal relay (#821)", () => {
   it("mesh.publish takes only the turn principal, not args/data; root inbox exposes it", async () => {
     const mesh = new MeshStore(path.join(root(), "mesh"), 64 * 1024, 100), h = host("publisher");
     h.input(receipt({ v: 1, channel: "voice", principal }));
-    const provider = new MeshProvider(mesh, h.identity, {} as any);
+    // An immediate addressed publish needs a known target (smarty-dev#5518).
+    const provider = new MeshProvider(mesh, h.identity, { get: (id: string) => id === "session:receiver" ? { id } : undefined, list: () => [] } as any);
     const event = await provider.invoke("publish", { topic: "fleet.work.task", to: "session:receiver", principal: forged, data: { principal: forged } }, invocation(h)) as any;
     expect(event.principal).toEqual(principal);
     deliverRootInbox(h.pi as any, [event]);

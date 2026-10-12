@@ -300,7 +300,12 @@ export const rootInboxSummary = (batch: RootInboxBatch) => ({
  * The one message that brings a batch into the session. Without an explicit `overflow`, the batch
  * is cut to the injection budget itself; every event id (shown or summarized) is in details.
  */
-export const rootInboxMessage = (batch: readonly MeshEvent[], overflow?: readonly MeshEvent[]) => {
+export const rootInboxMessage = (input: readonly MeshEvent[], extra?: readonly MeshEvent[]) => {
+  // A re-read shadow can repeat an event id; the carrier names each event once (smarty-dev#5518).
+  const seen = new Set<string>();
+  const unique = (list: readonly MeshEvent[]) => list.filter(event => !seen.has(event.id) && !!seen.add(event.id));
+  const batch = unique(input);
+  const overflow = extra === undefined ? undefined : unique(extra);
   const { shown: events, overflow: rest } = overflow === undefined ? rootInboxBudget(batch) : { shown: [...batch], overflow: [...overflow] };
   const all = [...events, ...rest];
   return {

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -58,7 +59,7 @@ afterEach(async () => {
 });
 
 describe("ActorDirectory", () => {
-  it("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {
+  it.skipIf(removalTreeDeleteRefused)("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-wait-"));
     roots.push(root);
     const { directory, manager } = open(root, "alpha");
@@ -88,7 +89,7 @@ describe("ActorDirectory", () => {
     } finally { release(); await Promise.allSettled([waiting, creating]); }
   });
 
-  it.each(["project", "session"] as const)("#169 round 1 retries an exact %s cleanup-only id after exhausted retries and reports it without reviving it", async (scope) => {
+  it.skipIf(removalTreeDeleteRefused).each(["project", "session"] as const)("#169 round 1 retries an exact %s cleanup-only id after exhausted retries and reports it without reviving it", async (scope) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-cleanup-"));
     roots.push(root);
     const { directory, actorRoots, manager } = open(root, "alpha");

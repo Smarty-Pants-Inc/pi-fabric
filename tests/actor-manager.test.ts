@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { REMOVAL_REFUSED_7858, removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
   activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import { classifyActivationFailure } from "../src/actors/activation-failure.js";
@@ -674,7 +675,8 @@ describe("ActorManager fleet model policy (#2490)", () => {
     expect(fs.existsSync(path.join(root, "actors", "actors.json"))).toBe(false);
   });
 
-  it.each(["hook", "predecessor"] as const)("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
+  // pi-fabric#952: the predecessor case waits for a finished removal (refused on win32, #7858).
+  it.each((["hook", "predecessor"] as const).filter(wait => !removalTreeDeleteRefused || wait === "hook"))("round 3 F4 rechecks the synchronous invocation fence after %s wait", async wait => {
     const { actors, root, mesh } = setup(true);
     const abort = new AbortController();
     let enter!: () => void; const entered = new Promise<void>(resolve => { enter = resolve; });
@@ -954,7 +956,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
   }, 20_000);
 
-  it("deletes a removed actor's presence once a stalled lock frees", async () => {
+  it.skipIf(removalTreeDeleteRefused)("deletes a removed actor's presence once a stalled lock frees", async () => {
     const { mesh, make, hold, release } = stalledSetup();
     const actors = make();
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
@@ -967,7 +969,7 @@ describe("ActorManager presence under a stalled mesh lock", () => {
   }, 20_000);
 
   // review/astra on #46, F1: a presence write held on the lock must not land after a newer one.
-  it("never puts a removed actor back when an older presence write lands late", async () => {
+  it.skipIf(removalTreeDeleteRefused)("never puts a removed actor back when an older presence write lands late", async () => {
     const { mesh, make } = stalledSetup();
     const actors = make();
     const put = mesh.put.bind(mesh);
@@ -5740,7 +5742,7 @@ describe("ActorManager extensions flag (read-only Pi actors)", () => {
 // smarty-dev#2184 item 8: a resident-host removal waited for the actor's in-flight run and
 // blocked the host's whole request queue.
 describe("ActorManager removal behind an in-flight run", () => {
-  it.each([true, false])("#169 round 3 joins the previous run after an ownership reload before removal (wait %s)", async (wait) => {
+  it.skipIf(removalTreeDeleteRefused).each([true, false])("#169 round 3 joins the previous run after an ownership reload before removal (wait %s)", async (wait) => {
     let owned = true;
     const { actors, agents, mesh, root } = setup(true, () => owned);
     let release!: () => void;
@@ -5814,7 +5816,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   }, 30_000);
 
-  it("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
+  it.skipIf(removalTreeDeleteRefused)("returns at once, names the run, lets a same-name create through, and finishes after the run", async () => {
     const { actors, agents } = setup(true);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -5862,7 +5864,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     });
     return { release, runId };
   };
-  it.each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
+  it.skipIf(removalTreeDeleteRefused).each(["acceptance", "unrelated update"])("#169 security S2 syncs the final pending-decision replacement after %s", async (phase) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "pending-decision", instructions: "Work." });
@@ -5929,7 +5931,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   });
 
-  it.each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
+  it.skipIf(removalTreeDeleteRefused).each(process.platform === "win32" ? [1] : [1, 2])("#169 round 3 refuses the pending removal decision at barrier %i", async (barrier) => {
     const { actors, agents, root } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "pending-sync", instructions: "Work." });
@@ -6022,7 +6024,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     expect(actors.list()).toEqual([]);
   }, 20_000);
 
-  it.each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
+  it.skipIf(removalTreeDeleteRefused).each(["directory", "presence"] as const)("smarty-dev#2339 F1: retains %s cleanup after registry revocation and drains it on restart without deleting a successor", async (failure) => {
     const { actors: initial, agents, root, mesh, identity, meshConfig } = setup(true);
     await initial.close();
     const actorRoot = path.join(root, "actors");
@@ -6090,7 +6092,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     }
   });
 
-  it("finishes an accepted removal after its owner restarts, keeping a same-name successor", async () => {
+  it.skipIf(removalTreeDeleteRefused)("finishes an accepted removal after its owner restarts, keeping a same-name successor", async () => {
     const { actors, agents, root, mesh, identity, meshConfig } = setup(true);
     const { release, runId } = hangingRun(agents);
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
@@ -6125,7 +6127,7 @@ describe("#169 round 2 removal coordination", () => {
     return { release, runId };
   };
 
-  it.each([false, true])("keeps each caller's wait policy during held acceptance (first wait=%s)", async (firstWait) => {
+  it.skipIf(removalTreeDeleteRefused).each([false, true])("keeps each caller's wait policy during held acceptance (first wait=%s)", async (firstWait) => {
     const { actors, agents } = setup(true);
     const run = liveRun(agents);
     const actor = await actors.create({ name: "mixed waits", instructions: "Work." });
@@ -6166,7 +6168,7 @@ describe("#169 round 2 removal coordination", () => {
     }
   });
 
-  it("does not resurrect or acknowledge a registry-live actor during a blocked removal and unrelated resync", async () => {
+  it.skipIf(removalTreeDeleteRefused)("does not resurrect or acknowledge a registry-live actor during a blocked removal and unrelated resync", async () => {
     const { actors, root } = setup(true);
     const actor = await actors.create({ name: "revoking", instructions: "Work." });
     const other = await actors.create({ name: "unrelated", instructions: "Work." });
@@ -6203,7 +6205,7 @@ describe("#169 round 2 removal coordination", () => {
     } finally { release(); await removing; lock.mockRestore(); }
   });
 
-  it("refuses a removal acknowledgment if a successful write did not actually revoke the registry id", async () => {
+  it.skipIf(removalTreeDeleteRefused)("refuses a removal acknowledgment if a successful write did not actually revoke the registry id", async () => {
     const { actors, root } = setup(true);
     const actor = await actors.create({ name: "uncommitted", instructions: "Work." });
     await actors.stop(actor.id);
@@ -6222,7 +6224,7 @@ describe("#169 round 2 removal coordination", () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
-  it("recovery waits for paused acceptance and the actual live drain before deleting history", async () => {
+  it.skipIf(removalTreeDeleteRefused)("recovery waits for paused acceptance and the actual live drain before deleting history", async () => {
     const { actors, agents, root } = setup(true);
     const run = liveRun(agents);
     const actor = await actors.create({ name: "recovering", instructions: "Work." });
@@ -6288,7 +6290,7 @@ it("#169 round 3 answers owns() for a cleanup-only id on a cold manager", async 
 });
 
 describe("#169 round 4 per-id revocation authorization", () => {
-  it("preserves B when its marker barrier fails while A commits a concurrent removal", async () => {
+  it.skipIf(removalTreeDeleteRefused)("preserves B when its marker barrier fails while A commits a concurrent removal", async () => {
     const { actors, root } = setup(true);
     const a = await actors.create({ name: "finalizer-a", instructions: "Work." });
     const b = await actors.create({ name: "finalizer-b", instructions: "Work." });
@@ -6354,7 +6356,7 @@ describe("#169 round 4 per-id revocation authorization", () => {
 });
 
 describe("#169 round 3 removal durability", () => {
-  it.each(process.platform === "win32" ? [1, 2] : [1, 2, 3, 4])("fails closed at removal barrier %i and retries successfully", async (barrier) => {
+  it.skipIf(removalTreeDeleteRefused).each(process.platform === "win32" ? [1, 2] : [1, 2, 3, 4])("fails closed at removal barrier %i and retries successfully", async (barrier) => {
     const { actors, root } = setup(true);
     const actor = await actors.create({ name: "barrier", instructions: "Work." });
     await actors.stop(actor.id);
@@ -6386,7 +6388,8 @@ describe("#169 round 3 removal durability", () => {
 });
 
 describe("#169 round 1 removal safety", () => {
-  it.each([false, true])("never cleans or acknowledges concurrent removals before the registry commit (failure=%s)", async (fail) => {
+  // pi-fabric#952: failure=false finishes both removals (the tree delete is refused on win32, #7858).
+  it.each([false, true].filter(fail => !removalTreeDeleteRefused || fail))("never cleans or acknowledges concurrent removals before the registry commit (failure=%s)", async (fail) => {
     const { actors, root } = setup(true);
     const actor = await actors.create({ name: "concurrent", instructions: "Work." });
     await actors.stop(actor.id);
@@ -6443,7 +6446,7 @@ describe("#169 round 1 removal safety", () => {
     }
   });
 
-  it("preserves the pre-commit presence obligation across a different-session restart, but a marker alone cannot remove a live actor", async () => {
+  it.skipIf(removalTreeDeleteRefused)("preserves the pre-commit presence obligation across a different-session restart, but a marker alone cannot remove a live actor", async () => {
     const { actors, root, mesh, identity, agents, meshConfig } = setup(true);
     const actor = await actors.create({ name: "prepared", instructions: "Work." });
     await actors.stop(actor.id);
@@ -6517,10 +6520,11 @@ describe("#169 round 1 removal safety", () => {
     actorManagers.push(restarted);
     await restarted.finishPendingRemovals();
     expect(fs.existsSync(dir), "the actor's tree").toBe(true);
-    expect(restarted.cleanupObligation(actor.id)?.removal?.state).toMatch(/names root session:another-root/);
+    // On win32 the #7858 refusal comes first (no fence there); the tree is kept either way.
+    expect(restarted.cleanupObligation(actor.id)?.removal?.state).toMatch(removalTreeDeleteRefused ? REMOVAL_REFUSED_7858 : /names root session:another-root/);
   });
 
-  it.each(["null", "invalid JSON", "symlink"])("recovers a valid cleanup independently of a preceding %s marker", async (bad) => {
+  it.skipIf(removalTreeDeleteRefused).each(["null", "invalid JSON", "symlink"])("recovers a valid cleanup independently of a preceding %s marker", async (bad) => {
     const { actors, root, identity, mesh, meshConfig, agents } = setup(true);
     const actor = await actors.create({ name: "healthy", instructions: "Work." });
     const actorRoot = path.join(root, "actors");

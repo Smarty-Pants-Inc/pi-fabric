@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { PRESENCE_REFRESH_MS } from "../src/actors/manager.js";
 import { MeshStore, type MeshBatchOperation } from "../src/mesh/store.js";
@@ -111,7 +112,7 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     clock.mockRestore();
   }, 120_000);
 
-  it("publishes a stop and a removal at once, renews stopped records rarely, and a restart republishes", async () => {
+  it.skipIf(removalTreeDeleteRefused)("publishes a stop and a removal at once, renews stopped records rarely, and a restart republishes", async () => {
     const { config, observer, start } = await fixture(false);
     let host = await start();
     let now = Date.now();

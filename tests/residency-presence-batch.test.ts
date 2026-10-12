@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
@@ -375,7 +376,7 @@ describe("#4383 resident host presence batch", () => {
     expect(host.actors.presenceBatch(false).ops).toEqual([]);
   });
 
-  it("commits removed actor presence and participant deletion before clearing cleanup", async () => {
+  it.skipIf(removalTreeDeleteRefused)("commits removed actor presence and participant deletion before clearing cleanup", async () => {
     const { host, config, records } = await fixture();
     const id = records[0]!.id;
     expect(host.mesh.get(`actors/${config.sessionId}/${id}`, { fresh: true })).toBeDefined();

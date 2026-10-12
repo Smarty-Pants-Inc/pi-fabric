@@ -1,6 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { beforeEach } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { retainedProcessStates, retainedProcessWorker } from "./helpers/retained-process-worker.js";
 import fs from "node:fs";
@@ -637,7 +638,7 @@ describe("saturated durable spawn receipt consistency (#181 F2)", () => {
 });
 
 describe("#169 round 2 public cleanup outcome", () => {
-  it.each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
+  it.skipIf(removalTreeDeleteRefused).each(["main", "nested"] as const)("carries failed cleanup and exact-id retry through the real %s client and provider", { timeout: 15_000 }, async (caller) => {
     const state = await rootHarness(`public-cleanup-${caller}`);
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
     const configPath = path.join(state.config.residencyRoot, "config.json");
@@ -692,7 +693,7 @@ describe("#169 round 2 public cleanup outcome", () => {
 });
 
 describe("#169 round 1 resident cleanup routing", () => {
-  it.each(["project", "session"] as const)("retries and reports an exact cleanup-only %s id through the resident removeActor request", { timeout: 15_000 }, async (scope) => {
+  it.skipIf(removalTreeDeleteRefused).each(["project", "session"] as const)("retries and reports an exact cleanup-only %s id through the resident removeActor request", { timeout: 15_000 }, async (scope) => {
     const state = await rootHarness(`cleanup-host-${scope}`);
     const configPath = path.join(state.config.residencyRoot, "config.json");
     fs.mkdirSync(state.config.residencyRoot, { recursive: true });
@@ -2138,7 +2139,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       await client.removeActor(actor.id);
     } finally { controller.abort(); await first; await control.close(); await client.close(); await state.participants.close(); await stopResident(state.config); }
   });
-  it("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
+  it.skipIf(removalTreeDeleteRefused)("keeps a durable actor responsive after its originating Main closes", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-actor");
     const agents = new AgentManager(repo, state.config.agents, {
       workerPath: fakeWorker,
@@ -2286,7 +2287,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
 
   // smarty-dev#2184 item 8: a removal waited for the actor's in-flight run and blocked every
   // later request to the host (clients timed out; a create right after it was dropped).
-  it("returns a removal behind an in-flight run at once and keeps serving requests", { timeout: 60_000 }, async () => {
+  it.skipIf(removalTreeDeleteRefused)("returns a removal behind an in-flight run at once and keeps serving requests", { timeout: 60_000 }, async () => {
     const testStarted = Date.now();
     const state = await rootHarness("resident-remove-pending");
     state.config.agents = { ...state.config.agents, timeoutMs: 120_000 };

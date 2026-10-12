@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
@@ -1362,7 +1363,8 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(incoming(third.actors, actor.id)).toHaveLength(2); // Successful admission left no pending duplicate.
   });
 
-  it.each(["stop", "remove", "recreate", "halt"] as const)("does not resurrect durable pending after explicit %s and restart", async (cancel) => {
+  // pi-fabric#952: remove and recreate need a finished removal (refused on win32, #7858); stop and halt run everywhere.
+  it.each((["stop", "remove", "recreate", "halt"] as const).filter(cancel => !removalTreeDeleteRefused || cancel === "stop" || cancel === "halt"))("does not resurrect durable pending after explicit %s and restart", async (cancel) => {
     const first = await timedActor();
     const { actors, actor } = first;
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "leading" });
@@ -1642,7 +1644,7 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(() => actors.status(actor.id)).toThrow();
   });
 
-  it("cancels on removal without rearming a removed actor", async () => {
+  it.skipIf(removalTreeDeleteRefused)("cancels on removal without rearming a removed actor", async () => {
     const { actors, actor } = await timedActor();
     const scheduled = vi.spyOn(globalThis, "setTimeout");
     const cancelled = vi.spyOn(globalThis, "clearTimeout");

@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -399,7 +400,7 @@ describe("fleet model policy (#2490)", () => {
     } finally { release(); await done; spy.mockRestore(); }
   });
 
-  it("F6 #3115 standalone Main creation needs no participants.self API", async () => {
+  it.skipIf(removalTreeDeleteRefused)("F6 #3115 standalone Main creation needs no participants.self API", async () => {
     const { provider, actors, agents } = setup();
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     // A minimal topology dependency is sufficient for local creation.
@@ -436,7 +437,7 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.status(previous.id).status).toBe("stopped");
   });
 
-  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+  it.skipIf(removalTreeDeleteRefused).each((["main", "task", "actor"] as const).flatMap(parent =>
     (["create", "import"] as const).flatMap(action =>
       (["registry", "presence"] as const).flatMap(publication =>
         (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
@@ -1300,7 +1301,7 @@ describe("queued spawn handles (#2576)", () => {
 });
 
 describe("#169 round 1 agents.remove cleanup routing", () => {
-  it("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
+  it.skipIf(removalTreeDeleteRefused)("discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership", async () => {
     const state = setup();
     await state.actors.close();
     const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };
@@ -1327,7 +1328,7 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
   });
 
-  it.each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
+  it.skipIf(removalTreeDeleteRefused).each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
     const state = setup();
     await state.actors.close();
     const actorRoots = { project: path.join(state.root, "project-actors"), session: path.join(state.root, "session-actors") };

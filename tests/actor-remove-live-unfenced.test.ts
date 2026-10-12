@@ -6,6 +6,7 @@ import { ResidentHost } from "../src/residency/host.js";
 import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { actorWithTree, pendingRemoval } from "./helpers/pending-removal.js";
+import { REMOVAL_REFUSED_7858, removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 
 // pi-fabric#952 round 2 (smarty-dev#8090): where the Main publication fence is unavailable (Windows: no flock,
 // smarty-dev#7858), a live remove never deletes the tree outside the fence. It revokes, keeps the tree, leaves the
@@ -65,10 +66,14 @@ describe("live actor remove without the Main publication fence", () => {
           ? /dead-root check was lost/.test(host.actors.cleanupObligation(actor.id)?.removal?.state ?? "") || !fs.existsSync(actor.dir)
           : !fs.existsSync(actor.dir) || /cleanup failed/.test(host.actors.cleanupObligation(actor.id)?.removal?.state ?? "")).toBe(true),
         { timeout: 20_000, interval: 50 });
-        expect(fs.existsSync(actor.dir), "the actor tree").toBe(kept);
+        // pi-fabric#952 on win32: no fence, so even the explicit false keeps its tree, refused with #7858 (row revoked).
+        expect(fs.existsSync(actor.dir), "the actor tree").toBe(kept || removalTreeDeleteRefused);
         if (kept) {
           expect(fs.readFileSync(path.join(actor.dir, "session.jsonl"), "utf8")).toBe("history\n");
           expect(restarted.actors.cleanupObligation(actor.id)?.removal?.state).toMatch(/dead-root check was lost/);
+        } else if (removalTreeDeleteRefused) {
+          expect(restarted.actors.cleanupObligation(actor.id)?.removal?.state).toMatch(REMOVAL_REFUSED_7858);
+          expect(f.registered(actor.id)).toBe(false);
         } else expect(restarted.actors.cleanupObligation(actor.id)).toBeUndefined();
       } finally { await restarted?.close(); await f.close(); }
     }, 60_000);

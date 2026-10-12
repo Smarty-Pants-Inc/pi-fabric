@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -149,7 +150,8 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
   } finally { await fixture.close(); }
 }, 15_000);
 
-it.each(["spawnBound", "createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", async operation => {
+// pi-fabric#952: the createActor case needs a finished actor removal (refused on win32, #7858).
+it.each((["spawnBound", "createActor"] as const).filter(operation => !removalTreeDeleteRefused || operation === "spawnBound"))("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", async operation => {
   const fixture = await setup();
   try {
     const create = operation === "spawnBound" ? vi.spyOn(fixture.host.agents, "spawn") : vi.spyOn(fixture.host.actors, "create");

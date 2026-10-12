@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { expect, it, vi } from "vitest";
+import { removalTreeDeleteRefused } from "./helpers/windows-removal.js";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
@@ -28,7 +29,7 @@ const runtimeAt = (cwd: string) => {
 const registries = (dir: string): string[] => fs.readdirSync(dir, { recursive: true, encoding: "utf8" })
   .filter((entry) => path.basename(entry) === "actors.json").map((entry) => path.join(dir, entry));
 
-it("a restarted Main finishes the removal it accepted before its restart", async () => {
+it.skipIf(removalTreeDeleteRefused)("a restarted Main finishes the removal it accepted before its restart", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-removal-restart-"));
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", cwd);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));

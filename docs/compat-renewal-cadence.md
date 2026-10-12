@@ -1,6 +1,6 @@
 # Mixed-release renewal cadence (smarty-dev#4383)
 
-## What old `6b15d905` actually does
+## What old `6b15d905` does
 
 There are two different meanings of “session liveness”; the previous RC3 analysis conflated them.
 All citations below are to the historical source, obtained with `git show 6b15d905:<path>`.
@@ -25,7 +25,7 @@ All citations below are to the historical source, obtained with `git show 6b15d9
   include a raw session put with initial publication or a genuine change
   (`src/topology/participant-directory.ts:1150-1175`), but it does not periodically
   renew that raw entry under the explicit policy.
-- **Absent/default policy:** genuinely state-only fallback readers keep the fixed
+- **Absent/default policy:** strictly state-only fallback readers keep the fixed
   half-TTL threshold, 7.5 s (`:1340-1342`), resulting in a commit every 10 s on the
   default 5 s heartbeat. Host and session due records share one batch.
 
@@ -46,7 +46,7 @@ per-key ownership/CAS checks, lock confirmation, and original lease TTLs are unc
 
 ## Actual old-source benchmark
 
-The retained harness imports both actual `6b15d905` and RC3 source, rather than assuming
+The retained harness imports both actual `6b15d905` and RC3 source and does not assume
 an old baseline. It runs 10 old + 10 RC3 Mains sharing an isolated ~2.36 MB state with
 5 s virtual heartbeats, and counts successful **state.json atomic renames** and the
 full byte size of each renamed payload. Startup/registration is outside the measured

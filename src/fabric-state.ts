@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RootInboxBatch, RootInboxSession } from "./topology/root-inbox.js";
+import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
@@ -10,6 +10,7 @@ import {
   FABRIC_COMPONENT_PROVIDER_NAMES,
   FABRIC_PROVIDER_COMPONENT_PREFIX,
 } from "./components/provider-component.js";
+import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import type { FabricOwnedModelGuidance } from "./components/model-guidance.js";
 import type { FabricComponentGraph } from "./components/types.js";
 import {
@@ -22,8 +23,12 @@ import {
   type FabricSchemaMode,
 } from "./config.js";
 import { FabricSessionApprovals } from "./core/approval-controller.js";
+import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
+import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";
 import { PrewalkDriftTracker } from "./prewalk/fs-drift.js";
+import type { FabricThinkingController } from "./thinking-control.js";
+import { FABRIC_THINKING_ENTRY_TYPE } from "./thinking.js";
 import type { PendingFabricHandoff } from "./prewalk/handoff.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
 import type { FabricExecutionResult } from "./execution-service.js";
@@ -53,12 +58,30 @@ import type { FabricLoadedFileIdentity } from "./build-identity.js";
 import { FabricManagedHost, type FabricManagedHostOptions } from "./managed-host.js";
 import { probeAgentPlacement } from "./agents/placement-config.js";
 
+/**
+ * Proof that one `ensure()` call bound to a still-live session lifecycle.
+ * Shutdown, session replacement, and a cwd rebootstrap retire it, including one
+ * that lands while `ensure()` itself is pending (smarty-dev#5962).
+ */
+export interface FabricLifecycleLease {
+  current(): boolean;
+}
+
 export interface FabricStateOptions {
   managedHost?: FabricManagedHostOptions;
   paths?: FabricRuntimePaths;
   runtimeLoader?: () => Promise<typeof import("./fabric-runtime-state.js")>;
   entryIdentity?: FabricLoadedFileIdentity;
 }
+
+// Survives extension generations (reload, session replacement) in this Pi process.
+// A shared mesh is not a session scope: unrelated cwds must not inherit a Main's re-arm hint.
+const PUBLISHED_MAIN_SCOPES = Symbol.for("pi-fabric.published-main-scopes.v1");
+const publishedMainScopes = (): Set<string> => {
+  const holder = globalThis as Record<symbol, Set<string> | undefined>;
+  return holder[PUBLISHED_MAIN_SCOPES] ??= new Set<string>();
+};
+const mainPresenceScope = (meshRoot: string, cwd: string): string => JSON.stringify([meshRoot, path.resolve(cwd)]);
 
 type ActivationHook = (context: ExtensionContext) => void | Promise<void>;
 type ActivationFailureHook = () => void | Promise<void>;
@@ -95,6 +118,9 @@ export class FabricState {
   readonly prewalk = new PrewalkController();
   readonly prewalkDrift = new PrewalkDriftTracker();
   readonly sessionApprovals = new FabricSessionApprovals();
+  // agent_end must revert an override even before activation; the controller
+  // itself loads only when an override can exist.
+  readonly thinking: FabricThinkingHost;
   #widgetDismissedAt = 0;
 
   constructor(
@@ -105,6 +131,10 @@ export class FabricState {
     this.#options = options;
     this.#managedHost = options.managedHost ? new FabricManagedHost(options.managedHost) : undefined;
     this.#entryIdentity = options.entryIdentity;
+    this.thinking = new FabricThinkingHost(async () => {
+      const { FabricThinkingController } = await import("./thinking-control.js");
+      return new FabricThinkingController(pi, () => this.#config?.thinking?.bounds ?? {});
+    });
   }
 
   get kernelReloadRequired(): boolean {
@@ -153,6 +183,20 @@ export class FabricState {
 
   get cwd(): string | undefined {
     return this.#cwd;
+  }
+
+  /** Foreground tools declared beside fabric_exec. prepareLoadout passes its pending active set. */
+  foregroundTools(active?: readonly string[]): FabricForegroundResolution {
+    const config = this.#config;
+    if (!config || config.foreground.tools.length === 0) return NO_FOREGROUND;
+    return resolveForegroundTools({
+      policy: config.foreground,
+      mode: config.schema.mode === "enforce" ? "enforce" : config.fullCodeMode ? "full-code" : "orchestration",
+      managedHost: this.#managedHost !== undefined,
+      registered: this.pi.getAllTools(),
+      active: new Set(active ?? this.pi.getActiveTools()),
+      allowlist: readChildToolAllowlist(),
+    });
   }
 
   get widgetDismissedAt(): number {
@@ -210,7 +254,7 @@ export class FabricState {
     this.prewalk.cancel();
     this.prewalkDrift.clear();
     this.activity.reset();
-    this.sessionApprovals.approvedRisks.clear();
+    this.sessionApprovals.reset();
     this.#widgetDismissedAt = 0;
     context.ui.setStatus("fabric-prewalk", undefined);
 
@@ -238,10 +282,21 @@ export class FabricState {
     await this.#activate(context, true);
   }
 
-  async ensure(context: ExtensionContext): Promise<void> {
+  async ensure(context: ExtensionContext): Promise<FabricLifecycleLease> {
     this.#assertOpen();
-    if (!this.#config || this.#cwd !== context.cwd) await this.bootstrap(context);
-    await this.#activate(context, false);
+    // Sample the lifecycle before the first await; only this call's own
+    // bootstrap may advance it. bootstrap() claims its generation synchronously.
+    let generation = this.#generation;
+    if (!this.#config || this.#cwd !== context.cwd) {
+      const booting = this.bootstrap(context);
+      generation = this.#generation;
+      await booting;
+    }
+    const runtime = await this.#activate(context, false);
+    const lease: FabricLifecycleLease = { current: () => generation === this.#generation && !this.#shutDown };
+    // Rebind background reads to the newest live ctx; never to a lease already retired.
+    if (lease.current()) runtime.bindLifecycle?.(context, lease.current);
+    return lease;
   }
 
   shouldEagerlyActivate(context: ExtensionContext): boolean {
@@ -259,11 +314,11 @@ export class FabricState {
     // Publish this Main in the shared participant directory at startup, so
     // peers can find and steer an idle session before it first uses Fabric.
     if (this.config.mesh.announce) return true;
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ??
-      (this.config.mesh.root
-        ? path.resolve(projectRoot, this.config.mesh.root)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+    const meshRoot = this.#meshRoot(context);
+    // Re-arm on session_start (smarty-dev#5962/#4313): a Main this process already published
+    // keeps its presence across /reload and session replacement. Its old heartbeat retired with
+    // the old ctx; waiting for first tool use let the lease lapse and the Main vanish silently.
+    if (publishedMainScopes().has(mainPresenceScope(meshRoot, context.cwd))) return true;
     const fabricSessionId = process.env.PI_FABRIC_SESSION_ID?.trim() || sessionId;
     const actorRoots = [
       path.join(meshRoot, "actors"),
@@ -289,10 +344,26 @@ export class FabricState {
     });
   }
 
+  #meshRoot(context: ExtensionContext): string {
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    return process.env.PI_FABRIC_MESH_ROOT ??
+      (this.config.mesh.root
+        ? path.resolve(projectRoot, this.config.mesh.root)
+        : path.join(projectRoot, ".pi", "fabric", "mesh"));
+  }
+
   mainAgentInfo(context?: ExtensionContext): FabricMainAgentInfo { return this.#required().mainAgentInfo(context); }
   peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] { return this.#current()?.peerInfos(options) ?? []; }
-  async nextRootInbox(session: RootInboxSession, idle?: () => boolean): Promise<RootInboxBatch | undefined> {
-    return this.#current()?.nextRootInbox(session, idle);
+  async nextRootInbox(session: RootInboxSession, idle?: () => boolean, options?: RootInboxReconcileOptions): Promise<RootInboxBatch | undefined> {
+    return this.#current()?.nextRootInbox(session, idle, options);
+  }
+  /** Mark injected inbox events consumed, so no later turn injects them again (R-token-waste). */
+  async consumeRootInbox(ids: readonly string[], receipts?: readonly string[]): Promise<void> {
+    await this.#current()?.consumeRootInbox(ids, receipts);
+  }
+  /** Whether the root inbox acked this event (smarty-dev#8962): the context hook shows it once. */
+  rootInboxAcked(id: string, sequence?: number): boolean {
+    return this.#current()?.rootInboxAcked(id, sequence) ?? false;
   }
   /** Give the records watchdog the host's gated idle wake (F21). */
   setRecordsWake(wake: (() => Promise<void>) | undefined): void {
@@ -309,13 +380,22 @@ export class FabricState {
   componentGraph(): FabricComponentGraph {
     return this.#current()?.componentGraph() ?? { components: [], edges: [], cycles: [] };
   }
-  modelGuidance(): FabricOwnedModelGuidance[] { return this.#current()?.modelGuidance() ?? []; }
+  modelGuidance(): FabricOwnedModelGuidance[] {
+    // Built-in provider guidance is a pure function of configuration, so it is
+    // already available before (and independent of) runtime activation.
+    return this.#current()?.modelGuidance() ?? (this.#config && !this.#managedHost ? builtinModelGuidance(this.#config) : []);
+  }
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
     return this.#current()?.participantInfos(options) ?? [];
   }
   queueUserMessage(targetId: string, message: string, delivery: FabricAgentMessageDelivery): Promise<FabricAgentMessageResult> {
     return this.#required().queueUserMessage(targetId, message, delivery);
   }
+  /** Main's live drain handles non-retryable provider errors itself (smarty-dev#8742). */
+  mainOwnsProviderRecovery(): boolean {
+    return this.#current()?.mainOwnsProviderRecovery() ?? false;
+  }
+
   reportMainProviderError(message: string): Promise<unknown> {
     return this.#required().reportMainProviderError(message);
   }
@@ -337,6 +417,7 @@ export class FabricState {
   backgroundWorkCount(): number {
     return this.#current()?.backgroundWorkCount() ?? 0;
   }
+  completionIdleSignal(): void { this.#current()?.completionIdleSignal(); }
   publishOpsEvent(topic: string, kind: string, data: Record<string, unknown>): Promise<void> {
     return this.#current()?.publishOpsEvent(topic, kind, data) ?? Promise.resolve();
   }
@@ -363,6 +444,17 @@ export class FabricState {
     this.#current()?.registerExternal(provider, options);
   }
 
+  /** False when the name is unknown, managed, or the generation pin does not match. */
+  withdrawExternal(name: string, generation?: number | string): boolean {
+    if (this.#managedHost || !this.#externalProviders.has(name)) return false;
+    // A generation pin needs a live binding to match; an unpinned withdrawal
+    // also forgets registrations no runtime has mounted yet.
+    const withdrawn = this.#current()?.withdrawExternal(name, generation) ?? false;
+    if (!withdrawn && generation !== undefined) return false;
+    this.#externalProviders.delete(name);
+    return true;
+  }
+
   registerExternalComponent(
     component: FabricComponentDefinition,
     options: { overwrite?: boolean } = {},
@@ -376,6 +468,19 @@ export class FabricState {
     }
     this.#externalComponents.set(component.name, component);
     this.#current()?.registerExternalComponent(component, options);
+  }
+
+  /** Apply only the decision selector; existing program snapshots and policy stay intact. */
+  setDecisionProfile(profile: string | null | undefined): void {
+    const profiles = this.config.jev.decisionProfiles?.profiles;
+    if (profile !== undefined && profile !== null &&
+        (typeof profile !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(profile) ||
+         ["__proto__", "prototype", "constructor"].includes(profile) || !profiles || !Object.hasOwn(profiles, profile))) {
+      throw new Error("Decision profile must name a configured profile or use document default");
+    }
+    this.#runtime?.setDecisionProfile(profile);
+    if (profile === undefined) delete this.config.jev.decisionProfile;
+    else this.config.jev.decisionProfile = profile;
   }
 
   reloadConfig(context: ExtensionContext): void {
@@ -467,6 +572,7 @@ export class FabricState {
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
     this.#shutDown = true;
+    this.sessionApprovals.reset();
     this.#deactivationHook?.();
     const generation = ++this.#generation;
     const activation = this.#activation;
@@ -542,7 +648,12 @@ export class FabricState {
             if (context.hasUI) context.ui.notify(`Pi Fabric component configuration not applied: ${error instanceof Error ? error.message : String(error)}`, "error");
           }
         }
-        await candidate.initialize(context, config);
+        // Background timers read this ctx only while this activation's lifecycle holds. The
+        // runtime installs it only after the predecessor's teardown: old sources never see
+        // the successor ctx during session replacement (smarty-dev#5962).
+        await candidate.initialize(context, config, {
+          lifecycle: () => generation === this.#generation && !this.#shutDown,
+        });
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {
           candidate.registerExternal(provider, { overwrite: true });
@@ -557,6 +668,12 @@ export class FabricState {
         this.#runtime = candidate;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
+        try {
+          if (config.mesh.enabled && context.isProjectTrusted() &&
+            resolveFabricIdentity(context.sessionManager.getSessionId()).identity.kind === "main") {
+            publishedMainScopes().add(mainPresenceScope(this.#meshRoot(context), context.cwd));
+          }
+        } catch { /* best-effort re-arm hint; the next first use still activates */ }
         return candidate;
       } catch (error) {
         try {
@@ -593,8 +710,10 @@ export class FabricState {
         prewalk: this.prewalk,
         prewalkDrift: this.prewalkDrift,
         sessionApprovals: this.sessionApprovals,
+        thinking: await this.thinking.load(),
         ...(this.#options.paths ? { paths: this.#options.paths } : {}),
         ...(this.#entryIdentity ? { entryIdentity: this.#entryIdentity } : {}),
+        foregroundTools: () => this.foregroundTools().tools,
       },
     );
   }
@@ -607,5 +726,52 @@ export class FabricState {
     const runtime = this.#current();
     if (!runtime?.initialized) throw new Error("Pi Fabric has not activated");
     return runtime;
+  }
+}
+
+type ThinkingHookContext = Pick<ExtensionContext, "sessionManager" | "model">;
+
+/** True when the active branch's latest Fabric thinking entry holds an override. */
+const branchHasThinkingOverride = (context: ThinkingHookContext): boolean => {
+  const branch = context.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (entry?.type !== "custom" || entry.customType !== FABRIC_THINKING_ENTRY_TYPE) continue;
+    const data = entry.data as { override?: unknown } | undefined;
+    return data?.override !== null && data?.override !== undefined;
+  }
+  return false;
+};
+
+/**
+ * Lazy front for the host thinking controller. Before first use an override
+ * can only come from a persisted session entry, so lifecycle hooks scan the
+ * branch instead of loading the controller module.
+ */
+export class FabricThinkingHost {
+  #controller: FabricThinkingController | undefined;
+  #loading: Promise<FabricThinkingController> | undefined;
+
+  constructor(private readonly create: () => Promise<FabricThinkingController>) {}
+
+  load(): Promise<FabricThinkingController> {
+    this.#loading ??= this.create().then((controller) => {
+      this.#controller = controller;
+      return controller;
+    });
+    return this.#loading;
+  }
+
+  invalidate(): void {
+    this.#controller?.invalidate();
+  }
+
+  async agentEnded(context: ThinkingHookContext): Promise<void> {
+    if (!this.#controller && !branchHasThinkingOverride(context)) return;
+    (await this.load()).agentEnded(context);
+  }
+
+  async enforceBounds(context: ThinkingHookContext): Promise<void> {
+    (await this.load()).enforceBounds(context);
   }
 }

@@ -62,7 +62,8 @@ const setup = async (wire: boolean) => {
 
 describe("bounded durable bridge event batches", () => {
   it("takes one lock for 256 events, pins the peer, and shares one durability barrier", async () => {
-    const mesh = store(), side = new StoreBridgeSide(mesh, "forge");
+    // Canonicalize the fixture so the expected chain has no additional symlink parents.
+    const mesh = new MeshStore(fs.realpathSync(scratch()), 65536, 500), side = new StoreBridgeSide(mesh, "forge");
     // Deterministic count bound independent of this machine's fsync latency.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const count = lockCount(mesh.root);
@@ -73,8 +74,16 @@ describe("bounded durable bridge event batches", () => {
     expect(count()).toBe(1);
     expect(mesh.read({ limit: 500 }).map(e => e.text)).toEqual(events.map(e => e.event.text));
     expect(mesh.read({ limit: 500 }).every(e => (e.data as BridgePublish["data"]).bridge.from === "forge")).toBe(true);
-    // One event-file sync and namespace confirmation, not receipts per event.
-    expect(sync.mock.calls.length).toBeLessThan(8);
+    // One event-file sync plus exactly one barrier per namespace ancestor, not receipts
+    // per event. A fixed threshold depends on TMPDIR depth and fails on fleet task roots.
+    let namespaceBarriers = 0;
+    if (process.platform !== "win32") {
+      for (let directory = mesh.root; ; directory = path.dirname(directory)) {
+        namespaceBarriers++;
+        if (path.dirname(directory) === directory) break;
+      }
+    }
+    expect(sync.mock.calls.length).toBe(namespaceBarriers + 1);
     expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
     await expect(side.publishBatch([...events, events[0]!])).rejects.toThrow("1..256");
   }, 30000);

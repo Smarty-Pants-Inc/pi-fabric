@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { FabricState } from "../src/fabric-state.js";
 import { coreOverridePromptGuidance } from "../src/core/core-override-guidance.js";
 import { PI_CORE_TOOL_NAMES } from "../src/core/pi-tools.js";
 import { extensionToolRosterGuidance } from "../src/core/system-guidance.js";
@@ -17,13 +18,25 @@ import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.
 import { emitBeforeAgentStart } from "./helpers/emit-before-agent-start.js";
 
 // smarty-dev#5492: an extension hides a tool by dropping it from Pi's active
-// set (pi.setActiveTools). Fabric itself also removes captured tools from that
-// set in full code mode, so "inactive" alone is not "hidden": only tools that
-// are inactive and were not removed by Fabric's ownership are hidden.
+// set (pi.setActiveTools). Fabric never removes tools from that set (native
+// prepareLoadout hides declarations and keeps tools active), so an inactive
+// registered tool is extension- or host-hidden, never Fabric-hidden, and must
+// stay hidden from listing and invocation even while Fabric owns the model's
+// tools (PR #567 review P2).
 
-const context = { cwd: process.cwd(), signal: new AbortController().signal } as FabricInvocationContext;
-afterEach(() => vi.unstubAllEnvs());
+const context = {
+  cwd: process.cwd(),
+  signal: new AbortController().signal,
+  nestedToolCallId: "fabric-nested-1",
+  update: () => {},
+  extensionContext: {},
+} as unknown as FabricInvocationContext;
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 
+const executed: string[] = [];
 const tool = (name: string, extra: { promptSnippet?: string; promptGuidelines?: string[] } = {}) => defineTool({
   name,
   label: name,
@@ -31,6 +44,7 @@ const tool = (name: string, extra: { promptSnippet?: string; promptGuidelines?: 
   ...extra,
   parameters: Type.Object({}),
   async execute() {
+    executed.push(name);
     return { content: [{ type: "text" as const, text: `${name} ran` }], details: {} };
   },
 });
@@ -39,8 +53,10 @@ const openai = createSyntheticSourceInfo("/ext/pi-better-openai/index.ts", { sou
 const fovea = createSyntheticSourceInfo("/ext/pi-fovea/index.ts", { source: "npm:pi-fovea" });
 const organon = createSyntheticSourceInfo("/ext/organon/index.ts", { source: "npm:organon" });
 
+const ALL = ["read", "bash", "fovea_focus", "openai_decide", "openai_image", "openai_websearch", "fabric_exec"];
+
 const setup = () => {
-  let active = ["read", "bash", "fovea_focus", "openai_decide", "openai_image", "openai_websearch", "fabric_exec"];
+  let active = [...ALL];
   const host = {
     getActiveTools: () => [...active],
     setActiveTools: (names: string[]) => { active = [...names]; },
@@ -48,6 +64,10 @@ const setup = () => {
   const runner = {
     createContext: () => ({ cwd: process.cwd() }),
     getActiveTools: () => host.getActiveTools(),
+    emit: async () => undefined,
+    emitToolCall: async () => undefined,
+    emitToolResult: async () => undefined,
+    hasHandlers: () => false,
   } as unknown as ExtensionRunner;
   const catalog = new CapturedToolCatalog();
   catalog.replace(
@@ -63,29 +83,32 @@ const setup = () => {
     "/ext/pi-fabric/index.ts",
   );
   const ownership = new FabricToolOwnership(host);
-  catalog.setHostVisibility(hostToolVisibility(host, ownership));
-  // Fabric's full-code ownership pass, as index.ts runs it.
+  catalog.setHostVisibility(hostToolVisibility(host));
+  // Fabric's full-code ownership pass, as extension.ts runs it: every captured
+  // tool is routed through fabric_exec.
   const applyOwnership = () => ownership.apply(
     true,
     new Set(catalog.listRegistered().map((entry) => entry.name)),
   );
-  return { host, catalog, ownership, applyOwnership };
+  const hide = (...names: string[]) =>
+    host.setActiveTools(host.getActiveTools().filter((name) => !names.includes(name)));
+  return { host, catalog, ownership, applyOwnership, hide };
 };
 
 const roster = (catalog: CapturedToolCatalog) =>
   extensionToolRosterGuidance(catalog.list(), new Set(PI_CORE_TOOL_NAMES)) ?? "";
 
+const names = (catalog: CapturedToolCatalog) => catalog.list().map((entry) => entry.name);
+
 describe("extension-hidden tools (smarty-dev#5492)", () => {
   it("omits hidden tools from the catalog, tools.catalog provider and guidance while visible tools stay", async () => {
     vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", undefined);
-    const { host, catalog, applyOwnership } = setup();
+    const { catalog, applyOwnership, hide } = setup();
     // pi-better-openai with image/decisions disabled: Pi no longer offers them.
-    host.setActiveTools(host.getActiveTools().filter((name) => name !== "openai_image" && name !== "openai_decide"));
+    hide("openai_image", "openai_decide");
     applyOwnership();
-    // Fabric routed the visible captured tools (and core read) through fabric_exec.
-    expect(host.getActiveTools()).toEqual(["fabric_exec"]);
 
-    expect(catalog.list().map((entry) => entry.name)).toEqual(["fovea_focus", "openai_websearch", "read"]);
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_websearch", "read"]);
     expect(catalog.size).toBe(3);
     expect(catalog.get("openai_image")).toBeUndefined();
     expect(catalog.get("openai_websearch")).toBeDefined();
@@ -110,9 +133,53 @@ describe("extension-hidden tools (smarty-dev#5492)", () => {
     expect(coreOverridePromptGuidance(catalog)).toContain("structure-aware reads");
   });
 
+  it("Fabric's ownership never removes a tool, so an inactive tool is never mistaken for one Fabric routes", () => {
+    const { host, ownership, applyOwnership } = setup();
+    host.setActiveTools(ALL.filter((name) => name !== "fabric_exec"));
+    expect(applyOwnership()).toBe(true);
+    // Every captured tool Fabric owns is still active: only fabric_exec was added.
+    expect(host.getActiveTools()).toEqual([...ALL.filter((name) => name !== "fabric_exec"), "fabric_exec"]);
+    expect(applyOwnership()).toBe(false);
+    expect(ownership.release()).toBe(false);
+    expect(host.getActiveTools()).toContain("openai_image");
+  });
+
+  it("keeps a tool its extension hid after Fabric took ownership hidden from listing and invocation (review P2)", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", undefined);
+    const { catalog, ownership, applyOwnership, hide } = setup();
+    // Full code mode: Fabric owns the model's tool surface and routes every
+    // captured tool, openai_image included, through fabric_exec.
+    applyOwnership();
+    expect(names(catalog)).toContain("openai_image");
+    expect(catalog.revalidateHostVisibility()).toBe(false); // baseline
+    const listener = vi.fn();
+    catalog.subscribe(listener);
+
+    // The extension then disables image generation while Fabric still owns the set.
+    hide("openai_image");
+    expect(catalog.revalidateHostVisibility()).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    // Fabric's per-turn reassertion must neither re-offer nor re-list it.
+    applyOwnership();
+    ownership.release();
+
+    const provider = new CapturedToolsProvider(catalog);
+    expect(names(catalog)).not.toContain("openai_image");
+    expect((await provider.list({}, context)).map((entry) => entry.name)).not.toContain("openai_image");
+    expect(await provider.describe("openai_image", context)).toBeUndefined();
+    expect(roster(catalog)).not.toContain("openai_image");
+    executed.length = 0;
+    expect(() => provider.prepareArguments("openai_image", {})).toThrow(/hidden by its extension/);
+    await expect(provider.invoke("openai_image", {}, context)).rejects.toThrow(/hidden by its extension/);
+    expect(executed).toEqual([]);
+    // A tool the extension still offers keeps working through fabric_exec.
+    await expect(provider.invoke("openai_websearch", {}, context)).resolves.toBeDefined();
+    expect(executed).toEqual(["openai_websearch"]);
+  });
+
   it("drops the whole extension line when all its tools are hidden, and restores it when re-offered", () => {
-    const { host, catalog, applyOwnership } = setup();
-    host.setActiveTools(host.getActiveTools().filter((name) => !name.startsWith("openai_")));
+    const { host, catalog, applyOwnership, hide } = setup();
+    hide("openai_decide", "openai_image", "openai_websearch");
     applyOwnership();
     expect(catalog.revalidateHostVisibility()).toBe(false); // first read only records the baseline
     expect(roster(catalog)).not.toContain("pi-better-openai");
@@ -125,8 +192,7 @@ describe("extension-hidden tools (smarty-dev#5492)", () => {
     expect(catalog.revalidateHostVisibility()).toBe(true);
     expect(listener).toHaveBeenCalledTimes(1);
     applyOwnership();
-    expect(host.getActiveTools()).toEqual(["fabric_exec"]);
-    expect(catalog.list().map((entry) => entry.name)).toContain("openai_image");
+    expect(names(catalog)).toContain("openai_image");
     expect(roster(catalog)).toContain("- @monotykamary/pi-better-openai: openai_image");
     expect(catalog.revalidateHostVisibility()).toBe(false);
   });
@@ -140,7 +206,7 @@ describe("extension-hidden tools (smarty-dev#5492)", () => {
       "/ext/pi-fabric/index.ts",
     );
     catalog.setHostVisibility(() => { throw new Error("not initialized"); });
-    expect(catalog.list().map((entry) => entry.name)).toEqual(["fovea_focus"]);
+    expect(names(catalog)).toEqual(["fovea_focus"]);
   });
 
   it("leaves extension-hidden tools out of the fabric_exec system prompt section", async () => {
@@ -167,6 +233,8 @@ describe("extension-hidden tools (smarty-dev#5492)", () => {
       { name: "openai_websearch", definition: tool("openai_websearch"), sourceInfo: openai },
     ] as unknown as CapturedToolEntry[];
     vi.spyOn(CapturedToolCatalog.prototype, "listRegistered").mockReturnValue(entries);
+    // The roster reads the live config once captured tools exist (post-bootstrap in Pi).
+    vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(DEFAULT_FABRIC_CONFIG);
     const { default: piFabric } = await import("../src/index.js");
     await piFabric(pi);
     const result = await emitBeforeAgentStart(handlers, {

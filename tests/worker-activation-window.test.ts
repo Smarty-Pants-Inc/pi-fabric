@@ -222,6 +222,63 @@ describe("activation projection", () => {
     else expect(fs.readFileSync(callbackFile, "utf8")).toBe("callback\n");
   }, TEST_GUARD_MS);
 
+  it("restores shared native provider methods and fences a late payload callback across real actor reload (#5962)", () => {
+    const dir = root();
+    fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
+    const evidence = path.join(dir, "evidence.json");
+    const hook = fs.realpathSync(path.resolve("src/worker/activation-window.ts"));
+    const child = path.join(dir, "reload.mjs");
+    fs.writeFileSync(child, `
+      import fs from 'node:fs';
+      import { fauxProvider } from '@earendil-works/pi-ai';
+      import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from '@earendil-works/pi-coding-agent';
+      import hook from ${JSON.stringify(pathToFileURL(hook).href)};
+      process.env.PI_FABRIC_ACTIVATION_WORKER_PID = String(process.ppid);
+      process.env.PI_FABRIC_ACTIVATION_NONCE = 'reload-nonce';
+      process.env.PI_FABRIC_PARENT_RUN = 'reload-actor';
+      process.env.PI_FABRIC_ACTIVATION_HOOK = ${JSON.stringify(hook)};
+      const root = ${JSON.stringify(dir)};
+      const modelRuntime = await ModelRuntime.create({modelsPath:null, refreshOnCreate:false, authPath:root+'/unused-auth.json'});
+      const faux = fauxProvider(); modelRuntime.registerNativeProvider(faux.provider);
+      const loader = new DefaultResourceLoader({cwd:root, agentDir:root, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true,
+        extensionFactories:[{name:'activation-window', factory:hook}]});
+      await loader.reload();
+      const {session} = await createAgentSession({cwd:root, agentDir:root, modelRuntime, model:faux.getModel(), resourceLoader:loader,
+        sessionManager:SessionManager.inMemory(root)});
+      const errors = [];
+      await session.bindExtensions({mode:'rpc', onError:error=>errors.push(error)});
+      const provider = session.extensionRunner.createContext().modelRegistry.getProvider(faux.getModel().provider);
+      const originalStream = provider.stream;
+      const originalSimple = provider.streamSimple;
+      let requests = 0;
+      const dispatch = async (model, context, options) => {await options.onPayload({messages:context.messages}, model); requests++; return 'fresh';};
+      provider.stream = dispatch; provider.streamSimple = dispatch;
+      try {
+        await session.extensionRunner.emitBeforeProviderHeaders({});
+        let release, entered;
+        const gate = new Promise(resolve=>release=resolve), started = new Promise(resolve=>entered=resolve);
+        const pending = provider.streamSimple(faux.getModel(), {messages:[]}, {onPayload:async payload=>{entered(); await gate; return payload}})
+          .then(value=>({value}), error=>({error:String(error)}));
+        await started;
+        await session.reload();
+        const restored = provider.stream === dispatch && provider.streamSimple === dispatch;
+        release();
+        const late = await pending;
+        await session.extensionRunner.emitBeforeProviderHeaders({});
+        const fresh = await provider.streamSimple(faux.getModel(), {messages:[]}, {onPayload:async payload=>payload});
+        fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({restored, late, fresh, requests, errors:errors.map(String)}));
+        await session.extensionRunner.emit({type:'session_shutdown', reason:'quit'});
+      } finally {
+        provider.stream = originalStream; provider.streamSimple = originalSimple; session.dispose();
+      }
+    `);
+    const result = spawnSync(process.execPath, [child], { encoding: "utf8", timeout: HANG_GUARD_MS });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(fs.readFileSync(evidence, "utf8"))).toEqual({
+      restored: true, late: { error: "Error: Fabric activation window session closed" }, fresh: "fresh", requests: 1, errors: [],
+    });
+  }, TEST_GUARD_MS);
+
   it("does not terminate an owner that accidentally loads the hook without worker binding", async () => {
     const { default: hook } = await import("../src/worker/activation-window.js");
     vi.stubEnv("PI_FABRIC_ACTIVATION_WORKER_PID", "");

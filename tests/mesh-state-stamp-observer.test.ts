@@ -35,7 +35,7 @@ const setup = async (readCacheMs = RUNTIME_MESH_READ_CACHE_MS) => {
   });
   const reads = vi.spyOn(fs, "readFileSync");
   const count = () => reads.mock.calls.filter(([target]) => String(target) === file).length;
-  return { writer, reader, disk, freeze, replace, count };
+  return { writer, reader, disk, freeze, replace, count, file };
 };
 afterEach(() => {
   vi.restoreAllMocks();
@@ -267,7 +267,7 @@ it("confirmWritable preserves a snapshot but requires canonical revalidation on 
 });
 
 it("header EIO permits within-TTL reuse but requires a canonical parse at expiry", async () => {
-  const { reader, freeze, replace, count } = await setup();
+  const { reader, freeze, replace, count, file } = await setup();
   freeze();
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -275,16 +275,20 @@ it("header EIO permits within-TTL reuse but requires a canonical parse at expiry
   const stamp = reader.cachedStateStamp();
   await replace((state) => { state.entries[key]!.value = { owner: "new" }; });
   const before = count();
-  const headers = vi.spyOn(fs, "readSync").mockImplementation(() => {
+  // Only reads of state.json count as header reads: the read signal (kernel witness,
+  // smarty-dev#4250) may be consulted first and fails closed on the same EIO.
+  const stateHeaders: number[] = [];
+  const headers = vi.spyOn(fs, "readSync").mockImplementation(((fd: number) => {
+    if (fs.fstatSync(fd).ino === real.statSync(file).ino) stateHeaders.push(fd);
     throw Object.assign(new Error("canonical header unavailable"), { code: "EIO" });
-  });
+  }) as typeof fs.readSync);
   expect(reader.cachedStateStamp(true)).toBe(stamp);
   expect(reader.get(key)).toEqual(old);
   expect(headers).not.toHaveBeenCalled();
   expect(count()).toBe(before);
   now += RUNTIME_MESH_READ_CACHE_MS;
   expect(reader.cachedStateStamp(true)).toBe(stamp);
-  expect(headers.mock.calls).toHaveLength(1);
+  expect(stateHeaders).toHaveLength(1);
   expect(count()).toBe(before + 1);
   expect(reader.get(key)?.value).toEqual({ owner: "new" });
   expect(reader.cachedStateStamp(true)).toBe(stamp);

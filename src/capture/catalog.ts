@@ -19,6 +19,7 @@ export type CapturedToolVisibility = (name: string) => boolean;
 
 export class CapturedToolCatalog {
   readonly #tools = new Map<string, CapturedToolEntry>();
+  #registered: RegisteredTool[] = [];
   // Pi decides which registered tools it offers: an extension hides a tool by
   // dropping it from the active set (pi.setActiveTools). The source returns a
   // per-read snapshot predicate; undefined (or a throwing host that is not yet
@@ -62,6 +63,9 @@ export class CapturedToolCatalog {
   ): void {
     // Always remember the runner (see field comment) before the enabled gate.
     this.#runner = runner;
+    // Metadata observation is independent of exposing extensions.*. Native MCP
+    // opt-in also works when full code mode or extension capture is disabled.
+    this.#registered = [...registeredTools];
     this.#tools.clear();
     if (!config.enabled) {
       // A replace under a disabled policy keeps the suspension flag: during
@@ -74,7 +78,7 @@ export class CapturedToolCatalog {
 
     for (const registeredTool of registeredTools) {
       const { definition, sourceInfo } = registeredTool;
-      if (sourceInfo.path === ownSourcePath) continue;
+      if (sourceInfo.path === ownSourcePath || definition.exposure === "hidden") continue;
       if (isRunReplyTool(definition.name, sourceInfo.path)) continue;     // host-owned (smarty-dev#967)
       this.#tools.set(definition.name, {
         name: definition.name,
@@ -98,6 +102,7 @@ export class CapturedToolCatalog {
   }
 
   clear(): void {
+    this.#registered = [];
     this.#tools.clear();
     this.#emit();
   }
@@ -114,6 +119,10 @@ export class CapturedToolCatalog {
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  registeredTools(): readonly RegisteredTool[] {
+    return this.#suspended ? [] : this.#registered;
   }
 
   setHostVisibility(source: (() => CapturedToolVisibility | undefined) | undefined): void {

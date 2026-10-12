@@ -10,7 +10,7 @@ import { TasksProvider } from "../src/providers/tasks-provider.js";
 describe.each(["typescript", "python"] as const)("%s shell task integration", kernel => {
   it("starts a monitor through the sandbox, discovers its handle and stops that same job", async () => {
     const jobs = new FabricShellJobStore(); const registry = new ActionRegistry();
-    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
+    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { allowUnhookedTools: true, shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
     registry.register(new TasksProvider(jobs));
     const config = normalizeFabricConfig({ fullCodeMode: true, approvals: { read: "allow", execute: "allow" }, executor: { kernel, pythonRuntime: "monty" } });
     const service = new FabricExecutionService(registry, config);

@@ -9,6 +9,105 @@ import { readFabricExecutionTraceV1 } from "../audit/index.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
 import { PI_CORE_TOOL_NAME_SET } from "./pi-tools.js";
 import { REPLY_TOOL_NAME } from "./reply-tool-identity.js";
+import type {
+  FabricToolPlacement,
+  FabricToolPlacementMode,
+  FabricToolPlacementResultV1,
+} from "../protocol.js";
+import type { ToolLoadout, ToolLoadoutChanges } from "@earendil-works/pi-coding-agent";
+
+// Hide every registered declaration, including historical transcript declarations,
+// except resolved foreground tools (full code mode only; enforce resolves none).
+// Keep tools active: Pi uses that set for native nested-call availability.
+// Since 1.0.4, hidden declarations also lose their system-prompt guidelines.
+// Carry callable tools' guidance on Fabric itself, using the pending loadout
+// rather than capture metadata (which excludes built-ins and can lag refresh).
+export const fabricToolLoadout = (
+  loadout: ToolLoadout,
+  exclusive: boolean,
+  foreground: readonly string[] = [],
+): ToolLoadoutChanges | undefined => {
+  if (!exclusive) return undefined;
+  const hiddenDeclarations = loadout.registered.map((tool) => tool.name)
+    .filter((name) => name !== "fabric_exec" && !foreground.includes(name));
+  const hidden = new Set(hiddenDeclarations);
+  const guidelines = loadout.callable.flatMap((tool) => {
+    // The capability was added in 1.0.4; older supported hosts still put these
+    // rules in the system prompt and need no duplicate.
+    const rules = typeof loadout.getPromptGuidelines === "function"
+      ? loadout.getPromptGuidelines(tool.name) : [];
+    return hidden.has(tool.name) && rules.length > 0
+      ? [`${tool.name}:`, ...rules.map((rule) => `- ${rule}`)] : [];
+  });
+  const fabric = loadout.declared.find((tool) => tool.name === "fabric_exec");
+  return {
+    hiddenDeclarations,
+    ...(fabric && guidelines.length > 0 ? { descriptions: {
+      fabric_exec: `${fabric.description}\n\nGuidelines for tools called inside fabric_exec:\n${guidelines.join("\n")}`,
+    } } : {}),
+  };
+};
+
+/**
+ * Answer pi-fabric:tool-placement:v1. `model` mirrors fabricToolLoadout: an
+ * exclusive mode declares only fabric_exec plus resolved foreground tools;
+ * orchestration declares the active set. `program` is the caller's view of
+ * pi.* / extensions.* reachability; `programCallable` lists `model` tools
+ * that a program can also call.
+ */
+export const fabricToolPlacement = (input: {
+  mode: FabricToolPlacementMode;
+  registered: readonly string[];
+  active: readonly string[];
+  program: (name: string) => boolean;
+  tools?: readonly string[];
+  foreground?: readonly string[];
+}): FabricToolPlacementResultV1 => {
+  const active = new Set(input.active);
+  const exclusive = input.mode !== "orchestration";
+  const tools: Record<string, FabricToolPlacement> = {};
+  const programCallable: string[] = [];
+  for (const name of input.tools ?? input.registered) {
+    if (Object.hasOwn(tools, name)) continue;
+    const program = input.program(name);
+    const model = active.has(name) &&
+      (!exclusive || name === FABRIC_TOOL_NAME || input.foreground?.includes(name) === true);
+    tools[name] = model ? "model" : program ? "program" : "unavailable";
+    if (model && program) programCallable.push(name);
+  }
+  return { version: 1, mode: input.mode, tools, ...(programCallable.length > 0 ? { programCallable } : {}) };
+};
+
+// setActiveTools can run during a captured call or in a later extension handler,
+// removing this tool (and thus its loadout hook). Reassert at the native request
+// boundary and project the whole transcript, including historical removals.
+// `tools` is fabric_exec, then any resolved foreground declarations.
+export const fabricModelContext = (
+  messages: import("@earendil-works/pi-agent-core").AgentMessage[],
+  tools: Pick<import("@earendil-works/pi-ai").Tool, "name" | "description" | "parameters">
+    | readonly Pick<import("@earendil-works/pi-ai").Tool, "name" | "description" | "parameters">[],
+): import("@earendil-works/pi-agent-core").AgentMessage[] => {
+  // Preserve prepareLoadout descriptions from the current native transcript.
+  // Replacing them with the registration-time definition drops hidden-tool
+  // guidelines and other native loadout transformations at this fallback seam.
+  const effective = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role !== "system") continue;
+    if ("replace" in message && message.replace === true) effective.clear();
+    for (const tool of message.toolsAdded ?? []) effective.set(tool.name, tool.description);
+  }
+  const declared = (Array.isArray(tools) ? [...tools] : [tools]).map((tool) => ({
+    ...tool, description: effective.get(tool.name) ?? tool.description,
+  }));
+  let first = true;
+  return messages.map((message) => {
+    if (message.role !== "system") return message;
+    const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message;
+    const declare = first || ("replace" in message && message.replace === true);
+    first = false;
+    return { ...rest, ...(declare ? { toolsAdded: declared } : {}) };
+  });
+};
 
 export interface FabricToolOwnershipHost {
   getActiveTools(): string[];
@@ -60,6 +159,8 @@ export class FabricToolLifecycle {
     event: ToolCallEvent,
     context?: ExtensionContext,
   ): Promise<ToolCallEventResult | undefined> {
+    if (event.parentToolCallId && [...this.#outerCalls].some((id) =>
+      event.parentToolCallId === id || event.parentToolCallId?.startsWith(`${id}/`))) return undefined;
     if (event.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX)) {
       if (this.#outerCalls.size > 0) return undefined;
       await this.#authorizeTopLevel(event);
@@ -104,9 +205,6 @@ export class FabricToolLifecycle {
   }
 }
 
-const sameTools = (left: string[], right: string[]): boolean =>
-  left.length === right.length && left.every((name, index) => name === right[index]);
-
 export interface ToolOwnershipReassertion {
   reassert(): void;
   schedule(): void;
@@ -139,88 +237,36 @@ export const createToolOwnershipReassertion = (options: {
   };
 };
 
-// A registered tool Pi does not offer — absent from the active set and not
-// removed by Fabric's own ownership — was hidden by its extension (or the
-// host's tool allowlist) and must not surface through Fabric (smarty-dev#5492).
+// Whether Pi currently offers a registered tool (smarty-dev#5492). An extension
+// hides a tool by dropping it from Pi's active set (pi.setActiveTools); the
+// host's tool allowlist does the same. Fabric itself never removes a tool from
+// that set: native prepareLoadout hides declarations while the tools stay
+// active, and FabricToolOwnership.apply only adds fabric_exec. So an inactive
+// registered tool was hidden by its extension or the host, never by Fabric's
+// own ownership, and stays hidden even while Fabric owns the model's tool
+// surface (full-code/enforce). Do not treat names Fabric routes through
+// fabric_exec as offered here: that would re-expose a tool its extension hid
+// after Fabric took ownership (PR #567 review P2).
 // Returns a per-read snapshot so one listing costs one active-set read.
 export const hostToolVisibility = (
   host: Pick<FabricToolOwnershipHost, "getActiveTools">,
-  ownership: Pick<FabricToolOwnership, "hiddenByFabric">,
 ) => (): ((name: string) => boolean) => {
-  const offered = new Set([...host.getActiveTools(), ...ownership.hiddenByFabric()]);
+  const offered = new Set(host.getActiveTools());
   return (name) => offered.has(name);
 };
 
 export class FabricToolOwnership {
-  #savedNativeCoreTools: Array<{ name: string; index: number }> | undefined;
-  // Captured extension tools stay registered so host extensions (permission
-  // systems, auditors) keep them in `pi.getAllTools()`; hiding from the model
-  // happens here, in the active set. Removed names are remembered so leaving
-  // full code mode (or adding a name to `capture.keepVisible`) re-exposes them.
-  #savedHiddenExtensionTools = new Map<string, number>();
-
   constructor(readonly host: FabricToolOwnershipHost) {}
 
-  apply(fullCodeMode: boolean, hiddenExtensionTools?: ReadonlySet<string>): boolean {
+  apply(fullCodeMode: boolean, _hiddenExtensionTools?: ReadonlySet<string>): boolean {
+    if (!fullCodeMode) return false;
     const active = this.host.getActiveTools();
-    if (!fullCodeMode) return this.#restore(active);
-
-    this.#savedNativeCoreTools ??= active.flatMap((name, index) =>
-      PI_CORE_TOOL_NAME_SET.has(name) ? [{ name, index }] : [],
-    );
-    const hidden = hiddenExtensionTools ?? new Set<string>();
-    const next: string[] = [];
-    active.forEach((name, index) => {
-      if (PI_CORE_TOOL_NAME_SET.has(name)) return;
-      if (hidden.has(name)) {
-        if (!this.#savedHiddenExtensionTools.has(name)) {
-          this.#savedHiddenExtensionTools.set(name, index);
-        }
-        return;
-      }
-      next.push(name);
-    });
-    for (const [name, index] of this.#savedHiddenExtensionTools) {
-      if (hidden.has(name) || next.includes(name)) continue;
-      this.#savedHiddenExtensionTools.delete(name);
-      next.splice(Math.min(index, next.length), 0, name);
-    }
-    if (!next.includes("fabric_exec")) next.push("fabric_exec");
-    return this.#setIfChanged(active, next);
-  }
-
-  release(): boolean {
-    return this.#restore(this.host.getActiveTools());
-  }
-
-  // Names Fabric itself removed from Pi's active set and would restore: these
-  // are still offered by their extensions, only routed through fabric_exec.
-  hiddenByFabric(): ReadonlySet<string> {
-    return new Set([
-      ...(this.#savedNativeCoreTools ?? []).map(({ name }) => name),
-      ...this.#savedHiddenExtensionTools.keys(),
-    ]);
-  }
-
-  #restore(active: string[]): boolean {
-    const saved = this.#savedNativeCoreTools;
-    const savedHidden = this.#savedHiddenExtensionTools;
-    if (!saved && savedHidden.size === 0) return false;
-    this.#savedNativeCoreTools = undefined;
-    this.#savedHiddenExtensionTools = new Map();
-    const next = [...active];
-    for (const { name, index } of saved ?? []) {
-      if (!next.includes(name)) next.splice(Math.min(index, next.length), 0, name);
-    }
-    for (const [name, index] of savedHidden) {
-      if (!next.includes(name)) next.splice(Math.min(index, next.length), 0, name);
-    }
-    return this.#setIfChanged(active, next);
-  }
-
-  #setIfChanged(active: string[], next: string[]): boolean {
-    if (sameTools(active, next)) return false;
-    this.host.setActiveTools(next);
+    if (active.includes(FABRIC_TOOL_NAME)) return false;
+    this.host.setActiveTools([...active, FABRIC_TOOL_NAME]);
     return true;
   }
+
+  // Native prepareLoadout owns visibility. No active tools were removed, so
+  // leaving full-code mode/shutting down has no saved selection to restore.
+  release(): boolean { return false; }
 }

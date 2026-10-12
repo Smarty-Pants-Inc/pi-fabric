@@ -79,10 +79,19 @@ describe("normalizeActionArgs", () => {
 
   it("strips nullish values for declared keys only", () => {
     const out = normalizeActionArgs(
-      { limit: null, bogus: undefined } as unknown as Record<string, unknown>,
-      { knownKeys: ["limit"] },
+      { limit: null, query: undefined, bogus: undefined } as unknown as Record<string, unknown>,
+      { knownKeys: ["limit", "query"] },
     );
     expect(Object.keys(out)).toEqual(["bogus"]);
+  });
+
+  it("keeps an explicit canonical null over an alias value (canonical wins)", () => {
+    expect(
+      normalizeActionArgs(
+        { id: "alias", session: null },
+        { aliases: { id: "session" } },
+      ),
+    ).toEqual({ session: null });
   });
 
   it("leaves unknown keys untouched for the validation stage", () => {
@@ -146,6 +155,73 @@ describe("schema-derived repair", () => {
 
   it("leaves enum synonyms untouched when the enum does not claim them", () => {
     expect(normalize("probe", { scope: "all" })).toEqual({ scope: "all" });
+  });
+});
+
+describe("explicit null preservation", () => {
+  const normalize = actionArgNormalizer(() => [
+    {
+      name: "probe",
+      inputSchema: {
+        type: "object",
+        properties: {
+          coalesceKey: { type: ["string", "null"] },
+          note: { anyOf: [{ type: "string" }, { type: "null" }] },
+          session: { type: "string" },
+          limit: { type: "number" },
+          scope: { type: "string", enum: ["local", "project"] },
+          items: { type: "array" },
+          options: { type: "object" },
+        },
+        required: ["coalesceKey"],
+        additionalProperties: false,
+      },
+    },
+  ]);
+
+  it("keeps null for required and optional nullable keys", () => {
+    expect(normalize("probe", { coalesceKey: null, note: null })).toEqual({
+      coalesceKey: null,
+      note: null,
+    });
+  });
+
+  it("still omits null for non-nullable optional keys", () => {
+    expect(normalize("probe", { coalesceKey: null, limit: null, scope: null })).toEqual({
+      coalesceKey: null,
+    });
+  });
+
+  it("drops declared undefined as omitted and leaves absent keys absent", () => {
+    const out = normalize("probe", { coalesceKey: null, note: undefined });
+    expect(out).toEqual({ coalesceKey: null });
+    expect("note" in out).toBe(false);
+    expect(normalize("probe", {})).toEqual({});
+  });
+
+  it("canonical null wins over a derived alias; alias null repairs to canonical", () => {
+    expect(normalize("probe", { coalesceKey: null, coalesce_key: "x" })).toEqual({
+      coalesceKey: null,
+    });
+    expect(normalize("probe", { coalesce_key: null })).toEqual({ coalesceKey: null });
+    expect(normalize("probe", { coalesceKey: undefined, coalesce_key: "x" })).toEqual({});
+    expect(normalize("probe", { session: null, id: "s1" })).toEqual({});
+  });
+
+  it("still repairs numerics and enums alongside null", () => {
+    expect(
+      normalize("probe", { coalesceKey: null, limit: "5", scope: "cwd" }),
+    ).toEqual({ coalesceKey: null, limit: 5, scope: "project" });
+  });
+
+  it("leaves nested array/object nulls unchanged", () => {
+    const items = [null, { a: null }, 1];
+    const options = { a: null, b: { c: null }, d: undefined };
+    const out = normalize("probe", { coalesceKey: "k", items, options });
+    expect(out.items).toBe(items);
+    expect(out.options).toBe(options);
+    expect(items).toEqual([null, { a: null }, 1]);
+    expect(Object.keys(options)).toEqual(["a", "b", "d"]);
   });
 });
 
@@ -307,6 +383,63 @@ describe("ActionRegistry prepare before validate", () => {
     await expect(
       registry.invoke("probe.pick", { session: "s1", before: 8 }, registryContext()),
     ).rejects.toThrow(/probe\.pick[\s\S]*\/before/);
+  });
+
+  const nullProbeProvider = (): FabricProvider => {
+    const actions = [
+      {
+        name: "pick",
+        description: "Pick with nullable coalescing",
+        inputSchema: {
+          type: "object",
+          properties: {
+            coalesceKey: { type: ["string", "null"] },
+            session: { type: "string" },
+          },
+          required: ["coalesceKey", "session"],
+          additionalProperties: false,
+        },
+        risk: "read" as const,
+      },
+    ];
+    const normalize = actionArgNormalizer(() => actions);
+    return {
+      name: "nullprobe",
+      description: "Probe null preservation",
+      async list() {
+        return actions;
+      },
+      async describe(name) {
+        return actions.find((item) => item.name === name);
+      },
+      prepareArguments(actionName, args) {
+        return normalize(actionName, args);
+      },
+      async invoke(_name, args) {
+        return args;
+      },
+    };
+  };
+
+  it("explicit null reaches invoke for a required nullable key", async () => {
+    const registry = new ActionRegistry();
+    registry.register(nullProbeProvider());
+    const result = await registry.invoke(
+      "nullprobe.pick",
+      { coalesceKey: null, session: "s1" },
+      registryContext(),
+    );
+    expect(result).toEqual({ coalesceKey: null, session: "s1" });
+  });
+
+  it("still rejects a null required non-nullable key", async () => {
+    const registry = new ActionRegistry();
+    registry.register(nullProbeProvider());
+    const failure = registry
+      .invoke("nullprobe.pick", { coalesceKey: null, session: null }, registryContext())
+      .then(() => undefined, (error: unknown) => error as Error);
+    const error = await failure;
+    expect(error?.message).toMatch(/nullprobe\.pick[\s\S]*required/);
   });
 
   it("still enforces required canonical keys after repair", async () => {

@@ -17,6 +17,24 @@ export function classifyPiBashError(error: unknown): unknown {
   return new PiBashExitError(error.message, exitCode, error.message.slice(0, match.index));
 }
 
+// Pi 0.99 returns ordinary nonzero exits instead of throwing. Classify only
+// at the execute boundary, before middleware can redact or replace the result.
+export function classifyPiBashResult(result: {
+  content: ReadonlyArray<{ type: string; text?: string }>;
+  isError?: boolean;
+  structuredContent?: unknown;
+}): unknown {
+  const text = result.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n");
+  const structured = result.structuredContent;
+  const code = typeof structured === "object" && structured !== null && "exit_code" in structured
+    ? structured.exit_code : undefined;
+  if (!result.isError || typeof code !== "number" || !Number.isSafeInteger(code) || code <= 0) return new Error(text || "Pi bash failed");
+  const suffix = `\n\nCommand exited with code ${code}`;
+  const output = text.endsWith(suffix) ? text.slice(0, -suffix.length)
+    : text === `Command exited with code ${code}` ? "" : text;
+  return new PiBashExitError(text, code, output);
+}
+
 // Display cleanup only: this never decides whether an error is a native exit.
 // Work exclusively with the final text so redacted/cleared content stays gone.
 function bashResultOutput(original: PiBashExitError, text: string): string {

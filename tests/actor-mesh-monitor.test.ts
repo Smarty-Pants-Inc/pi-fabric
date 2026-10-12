@@ -831,7 +831,12 @@ describe("ActorManager idle checkpoints", () => {
       s.release();
       await s.allRuns;
       await s.poll();
-      expect(s.cursor().last).toEqual({ sequence: events[10]!.sequence, id: events[10]!.id });
+      // The cursor reaches the eleventh event; past it only host alarms follow (the failed callerless activations
+      // drop their events: fabric.alarm.actor-activation actor-event-dropped, smarty-dev#9332).
+      const last = s.cursor().last as { sequence: number; id: string };
+      expect(last.sequence).toBeGreaterThanOrEqual(events[10]!.sequence);
+      expect(s.mesh.read({ limit: 100 }).filter(event => event.sequence > events[10]!.sequence)
+        .every(event => event.topic === "fabric.alarm.actor-activation")).toBe(true);
       expect(s.run).toHaveBeenCalledTimes(11);
       expect(s.run.mock.calls.map(([request]) =>
         JSON.parse(request.task.slice(request.task.indexOf("\n\n") + 2)).payload.id,

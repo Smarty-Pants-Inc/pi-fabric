@@ -3803,7 +3803,10 @@ describe("ActorManager", () => {
     await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
     await waitFor(() => next.status(actor.id).status === "failed" && !next.status(actor.id).inFlightRun);
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
-    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
+    const alarms = s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
+    expect(alarms.filter(alarm => alarm.kind === "actor-activation-blocked")).toHaveLength(1);
+    // smarty-dev#9332: the two callerless events were dropped with no retry: one alarm for the episode.
+    expect(alarms.filter(alarm => alarm.kind === "actor-event-dropped")).toHaveLength(1);
   });
 
   it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {

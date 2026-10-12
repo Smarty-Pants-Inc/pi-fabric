@@ -43,6 +43,7 @@ import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoales
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
+import { appendStuckPreparing, stuckPreparingNotice } from "./stuck-preparing.js";
 import { normalizeDeadRootFilterConfig, type FabricDeadRootFilterConfig } from "../config.js";
 import type {
   FabricActorBindingScope,
@@ -662,6 +663,14 @@ export class ActorManager {
   readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /**
+   * smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. Preparation
+   * time accrues across phase transitions of one activation; an admission-permit wait pauses it.
+   */
+  readonly #stuckPreparing = new Map<string, {
+    itemId: string; since: number; activeMs: number; activeSince?: number;
+    waitedMs: number; waitingSince?: number; notified: boolean;
+  }>();
   /** Removals that returned before their in-flight run ended, by actor id (smarty-dev#2184). */
   readonly #removals = new Map<string, Promise<void>>();
   /** Revoked actors still owe directory/presence cleanup; persisted independently of the registry. */
@@ -3500,7 +3509,9 @@ export class ActorManager {
         this.#replayDeadLetters(actor);
         const inferenceContext = actor.inferenceContext;
         actor.status = "preparing";
-        actor.preparing = { phase: "presence", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
+        const preparationStartedAt = Date.now();
+        actor.preparing = { phase: "presence", startedAt: preparationStartedAt, attempts: item.preparationAttempts ?? 0 };
+        this.#preparationClock(actor.id, item.id, "active", preparationStartedAt);
         actor.updatedAt = Date.now();
         delete actor.lastError;
         const abortController = new AbortController();
@@ -3605,6 +3616,7 @@ export class ActorManager {
               item.executionStarted = true;
               this.#persistQueue(actor.id);
               delete actor.preparing;
+              this.#endPreparationClock(actor.id, item.id);
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
               void this.#publishPresence(actor).catch(() => undefined);
@@ -3618,13 +3630,17 @@ export class ActorManager {
             () => this.#downgradeOutputPrincipal(actor, item),
             (handle) => {
               actor.status = "waiting";
-              actor.preparing = { phase: "waiting", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0,
+              const waitingAt = Date.now();
+              this.#preparationClock(actor.id, item.id, "waiting", waitingAt);
+              actor.preparing = { phase: "waiting", startedAt: waitingAt, attempts: item.preparationAttempts ?? 0,
                 runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
               void this.#publishPresence(actor).catch(() => undefined);
             },
             { timeoutMs: this.#preparationTimeoutMs, onPreparing: () => {
               actor.status = "preparing";
-              actor.preparing = { phase: "launch", startedAt: Date.now(), attempts: item.preparationAttempts ?? 0 };
+              const admittedAt = Date.now();
+              this.#preparationClock(actor.id, item.id, "active", admittedAt);
+              actor.preparing = { phase: "launch", startedAt: admittedAt, attempts: item.preparationAttempts ?? 0 };
               void this.#publishPresence(actor).catch(() => undefined);
             } },
           );
@@ -3927,6 +3943,7 @@ export class ActorManager {
           }
           delete actor.abortController;
           delete actor.preparing;
+          this.#endPreparationClock(actor.id, item.id);
           delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
@@ -4122,6 +4139,87 @@ export class ActorManager {
     } catch {
       // Best effort: the failures stay in the actor's messages and run records.
     }
+  }
+
+  /**
+   * smarty-dev#6337: an activation hung in preparation never fails, so the
+   * failure-streak notice above never fires. The resident host's maintenance
+   * tick calls this: an actor whose one activation has spent thresholdMs in
+   * preparation phases gets ONE owner notice per episode. The time accrues
+   * across phase transitions (presence, validity, binding, launch), but time
+   * spent waiting for an admission permit is excluded, so a permit wait alone
+   * never triggers it. The episode ends when the activation leaves preparing
+   * (it launches, settles or is requeued).
+   */
+  reportStuckPreparing(thresholdMs: number, now = Date.now()): number {
+    if (this.#halted || this.#closing || !(thresholdMs > 0)) return 0;
+    let sent = 0;
+    for (const actor of this.#draining.values()) {
+      const preparing = actor.preparing;
+      const episode = this.#stuckPreparing.get(actor.id);
+      // Only a preparation phase reports: a permit wait is not a stuck preparation.
+      if (!preparing || !episode || preparing.phase === "waiting" || actor.status === "stopped" || actor.removal) continue;
+      if (episode.itemId !== this.#inFlight.get(actor.id)?.id || !this.#canManageCached(actor.id)) continue;
+      const stuckMs = this.#preparationActiveMs(episode, now);
+      if (episode.notified || stuckMs < thresholdMs) continue;
+      episode.notified = true;
+      sent++;
+      const text = stuckPreparingNotice(actor.name, stuckMs, episode.since) +
+        ` Phase: ${preparing.phase}.` +
+        (episode.waitedMs >= 60_000 ? ` Not counted: ${Math.floor(episode.waitedMs / 60_000)} min waiting for an admission permit.` : "") +
+        ` Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log.`;
+      appendStuckPreparing(this.mesh.root, {
+        at: new Date(now).toISOString(), actorId: actor.id, actorName: actor.name, rootId: actor.rootId,
+        phase: preparing.phase, since: new Date(episode.since).toISOString(), stuckMs, waitedMs: episode.waitedMs,
+        // The backlog behind it: the queue and the overflow past the queue limit (smarty-dev#1065).
+        queued: this.#backlogLength(actor),
+      });
+      const notice: FabricActorMessage = {
+        id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
+        source: "fabric-host", createdAt: now, action: "message", text,
+      };
+      try {
+        // The same host alarm channel as the failure-streak notice: it reaches the
+        // root's Main and starts a turn whatever the actor's own delivery.
+        this.onDeliver({ actor: this.#publicInfo(actor), message: notice, delivery: "followUp", triggerTurn: true });
+      } catch {
+        // Best effort: the metrics line and the actor's preparing status remain.
+      }
+    }
+    // Safety net: an episode whose activation is no longer preparing is closed.
+    for (const id of this.#stuckPreparing.keys()) if (!this.#draining.get(id)?.preparing) this.#stuckPreparing.delete(id);
+    return sent;
+  }
+
+  /** smarty-dev#6337 review P2: one activation's preparation clock; a permit wait pauses it. */
+  #preparationClock(actorId: string, itemId: string, state: "active" | "waiting", now: number): void {
+    let episode = this.#stuckPreparing.get(actorId);
+    if (!episode || episode.itemId !== itemId) {
+      episode = { itemId, since: now, activeMs: 0, waitedMs: 0, notified: false };
+      this.#stuckPreparing.set(actorId, episode);
+    }
+    if (state === "waiting") {
+      if (episode.activeSince !== undefined) episode.activeMs += Math.max(0, now - episode.activeSince);
+      delete episode.activeSince;
+      episode.waitingSince ??= now;
+    } else {
+      if (episode.waitingSince !== undefined) episode.waitedMs += Math.max(0, now - episode.waitingSince);
+      delete episode.waitingSince;
+      episode.activeSince ??= now;
+    }
+  }
+
+  #endPreparationClock(actorId: string, itemId: string): void {
+    if (this.#stuckPreparing.get(actorId)?.itemId === itemId) this.#stuckPreparing.delete(actorId);
+  }
+
+  #preparationActiveMs(episode: { activeMs: number; activeSince?: number }, now: number): number {
+    return episode.activeMs + (episode.activeSince === undefined ? 0 : Math.max(0, now - episode.activeSince));
+  }
+
+  /** Every event waiting behind the in-flight one: the queue and its overflow. */
+  #backlogLength(actor: ManagedActor): number {
+    return actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0);
   }
 
   // Expiry is evaluated lazily wherever the block is read (#publicInfo). Routers read the
@@ -6763,7 +6861,7 @@ export class ActorManager {
       ...(actor.principalScope
         ? { principal: { id: actor.principalScope.principal.id, digest: actor.principalScope.digest } }
         : {}),
-      queued: actor.queue.length + (this.#overflow.get(actor.id)?.length ?? 0),
+      queued: this.#backlogLength(actor),
       messages: this.#messageCount(actor),
       createdAt: actor.createdAt,
       updatedAt: actor.updatedAt,

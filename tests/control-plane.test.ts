@@ -59,13 +59,23 @@ describe("sender final delivery outcomes", () => {
     return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
       fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
   };
-  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records a definite refusal (%s) at the sender", async reason => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-failed-")); roots.push(root);
+  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records an owner rejection without notRun (%s) as unknown: its handler may have run", async reason => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-rejected-")); roots.push(root);
     const owner = plane(root, "host:owner"), sender = plane(root, "host:sender");
     owner.start(() => ({ accepted: false, error: reason })); sender.start(() => ({ accepted: false }));
     await expect(sender.request("host:owner", "session:target", "followUp", { message: "later" })).rejects.toThrow(reason);
     const event = sender.mesh.read({ topic: "fabric.control.command" })[0]!;
-    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "failed", reason, at: expect.any(Number) }]);
+    expect(outcomes(root)).toEqual([{ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "unknown", reason, at: expect.any(Number) }]);
+  });
+  it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"])("records an owner rejection with notRun: true (%s) as failed", async reason => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-failed-")); roots.push(root);
+    const owner = plane(root, "host:owner"), sender = plane(root, "host:sender");
+    owner.start(() => ({ accepted: false, error: reason, notRun: true })); sender.start(() => ({ accepted: false }));
+    await expect(sender.request("host:owner", "session:target", "followUp", { message: "later" })).rejects.toThrow(reason);
+    // A proven-notRun message is resent once; each published attempt failed.
+    const events = sender.mesh.read({ topic: "fabric.control.command" });
+    expect(events.length).toBeGreaterThan(0);
+    expect(outcomes(root)).toEqual(events.map(event => ({ eventId: event.id, to: "session:target", from: "host:sender", mode: "followUp", outcome: "failed", reason, at: expect.any(Number) })));
   });
   it("records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-send-withdrawn-")); roots.push(root);

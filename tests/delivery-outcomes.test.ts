@@ -2,10 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { appendDeliveryOutcome } from "../src/mesh/delivery-outcomes.js";
+import { appendDeliveryOutcome, flushUnknownTargetOutcomes, recordUnknownTarget, UNKNOWN_TARGET_KEYS, UNKNOWN_TARGET_WINDOW_MS } from "../src/mesh/delivery-outcomes.js";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  flushUnknownTargetOutcomes();
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+const lines = (root: string) => {
+  const directory = path.join(root, "delivery-outcomes");
+  return fs.readdirSync(directory).filter(file => file.endsWith(".jsonl")).sort()
+    .flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+};
 
 describe("durable delivery outcomes", () => {
   it("appends delivered, superseded, failed, and unknown as JSONL records", () => {
@@ -90,6 +98,59 @@ describe("durable delivery outcomes", () => {
     expect(flags[0]! & fs.constants.O_APPEND).toBe(fs.constants.O_APPEND);
     expect(flags[0]! & fs.constants.O_TRUNC).toBe(0);
     expect(fs.readFileSync(path.join(root, ".lock", "owner"), "utf8")).toBe("held by a different mesh writer");
+  });
+
+  it("coalesces repeated unknown-target refusals per (sender, target) into one counted record", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-delivery-unknown-")); roots.push(root);
+    const at = Date.now();
+    for (let index = 0; index < 50; index++) recordUnknownTarget(root, "session:f", "missing", "Unknown Fabric target: missing", at + index);
+    recordUnknownTarget(root, "session:f", "other", "Unknown Fabric target: other", at);
+    recordUnknownTarget(root, "session:g", "missing", "Unknown Fabric target: missing", at);
+    // Only the first refusal of each (sender, target) window is written immediately.
+    expect(lines(root).map(row => [row.from, row.to, row.count])).toEqual([
+      ["session:f", "missing", undefined], ["session:f", "other", undefined], ["session:g", "missing", undefined]]);
+    flushUnknownTargetOutcomes(at + 100);
+    const rows = lines(root);
+    expect(rows).toHaveLength(4);
+    expect(rows[3]).toMatchObject({ to: "missing", from: "session:f", mode: "publish", outcome: "failed", reason: "Unknown Fabric target: missing", count: 49 });
+    expect(new Set(rows.map(row => row.eventId)).size).toBe(4);
+    // A refusal after the window opens a new one with its own immediate record.
+    recordUnknownTarget(root, "session:f", "missing", "Unknown Fabric target: missing", at + UNKNOWN_TARGET_WINDOW_MS + 1);
+    expect(lines(root)).toHaveLength(5);
+  });
+
+  it("bounds distinct unknown targets: past the tracked limit they share one per-sender window", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-delivery-unknown-many-")); roots.push(root);
+    const at = Date.now();
+    for (let index = 0; index < UNKNOWN_TARGET_KEYS + 40; index++) recordUnknownTarget(root, "session:f", `t${index}`, `Unknown Fabric target: t${index}`, at);
+    expect(lines(root)).toHaveLength(UNKNOWN_TARGET_KEYS + 1);
+    flushUnknownTargetOutcomes(at + 1);
+    const rows = lines(root);
+    expect(rows).toHaveLength(UNKNOWN_TARGET_KEYS + 2);
+    expect(rows.at(-1)).toMatchObject({ to: "*", from: "session:f", outcome: "failed", count: 39 });
+  });
+
+  it("caps a partition by records and bytes, dropping the oldest behind a counted truncated marker", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-delivery-cap-")); roots.push(root);
+    const at = Date.parse("2025-01-01T12:00:00Z");
+    const send = (index: number) => ({ eventId: `e${index}`, to: "t", from: "f", mode: "publish" as const });
+    for (let index = 0; index < 25; index++) appendDeliveryOutcome(root, send(index), "failed", "refused", at + index, { limits: { records: 10, bytes: 1 << 20 } });
+    let rows = lines(root);
+    expect(rows.length).toBeLessThanOrEqual(10);
+    expect(rows[0]).toMatchObject({ truncated: true, dropped: expect.any(Number) });
+    expect(rows[0].dropped + rows.length - 1).toBe(25);
+    expect(rows.at(-1)).toMatchObject({ eventId: "e24" });
+    // Retained evidence still dedups; the marker count accumulates across compactions.
+    appendDeliveryOutcome(root, send(24), "failed", "again", at + 30, { limits: { records: 10, bytes: 1 << 20 } });
+    expect(lines(root)).toHaveLength(rows.length);
+    for (let index = 25; index < 40; index++) appendDeliveryOutcome(root, send(index), "failed", "refused", at + index, { limits: { records: 1_000, bytes: 1_000 } });
+    rows = lines(root);
+    const bytes = fs.statSync(path.join(root, "delivery-outcomes", "20250101.jsonl")).size;
+    expect(bytes).toBeLessThanOrEqual(1_000);
+    expect(rows[0]).toMatchObject({ truncated: true });
+    expect(rows.filter(row => row.truncated)).toHaveLength(1);
+    expect(rows[0].dropped + rows.length - 1).toBe(40);
+    expect(rows.at(-1)).toMatchObject({ eventId: "e39" });
   });
 
   it("removes daily partitions older than seven UTC days", () => {

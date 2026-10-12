@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it, vi } from "vitest";
-import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { AgentMessageRouter, FabricParticipantNotYetMirroredError, FabricRouteAuthorityError } from "../src/providers/agents-message-router.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { FabricControlIncarnationRequiredError, FabricControlPlane } from "../src/topology/control-plane.js";
 import { RootInbox, rootInboxMessage, rootInboxSession } from "../src/topology/root-inbox.js";
 
 const roots: string[] = [];
@@ -34,6 +34,25 @@ it.each(["Unknown Fabric participant: missing", "Main's followUp queue is full"]
   const target = reason.startsWith("Unknown") ? "session:missing" : "main";
   await expect(router.routeMessage(target, "hello", undefined, "followUp", undefined, { idempotencyKey: "send" })).rejects.toThrow(reason.startsWith("Unknown") ? "Unknown Fabric participant" : reason);
   expect(outcomes(root)).toEqual([{ eventId: "send", to: target, from: from.id, mode: "followUp", outcome: "failed", reason: expect.stringContaining(reason.startsWith("Unknown") ? "Unknown Fabric participant" : reason), at: expect.any(Number) }]);
+});
+
+it.each([
+  ["FABRIC_ROUTE_AUTHORITY_CHANGED", () => new FabricRouteAuthorityError("main")],
+  ["FABRIC_CONTROL_INCARNATION_REQUIRED", () => new FabricControlIncarnationRequiredError("main")],
+  ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", () => new FabricParticipantNotYetMirroredError("main", "host:peer")],
+  [undefined, () => new Error("Fabric mesh bridge routing to remote host peer is unavailable for main; the routed owner could not be revalidated; this attempt was not published.")],
+] as const)("the local sender records a known pre-publication routing refusal (%s) as failed with its code", async (code, refusal) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-prepublication-refusal-")); roots.push(root);
+  const from = identity("session:sender");
+  const error = refusal();
+  const router = new AgentMessageRouter(
+    { status: () => { throw new Error("Unknown Fabric agent"); } } as never,
+    { identity: from, mesh: { root }, status: () => { throw new Error("Unknown Fabric actor"); }, validateDirectMessage: () => {} } as never,
+    { id: "session:main", local: true, matches: (id: string) => id === "main", deliverAgent: () => { throw error; } } as never,
+    { get: () => undefined, lastKnown: () => undefined } as never, undefined, binding => binding,
+  );
+  await expect(router.routeMessage("main", "hello", undefined, "steer", undefined, { idempotencyKey: "refused" })).rejects.toBe(error);
+  expect(outcomes(root)).toEqual([{ eventId: "refused", to: "main", from: from.id, mode: "steer", outcome: "failed", reason: code ? `${code}: ${error.message}` : error.message, at: expect.any(Number) }]);
 });
 
 it("a sender timeout can be followed by receiver-delivered evidence for the same wire event", async () => {

@@ -814,8 +814,9 @@ export class FabricControlPlane {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       // A command withdrawn unclaimed at its deadline (smarty-dev#6729) is definitely not delivered.
-      if (error instanceof FabricControlRejection || (isObject(error) && error.notDelivered === true)) finalOutcome = { outcome: "failed", reason };
-      else if (reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
+      // An owner rejection proves that only with notRun; otherwise its handler may have run.
+      if ((error instanceof FabricControlRejection && error.notRun) || (isObject(error) && error.notDelivered === true)) finalOutcome = { outcome: "failed", reason };
+      else if (error instanceof FabricControlRejection || reason.includes("outcome is unknown") || error instanceof FabricParticipantStaleError ||
         (options.signal?.aborted && isObject(options.signal.reason) && options.signal.reason.name === "TimeoutError")) {
         finalOutcome = { outcome: "unknown", reason };
       }

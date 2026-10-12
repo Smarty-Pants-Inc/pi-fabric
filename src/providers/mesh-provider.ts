@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
+import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -429,7 +428,8 @@ export class MeshProvider implements FabricProvider {
           !this.participants.list({ scope: "project", includeStale: true, fresh: true })
             .some(member => member.id === args.to || member.name === args.to)) {
           const reason = `Unknown Fabric target: ${args.to}`;
-          appendDeliveryOutcome(this.store.root, { eventId: randomUUID(), to: args.to, from: this.identity.id, mode: "publish" }, "failed", reason);
+          // Coalesced per (sender, target): a publish loop to unknown targets stays bounded.
+          recordUnknownTarget(this.store.root, this.identity.id, args.to, reason);
           throw new Error(reason);
         }
         if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");

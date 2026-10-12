@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { MeshProvider } from "../src/providers/mesh-provider.js";
+import { flushUnknownTargetOutcomes } from "../src/mesh/delivery-outcomes.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
 const roots: string[] = [];
@@ -50,6 +51,14 @@ describe("targeted publish outcomes", () => {
     const directory = path.join(provider.store.root, "delivery-outcomes");
     const rows = fs.readdirSync(directory).flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
     expect(rows).toEqual([{ eventId: expect.any(String), to: "missing", from: identity.id, mode: "publish", outcome: "failed", reason: "Unknown Fabric target: missing", at: expect.any(Number) }]);
+    // Repeats coalesce into one counted record instead of one fsynced record each.
+    for (let index = 0; index < 3; index++) {
+      await expect(provider.invoke("publish", { topic: "work", to: "missing", text: "again" }, context)).rejects.toThrow("Unknown Fabric target");
+    }
+    const read = () => fs.readdirSync(directory).flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(read()).toHaveLength(1);
+    flushUnknownTargetOutcomes();
+    expect(read()).toEqual([rows[0], { eventId: expect.any(String), to: "missing", from: identity.id, mode: "publish", outcome: "failed", reason: "Unknown Fabric target: missing", at: expect.any(Number), count: 3 }]);
     expect(provider.store.latestSequence()).toBe(0);
     await expect(provider.invoke("publish", { topic: "work", text: "broadcast" }, context)).resolves.toMatchObject({ topic: "work", text: "broadcast" });
   });

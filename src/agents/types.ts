@@ -70,6 +70,8 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
+  activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */
   routeClass?: string;
   protected?: boolean;
@@ -305,6 +307,10 @@ export interface AgentRunRecord {
 export interface AgentRunResult extends AgentRunRecord {
   /** Resolution marker in agents.run results; does not replace the observed model. */
   via?: string;
+  /** smarty-dev#8935: an ENODEV-unconfirmed run's saved answer, not yet settled; the actor commits it after delivery. */
+  enodevRecovered?: boolean;
+  /** Its delivery receipt already exists: a crash came after a delivery attempt; the actor replays idempotently. */
+  enodevReplay?: boolean;
   /** Canonical launch selection when via is present; may differ from the observed model. */
   selectedModel?: string;
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
@@ -315,6 +321,8 @@ export interface AgentRunResult extends AgentRunRecord {
 
 export interface AgentHandleInfo {
   finalAnswerReceipt?: { id: string; recordedAt: number };
+  /** smarty-dev#9855: on a waiting spawn, the admission permits unknown-outcome launches still hold. */
+  heldPermits?: number;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
@@ -552,6 +560,17 @@ export interface FabricAgentLog {
 }
 
 export type FabricSteeringMode = "all" | "one-at-a-time";
+
+/** smarty-dev#9855: held admission permits reached half of maxConcurrent. */
+export interface AgentAdmissionAlarm {
+  heldPermits: number;
+  maxConcurrent: number;
+  at: number;
+  message: string;
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
+  kind?: "recovered-answer-save-failed";
+  runId?: string;
+}
 
 export interface AgentFollowUpAlarm {
   code: "FABRIC_FOLLOW_UP_DEADLINE";

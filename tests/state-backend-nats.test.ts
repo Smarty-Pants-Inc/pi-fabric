@@ -3,7 +3,7 @@ import path from "node:path";
 import semver from "semver";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
+  applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MAX_MESSAGE_BYTES, MIN_SERVER, natsVersionAtLeastForTest, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
   guardNatsPort, NatsStateBackend, natsStreamName, NatsWrongLastSequenceError, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
@@ -244,12 +244,23 @@ describe("NATS state backend (smarty-dev#7504 phase 1)", () => {
   describe("refusals (never a fallback to file)", () => {
     it.each([
       ["a server older than 2.14.7", { version: "2.10.22", syncAlways: true }, /older than 2\.14\.7/],
+      // pi-fabric#918's cases under #937's strict-semver floor: both refuse as below it.
+      ["a prerelease of the minimum (pi-fabric#918)", { version: "2.14.7-rc.1", syncAlways: true }, /older than 2\.14\.7/],
+      ["a version with a suffix", { version: "2.14.7junk", syncAlways: true }, /older than 2\.14\.7/],
       ["a server that does not fsync every write", { version: "2.14.7", syncAlways: false }, /sync_always/],
       ["a server that does not report its sync policy", { version: "2.14.7", syncAlways: undefined }, /sync_always/],
     ])("refuses %s", async (_name, facts, reason) => {
       const server = fakeJetStream();
       Object.assign(server, facts);
       await expect(open(server)).rejects.toThrow(reason);
+    });
+
+    // pi-fabric#918's shared gate (open and migration) applies #937's strict-semver floor (its parity test is above).
+    it("the version rule: at or above 2.14.7 by strict semver; below it, a prerelease of it or an unparseable version fails closed", () => {
+      for (const version of ["2.14.7", "2.14.10", "3.0.0", "v2.14.7", "2.15.0-rc.1"]) expect(() => assertNatsServerSupported(version)).not.toThrow();
+      for (const version of ["2.11.0", "2.14.6", "2.14.7-rc.1", "2.14.7junk", "2.14", "2.14.7.1", ""]) {
+        expect(() => assertNatsServerSupported(version), version).toThrow(/older than 2\.14\.7/);
+      }
     });
 
     it("accepts a periodic-sync server only when the operator says so", async () => {

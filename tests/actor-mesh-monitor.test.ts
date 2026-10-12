@@ -8,6 +8,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshTailResult } from "../src/mesh/store.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 
 const roots: string[] = [];
 const monitors: ActorMeshMonitor[] = [];
@@ -39,6 +40,18 @@ function setup(cursor?: string) {
 const flush = async () => { for (let index = 0; index < 8; index++) await Promise.resolve(); };
 
 describe("ActorMeshMonitor", () => {
+  // smarty-dev#8825: the monitor's background poll reports a mesh outage past the bound to its owner's sink.
+  it("alarms its owner once when its poll stays deferred by a mesh lock timeout past five minutes", async () => {
+    const s = setup();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const alarms: unknown[] = [];
+    s.monitor.callbacks.outageAlarm = (alarm) => { alarms.push(alarm); };
+    s.mesh.tail.mockImplementation(() => { throw new MeshLockTimeoutError(" held by pid 123", 6, 8020); });
+    s.monitor.start(); await flush();
+    await vi.advanceTimersByTimeAsync(6 * 60 * 1_000);
+    expect(alarms).toEqual([expect.objectContaining({ label: "actor mesh monitor", state: "outage", reason: "mesh lock timeout" })]);
+  });
+
   it.each([50, 1_600])("delivers every changed watch burst within 100 ms without an actorPollMs=%i trailing timer", async actorPollMs => {
     const s = setup();
     s.monitor.config.actorPollMs = actorPollMs;
@@ -831,7 +844,12 @@ describe("ActorManager idle checkpoints", () => {
       s.release();
       await s.allRuns;
       await s.poll();
-      expect(s.cursor().last).toEqual({ sequence: events[10]!.sequence, id: events[10]!.id });
+      // The cursor reaches the eleventh event; past it only host alarms follow (the failed callerless activations
+      // drop their events: fabric.alarm.actor-activation actor-event-dropped, smarty-dev#9332).
+      const last = s.cursor().last as { sequence: number; id: string };
+      expect(last.sequence).toBeGreaterThanOrEqual(events[10]!.sequence);
+      expect(s.mesh.read({ limit: 100 }).filter(event => event.sequence > events[10]!.sequence)
+        .every(event => event.topic === "fabric.alarm.actor-activation")).toBe(true);
       expect(s.run).toHaveBeenCalledTimes(11);
       expect(s.run.mock.calls.map(([request]) =>
         JSON.parse(request.task.slice(request.task.indexOf("\n\n") + 2)).payload.id,

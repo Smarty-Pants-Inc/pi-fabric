@@ -12,7 +12,7 @@ import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { createMeshGrant, postWithMeshGrant } from "../src/mesh/grants.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -863,9 +863,9 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     });
     agentManagers.push(agents);
     const identity: MeshIdentity = { id: "session:presence", name: "main", kind: "main", sessionId: "presence" };
-    const make = () => {
+    const make = (extra: { meshOutageAlarmMs?: number } = {}) => {
       const manager = new ActorManager("presence", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
-        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs });
+        { actorRoot: path.join(root, "actors"), persistent: true, presenceRetryMs, ...extra });
       actorManagers.push(manager);
       return manager;
     };
@@ -943,6 +943,60 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     expect(actors.list().find((info) => info.id === actor.id)).toMatchObject({ instructionsDigest: sha("Second text."), instructionsLength: 12 });
     expect(actors.status(actor.id)).not.toHaveProperty("instructions");
   });
+
+  // pi-fabric#893 round 3: the presence path's retry is kept until its alarm and recovery were accepted.
+  const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
+  it("a presence outage alarm whose publish failed is delivered, then its recovery, once the write lands", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { mesh, make, hold, release } = stalledSetup();
+      const actors = make({ meshOutageAlarmMs: 400 });
+      const publish = mesh.publish.bind(mesh);
+      let rejected = 0;
+      vi.spyOn(mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && rejected++ === 0) throw new Error("mesh unavailable");
+        return publish(input);
+      });
+      hold();
+      const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+      await waitFor(() => rejected > 0, 10_000); // the outage alarm was raised and its first publish failed
+      release();
+      await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+      await waitFor(() => mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).length >= 2, 5_000);
+      const alarms = mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC });
+      expect(alarms.map((event) => event.kind)).toEqual(["mesh-outage", "mesh-recovered"]);
+      expect(alarms.every((event) => event.to === CHIEF)).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+  }, 30_000);
+
+  // pi-fabric#893 round 4: after the final presence write, a failed alarm publish has no later pass to ride on; the
+  // owner's timer delivers it.
+  it("delivers a queued presence alarm whose publishes failed past the final write, with no new presence pass", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", CHIEF);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { mesh, make, hold, release } = stalledSetup();
+      const actors = make({ meshOutageAlarmMs: 400 });
+      const publish = mesh.publish.bind(mesh);
+      let failing = true;
+      let rejected = 0;
+      vi.spyOn(mesh, "publish").mockImplementation(async (input) => {
+        if (input.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && failing) { rejected++; throw new Error("mesh unavailable"); }
+        return publish(input);
+      });
+      hold();
+      const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+      await waitFor(() => rejected > 0, 10_000);
+      release();
+      await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
+      const attempts = rejected;
+      await waitFor(() => rejected > attempts, 5_000); // the flush after the final write failed too
+      failing = false; // no further presence pass happens for this actor
+      await waitFor(() => mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).length >= 2, 5_000);
+      expect(mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC }).map((event) => event.kind)).toEqual(["mesh-outage", "mesh-recovered"]);
+    } finally { vi.unstubAllEnvs(); }
+  }, 30_000);
 
   it("publishes a new actor's presence once a stalled lock frees", async () => {
     const { mesh, make, hold, release } = stalledSetup();
@@ -3804,7 +3858,10 @@ describe("ActorManager", () => {
     await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
     await waitFor(() => next.status(actor.id).status === "failed" && !next.status(actor.id).inFlightRun);
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
-    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
+    const alarms = s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
+    expect(alarms.filter(alarm => alarm.kind === "actor-activation-blocked")).toHaveLength(1);
+    // smarty-dev#9332: the two callerless events were dropped with no retry: one alarm for the episode.
+    expect(alarms.filter(alarm => alarm.kind === "actor-event-dropped")).toHaveLength(1);
   });
 
   it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {

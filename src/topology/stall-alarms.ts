@@ -156,6 +156,16 @@ const PROVIDER_DEAD_ALARM_BATCH = 50;
  * the existing mesh bridge to remote senders and the age pass never repeats it; the age pass
  * still reports that address's other messages if they stay unread past mesh.undeliveredAlarmMs.
  */
+/**
+ * pi-fabric#939 P2-b: the one recipient of the agent-admission alarm. An owner alarm is never published without one,
+ * and never to a name ("org", "org-kate"): only an exact `session:<uuid>` address. The configured owner identity
+ * first, else this Main's own session id (the manager's owner); undefined means log locally and skip the publish.
+ */
+const SESSION_ADDRESS = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const admissionAlarmRecipient = (ownerIdentityId: string | undefined, identity: MeshIdentity | undefined): string | undefined =>
+  [ownerIdentityId?.trim(), identity?.kind === "main" ? identity.id : undefined]
+    .find((candidate): candidate is string => typeof candidate === "string" && SESSION_ADDRESS.test(candidate));
+
 export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
   event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
   const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];

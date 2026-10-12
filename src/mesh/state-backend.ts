@@ -405,13 +405,13 @@ export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendF
  * Interim R20 fence decision (smarty-dev#7504 phase 2, docs/mesh-backends.md "Bridges"): on `nats`, the state write
  * fence excludes no other writer, so a bridge's held-event ownership check (security F2) cannot hold. A root where a
  * bridge holds events (a mirrored remote host record) refuses `nats`, and a bridge refuses a `nats` store, until the
- * event log moves onto the stream (smarty-dev#717) or a lease fences it.
+ * event log moves onto the stream (smarty-dev#9725) or a lease fences it.
  */
 export class MeshStateNatsBridgeRefusedError extends Error {
   readonly code = "FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED";
   constructor(root: string, detail: string) {
     super(`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: ${root}: ${detail}; the nats backend has no R20 write fence for a bridge's `
-      + "held events until smarty-dev#717 (docs/mesh-backends.md, Bridges)");
+      + "held events until smarty-dev#9725 (docs/mesh-backends.md, Bridges)");
     this.name = "MeshStateNatsBridgeRefusedError";
   }
 }

@@ -1,3 +1,4 @@
+import { recordUnknownTarget } from "../mesh/delivery-outcomes.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -421,6 +422,16 @@ export class MeshProvider implements FabricProvider {
         const topic = String(args.topic);
         assertPublishTopic(topic);
         const dueAt = meshScheduleDueAt(args);
+        // An immediate addressed publish needs a known target. A scheduled one (#864) is released
+        // later, when its target may exist; its presence now proves nothing either way.
+        if (dueAt === undefined && typeof args.to === "string" && !this.participants.get(args.to, undefined, { fresh: true }) &&
+          !this.participants.list({ scope: "project", includeStale: true, fresh: true })
+            .some(member => member.id === args.to || member.name === args.to)) {
+          const reason = `Unknown Fabric target: ${args.to}`;
+          // Coalesced per (sender, target): a publish loop to unknown targets stays bounded.
+          recordUnknownTarget(this.store.root, this.identity.id, args.to, reason);
+          throw new Error(reason);
+        }
         if (dueAt === undefined && args.key !== undefined) throw new Error("mesh.publish key requires notBefore or afterMs");
         const dedupeKey = dueAt === undefined ? namespacedDedupeKey(args, context) : undefined;
         const checked = typeof args.text === "string" ? await outgoingMessageNotice(args.text, context, this.identity.id) : undefined;

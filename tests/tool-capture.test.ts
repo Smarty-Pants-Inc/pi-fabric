@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import {
   bundleExtensionRunnerConstructors,
+  HOST_EXTENSION_RUNNER_SYMBOL,
   installRegisteredToolCapture,
   type RegisteredToolCaptureController,
 } from "../src/capture/interceptor.js";
@@ -423,6 +424,66 @@ describe("registered extension tool capture", () => {
     } finally {
       process.argv[1] = savedArgv1;
       await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("captures the runner class a native SDK task entry registers (#8606)", async () => {
+    // Fabric's task entry runs a Pi SDK from another package realm while
+    // process.argv[1] is the entry script, so no lookup finds that SDK. Its
+    // registered ExtensionRunner is the class the guards' runner instantiates.
+    class TaskEntryRunner {
+      extensions: Array<{ tools: Map<string, RegisteredTool> }> = [];
+      getAllRegisteredTools(): RegisteredTool[] {
+        return this.extensions.flatMap((extension) => [...extension.tools.values()]);
+      }
+      getActiveTools(): string[] { return []; }
+      createContext(): object { return {}; }
+      async emit(): Promise<void> {}
+      async emitToolCall(): Promise<undefined> { return undefined; }
+      async emitToolResult(): Promise<undefined> { return undefined; }
+    }
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value: TaskEntryRunner, configurable: true });
+    try {
+      const fabricTool = tool("fabric_exec");
+      const catalog = new CapturedToolCatalog();
+      controllers.push(await installRegisteredToolCapture({ anchorDefinition: fabricTool, catalog }));
+      const runner = new TaskEntryRunner();
+      runner.extensions = [{ tools: new Map([["fabric_exec", registered(fabricTool, "/extensions/pi-fabric/index.ts")]]) }];
+      expect(catalog.runner).toBeUndefined();
+      runner.getAllRegisteredTools();
+      expect(catalog.runner).toBe(runner);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
+    }
+  });
+
+  it.each([
+    ["a plain object", { getAllRegisteredTools() { return []; } }, /not a constructor/],
+    ["a class without the emit methods", class { getAllRegisteredTools() { return []; } },
+      /prototype lacks getActiveTools, createContext, emit, emitToolCall, emitToolResult/],
+    ["an arrow function", () => undefined, /prototype is not an object/],
+  ])("refuses a bogus registered host runner: %s (#8606)", async (_label, value, reason) => {
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value, configurable: true });
+    try {
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(reason);
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(/Pi Fabric refuses the host ExtensionRunner/);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
+    }
+  });
+
+  it("refuses an accessor registered as the host runner (#8606)", async () => {
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { get: () => class {}, configurable: true });
+    try {
+      await expect(installRegisteredToolCapture({ anchorDefinition: tool("fabric_exec"), catalog: new CapturedToolCatalog() }))
+        .rejects.toThrow(/accessor, not a data property/);
+    } finally {
+      delete registry[HOST_EXTENSION_RUNNER_SYMBOL];
     }
   });
 });

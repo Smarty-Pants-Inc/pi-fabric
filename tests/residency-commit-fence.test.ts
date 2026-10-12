@@ -42,6 +42,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { claimFabricHandoff, runFabricHandoffAtBoundary } from "../src/prewalk/handoff.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -881,7 +882,7 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
   it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
     const state = await harness(false, undefined, ending === "handled uncertainty" || ending === "handled expiry" ? 250 : 10_000);
     const main = mainProvider(state);
-    main.registry.register(new PiToolsProvider(state.root));
+    main.registry.register(new PiToolsProvider(state.root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
     const config = normalizeFabricConfig({ fullCodeMode: true,
       executor: { resultFormat: "json", timeoutMs: 8_000, maxOutputChars: 1_400, memoryLimitBytes: 256 * 1024 * 1024 },
       prewalk: { compactOnReturn: false }, entropy: { compile: false } });

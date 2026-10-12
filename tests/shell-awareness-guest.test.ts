@@ -11,7 +11,7 @@ import { TasksProvider } from "../src/providers/tasks-provider.js";
 describe("discarded background result awareness", () => {
   it("projects a real sandbox-started task into model input even when the program returns unrelated data", async () => {
     const jobs = new FabricShellJobStore(); const registry = new ActionRegistry();
-    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
+    registry.register(new PiToolsProvider(process.cwd(), undefined, undefined, { allowUnhookedTools: true, shellJobs: jobs, powerShellToolDefinitionFactory: undefined }));
     registry.register(new TasksProvider(jobs));
     const config = normalizeFabricConfig({ fullCodeMode: true, approvals: { read: "allow", execute: "allow" } });
     const service = new FabricExecutionService(registry, config);

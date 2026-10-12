@@ -1,6 +1,6 @@
 import os from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
+import { MESH_ALARM_ATTEMPT_MS, MESH_ALARM_MAX_ATTEMPTS, MESH_JOURNAL_ALARM_TAG, MESH_OUTAGE_ALARM_AFTER_MS, MESH_OUTAGE_ALARM_TAG, MESH_OUTAGE_RECOVERY_SUCCESSES, MeshBackgroundQueue, MeshBackgroundRetry, type MeshOutageAlarm } from "../src/core/atomic-write.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshAlarmRecipient, meshOutageAlarmSink } from "../src/mesh/store.js";
 
 const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
@@ -243,11 +243,12 @@ describe("background outage alarm (smarty-dev#8825)", () => {
   it("keeps at most 32 queued events, dropping the oldest, with one fabric-alarm journal line", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // A publish that never settles (a hung mesh): nothing is delivered or retried, so only the cap bounds the queue.
-    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => new Promise(() => {}));
+    // A publish that never settles (a hung mesh), inside one attempt deadline: nothing is delivered or retried yet, so
+    // only the cap bounds the queue. A 1 ms outage bound keeps the whole run far inside MESH_ALARM_ATTEMPT_MS.
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => new Promise(() => {}), 1);
     for (let outage = 0; outage < 20; outage++) { // 20 outages: 40 events (alarm and recovery), none delivered
       retry.failure(busy());
-      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      await vi.advanceTimersByTimeAsync(2);
       retry.failure(busy());
       retry.success(true);
       await vi.advanceTimersByTimeAsync(0);
@@ -269,15 +270,16 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     const attempted: string[] = [];
     let release!: () => void;
     const first = new Promise<void>((resolve) => { release = resolve; });
+    // A 1 ms outage bound keeps the whole run inside one attempt deadline (smarty-dev#9848), so event 1 stays in flight.
     const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo((alarm) => {
       attempted.push(JSON.stringify(alarm));
       return attempted.length === 1 ? first : Promise.resolve(); // a delayed sink: the first publish hangs
-    });
+    }, 1);
     // 16 outages (alarm and recovery) and one more alarm: 33 events, one over the cap of 32, while event 1 is in
     // flight. The overflow drops event 1 itself (attempted, and counted).
     for (let outage = 0; outage <= 16; outage++) {
       retry.failure(busy());
-      await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+      await vi.advanceTimersByTimeAsync(2);
       retry.failure(busy());
       if (outage < 16) retry.success(true);
       await vi.advanceTimersByTimeAsync(0);
@@ -297,6 +299,26 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     expect(attempted).toEqual(raised);
     for (let i = 0; i < MESH_OUTAGE_RECOVERY_SUCCESSES; i++) retry.success(true);
     await retry.flushAlarms();
+  });
+
+  // smarty-dev#9848: a publish that never settles counts as a failed attempt at MESH_ALARM_ATTEMPT_MS, so the attempt
+  // limit still drains the queue; a late settle changes nothing.
+  it("a sink that never settles still runs the attempt limit: the event is dropped once and the queue drains", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let attempts = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => { attempts++; return new Promise(() => {}); });
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy()); // the alarm: attempt 1, which never settles
+    for (let i = 0; i < 20; i++) { await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS); void retry.flushAlarms(); }
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
+    expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS);
+    const journal = warn.mock.calls.map(([line]) => parse9729(String(line))).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toMatchObject({ droppedAfterRetries: 1, queued: 0 });
+    retry.success(true);
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
   });
 
   it("drops an event after 8 failed attempts with one final journal line, and the queue empties", async () => {

@@ -768,6 +768,19 @@ export const MESH_ALARM_MAX_AGE_MS = 30 * 60 * 1_000;
 /** Every stderr alarm line is `fabric.alarm.mesh-outage {json}`, the one shape smarty-dev#9729's factory reader pages
  * on: label (string), state ("outage" | "recovered"), sinceMs (epoch ms, int), optional durationMs (int) and reason
  * (string); extra fields are allowed. */
+/** One sink attempt's deadline (smarty-dev#9848): a publish that never settles counts as a failed attempt, so the
+ * attempt and age limits still run; its late settle is ignored. */
+export const MESH_ALARM_ATTEMPT_MS = 10_000;
+const withAttemptDeadline = (attempt: Promise<unknown> | void): Promise<unknown> => {
+  if (!attempt) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("mesh alarm publish did not settle")), MESH_ALARM_ATTEMPT_MS);
+    timer.unref?.();
+  });
+  Promise.resolve(attempt).catch(() => undefined); // a late rejection after the deadline is ignored, never unhandled
+  return Promise.race([attempt, deadline]).finally(() => clearTimeout(timer));
+};
 export const MESH_JOURNAL_ALARM_TAG = MESH_OUTAGE_ALARM_TAG;
 export const meshJournalAlarmLine = (alarm: { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs?: number;
   reason?: string; [extra: string]: unknown }): string =>
@@ -843,7 +856,7 @@ export class MeshBackgroundRetry {
       while (this.#pendingAlarms.length && this.#alarm) {
         const head = this.#pendingAlarms[0]!;
         head.attempts++;
-        try { await this.#alarm(head.alarm); }
+        try { await withAttemptDeadline(this.#alarm(head.alarm)); }
         catch {
           // Kept for the next call, until its attempts or age run out: then dropped, and reported once.
           if (head.attempts >= MESH_ALARM_MAX_ATTEMPTS || performance.now() - head.firstAt >= MESH_ALARM_MAX_AGE_MS) {

@@ -904,7 +904,7 @@ export class StateFile implements StateBackend {
     // The reduced remaining budget below must not turn an ordinary cold protocol-2
     // write into a bounded custody try. Await constructor preparation outside custody;
     // an actual registry-fenced try still fails closed promptly in #withLock.
-    if (this.#lock.lockProtocol === 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
+    if (this.#lock.lockProtocol >= 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
       await this.#lock.ownIncarnation;
     }
     for (;;) {

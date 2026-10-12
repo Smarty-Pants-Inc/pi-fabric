@@ -155,6 +155,52 @@ describe("held admission permits (smarty-dev#9855)", () => {
   });
 });
 
+// pi-fabric#939 round 2: a launched (managed) run that lost contact settles without its answer; the worker had saved
+// it. When the worker is proven gone, the spawner gets that saved answer once, through its completion path, and only
+// then is the permit released.
+describe("a lost-contact run's saved answer", () => {
+  onLinux("reaches the spawner exactly once before its permit is released", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
+    roots.push(root);
+    const settledResults: Array<{ id: string; status: string; text?: string }> = [];
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+      onSettled: result => settledResults.push({ id: result.id, status: result.status, ...(result.text ? { text: result.text } : {}) }),
+    });
+    managers.push(manager);
+    const worker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
+    children.push(worker);
+    let alive = true;
+    worker.once("exit", () => { alive = false; });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockResolvedValueOnce({
+      kind: "process", sessionId: String(worker.pid), isAlive: async () => alive, stop: async () => undefined,
+      lostContact: () => (alive ? undefined : ENODEV),
+    } as never);
+    const handle = await manager.spawn({ task: "lost contact", transport: "process" });
+    launch.mockRestore();
+    const directory = path.join(root, handle.id);
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id: handle.id, name: "lost contact", task: "lost contact",
+      status: "running", runner: "pi", transport: "process", sessionId: String(worker.pid), cwd: process.cwd(), startedAt: Date.now(),
+      updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
+    fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: handle.id, outcome: "completed", text: "SAVED" }));
+    await new Promise(resolve => { worker.once("exit", resolve); worker.kill("SIGKILL"); });
+    const first = await manager.wait(handle.id, { timeoutMs: 15_000 });
+    expect(first.status).not.toBe("completed"); // settled without the answer: the exit was unconfirmed
+    expect(manager.heldPermits()).toBe(1);
+    const saved = () => settledResults.filter(result => result.id === handle.id && result.status === "completed");
+    expect(saved()).toHaveLength(0);
+    const next = await manager.spawn({ task: "next", transport: "process" }); // releases: delivers first
+    expect(saved()).toEqual([{ id: handle.id, status: "completed", text: "SAVED" }]);
+    expect(manager.status(handle.id)).toMatchObject({ status: "completed", text: "SAVED" });
+    expect(manager.heldPermits()).toBe(0);
+    expect(next.status).not.toBe("queued");
+    manager.settleLostEnodevRuns("no-actor", new Set()); // a second release attempt
+    await manager.stop(next.id).catch(() => undefined);
+    await manager.spawn({ task: "again", transport: "process" }).then(again => manager.stop(again.id)).catch(() => undefined);
+    expect(saved()).toHaveLength(1);
+  }, 60_000);
+});
+
 // pi-fabric#939 round 1 P2-b: an owner alarm always has one exact session address, never a name or a broadcast.
 describe("admission alarm recipient", () => {
   const main = { id: "session:01a118ab-50cf-75ea-ae00-721c27d6d6cc", name: "main", kind: "main" as const };

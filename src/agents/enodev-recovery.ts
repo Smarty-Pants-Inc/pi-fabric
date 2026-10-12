@@ -150,6 +150,14 @@ export const ownedProcessGone = (owned: OwnedProcess): boolean => {
   return owned.started !== undefined && current !== undefined && current !== owned.started;
 };
 
+/** The worker's saved answer for run `directory` (its settlement.json receipt for exactly this run), else undefined. */
+export const savedEnodevAnswer = (directory: string): string | undefined => {
+  const id = path.basename(directory);
+  const settlement = readJson(path.join(directory, "settlement.json"));
+  return settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
+    typeof settlement.text === "string" ? settlement.text : undefined;
+};
+
 export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined): AgentRunResult | undefined => {
   // Worker-writable files (status.json, the marker) only select WHAT to write; whether the worker is gone comes
   // from the manager's own pid record. No own record: never proven gone, the permit stays.

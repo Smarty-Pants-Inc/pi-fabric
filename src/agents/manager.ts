@@ -18,7 +18,7 @@ import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/a
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, type OwnedProcess } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, ownedProcessGone, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -324,6 +324,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   heldPermit?: () => void;
   /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
   ownProcess?: OwnedProcess;
+  /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
+  recoveredAnswer?: boolean;
   id: string;
   name: string;
   task: string;
@@ -1789,6 +1791,10 @@ export class AgentManager {
     }
     for (const managed of this.#runs.values()) {
       if (!managed.heldPermit || !managed.settled) continue;
+      if (!managed.ownProcess || !ownedProcessGone(managed.ownProcess)) continue;
+      // pi-fabric#939 round 2: a saved answer the spawner never got goes through the normal completion path FIRST
+      // (status record, onSettled with its archive, the background notice), once; only then is the permit released.
+      if (!this.#deliverRecoveredAnswer(managed)) continue;
       if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
       const permit = managed.heldPermit;
       delete managed.heldPermit;
@@ -1801,6 +1807,30 @@ export class AgentManager {
     if (released) this.#invalidateUiList();
     if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined; // the episode ended
     return released;
+  }
+
+  /**
+   * The worker saved an answer (settlement.json) but the run settled without it (its exit was unconfirmed): deliver
+   * the completed result through the spawner's completion path. True when there is nothing to deliver or it was
+   * delivered (now or before: managed.recoveredAnswer makes it once); false keeps the permit for a later retry.
+   */
+  #deliverRecoveredAnswer(managed: ManagedAgent): boolean {
+    if (managed.recoveredAnswer) return true;
+    const text = savedEnodevAnswer(managed.runDirectory);
+    const settled = readRecord(managed.statusFile) ?? managed.latestRecord;
+    if (text === undefined || !settled || settled.status === "completed") return true;
+    const { error: _error, ...rest } = settled as AgentRunResult;
+    const recovered = { ...rest, status: "completed", text, enodevDelivered: true,
+      finishedAt: settled.finishedAt ?? Date.now(), updatedAt: Date.now() } as AgentRunResult;
+    try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    if (!this.#saveSettledResult(managed, recovered)) return false;
+    managed.recoveredAnswer = true;
+    managed.latestRecord = compactUiRecord(recovered);
+    managed.latestUiRecord = managed.latestRecord;
+    if (managed.background && !this.#closing && this.config.notifyOnComplete && this.#onBackgroundComplete) {
+      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
+    }
+    return true;
   }
 
   /** One alarm when held permits reach half of maxConcurrent, again every 6 h while they stay there. */

@@ -7,6 +7,7 @@ import { MAX_EXECUTOR_TIMEOUT_MS } from "../config.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
+import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { montyBindings } from "./monty-bridge.js";
 import { MONTY_BOOTSTRAP_SOURCE, montyErrorText, prepareMontySource } from "./monty-source.js";
 import { montyInput, normalizeMontyValue } from "./monty-values.js";
@@ -99,6 +100,18 @@ export class MontyRuntime implements FabricKernelRuntime {
       if (hostAbort.signal.aborted) throw hostAbort.signal.reason;
     };
     scheduleDeadline();
+    const humanWait = new HumanWaitDeadlinePause({
+      // ExecutionDeadline owns the clock, so a pause never lifts the host-owned ceiling.
+      remainingMs: () => executionDeadline.remainingMs(),
+      suspend: () => {
+        executionDeadline.suspend();
+        scheduleDeadline();
+      },
+      resume: (remainingMs) => {
+        executionDeadline.resume(remainingMs);
+        scheduleDeadline();
+      },
+    });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
     let result: FabricSandboxResult | undefined;
@@ -147,8 +160,11 @@ export class MontyRuntime implements FabricKernelRuntime {
         const settle = isPiShellRef(ref) && args.settle === true;
         if (isPiShellRef(ref)) delete args.settle;
         const floor = options.minimumTimeoutMsForHostCall?.(ref, args);
-        if (executionDeadline.extend(floor)) scheduleDeadline();
+        if (typeof floor === "number" && Number.isFinite(floor) && humanWait.paused) humanWait.raise(floor);
+        else if (executionDeadline.extend(floor)) scheduleDeadline();
         checkDeadline();
+        const waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
+        if (waitsForHuman) humanWait.enter();
         const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
         tasks.add(task);
         try {
@@ -169,7 +185,10 @@ export class MontyRuntime implements FabricKernelRuntime {
             return montyInput({ id, responseId: ++nextResponseId, __fabric_response_token: responseToken, value: { ok: false, ...exit, details: null, error: montyErrorText(error) } });
           }
           throw error;
-        } finally { tasks.delete(task); }
+        } finally {
+          tasks.delete(task);
+          if (waitsForHuman) humanWait.leave();
+        }
       };
       class PayloadValues {}
       const attributes = new PayloadValues();

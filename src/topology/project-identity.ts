@@ -1,3 +1,4 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -174,7 +175,7 @@ export const repositoryOf = (cwd: string): string | undefined => {
   let repository: string | undefined;
   try {
     repository = normalizeOrigin(execFileSync("git", ["-C", project, "config", "--get", "remote.origin.url"],
-      { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
+      { env: childProcessEnvironment(), encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
   } catch {
     // Non-git directories and repositories without an origin retain their native path identity.
   }

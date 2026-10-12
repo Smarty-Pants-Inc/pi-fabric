@@ -8,8 +8,10 @@ export const SENDER_HEADER_NAMES = { role: "X-Smarty-Role", agent: "X-Smarty-Age
 
 export interface SenderHeaders { role: string | undefined; agent: string | undefined; spawner: string | undefined }
 
-// Bounded ASCII, as model-route-hook: no CR/LF, spaces or free text can reach the wire.
-const SAFE_VALUE = /^[A-Za-z0-9._:@/-]{1,128}$/;
+// The gateway's sender allowlist, exactly: ASCII letters, digits and . _ : / - (no '@'), 1-64
+// characters. Anything else (CR/LF, spaces, '@', free text, longer values) is rejected, never repaired.
+export const SENDER_VALUE_MAX_LENGTH = 64;
+const SAFE_VALUE = /^[A-Za-z0-9._:/-]{1,64}$/;
 export const senderHeaderValue = (value: string | undefined | null): string | undefined =>
   typeof value === "string" && SAFE_VALUE.test(value) ? value : undefined;
 
@@ -52,13 +54,12 @@ export const senderAgent = (env: NodeJS.ProcessEnv = process.env, sessionName?: 
   return undefined;
 };
 
-/** Only a Fabric child has a spawner: its bound name, else (no name) the spawner's session id. */
-export const senderSpawner = (env: NodeJS.ProcessEnv = process.env): string | undefined => {
-  if (!isFabricChild(env)) return undefined;
-  const id = env.PI_FABRIC_SPAWNER_ID;
-  return senderHeaderValue(env.PI_FABRIC_SPAWNER_NAME) ?? senderHeaderValue(env.PI_FABRIC_SPAWNER_SESSION_ID) ??
-    (id?.startsWith("session:") ? senderHeaderValue(id) : undefined);
-};
+/**
+ * Only a Fabric child has a spawner, and only a named one: a spawner's session id (or a
+ * `session:` spawner id) never reaches a provider header. No name: the header is omitted.
+ */
+export const senderSpawner = (env: NodeJS.ProcessEnv = process.env): string | undefined =>
+  isFabricChild(env) ? senderHeaderValue(env.PI_FABRIC_SPAWNER_NAME) : undefined;
 
 export const resolveSenderHeaders = (env: NodeJS.ProcessEnv = process.env, sessionName?: string): Record<string, string> => {
   const values: SenderHeaders = { role: senderRole(env), agent: senderAgent(env, sessionName), spawner: senderSpawner(env) };

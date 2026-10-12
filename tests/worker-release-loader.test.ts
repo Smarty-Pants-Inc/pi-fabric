@@ -68,5 +68,7 @@ it.each([
   expect(new Set(loaded.map(row => row.name))).toEqual(new Set(["parent", "other", "caller-hook", "project-hook"]));
   const parentLoads = loaded.filter(row => row.name === "parent");
   expect(parentLoads.every(row => row.path === pathToFileURL(path.join(parent, "dist/index.js")).href)).toBe(true);
-  expect(parentLoads.every(row => row.argv[1].endsWith(entry === "sdk" ? path.join("worker", "task-entry.js") : "cli.js"))).toBe(true);
+  // All native Pi process tasks require the SDK final-answer durability/input
+  // fence, even when legacy profile retry settings disable automatic recovery.
+  expect(parentLoads.every(row => row.argv[1].endsWith(path.join("worker", "task-entry.js")))).toBe(true);
 }, 45000);

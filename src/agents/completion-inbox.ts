@@ -10,7 +10,7 @@ const SUMMARY_CHARS = 4_000;
 const BATCH_CHARS = 16_000;
 const IDLE_BATCH_MS = 40;
 
-type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
+type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "partialText" | "warnings" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
 type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
 type CompletionMessage = { customType: string; content: string; display: boolean; details: { ids: string[] } };
 
@@ -45,10 +45,15 @@ export class AgentCompletionInbox {
         this.#context = ctx;
         this.#confirmHeld();
         const stopReason = event.message?.role === "assistant" ? event.message.stopReason : undefined;
-        if (ctx.signal?.aborted || stopReason === "aborted" || stopReason === "error") {
+        // Only an owner cancel parks results until Main's next run (smarty-dev#733).
+        if (ctx.signal?.aborted || stopReason === "aborted") {
           this.#suspended = true;
           return;
         }
+        // A provider error or refusal (pi-ai maps Anthropic `refusal` to "error") ends the run, and
+        // Pi starts no run for a steer queued now. Keep results pending, not suspended: the idle
+        // flush armed at agent_settled, or a later enqueue, wakes Main (smarty-dev#6134, as #4012).
+        if (stopReason === "error") return;
         this.#flush();
       });
     // Any new run ends a suspension, not only typed input: after an abort the inbox must not
@@ -76,12 +81,20 @@ export class AgentCompletionInbox {
       });
     subscribe("context", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
     subscribe("turn_start", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
-    subscribe("agent_settled", (_event, ctx) => {
-        if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
+    subscribe("agent_settled", (event, ctx) => {
+        if (event.aborted || this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
         this.#confirmHeld();
-        this.#schedule();
+        this.idleSignal();
       });
+    // Pi counts a compacting Main as busy, and a compaction that no run surrounds (a manual
+    // /compact, Fabric's retry of a failed compaction) ends without agent_settled. Its end events
+    // arm the idle check for a completion that landed during it (smarty-dev#9271). Pi emits
+    // session_compact just before it leaves its compaction state, which it does as soon as the
+    // last handler returns; session_compact_failed comes after. Fabric's retry also signals from
+    // Pi's onComplete/onError callback, which runs after that state is gone (compaction/recovery.ts).
+    subscribe("session_compact", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
+    subscribe("session_compact_failed", (_event, ctx) => { this.#context = ctx; this.idleSignal(); });
     subscribe("input", (_event, ctx) => {
         this.#context = ctx;
         this.#suspended = false;
@@ -109,6 +122,8 @@ export class AgentCompletionInbox {
         id: result.id, name: result.name, status: result.status, startedAt: result.startedAt,
         ...(result.finishedAt !== undefined ? { finishedAt: result.finishedAt } : {}),
         text: clip(result.text, SUMMARY_CHARS),
+        ...(result.partialText !== undefined ? { partialText: clip(result.partialText, SUMMARY_CHARS) } : {}),
+        ...(result.warnings?.length ? { warnings: result.warnings.slice(-20).map(warning => clip(warning, SUMMARY_CHARS)) } : {}),
         ...(result.completionDelivery ? { completionDelivery: result.completionDelivery } : {}),
         ...(result.error !== undefined ? { error: clip(result.error, SUMMARY_CHARS) } : {}),
       },
@@ -126,6 +141,19 @@ export class AgentCompletionInbox {
     this.#acknowledged.add(id);
     this.#pending.delete(id);
     this.#handed.delete(id);
+  }
+
+  /**
+   * An event that can end Main's busy period arms one idle check, IDLE_BATCH_MS from now. A check
+   * that finds Main busy arms nothing: a run delivers at its own turn_end or before_agent_start,
+   * and a busy period without a run ends with one of these events (smarty-dev#9271). No polling.
+   */
+  idleSignal(): void {
+    if (this.#closed) return;
+    // Restart an earlier check: it could run before Pi leaves the busy state this event ends.
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#schedule();
   }
 
   close(): void {
@@ -230,9 +258,11 @@ export class AgentCompletionInbox {
   #schedule(): void {
     if (this.#closed || this.#timer || (!this.#receiptRetries.size && (this.#suspended || !this.#pending.size))) return;
     // Never enqueue into Pi during an active tool batch. turn_end owns that path.
+    // A check that finds Main busy does not re-arm itself; idleSignal() does, on an event.
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
+      if (this.#context.signal?.aborted) { this.#suspended = true; return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       if (this.#receiptRetries.size) this.#schedule();
     }, IDLE_BATCH_MS);
@@ -258,7 +288,9 @@ export class AgentCompletionInbox {
           "Unread background agent results (batched). Incorporate relevant results into the current task. These are run outcomes, not new user requests. Do not restart completed work or reply merely to acknowledge stale/superseded results. A completed run does not necessarily mean its assignment is complete.",
           ...group.map(({ result }) => {
             const seconds = Math.round(Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt) / 1_000);
-            const summary = [result.error, result.text].filter(Boolean).join("\n");
+            const output = result.status !== "completed" && result.partialText !== undefined
+              ? `Partial output (not a completed report):\n${result.partialText}` : result.text;
+            const summary = [result.error, ...(result.warnings ?? []).map(warning => `[pi-fabric warning] ${warning}`), output].filter(Boolean).join("\n");
             const redelivery = result.completionDelivery?.redeliveredFrom;
             const provenance = redelivery ? ` [re-delivered from dead Main session ${oneLine(redelivery)}]` : "";
             return `Agent ${oneLine(result.name).slice(0, 80)} (${result.id}) ${result.status} after ${seconds}s${provenance}:\n${clip(summary || "no result", perResult)}`;
@@ -296,6 +328,11 @@ export class AgentCompletionInbox {
       }
     } finally {
       this.#confirmHeld();
+    }
+    // A failed delivered receipt keeps its retry timer even with nothing left to send.
+    if (!this.#pending.size && !this.#receiptRetries.size && this.#timer) {
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
     }
   }
 }

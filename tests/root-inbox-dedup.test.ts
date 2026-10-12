@@ -12,6 +12,8 @@ const roots: string[] = [];
 const me: MeshIdentity = { id: "session:recipient", name: "recipient", kind: "main" };
 const peer: MeshIdentity = { id: "session:sender", name: "sender", kind: "main" };
 const HOUR = 60 * 60_000;
+const TOPIC = "fleet.work.pi-fabric.3036";
+const withTopic = (data: unknown) => data && typeof data === "object" ? { topic: TOPIC, ...data } : data;
 const setup = (maxEventBytes = 64 * 1024) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-inbox-dedup-"));
   roots.push(root);
@@ -24,8 +26,9 @@ const setup = (maxEventBytes = 64 * 1024) => {
     sendMessage: (message: unknown) => entries.push({ type: "custom_message", timestamp: new Date(now).toISOString(), ...(message as object) }),
   } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, me.id, true, root, "recipient");
-  const followUp = (data?: unknown, delivery: "steer" | "followUp" = "followUp") => main.deliverAgent({ from: peer, message: "already handled", delivery, data });
-  const publish = (data: unknown = { key: "work:1" }, to = me.id, from = peer) => mesh.publish({ topic: "fleet.work.pi-fabric.3036", kind: "ack", from, to, text: "shadow", data });
+  // A carrier's work key/ref claims work on the topic it names only (#852 security P1).
+  const followUp = (data?: unknown, delivery: "steer" | "followUp" = "followUp") => main.deliverAgent({ from: peer, message: "already handled", delivery, data: withTopic(data) });
+  const publish = (data: unknown = { key: "work:1" }, to = me.id, from = peer) => mesh.publish({ topic: TOPIC, kind: "ack", from, to, text: "shadow", data });
   return { root, mesh, entries, box, main, followUp, publish, advance: (ms: number) => { now += ms; }, session: () => rootInboxSession(entries) };
 };
 afterEach(() => {
@@ -157,7 +160,7 @@ describe("recipient-scoped shadow dedup (smarty-dev#3036)", () => {
     const held = new MainAgentController({ on: () => undefined, sendMessage: () => { throw new Error("not delivered"); } } as unknown as ExtensionAPI, me.id, true, h.root, "held");
     held.attachFollowUpDrain({ isIdle: () => false, hasPendingMessages: () => false, signal: { aborted: false } } as unknown as ExtensionContext, 120_000);
     try {
-      held.deliverAgent({ from: peer, message: "queued", delivery: "followUp", data: { key: "work:1" } });
+      held.deliverAgent({ from: peer, message: "queued", delivery: "followUp", data: { key: "work:1", topic: TOPIC } });
       await h.publish(); h.advance(1);
       const first = await inbox.next(h.session());
       expect(first.events).toHaveLength(1);
@@ -181,7 +184,7 @@ describe("confirmed persisted Main/inbox receipts (review F5)", () => {
     } as unknown as ExtensionContext, 0, path.join(h.root, "persisted-followups.json"));
     return { ...h, main, manager: () => manager, reload: () => { manager = SessionManager.open(manager.getSessionFile()!); },
       session: () => confirmedRootInboxSession(manager),
-      followUp: () => main.deliverAgent({ from: peer, message: "native work", delivery: "followUp", data: { key: "work:1" }, triggerTurn: false }),
+      followUp: () => main.deliverAgent({ from: peer, message: "native work", delivery: "followUp", data: { key: "work:1", topic: TOPIC }, triggerTurn: false }),
       receipts: (inbox: RootInbox) => (h.mesh.get(inbox.key, { fresh: true })?.value as { delivered?: string[] } | undefined)?.delivered ?? [],
       record: (events: Parameters<typeof rootInboxMessage>[0]) => {
         const message = rootInboxMessage(events);
@@ -324,9 +327,9 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
     expect(value.delivered.length).toBeLessThanOrEqual(1024);
     expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThan(limit * 0.75);
     const last = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
-      details: { from: peer, data: { key: `capacity:${threshold + 39}` } } }]).delivered!][0];
+      details: { from: peer, data: { key: `capacity:${threshold + 39}`, topic: TOPIC } } }]).delivered!][0];
     const first = [...rootInboxSession([{ type: "custom_message", customType: "pi-fabric-agent-message",
-      details: { from: peer, data: { key: "capacity:0" } } }]).delivered!][0];
+      details: { from: peer, data: { key: "capacity:0", topic: TOPIC } } }]).delivered!][0];
     expect(value.delivered).toContain(last);
     expect(value.delivered).not.toContain(first);
     h.entries.length = 0;
@@ -400,6 +403,82 @@ describe("receipt capacity and strong identities (review F1/F2)", () => {
 });
 
 describe("addressed-shadow age horizon (smarty-dev#3036)", () => {
+  it.each(["answer", "blocker", "handoff", "completion"])("delivers an addressed %s three hours late with its age", async (kind) => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const event = await h.mesh.publish({ topic: "fleet.work.tasks", kind, to: me.id,
+      from: { id: "fleet-tool:smarty-task-ryzen2", name: "smarty-task-ryzen2", kind: "agent" },
+      text: "BLOCKED lane result", data: { key: "ryzen2-task-lane-1" } });
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(e => e.id)).toEqual([event.id]);
+    expect(batch).not.toHaveProperty("skippedStale");
+    const prefix = `(delivered late: created ${new Date(event.createdAt).toISOString()}, 3 h ago)`;
+    expect(rootInboxMessage(batch.events).content).toContain(`${prefix} BLOCKED lane result`);
+    // An unconfirmed injection remains recoverable, including through the pending reread.
+    const retry = await h.box().next(h.session());
+    expect(retry.events[0]?.text).toBe(`${prefix} BLOCKED lane result`);
+    expect(h.mesh.read({ after: 0, limit: 10 })[0]?.text).toBe("BLOCKED lane result");
+  });
+
+  it("does not deliver an old broadcast answer or progress shadow", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    await h.mesh.publish({ topic: "fleet.work.tasks", kind: "answer", from: peer, text: "broadcast" });
+    await h.mesh.publish({ topic: "fleet.work.tasks", kind: "progress", from: peer, to: me.id, text: "ping" });
+    h.advance(3 * HOUR);
+    expect(await inbox.next(h.session())).toMatchObject({ events: [], skippedStale: 1 });
+    expect(await inbox.wake(h.session(), () => true)).toBeUndefined();
+  });
+
+  it("remembers a late answer at delivery time and never repeats it across drains and reloads", async () => {
+    const h = setup(); const inbox = h.box(); inbox.start();
+    const packet = { topic: "fleet.work.tasks", kind: "answer", from: peer, to: me.id,
+      text: "FAIL lane result", data: { key: "ryzen2-task-lane-2" } };
+    await h.mesh.publish(packet);
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events).toHaveLength(1);
+    h.entries.push({ type: "custom_message", timestamp: new Date(Date.now()).toISOString(), ...rootInboxMessage(batch.events) });
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const saved = h.mesh.get(inbox.key)!.value as { delivered: string[]; deliveredAt: number[] };
+    expect(saved.delivered.length).toBeGreaterThan(0);
+    expect(saved.deliveredAt.every(at => at === Date.now())).toBe(true);
+    h.entries.length = 0; // Persisted receipts suppress a new shadow even without session history.
+    await h.mesh.publish(packet); h.advance(1);
+    expect((await h.box().next(h.session())).events).toEqual([]);
+    h.advance(3 * HOUR); // Receipt trimming cannot rewind the committed cursor.
+    expect((await h.box().next(h.session())).events).toEqual([]);
+  });
+
+  it.each(["answer", "blocker", "handoff", "completion"])("does not re-deliver an already delivered late addressed %s after a cursor rewind, once per root", async (kind) => {
+    const h = setup();
+    const box = () => new RootInbox(h.mesh, me, () => [me.id, "shared-inbox"], { now: Date.now, steerGraceMs: 0 });
+    const inbox = box(); inbox.start();
+    const event = await h.mesh.publish({ topic: "fleet.work.tasks", kind, from: peer, to: "shared-inbox", text: "late result" });
+    h.advance(3 * HOUR);
+    const batch = await inbox.next(h.session());
+    expect(batch.events.map(e => e.id)).toEqual([event.id]);
+    h.entries.push({ type: "custom_message", timestamp: new Date(Date.now()).toISOString(), ...rootInboxMessage(batch.events) });
+    expect((await inbox.next(h.session())).events).toEqual([]);
+    const rewind = async (clearReceipts = false) => {
+      const saved = h.mesh.get(inbox.key, { fresh: true })!.value as { after: number };
+      await h.mesh.put({ key: inbox.key, identity: me, value: { ...saved, after: 0,
+        ...(clearReceipts ? { delivered: [], deliveredAt: [] } : {}) } });
+    };
+    await rewind();
+    // A restart with the original canonical receipt absent still has the durable ledger.
+    expect((await box().next(rootInboxSession([]))).events).toEqual([]);
+    h.advance(3 * HOUR);
+    h.entries.push(...Array.from({ length: 600 }, () => ({ type: "message" })));
+    await rewind(true);
+    // Even without the bounded ledger, the old whole-history session receipt wins.
+    expect((await box().next(h.session())).events).toEqual([]);
+    // The same mesh event is not a receipt for a different root accepting that address.
+    const other = { ...me, id: "session:other-root" };
+    const otherInbox = new RootInbox(h.mesh, other, () => [other.id, "shared-inbox"], { now: Date.now, steerGraceMs: 0 });
+    await h.mesh.put({ key: otherInbox.key, identity: other, value: { after: 0 } });
+    expect((await otherInbox.next(rootInboxSession([]))).events.map(e => e.id)).toEqual([event.id]);
+  });
+
   it("skips a 20-hour backlog on the first drain in one summary, without idle wakes", async () => {
     const h = setup(); const inbox = h.box(); inbox.start();
     for (let index = 0; index < 65; index++) await h.publish({ key: `old:${index}` });

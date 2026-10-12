@@ -1,19 +1,28 @@
+import { childProcessEnvironment } from "../core/atomic-write.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import crossSpawn from "cross-spawn";
+import { createRequire } from "node:module";
+import type CrossSpawn from "cross-spawn";
 import type { FabricThinking } from "../thinking.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
+
+// First-use load: the standalone worker bundle inlines this module, and a static
+// import of the external package would fail at link time, before the worker can
+// persist a startup failure (upstream lazy cross-spawn).
+let crossSpawnModule: typeof CrossSpawn | undefined;
+const crossSpawn = (): typeof CrossSpawn =>
+  crossSpawnModule ??= createRequire(import.meta.url)("cross-spawn") as typeof CrossSpawn;
 
 const spawnCli = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
 ): ChildProcess => NODE_SCRIPT_EXTENSIONS.has(path.extname(command).toLowerCase())
-  ? crossSpawn(process.execPath, [command, ...args], options)
-  : crossSpawn(command, [...args], options);
+  ? crossSpawn()(process.execPath, [command, ...args], { ...options, env: childProcessEnvironment(options.env) })
+  : crossSpawn()(command, [...args], { ...options, env: childProcessEnvironment(options.env) });
 
 const MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
 const MODEL_DISCOVERY_MAX_CHARS = 2_000_000;

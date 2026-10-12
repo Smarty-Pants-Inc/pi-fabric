@@ -5,7 +5,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import senderHeadersHook, { resolveSenderHeaders, senderHeaderValue, smartyTaskLane } from "../src/guards/sender-headers.js";
+import senderHeadersHook, {
+  resolveSenderHeaders, SENDER_VALUE_MAX_LENGTH, senderHeaderValue, senderSpawner, smartyTaskLane,
+} from "../src/guards/sender-headers.js";
 import piFabric from "../src/index.js";
 
 // Every sender-relevant variable, cleared so the ambient lane (this test may run inside one) cannot leak.
@@ -35,22 +37,30 @@ describe("sender headers (smarty-dev#6207)", () => {
   });
 
   it("smarty-task lane Main: the lane from the launcher's TASK_OUT=<tasks>/<lane>/artifacts", () => {
-    clean({ TASK_OUT: "/srv/scratch/paul/tasks/direct/fv2-senderhdr/artifacts", SMARTY_LANE: "other" });
+    clean({ TASK_OUT: path.join("scratch", "tasks", "direct", "fv2-senderhdr", "artifacts"), SMARTY_LANE: "other" });
     const headers = resolveSenderHeaders(process.env, "session-name");
     log("smarty-task-lane", headers);
     expect(headers).toEqual({ "X-Smarty-Agent": "fv2-senderhdr" });
-    expect(smartyTaskLane({ TASK_OUT: "/tmp/out" })).toBeUndefined();
+    expect(smartyTaskLane({ TASK_OUT: path.join("tmp", "out") })).toBeUndefined();
+    // Either separator: the launcher's path is parsed the same on Windows and POSIX.
+    expect(smartyTaskLane({ TASK_OUT: "tasks\\lane-w\\artifacts" })).toBe("lane-w");
+    expect(smartyTaskLane({ TASK_OUT: "tasks/lane-p/artifacts" })).toBe("lane-p");
   });
 
-  it("process task child: role task, its Fabric agent name, the spawner's name else session id", () => {
+  it("process task child: role task, its Fabric agent name, the spawner's name and never its session id", () => {
     clean({ SMARTY_ROLE: `task-agent@${REV}`, PI_FABRIC_TASK_PROCESS_CHILD: "1", PI_FABRIC_PARENT_RUN: "run-1",
       PI_FABRIC_AGENT_NAME: "fix-tests", PI_FABRIC_SPAWNER_NAME: "herdr-main-7", PI_FABRIC_SPAWNER_SESSION_ID: "01a0cd9c-7c24",
-      TASK_OUT: "/srv/x/lane/artifacts" });
+      PI_FABRIC_SPAWNER_ID: "session:01a0cd9c-7c24", TASK_OUT: path.join("x", "lane", "artifacts") });
     const headers = resolveSenderHeaders(process.env, "ignored");
     log("process-task", headers);
     expect(headers).toEqual({ "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests", "X-Smarty-Spawner": "herdr-main-7" });
+    // No named spawner: the header is omitted; neither session id is a fallback (security P1).
     vi.stubEnv("PI_FABRIC_SPAWNER_NAME", undefined);
-    expect(resolveSenderHeaders(process.env)["X-Smarty-Spawner"]).toBe("01a0cd9c-7c24");
+    expect(resolveSenderHeaders(process.env)).toEqual({ "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests" });
+    expect(senderSpawner(process.env)).toBeUndefined();
+    // An invalid name is rejected, and still never replaced by a session id.
+    vi.stubEnv("PI_FABRIC_SPAWNER_NAME", "main@host");
+    expect(resolveSenderHeaders(process.env)["X-Smarty-Spawner"]).toBeUndefined();
   });
 
   it("actor worker: actor role with its name class, the actor name, the spawning Main", () => {
@@ -59,20 +69,33 @@ describe("sender headers (smarty-dev#6207)", () => {
     const headers = resolveSenderHeaders(process.env);
     log("actor", headers);
     expect(headers).toEqual({ "X-Smarty-Role": "actor:review", "X-Smarty-Agent": "fleet-review-astra", "X-Smarty-Spawner": "herdr-main-7" });
-    // Unnamed actor: no guessed id slice; a session-id spawner only without a name.
+    // Unnamed actor and unnamed spawner: no guessed id slice, and the session:abc spawner id is never sent.
     vi.stubEnv("PI_FABRIC_ACTOR_NAME", undefined); vi.stubEnv("PI_FABRIC_SPAWNER_NAME", undefined);
-    expect(resolveSenderHeaders(process.env)).toEqual({ "X-Smarty-Role": "actor", "X-Smarty-Spawner": "session:abc" });
+    expect(resolveSenderHeaders(process.env)).toEqual({ "X-Smarty-Role": "actor" });
   });
 
-  it.each(["evil\r\nX-Injected: yes", "evil\n", "a".repeat(129), "has space", "tok=secret", ""])("rejects CR/LF, over-long and non-name values: %j", value => {
+  it.each(["evil\r\nX-Injected: yes", "evil\n", "a".repeat(65), "a".repeat(129), "has space", "tok=secret", "",
+    "user@host", "@", "project-agent@0123", "tab\tname", "semi;colon", "quote\"d", "back\\slash", "plus+sign", "ünïcode"])("rejects CR/LF, over-long, '@' and every other non-allowlisted value: %j", value => {
     expect(senderHeaderValue(value)).toBeUndefined();
-    clean({ SMARTY_ROLE: value, SMARTY_LANE: value, PI_FABRIC_PARENT_RUN: "r", PI_FABRIC_AGENT_NAME: value, PI_FABRIC_SPAWNER_NAME: value });
+    // SMARTY_ROLE's '@' delimits the launcher's @rev suffix (tested below), so it carries the value as its role part.
+    clean({ ...(value.includes("@") ? {} : { SMARTY_ROLE: `${value}@${REV}` }), SMARTY_LANE: value,
+      // A separator splits TASK_OUT into path segments, so only a single-segment value is a lane candidate.
+      ...(/^[^\\/]+$/.test(value) ? { TASK_OUT: ["t", value, "artifacts"].join("/") } : {}) });
     expect(resolveSenderHeaders(process.env, value)).toEqual({});
+    clean({ PI_FABRIC_PARENT_RUN: "r", PI_FABRIC_AGENT_NAME: value, PI_FABRIC_SPAWNER_NAME: value, PI_FABRIC_SPAWNER_SESSION_ID: "s-1" });
+    expect(resolveSenderHeaders(process.env, value)).toEqual({});
+    clean({ PI_FABRIC_ACTOR_ID: "a-1", PI_FABRIC_ACTOR_NAME: value, PI_FABRIC_SPAWNER_NAME: value });
+    expect(resolveSenderHeaders(process.env, value)).toEqual({ "X-Smarty-Role": value ? "actor:other" : "actor" });
   });
-  it("accepts exactly 128 bounded ASCII characters", () => {
-    const value = `a:b@c/d.e_f-${"x".repeat(116)}`;
-    expect(value).toHaveLength(128);
+  it("accepts exactly 64 characters of the gateway allowlist, and rejects 65", () => {
+    const value = `aZ09:b/c.d_e-${"x".repeat(51)}`;
+    expect(value).toHaveLength(SENDER_VALUE_MAX_LENGTH);
     expect(senderHeaderValue(value)).toBe(value);
+    expect(senderHeaderValue(`${value}x`)).toBeUndefined();
+    expect(senderHeaderValue("a")).toBe("a");
+    // A Main's role keeps only the part before @rev; the '@' itself never reaches the wire.
+    clean({ SMARTY_ROLE: `project-agent@${REV}`, SMARTY_LANE: "lane@1" });
+    expect(resolveSenderHeaders(process.env)).toEqual({ "X-Smarty-Role": "project-agent" });
   });
 
   it("the hook mutates Pi's header map in place, per request, keeping other headers", () => {
@@ -150,10 +173,18 @@ describe.skipIf(!fs.existsSync(workerPath))("sender headers in real built worker
     expect(launch.headers).toEqual({ "X-Session-Id": "unmodified", "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests", "X-Smarty-Spawner": "herdr-main-7" });
   });
 
-  it("process task child of an unnamed Main: the spawner's session id, never a guessed name", async () => {
+  it("process task child of an unnamed Main: no spawner header, never its session id or a guessed name", async () => {
     const { launch } = await run({ name: "fix-tests" }, () => undefined);
     log("worker process-task-unnamed-main", launch.headers);
-    expect(launch.headers["X-Smarty-Spawner"]).toBe("main-session-1");
+    expect(launch.headers).toEqual({ "X-Session-Id": "unmodified", "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests" });
+    expect(JSON.stringify(launch.headers)).not.toContain("main-session-1");
+    expect(JSON.stringify(launch.headers)).not.toContain("session:main-1");
+  });
+
+  it("process task child of a Main whose name fails the allowlist: no spawner header", async () => {
+    const { launch } = await run({ name: "fix-tests" }, () => "main@host");
+    expect(launch.headers["X-Smarty-Spawner"]).toBeUndefined();
+    expect(JSON.stringify(launch.headers)).not.toContain("main-session-1");
   });
 
   it("actor worker: actor role with name class, the actor name and the spawning Main's name", async () => {

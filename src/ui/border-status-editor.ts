@@ -36,12 +36,29 @@ export class BorderWorkingIndicator extends Loader {
  *  color, as Pi's embedded indicator is. */
 export class BorderStatusEditor extends Editor {
   private workingStatusIndicator: BorderWorkingIndicator | undefined;
+  /** Render-time label; width includes its padding. No extra editor rows. */
+  topBorderBadge: ((width: number) => string) | undefined;
 
   setWorkingStatusIndicator(indicator: BorderWorkingIndicator | undefined): void {
     this.workingStatusIndicator = indicator;
   }
 
   protected override renderTopBorder(width: number, hiddenLineCount: number): string {
+    if (!this.topBorderBadge) return this.renderStatusTopBorder(width, hiddenLineCount);
+    // Reserve native status/overflow space before asking for a compact target.
+    // The base editor still owns content, cursor markers, focus and hit testing.
+    const status = this.workingStatusIndicator?.renderInBorder(width) ?? "";
+    const reserve = (visibleWidth(status) > 0 ? 6 : 1) +
+      (hiddenLineCount > 0 ? visibleWidth(` ↑ ${hiddenLineCount} more `) + 3 : 0);
+    const budget = Math.max(0, width - reserve - 2);
+    const badge = budget >= 3 ? this.topBorderBadge(budget) : "";
+    const badgeWidth = visibleWidth(badge);
+    if (!badgeWidth || badgeWidth > budget) return this.renderStatusTopBorder(width, hiddenLineCount);
+    return this.renderStatusTopBorder(width - badgeWidth - 2, hiddenLineCount) +
+      badge + this.borderColor("──");
+  }
+
+  private renderStatusTopBorder(width: number, hiddenLineCount: number): string {
     const indicator = this.workingStatusIndicator;
     if (!indicator || width <= 0) return super.renderTopBorder(width, hiddenLineCount);
     let status = indicator.renderInBorder(Math.max(1, width - 5));

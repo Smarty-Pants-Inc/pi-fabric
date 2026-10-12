@@ -26,6 +26,7 @@ import {
   APPROVAL_MODES,
 } from "./settings-values.js";
 import { maxExecutorMemoryLimitBytes } from "../config.js";
+import { jevFabricStatus } from "../jev-fabric/status.js";
 import { INHERIT_VALUE } from "./model-picker.js";
 
 export const buildFullCodeModeSection = (
@@ -79,11 +80,19 @@ export const buildExecutorSection = (
           description: cpythonDescription,
           submenu: stringInputSubmenu(theme, "CPython binary", cpythonDescription),
         }),
+        setting("executor.jevFabric.binary", "jev-fabric binary", config.executor.jevFabric.binary || "auto", {
+          description: `Durable tasks and interactive sessions (macOS/Linux). auto uses your compatible install outside this workspace (PATH or ~/.local/bin), then the bundled package; an explicit path never falls back. ${jevFabricStatus() ? `In use: ${jevFabricStatus()}` : "Resolved at first durable or session use."}`,
+          submenu: stringInputSubmenu(theme, "jev-fabric binary", "auto, or a trusted absolute path or executable name. No shell arguments."),
+        }),
         setting("executor.runtime", "Runtime (TS)", config.executor.runtime, {
           description: enforceTypeScript
             ? "TypeScript only. Schema enforce mode requires the isolated QuickJS runtime; it does not change the configured kernel."
             : "TypeScript only; ignored by Python. QuickJS is isolated and limited by WASM32. Node/Bun processes support larger heaps but are an unsafe trusted-code escape hatch, not a security sandbox.",
           values: enforceTypeScript ? ["quickjs"] : EXECUTOR_RUNTIMES,
+        }),
+        setting("executor.codemodeProfile", "Codemode API (TS)", config.executor.codemodeProfile, {
+          description: "Additive preserves Fabric's tools API and adds nativeTools plus nonconflicting tools aliases. Native gives tools and discovery helpers Pi semantics; Fabric discovery stays at fabric.tools. Policies and limits still apply. Ignored by Python.",
+          values: ["additive", "native"],
         }),
         setting("executor.timeoutMs", "Timeout", formatMs(config.executor.timeoutMs), {
           description: `Default wall-clock time for a single fabric_exec program. A per-invocation timeoutMs or a matching executor.hostCallTimeouts ref can raise it up to the ${formatMs(config.executor.maxTimeoutMs)} policy maximum.`,
@@ -106,11 +115,11 @@ export const buildExecutorSection = (
           ),
         }),
         setting("executor.landlock.mode", "Bash filesystem confinement", config.executor.landlock.mode, {
-          description: "Linux Landlock ABI >=4 only. Off until rollout; enforce denies writes outside the reviewed role list. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command and is logged. Non-Linux unchanged.",
+          description: "Linux Landlock ABI >=4 only. Missing root policy defaults off; present but invalid/unreadable/untrusted policy fails strict enforce. Valid root policy or agent/project enforce can also opt in. Enforce denies writes outside the reviewed role list; agent/project off or permissive values cannot relax the baseline. No audit-only mode: trial enforce on one lane. A leading PI_FABRIC_LANDLOCK_ESCAPE=1 escapes one command only when valid root policy grants executor.landlock.allowEscape: true, and is logged; otherwise it is stripped, warns once and stays confined. Non-Linux unchanged.",
           values: ["off", "enforce"],
         }),
         setting("executor.landlock.disabled", "Fleet confinement kill switch", String(config.executor.landlock.disabled), {
-          description: "Host-only executor.landlock.disabled=true disables confinement for every lane. Set in the global agent fabric.json; project values are ignored.",
+          description: "Root-owned /etc/smarty/fabric-policy.json controls this fleet kill switch. Agent-dir and project values are always ignored; only valid root policy can disable confinement. Root policy updates must use atomic rename, not in-place rewrites.",
           values: BOOLEANS,
         }),
         setting(
@@ -140,6 +149,15 @@ export const buildExecutorSection = (
           {
             description:
               "Exact-ref deadline floors for known long-running host calls (configured in the Fabric config file), e.g. \"extensions.subagent\": 3600000.",
+          },
+        ),
+        setting(
+          "executor.humanWaitRefs",
+          "Human-wait refs",
+          config.executor.humanWaitRefs.length > 0 ? config.executor.humanWaitRefs.join(", ") : "none",
+          {
+            description:
+              "Exact host-call refs that wait for a person (configured in the Fabric config file). While one is in flight the program deadline is paused, so a question can wait indefinitely; cancellation still stops it.",
           },
         ),
         setting(
@@ -346,8 +364,13 @@ export const buildMcpSection = (
           description: "Enable the MCP provider inside fabric_exec.",
           values: BOOLEANS,
         }),
+        setting("mcp.nativeServers", "Pi-owned servers", (config.mcp.nativeServers ?? []).join(", "), {
+          description: "Opt-in exact server names from Pi's /mcp, comma-separated. Others stay on mcporter; no automatic fallback. Reload Fabric to apply.",
+          submenu: stringInputSubmenu(theme, "Pi-owned MCP servers",
+            "Exact names, comma-separated; blank disables. Pi owns connections and OAuth. Configure servers with /mcp; reload Fabric after changing this list."),
+        }),
         setting("mcp.disableOAuth", "Disable OAuth", config.mcp.disableOAuth ? "true" : "false", {
-          description: "Skip MCP OAuth flows.",
+          description: "Skip mcporter OAuth flows. Pi-owned servers use Pi's authentication and /mcp login.",
           values: BOOLEANS,
         }),
         setting("mcp.allowDynamicServers", "Dynamic servers", config.mcp.allowDynamicServers ? "true" : "false", {

@@ -1653,8 +1653,50 @@ export class ActorManager {
     }
     options.beforeCommit?.(actor.id);
     this.#archiveSession(actor, "requested");
-    await this.#publishPresence(actor, true);
+    const restore = this.#clearHardBlockForReset(actor);
+    try {
+      await this.#publishPresence(actor, true);
+    } catch (error) {
+      restore();
+      throw error;
+    }
+    this.#forgetRealarm(actor);
     return this.#publicInfo(actor);
+  }
+
+  /** smarty-dev#9890: an explicit reset is the documented repair for a hard block (auth, config,
+   * unknown): it ends the block and its failure streak, so routing presence reads idle again. A
+   * transient block keeps its own expiry. Only a requested reset calls this, never a size or context
+   * rotation. Returns an undo for a reset whose commit failed; it reports whether it restored the
+   * exact prior hard block and streak (never over a newer failure recorded meanwhile). */
+  #clearHardBlockForReset(actor: ManagedActor): () => boolean {
+    const blocked = actor.activationBlocked;
+    if (!blocked || activationBlockClass(blocked.code) !== "hard") return () => false;
+    const streak = actor.failureStreak;
+    delete actor.activationBlocked;
+    delete actor.failureStreak;
+    this.#armActivationBlockExpiry(actor);
+    return () => {
+      if (actor.activationBlocked || actor.failureStreak) return false;
+      actor.activationBlocked = blocked;
+      if (streak) actor.failureStreak = streak;
+      this.#armActivationBlockExpiry(actor);
+      // The failed reset may already have committed the cleared state to the registry, and a
+      // timed-out presence write may still land it late. Persist the restored block with a newer
+      // stamp, and queue a presence write behind the stalled one (writes are serialized per id),
+      // so the last write a router sees is the hard block.
+      actor.updatedAt = Date.now();
+      this.#emitChange();
+      void this.#saveActors(new Set(), { flush: true, durable: true })
+        .catch((error: unknown) => this.#retryRegistrySave(error, true));
+      if (this.#canManage(actor.id)) void this.#writePresence(actor.id).catch(() => undefined);
+      return true;
+    };
+  }
+
+  #forgetRealarm(actor: ManagedActor): void {
+    // Best effort, as on success: a stale claim names an older since, so it never gates a new block.
+    if (!actor.activationBlocked) void this.mesh.delete({ key: actorRealarmKey(actor.id) }).catch(() => undefined);
   }
 
   // At a run boundary: apply a requested reset, or reset a session past the size limit, so a
@@ -1695,10 +1737,17 @@ export class ActorManager {
       waiters?.forEach((waiter) => waiter.reject(failure));
       return undefined;
     }
+    const restore = trigger === "requested" ? this.#clearHardBlockForReset(live) : undefined;
     return this.#publishDrainPresence(live, waiters !== undefined).then(
-      () => waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live)))),
+      () => {
+        if (restore) this.#forgetRealarm(live);
+        waiters?.forEach((waiter) => waiter.resolve(this.#publicInfo(this.#liveActor(live))));
+      },
       (error: unknown) => {
-        this.#recordPreparationFailure(live, error);
+        // A restored hard block already gates routing: the reset's own publication failure is
+        // diagnostic only, never a new activation failure that could replace it with an expiring one.
+        const restored = restore?.() === true;
+        this.#recordPreparationFailure(live, error, undefined, restored);
         waiters?.forEach((waiter) => waiter.reject(error instanceof Error ? error : new Error(String(error))));
       },
     );
@@ -3436,7 +3485,7 @@ export class ActorManager {
     }
   }
 
-  #recordPreparationFailure(actor: ManagedActor, error: unknown, item?: ActorQueueItem): void {
+  #recordPreparationFailure(actor: ManagedActor, error: unknown, item?: ActorQueueItem, diagnosticOnly = false): void {
     const message = error instanceof Error ? error.message : String(error);
     actor.lastError = message;
     this.#recordMessage(this.#liveActor(actor), {
@@ -3450,7 +3499,7 @@ export class ActorManager {
     // preparation failure after the initial retries, once per durable streak.
     // Cleanup of that pending retry must not double-count a failed activation.
     // Failures outside an item retry still need fail-loud host reporting.
-    if (!item && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
+    if (!item && !diagnosticOnly && !actor.queue.some(pending => !pending.resolve && !pending.reject &&
       (pending.preparationAttempts ?? 0) > 0)) this.#noteFailedActivation(actor, message, undefined, false);
   }
 

@@ -222,6 +222,8 @@ interface ManagedActor {
   principalScope?: FabricScope;
   latestActivationSequence: number;
   sessionFile: string;
+  /** Last measured use of this session; persisted so the 80% reset survives a host restart. */
+  lastContextUsage?: { tokens: number; contextWindow: number };
   queue: ActorQueueItem[];
   messages: FabricActorMessage[];
   createdAt: number;
@@ -632,9 +634,6 @@ export class ActorManager {
   // smarty-dev#1439: resetSession callers that wait for the in-flight run to settle.
   readonly #pendingResets = new Map<string, Array<{ resolve(info: FabricActorInfo): void; reject(error: Error): void }>>();
   readonly #maxSessionBytes: number;
-  // smarty-dev#3238: each actor's last run context use. An overflow retry's fresh session is derived
-  // from its durable queue item (overflowRetried), so a restart before the reset still resets.
-  readonly #lastContextUsage = new Map<string, { tokens: number; contextWindow: number }>();
   readonly #transientBlockCooldownMs: number;
   readonly #transientBlockMaxMs: number;
   // smarty-dev#6144 review round 3: read at every drain, never captured, so a live config reload that
@@ -1668,7 +1667,7 @@ export class ActorManager {
     // while the next event is an overflow retry, starts the next run fresh. The retry is read from the
     // persisted queue item, never an in-memory marker, so a restart between the queue checkpoint and
     // this archive still retries on a fresh session; a session already fresh is not archived again.
-    const usage = this.#lastContextUsage.get(live.id);
+    const usage = live.lastContextUsage;
     const overflowRetry = !trigger && actor.queue[0]?.overflowRetried === true &&
       this.#sessionCarriedHistory(live, this.#sessionBytes(live.sessionFile));
     if (!trigger && (overflowRetry || (usage !== undefined && this.#carriesSession(live) &&
@@ -1727,8 +1726,8 @@ export class ActorManager {
     this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
     delete actor.runnerSessionId;
-    const usage = this.#lastContextUsage.get(actor.id);
-    this.#lastContextUsage.delete(actor.id);
+    const usage = actor.lastContextUsage;
+    delete actor.lastContextUsage;
     actor.updatedAt = Date.now();
     this.#recordMessage(actor, {
       id: randomUUID(),
@@ -3659,7 +3658,7 @@ export class ActorManager {
             throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
-          if (result.contextUsage) this.#lastContextUsage.set(actor.id, { ...result.contextUsage });
+          if (result.contextUsage) this.#liveActor(actor).lastContextUsage = { ...result.contextUsage };
           if (actor.runner === "claude" && result.runnerSessionId) {
             actor.runnerSessionId = result.runnerSessionId;
             await this.#saveActors();
@@ -3722,7 +3721,7 @@ export class ActorManager {
               this.#recordMessage(this.#liveActor(actor), silent);
               item.resolve?.(structuredClone(silent));
               this.#noteFailedActivation(actor, reason, result.id, abortController.signal.aborted || runStopped, 0, false,
-                contextOverflow, result.warnings);
+                contextOverflow, result.warnings, item.overflowRetried === true);
               if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
                 this.#noteDroppedEvent(actor, item, reason, result.id);
               }
@@ -3892,7 +3891,7 @@ export class ActorManager {
           item.reject?.(new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            false, error instanceof ActorContextOverflowError);
+            false, error instanceof ActorContextOverflowError, undefined, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
             this.#noteDroppedEvent(actor, item, message, runId);
@@ -3982,8 +3981,9 @@ export class ActorManager {
     }
   }
 
-  // smarty-dev#3238: a full-history Pi actor carries its session into every run. An activation
-  // window never shows the model that history, so a reset cannot free its context.
+  // Only full-history actors proactively reset from their last measured model context.
+  // Activation windows project history out, but a final payload refusal still gets one
+  // fresh-session retry when the durable journal has history (smarty-dev#10049).
   #carriesSession(actor: ManagedActor): boolean {
     return actor.runner === "pi" && actor.inferenceContext !== "activation";
   }
@@ -3995,7 +3995,7 @@ export class ActorManager {
   // Whether the first `bytes` of the session (what it held at launch; Pi only appends) hold a
   // conversation entry. The first one follows the header, so this rarely reads past one chunk.
   #sessionCarriedHistory(actor: ManagedActor, bytes: number): boolean {
-    if (!this.#carriesSession(actor) || bytes <= 0) return false;
+    if (actor.runner !== "pi" || bytes <= 0) return false;
     let fd: number | undefined;
     try {
       fd = fs.openSync(actor.sessionFile, "r");
@@ -4033,7 +4033,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" = false, contextOverflowCode = false, evidence?: readonly string[]): void {
+    preparation: boolean | "timeout" = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -4091,7 +4091,9 @@ export class ActorManager {
       `Last error: ${reason}${runId ? ` (run ${runId})` : ""}. ` +
       `Inspect it with agents.actorStatus({ id: ${JSON.stringify(actor.id)} }) and agents.log, then repair, reconfigure or recreate it. ` +
       `Reconcile any prepared external effects from the failed runs before rerouting their work.` +
-      (contextOverflow ? ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
+      (contextOverflow ? overflowRetried
+        ? " This activation was retried once after resetting its session, but the fresh session still overflowed; reduce its input before retrying."
+        : ` This activation was not retried; reduce its input or reset the session on its owning host with agents.resetSession({ id: ${JSON.stringify(actor.name)} }).` : "");
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out",
       source: "fabric-host", createdAt: Date.now(), action: "message", text,
@@ -5488,6 +5490,7 @@ export class ActorManager {
       ...(actor.records ? { records: { ...actor.records } } : {}),
       ...(actor.principalScope ? { principalScope: actor.principalScope } : {}),
       sessionFile: actor.sessionFile,
+      ...(actor.lastContextUsage ? { lastContextUsage: { ...actor.lastContextUsage } } : {}),
       ...(this.#lazyMessages.has(actor)
         ? this.#lazyMessages.get(actor)!.messageHistory !== undefined
           ? { messageHistory: this.#lazyMessages.get(actor)!.messageHistory }
@@ -6001,6 +6004,11 @@ export class ActorManager {
         ...(principalScope ? { principalScope } : {}),
         latestActivationSequence: 0,
         sessionFile: path.join(this.#actorRoot, record.id, "session.jsonl"),
+        ...(typeof record.lastContextUsage?.tokens === "number" && Number.isFinite(record.lastContextUsage.tokens) &&
+          record.lastContextUsage.tokens >= 0 && typeof record.lastContextUsage.contextWindow === "number" &&
+          Number.isFinite(record.lastContextUsage.contextWindow) && record.lastContextUsage.contextWindow > 0
+          ? { lastContextUsage: { tokens: record.lastContextUsage.tokens, contextWindow: record.lastContextUsage.contextWindow } }
+          : {}),
         queue: [],
         draining: false,
         messages: [],

@@ -1213,13 +1213,26 @@ export const natsStreamName = (root: string): string => {
   return `FABRIC_MESH_${createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 32)}`;
 };
 
+/** Where to reach a nats-server: the official client on `servers` (with `monitoringUrl`, `tls`), or an injected port. */
+export interface NatsEndpointOptions {
+  servers?: string[];
+  monitoringUrl?: string;
+  tls?: NatsTlsFiles;
+  /** A JetStream port (tests); then nothing is resolved or connected. */
+  port?: JetStreamPort;
+  /** Tests: the resolver for the loopback check (default dns.promises.lookup). */
+  lookup?: NatsLookup;
+}
+
 /**
- * Opens (and registers for the selector) the NATS state backend of a mesh root. Refuses, never falls back:
- * a server older than MIN_SERVER (2.14.7); a server that does not fsync every write unless the operator accepts it; a
- * stream that is retired; a root whose state is still in a stream under the old (c03c829f) name. Loads the official client only here.
+ * The one way to reach a nats-server for mesh state (pi-fabric#918 round 8: the backend's open and the migration share
+ * it). Every URL is checked and plaintext ones are PINNED to the loopback address of their one resolution, all BEFORE
+ * any connection (a refusal is a refusal, never a connect); the client connects to the pinned URLs only; then a
+ * non-loopback server that does not require authentication is refused before anything is read or written. The caller
+ * closes `port` when `owned`.
  */
-export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
-  const root = path.resolve(options.root);
+export const connectNatsEndpoint = async (options: NatsEndpointOptions): Promise<{ port: JetStreamPort; owned: boolean;
+  server: Awaited<ReturnType<JetStreamPort["server"]>> }> => {
   const lookup = options.lookup ?? systemLookup;
   const servers: string[] = [];
   for (const server of options.servers ?? []) servers.push(await assertNatsTransportSecure(server, "tls:", lookup));
@@ -1228,19 +1241,12 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
   // A tls:// server makes the client REQUIRE TLS on every connection (a server not offering it fails the connect),
   // whatever the client does with the scheme itself.
   const tls = options.tls ?? (servers.some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
+  const owned = options.port === undefined;
   const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(servers, {
     ...(monitoringUrl === undefined ? {} : { monitoringUrl }),
     ...(tls === undefined ? {} : { tls }) });
   try {
     const server = await port.server();
-    assertNatsServerSupported(server.version);
-    if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
-      throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
-    }
-    // pi-fabric#907: the server's own payload cap must not exceed ours (it then refuses oversized messages itself).
-    if (server.maxPayload !== undefined && server.maxPayload > MAX_MESSAGE_BYTES) {
-      throw new MeshStateNatsRefusedError(`nats-server max_payload is ${server.maxPayload} bytes (limit ${MAX_MESSAGE_BYTES}); set max_payload (docs/mesh-backends.md)`);
-    }
     // What a client CAN see of the server's access control is whether it requires authentication at all (INFO
     // auth_required). A non-loopback server that does not lets anyone on the network publish to or purge the stream:
     // refuse. Per-user publish/purge permissions are not visible to a client; docs/mesh-backends.md states the
@@ -1253,6 +1259,35 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     if (remote && server.authRequired !== true) {
       throw new MeshStateNatsRefusedError("a non-loopback nats-server that does not require authentication: anyone who can reach it could write or purge the state stream (docs/mesh-backends.md)");
     }
+    return { port, owned, server };
+  } catch (error) {
+    if (owned) await port.close().catch(() => undefined);
+    throw error;
+  }
+};
+
+/** pi-fabric#907: the server's own payload cap must not exceed ours (it then refuses oversized messages itself). */
+export const assertNatsMaxPayload = (server: { maxPayload?: number }): void => {
+  if (server.maxPayload !== undefined && server.maxPayload > MAX_MESSAGE_BYTES) {
+    throw new MeshStateNatsRefusedError(`nats-server max_payload is ${server.maxPayload} bytes (limit ${MAX_MESSAGE_BYTES}); set max_payload (docs/mesh-backends.md)`);
+  }
+};
+
+/**
+ * Opens (and registers for the selector) the NATS state backend of a mesh root. Refuses, never falls back: an endpoint
+ * connectNatsEndpoint refuses; a server older than MIN_SERVER (2.14.7); a server that does not fsync every write unless
+ * the operator accepts it; a stream that is retired; a root whose state is still in a stream under the old (c03c829f)
+ * name. Loads the official client only in connectNatsEndpoint.
+ */
+export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions): Promise<NatsStateBackend> => {
+  const root = path.resolve(options.root);
+  const { port, owned, server } = await connectNatsEndpoint(options);
+  try {
+    assertNatsServerSupported(server.version);
+    if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
+      throw new MeshStateNatsRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): an acked write may not survive a power loss; the operator may accept it explicitly`);
+    }
+    assertNatsMaxPayload(server);
     const stream = natsStreamName(root);
     // smarty-dev#9663 item 4: a stream under the c03c829f name holds this root's state; the hashed stream would
     // silently start empty beside it. Refuse until the operator migrates it.
@@ -1273,7 +1308,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     prepared.set(root, backend);
     return backend;
   } catch (error) {
-    if (!options.port) await port.close().catch(() => undefined);
+    if (owned) await port.close().catch(() => undefined);
     throw error;
   }
 };

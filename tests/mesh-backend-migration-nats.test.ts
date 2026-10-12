@@ -194,10 +194,15 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     const victim = path.join(outside, "victim.txt");
     fs.writeFileSync(victim, "keep me");
     fs.symlinkSync(victim, path.join(root, "state.json.nats-cutover-1"));
-    await expect(importMeshStateToNats(root, reconnectable(targetKind)())).rejects.toThrow(/nats-cutover-1 is not a regular file of this user/);
+    // pi-fabric#918 round 8: one server (and so the root's one stream) for both steps, as on a real server.
+    const linked = reconnectable(targetKind);
+    await expect(importMeshStateToNats(root, linked())).rejects.toThrow(/nats-cutover-1 is not a regular file of this user/);
     expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
     expect(fileDigest(root)).toBe(digest);
+    // The link refused BEFORE any stream write: the root's stream is still empty.
+    const raw = await rawPort(linked());
+    try { expect(await raw.lastSequence(natsStreamName(root))).toBe(0); } finally { if (targetKind === "nats") await raw.close(); }
 
     // A regular kept copy that holds another state refuses too.
     fs.unlinkSync(path.join(root, "state.json.nats-cutover-1"));
@@ -206,7 +211,9 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     stores.push(store);
     await store.put({ key: "changed/after/copy", value: 1, identity });
     store.closeState();
-    await expect(importMeshStateToNats(root, reconnectable(targetKind)())).rejects.toThrow(/nats-cutover-1 exists and holds another state/);
+    await expect(importMeshStateToNats(root, linked())).rejects.toThrow(/nats-cutover-1 exists and holds another state/);
+    const after = await rawPort(linked());
+    try { expect(await after.lastSequence(natsStreamName(root))).toBe(0); } finally { if (targetKind === "nats") await after.close(); }
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
 
     const clean = tempRoot("links-rollback");

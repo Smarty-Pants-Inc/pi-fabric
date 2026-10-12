@@ -32,8 +32,8 @@ import { renameAtomic } from "../core/atomic-write.js";
 import { encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker } from "./backend-fence.js";
 import { MeshBackendRefusedError, meshSnapshotDigest, normalizeSnapshot, type MeshBackendStep, type MeshStateSnapshot } from "./backend-migration.js";
 import { holdMeshFence } from "./fence-lock.js";
-import { applyNatsMessage, assertNatsServerSupported, assertNatsTransportSecure, MAX_MESSAGE_BYTES, NatsStateBackend, natsSnapshotLimits, natsStreamName,
-  NatsWrongLastSequenceError, type JetStreamPort, type NatsTlsFiles } from "./state-backend-nats.js";
+import { applyNatsMessage, assertNatsMaxPayload, assertNatsServerSupported, connectNatsEndpoint, MAX_MESSAGE_BYTES, NatsStateBackend,
+  natsSnapshotLimits, natsStreamName, NatsWrongLastSequenceError, type JetStreamPort, type NatsLookup, type NatsTlsFiles } from "./state-backend-nats.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "./state-file.js";
 
 const STATE_JSON = "state.json";
@@ -65,6 +65,8 @@ export interface MeshNatsMigrationOptions {
   servers?: string[];
   monitoringUrl?: string;
   tls?: NatsTlsFiles;
+  /** Tests: the resolver for the loopback check (as openNatsStateBackend). */
+  lookup?: NatsLookup;
   /** Host-only: accept a server that does not report `sync_always` (as openNatsStateBackend). */
   acceptPeriodicSync?: boolean;
   /** The state size bound (as both stores). Default 32 MiB. */
@@ -214,27 +216,18 @@ const importChunks = (state: MeshStateSnapshot, epoch: number): Uint8Array[] => 
     highWater: normalized.highWater, changes: group }));
 };
 
-const connect = async (options: MeshNatsMigrationOptions): Promise<{ port: JetStreamPort; owned: boolean }> => {
-  if (options.port) return { port: options.port, owned: false };
-  for (const server of options.servers ?? []) assertNatsTransportSecure(server, "tls:");
-  if (options.monitoringUrl !== undefined) assertNatsTransportSecure(options.monitoringUrl, "https:");
-  const tls = options.tls ?? ((options.servers ?? []).some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
-  const port = await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [], {
-    ...(options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl }), ...(tls === undefined ? {} : { tls }) });
-  return { port, owned: true };
-};
-
 /** Connects, refuses an unsafe server, ensures the stream, then runs `body` under the migration fence. */
 const run = async <T>(root: string, options: MeshNatsMigrationOptions, gateVersion: boolean,
   body: (port: JetStreamPort, stream: string, subject: string) => Promise<T>): Promise<T> => {
   root = path.resolve(root);
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw new MeshBackendRefusedError(`No mesh root at ${root}`);
-  const { port, owned } = await connect(options);
+  // The backend's own endpoint path (pi-fabric#918 round 8): pinned URLs, refusals before any connect, and a remote
+  // server without authentication refused before anything is read or written; a rollback too.
+  const { port, owned, server } = await connectNatsEndpoint(options);
   try {
-    const server = await port.server();
     // Before an IMPORT writes anything: a server the backend refuses to open would strand a migrated root (pi-fabric#918).
-    // A rollback is the escape hatch from such a server, so it is never gated on the version (round 4).
-    if (gateVersion) assertNatsServerSupported(server.version);
+    // A rollback is the escape hatch from such a server, so it is never gated on the version or max_payload (round 4).
+    if (gateVersion) { assertNatsServerSupported(server.version); assertNatsMaxPayload(server); }
     if (server.syncAlways !== true && options.acceptPeriodicSync !== true) {
       throw new MeshBackendRefusedError(`nats-server does not report sync_always (got ${String(server.syncAlways)}): refusing to migrate state onto it`);
     }
@@ -274,13 +267,17 @@ const readKeptCopy = (copy: string, options: MeshNatsMigrationOptions): MeshStat
   return readSource(copy, options);
 };
 
+/** Whether a kept copy of this state is already at `copy`; a link or another user's file there (readKeptCopy), or a
+ * copy of another state, refuses. */
+const keptCopyPresent = (copy: string, digest: string, options: MeshNatsMigrationOptions): boolean => {
+  const existing = readKeptCopy(copy, options);
+  if (existing === undefined) return false;
+  if (meshSnapshotDigest(existing) !== digest) throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${copy} exists and holds another state`);
+  return true;
+};
 /** Keeps the source at `copy`: an existing copy must be our regular file with the source's digest, else refuse. */
 const keepCopy = (root: string, copy: string, source: MeshStateFile, digest: string, options: MeshNatsMigrationOptions): void => {
-  const existing = readKeptCopy(copy, options);
-  if (existing !== undefined) {
-    if (meshSnapshotDigest(existing) !== digest) throw new MeshBackendRefusedError(`Fabric mesh NATS migration refused: ${copy} exists and holds another state`);
-    return;
-  }
+  if (keptCopyPresent(copy, digest, options)) return;
   writeDurably(copy, encodeMeshStateFile(source).serialized);
   fsyncDirectory(root);
   // Read the new copy back BEFORE state.json becomes the marker: a torn or corrupted write never stands for the source.
@@ -334,6 +331,10 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     // A file root without state.db is at epoch 0 (an epoch-stamped state.json needs its state.db), so E+1 = 1; every
     // import uses its own empty stream, whose lifecycle starts at 0.
     const epoch = 1;
+    // pi-fabric#918 round 8: the kept-copy path is checked BEFORE anything is written to the stream, so a hostile link
+    // there (or a copy of another state) refuses with the stream untouched, whatever the stream already holds. keepCopy
+    // checks it again right before it writes (a link created in between still refuses, never followed).
+    keptCopyPresent(path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`), digest, options);
     const tombstones = normalizeSnapshot(source).tombstones.length;
     if (tombstones > limits.maxStateTombstones) {
       throw new MeshNatsMigrationLimitError(`state.json holds ${tombstones} tombstones, more than maxStateTombstones ${limits.maxStateTombstones}`);

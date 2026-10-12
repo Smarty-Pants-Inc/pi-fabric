@@ -1,10 +1,13 @@
 import path from "node:path";
+import { nativeToolResult } from "../core/native-tool-result.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { runAbortable, throwIfAborted } from "../async-settlement.js";
-import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
+import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
+import type { AgentToolResult, ExtensionRunner, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
-import { classifyPiBashError, piBashResultError } from "../core/pi-bash-error.js";
+import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
+import { assertShellToolPermitted, preflightShellCall } from "./shell-preflight.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -17,6 +20,7 @@ export interface CapturedToolInvocationResult {
   text: string;
   details?: unknown;
   isError: boolean;
+  structuredContent?: unknown;
   terminate?: boolean;
   source: SourceInfo;
 }
@@ -57,6 +61,7 @@ const asInvocationResult = (
   text: textFromContent(result.content),
   ...(result.details !== undefined ? { details: result.details } : {}),
   isError,
+  ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
   ...(result.terminate !== undefined ? { terminate: result.terminate } : {}),
   source: entry.sourceInfo,
 });
@@ -94,16 +99,42 @@ export class CapturedToolsProvider implements FabricProvider {
     "Tools captured from other Pi extensions and invoked lazily through Fabric";
 
   readonly #scheduler = new CapturedToolScheduler();
+  readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
-  constructor(readonly catalog: CapturedToolCatalog) {}
+  readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
+  readonly #omitFromDiscovery: (entry: CapturedToolEntry) => boolean;
+
+  /**
+   * Without getPowerShellPolicy a captured powershell override is refused (smarty-dev#9826).
+   * A bare function is the discovery-filter-only form (native MCP tools stay out of discovery).
+   */
+  constructor(
+    readonly catalog: CapturedToolCatalog,
+    options:
+      | {
+          getPowerShellPolicy?: (() => FabricPowerShellPolicy) | undefined;
+          omitFromDiscovery?: ((entry: CapturedToolEntry) => boolean) | undefined;
+        }
+      | ((entry: CapturedToolEntry) => boolean) = {},
+  ) {
+    const normalized = typeof options === "function" ? { omitFromDiscovery: options } : options;
+    this.#getPowerShellPolicy = normalized.getPowerShellPolicy;
+    this.#omitFromDiscovery = normalized.omitFromDiscovery ?? (() => false);
+  }
+
+  async close(): Promise<void> {
+    this.#lifetime.abort(new Error("Captured extension tool session closed"));
+  }
 
   async list(
     request: FabricProviderListRequest,
     _context: FabricInvocationContext,
   ): Promise<FabricActionDescriptor[]> {
     const query = request.query?.trim().toLowerCase();
-    const descriptors = this.catalog.list().filter((entry) => !this.#allowedTools || this.#allowedTools.has(entry.name)).map(descriptorFrom);
+    const descriptors = this.catalog.list().filter((entry) =>
+      (!this.#allowedTools || this.#allowedTools.has(entry.name)) && !this.#omitFromDiscovery(entry),
+    ).map(descriptorFrom);
     if (!query) return descriptors;
     return descriptors.filter((descriptor) =>
       `${descriptor.name} ${descriptor.description} ${descriptor.namespace ?? ""}`
@@ -136,12 +167,21 @@ export class CapturedToolsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
-  ): Promise<CapturedToolInvocationResult> {
+  ): Promise<unknown> {
     this.#assertAllowed(actionName);
+    // smarty-dev#9826: refuse a powershell override before its lifecycle starts.
+    assertShellToolPermitted(actionName, this.#getPowerShellPolicy?.());
+    // Include provider custody even for host-direct calls without a turn signal.
+    // Queued work and non-cooperative late results cannot use a retired runner.
+    context = { ...context, signal: shareCancellationEffects(AbortSignal.any([
+      this.#lifetime.signal, ...(context.signal ? [context.signal] : []),
+    ]), context.signal) };
+    throwIfAborted(context.signal);
     const entry = this.catalog.require(actionName);
-    return this.#scheduler.run(entry.definition.executionMode, () =>
+    const result = await this.#scheduler.run(entry.definition.executionMode, () =>
       runAbortable(context.signal, () => this.#invokeCaptured(entry, args, context)),
     );
+    return context.nativeToolResult ? nativeToolResult(entry.definition, result, result.isError) : result;
   }
 
   #assertAllowed(name: string): void {
@@ -156,6 +196,30 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<CapturedToolInvocationResult> {
     const { runner, wrappedTool } = entry;
+    const native = context.extensionContext as Partial<import("@earendil-works/pi-coding-agent").ExtensionToolContext>;
+    // Native calls own validation, middleware, child IDs, execution events and
+    // usage accounting. Shells retain the adapted boundary so native exit status
+    // is captured BEFORE tool_result redaction/recovery (and cwd stays scoped).
+    // Tools with prepareArguments use Fabric's wrapper: the registry already
+    // prepared the authorized arguments; native dispatch would prepare twice.
+    if (native.executeTool && native.tools?.some((tool) => tool.name === entry.name) &&
+        !isPiShellToolName(entry.name) && !wrappedTool.prepareArguments) {
+      const activeBefore = runner.getActiveTools();
+      const outcome = await native.executeTool(entry.name, args, {
+        ...(context.signal ? { signal: context.signal } : {}),
+        onUpdate: (partial) => {
+          const progress = textFromContent(partial.content).trim();
+          if (progress) context.update(`${entry.name}: ${progress.slice(0, 500)}`);
+        },
+      });
+      const activeAfter = new Set(runner.getActiveTools());
+      this.catalog.remove(activeBefore.filter((name) => !activeAfter.has(name)));
+      context.updateArguments?.(outcome.toolCall.arguments);
+      const images = outcome.result.content.filter((part) => part.type === "image");
+      if (images.length && !context.nativeToolResult) context.attachMedia?.(images);
+      if (outcome.isError && !(context.nativeToolResult && entry.definition.outputSchema && outcome.result.structuredContent !== undefined)) throw new Error(textFromContent(outcome.result.content) || `Captured tool ${entry.name} failed`);
+      return asInvocationResult(entry, outcome.result, outcome.isError);
+    }
     const toolCallId = context.nestedToolCallId;
     await runAbortable(context.signal, () => runner.emit({
       type: "tool_execution_start",
@@ -169,26 +233,58 @@ export class CapturedToolsProvider implements FabricProvider {
     let thrown: unknown;
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
+    // A retired invocation (provider closed, turn cancelled, or execute already settled) must
+    // never touch the turn's context: a non-cooperative tool's late onUpdate is dropped, the
+    // same way runner emits are fenced by the combined signal (smarty-dev#5962).
+    let settled = false;
+    const retired = (): boolean => settled || context.signal?.aborted === true;
     try {
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-        type: "tool_call",
-        toolName: entry.name,
-        toolCallId,
-        input: args,
-      }));
-      context.updateArguments?.(args);
-      if (preflight?.block) {
-        throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+      let executionContext: ReturnType<ExtensionRunner["createContext"]> | undefined;
+      if (isPiShellToolName(entry.name)) {
+        // smarty-dev#8606: a shell override takes the same preflight as pi.bash
+        // and pi.powershell. The hook sees a copy, and any hook change to the
+        // judged call (command, cwd or any other argument) refuses it.
+        const sessionContext = runner.createContext();
+        args = await preflightShellCall({
+          name: entry.name,
+          args,
+          sessionCwd: sessionContext.cwd,
+          toolCallId,
+          runner,
+          signal: context.signal,
+          blocked: `Captured tool ${entry.name} was blocked`,
+          onBlock: () => context.updateArguments?.(args),
+          powershell: this.#getPowerShellPolicy?.(),
+        });
+        context.updateArguments?.(args);
+        // Only the judged cwd runs. Upstream 0.110 hands shells a per-call tool
+        // context; keep its accessors by layering the judged cwd over it.
+        const requestedCwd = args.cwd;
+        if (typeof requestedCwd === "string") {
+          executionContext = Object.defineProperty(Object.create(runner.createToolContext
+            ? runner.createToolContext(toolCallId, context.signal)
+            : sessionContext), "cwd", { value: requestedCwd, enumerable: true });
+        }
+      } else {
+        const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+          type: "tool_call",
+          toolName: entry.name,
+          toolCallId,
+          input: args,
+        }));
+        context.updateArguments?.(args);
+        if (preflight?.block) {
+          throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+        }
       }
       executionStarted = true;
-      const requestedCwd = args.cwd;
-      const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? { ...runner.createContext(), cwd: requestedCwd }
-        : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
+        if (retired()) return;
         const progress = textFromContent(partialResult.content).trim();
-        if (progress) context.update(`${entry.name}: ${progress.slice(0, 500)}`);
+        if (progress) {
+          try { context.update(`${entry.name}: ${progress.slice(0, 500)}`); } catch { /* progress is advisory */ }
+        }
         updateTail = updateTail
           .then(() =>
             runAbortable(context.signal, () => runner.emit({
@@ -202,6 +298,8 @@ export class CapturedToolsProvider implements FabricProvider {
           .catch(() => undefined);
         }, executionContext),
       );
+      isError = result.isError === true;
+      if (isError && isPiShellToolName(entry.name)) thrown = classifyPiBashResult(result);
     } catch (error) {
       thrown = isPiShellToolName(entry.name) && executionStarted ? classifyPiBashError(error) : error;
       isError = true;
@@ -216,6 +314,7 @@ export class CapturedToolsProvider implements FabricProvider {
       };
     }
 
+    settled = true;
     await updateTail;
     throwIfAborted(context.signal);
     const patch = await runAbortable(context.signal, () => runner.emitToolResult({
@@ -225,6 +324,7 @@ export class CapturedToolsProvider implements FabricProvider {
       input: args,
       content: result.content,
       details: result.details,
+      ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
       isError,
     }));
     if (patch) {
@@ -232,6 +332,8 @@ export class CapturedToolsProvider implements FabricProvider {
         ...result,
         content: patch.content ?? result.content,
         ...(patch.details !== undefined ? { details: patch.details } : {}),
+        ...((patch.content !== undefined || patch.structuredContent !== undefined)
+          ? { structuredContent: patch.structuredContent } : {}),
       };
       isError = patch.isError ?? isError;
     }
@@ -247,8 +349,8 @@ export class CapturedToolsProvider implements FabricProvider {
     // Keep observations emitted before a failed batch as well as successful
     // results. Hooks have already produced the final model-facing content.
     const images = result.content.filter((part) => part.type === "image");
-    if (images.length > 0) context.attachMedia?.(images);
-    if (isError) {
+    if (images.length > 0 && !context.nativeToolResult) context.attachMedia?.(images);
+    if (isError && !(context.nativeToolResult && entry.definition.outputSchema && result.structuredContent !== undefined)) {
       if (isPiShellToolName(entry.name)) {
         throw piBashResultError(thrown, textFromContent(result.content));
       }
@@ -257,6 +359,6 @@ export class CapturedToolsProvider implements FabricProvider {
         text || (thrown instanceof Error ? thrown.message : `Captured tool ${entry.name} failed`),
       );
     }
-    return asInvocationResult(entry, result, false);
+    return asInvocationResult(entry, result, isError);
   }
 }

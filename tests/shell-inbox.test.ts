@@ -152,6 +152,72 @@ describe("shell event delivery", () => {
     expect(h.inbox.pendingCount()).toBe(0);
   });
 
+  it("resumes delivery after a recovered provider error without cancelling live monitors", async () => {
+    const h = harness(); const build = h.begin(), watch = h.begin("wake");
+    h.emit("turn_end", { message: { role: "assistant", stopReason: "error" } });
+    expect(watch.abort.signal.aborted).toBe(false);
+    await build.finish(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual([build.id]);
+    h.idle(); h.emit("agent_settled", { aborted: false });
+    await watch.finish(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps terminal provider errors quiet until input and then delivers retained builds", async () => {
+    const h = harness(); const build = h.begin(), watch = h.begin("wake");
+    h.emit("turn_end", { message: { role: "assistant", stopReason: "error" } });
+    h.idle(); h.emit("agent_settled", { aborted: false });
+    expect(watch.abort.signal.aborted).toBe(true);
+    await build.finish(0);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    h.emit("input");
+    expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+  });
+
+  it.each(["busy", "queued input"])("rechecks deferred delivery after %s clears without another lifecycle event", async blocked => {
+    const h = harness();
+    if (blocked === "queued input") { h.idle(); h.pending(true); }
+    const job = h.begin(); await job.finish(0);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.idle(); h.pending(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(h.sendMessage.mock.calls[0]![0].details.ids).toEqual([job.id]);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("honors settled aborts without a signal and never clears interruption on a later healthy boundary", async () => {
+    const h = harness(); const build = h.begin(), watch = h.begin("wake");
+    h.emit("agent_settled", { aborted: true });
+    expect(watch.abort.signal.aborted).toBe(true);
+    h.emit("turn_end", { message: { role: "assistant", stopReason: "error" } });
+    h.emit("turn_end", { message: { role: "assistant", stopReason: "stop" } });
+    await build.finish(0); h.idle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.emit("input");
+    expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+  });
+
+  it("cancels a deferred delivery retry when closed", async () => {
+    const h = harness(); await h.begin().finish(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(vi.getTimerCount()).toBe(1);
+    h.inbox.close(); h.idle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it("delivers one terminal deadline notice without renewing a monitor", async () => {
     const h = harness(); h.idle();
     const job = h.jobs.begin("bash", "watch", { monitor: parseShellMonitor({ delivery: "wake", timeoutMs: 1000 })! }); job.spill();
@@ -171,7 +237,7 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("turn_end");
-    expect(h.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ customType: SHELL_MESSAGE_TYPE, details: { ids: [job.id] }, display: false, content: expect.stringContaining("not human input or approval") }), { deliverAs: "steer", triggerTurn: true });
+    expect(h.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ customType: SHELL_MESSAGE_TYPE, details: { ids: [job.id], wakeCause: { cause: "inbox", from: { id: "fabric:host", name: "Fabric host", kind: "main" } } }, display: false, content: expect.stringContaining("not human input or approval") }), { deliverAs: "steer", triggerTurn: true });
     h.emit("turn_end"); expect(h.sendMessage).toHaveBeenCalledOnce();
   });
   it("wakes an idle owner once, batches completions, and defers to queued input", async () => {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../src/agents/bash-worktree-add.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 const roots: string[] = [];
 const worktrees: Array<{ repository: string; path: string }> = [];
@@ -79,7 +80,7 @@ describe("PiToolsProvider bash intercept", () => {
   it("hijacks git worktree add through pi.bash", async () => {
     const repository = initRepository();
     const dest = path.join(repository, "from-bash");
-    const provider = new PiToolsProvider(repository);
+    const provider = new PiToolsProvider(repository, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true });
     const result = await provider.invoke(
       "bash",
       { command: "git worktree add -b from-bash from-bash HEAD" },

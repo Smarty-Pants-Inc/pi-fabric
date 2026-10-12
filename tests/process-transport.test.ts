@@ -195,6 +195,18 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
+  it("never auto-selects a v1 worker without the receipt/attributed-refusal boundary", async () => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(2);
+    const f = fixture();
+    const legacy = f.release("legacy-terminal-protocol", 1);
+    f.select(legacy);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await probe(f, f.parent);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 1");
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 2");
+  });
+
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {
     const f = fixture(false);
     f.select(f.release("native-incompatible", WORKER_PROTOCOL_VERSION + 1));
@@ -291,7 +303,13 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
       expect(await workerStarted(f.root)).toBe(pid);
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8").slice(fs.readFileSync(`/proc/${pid}/stat`, "utf8").lastIndexOf(")") + 2).split(" ");
       expect(Number(stat[2])).toBe(pid); // field 5 is PGID
-      expect(fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n").slice(0, 6)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect", "--"]);
+      const scopeArgs = fs.readFileSync(path.join(f.root, "scope-args"), "utf8").split("\n");
+      expect(scopeArgs.slice(0, 5)).toEqual(["--user", "--scope", "--slice=batch.slice", "--quiet", "--collect"]);
+      expect(scopeArgs[5]).toMatch(/^--unit=fabric-scope-.+\.scope$/);
+      expect(scopeArgs[6]).toBe("--");
+      // A fake systemd-run admits into the caller cgroup, not our unique scope.
+      expect(handle.liveness).toBeUndefined();
+      expect(handle.treeClosed).toBeUndefined();
       expect(await handle.isAlive()).toBe(true); expect(warn).not.toHaveBeenCalled();
     } finally { await handle.stop(); await handle.waitForClose?.(); }
     expect(await handle.isAlive()).toBe(false); expect(handle.lostContact?.()).toBeUndefined();
@@ -323,3 +341,36 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
   });
 });
 }
+
+const directory = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-transport-"));
+  roots.push(root);
+  return root;
+};
+
+describe("process transport startup diagnostics", () => {
+  it("rejects a failed spawn without an unhandled child error", async () => {
+    const root = directory();
+    await expect(spawnDetached(path.join(root, "missing.mjs"), [], path.join(root, "missing-cwd"))).rejects.toThrow(/ENOENT/);
+    await new Promise(resolve => setImmediate(resolve));
+  });
+
+  // Upstream bounded stderr capture is not ported yet (smarty-dev#5776 follow-up): a piped stderr
+  // inherited by execution descendants would hold back the child "close" event our process-tree
+  // custody relies on. Unskip with the port.
+  it.skip("surfaces bounded stderr even when the worker cannot execute its bootstrap", async () => {
+    const root = directory();
+    const worker = path.join(root, "crash.mjs");
+    fs.writeFileSync(worker, 'process.stderr.write("x".repeat(60000) + "\\nworker-bootstrap-sentinel 界面\\n"); process.exitCode = 1;');
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 20000, sessionExport: false }, {
+      workerPath: worker, runRoot: path.join(root, "runs"), fullCodeMode: false,
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "probe", transport: "process", extensions: false });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("worker stderr:");
+    expect(result.error).toContain("worker-bootstrap-sentinel 界面");
+    expect(result.error).not.toContain("�");
+    expect(result.error!.length).toBeLessThan(21000);
+  });
+});

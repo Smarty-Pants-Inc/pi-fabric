@@ -9,7 +9,13 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import type { AgentTransportHandle, AgentTransportLaunch } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { privateDirTestHooks } from "../src/storage/private-dir.js";
 import { hasUnresolvedWorker } from "../src/storage/retention.js";
+
+// The cases below mock process.platform to probe the manager's product branch. Run directories are still made on
+// the real host, so the private-dir fallback must see the real platform: a mocked "linux" on a Windows runner
+// would otherwise demand /proc/self/fd (pi-fabric#875).
+const hostPlatform = process.platform;
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -20,10 +26,12 @@ const roots: string[] = [];
 afterEach(() => {
   vi.useRealTimers(); vi.restoreAllMocks();
   vi.mocked(spawn).mockReset();
+  delete privateDirTestHooks.platform;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const setup = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-merge-")); roots.push(root);
+  privateDirTestHooks.platform = hostPlatform;
   return new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000,
     maxConcurrent: 1, retainRuns: false, budgetUsd: 0, notifyOnComplete: false },
   { runRoot: path.join(root, "runs"), workerPath: path.join(root, "worker.mjs") });

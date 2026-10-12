@@ -14,7 +14,9 @@ const JEV_NOT_A_CHAT_PROVIDER =
 // Newer Pi requires every provider to carry at least one api/images/classifiers
 // implementation. Jev is auth-only and publishes no models, so this stream is
 // unreachable in practice; if anything ever calls it, it ends with an error.
-const failWithoutModels = (model: Model<Api>) => {
+const failWithoutModels = (model: Model<Api> | undefined) => {
+  // Upstream contract: a direct call without a model is a usage error, not a stream.
+  if (!model) throw new Error("Jev supplies typed judgments, not chat generation");
   const stream = createAssistantMessageEventStream();
   const error = {
     role: "assistant" as const,

@@ -23,6 +23,7 @@ const selectListThemeFor = (theme: unknown) => {
   };
 };
 import type { FabricApprovalConfig } from "../config.js";
+import { actionApprovalOverride } from "./approval-overrides.js";
 import type { FabricRisk } from "../protocol.js";
 import type { ResolvedFabricAction } from "./action-registry.js";
 import {
@@ -47,6 +48,14 @@ const sessionLabel = (risk: FabricRisk): string =>
 export class FabricSessionApprovals {
   readonly approvedRisks = new Set<FabricRisk>();
   #tail: Promise<void> = Promise.resolve();
+  #generation = 0;
+  get generation(): number { return this.#generation; }
+
+  reset(): void {
+    this.#generation++;
+    this.#tail = Promise.resolve(); // A successor must not wait for a retired dialog/classifier.
+    this.approvedRisks.clear();
+  }
 
   async serialize<T>(request: () => Promise<T>): Promise<T> {
     const previous = this.#tail;
@@ -78,6 +87,7 @@ export interface FabricAutoApprovalAudit {
 }
 
 export class ApprovalController {
+  readonly #generation: number;
   readonly #inheritedRisks = new Set<FabricRisk>(inheritedRisks());
 
   constructor(
@@ -92,15 +102,30 @@ export class ApprovalController {
     readonly brokeredNetwork?: (provider: string) => boolean,
     /** Internal routing cannot own a classifier or approval dialog: refuse ungranted `auto`/`ask` before queuing. */
     readonly internalRouting = false,
-  ) {}
+    /** approvals.headless "decision": resolve to true only on an explicit approve. */
+    readonly headless?: (action: ResolvedFabricAction, reason?: string) => Promise<boolean>,
+  ) { this.#generation = sessionApprovals.generation; }
+
+  #assertCurrent(): void {
+    if (this.#generation !== this.sessionApprovals.generation) {
+      throw new FabricTraceSafeError("Fabric approval session closed; no approval was granted");
+    }
+  }
 
   async approve(
     action: ResolvedFabricAction,
     args: Record<string, unknown> = {},
   ): Promise<void> {
+    this.#assertCurrent();
+    const override = actionApprovalOverride(this.config.actions, action.ref);
+    // An action-level deny is absolute: no inherited or session risk grant lifts it.
+    if (override === "deny") {
+      throw new FabricTraceSafeError(`${action.ref} is denied by the Fabric approvals.actions policy`);
+    }
     // This is an immutable host capability, not a model/configurable network grant.
     if (action.risk === "network" && this.brokeredNetwork?.(action.provider) === true) return;
-    const mode = this.config[action.risk];
+    // Exact ref beats provider wildcard beats the risk-class mode.
+    const mode = override ?? this.config[action.risk];
     if (
       mode === "allow" ||
       (!this.brokeredNetwork && (
@@ -123,6 +148,7 @@ export class ApprovalController {
     }
 
     await this.sessionApprovals.serialize(async () => {
+      this.#assertCurrent();
       if (this.sessionApprovals.approvedRisks.has(action.risk)) return;
       if (mode !== "auto") {
         await this.#requestApproval(action);
@@ -137,6 +163,7 @@ export class ApprovalController {
           this.config.model,
         );
       } catch (error) {
+        this.#assertCurrent();
         const message = error instanceof Error ? error.message : String(error);
         this.onAutoDecision?.({
           action: action.ref,
@@ -152,6 +179,7 @@ export class ApprovalController {
         );
         return;
       }
+      this.#assertCurrent();
       this.onAutoDecision?.({
         action: action.ref,
         risk: action.risk,
@@ -174,7 +202,16 @@ export class ApprovalController {
     action: ResolvedFabricAction,
     escalationReason?: string,
   ): Promise<void> {
+    this.#assertCurrent();
     if (!this.context.hasUI) {
+      if (this.config.headless === "decision" && this.headless) {
+        const approved = await this.headless(action, escalationReason);
+        // A session reset while the decision was pending retires it: a late
+        // answer must not authorize the old action (same fence as the UI path).
+        this.#assertCurrent();
+        if (approved) return;
+        throw new FabricTraceSafeError(`${action.ref} approval was denied, cancelled, or expired`);
+      }
       throw new FabricTraceSafeError(`${action.ref} requires approval, but no interactive UI is available`);
     }
 
@@ -186,6 +223,7 @@ export class ApprovalController {
       ? await this.#requestTuiApproval(action, escalationReason)
       : await this.#requestDialogApproval(action, escalationReason);
 
+    this.#assertCurrent();
     if (choice === "deny") {
       this.context.ui.notify(`Denied ${action.risk} access for ${action.ref}`, "warning");
       throw new FabricTraceSafeError(`User denied ${action.risk} access for ${action.ref}`);

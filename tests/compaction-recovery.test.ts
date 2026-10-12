@@ -3,7 +3,7 @@ import type { CompactOptions, ExtensionAPI, ExtensionContext } from "@earendil-w
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "../src/compaction/recovery.js";
 
 afterEach(() => vi.useRealTimers());
-const harness = (idle = true) => {
+const harness = (idle = true, retryEnded?: () => void) => {
   vi.useFakeTimers();
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => unknown>();
   const alarm = vi.fn(async (_data: Record<string, unknown>) => {});
@@ -13,7 +13,7 @@ const harness = (idle = true) => {
   const context = { isIdle: () => isIdle, signal: controller.signal, compact,
     sessionManager: { getSessionId: () => session }, getContextUsage: () => ({ tokens: 259000, contextWindow: 272000, percent: 95.22 }) } as unknown as ExtensionContext;
   registerCompactionRecovery({ on: (name: string, fn: any) => handlers.set(name, fn) } as unknown as ExtensionAPI,
-    { enabled: () => true, alarm });
+    { enabled: () => true, alarm, ...(retryEnded ? { retryEnded } : {}) });
   const emit = async (event: string, value = {}) => handlers.get(event)?.({ type: event, ...value }, context);
   const failure = (extra = {}) => emit("session_compact_failed", { reason: "threshold", aborted: false, willRetry: false,
     fromExtension: false, errorMessage: "Auto-compaction failed: stream disconnected", ...extra });
@@ -48,6 +48,17 @@ describe("Fabric-hosted compaction recovery", () => {
     await h.emit("session_compact"); h.compact.mock.calls[0]![0]?.onComplete?.({} as never);
     expect(h.alarm).not.toHaveBeenCalled(); await h.failure(); await vi.runOnlyPendingTimersAsync();
     expect(h.compact).toHaveBeenCalledTimes(2);
+  });
+
+  // smarty-dev#9271: no agent_settled follows a retry on an idle Main; this callback wakes it for a
+  // child completion that landed during the retry. Pi calls onComplete/onError after its compaction state is gone.
+  it.each(["onComplete", "onError"] as const)("signals the end of its retry from Pi's %s callback", async end => {
+    const retryEnded = vi.fn();
+    const h = harness(true, retryEnded); await h.failure(); await vi.runOnlyPendingTimersAsync();
+    expect(h.compact).toHaveBeenCalledOnce(); expect(retryEnded).not.toHaveBeenCalled();
+    const options = h.compact.mock.calls[0]![0]!;
+    if (end === "onComplete") options.onComplete?.({} as never); else options.onError?.(new Error("stream disconnected again"));
+    expect(retryEnded).toHaveBeenCalledOnce();
   });
 
   it.each([{ aborted: true }, { errorMessage: "Compaction failed: Already compacted" },

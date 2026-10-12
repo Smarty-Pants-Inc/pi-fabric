@@ -1,4 +1,6 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { nativeMcpIdentity } from "./core/native-mcp-identity.js";
+import { FABRIC_TOOLS_MEMBERS, speculativeNativeRef } from "./core/native-tool-names.js";
+import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { FabricConfig } from "./config.js";
 import type { ActionRegistry, ResolvedFabricAction } from "./core/action-registry.js";
 import type { FabricInvocationContext } from "./protocol.js";
@@ -26,6 +28,8 @@ export class RuntimeStateSpeculation {
     readonly readCapabilityView: () => FabricInvocationContext["capabilityView"],
     readonly allowRef: (ref: string) => boolean = () => true,
     kernel: "typescript" | "python" = "typescript",
+    readonly nativeDefinitions: () => readonly ToolDefinition[] = () => [],
+    readonly nativeProfile: () => boolean = () => false,
   ) {
     const speculation = readConfig();
     if (!speculation?.enabled) return;
@@ -63,7 +67,7 @@ export class RuntimeStateSpeculation {
     // full once the factory lands (their extractors buffered the prefix).
     const factory = kernel === "python"
       ? import("./speculation/python-scanner.js").then((module) => () => new module.PythonLiteralCallScanner())
-      : import("./speculation/scanner.js").then((module) => () => new module.LiteralCallScanner());
+      : import("./speculation/scanner.js").then((module) => () => new module.LiteralCallScanner((name, root) => root === "tools" && !this.nativeProfile() && FABRIC_TOOLS_MEMBERS.has(name) ? undefined : speculativeNativeRef(name, this.nativeDefinitions(), nativeMcpIdentity)));
     void factory.then((create) => this.tap?.setScannerFactory(create), () => undefined);
   }
 
@@ -84,6 +88,7 @@ export class RuntimeStateSpeculation {
       parentToolCallId: toolCallId,
       nestedToolCallId: "fabric-speculation",
       extensionContext: context,
+      ...(candidate.nativeToolResult ? {nativeToolResult: true} : {}),
       update() {},
       ...(capabilityView
         ? { capabilityView }

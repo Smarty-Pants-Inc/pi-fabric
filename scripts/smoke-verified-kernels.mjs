@@ -28,7 +28,7 @@ const parent = authority.authorityIssue(names(["exact grant"]));
 assert.equal(authority.authorityLive(authority.authorityDerive(parent, names(["different grant"]))), false);
 assert.equal(authority.authorityLive(authority.authorityRelease(parent)), false);
 const life = { $: "Life", phase: { $: "Retiring" }, owner: false, holds: 0n, calls: 0n, revoked: true };
-const closing = bindingStep(life, { $: "Close" });
+const closing = bindingStep(life, { $: "Shut" });
 assert.equal(closing.command.$, "StartClose");
 assert.equal(bindingStep(closing.next, { $: "Begin", cleanup: true }).command.$, "Denied");
 const revision = value => ({ $: "Revision", high: value / 4294967296n, low: value % 4294967296n });

@@ -14,6 +14,7 @@ import {
   encodeCompactionRequest,
 } from "../compaction/instructions.js";
 import type {
+  AgentForkSeed,
   AgentSessionSeed,
   AgentToolResultMessage,
   HandoffCompactionRequest,
@@ -172,7 +173,7 @@ export const snapshotHandoffSession = (
 };
 
 const materializeBranch = (
-  seed: AgentSessionSeed,
+  seed: Pick<AgentSessionSeed, "sourceBranch" | "sourceSessionFile">,
   cwd: string,
   directory: string,
 ): SessionManager => {
@@ -345,6 +346,44 @@ export const writeHandoffSession = (
   });
   const sessionFile = session.getSessionFile();
   if (!sessionFile) throw new Error("Trajectory handoff did not produce a Pi session file");
+  fs.chmodSync(sessionFile, 0o600);
+  return sessionFile;
+};
+
+/**
+ * Materialize a non-blocking fork (agents.run/spawn seed: "branch"). The seed
+ * already ends at the caller's last completed turn, so no tool call is left
+ * dangling; the worker then sends the task as the next user turn.
+ */
+export const writeForkSession = (
+  seed: AgentForkSeed,
+  cwd: string,
+  directory: string,
+  transfer?: ThinkingTransferInput,
+): string => {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const policy = transfer ? thinkingTransferPolicy(transfer) : "preserved";
+  const raw = structuredClone(seed.sourceBranch);
+  const digest = policy === "stripped" && transfer ? buildThinkingDigest(raw, transfer) : undefined;
+  const entries = policy === "preserved" ? raw : translateThinkingForExecutor(raw, policy).entries;
+  const session = materializeBranch(
+    { sourceBranch: entries, ...(seed.sourceSessionFile ? { sourceSessionFile: seed.sourceSessionFile } : {}) },
+    cwd,
+    directory,
+  );
+  if (digest) {
+    session.appendCustomMessageEntry(THINKING_DIGEST_CUSTOM_TYPE, digest.content, false, {
+      policy,
+      citedBlocks: digest.citedBlocks,
+    });
+  }
+  session.appendCustomEntry("pi-fabric-fork", {
+    sourceSessionId: seed.sourceSessionId,
+    boundary: "last_completed_turn",
+    entries: seed.sourceBranch.length,
+  });
+  const sessionFile = session.getSessionFile();
+  if (!sessionFile) throw new Error("Branch seed did not produce a Pi session file");
   fs.chmodSync(sessionFile, 0o600);
   return sessionFile;
 };

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricShellJobStore, type FabricShellJobInfo } from "../src/core/shell-jobs.js";
@@ -23,7 +23,12 @@ const fixture = () => {
     mainAgentInfo: () => ({ id: "main", name: "Main", kind: "main", status: "idle", runner: "pi", transport: "host", cwd: process.cwd(), startedAt: 1, updatedAt: 1, pendingMessages: false, local: true }),
   } as unknown as FabricState;
   const controller = new FabricUiController(state); cleanup.push(() => controller.stop());
-  const setWidget = vi.fn(), notify = vi.fn(), requestRender = vi.fn();
+  const notify = vi.fn(), requestRender = vi.fn();
+  const setWidget = vi.fn((_id: string, content: unknown) => {
+    if (typeof content === "function") {
+      return (content as (tui: TUI, theme: Theme) => FabricWidget)({ requestRender } as unknown as TUI, theme);
+    }
+  });
   const context = { mode: "tui", hasUI: true, ui: { setWidget, notify } } as unknown as ExtensionContext;
   return { jobs, state, controller, context, setWidget, notify, requestRender };
 };
@@ -61,7 +66,7 @@ describe("background shell UI", () => {
       expect(lines[0]).toContain(ansiTheme.fg("dim", " · /fabric tasks · ctrl+alt+t"));
       expect(lines[1]).toBe(
         `  ${ansiTheme.fg(color, glyph)} ${ansiTheme.fg("muted", "7b6eb606")} ${ansiTheme.fg("muted", status)}` +
-        `${ansiTheme.fg("dim", " · 3s · ")}${ansiTheme.fg("muted", description ? "Watch CI 界" : "sleep 30")}`,
+        `${ansiTheme.fg("dim", job.finishedAt === undefined ? " · " : " · 3s · ")}${ansiTheme.fg("muted", description ? "Watch CI 界" : "sleep 30")}`,
       );
       for (const width of [1, 12, 40, 80]) {
         expect(widget.render(width).every(line => visibleWidth(line) <= width)).toBe(true);
@@ -85,7 +90,7 @@ describe("background shell UI", () => {
     expect(widget.hasChanged()).toBe(false);
     expect(widget.render(120)[1]).toMatch(/^  ✓ /);
   });
-  it("keeps the widget live after the executor is idle and refreshes elapsed time without output", async () => {
+  it("keeps active shell status visible without recurring elapsed refreshes and expires it on the next event", async () => {
     vi.useFakeTimers(); vi.setSystemTime(10000);
     const h = fixture(); h.controller.start(h.context);
     expect(vi.getTimerCount()).toBe(0);
@@ -98,10 +103,23 @@ describe("background shell UI", () => {
     const widget = new FabricWidget(theme, () => h.controller.snapshot(), 5);
     expect(widget.render(80).join("\n")).toContain("/fabric tasks");
     expect(widget.render(80).join("\n")).toContain("Watch CI");
+    const actors = vi.spyOn(h.state.actors, "list");
+    h.requestRender.mockClear();
+    const eventTime = h.controller.snapshot().now;
+    expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(3000);
-    expect(widget.render(80).join("\n")).toContain("3s");
+    expect(actors).not.toHaveBeenCalled();
+    expect(h.requestRender).not.toHaveBeenCalled();
+    expect(h.controller.snapshot().now).toBe(eventTime);
+    expect(widget.render(80).join("\n")).not.toContain("3s");
     await job.finish(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.requestRender).toHaveBeenCalled();
+    expect(widget.render(80).join("\n")).toContain("3s"); // Fixed completion duration.
+    expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(31000);
+    expect(shouldShowFabricWidget(h.controller.snapshot(), "auto")).toBe(true); // Quiet state is unchanged.
+    h.controller.setHostStreaming(false); // Next explicit event observes age expiry.
     expect(shouldShowFabricWidget(h.controller.snapshot(), "auto")).toBe(false);
     h.controller.stop(); expect(vi.getTimerCount()).toBe(0);
   });

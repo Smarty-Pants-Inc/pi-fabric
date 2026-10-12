@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { residentRemovalsPath } from "../src/residency/protocol.js";
 import { mainPublicationFencePath, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { fixture, rootParticipantKey, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
@@ -77,6 +78,37 @@ describe.skipIf(process.platform !== "linux")("live actor remove across processe
       expect(participantPid(f)).toBe(main.pid);
     } finally { await h.close(); await f.close(); }
   }, 120_000);
+
+  it("a host restarted between an operator remove's accept and its cleanup keeps the tree while the Main lives; a rerun with the Main dead deletes it", async () => {
+    const f = await fixture();
+    const h = processHarness();
+    try {
+      const actor = await live(f, h, "restarted-host", "afterBindings");
+      const first = h.remover("none", removeArgs(f, actor.id));
+      await actor.host.next("paused"); // accepted: the row is revoked and the cleanup marker is durable; the tree is next
+      expect(await actor.host.kill("SIGKILL")).toEqual([null, "SIGKILL"]);
+      await first.kill("SIGKILL");
+      const main = await h.main(f.config.meshRoot, f.config.rootId);
+      expect(await main.publish()).toMatchObject({ ok: true }); // the root's Main is alive again
+      // A new resident host process: its start finishes the removal it inherits, without the operator's check.
+      await h.host(f.config.residencyRoot, "none");
+      const states = () => {
+        try { return (JSON.parse(fs.readFileSync(residentRemovalsPath(f.config.residencyRoot), "utf8")) as { removals: { id: string; state: string }[] })
+          .removals.filter(removal => removal.id === actor.id).map(removal => removal.state); } catch { return []; }
+      };
+      await vi.waitFor(() => expect(!fs.existsSync(actor.dir) || states().some(state => /check was lost/.test(state))).toBe(true),
+        { timeout: 30_000, interval: 100 });
+      expect(fs.existsSync(actor.dir), "the live Main's actor tree after the host restart").toBe(true);
+      expect(history(actor.dir)).toBe("history\n");
+      expect(f.registered(actor.id)).toBe(false);
+      // The operator reruns the remove once the Main is stopped: the dead-root check runs again under the fence.
+      await main.stop();
+      const rerun = h.remover("none", removeArgs(f, actor.id));
+      expect(await rerun.next("exit")).toMatchObject({ code: 0, err: "" });
+      expect(fs.existsSync(actor.dir)).toBe(false);
+      expect(fenced(f)).toBe(false);
+    } finally { await h.close(); await f.close(); }
+  }, 150_000);
 
   // The live remover killed at the fence's two creation points (#8082 item 2) and while it holds the fence: the tree is
   // never deleted, no fence outlives its holder (no clock: the kernel drops the lock), and the Main publishes.

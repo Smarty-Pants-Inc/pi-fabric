@@ -1718,11 +1718,21 @@ export class ResidentHost {
         // Exact id/name within this executor's root only; never resolve via the caller's root.
         const candidates = this.actors.listOwned().filter(actor => actor.rootId === this.config.rootId &&
           actor.residency === "durable" && (actor.id === command.id || actor.name === command.id));
-        if (candidates.length !== 1) throw new Error(candidates.length
+        // smarty-dev#8090: the pending cleanup of an accepted operator remove (its row is already revoked), by exact id
+        // only. A remove of it runs the dead-root check again, under the Main publication fence, before the tree delete.
+        const obligation = command.action === "remove" && candidates.length === 0 ? this.actors.cleanupObligation(command.id) : undefined;
+        const pendingCleanup = obligation?.rootId === this.config.rootId && obligation.residency === "durable" ? obligation : undefined;
+        if (candidates.length !== 1 && !pendingCleanup) throw new Error(candidates.length
           ? `Ambiguous resident actor: ${command.id}` : `Unknown Fabric actor: ${command.id}`);
-        const actor = candidates[0]!;
+        const actor = candidates[0] ?? pendingCleanup!;
+        const fencedCheck = () => fencedOperatorCheck(this.mesh, { id: this.identity.id, name: this.identity.name, kind: "agent" }, this.config.rootId, get =>
+          assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, { get }), command.confirmDeadRoot));
         if (command.dryRun === true) {
           response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor, operatorEvidence: evidence, completedAt: Date.now() };
+        } else if (pendingCleanup) {
+          check();
+          commit(actor.id);
+          response = await this.#removeResidentActor(actor.id, requestId, () => check(), fencedCheck);
         } else {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
@@ -1731,11 +1741,9 @@ export class ResidentHost {
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check(),
-              // smarty-dev#8090: the same check again under the Main publication fence, before the tree delete, inside the
-              // state transaction and the root participant's key lock (as the offline removal runs it).
-              () => fencedOperatorCheck(this.mesh, { id: this.identity.id, name: this.identity.name, kind: "agent" }, this.config.rootId, get =>
-                assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, { get }), command.confirmDeadRoot)));
+            // smarty-dev#8090: the same check again under the Main publication fence, before the tree delete, inside the
+            // state transaction and the root participant's key lock (as the offline removal runs it).
+            : await this.#removeResidentActor(actor.id, requestId, () => check(), fencedCheck);
         }
       } else if (command.operation === "actors") {
         response = {

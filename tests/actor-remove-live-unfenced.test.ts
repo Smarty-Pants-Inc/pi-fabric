@@ -1,0 +1,55 @@
+import fs from "node:fs";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { fixture } from "./helpers/dead-root-fixture.js";
+
+// pi-fabric#952 round 2 (smarty-dev#8090): where the Main publication fence is unavailable (Windows: no flock,
+// smarty-dev#7858), a live remove never deletes the tree outside the fence. It revokes, keeps the tree, leaves the
+// cleanup pending, and refuses as the offline removal does. The platform reads as win32 only from the step right
+// before the tree delete (the bindings delete) until the remove returns, so nothing else in the removal changes.
+describe("live actor remove without the Main publication fence", () => {
+  it("keeps the tree and leaves the cleanup pending; it never deletes unfenced", async () => {
+    const f = await fixture();
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const remove = ActorBindingStore.prototype.delete;
+    try {
+      const actor = await f.create("unfenced");
+      const dir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+      ActorBindingStore.prototype.delete = async function (this: ActorBindingStore, ...values: Parameters<ActorBindingStore["delete"]>) {
+        const result = await remove.apply(this, values);
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        return result;
+      };
+      let result: Awaited<ReturnType<typeof f.host.actors.remove>>;
+      try { result = await f.host.actors.remove(actor.id); }
+      finally { Object.defineProperty(process, "platform", platform); ActorBindingStore.prototype.delete = remove; }
+      expect(fs.existsSync(dir), "the actor tree").toBe(true);
+      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(result).toMatchObject({ removed: true, cleaned: false,
+        pending: expect.stringContaining("actor removal is not supported where file ownership cannot be proven (smarty-dev#7858)") });
+      expect(f.registered(actor.id)).toBe(false); // revoked: only the tree delete waits
+      expect(f.host.actors.cleanupObligation(actor.id)).toBeDefined();
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      ActorBindingStore.prototype.delete = remove;
+      await f.close();
+    }
+  }, 60_000);
+
+  it("a removal marker with a malformed operator flag keeps the tree (fail closed)", async () => {
+    const f = await fixture();
+    try {
+      const actor = await f.create("malformed-marker");
+      const dir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+      // A marker that names this actor correctly but whose operator flag is not `true`.
+      fs.writeFileSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`), JSON.stringify({
+        id: actor.id, sessionDir: dir, presenceKey: `actors/${f.config.sessionId}/${actor.id}`, operatorCheck: "yes" }));
+      await f.host.actors.remove(actor.id).catch(() => undefined);
+      expect(fs.existsSync(dir), "the actor tree").toBe(true);
+      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+    } finally { await f.close(); }
+  }, 60_000);
+});

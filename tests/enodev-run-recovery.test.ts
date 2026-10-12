@@ -122,19 +122,21 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
   // earlier ENODEV-unconfirmed run's saved answer completes it. Only the process launch is stubbed.
   // An actor activation interrupted mid-run by a real close, then given the pre-#849 outcome: the worker completed
   // and saved its answer, but its exit stayed unconfirmed (ENODEV). Returns what a restart needs.
-  const interruptedRun = async () => {
+  const interruptedRun = async (delivery?: "followUp") => {
     const root = tempRoot();
     const runRoot = path.join(root, "runs");
     const actorRoot = path.join(root, "actors");
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-    const actors = (agents: AgentManager, rootId = "session:reload", extra: { canManageActor?: (id: string) => boolean } = {}) =>
+    const actors = (agents: AgentManager, rootId = "session:reload", extra: { canManageActor?: (id: string) => boolean } = {},
+      onDeliver: ConstructorParameters<typeof ActorManager>[5] = () => {}) =>
       new ActorManager("reload",
         { id: rootId, name: "main", kind: "main", sessionId: rootId.slice(8) }, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 },
-        agents, () => {}, { actorRoot, persistent: true, meshCursorPath: path.join(actorRoot, "mesh-cursor.json"), ...extra });
+        agents, onDeliver, { actorRoot, persistent: true, meshCursorPath: path.join(actorRoot, "mesh-cursor.json"), ...extra });
     const config = { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true };
     const first = new AgentManager(root, config, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot });
     const before = actors(first);
-    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });
+    const actor = await before.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text",
+      ...(delivery ? { delivery, triggerTurn: false } : {}) });
     await mesh.publish({ topic: "team.pulls", from: { id: "peer", name: "peer", kind: "actor" }, text: "LIVE_WITH_PROGRESS interrupted" });
     await vi.waitFor(() => expect(before.status(actor.id).status).toBe("running"), { timeout: 10_000, interval: 20 });
     const id = fs.readdirSync(runRoot).find(name => /^[a-f0-9]{32}$/.test(name))!;
@@ -315,6 +317,43 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed actor runs (sma
       await new Promise(resolve => setTimeout(resolve, 200));
       expect(outputs()).toHaveLength(1);
       expect(relaunched).not.toHaveBeenCalled();
+    } finally {
+      await owner.close();
+      await next.close();
+    }
+  }, 90_000);
+
+  // pi-fabric#912 round 6: a registry save during the awaited publish may persist the message record before onDeliver.
+  it("crash after the message record is saved, before onDeliver: the restart hands the answer to the host once", async () => {
+    const { actor, id, actorRoot, actors, second, restart, mesh } = await interruptedRun("followUp"); // a host hand-off actor
+    const queueFile = path.join(actorRoot, actor.id, fs.readdirSync(path.join(actorRoot, actor.id)).find(name => /^queue-[a-f0-9]{16}\.json$/.test(name))!);
+    const beforeAck = fs.readFileSync(queueFile, "utf8");
+    const outputs = () => mesh.read({ after: 0, limit: 1_000 })
+      .filter(event => event.topic === "fabric.actor.output" && event.from.id === actor.id && event.text === "SAVED_ANSWER");
+    vi.spyOn(second, "commitEnodevRecovery").mockReturnValue(false);
+    const lost = vi.fn(); // the crash point: this process dies before its hand-off reaches the host
+    const first = actors(second, undefined, {}, lost);
+    try {
+      await vi.waitFor(() => expect(outputs()).toHaveLength(1), { timeout: 15_000, interval: 20 });
+      expect(lost).toHaveBeenCalledTimes(1); // the first process called it; its effect is what the crash loses
+    }
+    finally { await first.close(); await second.close(); } // close saves the registry: the message record persists
+    fs.writeFileSync(queueFile, beforeAck); // the queue ack never reached the disk
+    const next = restart();
+    const relaunched = vi.spyOn(next, "spawn").mockRejectedValue(new Error("launched a rerun"));
+    const delivered = vi.fn();
+    const owner = actors(next, undefined, {}, delivered);
+    try {
+      await vi.waitFor(() => expect(delivered).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(delivered).toHaveBeenCalledTimes(1);
+      expect(delivered.mock.calls[0]![0]).toMatchObject({ message: { text: "SAVED_ANSWER" } });
+      expect(outputs()).toHaveLength(1);
+      const records = owner.messages(actor.id).filter(message => message.text === "SAVED_ANSWER");
+      expect(records).toHaveLength(1);
+      expect(records[0]!.id).toBe(delivered.mock.calls[0]![0].message.id);
+      expect(relaunched).not.toHaveBeenCalled();
+      expect(id).toMatch(/^[a-f0-9]{32}$/);
     } finally {
       await owner.close();
       await next.close();

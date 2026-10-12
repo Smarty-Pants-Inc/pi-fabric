@@ -3711,8 +3711,9 @@ export class ActorManager {
               ...(message.data !== undefined ? { data: message.data } : {}),
             })
             .catch(() => undefined);
+          // pi-fabric#912 round 6: a replay still hands the answer to the host. The mesh event stays exactly once
+          // (dedupeKey); the host hand-off is at least once, never lost (a save may persist the record before this).
           if (
-            !replayed &&
             (message.action === "message" || message.action === "stop") &&
             message.text &&
             actor.delivery !== "mailbox"

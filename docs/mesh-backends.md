@@ -29,6 +29,10 @@ replays the stream. The factory then returns that prepared backend.
 - **Refusals:** a server older than 2.11; a server whose `sync_always` is not proven true, unless the host passes
 `acceptPeriodicSync`; a retired stream; writes while the stream is importing; a `fresh` read while the projector lags
 (busy, retryable); and a stream message that could not have passed the CAS (the backend fails closed).
+- **Bridges (interim):** on `nats` the R20 state write fence excludes no other writer, so a bridge's held-event
+ownership check (security F2) cannot hold. A root where a bridge holds events (a mirrored remote host record) refuses
+`nats`, and a bridge refuses a `nats` store (`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED`). This lasts until the event log
+moves onto the state stream (smarty-dev#717) or a lease fences the append.
 - **Lifecycle:** `import-begin` (ready, newer epoch) -> importing; `import-commit` (importing, same epoch) -> ready;
 `retire` (ready or importing, newer epoch) -> retired, terminal. Any other control record, or a batch after `retire`, is a
 protocol violation: the projector fails closed.
@@ -142,7 +146,10 @@ the marker is removed. The new parts are a `nats` value for `MeshBackendFlag` an
    refuse. The migrator projects the stream and checks the digest against the source snapshot
    (as the `import-verify` step). It then re-reads the source and compares it with G0, as
    cutover does today.
-3. **Commit.** Install the moved marker (`backend: "nats"`, epoch E+1) over `state.json`. Then
+3. **Commit.** Install the NATS moved marker (epoch E+1) over `state.json`. It is the SQLite
+   marker's exact shape plus `natsStream`, so every release since pi-fabric#627 (main c58cec72)
+   refuses it on its tolerant read as well (a new `format` would read as damage there, so as an
+   EMPTY mesh). Releases before c58cec72 know no marker, the same gap the SQLite cutover accepts. Then
    publish `import-commit{E+1}` with the expected last sequence. Then set the local flag to
    `nats`. Every crash point reruns from the stream head plus the marker, as the `importing`
    rerun does now.

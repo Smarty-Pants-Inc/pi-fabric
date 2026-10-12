@@ -18,7 +18,7 @@ import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/a
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -322,6 +322,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
+  /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
+  ownProcess?: OwnedProcess;
   id: string;
   name: string;
   task: string;
@@ -423,6 +425,8 @@ interface QueuedAgent {
   cleanupPending?: string;
   /** smarty-dev#9855: the admission permit an unknown-outcome launch holds until it is proven gone (once-only). */
   heldPermit?: () => void;
+  /** pi-fabric#939: the pid the launch obligation reported to this manager, with its birth when readable. */
+  ownProcess?: OwnedProcess;
   info: AgentHandleInfo;
   task: string;
   enqueuedAt: number;
@@ -1098,6 +1102,8 @@ export class AgentManager {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
+    // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
+    this.#checkHeldPermits();
     const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
@@ -1532,6 +1538,8 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
+          ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
           ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
@@ -1633,6 +1641,8 @@ export class AgentManager {
           }
           queued.cleanupPending = obligation.message;
           queued.heldPermit ??= once(release);
+          const owned = obligation.transport === "process" ? ownedProcess(obligation.sessionId) : undefined;
+          if (owned) queued.ownProcess ??= owned;
           queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
           try {
             markUnresolvedWorker(runDirectory, obligation.message, {
@@ -1761,7 +1771,7 @@ export class AgentManager {
     let released = 0;
     for (const queued of this.#queued.values()) {
       if (!queued.heldPermit) continue;
-      const settled = settleGoneEnodevLaunch(path.join(this.#runRoot, queued.info.id));
+      const settled = settleGoneEnodevLaunch(path.join(this.#runRoot, queued.info.id), queued.ownProcess);
       if (!settled) continue;
       const permit = queued.heldPermit;
       delete queued.heldPermit;
@@ -1779,7 +1789,7 @@ export class AgentManager {
     }
     for (const managed of this.#runs.values()) {
       if (!managed.heldPermit || !managed.settled) continue;
-      if (!settleGoneEnodevLaunch(managed.runDirectory)) continue;
+      if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
       const permit = managed.heldPermit;
       delete managed.heldPermit;
       delete managed.lostContact;

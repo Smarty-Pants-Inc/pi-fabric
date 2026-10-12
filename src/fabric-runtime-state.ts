@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -1025,9 +1025,14 @@ export class FabricRuntimeState {
       onAdmissionAlarm: (alarm) => {
         if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
         const mesh = this.#mesh, from = this.#identity;
-        const owner = process.env.PI_FABRIC_OWNER_IDENTITY_ID?.trim() || undefined;
+        // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
+        const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
+        if (!to) {
+          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          return;
+        }
         void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: "fabric.alarm.agent-admission", kind: "agent-admission-held",
-          from, ...(owner ? { to: owner } : {}), text: alarm.message, data: { ...alarm } })).catch(() => undefined);
+          from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },

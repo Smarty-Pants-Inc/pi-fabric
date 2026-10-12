@@ -129,7 +129,31 @@ const settle = (directory: string, run: EnodevRun, terminal: Record<string, unkn
  * (it holds its admission permit). Settles it: a terminal record that has one keeps it; otherwise completed with the
  * saved answer, else failed lost. Marker removed last. Undefined keeps the veto (and the caller keeps the permit).
  */
-export const settleGoneEnodevLaunch = (directory: string): AgentRunResult | undefined => {
+/** What the MANAGER recorded about a launched worker (never the worker-writable status file): pid and /proc birth. */
+export interface OwnedProcess { pid: number; started?: string }
+
+/** The manager's own record of `pid` now: its start time when it can be read (Linux /proc), for pid-reuse checks. */
+export const ownedProcess = (sessionId: unknown): OwnedProcess | undefined => {
+  const pid = Number(sessionId);
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return undefined;
+  const started = processStartTime(pid);
+  return { pid, ...(started !== undefined ? { started } : {}) };
+};
+
+/**
+ * pi-fabric#939 round 1: proven gone from the manager's OWN record only. The recorded pid is not alive, or it is
+ * alive with a different start time (reused). A live pid with no recorded birth is not proven gone.
+ */
+export const ownedProcessGone = (owned: OwnedProcess): boolean => {
+  if (!processAlive(owned.pid)) return true;
+  const current = processStartTime(owned.pid);
+  return owned.started !== undefined && current !== undefined && current !== owned.started;
+};
+
+export const settleGoneEnodevLaunch = (directory: string, owned: OwnedProcess | undefined): AgentRunResult | undefined => {
+  // Worker-writable files (status.json, the marker) only select WHAT to write; whether the worker is gone comes
+  // from the manager's own pid record. No own record: never proven gone, the permit stays.
+  if (!owned || !ownedProcessGone(owned)) return undefined;
   const id = path.basename(directory);
   const markerFile = path.join(directory, UNRESOLVED_WORKER_FILE);
   const marker = readJson(markerFile);
@@ -141,7 +165,7 @@ export const settleGoneEnodevLaunch = (directory: string): AgentRunResult | unde
   }
   if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
   const record = readJson(statusFile);
-  if (!record || record.id !== id || record.transport !== "process" || !enodevWorkerGone(record)) return undefined;
+  if (!record || record.id !== id || record.transport !== "process") return undefined;
   const settlement = readJson(path.join(directory, "settlement.json"));
   const text = settlement?.version === 1 && settlement.runId === id && settlement.outcome === "completed" &&
     typeof settlement.text === "string" ? settlement.text : undefined;

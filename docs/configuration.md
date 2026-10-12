@@ -214,6 +214,8 @@ effective timeout = min(
 
 where absent values do not participate, and time spent inside a `humanWaitRefs` call is not counted. Outside interactive Main, orchestration programs (`agents.run` / `agents.wait` / `agents.ask`, `workflow.agent`, ...) keep their separate `agents.timeoutMs` floor, which is unaffected by `executor.maxTimeoutMs`. In interactive Main, the fixed `executor.mainMaxTimeoutMs` ceiling takes precedence over every source above; repeated host calls cannot extend it.
 
+`executor.powershell` (default `"refuse"`) gates PowerShell (smarty-dev#9826). By default `pi.powershell` is **refused**, and so is every captured or extension `powershell` override, whether it is reached through `pi.powershell` or `extensions.powershell`. The refusal names smarty-dev#9826 and happens before any `tool_call` hook or execution. The reason: no Fabric guard judges PowerShell grammar, and the fleet's command guards are bash-only. Showing them PowerShell source as a bash call is not a safety mechanism, because PowerShell-only spellings (for example `Set-Location <dir>; …`, the `&` call operator or `-EncodedCommand`) do not parse the way a bash guard reads them. Set `"powershell": "allow"` under `executor` in the host profile's `PI_CODING_AGENT_DIR/fabric.json` to opt in. The key is **host-only**: a workspace `.pi/fabric.json` cannot set or withdraw it. **The opt-in accepts that grammar gap.** With it, each call is first shown to guards as a `bash` `tool_call` (`input.shell: "powershell"`, a non-session `cwd` as a leading `cd`), then as the `powershell`-named `tool_call`. A block from either refuses the call. A hook that rewrites either input also refuses it, so the command runs only exactly as judged. Any other value refuses. Pi's own model-facing `powershell` tool, used outside full code mode, is not gated by this key.
+
 ## Full reference
 
 ```json
@@ -231,6 +233,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "hostCallTimeouts": {},
     "humanWaitRefs": ["extensions.ask"],
     "shellHangMs": 120000,
+    "powershell": "refuse",
     "memoryLimitBytes": 67108864,
     "maxOutputChars": 100000,
     "maxNestedResultChars": 2000000,

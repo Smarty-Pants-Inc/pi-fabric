@@ -350,7 +350,7 @@ describe("tasks provider", () => {
   it("rejects a ninth monitor before spawning another shell", async () => {
     const { store } = setup();
     for (let i = 0; i < 8; i++) store.begin("bash", "existing watch", { monitor: { delivery: "ui", intervalMs: 1000, timeoutMs: 300000 } });
-    const native = new PiToolsProvider(process.cwd(), undefined, undefined, { shellJobs: store, powerShellToolDefinitionFactory: undefined });
+    const native = new PiToolsProvider(process.cwd(), undefined, undefined, { allowUnhookedTools: true, shellJobs: store, powerShellToolDefinitionFactory: undefined });
     await expect(native.invoke("bash", { command: "echo forbidden", monitor: { delivery: "wake" } }, context)).rejects.toThrow("At most 8 monitors");
     expect(store.list()).toHaveLength(8);
   });

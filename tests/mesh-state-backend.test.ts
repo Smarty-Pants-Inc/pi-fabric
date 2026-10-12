@@ -275,13 +275,13 @@ describe.each(["file", "sqlite", "nats"] as const)("R11 callbacks on the %s back
 describe("nats refuses a bridge: the interim R20 fence decision (smarty-dev#7504, #717)", () => {
   it("a root where a bridge holds events refuses nats with the named error; a root without a bridge opens", async () => {
     const bridged = tempRoot("nats-bridged");
-    const backend = await openNatsStateBackend({ root: bridged, port: fakeJetStream().port(), stream: "B" });
+    const backend = await openNatsStateBackend({ root: bridged, port: fakeJetStream().port() });
     await backend.put({ key: "topology/hosts/remote-1", value: { format: 1, id: "remote-1", remoteHost: "peer-a" }, identity });
     expect(() => open(bridged, { stateBackend: "nats" })).toThrow(MeshStateNatsBridgeRefusedError);
     expect(() => open(bridged, { stateBackend: "nats" })).toThrow(/FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: .*topology\/hosts\/remote-1 is mirrored from peer-a.*smarty-dev#717/);
 
     const plain = tempRoot("nats-plain");
-    const local = await openNatsStateBackend({ root: plain, port: fakeJetStream().port(), stream: "P" });
+    const local = await openNatsStateBackend({ root: plain, port: fakeJetStream().port() });
     await local.put({ key: "topology/hosts/local-1", value: { format: 1, id: "local-1" }, identity });
     const store = open(plain, { stateBackend: "nats" });
     expect(store.stateBackend).toBe("nats");

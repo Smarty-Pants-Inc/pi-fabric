@@ -8,7 +8,7 @@ import { importMeshState } from "../src/mesh/backend-migration.js";
 import { MeshStateBusyError } from "../src/mesh/state-backend.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { closeNatsStateBackend } from "../src/mesh/state-backend-nats.js";
-import { itFor, natsMonitorUrl, natsServerUrl, natsTestStream, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
+import { itFor, natsMonitorUrl, natsServerUrl, prepareNatsRoot, reportNatsSkip } from "./helpers/nats-state-server.js";
 
 // Four processes write one sqlite-backed (or, on a real nats-server, one NATS-backed: smarty-dev#7504) mesh root
 // concurrently (smarty-dev#6477 L2a). Each child
@@ -19,7 +19,7 @@ import { createJiti } from "jiti";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-const [root, countText, kind, stream] = process.argv.slice(1);
+const [root, countText, kind] = process.argv.slice(1);
 const count = Number(countText);
 let lockAttempts = 0;
 const isLock = (target) => path.basename(String(target)).startsWith(".lock") && path.dirname(path.resolve(String(target))) === path.resolve(root);
@@ -31,7 +31,7 @@ const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
 const { MeshStore } = await jiti.import("./src/mesh/store.ts");
 if (kind === "nats") {
   const { openNatsStateBackend } = await jiti.import("./src/mesh/state-backend-nats.ts");
-  await openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL, stream });
+  await openNatsStateBackend({ root, servers: [process.env.NATS_SERVER_URL], monitoringUrl: process.env.NATS_MONITOR_URL });
 }
 const store = new MeshStore(root, 64 * 1024, 1000, { stateBackend: kind });
 if (store.stateBackend !== kind) throw new Error("not " + kind + ": " + JSON.stringify(store.stateDiagnostics()));
@@ -56,8 +56,8 @@ interface ChildResult { code: number | null; stdout: string; stderr: string }
 // node:sqlite prints "ExperimentalWarning: SQLite is an experimental feature" on Node 22 (CI's
 // runner Node); production does not suppress it, so only these test children silence that one
 // warning class. Every other stderr byte still fails the assertion below.
-const runChild = (root: string, count: number, kind: "sqlite" | "nats" = "sqlite", stream = ""): Promise<ChildResult> => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", CHILD, root, String(count), kind, stream],
+const runChild = (root: string, count: number, kind: "sqlite" | "nats" = "sqlite"): Promise<ChildResult> => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", CHILD, root, String(count), kind],
     { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_FABRIC_MESH_STATE_BACKEND: "",
       ...(natsServerUrl ? { NATS_SERVER_URL: natsServerUrl } : {}), ...(natsMonitorUrl ? { NATS_MONITOR_URL: natsMonitorUrl } : {}) } });
   let stdout = "";
@@ -77,15 +77,14 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-state-backend-mp-"));
     roots.push(root);
     // sqlite mode opens only an imported root (smarty-dev#6477): the harness imports the fresh root first.
-    // nats: every process prepares the root on one fresh stream of the real server.
-    const stream = kind === "nats" ? natsTestStream() : "";
+    // nats: every process prepares the root; its stream is derived from the fresh root (pi-fabric#937).
     if (kind === "sqlite") await importMeshState(root);
     const seen: string[] = [];
     const watcher = fs.watch(root, (_event, name) => { if (name) seen.push(String(name)); });
     const count = 40;
     let results: ChildResult[];
     try {
-      results = await Promise.all(Array.from({ length: 4 }, () => runChild(root, count, kind, stream)));
+      results = await Promise.all(Array.from({ length: 4 }, () => runChild(root, count, kind)));
       await new Promise(resolve => setTimeout(resolve, 50));
     } finally { watcher.close(); }
     for (const result of results) {
@@ -98,7 +97,7 @@ describe.each(["sqlite", "nats"] as const)("%s state backend across processes", 
     if (kind === "sqlite") expect(JSON.parse(fs.readFileSync(path.join(root, "state.json"), "utf8"))).toMatchObject({ format: "sqlite", movedTo: "state.db", epoch: 1 });
     else expect(fs.readdirSync(root).filter(name => name.startsWith("state"))).toEqual([]);
     // nats: a fresh process view replays the stream from the server.
-    if (kind === "nats") await prepareNatsRoot(root, { stream });
+    if (kind === "nats") await prepareNatsRoot(root);
     const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: kind });
     try {
       expect(store.get("counter")?.value).toBe(4 * count);

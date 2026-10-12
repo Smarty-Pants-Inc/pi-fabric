@@ -30,6 +30,7 @@ const setup = (options: {
   maxSessionBytes?: number;
   canManageActor?: (id: string) => boolean | undefined;
   resolvePiModel?: (model: string) => string | Promise<string>;
+  preparationTimeoutMs?: number;
 } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-reset-"));
   roots.push(root);
@@ -51,6 +52,7 @@ const setup = (options: {
     ...(options.maxSessionBytes !== undefined ? { maxSessionBytes: options.maxSessionBytes } : {}),
     ...(options.canManageActor ? { canManageActor: options.canManageActor } : {}),
     ...(options.resolvePiModel ? { resolvePiModel: options.resolvePiModel } : {}),
+    ...(options.preparationTimeoutMs !== undefined ? { preparationTimeoutMs: options.preparationTimeoutMs } : {}),
   });
   managers.push(actors, agents);
   // The fake worker appends each run's turns to its --session file, as Pi does: a run's
@@ -536,6 +538,94 @@ describe("actor session reset (smarty-dev#1439)", () => {
       expect(actors.status(actor.id)).not.toHaveProperty("activationBlocked");
       await waitFor(() => presence(mesh, actor.id)?.status === "idle");
       expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlocked");
+    });
+
+    // review P1: the deferred reset's registry save commits the cleared block, then its presence
+    // preparation times out. The rollback must restore the exact hard block and streak, durably and
+    // on the router, and must not turn the timeout into an expiring transient block.
+    it("a deferred reset whose presence preparation times out keeps the exact hard block and streak", async () => {
+      const deadline = 987_654; // a distinctive preparation deadline; its timer is captured and fired, never waited for
+      const { actors, agents, mesh, root, runs } = setup({ preparationTimeoutMs: deadline });
+      const actor = await actors.create({ name: "reset-timeout", instructions: "Work." });
+      await block(actors, agents, actor.id);
+      expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard" } });
+      const record = () => (JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as
+        { actors: Array<Record<string, unknown>> }).actors.find((row) => row.id === actor.id);
+      const blocks: Array<Record<string, unknown>> = [];
+      const unsubscribe = actors.subscribe(() => {
+        const blocked = actors.status(actor.id).activationBlocked;
+        if (blocked && blocks.at(-1)?.count !== blocked.count) blocks.push(structuredClone(blocked) as Record<string, unknown>);
+      });
+      // Capture each preparation deadline timer; mark it settled when the manager clears it.
+      const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+      const deadlines: Array<{ timer: unknown; fire: () => void; cleared: boolean }> = [];
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number, ...args: unknown[]) => {
+        const timer = realSetTimeout(callback, ms, ...args);
+        if (ms === deadline) deadlines.push({ timer, fire: callback, cleared: false });
+        return timer;
+      }) as typeof setTimeout);
+      vi.spyOn(globalThis, "clearTimeout").mockImplementation(((timer?: Parameters<typeof clearTimeout>[0]) => {
+        const entry = deadlines.find((candidate) => candidate.timer === timer);
+        if (entry) entry.cleared = true;
+        realClearTimeout(timer);
+      }) as typeof clearTimeout);
+      // Gate the presence write that would publish the cleared (unblocked) state.
+      const key = `actors/test/${actor.id}`;
+      const put = mesh.put.bind(mesh);
+      let gated = false, lateLanded = false, putsAfterLate = 0;
+      let releasePresence!: () => void;
+      const presenceGate = new Promise<void>((resolve) => { releasePresence = resolve; });
+      vi.spyOn(mesh, "put").mockImplementation(async (request) => {
+        const value = request.value as Record<string, unknown> | undefined;
+        if (request.key === key && lateLanded) putsAfterLate++;
+        if (request.key === key && !gated && value && !value.activationBlocked) {
+          gated = true;
+          await presenceGate;
+          const result = await put(request);
+          lateLanded = true;
+          return result;
+        }
+        return put(request);
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      vi.mocked(agents.run).mockImplementationOnce(async () => { entered = true; await gate; throw new Error(AUTH); });
+      try {
+        const failing = actors.ask(actor.id, "held failure").catch((error: Error) => error);
+        await waitFor(() => entered);
+        const reset = actors.resetSession(actor.id).catch((error: Error) => error);
+        release();
+        expect(await failing).toBeInstanceOf(Error);
+        // The registry save has committed; presence preparation is waiting on the gated write.
+        await waitFor(() => gated && deadlines.some((entry) => !entry.cleared));
+        const pending = deadlines.filter((entry) => !entry.cleared);
+        expect(pending).toHaveLength(1);
+        realClearTimeout(pending[0]!.timer as NodeJS.Timeout);
+        pending[0]!.fire();
+        expect(await reset).toMatchObject({ code: "FABRIC_ACTOR_PREPARATION_TIMEOUT" });
+        const hard = blocks.find((entry) => entry.count === 4);
+        expect(hard).toMatchObject({ code: "auth", class: "hard" });
+        expect(hard).not.toHaveProperty("retryAt");
+        // In memory: the exact hard block, still failed.
+        expect(actors.status(actor.id)).toMatchObject({ status: "failed", activationBlocked: hard });
+        expect(actors.status(actor.id).activationBlocked).toEqual(hard);
+        // Durable registry: the exact block and streak replace the committed cleared state.
+        await waitFor(() => JSON.stringify(record()?.activationBlocked) === JSON.stringify(hard));
+        expect(record()).toMatchObject({ activationBlocked: hard, failureStreak: { count: 4, notified: true } });
+        // The late write of the cleared state lands, and a newer write publishes the hard block over it.
+        releasePresence();
+        await waitFor(() => lateLanded && putsAfterLate > 0 && presence(mesh, actor.id)?.status === "failed");
+        expect(presence(mesh, actor.id)).toMatchObject({ status: "failed", activationBlocked: hard });
+        expect(presence(mesh, actor.id)).not.toHaveProperty("activationBlockExpired");
+        expect((presence(mesh, actor.id)!.activationBlocked as Record<string, unknown>).retryAt).toBeUndefined();
+      } finally { release(); releasePresence(); unsubscribe(); }
+      // The next explicit reset still repairs it, and the next item runs.
+      await expect(actors.resetSession(actor.id)).resolves.toMatchObject({ status: "idle" });
+      await waitFor(() => presence(mesh, actor.id)?.status === "idle");
+      const before = runs.length;
+      await expect(actors.ask(actor.id, "next item")).resolves.toMatchObject({ direction: "out" });
+      expect(runs.length - before).toBe(1);
     });
 
     it("a failed reset keeps the hard block", async () => {

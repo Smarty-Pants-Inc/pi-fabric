@@ -21,7 +21,7 @@ import { saveWorkerCompletion } from "./agents/completion-journal.js";
 import { taskAgentEnvironment } from "./agents/task-environment.js";
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
-import { executionGroup } from "./worker/execution-group.js";
+import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
@@ -773,6 +773,7 @@ const main = async (): Promise<void> => {
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
       observe(): void {},
+      members: (): number[] => [],
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
         if (execution.exitCode === null && execution.signalCode === null) execution.kill(signal);
@@ -780,7 +781,8 @@ const main = async (): Promise<void> => {
     } : executionGroup(execution);
     executionGroups.set(execution, group);
     execution.once("close", () => { nativeClosed = true; });
-    const groupObserver = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, 100);
+    // Background adoption only; signal()/exited() re-read members on demand.
+    const groupObserver = observeExecutionGroup(group);
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
       const exited = () => nativeClosed && group.exited();

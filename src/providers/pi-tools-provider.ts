@@ -27,6 +27,7 @@ import {
   isPiShellToolName,
   PI_CORE_TOOL_NAMES,
   type PiCoreToolName,
+  type PiShellToolName,
 } from "../core/pi-tools.js";
 import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import {
@@ -51,6 +52,8 @@ import type {
 } from "../protocol.js";
 import { countContentLines } from "../ui/preview-lines.js";
 import { CapturedToolsProvider } from "./captured-tools-provider.js";
+import { assertShellToolPermitted, preflightShellCall } from "./shell-preflight.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import { normalizePiArguments } from "../core/pi-arguments.js";
 import { validationMessage } from "../core/action-arguments.js";
 import {
@@ -132,7 +135,15 @@ const MAX_REPLACE_ALL_FILE_CHARS = 2_000_000;
 
 interface PiToolsProviderHostCapabilities {
   requireCapturedOverrides?: boolean;
+  /**
+   * Test-only: let mutating pi.* calls run with no extension runner, so no
+   * tool_call hook (a guard extension) can see them. Production config never
+   * sets it; without it such a call fails closed (smarty-dev#8606).
+   */
+  allowUnhookedTools?: boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
+  /** Live executor.powershell; absent means pi.powershell is refused (smarty-dev#9826). */
+  getPowerShellPolicy?: (() => FabricPowerShellPolicy) | undefined;
   getShellHangMs?: () => number;
   getLandlockSettings?: (() => LandlockSettings) | undefined;
   shellJobs?: FabricShellJobStore;
@@ -202,6 +213,7 @@ const writeTools = new Set<PiCoreToolName>(["edit", "write"]);
 
 // The content array every pi core tool returns: text and/or image blocks.
 type ToolContent = AgentToolResult<unknown>["content"];
+
 
 const riskForTool = (name: PiCoreToolName): FabricRisk => {
   if (readTools.has(name)) return "read";
@@ -279,12 +291,14 @@ export class PiToolsProvider implements FabricProvider {
   readonly #capturedTools: CapturedToolsProvider | undefined;
   readonly #cwd: string;
   readonly #requireCapturedOverrides: boolean;
+  readonly #allowUnhookedTools: boolean;
   readonly #bashDefinitions = new BashCwdDefinitions();
   readonly #powershellDefinitions: PowerShellCwdDefinitions | undefined;
   readonly #shellJobs: FabricShellJobStore;
   readonly #ownsShellJobs: boolean;
   readonly #getShellHangMs: (() => number) | undefined;
   readonly #getLandlockSettings: (() => LandlockSettings) | undefined;
+  readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
   #landlock: LandlockBashConfinement | undefined;
 
   constructor(
@@ -295,6 +309,7 @@ export class PiToolsProvider implements FabricProvider {
   ) {
     this.#cwd = cwd;
     this.#requireCapturedOverrides = hostCapabilities.requireCapturedOverrides === true;
+    this.#allowUnhookedTools = hostCapabilities.allowUnhookedTools === true;
     const powerShellFactory = hostCapabilities.powerShellToolDefinitionFactory;
     this.#powershellDefinitions = powerShellFactory
       ? new PowerShellCwdDefinitions(powerShellFactory)
@@ -315,6 +330,7 @@ export class PiToolsProvider implements FabricProvider {
     this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
     this.#getLandlockSettings = hostCapabilities.getLandlockSettings;
+    this.#getPowerShellPolicy = hostCapabilities.getPowerShellPolicy;
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -683,17 +699,20 @@ export class PiToolsProvider implements FabricProvider {
       if (denial) throw new Error(denial);
     }
     if (!this.#requireCapturedOverrides && !this.#tools[name]) throw new Error(`Unknown Pi tool: ${actionName}`);
+    // smarty-dev#9826: PowerShell (built-in or a captured override) fails closed
+    // before any other path unless the profile opted in.
+    assertShellToolPermitted(name, this.#getPowerShellPolicy?.());
     // Pin the selected protection across awaited lifecycle hooks/catalog refreshes.
     const middleware = this.#bashMiddleware(name);
     const runner = this.#catalog?.runner;
-    // Gap B: a catalog is installed but its runner — and the tool_call
-    // preflight extensions rely on — is not yet available. This is the
-    // transient window before the first tool refresh populates the runner.
-    // Running a mutating tool here would silently skip that preflight, so fail
-    // closed for non-read tools and let the model retry once hooks are live.
-    // The no-catalog path (tests, embeds) has no extension system to guard and
-    // keeps the direct-execute fallback below unchanged.
-    if (this.#catalog && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
+    // smarty-dev#8606: a mutating call needs the tool_call preflight that guard
+    // extensions rely on. With no observed runner (no catalog, or a catalog
+    // whose runner was never captured or is not populated yet) nothing could
+    // refuse it, so fail closed instead of executing unhooked. A captured
+    // override replays the lifecycle on its own runner. Only the test-only
+    // allowUnhookedTools option keeps the direct execute.
+    const capturedOverride = this.#catalog?.get(name) !== undefined && !middleware;
+    if (!runner && !capturedOverride && !this.#allowUnhookedTools && riskForTool(name) !== "read") {
       throw new Error(
         `Pi tool ${name} is unavailable until extension tool hooks initialize; retry once tools are ready`,
       );
@@ -738,6 +757,8 @@ export class PiToolsProvider implements FabricProvider {
       if (isPiShellToolName(name) && args.notify !== undefined) throw new Error("notify requires durable:true");
       // `durable` is Fabric's own argument; an override never sees it.
       const { durable: _durable, ...overrideArgs } = args;
+      // CapturedToolsProvider runs every shell call through preflightShellCall,
+      // including the bash-guard view of an opted-in powershell override.
       const value = await this.#capturedTools!.invoke(name, overrideArgs, context);
       if (context.nativeToolResult) return value;
       const result = value as import("./captured-tools-provider.js").CapturedToolInvocationResult;
@@ -747,9 +768,8 @@ export class PiToolsProvider implements FabricProvider {
       return this.#normalizeResult(name, result, args, context);
     }
     const tool = this.#definitionFor(name, args);
-    // Without a runner (e.g. before the first tool refresh populated the
-    // catalog) fall back to a direct execute — no extension hooks fire, but
-    // the call still works. Once tools are refreshed the runner is available.
+    // No runner: only read-risk tools, or a test that set allowUnhookedTools,
+    // reach this direct execute; no extension hooks fire here.
     if (!runner) {
       const result = await this.#runExecute(
         name,
@@ -774,22 +794,54 @@ export class PiToolsProvider implements FabricProvider {
   // Emit the tool_call preflight for a nested pi.* call and enforce a block.
   // Shared by #invokeWithEvents and the git-worktree-add intercept so both obey
   // the same extension policy through one code path (no duplicated enforcement).
+  // Every shell call (bash, powershell) is judged by preflightShellCall, the
+  // single helper the captured-override path uses too (smarty-dev#8606): the
+  // hook sees a copy, a non-session cwd is shown as the leading cd it judged,
+  // and any hook change to the judged call refuses it.
   async #emitToolCallPreflight(
     name: PiCoreToolName,
     args: Record<string, unknown>,
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
+    const input = isPiShellToolName(name)
+      ? await preflightShellCall({
+          name,
+          args,
+          sessionCwd: this.#cwd,
+          toolCallId: context.nestedToolCallId,
+          runner,
+          signal: context.signal,
+          onBlock: () => context.updateArguments?.(args),
+          powershell: this.#getPowerShellPolicy?.(),
+        })
+      : await this.#emitGenericToolCall(name, args, context, runner);
+    // Carry the result back onto the caller's args: a non-shell hook's rewrites,
+    // or for pi.bash only Fabric's own run defaults (a shell rewrite is refused).
+    for (const key of Object.keys(args)) if (!Object.hasOwn(input, key)) delete args[key];
+    Object.assign(args, input);
+    context.updateArguments?.(args);
+  }
+
+  // A non-shell tool's hook sees a copy; its rewrites are carried back.
+  async #emitGenericToolCall(
+    name: PiCoreToolName,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    runner: ExtensionRunner,
+  ): Promise<Record<string, unknown>> {
+    const input: Record<string, unknown> = { ...args };
     const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
       type: "tool_call",
       toolName: name,
       toolCallId: context.nestedToolCallId,
-      input: args,
+      input,
     }));
-    context.updateArguments?.(args);
     if (preflight?.block) {
+      context.updateArguments?.(args);
       throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
     }
+    return input;
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so

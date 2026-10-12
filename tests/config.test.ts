@@ -174,6 +174,31 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
   }
 });
 
+describe("executor.powershell opt-in (smarty-dev#9826)", () => {
+  it("defaults to refuse and accepts only the exact allow", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({}).executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({ executor: { powershell: "allow" } }).executor.powershell).toBe("allow");
+    for (const value of ["refuse", "Allow", "ALLOW", true, 1, "yes", null, {}]) {
+      expect(normalizeFabricConfig({ executor: { powershell: value } }).executor.powershell).toBe("refuse");
+    }
+  });
+  it("honors the host profile opt-in and ignores a project opt-in", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+    expect(loadGlobalFabricConfig(agentDir).executor.powershell).toBe("allow");
+    // A project layer cannot withdraw it either: the key is host-only.
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "refuse" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+  });
+});
+
 describe("Fabric configuration", () => {
   it("golden: no files preserve main's built-in executor.landlock default across all loaders", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();

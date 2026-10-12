@@ -23,7 +23,7 @@ it("keeps Landlock out of import/registration/idle/off calls, then loads at firs
   const settings = loadFabricConfig({ cwd, agentDir, projectTrusted: true }).executor.landlock;
   expect(settings).toEqual(DEFAULT_FABRIC_CONFIG.executor.landlock);
   expect(settings).toEqual({ mode: "off", disabled: false });
-  const provider = new PiToolsProvider(cwd, undefined, undefined, {
+  const provider = new PiToolsProvider(cwd, undefined, undefined, { allowUnhookedTools: true,
     powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
     getLandlockSettings: () => liveLandlockSettings(settings, agentDir),
   });

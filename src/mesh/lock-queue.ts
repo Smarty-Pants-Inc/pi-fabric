@@ -19,6 +19,18 @@ const GATED_BUDGET_MS = 2000;
 // The head refreshes its receipt this often; the stall bound is at least four heartbeats.
 const HEARTBEAT_MS = 50;
 
+/** Whether any waiter's receipt is queued in `directory` (one readdir; an absent directory has none). A newcomer that
+ * finds one queues behind it instead of barging (smarty-dev#9805). */
+export const meshLockQueueBusy = (directory: string): boolean => {
+  // Fail open (pi-fabric#936 round 3): any stat or listing error (EACCES on a directory another user planted, EIO)
+  // means "nobody queued", the pre-#9805 contest, never a failed write. No throw on the common path either: a root
+  // that never queued has no directory, and an ENOENT exception per write costs more than the stat.
+  try {
+    if (!fs.statSync(directory, { throwIfNoEntry: false })) return false;
+    return fs.readdirSync(directory).some(name => TICKET.test(name));
+  } catch { return false; }
+};
+
 const pidAlive = (name: string): boolean => {
   try { process.kill(Number(name.split("-")[1]), 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
@@ -221,8 +233,9 @@ export class MeshLockTicket {
     this.#predecessorWatcher = this.#rootWatcher = undefined;
     this.#wake = undefined;
     if (this.#closed) return;
-    fs.rmSync(this.#file, { force: true });
     this.#closed = true;
+    // Never throws (pi-fabric#936 round 3): a writer's cleanup must always finish; an unremovable receipt goes stale.
+    try { fs.rmSync(this.#file, { force: true }); } catch { /* left to stale reaping */ }
     // Keep the empty directory OUTSIDE the mesh: removing/recreating it races enqueue.
   }
 }

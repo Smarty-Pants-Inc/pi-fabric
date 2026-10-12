@@ -8,6 +8,9 @@ import {
 import type { AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
@@ -18,6 +21,8 @@ import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 import { PrewalkController } from "../src/prewalk/controller.js";
+import { applyRunBashDefaults } from "../src/guards/actor-bash-timeout.js";
+import { SHELL_REWRITE_REFUSED } from "../src/providers/shell-preflight.js";
 
 const context = {
   cwd: process.cwd(),
@@ -410,6 +415,139 @@ describe("CapturedToolsProvider", () => {
     await expect(registry.invoke("pi.grep", { pattern: "CreateUser" }, context)).resolves.toBe(
       "fovea grep CreateUser",
     );
+  });
+
+  // CODE_REVIEW P1 on d2a0012b: the captured bash override path handed the
+  // tool_call hook the caller's args and read args.cwd afterwards, so a hook
+  // could move execution away from the cwd the guard judged.
+  it("refuses a tool_call hook that moves a captured bash override's cwd (#8606)", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-captured-cwd-")));
+    const session = path.join(root, "repo");
+    const linked = path.join(root, "linked");
+    fs.mkdirSync(session);
+    fs.mkdirSync(linked);
+    const runs: Array<{ command: unknown; cwd: unknown; timeout?: unknown }> = [];
+    const definition = defineTool({
+      name: "bash",
+      label: "bash (override)",
+      description: "Extension-owned bash override",
+      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()), timeout: Type.Optional(Type.Number()) }),
+      async execute(_id, params, _signal, _onUpdate, ctx) {
+        runs.push({ command: params.command, cwd: ctx.cwd, ...(params.timeout !== undefined ? { timeout: params.timeout } : {}) });
+        return { content: [{ type: "text" as const, text: `ran ${params.command}` }], details: {} };
+      },
+    });
+    const seen: Array<Record<string, unknown>> = [];
+    const run = async (args: Record<string, unknown>, hook: (input: Record<string, unknown>) => unknown, viaPi: boolean) => {
+      const runner = {
+        createContext: () => ({ cwd: session }),
+        getActiveTools: () => [],
+        emit: vi.fn(async () => {}),
+        emitToolCall: vi.fn(async (event: { input: Record<string, unknown> }) => {
+          seen.push({ ...event.input });
+          return hook(event.input);
+        }),
+        emitToolResult: vi.fn(async () => undefined),
+      } as unknown as ExtensionRunner;
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([{
+        definition,
+        sourceInfo: createSyntheticSourceInfo("/extensions/bash-override.ts", { source: "test" }),
+      }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const captured = new CapturedToolsProvider(catalog);
+      const invocation = { ...context, cwd: session, extensionContext: { cwd: session } as ExtensionContext };
+      return viaPi
+        ? new PiToolsProvider(session, catalog, captured).invoke("bash", args, invocation)
+        : captured.invoke("bash", args, invocation);
+    };
+    try {
+      // Both entry points: pi.bash delegating to the override, and extensions.bash directly.
+      for (const viaPi of [true, false]) {
+        runs.length = 0;
+        const RW = `Captured tool bash was blocked: ${SHELL_REWRITE_REFUSED}`;
+        // A hook that ADDS cwd to a call judged in the session cwd is refused.
+        await expect(run({ command: "printf ran > ran.txt" }, (input) => { input.cwd = linked; }, viaPi)).rejects.toThrow(RW);
+        // A hook that CHANGES cwd is refused, with or without a leading-cd preface.
+        await expect(run({ command: "printf ran > ran.txt", cwd: session }, (input) => { input.cwd = linked; }, viaPi)).rejects.toThrow(RW);
+        await expect(run({ command: "printf ran > ran.txt", cwd: linked }, (input) => { input.cwd = session; }, viaPi)).rejects.toThrow(RW);
+        // A hook that drops the leading cd it judged is refused.
+        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = "ls"; }, viaPi)).rejects.toThrow(RW);
+        // CODE_REVIEW P1 on 692c62a0: a command-only rewrite is refused, in the session cwd
+        // and behind the judged leading cd alike, as is a change to any other argument.
+        await expect(run({ command: "printf original" }, (input) => { input.command = "printf rewritten"; }, viaPi)).rejects.toThrow(RW);
+        await expect(run({ command: "ls", cwd: linked }, (input) => { input.command = `${String(input.command)} -la`; }, viaPi)).rejects.toThrow(RW);
+        expect(seen.at(-1)?.command).toBe(`cd '${linked}' && ls`);
+        await expect(run({ command: "ls" }, (input) => { input.timeout = 5; }, viaPi)).rejects.toThrow(RW);
+        expect(runs).toEqual([]);
+        // An unchanged call runs as judged, in its cwd.
+        await run({ command: "ls", cwd: linked }, () => undefined, viaPi);
+        expect(runs.at(-1)).toEqual({ command: "ls", cwd: linked });
+        // Fabric's own run defaults are not a hook rewrite: its hook hands them back, and
+        // they apply to the judged call after the guards (smarty-dev#2184/#6137 timeout cap).
+        await run({ command: "ls" }, (input) => { applyRunBashDefaults({ PI_FABRIC_BASH_IDLE_S: "0" }, input as never); }, viaPi);
+        expect(runs.at(-1)).toEqual({ command: "ls", cwd: session, timeout: 600 });
+        // A block still refuses before anything runs.
+        const before = runs.length;
+        await expect(run({ command: "git stash list" }, () => ({ block: true, reason: "guard refused git stash" }), viaPi))
+          .rejects.toThrow("guard refused git stash");
+        expect(runs.length).toBe(before);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // smarty-dev#9826: a bash-only guard is not a PowerShell safety mechanism, so
+  // an extension's powershell override fails closed unless the profile opts in.
+  it("refuses a captured powershell override by default and runs it through both preflights when opted in (#9826)", async () => {
+    const runs: unknown[] = [];
+    const definition = defineTool({
+      name: "powershell",
+      label: "powershell (override)",
+      description: "Extension-owned powershell override",
+      parameters: Type.Object({ command: Type.String(), cwd: Type.Optional(Type.String()) }),
+      async execute(_id, params) {
+        runs.push(params.command);
+        return { content: [{ type: "text" as const, text: `ran ${params.command}` }], details: {} };
+      },
+    });
+    const toolNames: string[] = [];
+    const runner = {
+      createContext: () => ({ cwd: process.cwd() }),
+      getActiveTools: () => [],
+      emit: vi.fn(async () => {}),
+      emitToolCall: vi.fn(async (event: { toolName: string }) => { toolNames.push(event.toolName); return undefined; }),
+      emitToolResult: vi.fn(async () => undefined),
+    } as unknown as ExtensionRunner;
+    const catalog = new CapturedToolCatalog();
+    catalog.replace([{
+      definition,
+      sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override.ts", { source: "test" }),
+    }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+    const args = { command: "Write-Output ok" };
+    for (const provider of [
+      new CapturedToolsProvider(catalog),
+      new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse" }),
+      // Main's discovery filter (bare-function form) keeps the default refusal.
+      new CapturedToolsProvider(catalog, () => false),
+    ]) {
+      await expect(provider.invoke("powershell", { ...args }, context)).rejects.toThrow("smarty-dev#9826");
+      // Through pi.powershell too: a provider without the opt-in refuses before delegating.
+      await expect(new PiToolsProvider(process.cwd(), catalog, provider).invoke("powershell", { ...args }, context))
+        .rejects.toThrow("smarty-dev#9826");
+    }
+    expect(runs).toEqual([]);
+    expect(toolNames).toEqual([]);
+    expect(runner.emit).not.toHaveBeenCalled();
+    // The runtime passes both options; the discovery filter does not touch the policy.
+    const hidden = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse", omitFromDiscovery: () => true });
+    expect(await hidden.list({}, context)).toEqual([]);
+    await expect(hidden.invoke("powershell", { ...args }, context)).rejects.toThrow("smarty-dev#9826");
+    const optedIn = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "allow", omitFromDiscovery: () => false });
+    const result = await optedIn.invoke("powershell", { ...args }, context) as { text: string };
+    expect(result.text).toBe("ran Write-Output ok");
+    expect(runs).toEqual(["Write-Output ok"]);
+    expect(toolNames).toEqual(["bash", "powershell"]);
   });
 
   it("releases scheduler barriers after an aborted non-cooperative tool", async () => {

@@ -106,6 +106,18 @@ describe("published build artifact guards", () => {
     fs.appendFileSync(path.join(dir, "dist/verified/generated/storage-kernel.js"), "\n// changed\n");
     rejected(dir, "Bundled verified artifact differs");
   });
+  // smarty-dev#8145: the lease probe trusts dist/ only when no other user can write any of it.
+  it.skipIf(process.platform !== "linux")("rejects a group- or other-writable dist/, or a symlink inside it", () => {
+    const dir = fixture();
+    fs.chmodSync(path.join(dir, "dist"), 0o775);
+    rejected(dir, "dist must be owned by uid");
+    fs.chmodSync(path.join(dir, "dist"), 0o755);
+    fs.chmodSync(path.join(dir, "dist/mesh/mesh-backend-cli.js"), 0o646);
+    rejected(dir, "dist/mesh/mesh-backend-cli.js must be owned by uid");
+    fs.chmodSync(path.join(dir, "dist/mesh/mesh-backend-cli.js"), 0o644);
+    fs.symlinkSync(os.tmpdir(), path.join(dir, "dist/native/elsewhere"));
+    rejected(dir, "dist/native/elsewhere must not be a symlink");
+  });
   // smarty-dev#8121: CI and release builds ship the helpers, so they must come from the pinned toolchain.
   it.runIf(process.platform === "linux")("rejects unpinned native helpers under CI or FABRIC_NATIVE_CC_PINNED=1, and only warns locally", () => {
     const dir = fixture();

@@ -123,7 +123,7 @@ describe("real worker durable process protocol", () => {
     fs.symlinkSync(path.resolve("node_modules"), path.join(fixture, "node_modules"), process.platform === "win32" ? "junction" : "dir");
     // Fork: the worker loads its hooks and lazy profile from sibling files (as in dist/).
     const siblings = ["worker/retry-profile", "worker/activation-window", "worker/principal-delivery", "worker/session-id",
-      "worker/reply-tool", "worker/task-entry", "worker/release-entry", "guards/actor-bash-hook", "guards/model-route-hook", "agents/write-guard"];
+      "worker/reply-tool", "worker/task-entry", "worker/release-entry", "guards/actor-bash-hook", "guards/model-route-hook", "guards/sender-headers", "agents/write-guard"];
     await build({
       entryPoints: Object.fromEntries([["worker", path.resolve("src/worker.ts")], ...siblings.map(entry => [entry, path.resolve(`src/${entry}.ts`)])]),
       outdir: fixture, bundle: true, platform: "node", format: "esm", packages: "external", logLevel: "silent",
@@ -135,6 +135,8 @@ describe("real worker durable process protocol", () => {
       process.stdout.write(JSON.stringify({type: 'launch_probe', execPath: process.execPath, argv: process.argv.slice(2), kernel: process.env.PI_FABRIC_KERNEL}) + '\\n');
       if (process.env.DURABLE_ROUTING_QUESTION === '1') {
         await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-rpc-question.mjs")).href)});
+      } else if (process.env.DURABLE_ROUTING_SENDER === '1') {
+        await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-sender.mjs")).href)});
       } else {
         await import(${JSON.stringify(pathToFileURL(path.resolve("tests/fixtures/fake-pi-model.mjs")).href)});
       }
@@ -197,6 +199,47 @@ describe("real worker durable process protocol", () => {
       type: "extension_ui_response", id: "ui-1", value: "B",
     });
     expect(result.blockedOn).toBeUndefined();
+  });
+
+  // smarty-dev#6207: every Pi-backed runner loads the same sender-header hook, exactly once, through
+  // the manager's real launch path. Ambient sender variables are cleared so this lane cannot leak in.
+  const senderRun = async (runner: "pi" | "pi-durable") => {
+    for (const key of ["SMARTY_ROLE", "SMARTY_LANE", "TASK_OUT", "PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME",
+      "PI_FABRIC_PARENT_RUN", "PI_FABRIC_AGENT_NAME", "PI_FABRIC_TASK_PROCESS_CHILD", "PI_FABRIC_SPAWNER_ID",
+      "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN", "PI_FABRIC_SPAWNER_NAME", "PI_FABRIC_SPAWNER_SESSION_ID"]) vi.stubEnv(key, undefined);
+    vi.stubEnv("SMARTY_ROLE", "project-agent@0123abcd");
+    vi.stubEnv("DURABLE_ROUTING_SENDER", "1");
+    const root = temporary();
+    fs.writeFileSync(path.join(root, "scenario"), "success");
+    vi.stubEnv("FAKE_MODEL_SCENARIO", path.join(root, "scenario"));
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, runner, model: "", timeoutMs: 5000, retainRuns: true }, {
+      workerPath: worker, piBinary: path.resolve("tests/fixtures/fake-pi-sender.mjs"), runRoot: path.join(root, "runs"),
+      mainAgentId: "session:main-1", identityId: "session:main-1", spawnerSessionId: "main-session-1", spawnerName: () => "herdr-main-7",
+    });
+    managers.push(manager);
+    const result = await manager.run({ task: "harmless", name: "fix-tests", runner, model: "openai-codex/gpt-5.6-sol", transport: "process", extensions: false });
+    const events = fs.readFileSync(path.join(root, "runs", result.id, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    return { result, events, hook: path.join(fs.realpathSync(fixture), "guards", "sender-headers.js") };
+  };
+  const TASK_SENDER = { "X-Session-Id": "unmodified", "X-Smarty-Role": "task", "X-Smarty-Agent": "fix-tests", "X-Smarty-Spawner": "herdr-main-7" };
+
+  it("pi-durable: the durable worker gets the sender-header hook once and its requests carry the sender headers", async () => {
+    const { result, events, hook } = await senderRun("pi-durable");
+    expect(result.status, result.error).toBe("completed");
+    const launch = events.find(event => event.type === "launch_probe");
+    expect(launch.argv.filter((arg: string, index: number) => launch.argv[index - 1] === "-e" && arg === hook)).toHaveLength(1);
+    const sender = events.find(event => event.type === "fake_sender_headers");
+    expect(sender).toMatchObject({ hookLoaded: true, senderHooks: [hook] });
+    expect(sender.headers).toEqual(TASK_SENDER);
+  });
+
+  it("pi: the pi child still gets the sender-header hook exactly once", async () => {
+    const { result, events, hook } = await senderRun("pi");
+    expect(result.status, result.error).toBe("completed");
+    expect(events.some(event => event.type === "launch_probe")).toBe(false);
+    const sender = events.find(event => event.type === "fake_sender_headers");
+    expect(sender).toMatchObject({ hookLoaded: true, senderHooks: [hook] });
+    expect(sender.headers).toEqual(TASK_SENDER);
   });
 
   it("keeps explicit pi on piBinary, not the durable entry", async () => {

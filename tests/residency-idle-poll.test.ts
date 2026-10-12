@@ -23,7 +23,7 @@ const fixture = (onIdle: () => void = () => {}) => {
     format: RESIDENT_HOST_FORMAT, rootId: "session:idle-poll", sessionId: "idle-poll",
     cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"),
     actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(path.join(root, "mesh"), "session:idle-poll"),
-    fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, residentIdleExitMs: 30_000 },
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("dist/agents/worker.js"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };
@@ -74,8 +74,8 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
         if (inCheck > 0) checkListings++;
         return list(...args);
       });
-      const active = host.actors.hasActiveDurableActor.bind(host.actors);
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => {
+      const active = host.actors.hasOwnedActors.bind(host.actors);
+      const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => {
         inCheck++;
         try { return active(); } finally { inCheck--; }
       });
@@ -175,7 +175,8 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       await host.start();
       const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       let active = false;
-      const checks = vi.spyOn(host.actors, "hasActiveDurableActor").mockImplementation(() => active);
+      const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => active);
+      await sleep(200); // Start the continuously dead-and-empty observation window.
       // Just short of the idle window: the next tick takes a current (inactive) observation.
       now += 29_950;
       await sleep(200);
@@ -189,6 +190,8 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(idled).toBe(0);
       // Truly idle for the whole window again: the host exits.
       active = false;
+      now += 1_000;
+      await sleep(200); // First confirmed zero-actor sample starts the new window.
       now += 30_100;
       await sleep(200);
       expect(idled).toBeGreaterThan(0);
@@ -206,6 +209,7 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     try {
       await host.start();
+      await sleep(200);
       // Close to the idle window with no actor: the next tick caches an inactive observation.
       now += 29_000;
       await sleep(200);
@@ -222,6 +226,9 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(runs).toHaveBeenCalledTimes(1);
       await host.actors.stop(actor.id);
       expect(host.actors.status(actor.id).status).toBe("stopped");
+      // A stopped actor still belongs to this resident. Only removal leaves zero actors.
+      await host.actors.remove(actor.id);
+      await sleep(200);
       // The clock did not move: by time alone every tick during the run reused the inactive sample.
       expect(Date.now()).toBe(sampledAt);
       const ended = now;

@@ -1,4 +1,5 @@
 import type { MeshLockProtocol } from "../config.js";
+import { meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -317,6 +318,11 @@ export interface MeshStoreOptions {
   /** Grace for an empty ownerless directory; recorded live owners never expire. Default 30 s. */
   staleLockMs?: number;
   /**
+   * A `.lock` or SQLite writer-lock hold longer than this emits a `held` event to
+   * `<root>/lock-stats/events.jsonl` (smarty-dev#9290). Default 1,000 ms; 0 disables them.
+   */
+  lockHeldEventMs?: number;
+  /**
    * Reads (get, list, listAll) reuse the last parsed state for up to this long, even when
    * another process has rewritten the file since. Every write still reads the file fresh
    * against an identity revalidated under the lock and checks versions, and a store sees its own writes at once. 0 (the
@@ -335,6 +341,46 @@ export interface MeshStoreOptions {
 
 /** Distinct revisions for a SQLite stamp that could not be read: never equal, so never validating. */
 let unreadableStateRevisions = 0;
+
+/** A background mesh path whose writes stay deferred past MESH_OUTAGE_ALARM_AFTER_MS, and its recovery (smarty-dev#8825). */
+export const FABRIC_MESH_OUTAGE_ALARM_TOPIC = "fabric.alarm.mesh-outage";
+const ALARM_SESSION = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+let refusedAlarmTo: string | undefined;
+/** Whether a value is the one accepted alarm target, `session:<uuid>` (also the bridge's check on a carried alarm). */
+export const isMeshAlarmTarget = (value: unknown): value is string => typeof value === "string" && ALARM_SESSION.test(value);
+/**
+ * Who a mesh-health alarm goes to (pi-fabric#893 rounds 3-5, R-org-delegate; owner decision by fabric-store): never
+ * the whole shared mesh, and only ever one session. `PI_FABRIC_MESH_ALARM_TO` must be exactly `session:<uuid>`
+ * (lowercase canonical uuid). Anything else (a bare name such as org or fabric-store, a topic, whitespace, any other
+ * form) is refused, with one stderr line naming it, and the launcher's `SMARTY_LEAD_SESSION` is used only if it is a
+ * `session:<uuid>`. Neither: undefined, and the alarm stays on stderr only (fail closed). Whether the session is a
+ * principal's is not checked here: accepted security gap smarty-dev#9820. ponytail: the env only, not the
+ * `.local/lead` marker walk, which would pull topology/project-identity into the store's eager startup graph.
+ */
+export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string | undefined => {
+  const configured = env.PI_FABRIC_MESH_ALARM_TO;
+  if (configured !== undefined && configured !== "") {
+    if (ALARM_SESSION.test(configured)) return configured;
+    if (refusedAlarmTo !== configured) {
+      refusedAlarmTo = configured;
+      console.warn(`[pi-fabric] PI_FABRIC_MESH_ALARM_TO refused (${JSON.stringify(configured.slice(0, 80))}): `
+        + "only session:<uuid>; mesh alarms fall back to SMARTY_LEAD_SESSION or stderr only");
+    }
+  }
+  const lead = env.SMARTY_LEAD_SESSION;
+  return lead !== undefined && ALARM_SESSION.test(lead) ? lead : undefined;
+};
+
+/** The MeshBackgroundRetry.alarmsTo sink of an owner: resolved at alarm time (owners assign their mesh after field init). */
+export const meshOutageAlarmSink = (owner: () => { mesh: Pick<MeshStore, "publish"> | undefined; from: MeshIdentity | undefined }) =>
+  (alarm: MeshOutageAlarm): Promise<unknown> | void => {
+    const { mesh, from } = owner();
+    const to = meshAlarmRecipient();
+    if (!mesh || !from || !to) return; // no recipient: the stderr line is the only sink, never a broadcast
+    return mesh.publish({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, to, kind: `mesh-${alarm.state}`, from,
+      text: `${alarm.label}: mesh writes ${alarm.state === "outage" ? "deferred" : "recovered"} after ${Math.floor(alarm.durationMs / 1_000)}s`,
+      data: { ...alarm } });
+  };
 
 /** A SQLite WAL-cap refusal (FABRIC_MESH_STATE_WAL_CAP): a reader pins the WAL above the hard cap (smarty-dev#7451). */
 export const MESH_WAL_CAP_ALARM_TOPIC = "fabric.alarm.mesh-wal-cap";
@@ -718,22 +764,27 @@ export class MeshStore {
   // smarty-dev#7451 item 6: a write the SQLite WAL cap refused (a reader pins the WAL) raises one log line and one
   // MESH_WAL_CAP_ALARM_TOPIC event per store at most every MESH_WAL_CAP_ALARM_MS. The event goes to events.jsonl,
   // which the cap does not gate. The refusal itself is rethrown unchanged (callers retry it, item 8).
+  // smarty-dev#9513: the event names the refused operation's own writer (a delete has none: the store's process), and
+  // carries a reader COUNT, never reader pids or command lines (those stay in the error for the local operator).
   #walCapAlarmAt = Number.NEGATIVE_INFINITY;
-  #walCapIdentity: MeshIdentity | undefined;
   #alarmWalCap<T>(write: Promise<T>, identity?: MeshIdentity): Promise<T> {
-    if (identity) this.#walCapIdentity = identity;
     return write.catch((error: unknown) => {
       const now = Date.now();
       if (isMeshStateWalCap(error) && now - this.#walCapAlarmAt >= MESH_WAL_CAP_ALARM_MS) {
         this.#walCapAlarmAt = now;
-        const { walBytes, capBytes, readers } = error as { walBytes?: number; capBytes?: number; readers?: string };
-        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes)${readers ? `; ${readers}` : ""}`;
-        console.warn(`[pi-fabric] ${text} at ${this.root}`);
-        const from = this.#walCapIdentity;
+        const { walBytes, capBytes, readerCount } = error as { walBytes?: number; capBytes?: number; readerCount?: number };
+        const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
+          + `${readerCount ?? 0} WAL reader(s))`;
+        // The journal alarm line #9729 pages on; no mesh root path, no reader pids (pi-fabric#893 rounds 4-5).
+        console.warn(meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
+          reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount: readerCount ?? 0 }));
+        const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.
+        const recipient = meshAlarmRecipient(); // no recipient: the log line only, never a broadcast
         try {
-          if (from) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, kind: "mesh-wal-cap", from, text,
-            data: { root: this.root, walBytes, capBytes, readers } }).catch(() => undefined);
+          if (recipient) void this.publish({ topic: MESH_WAL_CAP_ALARM_TOPIC, to: recipient, kind: "mesh-wal-cap", from, text,
+            data: { root: this.root, walBytes, capBytes, readerCount: readerCount ?? 0, writer: identity ? identity.id : null } })
+            .catch(() => undefined);
         } catch { /* the alarm is best effort */ }
       }
       throw error;

@@ -1,7 +1,8 @@
 import fs, { type FSWatcher } from "node:fs";
-import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { MeshBackgroundRetry, type MeshOutageAlarm } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { warnWatchFallback } from "../core/watch-fallback.js";
 import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
@@ -18,7 +19,9 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 
 /** Owns observation resources and the format-1 cursor, never actor ownership or dispatch policy. */
 export class ActorMeshMonitor {
-  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
+  // The monitor has no identity or publish of its own: its owner supplies the outage sink (smarty-dev#8825).
+  readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor")
+    .alarmsTo((alarm) => this.callbacks.outageAlarm?.(alarm));
   #safetyNetTimer: NodeJS.Timeout | undefined;
   #dueTimer: NodeJS.Timeout | undefined;
   #dueAt: number | undefined;
@@ -62,6 +65,8 @@ export class ActorMeshMonitor {
       canConsumeMesh?: (() => boolean) | undefined;
       /** false: full (retry unchanged); "ignored": no local delivery; true/void: handed on. */
       onEvent(event: MeshEvent): boolean | void | "ignored";
+      /** The owner's MeshBackgroundRetry outage sink (smarty-dev#8825). */
+      outageAlarm?: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
     },
   ) {
     const saved = this.#readCursor();
@@ -98,9 +103,12 @@ export class ActorMeshMonitor {
         this.#schedule();
       });
       this.#watcher = watcher;
-      watcher.on("error", () => this.#fallback(watcher));
-    } catch {
+      watcher.on("error", (error) => this.#fallback(watcher, error));
+    } catch (error) {
       // An unsupported watch (including a missing directory) takes the fallback.
+      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
+      // and say so once, so nobody hunts for free space and the session never crashes.
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     }
     this.#startSafetyNet();
     this.schedule();
@@ -151,8 +159,9 @@ export class ActorMeshMonitor {
     });
   }
 
-  #fallback(watcher: FSWatcher): void {
+  #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     watcher.close();
     this.#watcher = undefined;
     this.#startSafetyNet();

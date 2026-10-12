@@ -351,7 +351,7 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     expect(result.status, result.error).toBe("completed");
     const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
     expect(argv).toEqual(["--mode", "rpc", "--session", path.join(path.dirname(result.logFile!), "session.jsonl"), "--no-extensions",
-      "-e", guard, "-e", projectGuard, "-e", packageGuard, "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "--no-tools", "--thinking", "medium"]);
+      "-e", guard, "-e", projectGuard, "-e", packageGuard, "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "--no-tools", "--thinking", "medium"]);
     expect(argv).not.toContain(foreign); expect(argv).not.toContain(alias);
     const log = events(result.logFile!);
     expect(log.filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: ["bash-guard.ts", "project-tool-guard.ts", "extension.ts"], loadedCount: 3, skippedCount: 2 }]);
@@ -390,7 +390,7 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     const result = await managerFor(f, shim(f, recorder)).run({ task: "missing settings", transport: "process", extensions: true, tools: [] });
     expect(result.status, result.error).toBe("completed"); expect(result.warnings ?? []).toEqual([]);
     expect(JSON.parse(fs.readFileSync(argvFile, "utf8"))).toEqual(["--mode", "rpc", "--session", path.join(path.dirname(result.logFile!), "session.jsonl"), "--no-extensions",
-      "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "--no-tools", "--thinking", "medium"]);
+      "-e", f.pinned, "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "--no-tools", "--thinking", "medium"]);
     expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual([{ type: "fabric_profile_extensions", names: [], loadedCount: 0, skippedCount: 0 }]);
   });
   it.each(["shim", "native"])("%s real Pi process preserves the profile guard (native argv remains unchanged)", async launch => {
@@ -421,7 +421,7 @@ describe.skipIf(process.platform === "win32")("real worker profile guards throug
     // A native launcher runs through the SDK task entry (final-answer fence),
     // which receives its SDK directory and recovery scale ahead of Pi's argv.
     expect(argv).toEqual([...(launch === "native" ? [resolveRetrySdk(cli), String(recoveryTimeScale())] : []), "--mode", "rpc", "--session", session, ...(launch === "shim" ? ["--no-extensions", "-e", guard] : []), "-e", f.pinned,
-      "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/actor-bash-hook.js"), "--tools", "bash", "--model", "proof/offline", "--thinking", "medium"]);
+      "-e", path.join(parent, "dist/worker/principal-delivery.js"), "-e", path.join(parent, "dist/worker/session-id.js"), "-e", path.join(parent, "dist/guards/actor-bash-hook.js"), "-e", path.join(parent, "dist/guards/sender-headers.js"), "--tools", "bash", "--model", "proof/offline", "--thinking", "medium"]);
     expect(events(result.logFile!).filter(event => event.type === "fabric_profile_extensions")).toEqual(launch === "shim" ? [{ type: "fabric_profile_extensions", names: ["marker-guard.ts"], loadedCount: 1, skippedCount: 0 }] : []);
     const sessionEvents = events(session);
     expect(sessionEvents.some(event => event.type === "message" && event.message?.role === "toolResult" && event.message.isError === true)).toBe(true);

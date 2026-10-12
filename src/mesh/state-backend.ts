@@ -247,6 +247,8 @@ export interface StateBackendOptions {
   busyTimeoutMs?: number;
   /** shadow: the budget of one shadow write (never the caller's). Default 250 ms. */
   shadowBudgetMs?: number;
+  /** sqlite: a writer-lock hold longer than this emits a `held` lock event. Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
 }
 
 // ------------------------------------------------------------------ implementation (L2a)
@@ -393,9 +395,40 @@ export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendF
   shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
   // smarty-dev#7504: the factory is synchronous, the NATS connection and the stream replay are not. A host prepares
   // the backend first (`openNatsStateBackend`); an unprepared root refuses, never falls back.
-  nats: { create: (context) => preparedNatsStateBackend(context.root) ?? (() => {
-    throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
-  })() },
+  nats: { create: (context) => {
+    const backend = preparedNatsStateBackend(context.root);
+    if (!backend) throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
+    assertNoBridgeOnNats(context.root, backend);
+    return backend;
+  } },
+};
+
+/**
+ * Interim R20 fence decision (smarty-dev#7504 phase 2, docs/mesh-backends.md "Bridges"): on `nats`, the state write
+ * fence excludes no other writer, so a bridge's held-event ownership check (security F2) cannot hold. A root where a
+ * bridge holds events (a mirrored remote host record) refuses `nats`, and a bridge refuses a `nats` store, until the
+ * event log moves onto the stream (smarty-dev#9725) or a lease fences it.
+ */
+export class MeshStateNatsBridgeRefusedError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED";
+  constructor(root: string, detail: string) {
+    super(`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: ${root}: ${detail}; the nats backend has no R20 write fence for a bridge's `
+      + "held events until smarty-dev#9725 (docs/mesh-backends.md, Bridges)");
+    this.name = "MeshStateNatsBridgeRefusedError";
+  }
+}
+
+const assertNoBridgeOnNats = (root: string, backend: StateBackend): void => {
+  const bridged = backend.listAllShared("topology/hosts/").find(entry => {
+    const value = entry.value as { remoteHost?: unknown } | null;
+    return typeof value === "object" && value !== null && typeof value.remoteHost === "string";
+  });
+  if (bridged) throw new MeshStateNatsBridgeRefusedError(root, `a bridge holds events here (${bridged.key} is mirrored from ${String((bridged.value as { remoteHost: string }).remoteHost)})`);
+};
+
+/** A bridge side on a `nats` store refuses (the same interim decision). */
+export const assertBridgeStateBackend = (root: string, kind: string): void => {
+  if (kind === "nats") throw new MeshStateNatsBridgeRefusedError(root, "a bridge cannot run on a nats store");
 };
 
 /**
@@ -420,6 +453,7 @@ const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = optio
   ...(lockTimeoutMs !== undefined ? { lockTimeoutMs } : {}),
   ...(options.busyTimeoutMs !== undefined ? { busyTimeoutMs: options.busyTimeoutMs } : {}),
   ...(options.writeSignal ? { writeSignal: options.writeSignal } : {}),
+  ...(options.lockHeldEventMs !== undefined ? { lockHeldEventMs: options.lockHeldEventMs } : {}),
 });
 
 /**
@@ -662,6 +696,7 @@ export class SqliteStateBackend implements StateBackend {
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
           ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
+          ...(input.lockClass ? { lockClass: input.lockClass } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;

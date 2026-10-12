@@ -108,7 +108,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { captureStorageDelete, captureStoragePut, storageRevision, type StorageTransition } from "../verified/storage.js";
-import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, readMeshStateMovedMarker } from "./backend-fence.js";
+import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedToNatsError, readMeshStateMovedMarker } from "./backend-fence.js";
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
@@ -116,8 +116,12 @@ import { processStartTime, residentProcessAlive } from "../residency/process-ide
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
-import { formatWalReaders, walReaderPids } from "./wal-readers.js";
+import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
+import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
 import { assertPrivatePath, assertPrivateStateRoot, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
+
+// The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
+const lockEvents = createLockEvents();
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -177,6 +181,8 @@ const classifyStateFile = (file: string): "absent" | "empty" | "marker" | "popul
   let parsed: unknown;
   try { parsed = JSON.parse(serialized); } catch { parsed = undefined; } // damaged: not provably empty, refuse
   if (isMeshStateMovedMarker(parsed)) return "marker";
+  // smarty-dev#7504: the state moved to a NATS stream; sqlite mode must never create a fresh database over it.
+  if (isMeshStateNatsMarker(parsed)) throw meshStateMovedToNatsError(file, parsed);
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const state = parsed as { entries?: unknown; versions?: unknown; tombstoneOrder?: unknown; highWater?: unknown };
     const empty = (value: unknown): boolean => value === undefined || value === null
@@ -355,7 +361,7 @@ export class MeshStateRetiredError extends Error {
 /** A write refused while the WAL is above `walHardCapBytes` (a reader is pinning it). Retryable later. */
 export class MeshStateWalCapError extends Error {
   readonly code = "FABRIC_MESH_STATE_WAL_CAP";
-  constructor(readonly walBytes: number, readonly capBytes: number, readonly readers = "") {
+  constructor(readonly walBytes: number, readonly capBytes: number, readonly readers = "", readonly readerCount = 0) {
     super(`Fabric mesh state write refused: the SQLite WAL is ${walBytes} bytes, above the ${capBytes}-byte cap; `
       + `a reader is pinning the WAL; restart it or roll back${readers ? ` (WAL readers: ${readers})` : ""}`);
     this.name = "MeshStateWalCapError";
@@ -408,6 +414,8 @@ export interface SqliteStateStoreOptions {
   changesRetained?: number;
   /** Driver adapter. Default: node:sqlite, loaded at first use. */
   open?: SqliteOpener;
+  /** A writer-lock hold longer than this emits a `held` lock event (smarty-dev#9290). Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
   /**
    * Who may initialise state.db (smarty-dev#6477). Default: nobody; only an imported mesh root opens (an
    * initialised state.db plus the moved marker), anything else refuses with no side effect. "create":
@@ -704,6 +712,7 @@ export class SqliteStateStore {
   readonly #lockTimeoutMs: number;
   readonly #busyTimeoutMs: number;
   readonly #fifoAfterMs: number;
+  readonly #lockHeldEventMs: number;
   readonly #signal: AbortSignal | undefined;
   readonly #checkpointBytes: number;
   readonly #emergencyBytes: number;
@@ -756,6 +765,7 @@ export class SqliteStateStore {
     this.#lockTimeoutMs = Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     this.#busyTimeoutMs = clampBusy(options.busyTimeoutMs);
     this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 0);
+    this.#lockHeldEventMs = lockHeldEventThreshold(options.lockHeldEventMs);
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
     this.#emergencyBytes = Math.max(this.#checkpointBytes, options.emergencyCheckpointBytes ?? 64 * 1024 * 1024);
@@ -1027,7 +1037,7 @@ export class SqliteStateStore {
     const { key, value, identity, ifVersion } = input;
     validateMeshStateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
-    return this.#write((tx) => {
+    return this.#write("put/delete", (tx) => {
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -1039,7 +1049,7 @@ export class SqliteStateStore {
     const { key, ifVersion } = input;
     validateMeshStateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
-    return this.#write<{ deleted: boolean; version?: number }>((tx) => {
+    return this.#write<{ deleted: boolean; version?: number }>("put/delete", (tx) => {
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind === "unchanged") return { deleted: false };
@@ -1061,11 +1071,14 @@ export class SqliteStateStore {
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
     beforeCommit?: () => void;
+    /** Lock-event class for the bridge's own writes (as the file store's lock stats). */
+    lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
+    const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
     for (const op of input.ops) validateMeshStateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
     let committed: number | undefined;
-    const results = await this.#write((tx) => {
+    const results = await this.#write(lockClass, (tx) => {
       if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
       const view = this.#view();
       const started = performance.now();
@@ -1118,7 +1131,7 @@ export class SqliteStateStore {
     if (committed !== undefined && input.afterCommit) {
       const afterCommit = input.afterCommit;
       this.#stats.afterCommitReacquired += 1;
-      await this.#write((tx) => {
+      await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
         this.#timedAfterCommit(afterCommit, this.#view());
       });
@@ -1138,7 +1151,7 @@ export class SqliteStateStore {
 
   /** Runs a synchronous operation excluded from every state commit (review-opus P1-2 group (a)). */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
-    return this.#write(() => operation(), lockTimeoutMs);
+    return this.#write("custody", () => operation(), lockTimeoutMs);
   }
 
   /**
@@ -1160,6 +1173,7 @@ export class SqliteStateStore {
       throw new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
     }
     this.#inTransaction = true;
+    const began = performance.now();
     try {
       const meta = this.#meta();
       if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
@@ -1171,12 +1185,18 @@ export class SqliteStateStore {
     } finally {
       try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* connection ends it */ }
       this.#inTransaction = false;
+      this.#heldEvent("other", performance.now() - began);
     }
+  }
+
+  // smarty-dev#9290: a writer-lock hold longer than the threshold, reported by the holder at release.
+  #heldEvent(lockClass: MeshLockClass, heldMs: number): void {
+    if (this.#lockHeldEventMs > 0 && heldMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "sqlite", lockClass, heldMs);
   }
 
   /** Proves the state is writable now (and not retired): acquires and releases the write lock. */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
-    await this.#write(() => { onAcquired?.(Date.now()); });
+    await this.#write("heartbeat/confirm", () => { onAcquired?.(Date.now()); });
   }
 
   /**
@@ -1185,7 +1205,7 @@ export class SqliteStateStore {
    */
   async retire(): Promise<number> {
     // Exempt from the WAL cap: retiring is the roll-back the cap's refusal advises (a few meta rows).
-    return this.#write((tx) => {
+    return this.#write("other", (tx) => {
       const epoch = this.#epoch + 1;
       // data_version does not move for this connection's own commits: drop the cached value so the
       // next read on this store re-checks the retirement flag (review round 2 P2).
@@ -1200,7 +1220,7 @@ export class SqliteStateStore {
   /** One-time import of a file-store snapshot into an empty database (lane L4 drives migration). */
   async importState(state: { entries: Record<string, MeshStateEntry>; versions?: Record<string, number>;
     tombstoneOrder?: string[]; highWater?: number }): Promise<{ entries: number; tombstones: number; highWater: number }> {
-    return this.#write((tx) => {
+    return this.#write("other", (tx) => {
       if (Number(this.#sql.kvCount.get()?.n ?? 0) > 0 || Number(this.#sql.tombCount.get()?.n ?? 0) > 0 || tx.commit !== 0) {
         throw new Error("Fabric mesh SQLite import needs an empty database");
       }
@@ -1572,7 +1592,8 @@ export class SqliteStateStore {
   // Asynchronous, fair acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
-  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs, walCapExempt = false): Promise<T> {
+  async #write<T>(lockClass: MeshLockClass, body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs,
+    walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1632,7 +1653,7 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body);
+            return this.#run(body, lockClass);
           }
         }
         const now = performance.now();
@@ -1641,6 +1662,13 @@ export class SqliteStateStore {
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
           this.#flushCheckpointWindow();
+          // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
+          // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
+          // Leave the FIFO first: the /proc/locks read and the append must not keep this timed-out
+          // ticket at the head (pi-fabric#905 review round 3).
+          ticket?.close();
+          ticket = undefined;
+          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
@@ -1686,7 +1714,7 @@ export class SqliteStateStore {
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1717,6 +1745,7 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only
         // imports also notify, but write-free fences never schedule unnecessary maintenance.
@@ -1783,7 +1812,10 @@ export class SqliteStateStore {
       } catch { this.#stats.checkpoints.failed += 1; }
       size = this.walBytes();
     }
-    if (size > this.#walHardCapBytes) throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(walReaderPids(this.file)));
+    if (size > this.#walHardCapBytes) {
+      const readers = walReaderPids(this.file);
+      throw new MeshStateWalCapError(size, this.#walHardCapBytes, formatWalReaders(readers), readers.length);
+    }
   }
 
   // Reader starvation (see the module comment): after a COMMIT, throttled to 4/s, a WAL above

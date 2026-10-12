@@ -42,6 +42,16 @@ describe("CI Node runtime prerequisites", () => {
     expect(steps[realPi]!.env).toEqual({ FABRIC_5492_REAL_PI: "1" });
   });
 
+  it("runs the real-Pi sender-header wire proof on Linux after the build (smarty-dev#6207)", () => {
+    const { steps } = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")).jobs.check as { steps: Step[] };
+    const build = steps.findIndex((step) => step.run === "bun run build");
+    const realPi = steps.findIndex((step) => step.run === "bunx vitest run tests/sender-headers-real-pi.test.ts");
+    expect(build).toBeGreaterThanOrEqual(0);
+    expect(realPi).toBeGreaterThan(build);
+    expect(steps[realPi]!.if).toBe("runner.os == 'Linux'");
+    expect(steps[realPi]!.env).toEqual({ FABRIC_6207_REAL_PI: "1" });
+  });
+
   // Our deliberately pinned jobs keep their own Node version (fork CI policy: our jobs stay as
   // they are). mesh-lock-bench measures dist/ built for node24 against a fixed baseline.
   const pinnedNodeJobs = new Set(["test.yml:mesh-lock-bench"]);

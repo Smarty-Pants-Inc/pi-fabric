@@ -86,8 +86,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { renameAtomic } from "../core/atomic-write.js";
 import { storageRevision } from "../verified/storage.js";
-import { assertFileStateWritable, encodeMeshStateMovedMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf, readMeshStateMovedMarker,
-  readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource } from "./backend-fence.js";
+import { assertFileStateWritable, encodeMeshStateMovedMarker, encodeMeshStateNatsMarker, MeshBackendFenceError, meshFenceAlarm, meshStateSourceOf,
+  readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch as readEpochHeader, type MeshBackendAlarm, type MeshStateMovedMarker,
+  type MeshStateNatsMarker, type MeshStateSource } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
 import { holdMeshFence } from "./fence-lock.js";
 import type { MeshLock } from "./mesh-lock.js";
@@ -97,15 +98,24 @@ import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateM
 import { assertPrivateStateRoot, openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
-export { assertFileStateWritable, MeshBackendFenceError, readMeshStateMovedMarker, type MeshBackendAlarm, type MeshStateMovedMarker, type MeshStateSource };
+export { assertFileStateWritable, encodeMeshStateNatsMarker, MeshBackendFenceError, readMeshStateMovedMarker, readMeshStateNatsMarker, type MeshBackendAlarm,
+  type MeshStateMovedMarker, type MeshStateNatsMarker, type MeshStateSource };
 
-export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file";
+/**
+ * state.db's `meta.backend`. `nats` (smarty-dev#7504, docs/mesh-backends.md §Migration step 3): the state moved to a
+ * NATS stream; sqlite readers and writers fail closed on it as on any flag but `sqlite`, and the reader rule
+ * (`meshStateSourceOf`) refuses file and sqlite mode and names the stream.
+ */
+export type MeshBackendFlag = "sqlite" | "importing" | "exporting" | "file" | "nats";
 
 /** Crash points, in commit order. `onStep` runs synchronously right after each one. */
 export type MeshBackendStep =
   | "import-read" | "import-commit" | "import-verify"
   | "rollback-flag" | "rollback-export-temp" | "rollback-verify" | "rollback-switch" | "rollback-replace"
-  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag";
+  | "abort-rollback" | "cutover-reconcile" | "cutover-copy" | "cutover-marker" | "cutover-flag"
+  // file <-> nats (backend-migration-nats.ts, smarty-dev#9670)
+  | "nats-import-begin" | "nats-import-chunk" | "nats-import-verify" | "nats-copy" | "nats-marker" | "nats-import-commit"
+  | "nats-retire" | "nats-export-temp" | "nats-replace";
 
 export interface MeshCensusWriter { pid: number; release: string; mode: string }
 /** Provided by the census lane (writer-census.ts): the writers it attributed and the evidence it could not. */
@@ -245,6 +255,8 @@ export interface MeshBackendStatus {
   fileError?: string;
   /** state.json is cutover's moved marker (backend=sqlite at fileEpoch), not state. */
   fileMoved?: boolean;
+  /** state.json is the NATS moved marker: the state is on this stream at fileEpoch (smarty-dev#7504). */
+  natsStream?: string;
   dbDigest?: string;
   fileDigest?: string;
   importDigest?: string | undefined;
@@ -287,7 +299,7 @@ type FencedFile = MeshStateFile & { backendEpoch?: number; backendDigest?: strin
 
 // ------------------------------------------------------------------ digest
 
-interface NormalizedState {
+export interface NormalizedState {
   entries: MeshStateEntry[];
   tombstones: Array<{ key: string; version: number }>;
   highWater: number;
@@ -301,7 +313,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * The file store's own validation (state-file.ts stateSlot) and tombstone order
  * (compactStateTombstones: tombstoneOrder first occurrence, then the remaining versions keys).
  */
-const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
+export const normalizeSnapshot = (state: MeshStateSnapshot): NormalizedState => {
   if (!isRecord(state) || !isRecord(state.entries)) throw new Error("Invalid Fabric mesh state envelope");
   if (state.versions !== undefined && !isRecord(state.versions)) throw new Error("Invalid Fabric mesh revision table");
   if (state.tombstoneOrder !== undefined && !Array.isArray(state.tombstoneOrder)) throw new Error("Invalid Fabric mesh tombstone order");
@@ -1185,16 +1197,23 @@ export const meshBackendStatus = async (root: string, options: MeshBackendOption
     } finally { fence.close(); }
   }
   const marker = readMeshStateMovedMarker(root);
+  const nats = marker ? undefined : readMeshStateNatsMarker(root);
   if (marker) {
     status.fileEpoch = marker.epoch;
     status.fileMoved = true;
+  } else if (nats) {
+    status.fileEpoch = nats.epoch;
+    status.fileMoved = true;
+    status.natsStream = nats.natsStream;
   } else try {
     const file = readFile(root, options);
     status.fileEpoch = fileEpochOf(file);
     status.fileGeneration = typeof file.readGeneration === "string" ? file.readGeneration : undefined;
     status.fileDigest = meshSnapshotDigest(file);
   } catch (error) { status.fileError = (error as Error).message; }
-  status.fenceHolds = status.fileEpoch === undefined ? status.backend !== "file"
+  // A NATS marker holds over no database (from file) or over a fenced one (from sqlite: exporting, then nats) at or below its epoch.
+  status.fenceHolds = nats ? (status.backend === "none" || (["exporting", "nats"].includes(status.backend) && status.epoch <= nats.epoch))
+    : status.fileEpoch === undefined ? status.backend !== "file"
     : status.fileEpoch <= status.epoch && (status.fileMoved ? ["sqlite", "importing", "exporting", "file"].includes(status.backend)
       : status.backend !== "file" || status.fileEpoch === status.epoch);
   const { onAlarm: _quiet, ...quiet } = options;

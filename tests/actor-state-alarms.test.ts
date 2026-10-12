@@ -6,6 +6,7 @@ import { ActorManager, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorAlarmKey } from
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import * as processIdentity from "../src/residency/process-identity.js";
 
 // smarty-dev#9332: actor states that cannot act raise fabric.alarm.actor-activation (same envelope, ownerRoot routing),
 // evaluated on the existing retention sweep (retentionSweepMs, no new timer), re-alarmed once per 6 h slot.
@@ -42,7 +43,15 @@ const setup = (persistent = false) => {
   closers.push(() => agents.close(), () => actors.close());
   const alarms = (kind: string, id: string) => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 200 })
     .filter(event => event.kind === kind && (event.data as { actorId?: string }).actorId === id);
-  return { root, mesh, agents, actors, clock, alarms };
+  /** A new manager on the same actor root (a host restart). */
+  const restart = async () => {
+    await actors.close();
+    const next = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent, retentionSweepMs: 20 });
+    closers.push(() => next.close());
+    return next;
+  };
+  return { root, mesh, agents, actors, clock, alarms, restart };
 };
 
 describe("actor state alarms (smarty-dev#9332)", () => {
@@ -132,7 +141,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     await waitFor(() => fs.existsSync(path.join(directory, "status.json")) &&
       fs.existsSync(path.join(s.agents.runDirectory(s.actors.status(live.id).inFlightRun!.id)!, "status.json")));
     const owned = s.agents.workerIdentity(runId)!;
-    expect(owned).toMatchObject({ pid: expect.any(Number), startTime: expect.any(String) });
+    expect(owned).toMatchObject({ pid: expect.any(Number), open: true });
     const stuckAlarms = () => s.alarms("actor-run-stuck", stuck.id);
     const teardown = async () => {
       // A run that did work detaches on an actor stop (fake-worker HANG_WITH_PROGRESS): end the runs themselves.
@@ -180,7 +189,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     const pid = await deadPid();
     // The host's record names a worker that has exited; the status file claims it is running.
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
-    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid, startTime: "1" } : real(id));
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid, startTime: "1", open: true } : real(id));
     const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
     fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "running", sessionId: String(process.pid) }));
     try {
@@ -199,7 +208,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     const f = await stuckFixture();
     // This process is alive, but it is not the worker the host launched: its start time differs.
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
-    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: process.pid, startTime: "1" } : real(id));
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: process.pid, startTime: "1", open: true } : real(id));
     try { await f.expectAlarm("worker-pid-reused"); } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
   }, 60_000);
 
@@ -212,4 +221,74 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       await f.expectAlarm("worker-unverified");
     } finally { await f.teardown(); }
   }, 60_000);
+
+  // pi-fabric#944 round 2.
+  it("no start time (as off Linux): a live owned handle is proof, no alarm; with the handle closed and the pid alive: worker-unverified", async () => {
+    vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined); // before the spawn: none is recorded
+    const f = await stuckFixture();
+    try {
+      expect(f.owned.startTime).toBeUndefined();
+      f.s.clock.skew = 31 * MINUTE;
+      await settle();
+      expect(f.stuckAlarms()).toHaveLength(0); // the live worker of an open owned handle
+      const real = f.s.agents.workerIdentity.bind(f.s.agents);
+      vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => {
+        const identity = real(id);
+        return id === f.runId && identity ? { ...identity, open: false } : identity; // the handle closed, the pid still alive
+      });
+      await waitFor(() => f.stuckAlarms().length === 1);
+      expect(f.stuckAlarms()[0]!.data).toMatchObject({ reason: "worker-unverified", runId: f.runId });
+      vi.mocked(f.s.agents.workerIdentity).mockRestore();
+    } finally { await f.teardown(); }
+  }, 60_000);
+
+  it("a dropped-event episode survives a restart: the next slot re-alarms once from the new manager", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "dropper", instructions: "Respond.", responseMode: "directive", coalesce: false });
+    await s.actors.tell(actor.id, "FAIL_DIRECTIVE one");
+    await waitFor(() => s.alarms("actor-event-dropped", actor.id).length === 1);
+    await waitFor(() => !s.actors.status(actor.id).inFlightRun && s.actors.status(actor.id).queued === 0);
+    const next = await s.restart();
+    expect(next.status(actor.id)).toBeDefined();
+    s.clock.skew = 6 * HOUR + 1_000;
+    await waitFor(() => s.alarms("actor-event-dropped", actor.id).length === 2);
+    await settle();
+    expect(s.alarms("actor-event-dropped", actor.id)).toHaveLength(2);
+    expect(s.alarms("actor-event-dropped", actor.id)[1]!.data).toMatchObject({ count: 1, since: (s.alarms("actor-event-dropped", actor.id)[0]!.data as { since: number }).since });
+  }, 60_000);
+
+  it("alarm data carries fixed failure codes, never raw error text (paths, secrets)", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "leaky", instructions: "Run", residency: "durable", coalesce: false });
+    const leak = "Error: open /home/paul/.config/secret.json failed: Authorization: Bearer sk-abcdefghijklmnop0123";
+    vi.spyOn(s.agents, "run").mockRejectedValue(new Error(leak));
+    await s.actors.tell(actor.id, "anything");
+    await waitFor(() => s.alarms("actor-event-dropped", actor.id).length === 1);
+    await waitFor(() => !s.actors.status(actor.id).inFlightRun && !s.actors.status(actor.id).preparing);
+    await s.actors.stop(actor.id);
+    s.clock.skew = 10 * MINUTE + 1_000;
+    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 1);
+    for (const alarm of [...s.alarms("actor-event-dropped", actor.id), ...s.alarms("actor-stopped", actor.id)]) {
+      const text = JSON.stringify(alarm.data);
+      expect(text).not.toContain("/home/");
+      expect(text).not.toContain("Bearer");
+      expect(text).not.toContain("sk-abcdef");
+    }
+    expect(s.alarms("actor-event-dropped", actor.id)[0]!.data).toMatchObject({ reason: expect.stringMatching(/^[a-z-]+$/) });
+  }, 60_000);
+
+  it("processStartTime counts field 22 from after the LAST ')' (a comm with spaces and parentheses)", async () => {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, ["-e", "process.title = 'a) b (c'; setTimeout(() => {}, 10_000); process.stdout.write('ready')"], { stdio: ["ignore", "pipe", "ignore"] });
+    try {
+      await new Promise(resolve => child.stdout!.once("data", resolve));
+      const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      expect(stat).toContain("(a) b (c)");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      expect(processIdentity.processStartTime(child.pid!)).toBe(fields[19]);
+      expect(fields[19]).toMatch(/^\d+$/);
+      // A naive split from the first ')' would land elsewhere: the start time must not depend on comm.
+      expect(stat.slice(stat.indexOf(")") + 2).trim().split(/\s+/)[19]).not.toBe(fields[19]);
+    } finally { child.kill("SIGKILL"); }
+  });
 });

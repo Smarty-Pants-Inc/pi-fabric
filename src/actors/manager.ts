@@ -495,6 +495,17 @@ export const actorAlarmKey = (actorId: string, kind: ActorAlarmKind): string =>
  * ACTOR_BLOCK_REALARM_EVERY_MS (6 h). Undefined before the first. */
 const actorAlarmSlot = (now: number, since: number, after: number): number | undefined =>
   now - since < after ? undefined : Math.floor((now - since - after) / ACTOR_BLOCK_REALARM_EVERY_MS);
+/** A persisted dropped-event episode (smarty-dev#9332), validated on restore; anything malformed is dropped. */
+const restoredEventsDropped = (value: unknown): { eventsDropped?: NonNullable<ManagedActor["eventsDropped"]> } => {
+  const episode = value as Partial<NonNullable<ManagedActor["eventsDropped"]>> | undefined;
+  if (!episode || !Number.isFinite(episode.since) || !Number.isSafeInteger(episode.count) || episode.count! < 1 ||
+      !Number.isFinite(episode.at) || typeof episode.reason !== "string" || typeof episode.eventRef !== "object" ||
+      episode.eventRef === null || Array.isArray(episode.eventRef)) return {};
+  const eventRef = Object.fromEntries(Object.entries(episode.eventRef)
+    .filter((entry): entry is [string, string | number] => typeof entry[1] === "string" || typeof entry[1] === "number"));
+  return { eventsDropped: { since: episode.since!, count: episode.count!, at: episode.at!, reason: episode.reason.slice(0, 80),
+    ...(typeof episode.runId === "string" ? { runId: episode.runId } : {}), eventRef } };
+};
 /** A durable or supervisor actor stopped for longer than this alarms (smarty-dev#9332). */
 export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 /** An activation block with an unclassified cause (code "unknown") alarms once it is this old, after one failure. */
@@ -4847,7 +4858,8 @@ export class ActorManager {
       const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
       this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
         actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
-        ...(actor.stopReason ? { stopReason: actor.stopReason } : {}), ...(actor.lastError ? { lastError: actor.lastError.slice(0, 300) } : {}),
+        ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
+        ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
         since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
         () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
           (current.stoppedAt ?? current.updatedAt) === since; });
@@ -4882,10 +4894,14 @@ export class ActorManager {
     // TODO(pi-fabric#939): use its OwnedProcess {pid, /proc start time} once it lands; this is the same field-22
     // comparison, done locally.
     const worker = this.agents.workerIdentity(runId);
-    if (!worker || worker.startTime === undefined) return "worker-unverified";
-    const current = processStartTime(worker.pid);
-    if (current === undefined) return processIsAlive(worker.pid) ? "worker-unverified" : "worker-gone";
-    if (current !== worker.startTime) return "worker-pid-reused";
+    if (!worker) return "worker-unverified";
+    const current = worker.startTime === undefined ? undefined : processStartTime(worker.pid);
+    if (current === undefined) {
+      // No start time to compare (off Linux, or /proc unreadable): this host's own open transport handle for the
+      // run, with its pid alive, is the proof (pi-fabric#944 round 2). No open handle as well: unverified.
+      if (!processIsAlive(worker.pid)) return "worker-gone";
+      if (!worker.open) return "worker-unverified";
+    } else if (current !== worker.startTime) return "worker-pid-reused";
     // The launched worker is alive. Past the threshold (far beyond any startup window) it must also have written a
     // readable status record; an absent or corrupt one fails toward the alarm. A readable one never clears a dead worker.
     return readRunRecord(path.join(directory, "status.json")) ? undefined : "worker-unverified";
@@ -4917,7 +4933,9 @@ export class ActorManager {
     if (this.#halted || this.#closing) return;
     const now = Date.now();
     const previous = actor.eventsDropped;
-    const dropped = { since: previous?.since ?? now, count: (previous?.count ?? 0) + 1, at: now, reason: reason.slice(0, 300),
+    // A fixed failure code, never the raw error text (paths, secrets): pi-fabric#944 round 2.
+    const code = classifyActivationFailure({ lastError: reason, error: reason }).code;
+    const dropped = { since: previous?.since ?? now, count: (previous?.count ?? 0) + 1, at: now, reason: code,
       ...(runId ? { runId } : {}), eventRef: actorEventRef(item) };
     actor.eventsDropped = dropped;
     this.#alarmDroppedEvents(actor, dropped, now);
@@ -5316,6 +5334,7 @@ export class ActorManager {
       ...(actor.capabilityDigest ? { capabilityDigest: actor.capabilityDigest } : {}),
       ...(actor.activationBlocked ? { activationBlocked: { ...actor.activationBlocked } } : {}),
       ...(actor.failureStreak ? { failureStreak: { ...actor.failureStreak } } : {}),
+      ...(actor.eventsDropped ? { eventsDropped: structuredClone(actor.eventsDropped) } : {}),
       ...(actor.validWhile ? { validWhile: actor.validWhile } : {}),
       ...(actor.records ? { records: { ...actor.records } } : {}),
       sessionFile: actor.sessionFile,
@@ -5821,6 +5840,7 @@ export class ActorManager {
           typeof record.failureStreak?.notified === "boolean"
           ? { failureStreak: { count: record.failureStreak.count, notified: record.failureStreak.notified } }
           : {}),
+        ...restoredEventsDropped((source as { eventsDropped?: unknown }).eventsDropped),
         ...(records ? { records } : {}),
         ...(record.validWhile?.version === 1 && typeof record.validWhile.source === "string"
           ? { validWhile: record.validWhile }

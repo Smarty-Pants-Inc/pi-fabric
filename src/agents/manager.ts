@@ -1095,10 +1095,14 @@ export class AgentManager {
   readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined }>();
 
   /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
-   * not be read, e.g. off Linux). Undefined: no live handle, or a transport without a local process. */
-  workerIdentity(runId: string): { pid: number; startTime: string | undefined } | undefined {
-    const transport = this.#runs.get(runId)?.transport;
-    return transport ? this.#workerIdentities.get(transport) : undefined;
+   * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
+   * contact not lost). Undefined: no live handle, or a transport without a local process. */
+  workerIdentity(runId: string): { pid: number; startTime: string | undefined; open: boolean } | undefined {
+    const managed = this.#runs.get(runId);
+    const identity = managed?.transport ? this.#workerIdentities.get(managed.transport) : undefined;
+    if (!managed || !identity) return undefined;
+    const open = !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
+    return { ...identity, open };
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {

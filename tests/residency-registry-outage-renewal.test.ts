@@ -100,24 +100,36 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
     // Fence a delayed renewal at its actual per-key decision, not just at timer
     // selection. Rotate the token while retaining the root: a root-only guard
     // would incorrectly renew this predecessor generation.
-    const oldEnvelope = readParticipantFile(config.meshRoot, keys[1]!)!;
     const keyLock = path.join(config.meshRoot, "participants", ".locks", keys[1]!.split("/").at(-1)!);
-    let rotated = false;
+    // Arm only under this test's registry custody (smarty-dev#6956). The host's
+    // interval renewal lane acquires this key on its own; if it rotated the
+    // lineage before we held the registry, the host's next fenced publication
+    // could remove the predecessor envelope before the assertion below reads it.
+    let armed = false, rotated = false;
+    let atRotation: ReturnType<typeof readParticipantFile>;
     let delayedRenewal: Promise<void> | undefined;
     const rename = fs.renameSync.bind(fs);
     const receipt = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
       rename(from, to);
-      if (!rotated && String(to) === keyLock) {
+      if (armed && !rotated && String(to) === keyLock) {
         rotated = true;
+        // The envelope as the delayed renewal found it, read under its key receipt.
+        atRotation = readParticipantFile(config.meshRoot, keys[1]!);
         registry.write(registry.records().map(row => row.id === actors[1]!.id
           ? { ...row, adoptedAt: Date.now(), adoptedFrom: ["previous-generation"] } : row), { durable: true });
       }
     });
     try {
       await registry.withLock(async () => {
+        armed = true;
         delayedRenewal = host.participants.refresh();
-        await waitFor(() => rotated, 1_000, "lineage rotation between key acquisition and renewal write");
-        expect(readParticipantFile(config.meshRoot, keys[1]!)!.updatedAt).toBe(oldEnvelope.updatedAt);
+        // The refresh may join a renewal lane already past this key; the next
+        // interval tick then takes it. Bound by the renewal cadence, not a sleep.
+        await waitFor(() => rotated, 10_000, "lineage rotation between key acquisition and renewal write");
+        expect(atRotation).toBeDefined();
+        // No fenced publication can remove it while we hold the registry, and the
+        // rotated lineage must veto the renewal write at its per-key decision.
+        expect(readParticipantFile(config.meshRoot, keys[1]!)?.updatedAt).toBe(atRotation!.updatedAt);
       });
     } finally { receipt.mockRestore(); }
     await delayedRenewal;
@@ -132,4 +144,4 @@ it("#4383 real resident actor envelopes renew on every heartbeat through another
     await host.close(); await main.close(); await observer.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
-}, 50_000);
+}, 60_000);

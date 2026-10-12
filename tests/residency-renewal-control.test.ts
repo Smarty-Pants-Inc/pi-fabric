@@ -82,8 +82,10 @@ it("completes a real resident setter overlapped with automatic shared renewal, t
       return batch({ ...input, afterCommit: view => {
         if (overlap) {
           // Observe actual physical owners inside the production mesh critical section.
-          sawBothLocks = [registryLock, sessionLock, meshLock].every(file =>
-            fs.readFileSync(file, "utf8").split("\n")[1] === String(process.pid));
+          // smarty-dev#8526: an actor-only round locks the registry holding that actor (the
+          // project root here), never the session registry it publishes nothing from.
+          sawBothLocks = [registryLock, meshLock].every(file =>
+            fs.readFileSync(file, "utf8").split("\n")[1] === String(process.pid)) && !fs.existsSync(sessionLock);
         }
         input.afterCommit?.(view);
       } });

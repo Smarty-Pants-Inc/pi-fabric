@@ -83,6 +83,16 @@ export const sanitizeFabricMediaValue = (value: unknown): SanitizedFabricMedia =
   const seen = new WeakSet<object>();
 
   const walk = (node: unknown): unknown => {
+    // Local-only native image forms. Never fetch or interpret remote URLs.
+    let local: unknown = node;
+    if (node && typeof node === "object" && "image_url" in node) {
+      const url = (node as { image_url: unknown }).image_url;
+      local = typeof url === "string" ? url : url && typeof url === "object" && "url" in url ? url.url : undefined;
+    }
+    if (typeof local === "string") {
+      const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$/.exec(local);
+      if (match) node = { type: "image", mimeType: match[1], data: match[2]!.replace(/\s/g, "") };
+    }
     if (typeof node === "string") {
       if (looksLikeBase64(node)) return omittedMarker(node.length);
       return sanitizeFabricMediaText(node);

@@ -44,6 +44,8 @@ export interface FabricModelSelectorOptions {
   inheritLabel?: string;
   /** Description shown for the unset/default row's footer name. */
   inheritName?: string;
+  /** Whether the unset/Inherit row is pinned on top. Defaults to true. */
+  inheritRow?: boolean;
 }
 
 /**
@@ -70,6 +72,7 @@ export class FabricModelSelector extends Container implements Focusable {
   private readonly headerText: string;
   private readonly inheritLabel: string;
   private readonly inheritName: string;
+  private readonly inheritRow: boolean;
   private _focused = false;
 
   constructor(options: FabricModelSelectorOptions) {
@@ -85,6 +88,7 @@ export class FabricModelSelector extends Container implements Focusable {
       "Default model for Fabric agents and actors. Pick Inherit to use the host session's model.";
     this.inheritLabel = options.inheritLabel ?? INHERIT_VALUE;
     this.inheritName = options.inheritName ?? "Use the host session's default model";
+    this.inheritRow = options.inheritRow !== false;
 
     this.allEntries = this.buildEntries(options.source.models);
     this.filteredEntries = this.allEntries;
@@ -166,13 +170,6 @@ export class FabricModelSelector extends Container implements Focusable {
 
   private buildEntries(models: ModelLike[]): ModelEntry[] {
     const sorted = sortByLastUsed(models, this.lastUsed, this.currentKey);
-    const inherit: ModelEntry = {
-      value: INHERIT_VALUE,
-      id: this.inheritLabel,
-      provider: "",
-      name: this.inheritName,
-      isModel: false,
-    };
     const modelEntries: ModelEntry[] = sorted.map((model) => ({
       value: modelKey(model.provider, model.id),
       id: model.id,
@@ -180,6 +177,14 @@ export class FabricModelSelector extends Container implements Focusable {
       name: model.name ?? model.id,
       isModel: true,
     }));
+    if (!this.inheritRow) return modelEntries;
+    const inherit: ModelEntry = {
+      value: INHERIT_VALUE,
+      id: this.inheritLabel,
+      provider: "",
+      name: this.inheritName,
+      isModel: false,
+    };
     return [inherit, ...modelEntries];
   }
 

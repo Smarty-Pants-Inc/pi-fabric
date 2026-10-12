@@ -16,6 +16,7 @@ import type { FabricInvocationContext, FabricProvider } from "../src/protocol.js
 import { SchemaController } from "../src/schema/controller.js";
 import type { SchemaEvidence } from "../src/schema/types.js";
 import { StateStore } from "../src/state/store.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 const roots: string[] = [];
 const identity: MeshIdentity = { id: "session:schema", name: "main", kind: "main", sessionId: "schema" };
@@ -64,7 +65,7 @@ const hypothesisAndCertificate = async (
 const runService = async (mode: FabricSchemaMode, code: string, provider?: FabricProvider) => {
   const setup = fixture(mode);
   const registry = new ActionRegistry();
-  registry.register(new PiToolsProvider(setup.cwd));
+  registry.register(new PiToolsProvider(setup.cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
   registry.register(new SchemaProvider(setup.controller));
   if (provider) registry.register(provider);
   const config = structuredClone(DEFAULT_FABRIC_CONFIG);

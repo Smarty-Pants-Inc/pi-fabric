@@ -76,10 +76,12 @@ it("resume installs C before successor publication: competing drainers never inh
     const participants = { list: () => [A, D].map(who => ({ id: who.id, kind: "root", stale: false })) } as unknown as FabricParticipantSource;
     const aDrain = new MainInboxMaintenance(new MeshStore(mesh.root, 64 * 1024, 500), A, participants, competingA.main, config.mesh);
     const dDrain = new MainInboxMaintenance(new MeshStore(mesh.root, 64 * 1024, 500), D, participants, liveD.main, config.mesh);
-    const exclusive = MeshStore.prototype.exclusive;
+    // Inbox succession takes the file custody lock (smarty-dev#6477 L5); pause after
+    // MeshStore.custody returns, i.e. after every lock it took has been released.
+    const custody = MeshStore.prototype.custody;
     let paused = false;
-    vi.spyOn(MeshStore.prototype, "exclusive").mockImplementation(async function<T>(this: MeshStore, operation: () => T, timeout?: number): Promise<T> {
-      const result = await exclusive.call(this, operation, timeout) as T;
+    vi.spyOn(MeshStore.prototype, "custody").mockImplementation(async function<T>(this: MeshStore, operation: () => T, timeout?: number): Promise<T> {
+      const result = await custody.call(this, operation, timeout) as T;
       if (this === runtime.mesh && !paused && fs.existsSync(successorFile) &&
         JSON.parse(fs.readFileSync(successorFile, "utf8")).newRoot === C.id) {
         paused = true;

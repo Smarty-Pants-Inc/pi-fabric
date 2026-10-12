@@ -78,13 +78,13 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
-    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000) => {
+    const missedWork = (text: string, to: string | null = `session:${session.sessionManager.getSessionId()}`, ageMs = 120_000, kind = "handoff") => {
       const id = randomUUID();
       const log = path.join(meshRoot, "events.jsonl");
       const lines = fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [];
       const sequence = (lines.length ? (JSON.parse(lines.at(-1)!) as { sequence: number }).sequence : 0) + 1;
       fs.appendFileSync(log, `${JSON.stringify({
-        id, sequence, topic: "fleet.work.pi-fabric.1", kind: "handoff",
+        id, sequence, topic: "fleet.work.pi-fabric.1", kind,
         from: { id: "session:peer", name: "main", kind: "main", sessionId: "peer" },
         ...(to ? { to } : {}),
         text, data: { ref: "Smarty-Pants-Inc/pi-fabric#1", key: text }, createdAt: Date.now() - ageMs,
@@ -155,7 +155,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
 
   it("summarises a 20-hour backlog once at turn start without injecting work or chaining turns (#3036)", async () => {
     const { session, faux, inboxMessages, missedWork } = await start();
-    for (let index = 0; index < 45; index++) missedWork(`stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    for (let index = 0; index < 45; index++) missedWork(`stale shadow ${index}`, undefined, 20 * 60 * 60_000, "progress");
     let inferences = 0;
     faux.setResponses([() => { inferences++; return fauxAssistantMessage("next"); },
       () => { inferences++; return fauxAssistantMessage("unwanted backlog wake"); }]);
@@ -176,7 +176,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
     let inferences = 0;
     faux.setResponses([() => { inferences++; return fauxAssistantMessage("must not wake"); }]);
-    for (let index = 0; index < 45; index++) missedWork(`idle stale shadow ${index}`, undefined, 20 * 60 * 60_000);
+    for (let index = 0; index < 45; index++) missedWork(`idle stale shadow ${index}`, undefined, 20 * 60 * 60_000, "progress");
     const summaries = () => session.sessionManager.getEntries().filter(entry => entry.type === "custom_message" &&
       entry.customType === "pi-fabric-inbox-summary");
     const deadline = Date.now() + 10_000;
@@ -188,6 +188,22 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(summaries()).toHaveLength(1);
     expect(inferences).toBe(0);
     expect(session.isStreaming).toBe(false);
+  }, 60_000);
+
+  it("delivers a three-hour-old addressed answer to Main with its age, only once (#4313)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start();
+    missedWork("BLOCKED: lane needs Main", undefined, 3 * 60 * 60_000, "answer");
+    faux.setResponses([() => {
+      expect(inboxMessages()).toHaveLength(1);
+      const content = JSON.stringify(inboxMessages()[0]);
+      expect(content).toContain("(delivered late: created ");
+      expect(content).toContain("3 h ago) BLOCKED: lane needs Main");
+      return fauxAssistantMessage("seen blocker");
+    }]);
+    await session.prompt("drain old results");
+    faux.setResponses([fauxAssistantMessage("no duplicate")]);
+    await session.prompt("drain again");
+    expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 
   it("brings a missed work event to the next turn, and only once", async () => {
@@ -210,6 +226,95 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toHaveLength(1);
   }, 60_000);
 
+  it("reconciles 50 steer-driven turns inside one real run, without duplicate inbox IDs (#4313)", async () => {
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, { persisted: true });
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 500);
+    const rootId = `session:${session.sessionManager.getSessionId()}`;
+    const key = "topology/inbox/" + createHash("sha256").update(rootId).digest("hex").slice(0, 32);
+    const cursor = () => mesh.get(key, { fresh: true })!.value as { after: number; pending?: unknown };
+    const ids = () => inboxMessages().flatMap(message => (message as { details?: { ids?: string[] } }).details?.ids ?? []);
+    const first = missedWork("held at the first inference");
+    const firstSequence = mesh.read({ after: 0, limit: 500 }).find(event => event.id === first)!.sequence;
+    let second: string, third: string, inferences = 0, settled = 0;
+    const unsubscribe = session.subscribe(event => { if (event.type === "agent_settled") settled++; });
+    try {
+      faux.setResponses(Array.from({ length: 53 }, (_, index) => async () => {
+        const turn = index + 1; inferences++;
+        expect(settled).toBe(0); // No fresh run or completed-settle escape hatch.
+        if (turn === 1) second = missedWork("later work inside the same run");
+        if (turn === 25) third = missedWork("work behind the pending followUp");
+        if (turn >= 2) expect(cursor().after).toBeGreaterThanOrEqual(firstSequence);
+        if (turn <= 50) await session.steer(`continue busy work ${turn}`);
+        if (turn <= 51) expect(ids()).toEqual([first]);
+        if (turn === 52) expect(ids()).toEqual([first, second]);
+        if (turn === 53) expect(ids()).toEqual([first, second, third]);
+        return fauxAssistantMessage(`busy turn ${turn}`);
+      }));
+      await session.prompt("keep working");
+      expect(inferences).toBe(53);
+      expect(settled).toBe(1);
+      expect(ids()).toEqual([first, second!, third!]);
+      expect(new Set(ids()).size).toBe(3);
+      expect(cursor().pending).toBeUndefined();
+    } finally { unsubscribe(); mesh.closeState(); }
+  }, 60_000);
+
+  it("redelivers a host-cancelled followUp once on the next prompt, without reload (#4313 round 2)", async () => {
+    let cancelQueued: (() => void) | undefined;
+    const { session, faux, inboxMessages, missedWork, meshRoot } = await start(100_000, false, {
+      persisted: true,
+      extensions: root => {
+        const observer = path.join(root, "cancel-inbox-followup.ts");
+        fs.writeFileSync(observer, `export default function(pi) {
+          pi.on("turn_end", () => globalThis[Symbol.for("pi-fabric.test.cancel-inbox-followup")]?.());
+        }`);
+        return [observer];
+      },
+    });
+    const cancelKey = Symbol.for("pi-fabric.test.cancel-inbox-followup");
+    const globals = globalThis as Record<symbol, unknown>;
+    globals[cancelKey] = () => cancelQueued?.();
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 500);
+    const rootId = `session:${session.sessionManager.getSessionId()}`;
+    const key = "topology/inbox/" + createHash("sha256").update(rootId).digest("hex").slice(0, 32);
+    const cursor = () => mesh.get(key, { fresh: true })!.value as { after: number; pending?: { ids: string[] } };
+    const ids = () => inboxMessages().flatMap(message => (message as { details?: { ids?: string[] } }).details?.ids ?? []);
+    const held = missedWork("held before cancellation");
+    let pending = "", cancellations = 0, inferences = 0;
+    try {
+      faux.setResponses([() => {
+        inferences++; pending = missedWork("cancel after enqueue before receipt");
+        cancelQueued = () => {
+          expect(session.agent.peekQueuedMessages().some(message => message.role === "custom" &&
+            (message as { details?: { ids?: string[] } }).details?.ids?.includes(pending))).toBe(true);
+          expect(ids()).toEqual([held]);
+          cancelQueued = undefined; cancellations++;
+          session.clearQueue(); session.agent.abort();
+        };
+        return fauxAssistantMessage("owner cancels at the turn boundary");
+      }]);
+      await session.prompt("enqueue then cancel");
+      expect(cancellations).toBe(1);
+      expect(inferences).toBe(1);
+      expect(ids()).toEqual([held]);
+      expect(cursor().pending?.ids).toEqual([pending]);
+      const newer = missedWork("newer work must not wedge behind cancellation");
+      faux.setResponses(Array.from({ length: 2 }, () => () => {
+        inferences++; return fauxAssistantMessage("processed resumed work");
+      }));
+      await session.prompt("resume without reload");
+      expect(ids()).toEqual([held, pending, newer]);
+      expect(new Set(ids()).size).toBe(3);
+      expect(inferences).toBe(3);
+      expect(cursor().pending).toBeUndefined();
+      faux.setResponses([fauxAssistantMessage("no duplicate")]);
+      await session.prompt("check once more");
+      expect(ids()).toEqual([held, pending, newer]);
+    } finally { delete globals[cancelKey]; mesh.closeState(); }
+  }, 60_000);
+
   it("turn start never re-inserts an aggregate after split inbox receipts", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(1_000, false, { warm: false });
     const identityId = `session:${session.sessionManager.getSessionId()}`;
@@ -227,12 +332,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       customType: "pi-fabric-inbox", content: `recorded ${id}`, display: true, details: { ids: [id] },
     }, { triggerTurn: false });
     expect(inboxMessages()).toHaveLength(2);
-    // Load the persisted pending batch into Fabric's real inbox. An unsuccessful warm
-    // turn must not reconcile at settle; the next before_agent_start owns the receipt.
+    // Load the persisted pending batch into Fabric's real inbox. Even an unsuccessful
+    // warm run commits confirmed work at its turn/settle boundaries, without redelivery.
     faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
       { ...fauxAssistantMessage("warm failed"), stopReason: "error", errorMessage: "test warm failure" }]);
     await session.prompt("warm");
-    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeDefined();
+    expect((mesh.get(key, { fresh: true })!.value as { pending?: unknown }).pending).toBeUndefined();
     expect(inboxMessages()).toHaveLength(2);
     faux.setResponses([fauxAssistantMessage("noted")]);
     await session.prompt("next");
@@ -270,7 +375,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     // The steer that carried work key "steered" reached the session, as Main's deliverAgent writes it.
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("Only published.");
@@ -317,8 +422,11 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       fauxAssistantMessage("mailbox followUp processed"),
     ]);
     await session.prompt("fail the stream");
-    expect(session.isStreaming).toBe(false);
+    // During-error work may already have started its one event-driven followUp
+    // when the original prompt's promise resolves. The assertions below still
+    // require exactly one inbox delivery and exactly one additional model call.
     if (timing === "after-error") {
+      expect(session.isStreaming).toBe(false);
       await sleep(300); // Mail arriving before the 1s retry can satisfy the continuation.
       expect(faux.state.callCount).toBe(calls + 1);
       missedWork("Follow up after stream disconnect.");
@@ -352,7 +460,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     faux.setResponses([fauxAssistantMessage("should not run")]);
     await session.sendCustomMessage({
       customType: "pi-fabric-agent-message", content: "Steered text.", display: true,
-      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text." } },
+      details: { id: "m1", from: { id: "session:peer", name: "main", kind: "main" }, delivery: "followUp", triggerTurn: false, data: { key: "Steered text.", topic: "fleet.work.pi-fabric.1" } },
     }, { triggerTurn: false });
     missedWork("Steered text.");
     missedWork("For everyone.", null);
@@ -361,7 +469,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(session.isStreaming).toBe(false);
   }, 60_000);
 
-  it("does not wake a busy Main: the event comes after the run settles, in a new run", async () => {
+  it("does not wake while a busy Main streams: the event joins its running loop at turn end", async () => {
     const { session, faux, inboxMessages, missedWork } = await start(40, true);
     const order: string[] = [];
     session.subscribe((event) => {
@@ -375,7 +483,8 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await session.prompt("work");
     await until(() => inboxMessages().length > 0 && !session.isStreaming);
     expect(inboxMessages()).toHaveLength(1);
-    expect(order.slice(0, 2)).toEqual(["settled", "inbox"]);
+    expect(order.slice(0, 2)).toEqual(["inbox", "settled"]);
+    expect(order.filter(item => item === "settled")).toHaveLength(1);
   }, 60_000);
 
   it("stays off after a cancelled run until the next turn starts", async () => {
@@ -415,6 +524,66 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     await until(() => inboxMessages().length > 0 && !session.isStreaming, 15_000);
     expect(inboxMessages()).toHaveLength(1);
     expect(JSON.stringify(inboxMessages()[0])).toContain("Sent right after you started.");
+  }, 60_000);
+
+  // A passive followUp records context without inference. Its receipt prevents repeated idle
+  // injection and a second copy at before_agent_start (Pi's nextTurn queue has no receipt yet).
+  const occurrences = (value: unknown, needle: string) => JSON.stringify(value).split(needle).length - 1;
+  const threeHours = 3 * 60 * 60_000;
+
+  it("queues a late answer for an idle Main's next natural turn without a model turn, and brings it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    const id = missedWork("LATE-IDLE-553 answer for Main", undefined, threeHours, "answer");
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read the late answer");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await until(() => inboxMessages().length > 0 || faux.state.callCount > calls, 5_000);
+    expect(inboxMessages()).toHaveLength(1);
+    // Many idle ticks after passive admission: no inference and no second copy.
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    expect(JSON.stringify(inboxMessages()[0])).toContain("3 h ago) LATE-IDLE-553 answer for Main");
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    faux.setResponses([fauxAssistantMessage("again")]);
+    await session.prompt("again");
+    expect(inboxMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("does not chain an inference for a late answer that arrives during a run; the next turn takes it once (#553)", async () => {
+    const { session, faux, inboxMessages, missedWork } = await start(1_000, true);
+    const calls = faux.state.callCount;
+    let id = "";
+    faux.setResponses([
+      () => { id = missedWork("LATE-SETTLE-553 answer for Main", undefined, threeHours, "answer"); return fauxAssistantMessage("working"); },
+      fauxAssistantMessage("unexpected chained turn"),
+    ]);
+    await session.prompt("work");
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(1_500);
+    expect(faux.state.callCount).toBe(calls + 1);
+    expect(session.isStreaming).toBe(false);
+    expect(inboxMessages()).toHaveLength(1);
+    let seen = -1;
+    faux.setResponses([(context) => {
+      seen = occurrences(context.messages, id);
+      return fauxAssistantMessage("read it");
+    }, fauxAssistantMessage("unexpected extra turn")]);
+    await session.prompt("next");
+    expect(faux.state.callCount).toBe(calls + 2);
+    expect(seen).toBe(1);
+    expect(inboxMessages()).toHaveLength(1);
+    await sleep(500);
+    expect(faux.state.callCount).toBe(calls + 2);
   }, 60_000);
 
   it("is inert on a Pi without the preflight capability: an idle Main takes the event at its next turn", async () => {

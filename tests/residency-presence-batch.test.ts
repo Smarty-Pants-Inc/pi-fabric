@@ -65,17 +65,35 @@ describe("#4383 resident host presence batch", () => {
     const actor = records[0]!;
     // A skip filter records real ActorManager delivery without launching a worker.
     await host.actors.setActivationFilter(actor.id, [{ id: "probe", topic: ["fleet.phase-lock"], kind: ["skip"] }]);
+    const consumable = host.participants.canConsumeMesh.bind(host.participants);
     const gate = vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(false);
     const event = await host.mesh.publish({ topic: "fleet.phase-lock", kind: "skip", to: actor.id, from: host.identity });
-    await delay(Math.max(0, heartbeatStartedAt + 5_000 - phase - Date.now()));
+    // Boot the holder before the phase point: process startup on a slow runner (hundreds of
+    // ms on Windows) must not push the first hold past the heartbeat it is meant to cover.
+    // The holder reports every acquisition, so progress is bounded in hold periods, not ms.
     const child = spawn(process.execPath, [path.resolve("tests/fixtures/hold-mesh-lock.mjs"), config.meshRoot,
-      String(hold), String(gap), "16000"], { stdio: ["ignore", "pipe", "inherit"] });
+      String(hold), String(gap), "120000", "stdin"], { stdio: ["pipe", "pipe", "inherit"] });
     const exited = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
     let holderExited = false; void exited.then(() => { holderExited = true; });
+    let holds = 0, holderOutput = "";
+    const holderSaid = (line: string) => holderOutput.split("\n").includes(line);
+    const holderLine = new Promise<void>((resolve, reject) => {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        holderOutput += chunk; holds = holderOutput.split("\n").filter(line => line === "held").length; resolve();
+      });
+      child.once("error", reject);
+    });
     try {
-      await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+      while (!holderSaid("ready")) { await holderLine; if (holderExited) throw new Error("lock holder exited before ready"); await delay(5); }
+      await delay(Math.max(0, heartbeatStartedAt + 5_000 - phase - Date.now()));
+      child.stdin.write("go\n");
+      while (holds < 1) { if (holderExited) throw new Error("lock holder exited before holding"); await delay(1); }
       const started = Date.now(), prior = host.participants.confirmedAt();
-      await delay(phase + 150); // first automatic heartbeat's 50 ms attempt must fail
+      // The first automatic heartbeat lands inside this hold and its 50 ms attempt must fail.
+      // Wait for that observable failure (bounded by the first hold), not a fixed delay
+      // that a descheduled runner can overrun before the heartbeat timer even fires.
+      while (holds === 1 && !holderExited && consumable()) await delay(5);
       gate.mockRestore();
       expect(host.actors.status(actor.id).filteredCount ?? 0).toBe(0);
       expect(host.participants.confirmedAt()).toBe(prior);
@@ -105,29 +123,33 @@ describe("#4383 resident host presence batch", () => {
           return rename(source, target);
         });
       }
-      let progressedAt = 0;
-      while (Date.now() - started < 15_000) {
-        const renewed = host.participants.confirmedAt() > started && records.every(row =>
-          readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt > started &&
-          host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.updatedAt > started);
-        if (renewed && host.actors.status(actor.id).filteredCount === 1 && host.participants.canConsumeMesh()) {
-          progressedAt = Date.now(); break;
-        }
+      let progressedAt = 0, progressedDuringHold = 0;
+      const progressed = () => host.participants.confirmedAt() > started && records.every(row =>
+        readParticipantFile(config.meshRoot, participantKey(row.id))!.updatedAt > started &&
+        host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })!.updatedAt > started) &&
+        host.actors.status(actor.id).filteredCount === 1 && host.participants.canConsumeMesh();
+      // "Within three periods" counted by the holder itself: progress must land in one of the
+      // first three gaps, i.e. before the 4th hold is reported, however slow the runner is.
+      while (holds <= 3 && !holderExited) {
+        if (progressed()) { progressedAt = Date.now(); progressedDuringHold = holds; break; }
         await delay(25);
       }
+      // Commit in the third gap may only be observed after the 4th hold is reported.
+      if (!progressedAt && progressed()) { progressedAt = Date.now(); progressedDuringHold = holds; }
       console.log(JSON.stringify({ regression: "periodic-mesh-predicates", platform: process.platform, hold, gap, phase, files,
-        admissions, batchAttempts, eventId: event.id, progressMs: progressedAt ? progressedAt - started : 0,
+        admissions, batchAttempts, eventId: event.id, progressMs: progressedAt ? progressedAt - started : 0, holds, progressedDuringHold,
         elapsedMs: Date.now() - started, confirmedAt: host.participants.confirmedAt(), started,
         renewedParticipants: records.filter(row => (readParticipantFile(config.meshRoot, participantKey(row.id))?.updatedAt ?? 0) > started).length,
         renewedEnvelopes: records.filter(row => (host.mesh.get(`actors/${config.sessionId}/${row.id}`, { fresh: true })?.updatedAt ?? 0) > started).length,
         filteredCount: host.actors.status(actor.id).filteredCount ?? 0, canConsume: host.participants.canConsumeMesh(),
         leaseAt: readHostLease(config.meshRoot, host.hostId)?.updatedAt, holderStillRunning: !holderExited }));
-      expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three periods").toBeGreaterThan(0);
+      expect(progressedAt, "committed heartbeat, all 40 envelopes and real actor-event delivery within three hold periods").toBeGreaterThan(0);
       expect(holderExited, "recovery must happen while the periodic holder continues").toBe(false);
       expect(readHostLease(config.meshRoot, host.hostId)!.updatedAt).toBeGreaterThan(started);
-    } finally { gate.mockRestore(); await exited; }
+    } finally { gate.mockRestore(); child.stdin.end(); await exited; }
+    // Exit 0: the holder released only its own receipt, so recovery never stole custody.
     expect(await exited).toBe(0);
-  }, 30000);
+  }, 90_000); // Safety net only; the assertions above are bounded in holder periods.
 
   it("reselects adopted actors after the out-of-custody admission wait", async () => {
     const { host, config, records } = await fixture();

@@ -42,7 +42,7 @@ it("a sender timeout can be followed by receiver-delivered evidence for the same
   const pi = { on: () => () => {}, sendMessage: (message: { details: unknown }) => sent.push(message) } as unknown as ExtensionAPI;
   const context = { isIdle: () => true, hasPendingMessages: () => false, signal: { aborted: false },
     sessionManager: { getEntries: () => entries } } as unknown as ExtensionContext;
-  const main = new MainAgentController(pi, "session:receiver", true, root, "receiver", true, undefined, root);
+  const main = new MainAgentController(pi, "session:receiver", true, root, "receiver", true, undefined, {}, undefined, root);
   main.attachFollowUpDrain(context, 0, path.join(root, "main-followups", "receiver.json"));
   closers.push(() => main.closeFollowUpDrain());
   const make = (id: string) => {

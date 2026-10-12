@@ -1,7 +1,13 @@
 import { isJevModelId } from "./routes.js";
+import { normalizeDecisionProfiles } from "./decision-profiles.js";
+import type { DecisionProfiles } from "./decision-types.js";
 
 export interface FabricJevConfig {
   enabled: boolean;
+  /** Trusted routing-only profiles; independent of legacy evaluate and auto approval. */
+  decisionProfiles?: DecisionProfiles;
+  /** Optional trusted selector, overriding the document default; never affects auto approval. */
+  decisionProfile?: string | null;
   model: string;
   /** Minimum Noul safety probability for Jev auto approvals (0–1). */
   autoApprovalThreshold: number;
@@ -15,6 +21,13 @@ export interface FabricJevConfig {
   maxEvaluations: number;
   maxToolCalls: number;
   maxTokens: number;
+  /**
+   * Where Jev program decisions are dispatched. `fabric` (default) is always
+   * in-process. `auto` opts into one jev-fabric `serve` connection per program
+   * run when a compatible binary is available (macOS/Linux), else in-process;
+   * `jev-fabric` requires it. Direct calls and auto approvals stay in-process.
+   */
+  transport: "auto" | "fabric" | "jev-fabric";
 }
 export const DEFAULT_JEV_CONFIG: FabricJevConfig = {
   enabled: true,
@@ -29,6 +42,7 @@ export const DEFAULT_JEV_CONFIG: FabricJevConfig = {
   maxEvaluations: 1_000,
   maxToolCalls: 10_000,
   maxTokens: 1_000_000,
+  transport: "fabric",
 };
 export function normalizeJevConfig(value: unknown): FabricJevConfig {
   const input = value && typeof value === "object" && !Array.isArray(value)
@@ -39,8 +53,14 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
       ? Math.max(min, Math.min(max, Math.floor(v))) : DEFAULT_JEV_CONFIG[key] as number;
   };
   const command = input.credentialCommand;
+  const decisionProfiles = input.decisionProfiles === undefined ? undefined : normalizeDecisionProfiles(input.decisionProfiles);
+  const decisionProfile = input.decisionProfile;
+  if (decisionProfile !== undefined && decisionProfile !== null && (typeof decisionProfile !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(decisionProfile) || !decisionProfiles || !Object.hasOwn(decisionProfiles.profiles, decisionProfile)))
+    throw new Error("jev.decisionProfile must name a known decision profile");
   return {
     enabled: typeof input.enabled === "boolean" ? input.enabled : true,
+    ...(decisionProfiles ? { decisionProfiles } : {}),
+    ...(decisionProfile === null || typeof decisionProfile === "string" ? { decisionProfile } : {}),
     // Bare aliases use the direct route; `~typesafe/...` and `typesafe/...` select OpenRouter decisions.
     model: typeof input.model === "string" && isJevModelId(input.model)
       ? input.model : DEFAULT_JEV_CONFIG.model,
@@ -58,5 +78,6 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
     maxEvaluations: integer("maxEvaluations", 100_000),
     maxToolCalls: integer("maxToolCalls", 1_000_000),
     maxTokens: integer("maxTokens", 100_000_000),
+    transport: input.transport === "auto" || input.transport === "jev-fabric" ? input.transport : "fabric",
   };
 }

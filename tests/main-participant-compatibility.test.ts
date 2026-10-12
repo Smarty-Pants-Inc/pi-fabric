@@ -97,7 +97,8 @@ describe("mixed-generation Main discovery (#409)", () => {
     const deliverAgent = vi.fn((message: unknown) => { received.push(message); return { queued: true, messageId: `received-${received.length}` }; });
     const main = (id: MeshIdentity, receive = vi.fn()) => ({ id: id.id, local: true, matches: (target: string) => target === id.id, deliverAgent: receive }) as Ports[2];
     const plane = (id: MeshIdentity) => {
-      const value = new FabricControlPlane(mesh(), id, { enabled: true, hostId: id.id, pollMs: 20, acknowledgementTimeoutMs: 2_000 });
+      const value = new FabricControlPlane(mesh(), id, { enabled: true, hostId: id.id, pollMs: 20, acknowledgementTimeoutMs: 2_000,
+        ...(id.id === upgraded.id ? { ownerIncarnation: writer.ownerIncarnation } : {}) });
       planes.push(value); return value;
     };
     const ownerControl = plane(upgraded), senderControl = plane(existing);

@@ -48,7 +48,7 @@ const inboxFixture = () => {
     type: "custom_message", customType: ROOT_INBOX_CUSTOM_TYPE,
     details: { ids },
   });
-  const carried = { from: { id: "peer" }, data: { key: " work " } };
+  const carried = { from: { id: "peer" }, data: { key: " work ", topic: " fleet.work.x " } };
   entries.push({ type: "custom_message", customType: "pi-fabric-agent-message", details: { items: [carried] } });
   const rootSession = rootInboxSession(entries);
   const session = rootSession;
@@ -75,9 +75,10 @@ describe("session-entry consumers release canonical history (smarty-dev#2177)", 
     expect(session.holdsBatch(["a", "b"])).toBe(true);
     expect(session.holdsBatch(["missing"])).toBe(false);
     if (holdsSteer) {
-      expect(holdsSteer("peer", "work")).toBe(true);
-      expect(holdsSteer("other", "work")).toBe(false);
-      expect(holdsSteer("peer", "missing")).toBe(false);
+      expect(holdsSteer("peer", "work", "fleet.work.x")).toBe(true);
+      expect(holdsSteer("peer", "work", "fleet.work.y")).toBe(false);
+      expect(holdsSteer("other", "work", "fleet.work.x")).toBe(false);
+      expect(holdsSteer("peer", "missing", "fleet.work.x")).toBe(false);
     }
   });
 

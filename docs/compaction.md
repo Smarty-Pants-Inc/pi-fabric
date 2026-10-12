@@ -55,10 +55,35 @@ boundary. When Pi's built-in threshold is lower, Fabric defers that automatic
 compaction until the model reaches its model-specific threshold. Fabric never
 defers overflow and manual compactions.
 
+## Headroom trigger
+
+`compaction.outputReserveTokens` (default `0`, disabled) keeps room for the
+next response. When it is positive, Fabric also compacts at the settled
+boundary once `contextWindow - tokens < outputReserveTokens`, independent of
+any model threshold, and it never defers Pi's own threshold compaction while
+the reserve is breached. `compact.status().lastAuto` records the last host
+compaction attempt with `trigger: "headroom" | "tokens" | "ratio"`.
+`compaction.pressureBands` (default `{ "warn": 0.6, "urgent": 0.8 }`) only
+labels `compact.pressure()`; it never triggers compaction. Both values must
+satisfy `0 < warn < urgent < 1`, or Fabric uses the defaults.
+
+```json
+{
+  "compaction": {
+    "outputReserveTokens": 16000,
+    "pressureBands": { "warn": 0.6, "urgent": 0.8 }
+  }
+}
+```
+
+See [programmatic compaction](programmatic-compaction.md#pressure) for the
+pressure reading and the persistent [carry-forward focus](programmatic-compaction.md#carry-forward-focus)
+rendered under `[Carry Forward]`.
+
 ## Invariants
 
 1. **The session log is ground truth.** The summary is a bounded continuation view with stable entry-id and file addresses.
-2. **Live cut and cumulative truth are separate.** The cut comes from the window made live by the last compaction. Fabric rebuilds the summary from every raw, typed, content-bearing entry on the supplied active branch prefix before the new kept boundary.
+2. **Live cut and cumulative truth are separate.** The cut comes from the window made live by the last compaction. Fabric rebuilds the summary from every typed, content-bearing entry on the supplied active branch prefix before the new kept boundary, after applying branch-relative `context_edit` omissions and content replacements. Abandoned recovery attempts remain addressable in raw history but never reappear in later summaries. System prompt/tool checkpoints are replayed by Pi, not selected as continuity content.
 3. **Rendered summaries are never semantic input.** `compaction` entries, branch-summary prose, custom summary prose, and unknown roles produce no normalized events. A valid Fabric branch-summary details envelope may contribute its typed facts. Its `summary` string never contributes. Top-level Pi `custom_message` entries work differently: Pi puts them in model context, so Fabric preserves their typed `customType`, text content, visibility, and bounded JSON details. `custom` state entries that bear no context remain excluded.
 4. **Structure drives projection.** The core uses entry/message types, roles, content-part types, custom-message fields, tool names, typed `fabric_exec` display fields, JSON arguments, call ids, `isError`, aggregate trace outcomes, exit codes, entry ids, ordering, valid Fabric execution traces, and valid Fabric branch-summary facts. It applies no semantic regex over prose, code, shell commands, or tool output. Whitespace normalization, bounded truncation, exact identity comparisons, and path segmentation stay mechanical.
 5. **Serialization is deterministic and bounded.** Identical branch entries and instructions produce byte-identical output. The rendered result is at most 32 KiB in UTF-8.
@@ -211,6 +236,7 @@ pointer.
 - **Recent user directions and discussion**: complete bounded user/preceding-assistant exchanges, with roles and entry IDs. This is source evidence, not an inferred current-goal declaration.
 - **Historical requests**: sampled older user requests, including the original objective once it leaves the recent window. The internal `goal` omission key remains for v2 compatibility.
 - **Compaction Request**: canonicalized, bounded custom instructions. See below.
+- **Carry Forward**: the persistent `compact.carry` list from the latest carry entry on the branch, in every summary until cleared. Protected like the request block and bounded to 3 KiB.
 - **Files And Changes**: successful typed file-tool addresses grouped as Created, Written, Modified, or Read. `edit` counts as Modified. `write` counts as Written unless a typed result explicitly proves creation.
 - **Fabric Activity**: completed named `fabric_exec` runs as bounded `name → outcome` records that place an em dash between the name and the optional description, followed in source order by phases and significant non-file nested operations, including bash, agents, workflow, mesh, state, MCP, and extension refs. Named runs expose the exact assistant call entry ID while sourced raw, and their typed fact address after branch rehydration. Nested phases and operations expose stable `entryId/subordinal` addresses. The name and outcome are mandatory for a rendered run. The optional description decays first under tighter views.
 - **Outstanding Context**: typed tool/bash failures and later exact structural resolutions. File failures require the same action and path, bash failures the same command, and generic failures the same ref and arguments. Fabric quotes explicit error text with bounds and never parses or classifies it. Trace failures use only `operation.outcome` and `operation.error`.
@@ -386,6 +412,44 @@ preserves the explicit pi-vcc sentinel and marker cooperation above. It never
 monkeypatches Pi's private runner. A deployment that requires Fabric to
 win over arbitrary hooks must load Fabric after those extensions, while
 accounting for a pi-vcc override that loads later.
+
+## Compaction ownership
+
+On `session_compact`, Fabric classifies the committed entry. Details that
+carry Fabric's own `compactor: "fabric"` tag mean `owner: "fabric"`. Any other
+extension result (`fromHook`) means `"external"`, and anything else came from
+Pi's summarizer (`"pi"`). Before the first compaction on a branch the owner is
+`"none"`. Fabric derives the value from the latest compaction entry on the
+active branch, so `compact.status()` and `compact.pressure()` report it after
+reload or restart too.
+
+When `compaction.engine` is `"fabric"` and another owner wins, Fabric emits one
+warning per session: a UI notification when available, otherwise a log line.
+It never retries, re-compacts, or otherwise contests the result. The pi-vcc
+sentinel and pi-vcc overrides that Fabric yields to on purpose do not warn. To
+make Fabric the owner, load it after other compaction extensions as described
+above, or set the engine to `"pi"` to hand compaction over deliberately.
+
+## Orphaned tool-result repair
+
+A compaction cut made by another owner, a crashed turn, or a hand-edited
+session can leave a `toolResult` without its tool call, or a tool call without
+a result. Providers reject both. With `compaction.repairOrphans` (default
+`true`), Fabric's `context` hook repairs the outgoing message list:
+
+- A `toolResult` is kept only when the nearest preceding assistant message
+  issued its `toolCallId` and no earlier result answered it. Otherwise it is
+  dropped.
+- A non-final assistant message whose tool calls have no result before the
+  next user or assistant message receives one synthetic error result per
+  missing call, `"Tool result missing (repaired by Fabric)"`, placed after the
+  results that did arrive. Assistant messages that ended in `error` or
+  `aborted` get no synthetic results, because Pi drops them before the
+  provider request.
+
+The repair changes only the request sent to the provider, never the session
+log. A list without defects is returned unchanged, with the same array
+identity, so prompt caching is unaffected.
 
 ## Reconstruction QA
 

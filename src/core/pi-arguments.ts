@@ -74,7 +74,7 @@ function createPiArgumentNormalizer() {
     grep: ["path", "glob", "ignoreCase", "literal", "context", "limit"],
     find: ["path", "limit"],
     ls: ["path", "limit"],
-    bash: ["timeout", "background"],
+    bash: ["timeout", "background", "durable"],
     powershell: ["timeout", "background"],
   };
   const __normalizePiArgs = (name: string, args: any, canonicalFields: readonly string[] = []): unknown => {
@@ -125,6 +125,8 @@ function createPiArgumentNormalizer() {
         }
       }
     }
+    // ponytail: native core optionals are nonnullable. A nullable exact-core
+    // override here would lose its null; revisit if one is ever declared.
     const optionalFields = __piOptionalFields[name];
     if (optionalFields) {
       for (const key of optionalFields) {

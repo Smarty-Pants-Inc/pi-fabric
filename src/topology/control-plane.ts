@@ -1166,8 +1166,12 @@ export class FabricControlPlane {
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
     const key = ownedKey;
-    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes.
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return;
+    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
+    // bridge delivered late (its bridged copy was published here just now, smarty-dev#9751) is not history:
+    // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
+    const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
+      now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
+    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
     const duplicate = this.#sharedClaims.has(ownedKey)

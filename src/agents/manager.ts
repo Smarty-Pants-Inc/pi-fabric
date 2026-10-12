@@ -24,6 +24,8 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+  settleLostEnodevRun } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -800,6 +802,8 @@ export class AgentManager {
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
+  #enodevRuns: string[] | undefined;
+  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
   readonly #foregroundPrepared = new Set<string>();
   readonly #pendingAbandonment = new Set<string>();
   readonly #foregroundDelivered = new Set<string>();
@@ -2295,6 +2299,8 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
+    const recovered = this.#recoverEnodevRun(request, signal, authorize);
+    if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
@@ -2879,6 +2885,80 @@ export class AgentManager {
   runningCount(): number {
     return [...this.#runs.values()].filter((managed) => !managed.settled).length +
       [...this.#queued.values()].filter((queued) => !queued.terminal).length;
+  }
+
+  /**
+   * smarty-dev#8935: a restored actor activation whose earlier run completed, but was left "execution exit
+   * unconfirmed" by the pre-pi-fabric#849 ENODEV scope observation, gets that run's saved answer instead of a rerun.
+   * The run root is scanned once per manager; each run settles at most once (settleEnodevRun).
+   */
+  // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
+  // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
+  // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
+  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
+    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (signal?.aborted || (authorize && !authorize())) return undefined;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const result = peekEnodevRun(directory, request.actorId, request.activationId);
+      if (!result) continue;
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
+      // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
+      const replay = enodevDelivered(directory, result.id, request.activationId);
+      return { ...result, enodevRecovered: true, ...(replay ? { enodevReplay: true } : {}) };
+    }
+    return undefined;
+  }
+
+  /** The actor delivered a recovered answer: its durable receipt, written before the actor acks its queue. */
+  noteEnodevDelivered(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    noteEnodevDelivered(pending.directory, runId, pending.activationId);
+    return true;
+  }
+
+  /** The actor acked the delivered activation in its queue: settle its run (terminal record, archive, marker last). */
+  commitEnodevRecovery(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    this.#enodevCommits.delete(runId);
+    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (!result) return false;
+    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#previousRuns.set(result.id, structuredClone(result));
+    this.#retentionRevision++;
+    return true;
+  }
+
+  /**
+   * smarty-dev#8935: an ENODEV-unconfirmed run of `actorId` whose activation is not in `pending` (the actor's
+   * restored queue) will never be claimed by a run request: settle it as lost once its worker is proven gone, so
+   * retention can collect it. One log line per run.
+   */
+  settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string>): void {
+    if (process.platform !== "linux") return;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const activationId = settleLostEnodevRun(directory, actorId, pending);
+      if (activationId === undefined) continue;
+      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+      this.#retentionRevision++;
+      if (enodevDelivered(directory, path.basename(directory), activationId)) {
+        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+          `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
+        continue;
+      }
+      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+        "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
+    }
+  }
+
+  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
+  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+    if (process.platform !== "linux") return { starts: 0, alarm: false };
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
   }
 
   #previousRun(id: string): AgentRunResult | undefined {

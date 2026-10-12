@@ -58,6 +58,16 @@ The gate decides from an inventory, never from what readers chose to register:
    bytes are the executed bytes. A mismatch, a symlink, no compiled digest, or no `/proc/self/fd` is
    `holder@lease-probe` (no copy, no path exec). The trust root is the installed package: a writer who
    can change the bundle can change the gate itself (smarty-dev#7800). Compiler pin: smarty-dev#8121.
+   The helper and the gate's own bundle, and every directory on their real paths up to the install root
+   (the package directory), must be owned by this user (or root), not group- or other-writable, and
+   inside that root (no symlink out of it), checked at each probe. Above the root, every ancestor up to
+   the first root-owned one that only root can change (or a root-owned sticky one, such as `/tmp`)
+   must be ours (or root) and not group- or other-writable. The operator's `bin/fabric-mesh-backend` runs
+   the same check on itself, the gate bundle and the helper BEFORE it loads the bundle, and exits 3
+   (a bundle another user swapped in would drop its own check). Otherwise it is
+   `holder@lease-probe` (smarty-dev#8145). The build strips group/other write from `dist/`, and the
+   build check refuses any such entry or symlink in `dist/`. A same-user in-place write between the hash and the exec
+   remains the accepted smarty-dev#7800 class: Node has no `memfd_create` to exec a sealed copy.
 
    The fenced window (smarty-dev#8116): under the fence the helper runs as `fabric-mesh-lease --watch`. Its
    inotify watches (the directories of `state.db`, `-wal` and `-shm`, plain and under `state-shadow/`, and

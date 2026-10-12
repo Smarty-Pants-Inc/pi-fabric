@@ -4,7 +4,7 @@ import type { FabricKernelRuntime, FabricHostCall, FabricSandboxOptions } from "
 import { QuickJsRuntime } from "./quickjs-runtime.js";
 import { BunProcessRuntime, NodeProcessRuntime } from "./node-process-runtime.js";
 import { repairFabricGuestCode } from "./guest-code-repair.js";
-import { typeCheckFabricCode } from "./type-checker.js";
+import { typeCheckFabricCode, wrapFabricGuestCode } from "./type-checker.js";
 import { guestTypeDeclarations } from "./guest-types.js";
 import { withRecordsDeclarations } from "../records/guest-types.js";
 import { buildDynamicGuestDeclarations } from "./dynamic-guest-types.js";
@@ -30,7 +30,11 @@ export class TypeScriptKernelRuntime implements FabricKernelRuntime {
     sources: FabricGuestTypeSources,
     overrides: FabricCoreOverrideTypeSource[],
     includeTypeCorrectness = false,
+    codemodeProfile: "additive" | "native" = "additive",
   ) {
+    // Native scripts are JavaScript, not repaired/type-checked TypeScript.
+    // Dispatch still validates every tool argument and applies all policy.
+    if (codemodeProfile === "native") return { code: source, checked: { errors: [], javascript: wrapFabricGuestCode(source) } };
     const code = repairFabricGuestCode(source);
     const coreOverrides = fullCodeMode
       ? buildCoreOverrideGuestDeclarations(overrides)

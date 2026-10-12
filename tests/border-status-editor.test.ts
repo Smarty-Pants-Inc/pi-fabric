@@ -1,6 +1,6 @@
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { CustomEditor } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/custom-editor.js";
 import { WorkingStatusIndicator } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/status-indicator.js";
@@ -80,6 +80,36 @@ describe("BorderStatusEditor inherits Pi's embedded working status", () => {
     editor.setWorkingStatusIndicator(undefined);
     indicator.stop();
     expect(stripTerminalSequences(editor.render(40)[0] ?? "")).toBe(piPlain());
+  });
+
+  it.each(["regular", "fullscreen"])("keeps native content, cursor and status labels with a border badge in %s", (mode) => {
+    const ui = { ...tui(), mode } as TUI;
+    const editor = new BorderStatusEditor(ui, theme, { paddingX: 0 });
+    editor.focused = true;
+    const indicator = new BorderWorkingIndicator(ui, (text) => text, "Working");
+    editor.setWorkingStatusIndicator(indicator);
+    editor.setText(scrolledDraft);
+    try {
+      for (const width of [1, 2, 8, 16, 24, 40, 80, 120]) {
+        editor.topBorderBadge = undefined;
+        const native = editor.render(width);
+        editor.topBorderBadge = (budget) => ` ${truncateToWidth("worker", budget - 2, "…")} `;
+        const decorated = editor.render(width);
+        expect(decorated.slice(1)).toEqual(native.slice(1));
+        expect(decorated.join("\n")).toContain(CURSOR_MARKER);
+        // Native content may exceed pathological one-cell widths; only the
+        // decorated border is ours, and all remaining rows match Pi exactly.
+        expect(visibleWidth(decorated[0]!)).toBeLessThanOrEqual(width);
+        if (width >= 40) {
+          // Pi collapses to spinner-only when the centered overflow label
+          // and the full status cannot both fit beside the target.
+          expect(decorated[0]).toContain("⠋");
+          if (width >= 80) expect(decorated[0]).toContain("Working");
+          expect(decorated[0]).toContain("more");
+          expect(decorated[0]).toMatch(/ worker ──$/);
+        }
+      }
+    } finally { indicator.stop(); }
   });
 
   it("paints the spinner and the label with the editor border color", () => {

@@ -230,7 +230,7 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
   });
 
-  it("--apply refuses until #7916 PR-b and changes nothing; the dry run previews and the daily sweep only reports (smarty-dev#7916)", () => {
+  it("--apply refuses until #10678 and changes nothing; the dry run previews and the daily sweep only reports (smarty-dev#7916)", () => {
     const { root, actor } = make();
     const cli = path.resolve("src/storage/retention-cli.ts");
     const runner = `const { createJiti } = require("jiti"); const { pathToFileURL } = require("node:url");
@@ -246,7 +246,7 @@ createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.string
     const prior = fs.readFileSync(report, "utf8");
     const result = spawnSync(process.execPath, ["-e", runner, root, "--apply", "--report", report], { encoding: "utf8", timeout: 60_000 });
     expect(result.status, result.stderr).toBe(2);
-    expect(result.stderr).toMatch(/--apply is disabled until smarty-dev#7916 PR-b/);
+    expect(result.stderr).toMatch(/--apply is disabled until smarty-dev#10678/);
     expect(fs.readFileSync(report, "utf8")).toBe(prior);
     expect(fs.existsSync(old)).toBe(true);
     const argv = meshRetentionSweepArgs(root, 7 * 86400000);

@@ -133,6 +133,45 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     expect(stderr.mock.calls.filter(([text]) => String(text).includes("full /proc scan"))).toHaveLength(1);
   });
 
+  it("runs the full /proc scan when the descendant walk exceeds its limit", () => {
+    const processes = new Map<number, { group: number; parent?: number }>([[100, { group: 100 }]]);
+    const children = new Map<number, number[]>();
+    const add = (pid: number, parent: number, group = 100) => {
+      processes.set(pid, { group, parent });
+      children.set(parent, [...(children.get(parent) ?? []), pid]);
+    };
+    const missing = () => Object.assign(new Error("gone"), { code: "ENOENT" });
+    const readdir = vi.spyOn(fs, "readdirSync").mockImplementation(dir => {
+      if (String(dir) === "/proc") return [...processes.keys()].map(String) as never;
+      const pid = Number(String(dir).split("/")[2]);
+      if (!processes.has(pid)) throw missing();
+      return [String(pid)] as never;
+    });
+    vi.spyOn(fs, "readFileSync").mockImplementation(file => {
+      const pid = Number(String(file).split("/")[2]);
+      const value = processes.get(pid);
+      if (!value) throw missing();
+      if (String(file).endsWith("/children")) return (children.get(pid) ?? []).join(" ");
+      const fields = Array<string>(20).fill("0");
+      fields[0] = "S"; fields[2] = String(value.group); fields[19] = `birth-${pid}`;
+      return `${pid} (fixture) ${fields.join(" ")}`;
+    });
+    const group = executionGroup(Object.assign(new EventEmitter(), { pid: 100 }) as unknown as ChildProcess);
+    const scans = () => readdir.mock.calls.filter(([dir]) => String(dir) === "/proc").length;
+    // A normal tree is fully covered by the walk: no host-wide scan.
+    for (let pid = 101; pid <= 110; pid++) add(pid, 100);
+    expect(group.members().sort((a, b) => a - b)).toEqual([100, ...Array.from({ length: 10 }, (_, i) => 101 + i)]);
+    expect(scans()).toBe(0);
+    // More than 4096 reachable descendants: the walk is partial, so members()
+    // must fall back to the full scan and report every member.
+    for (let pid = 1000; pid < 6000; pid++) add(pid, 100 + (pid % 10) + 1);
+    for (let pid = 9000; pid < 9010; pid++) add(pid, 1, 9000);
+    const all = group.members();
+    expect(scans()).toBe(1);
+    expect(all).toHaveLength(5011);
+    expect(new Set(all)).toEqual(new Set([...processes].filter(([, row]) => row.group === 100).map(([pid]) => pid)));
+  });
+
   it("refuses a group whose recorded member moved to a foreign group", () => {
     const { processes, group, kill } = setup();
     processes.set(100, { started: "leader-birth", group: 200 });

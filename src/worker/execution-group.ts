@@ -48,8 +48,10 @@ const childrenOf = (pid: number): number[] => {
   });
 };
 
-/** Every live process reachable from roots by parent links (roots included). */
-const descendants = (roots: Iterable<number>): Member[] => {
+/** Every live process reachable from roots by parent links (roots included).
+ * truncated is true when WALK_LIMIT stopped the walk with unvisited pids still
+ * queued: members is then a partial view and must never be treated as complete. */
+const descendants = (roots: Iterable<number>): { members: Member[]; truncated: boolean } => {
   const seen = new Set<number>();
   const found: Member[] = [];
   const queue = [...roots];
@@ -62,7 +64,7 @@ const descendants = (roots: Iterable<number>): Member[] => {
     found.push(value);
     queue.push(...childrenOf(pid));
   }
-  return found;
+  return { members: found, truncated: queue.some(pid => !seen.has(pid)) };
 };
 
 /** The legacy host-wide scan: every process on the host. Only used as the
@@ -115,11 +117,13 @@ export const executionGroup = (child: ChildProcess) => {
     else {
       // Walk the leader's tree plus every member seen last time, so an orphan
       // already recorded stays tracked after reparenting out of that tree.
-      current = inGroup(descendants([pid, ...previous]));
-      // A vanished member may have orphaned unrecorded children, and an empty
-      // walk is about to latch: only then confirm with one host-wide scan.
+      const walk = descendants([pid, ...previous]);
+      current = inGroup(walk.members);
+      // A vanished member may have orphaned unrecorded children, an empty walk
+      // is about to latch, and a walk cut off at WALK_LIMIT omitted members:
+      // only then confirm with one host-wide scan. Never trust a partial walk.
       const now = new Set(current.map(value => value.pid));
-      if (!current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());
+      if (walk.truncated || !current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());
     }
     previous = new Set(current.map(value => value.pid));
     if (!current.length) { empty = true; return []; }

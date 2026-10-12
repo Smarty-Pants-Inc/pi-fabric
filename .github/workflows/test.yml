@@ -107,6 +107,13 @@ jobs:
         env:
           FABRIC_8742_REAL_PI: '1'
         run: bunx vitest run tests/main-provider-dead-real-pi.test.ts
+      - name: Real Pi sender headers (smarty-dev#6207)
+        # A real Pi process (RPC mode) loads the built dist/; a Main request and its process child's request
+        # reach a local stub that records the HTTP headers: X-Smarty-* on the wire, once, never caller-set.
+        if: runner.os == 'Linux'
+        env:
+          FABRIC_6207_REAL_PI: '1'
+        run: bunx vitest run tests/sender-headers-real-pi.test.ts
       # smarty-dev#8953: agents.processSlice runs workers in systemd --user scopes. GitHub-hosted ubuntu boots
       # systemd as PID 1 but starts no user manager for the runner: linger starts one, with its session bus.
       - name: Start a user systemd manager

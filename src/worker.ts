@@ -54,6 +54,7 @@ import { syncPathNamespace } from "./core/atomic-write.js";
 import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
+import { senderHeaderHookPath } from "./guards/sender-headers.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -182,6 +183,22 @@ const loadVedaCli = async (): Promise<VedaCliModule> => {
   return import(sourceModulePath) as Promise<VedaCliModule>;
 };
 
+/**
+ * Every runner whose child is Pi: the pi CLI (or Fabric's task entry) and the pi-durable SDK
+ * worker, which loads each explicit -e path into its session's extension list.
+ */
+const PI_BACKED_RUNNERS: ReadonlySet<string> = new Set(["pi", "pi-durable"]);
+/**
+ * smarty-dev#6207: the one launch rule for the sender-header hook. Every Pi-backed child names
+ * its sender, also with --no-extensions (an explicit -e still loads). The Main's own hook skips
+ * worker children, so a runner missing here would send no sender headers at all.
+ */
+const senderHeaderHookArguments = (runner: string): string[] => {
+  if (!PI_BACKED_RUNNERS.has(runner)) return [];
+  const hookPath = senderHeaderHookPath(import.meta.url);
+  if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
+  return ["-e", hookPath];
+};
 const MAX_STDERR_CHARS = 20_000;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
@@ -342,7 +359,7 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
-  const isPi = options.runner === "pi" || options.runner === "pi-durable";
+  const isPi = PI_BACKED_RUNNERS.has(options.runner);
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
         file: options.sessionExportFile,
@@ -564,6 +581,8 @@ const main = async (): Promise<void> => {
     // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
+  // smarty-dev#6207: one rule for every Pi-backed runner (pi CLI or task entry, pi-durable SDK worker).
+  piArguments.push(...senderHeaderHookArguments(options.runner));
   if (options.writePolicy) {
     // The guard loads even with --no-extensions; other runners cannot enforce it.
     if (!isPi) throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);
@@ -651,7 +670,7 @@ const main = async (): Promise<void> => {
   // A task child has its own identity and reply contract, not its actor parent's.
   for (const key of ["PI_FABRIC_ACTOR_ID", "PI_FABRIC_ACTOR_NAME", "PI_FABRIC_ACTOR_SESSION_FILE",
     "PI_FABRIC_REPLY_SCHEMA_FILE", "PI_FABRIC_REPLY_FILE", "PI_FABRIC_REPLY_HOOK",
-    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN"]) {
+    "PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_KIND", "PI_FABRIC_SPAWNER_RUN", "PI_FABRIC_SPAWNER_NAME"]) {
     delete childEnvironment[key];
   }
   // A nested explicit-model task must never inherit its parent's route attribution.
@@ -727,6 +746,7 @@ const main = async (): Promise<void> => {
         PI_FABRIC_SPAWNER_KIND: options.spawner.kind,
         PI_FABRIC_SPAWNER_RUN: options.spawner.runId ?? "",
       } : {}),
+      ...(options.spawnerName ? { PI_FABRIC_SPAWNER_NAME: options.spawnerName } : {}),
       ...(options.mainAgentId ? { PI_FABRIC_MAIN_AGENT_ID: options.mainAgentId } : {}),
       ...(options.fabricSessionId ? { PI_FABRIC_SESSION_ID: options.fabricSessionId } : {}),
       PI_FABRIC_GRANTED_RISKS: options.grantedRisks.join(","),

@@ -392,6 +392,8 @@ export interface AgentWorkerOptions {
   fullCodeMode: boolean;
   mainAgentId?: string;
   spawner?: AgentSpawner;
+  /** The spawner's own sender name (smarty-dev#6207), sent as X-Smarty-Spawner. */
+  spawnerName?: string;
   fabricSessionId?: string;
   extensions: boolean;
   tools: string[];

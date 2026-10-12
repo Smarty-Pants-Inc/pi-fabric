@@ -4,9 +4,10 @@ import path from "node:path";
 import { jetstreamManager, StorageType } from "@nats-io/jetstream";
 import { createAccount, fromSeed } from "@nats-io/nkeys";
 import { connect, credsAuthenticator, type NatsConnection } from "@nats-io/transport-node";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  freeLoopbackPort, initLocalNats, localSystemCreds, mintLocalNatsUser, mintNatsUser, natsOrgAccountJwt, pushNatsAccountJwt,
+  freeLoopbackPort, initLocalNats, localSystemCreds, mintLocalNatsUser, mintNatsUser, natsOrgAccountJwt, natsServerConfig, pushNatsAccountJwt,
   revokeLocalNatsUsers, startLocalNatsServer, type LocalNatsInit, type LocalNatsServer, type NatsAccountKeys,
 } from "../src/mesh/nats-auth.js";
 import { closeNatsStateBackend, MAX_MESSAGE_BYTES, natsStreamName, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
@@ -223,6 +224,62 @@ describe.skipIf(!available || !built)(`pi-fabric nats, real bin, single machine$
       const exited = new Promise(resolve => serve.once("exit", resolve));
       serve.kill("SIGTERM");
       await exited;
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+// T1, the route part on loopback (design Q5): two nodes route over mutual TLS with known-URL checking; a third node with a
+// certificate from the SAME CA but a name that is not in the known route URLs cannot join. Every listener is 127.0.0.1.
+const openssl = (() => {
+  try { return (createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process")).spawnSync("openssl", ["version"]).status === 0; }
+  catch { return false; }
+})();
+describe.skipIf(!available || !openssl)(`T1 route mTLS on loopback${available && openssl ? "" : " (skipped: needs NATS_BIN and openssl)"}`, () => {
+  it("two known nodes route; a node with a valid CA certificate but an unknown name is refused as a route", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-routes-"));
+    const servers: LocalNatsServer[] = [];
+    try {
+      const ssl = (...args: string[]) => { const run = spawnSync("openssl", args, { cwd: work, encoding: "utf8" }); if (run.status !== 0) throw new Error(run.stderr); };
+      ssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1", "-subj", "/CN=test-ca");
+      const cert = (name: string, dns: string) => {
+        fs.writeFileSync(path.join(work, `${name}.ext`), `subjectAltName=DNS:${dns}\nextendedKeyUsage=serverAuth,clientAuth\n`);
+        ssl("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`, "-subj", `/CN=${dns}`);
+        ssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem`, "-days", "1", "-extfile", `${name}.ext`);
+        return { certFile: path.join(work, `${name}.pem`), keyFile: path.join(work, `${name}.key`), caFile: path.join(work, "ca.pem") };
+      };
+      const ports = await Promise.all(Array.from({ length: 9 }, () => freeLoopbackPort()));
+      const local = initLocalNats({ dir: path.join(work, "keys"), org: "route-test", env: {} });
+      const operatorJwt = fs.readFileSync(path.join(local.dir, "operator.jwt"), "utf8").trim();
+      const config = fs.readFileSync(local.configFile, "utf8");
+      const preload = Object.fromEntries([...config.matchAll(/^ {2}(A[A-Z2-7]{55}): "([^"]+)"$/gm)].map(match => [match[1]!, match[2]!]));
+      const start = async (name: string, client: number, http: number, route: number, routes: string[], tls: ReturnType<typeof cert>) => {
+        const dir = path.join(work, name);
+        fs.mkdirSync(path.join(dir, "jwt"), { recursive: true });
+        const file = path.join(dir, "nats.conf");
+        fs.writeFileSync(file, natsServerConfig({ serverName: name, listen: `127.0.0.1:${client}`, http: `127.0.0.1:${http}`, operatorJwt,
+          systemAccount: local.systemAccount, resolverDir: path.join(dir, "jwt"), preload, jetstreamDir: path.join(dir, "js"),
+          cluster: { name: "fabric-test", listen: `127.0.0.1:${route}`, routes, tls } }));
+        const node = await startLocalNatsServer({ binary: binary!, configFile: file, url: `nats://127.0.0.1:${client}`, httpUrl: `http://127.0.0.1:${http}`, ready: "server" });
+        servers.push(node);
+        return node;
+      };
+      // Route pooling opens several routes per peer: count the distinct peer names.
+      const peers = async (node: LocalNatsServer): Promise<string[]> => [...new Set((((await (await fetch(new URL("/routez", node.httpUrl))).json()) as
+        { routes?: { remote_name?: string }[] }).routes ?? []).map(route => route.remote_name ?? "?"))].sort();
+      const [c1, h1, r1, c2, h2, r2, c3, h3, r3] = ports as [number, number, number, number, number, number, number, number, number];
+      const n1 = await start("n1", c1, h1, r1, [`tls://localhost:${r2}`], cert("n1", "localhost"));
+      const n2 = await start("n2", c2, h2, r2, [`tls://localhost:${r1}`], cert("n2", "localhost"));
+      await vi.waitFor(async () => { expect(await peers(n1)).toEqual(["n2"]); }, { timeout: 15_000, interval: 200 });
+      // The rogue: same CA, a name no known route URL has. It dials n1 and n2; both must refuse it.
+      const rogue = await start("rogue", c3, h3, r3, [`tls://localhost:${r1}`, `tls://localhost:${r2}`], cert("rogue", "rogue.invalid"));
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+      expect(await peers(rogue)).toEqual([]);
+      expect(await peers(n1)).toEqual(["n2"]);
+      expect(await peers(n2)).toEqual(["n1"]);
+    } finally {
+      for (const node of servers) await node.stop();
       fs.rmSync(work, { recursive: true, force: true });
     }
   }, 60_000);

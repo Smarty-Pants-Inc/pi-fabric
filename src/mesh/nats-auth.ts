@@ -427,7 +427,9 @@ export const freeLoopbackPort = (): Promise<number> => new Promise((resolve, rej
  * Starts `nats-server -c <config>` as a child (the embedded single node) and waits until its monitoring endpoint
  * answers. The config's listeners decide the bind address: `initLocalNats` writes 127.0.0.1 only. `stop()` ends it.
  */
-export const startLocalNatsServer = async (input: { binary: string; configFile: string; url: string; httpUrl: string; timeoutMs?: number }): Promise<LocalNatsServer> => {
+export const startLocalNatsServer = async (input: { binary: string; configFile: string; url: string; httpUrl: string; timeoutMs?: number;
+  /** "server": up and answering, before JetStream has a cluster quorum (a cluster node starting alone). Default: healthy. */
+  ready?: "healthy" | "server" }): Promise<LocalNatsServer> => {
   const child = spawn(input.binary, ["-c", input.configFile], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString("utf8")).slice(-4_000); });
@@ -437,7 +439,7 @@ export const startLocalNatsServer = async (input: { binary: string; configFile: 
   for (;;) {
     if (child.exitCode !== null) throw new Error(`nats-server exited ${child.exitCode}: ${stderr}`);
     try {
-      const response = await fetch(new URL("/healthz", input.httpUrl), { signal: AbortSignal.timeout(500) });
+      const response = await fetch(new URL(input.ready === "server" ? "/varz" : "/healthz", input.httpUrl), { signal: AbortSignal.timeout(500) });
       if (response.ok) break;
     } catch { /* not up yet */ }
     if (Date.now() > deadline) { await stop(); throw new Error(`nats-server did not become healthy: ${stderr}`); }

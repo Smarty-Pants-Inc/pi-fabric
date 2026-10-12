@@ -205,6 +205,25 @@ const sweep = async (meshRoot: string, options: {
   };
   if (gate()) return { dryRun, changes, removedRuns, bytesBefore: 0, bytesAfter: 0, skipped: [{ path: meshRoot, reason: halted! }] };
   const actorsRoot = path.join(meshRoot, "actors");
+  // #9160: each direct actors/ entry's lstat type, dev and ino (never mtime: actor activity must not stop the sweep),
+  // taken before discovery so a swap during or after the walk differs. undefined: unknown listing or stat (fail closed).
+  const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
+  const entries = (): Map<string, string> | undefined => {
+    try {
+      if (absent(actorsRoot)) return new Map();
+      return new Map(fs.readdirSync(actorsRoot).map(name => {
+        const stat = fs.lstatSync(path.join(actorsRoot, name));
+        return [name, `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`] as const;
+      }));
+    } catch { return undefined; }
+  };
+  let listing = entries();
+  if (!listing) throw new Error(`Actor references are uncertain: ${actorsRoot}`);
+  // First identity ever seen per name, never dropped: a same-named entry that differs (even after a removal the
+  // re-walk accepted) stops the sweep. Only new names may be absorbed by a re-walk.
+  const identities = new Map(listing);
+  const replaced = (current: Map<string, string>): boolean =>
+    [...current].some(([name, identity]) => identities.has(name) && identities.get(name) !== identity);
   discover(actorsRoot);
   // pi-fabric#645 review round 4: every final pre-delete check re-discovers the registry roots. A root
   // created (or removed) since discovery may hold a cross-root reference the reread of `registries`
@@ -221,25 +240,34 @@ const sweep = async (meshRoot: string, options: {
   // a directory's mtime need not change. A changed listing re-walks the whole tree, as before (pi-fabric#645 round 4).
   const rootSet = (roots: readonly string[]) => [...roots].sort().join("\0");
   const discovered = rootSet(registries);
-  const names = (): string => { try { return fs.readdirSync(actorsRoot).sort().join("\0"); } catch { return "\0unreadable"; } };
+  const nameSet = (map: Map<string, string>): string => [...map.keys()].sort().join("\0");
   const unregistered = (): string[] => [actorsRoot, ...(() => { try { return fs.readdirSync(actorsRoot); } catch { return []; } })()
     .map(name => path.join(actorsRoot, name))].filter(directory => !registries.includes(directory) && ownedStat(directory)?.isDirectory());
-  let listing = names();
   let watch = unregistered();
   let rootsChanged = false;
   const registryRootsChanged = (): boolean => {
     if (rootsChanged) return true;
     let changed: string | undefined = watch.some(directory => fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false }) !== undefined)
       ? "an actors.json appeared" : undefined;
-    if (!changed && names() !== listing) {
+    const current = changed ? undefined : entries();
+    if (!changed && !current) changed = "the actors listing is unknown";
+    else if (!changed && replaced(current!)) changed = "an actors entry changed type or identity";
+    else if (!changed && nameSet(current!) !== nameSet(listing!)) {
       // A name came or went: re-walk, and accept it only when the registry roots are exactly the discovered ones.
       // The listing is taken before the walk: a name added during it differs again at the next check.
-      const before = names();
-      try {
-        const found: string[] = []; discover(actorsRoot, 0, found);
-        if (rootSet(found) !== discovered) changed = "a registry root came or went";
-      } catch (error) { changed = `uncertain: ${(error as Error).message}`; }
-      if (!changed) { listing = before; watch = unregistered(); registryRewalks++; }
+      const before = entries();
+      if (!before) changed = "the actors listing is unknown";
+      else if (replaced(before)) changed = "an actors entry changed type or identity";
+      else {
+        try {
+          const found: string[] = []; discover(actorsRoot, 0, found);
+          if (rootSet(found) !== discovered) changed = "a registry root came or went";
+        } catch (error) { changed = `uncertain: ${(error as Error).message}`; }
+        if (!changed) {
+          listing = before; watch = unregistered(); registryRewalks++;
+          for (const [name, identity] of before) if (!identities.has(name)) identities.set(name, identity);
+        }
+      }
     }
     if (changed) {
       rootsChanged = true;

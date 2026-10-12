@@ -18,21 +18,29 @@ const roots: string[] = [];
 afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
 
 type Model = { provider: string; id: string; api: string; contextWindow: number };
-type Step = { op: "dispatch"; model?: Partial<Model>; payload: Record<string, unknown>; replace?: Record<string, unknown> }
-  | { op: "report"; model?: Partial<Model>; usage?: Record<string, number>; stopReason?: string; tools?: boolean };
+// mutate: the awaited callback edits payload.input[at] in place (creating it when absent) and returns undefined.
+type Step = { op: "dispatch"; model?: Partial<Model>; payload: Record<string, unknown>; replace?: Record<string, unknown>;
+  mutate?: { at: number; set: Record<string, unknown> } }
+  | { op: "report"; model?: Partial<Model>; usage?: Record<string, number>; stopReason?: string; tools?: boolean; content?: unknown[] };
 
 const M: Model = { provider: "p", id: "m", api: "openai-responses", contextWindow: W };
 // 40,000 opaque chars: 11.4k (3.5) / 10k (4) tokens by characters, above the window, but billed by provider usage.
 const C = "gAAAAA" + Array.from({ length: 39_994 }, (_, i) => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[(i * 7919) % 64]).join("");
+const C2 = "gAAAAB" + C.slice(6); // another 40,000-char ciphertext
+const R = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: C };
+const R2 = { type: "reasoning", id: "rs_2", summary: [], encrypted_content: C2 };
+const U = { role: "user", content: "SMALL" };
 const base = (extra: Record<string, unknown> = {}, user = "SMALL") => ({ model: "m", input: [
-  { role: "user", content: user }, { type: "reasoning", id: "rs_1", summary: [], encrypted_content: C }], ...extra });
+  { role: "user", content: user }, R], ...extra });
 const usage = (total: number) => ({ input: total - 100, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: total });
 const report = (total: number, rest: Partial<Extract<Step, { op: "report" }>> = {}): Step => ({ op: "report", usage: usage(total), ...rest });
 const x = (chars: number) => "x".repeat(chars);
-// A first ordinary request carries no opaque reasoning; only its valid same-model report may anchor the next
-// request that replays opaque ciphertext. seed dispatches 2 (small, then the anchored opaque base).
+// A native Responses thinking block: thinkingSignature is the JSON reasoning output item (shared adapter).
+const sig = (item: unknown) => ({ type: "thinking", thinking: "", thinkingSignature: typeof item === "string" ? item : JSON.stringify(item) });
+// A first ordinary request carries no opaque reasoning; its valid same-model report (whose response emitted R,
+// already counted in its usage) anchors the next request that replays R. seed dispatches 2 (small, then base).
 const small = (extra: Record<string, unknown> = {}) => ({ model: "m", input: [{ role: "user", content: "SMALL" }], ...extra });
-const seed = (): Step[] => [{ op: "dispatch", payload: small() }, report(3_000), { op: "dispatch", payload: base() }];
+const seed = (): Step[] => [{ op: "dispatch", payload: small() }, report(3_000, { content: [sig(R)] }), { op: "dispatch", payload: base() }];
 
 function run(steps: Step[]) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-usage-"));
@@ -65,10 +73,12 @@ function run(steps: Step[]) {
       if (step.op === 'dispatch') {
         await handlers.get('before_provider_headers')({}, ctx);
         // The callback (after the native before_provider_request chain) may replace the payload.
-        await provider.streamSimple(model, {messages: [], payload: step.payload},
-          {onPayload: async payload => step.replace ?? undefined});
+        await provider.streamSimple(model, {messages: [], payload: step.payload}, {onPayload: async payload => {
+          if (step.mutate) Object.assign(payload.input[step.mutate.at] ??= {}, step.mutate.set);
+          return step.replace ?? undefined;
+        }});
       } else {
-        await handlers.get('turn_end')({type: 'turn_end', toolResults: [], message: {role: 'assistant', content: [],
+        await handlers.get('turn_end')({type: 'turn_end', toolResults: [], message: {role: 'assistant', content: step.content ?? [],
           provider: model.provider, model: model.id, api: model.api, stopReason: step.stopReason ?? 'stop', usage: step.usage, timestamp: 1}});
       }
     }
@@ -165,6 +175,56 @@ describe("activation window provider-usage anchor (smarty-dev#10560)", () => {
     // Two admissions in one turn (a side request) make the pairing ambiguous: the report is ignored.
     refuses(run([{ op: "dispatch", payload: small() }, { op: "dispatch", payload: small() }, report(3_000), grow]), 2);
     admits(run([{ op: "dispatch", payload: small() }, { op: "dispatch", payload: small() }, report(3_000), visible]), 3);
+  }, GUARD_MS);
+
+  it("R3: charges in full opaque reasoning the trusted report does not cover", () => {
+    // Audit R3 counterexample: valid 3,000 report with an explicitly empty output inventory, then the awaited
+    // callback replaces the request with 40,000 new ciphertext chars (full estimate ~11.4k > 8k).
+    const r = run([{ op: "dispatch", payload: small() }, report(3_000, { content: [] }), { op: "dispatch", payload: small(), replace: base() }]);
+    refuses(r, 1);
+    expect(r.refusal.tokens).toBeGreaterThan(W);
+    // An earlier transform (provider-built payload) adding uncovered ciphertext.
+    refuses(run([{ op: "dispatch", payload: small() }, report(3_000, { content: [] }), { op: "dispatch", payload: base() }]), 1);
+    const after = [...seed(), report(3_000, { content: [] })];
+    for (const step of [
+      { replace: { model: "m", input: [U, { ...R, encrypted_content: C2 }] } }, // replaced ciphertext, same id
+      { mutate: { at: 1, set: { encrypted_content: C2 } } }, // in-place ciphertext mutation
+      { mutate: { at: 1, set: { id: "rs_9" } } }, // re-identified covered ciphertext
+      { replace: { model: "m", input: [U, R, R] } }, // duplicated covered item (one covered occurrence)
+      { mutate: { at: 2, set: R } }, // in-place appended copy
+      // The same changes made before the callback (earlier transform / native payload), identity callback.
+      { payload: { model: "m", input: [U, { ...R, id: "rs_9" }] } },
+      { payload: { model: "m", input: [U, R, R] } },
+      { payload: { model: "m", input: [U, { ...R, encrypted_content: C2 }] } },
+    ]) refuses(run([...after, { op: "dispatch", payload: base(), ...step }]), 2);
+    // Two output parts naming the same native item cover one occurrence, not two replayed copies.
+    refuses(run([{ op: "dispatch", payload: small() }, report(3_000, { content: [sig(R), sig(R)] }),
+      { op: "dispatch", payload: { model: "m", input: [U, R, R] } }]), 1);
+    // Malformed or unqualified signatures, or a non-thinking block, create no coverage.
+    for (const block of [sig("not json"), sig("null"), sig({ type: "reasoning", id: "rs_1" }), sig({ ...R, type: "message" }),
+      { type: "text", text: "", thinkingSignature: JSON.stringify(R) }]) {
+      refuses(run([{ op: "dispatch", payload: small() }, report(3_000, { content: [block] }), { op: "dispatch", payload: base() }]), 1);
+    }
+    // An untrusted report's output inventory is ignored.
+    for (const bad of [report(3_000, { stopReason: "error", content: [sig(R)] }), report(0, { content: [sig(R)] }),
+      report(3_000, { model: { id: "m2" }, content: [sig(R)] })]) {
+      refuses(run([{ op: "dispatch", payload: small() }, bad, { op: "dispatch", payload: base() }]), 1);
+    }
+  }, GUARD_MS);
+
+  it("admits fresh provider reasoning and its byte-exact replay on all three Responses APIs", () => {
+    for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) {
+      const r = run([{ op: "dispatch", model: { api }, payload: small() }, report(3_000, { model: { api }, content: [sig(R)] }),
+        { op: "dispatch", model: { api }, payload: base() }]);
+      admits(r, 2);
+      expect(r.sent[1]).toBe(JSON.stringify(base()));
+    }
+    // Multi-turn history: R covered by the dispatched input, R2 by the next response's output; identity callback.
+    const both = { model: "m", input: [U, R, U, R2] };
+    const r = run([...seed(), report(3_000, { content: [sig(R2)] }), { op: "dispatch", payload: both },
+      report(3_000, { content: [] }), { op: "dispatch", payload: both, replace: both }]);
+    admits(r, 4);
+    for (const body of r.sent.slice(2)) expect(body).toBe(JSON.stringify(both));
   }, GUARD_MS);
 
   it("keeps a no-tool answer's report for a later continuation request", () => {

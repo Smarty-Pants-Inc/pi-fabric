@@ -474,6 +474,8 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
+
 export interface FabricMeshConfig {
   /** Host-only; warn admits legacy senders, enforce requires a captured destination epoch. */
   controlIncarnationFence: MeshControlIncarnationFence;
@@ -489,6 +491,8 @@ export interface FabricMeshConfig {
   maxEventBytes: number;
   maxReadEvents: number;
   actorPollMs: number;
+  /** Exit a dead-root resident after this long with no actors or requests; 0 disables. */
+  residentIdleExitMs: number;
   /** Explicit background observational age; 1 s runtime floor, never ordinary authority reads. */
   idleReadCoalesceMs: number;
   /** Admission window for commands routed over a mesh bridge, minimum 30 s. */
@@ -813,6 +817,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     maxEventBytes: 256 * 1024,
     maxReadEvents: 500,
     actorPollMs: 250,
+    residentIdleExitMs: RESIDENT_IDLE_EXIT_MS,
     idleReadCoalesceMs: 5_000,
     bridgeControlTimeoutMs: 30_000,
     actorQueueLimit: 32,
@@ -1731,6 +1736,9 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.mesh.actorPollMs,
         50,
         10_000,
+      ),
+      residentIdleExitMs: boundedInteger(
+        mesh.residentIdleExitMs, DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs, 0, 7 * 24 * 60 * 60_000,
       ),
       idleReadCoalesceMs: boundedInteger(
         mesh.idleReadCoalesceMs,

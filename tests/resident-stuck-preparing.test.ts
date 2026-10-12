@@ -56,7 +56,7 @@ describe("resident host stuck-preparing notice (smarty-dev#6337)", () => {
       await new Promise((resolve) => setTimeout(resolve, 2_500));
       expect(stuck()).toHaveLength(1);
       const lines = fs.readFileSync(stuckPreparingPath(config.meshRoot), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      expect(lines).toEqual([expect.objectContaining({ actorId: actor.id, actorName: "stuck-advisor", rootId: config.rootId })]);
+      expect(lines).toEqual([expect.objectContaining({ actorId: actor.id, actorName: "stuck-advisor", rootId: config.rootId, waitedMs: 0, queued: 0 })]);
       release();
       await waitFor(() => host.actors.status(actor.id).status === "idle" && host.actors.inFlightCount() === 0);
     } finally {

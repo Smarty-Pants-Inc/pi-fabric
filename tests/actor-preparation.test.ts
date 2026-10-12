@@ -26,7 +26,8 @@ const deferred = <T>() => {
   return { promise, resolve };
 };
 type Options = NonNullable<ConstructorParameters<typeof ActorManager>[6]>;
-const setup = (options: Options = {}, maxConcurrent = 20, agentOptions: NonNullable<ConstructorParameters<typeof AgentManager>[2]> = {}) => {
+const setup = (options: Options = {}, maxConcurrent = 20, agentOptions: NonNullable<ConstructorParameters<typeof AgentManager>[2]> = {},
+  meshOptions: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-preparation-"));
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent }, {
@@ -34,7 +35,7 @@ const setup = (options: Options = {}, maxConcurrent = 20, agentOptions: NonNulla
   });
   const notices: string[] = [];
   const actors = new ActorManager("preparation", { id: "session:preparation", name: "main", kind: "main" }, mesh,
-    { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, (delivery) => {
+    { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, ...meshOptions }, agents, (delivery) => {
       if (delivery.message.source === "fabric-host") notices.push(delivery.message.text ?? "");
     },
     { actorRoot: path.join(root, "actors"), persistent: true, preparationTimeoutMs: 80, preparationRetryMs: 60, ...options });
@@ -905,19 +906,22 @@ describe("stuck preparing owner notice (smarty-dev#6337)", () => {
   // Only the reporting tick runs on the fake clock: activation persistence uses
   // synchronous lock deadlines that a frozen Date would never reach.
   const at = (ms: number) => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(ms); };
-  const stuckSetup = async (name: string) => {
+  // Jumps the clock but keeps it moving, so activation transitions can run on it.
+  const jump = (ms: number) => { vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true }); vi.setSystemTime(ms); };
+  const readMetrics = (root: string) => {
+    const file = path.join(root, "mesh", "metrics", "stuck-preparing.jsonl");
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
+  };
+  const stuckSetup = async (name: string, meshOptions: Partial<typeof DEFAULT_FABRIC_CONFIG.mesh> = {}) => {
     let gate = deferred<void>();
     let stalled = false;
     // A binding that never resolves and no 30 s deadline: the activation stays in preparing.
     const s = setup({ preparationTimeoutMs: 24 * 60 * MIN,
-      resolvePiModel: (model) => stalled ? gate.promise.then(() => model) : model });
+      resolvePiModel: (model) => stalled ? gate.promise.then(() => model) : model }, 20, {}, meshOptions);
     cleanups.push(async () => { vi.useRealTimers(); gate.resolve(); });
     const actor = await s.actors.create({ name, model: "provider/test", instructions: "Reply", responseMode: "text", coalesce: false });
     const stuck = () => s.notices.filter((text) => text.includes("stuck in preparing"));
-    const metrics = () => {
-      const file = path.join(s.root, "mesh", "metrics", "stuck-preparing.jsonl");
-      return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
-    };
+    const metrics = () => readMetrics(s.root);
     const begin = async (): Promise<number> => {
       s.actors.tell(actor.id, "work");
       stalled = true;
@@ -985,5 +989,65 @@ describe("stuck preparing owner notice (smarty-dev#6337)", () => {
       expect.stringContaining(`stuck in preparing for 12 min (since ${new Date(second).toISOString()})`),
     ]);
     expect(s.metrics()).toHaveLength(2);
+  });
+
+  // Review P2 on #580: the clock accrues across phase transitions, and an admission-permit
+  // wait pauses it, so a permit wait alone never sends the notice.
+  it("counts preparation across phases but never the admission-permit wait", async () => {
+    const binding = deferred<void>();
+    const launch = deferred<void>();
+    let stallBinding = false;
+    const s = setup({ preparationTimeoutMs: 24 * 60 * MIN,
+      resolvePiModel: (model) => stallBinding ? binding.promise.then(() => model) : model }, 1, {
+      preparePiModel: async (model) => { if (model === "provider/stalled") await launch.promise; return model; } });
+    cleanups.push(async () => { vi.useRealTimers(); binding.resolve(); launch.resolve(); });
+    const blocker = await s.agents.spawn({ task: "HANG", model: "provider/healthy" });
+    cleanups.push(async () => { await s.agents.stop(blocker.id).catch(() => undefined); });
+    const actor = await s.actors.create({ name: "permit-prep", model: "provider/stalled", instructions: "Reply", responseMode: "text", coalesce: false });
+    const stuck = () => s.notices.filter((text) => text.includes("stuck in preparing"));
+    stallBinding = true;
+    s.actors.tell(actor.id, "work");
+    await waitFor(() => s.actors.status(actor.id).preparing?.phase === "binding");
+    const since = s.actors.status(actor.id).preparing!.startedAt;
+    // Eight minutes in binding, then the permit wait.
+    jump(since + 8 * MIN);
+    binding.resolve();
+    await waitFor(() => s.actors.status(actor.id).status === "waiting");
+    const waitingAt = s.actors.status(actor.id).preparing!.startedAt;
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    jump(waitingAt + 30 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(stuck()).toEqual([]);
+    // The permit arrives; model preparation then hangs in launch.
+    await s.agents.stop(blocker.id);
+    await waitFor(() => s.actors.status(actor.id).status === "preparing" && s.actors.status(actor.id).preparing?.phase === "launch");
+    const admittedAt = s.actors.status(actor.id).preparing!.startedAt;
+    expect(admittedAt).toBeGreaterThanOrEqual(waitingAt + 30 * MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0); // About 8 min of preparation, not 38.
+    jump(admittedAt + MIN);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0); // About 9 min: binding time is kept, the wait is not.
+    jump(admittedAt + 2 * MIN + 5_000);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1); // Over 10 min summed across binding and launch.
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(0);
+    expect(stuck()).toEqual([expect.stringContaining(
+      `stuck in preparing for 10 min (since ${new Date(since).toISOString()})`)]);
+    expect(stuck()[0]).toContain("Phase: launch. Not counted: 30 min waiting for an admission permit.");
+    const [line] = readMetrics(s.root) as Array<{ stuckMs: number; waitedMs: number; phase: string; since: string }>;
+    expect(line).toMatchObject({ phase: "launch", since: new Date(since).toISOString() });
+    expect(line!.stuckMs).toBeGreaterThanOrEqual(THRESHOLD);
+    expect(line!.stuckMs).toBeLessThan(THRESHOLD + MIN);
+    expect(line!.waitedMs).toBeGreaterThanOrEqual(30 * MIN);
+    expect(line!.waitedMs).toBeLessThan(31 * MIN);
+  });
+
+  // Review P3 on #580: the queued figure is the whole backlog, the overflow included.
+  it("counts the overflow backlog in the queued metric", async () => {
+    const s = await stuckSetup("backlog-prep", { actorQueueLimit: 2 });
+    const since = await s.begin();
+    for (let index = 0; index < 5; index++) s.actors.tell(s.actor.id, `more ${index}`);
+    expect(s.actors.status(s.actor.id).queued).toBe(5); // Two in the queue, three in its overflow.
+    at(since + THRESHOLD);
+    expect(s.actors.reportStuckPreparing(THRESHOLD)).toBe(1);
+    expect(s.metrics()).toEqual([expect.objectContaining({ actorId: s.actor.id, queued: 5, waitedMs: 0, stuckMs: THRESHOLD })]);
   });
 });

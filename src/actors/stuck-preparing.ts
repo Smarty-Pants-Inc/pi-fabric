@@ -17,7 +17,11 @@ export interface StuckPreparingLine {
   rootId: string;
   phase: string;
   since: string;
+  /** Preparation time, summed across phases, excluding admission-permit waits. */
   stuckMs: number;
+  /** Admission-permit wait time in this episode, not counted in stuckMs. */
+  waitedMs: number;
+  /** Events waiting behind the stuck one: the actor's queue plus its overflow backlog. */
   queued: number;
 }
 

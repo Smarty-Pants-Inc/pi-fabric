@@ -42,6 +42,7 @@ import type {
   PortableMemorySource,
 } from "./portable.js";
 import { MemorySourceError } from "./portable.js";
+import type { FabricScope } from "../protocol.js";
 import { observeHostSource, observeSource, observeSources, type SourceObservation } from "./source-observation.js";
 import {
   liveBranchResolver,
@@ -94,11 +95,12 @@ const assertAuthorized = async (
   source: PortableMemorySource,
   action: MemorySourceAction,
   sessionKey: string | null,
+  scope: Readonly<FabricScope> | undefined,
 ): Promise<void> => {
   if (!source.authorize) return;
   let allowed: boolean;
   try {
-    allowed = await source.authorize(action, sessionKey);
+    allowed = await (scope ? source.authorize(action, sessionKey, scope) : source.authorize(action, sessionKey));
   } catch {
     // Adapter failures stay sanitized: no backend error text, paths, or
     // credentials may reach public memory results.
@@ -140,12 +142,13 @@ const loadHostSnapshot = async (
   sessionKey: string,
   action: MemorySourceAction,
   signal?: AbortSignal,
+  scope?: Readonly<FabricScope>,
 ): Promise<HostSnapshot | null> => {
   checkAbort(signal);
-  await assertAuthorized(source, action, sessionKey);
+  await assertAuthorized(source, action, sessionKey, scope);
   const response = await source.loadSession(sessionKey, signal === undefined ? {} : { signal });
   checkAbort(signal);
-  await assertAuthorized(source, action, sessionKey);
+  await assertAuthorized(source, action, sessionKey, scope);
   if (response === null || response === undefined) return null;
   const key = asSessionKey(response.sessionKey);
   const revision = asSessionKey(response.revision);
@@ -188,9 +191,10 @@ export const listHostSnapshots = async (
   limit: number,
   action: MemorySourceAction,
   signal?: AbortSignal,
+  scope?: Readonly<FabricScope>,
 ): Promise<{ snapshots: HostSnapshot[]; coverageReasons: string[] }> => {
   checkAbort(signal);
-  await assertAuthorized(source, action, null);
+  await assertAuthorized(source, action, null, scope);
   const boundedLimit = Math.max(0, Math.floor(limit));
   const listed = normalizeListResponse(
     await source.listSessions(signal === undefined ? { limit: boundedLimit } : { limit: boundedLimit, signal }),
@@ -208,7 +212,7 @@ export const listHostSnapshots = async (
       coverageReasons.add("invalid_source_response");
       continue;
     }
-    const snapshot = await loadHostSnapshot(source, key, action, signal);
+    const snapshot = await loadHostSnapshot(source, key, action, signal, scope);
     if (!snapshot) {
       coverageReasons.add("source_unavailable");
       continue;
@@ -217,7 +221,7 @@ export const listHostSnapshots = async (
     snapshots.push(snapshot);
   }
   if (snapshots.length === 0) {
-    await assertAuthorized(source, action, null);
+    await assertAuthorized(source, action, null, scope);
   }
   return { snapshots, coverageReasons: [...coverageReasons] };
 };
@@ -456,12 +460,12 @@ export const hostRecallPlan = async (
 ): Promise<RecallSourcePlan> => {
   const loaded = sessionKey !== null
     ? await (async () => {
-        const snapshot = await loadHostSnapshot(source, sessionKey, "recall", signal);
+        const snapshot = await loadHostSnapshot(source, sessionKey, "recall", signal, context.fabricScope);
         return snapshot
           ? { snapshots: [snapshot], coverageReasons: [] as string[] }
           : null;
       })()
-    : await listHostSnapshots(source, context.config.maxSessions, "recall", signal);
+    : await listHostSnapshots(source, context.config.maxSessions, "recall", signal, context.fabricScope);
   if (!loaded) throw new MemorySourceError("session_not_found", `Session not found in source ${sourceId}: ${sessionKey}`);
   const snapshots = loaded.snapshots;
   const refs = snapshots.map(hostRef);
@@ -544,7 +548,7 @@ export const hostExpansionAccess = async (
 ): Promise<ExpansionAccess> => {
   const source = resolveRegisteredSource(context.sources, sourceId);
   const sessionKey = hostSessionKey(sourceId, session);
-  const snapshot = await loadHostSnapshot(source, sessionKey, "expand", signal);
+  const snapshot = await loadHostSnapshot(source, sessionKey, "expand", signal, context.fabricScope);
   if (!snapshot) {
     throw new MemorySourceError("session_not_found", `Session not found in source ${sourceId}: ${sessionKey}`);
   }

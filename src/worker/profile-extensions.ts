@@ -1,0 +1,310 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import ignore from "ignore";
+import { minimatch } from "minimatch";
+import { satisfies, validRange } from "semver";
+import { resolveAgentDir } from "../core/agent-dir.js";
+import { fabricResourceRoot } from "../core/fabric-resource.js";
+
+export interface ProfileExtensions {
+  paths: string[];
+  names: string[];
+  warnings: string[];
+}
+
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const override = (value: string): boolean => /^[!+-]/.test(value);
+const glob = (value: string): boolean => /[*?]/.test(value);
+const real = (value: string): string => { try { return fs.realpathSync(value); } catch { return path.resolve(value); } };
+const resolvePath = (value: string, base: string): string => {
+  const trimmed = value.trim();
+  const expanded = trimmed === "~" ? os.homedir() : /^~[/\\]/.test(trimmed) ? path.join(os.homedir(), trimmed.slice(2))
+    : trimmed.startsWith("file://") ? fileURLToPath(trimmed) : trimmed;
+  return path.resolve(base, expanded);
+};
+/** Pi matches settings filters against the path as listed or as reached
+ * through a selected directory (relative to the filter base, absolute, and
+ * basename for globs), never its symlink target. Exclusions additionally match
+ * the canonical file (relative to the canonical base, absolute, basename), so
+ * an exclusion written against a symlink target also holds: stricter than Pi,
+ * never looser. Inclusions stay exactly Pi's, so no file loads that Pi leaves
+ * disabled.
+ */
+const matches = (file: string, pattern: string, base: string, exact = false, exclusion = false): boolean => {
+  const posix = (value: string): string => value.split(path.sep).join("/");
+  const normalized = posix(pattern.replace(/^\.\//, ""));
+  const views: Array<[string, string]> = [[file, base]];
+  if (exclusion) views.push([real(file), real(base)]);
+  return views.some(([target, root]) => [path.relative(root, target), target, ...(exact ? [] : [path.basename(target)])].map(posix)
+    .some(value => exact ? value === normalized : minimatch(value, normalized)));
+};
+/** Pi's applyPatterns for one file: includes, then `!` excludes, `+` exact
+ * force-includes and `-` exact force-excludes. */
+const enabledBy = (file: string, patterns: string[], base: string): boolean => {
+  const includes = patterns.filter(value => !override(value));
+  let enabled = !includes.length || includes.some(pattern => matches(file, pattern, base));
+  if (patterns.some(value => value.startsWith("!") && matches(file, value.slice(1), base, false, true))) enabled = false;
+  if (patterns.some(value => value.startsWith("+") && matches(file, value.slice(1), base, true))) enabled = true;
+  if (patterns.some(value => value.startsWith("-") && matches(file, value.slice(1), base, true, true))) enabled = false;
+  return enabled;
+};
+interface Resource { file: string; enabled: boolean }
+
+/** The selected profile's settings.json exists but cannot be read or parsed.
+ * An opaque launcher runs with --no-extensions, so continuing would start the
+ * task without the profile's guard extensions: refuse instead (fail closed).
+ * The message names the file and a fixed reason only, never file contents or
+ * parser snippets (which can echo secrets).
+ */
+export class ProfileSettingsError extends Error {
+  readonly settingsFile: string;
+  readonly reason: string;
+  constructor(settingsFile: string, reason: string) {
+    super(`Refusing to launch the task: profile settings ${settingsFile} ${reason}. The custom Pi launcher runs with --no-extensions, so the profile's guard extensions would not load; fix the settings file`);
+    this.name = "ProfileSettingsError";
+    this.settingsFile = settingsFile;
+    this.reason = reason;
+  }
+}
+
+/** Opaque launchers cannot expose Pi's pre-load discovery API. Replay only the
+ * selected personal profile's explicit extensions/packages, never auto-discovery
+ * or project resources (whose trust boundary belongs to Pi). Filesystem discovery
+ * mirrors Pi's path bases, manifests, conventional directories and filters; it
+ * neither imports extension code/a peer SDK nor installs missing packages.
+ * A missing settings.json has nothing to replay. Settings that exist but cannot
+ * be read or are not a JSON object throw {@link ProfileSettingsError}.
+ */
+export const resolveProfileExtensions = (pinnedFabricPath: string, environment: NodeJS.ProcessEnv = process.env): ProfileExtensions => {
+  const warnings = new Map<string, string>();
+  const warn = (entry: string, reason: string): void => { if (!warnings.has(entry)) warnings.set(entry, `Profile extension ${entry} skipped: ${reason}`); };
+  let profile: string;
+  try { profile = path.resolve(resolveAgentDir(environment.PI_CODING_AGENT_DIR ?? "")); }
+  catch { throw new ProfileSettingsError("settings.json", "cannot be located (PI_CODING_AGENT_DIR does not resolve to a profile directory)"); }
+  const settingsFile = path.join(profile, "settings.json");
+  let text: string;
+  try { text = fs.readFileSync(settingsFile, "utf8"); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { paths: [], names: [], warnings: [] }; // No profile config: nothing to replay.
+    throw new ProfileSettingsError(settingsFile, `cannot be read${typeof code === "string" && /^E[A-Z0-9]+$/.test(code) ? ` (${code})` : ""}`);
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text.replace(/^\uFEFF/, "")); }
+  catch { throw new ProfileSettingsError(settingsFile, "is not valid JSON"); }
+  if (!record(parsed)) throw new ProfileSettingsError(settingsFile, "is not a JSON object");
+  const settings = parsed;
+  const pinned = real(pinnedFabricPath);
+  const isFabric = (file: string): boolean => {
+    if (real(file) === pinned || fabricResourceRoot(file, "extensions")) return true;
+    try { return JSON.parse(fs.readFileSync(path.join(file, "package.json"), "utf8")).name === "pi-fabric"; } catch { return false; }
+  };
+  const strings = (value: unknown, entry: string): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) { warn(entry, "expected a list"); return []; }
+    // Keep positions stable so a bad item and a later missing path cannot
+    // collide in the one-warning-per-entry ledger. Empty sentinels never load.
+    return value.map((item, index) => {
+      if (typeof item === "string" && item.trim() && !item.includes("\0")) return item;
+      warn(`${entry}[${index}]`, "expected a nonempty path or pattern"); return "";
+    });
+  };
+  const manifest = (directory: string): Record<string, unknown> | undefined => {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(path.join(directory, "package.json"), "utf8"));
+      if (!record(parsed)) throw new Error("invalid manifest");
+      return parsed;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  };
+  const visiting = new Set<string>();
+  const collect = (file: string, entry: string): string[] => {
+    const canonical = real(file);
+    if (visiting.has(canonical)) { warn(entry, "cyclic extension directory"); return []; }
+    visiting.add(canonical);
+    try {
+      if (isFabric(file)) return [];
+      const stat = fs.statSync(file);
+      if (stat.isFile()) {
+        if (!/\.(?:[cm]?[jt]s)$/.test(file)) { warn(entry, "not an extension file"); return []; }
+        return [file]; // Filter on the listed/reached path; canonicalize only for identity.
+      }
+      if (!stat.isDirectory()) { warn(entry, "not a file or directory"); return []; }
+      const pkg = manifest(file);
+      const declared = record(pkg?.pi) ? strings(pkg.pi.extensions, `${entry}.pi.extensions`) : [];
+      if (declared.length) {
+        const found = fromManifest(declared, file, entry);
+        if (found.length) return found;
+      }
+      for (const index of ["index.ts", "index.js"]) {
+        const target = path.join(file, index);
+        if (fs.existsSync(target)) return collect(target, entry);
+      }
+      // Pi discovers direct .ts/.js children and subdirectory entrypoints, not
+      // arbitrary recursive trees. Exact manifest paths may target dot paths.
+      const ignored = ignore();
+      for (const name of [".gitignore", ".ignore", ".fdignore"]) {
+        try { ignored.add(fs.readFileSync(path.join(file, name), "utf8")); } catch { /* Pi ignores unreadable ignore files. */ }
+      }
+      return fs.readdirSync(file, { withFileTypes: true }).flatMap(child => {
+        if (child.name.startsWith(".") || child.name === "node_modules") return [];
+        try {
+          const target = path.join(file, child.name);
+          const childStat = fs.statSync(target);
+          const ignorePath = childStat.isDirectory() ? `${child.name}/` : child.name;
+          if (ignored.ignores(ignorePath)) return [];
+          if (childStat.isFile()) return /\.(?:ts|js)$/.test(child.name) ? collect(target, `${entry}/${child.name}`) : [];
+          if (!childStat.isDirectory()) return [];
+          const childPkg = manifest(target);
+          if (record(childPkg?.pi) && Array.isArray(childPkg.pi.extensions) && childPkg.pi.extensions.length) return collect(target, `${entry}/${child.name}`);
+          const index = ["index.ts", "index.js"].find(name => fs.existsSync(path.join(target, name)));
+          return index ? collect(path.join(target, index), `${entry}/${child.name}`) : [];
+        } catch { warn(`${entry}/${child.name}`, "missing, unreadable or invalid entry"); return []; }
+      });
+    } catch { warn(entry, "missing, unreadable or invalid entry"); return []; }
+    finally { visiting.delete(canonical); }
+  };
+  const fromManifest = (entries: string[], base: string, entry: string): string[] => {
+    const found = entries.flatMap((value, index) => {
+      if (!value || override(value)) return [];
+      const key = `${entry}.pi.extensions[${index}]`;
+      try {
+        const targets = glob(value) ? fs.globSync(value, { cwd: base }).filter(match => path.relative(base, path.resolve(base, match)).split(path.sep).every(part => part === ".." || !part.startsWith("."))).sort().map(match => path.resolve(base, match)) : [path.resolve(base, value)];
+        if (!targets.length) warn(key, "pattern matched no extensions");
+        return targets.flatMap(target => collect(target, key));
+      } catch { warn(key, "invalid extension path or pattern"); return []; }
+    });
+    // Pi drops manifest-disabled files before user filters see them.
+    const patterns = entries.filter(override);
+    return found.filter(file => enabledBy(file, patterns, base));
+  };
+  const extensions = strings(settings.extensions, "extensions");
+  const explicit = extensions.flatMap((value, index) => {
+    // Top-level globs are selectors, not discovery roots, just like Pi.
+    if (!value || override(value) || glob(value)) return [];
+    try { return collect(resolvePath(value, profile), `extensions[${index}]`); }
+    catch { warn(`extensions[${index}]`, "invalid extension path"); return []; }
+  });
+  const selectors = extensions.filter(value => override(value) || glob(value));
+  const topLevel: Resource[] = explicit.map(file => ({ file, enabled: enabledBy(file, selectors, profile) }));
+  const packageResources: Resource[] = [];
+  const installedPath = (source: string): string => {
+    if (source.startsWith("npm:")) {
+      const spec = source.slice(4).trim();
+      const split = spec.indexOf("@", spec.startsWith("@") ? 1 : 0);
+      const name = split < 0 ? spec : spec.slice(0, split);
+      if (!/^(?:@[a-zA-Z0-9._-]+\/)?[a-zA-Z0-9._-]+$/.test(name) || name.split("/").some(part => part === "." || part === "..")) throw new Error("invalid npm package");
+      const managed = path.join(profile, "npm", "node_modules", name);
+      if (name === "pi-fabric" || fs.existsSync(managed)) return managed;
+      // Match Pi's legacy global fallback without installing or updating. Only
+      // a bounded local package-root query is needed; no network/auth lookup.
+      const command = settings.npmCommand === undefined ? ["npm"] : strings(settings.npmCommand, "npmCommand");
+      if (!command.length || command.some(value => !value)) return managed;
+      const bun = path.basename(command[0]!).replace(/\.exe$/, "") === "bun";
+      const result = spawnSync(command[0]!, [...command.slice(1), ...(bun ? ["pm", "bin", "-g"] : ["root", "-g"])], { encoding: "utf8", timeout: 2000, windowsHide: true });
+      if (result.status !== 0 || !result.stdout.trim()) return managed;
+      const root = bun ? path.join(path.dirname(result.stdout.trim()), "install", "global", "node_modules") : result.stdout.trim();
+      const legacy = path.join(root, name);
+      return fs.existsSync(legacy) ? legacy : managed;
+    }
+    if (/^(?:git:|github:|https?:\/\/|ssh:\/\/)/.test(source)) {
+      let url = (source.startsWith("git://") ? source : source.replace(/^git:/, "")).trim().replace(/^github:/, "github.com/");
+      if (/^git@[^:]+:/.test(url)) url = url.replace(/^git@([^:]+):/, "https://$1/");
+      if (!url.includes("://")) url = `https://${url}`;
+      const parsed = new URL(url);
+      const repo = parsed.pathname.replace(/^\/+/, "").split("@")[0]!.replace(/\.git$/, "");
+      const decoded = decodeURIComponent(repo);
+      if (!parsed.hostname || decoded.split("/").length < 2 || decoded.includes("\\") || decoded.split("/").includes("..")) throw new Error("invalid git package");
+      return path.join(profile, "git", parsed.hostname, repo);
+    }
+    return resolvePath(source, profile);
+  };
+  const seenPackages = new Set<string>();
+  const packages = settings.packages;
+  if (packages !== undefined && !Array.isArray(packages)) warn("packages", "expected a list");
+  for (const [index, item] of (Array.isArray(packages) ? packages : []).entries()) {
+    const entry = `packages[${index}]`;
+    const source = typeof item === "string" ? item : record(item) ? item.source : undefined;
+    if (typeof source !== "string" || !source.trim() || source.includes("\0")) { warn(entry, "expected a package source"); continue; }
+    if (/^npm:pi-fabric(?:@|$)/.test(source.trim())) continue;
+    try {
+      const root = installedPath(source.trim());
+      if (isFabric(root)) continue;
+      const identity = real(root);
+      if (seenPackages.has(identity)) continue; // Personal profile: first package declaration wins, like Pi.
+      seenPackages.add(identity);
+      const rootStat = fs.statSync(root);
+      const pkg = rootStat.isDirectory() ? manifest(root) : undefined;
+      if (source.trim().startsWith("npm:")) {
+        // Pi reinstalls an npm package whose installed version does not satisfy
+        // the configured spec; an opaque launcher never installs, so skip it.
+        const spec = source.trim().slice(4).trim();
+        const split = spec.indexOf("@", spec.startsWith("@") ? 1 : 0);
+        const configured = split < 0 ? undefined : spec.slice(split + 1);
+        const range = configured ? validRange(configured) ?? undefined : undefined;
+        const installed = pkg?.version;
+        if (typeof installed !== "string" || !installed) { warn(entry, "installed npm package has no version"); continue; }
+        if (range && !satisfies(installed, range)) { warn(entry, "installed version does not match the configured spec"); continue; }
+      }
+      if (record(item) && item.extensions !== undefined && (!Array.isArray(item.extensions) || item.extensions.some(value => typeof value !== "string" || !value))) {
+        warn(entry, "invalid extension filter"); continue;
+      }
+      if (record(item) && item.autoload !== undefined && typeof item.autoload !== "boolean") { warn(entry, "invalid autoload filter"); continue; }
+      const pi = record(pkg?.pi) ? pkg.pi : undefined;
+      let found: string[];
+      const packageFilter = record(item) && (item.extensions !== undefined || item.autoload === false);
+      if (rootStat.isFile()) found = collect(root, entry); // Pi loads a direct package file regardless of resource filters.
+      else if (pi && (!packageFilter || (Array.isArray(pi.extensions) && pi.extensions.length))) found = fromManifest(strings(pi.extensions, `${entry}.pi.extensions`), root, entry);
+      else if (fs.existsSync(path.join(root, "extensions"))) found = collect(path.join(root, "extensions"), entry);
+      else if (record(item) || ["skills", "prompts", "themes"].some(type => fs.existsSync(path.join(root, type)))) found = [];
+      else found = collect(root, entry);
+      if (rootStat.isDirectory() && record(item) && item.autoload === false) {
+        // Pi applies a delta in order: an unmentioned resource is not listed,
+        // and the last matching plain/glob or +/-/! pattern wins.
+        const patterns = Array.isArray(item.extensions) ? item.extensions as string[] : [];
+        const delta = new Map<string, boolean>();
+        for (const value of patterns) {
+          const target = override(value) ? value.slice(1) : value;
+          const exclusion = value.startsWith("-") || value.startsWith("!");
+          for (const file of found) if (matches(file, target, root, value.startsWith("+") || value.startsWith("-"), exclusion)) delta.set(file, !exclusion);
+        }
+        packageResources.push(...[...delta].map(([file, enabled]) => ({ file, enabled })));
+      } else if (rootStat.isDirectory() && record(item) && Array.isArray(item.extensions)) {
+        // An empty list disables every extension of the package, like Pi.
+        const patterns = item.extensions as string[];
+        packageResources.push(...found.map(file => ({ file, enabled: patterns.length > 0 && enabledBy(file, patterns, root) })));
+      } else packageResources.push(...found.map(file => ({ file, enabled: true })));
+    } catch { warn(entry, "missing, unreadable or invalid package"); }
+  }
+  // Pi's resource ledger: the first entry per listed path wins (packages are
+  // listed before top-level settings), top-level settings outrank packages,
+  // then the first-ranked entry per canonical file decides it, enabled or not.
+  // A disabled alias therefore also suppresses a lower-ranked enabled alias.
+  // One deliberate departure, stricter than Pi and never looser: Pi keeps the
+  // package entry when a top-level entry lists the identical path, so a
+  // top-level exclusion of that path would lose. Here a disabled top-level
+  // entry replaces the package entry at its own top-level rank and position,
+  // so the top-level exclusion decides that canonical file. An enabled
+  // top-level entry for the identical path still leaves Pi's package entry in
+  // place, so nothing loads that Pi leaves disabled.
+  const listed = new Map<string, Resource & { rank: number }>();
+  for (const resource of packageResources) if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank: 4 });
+  for (const resource of topLevel) {
+    if (!resource.enabled && listed.get(resource.file)?.rank === 4) listed.delete(resource.file);
+    if (!listed.has(resource.file)) listed.set(resource.file, { ...resource, rank: 2 });
+  }
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  for (const { file, enabled } of [...listed.values()].sort((a, b) => a.rank - b.rank)) {
+    const canonical = real(file);
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    if (enabled && !isFabric(canonical)) paths.push(canonical);
+  }
+  return { paths, names: paths.map(file => path.basename(file)), warnings: [...warnings.values()] };
+};

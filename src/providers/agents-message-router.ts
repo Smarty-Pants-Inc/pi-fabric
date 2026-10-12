@@ -623,7 +623,6 @@ export class AgentMessageRouter {
         { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
-
     // Persistent actors consume both delivery modes through their serial mailbox.
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
@@ -808,7 +807,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
+          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -878,7 +877,7 @@ export class AgentMessageRouter {
       // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
       // Validate without promoting the owner's current defaults into fixed per-call overrides.
       await this.actorManager.resolveActivationBinding(actor.id, options);
-      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
+      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {

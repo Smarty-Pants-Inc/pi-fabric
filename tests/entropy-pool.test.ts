@@ -15,6 +15,8 @@ import {
   poolToValueObservations,
   saveObservationPool,
   saveObservationPoolAsync,
+  updateObservationPoolAsync,
+  SessionObservationCache,
   type EntropyObservationWindow,
   type EntropyValueObservation,
 } from "../src/entropy/index.js";
@@ -174,6 +176,32 @@ describe("mergeObservationWindow", () => {
 });
 
 describe("observation pool store", () => {
+  it("rebases warmed snapshots on the locked pool without losing sibling writes", async () => {
+    const agentDir = makeTempDir();
+    const first = [window("a.jsonl", [obs("mcp.flags.set", "level", "info", 3)])];
+    const second = [window("b.jsonl", [obs("mcp.flags.set", "level", "warn", 2)])];
+    const firstCache = new SessionObservationCache();
+    const secondCache = new SessionObservationCache();
+    await Promise.all([firstCache.merge(undefined, first), secondCache.merge(undefined, second)]);
+    expect((await updateObservationPoolAsync(agentDir, first, firstCache)).written).toBe(true);
+    expect((await updateObservationPoolAsync(agentDir, second, secondCache)).written).toBe(true);
+    expect((await updateObservationPoolAsync(agentDir, first, firstCache)).written).toBe(false);
+    expect(poolToValueObservations(loadObservationPool(agentDir).file!)).toEqual([
+      obs("mcp.flags.set", "level", "info", 3), obs("mcp.flags.set", "level", "warn", 2),
+    ]);
+  });
+
+  it("leaves damaged evidence intact instead of self-repairing it into authority", async () => {
+    const agentDir = makeTempDir();
+    const target = path.join(agentDir, "fabric", "entropy", "observation-pool.json");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "{ damaged");
+    await expect(updateObservationPoolAsync(agentDir, [])).rejects.toThrow("malformed JSON");
+    expect(fs.readFileSync(target, "utf8")).toBe("{ damaged");
+    expect(fs.existsSync(path.join(path.dirname(target), "observation-pool.lock"))).toBe(false);
+  });
+
+
   it("round-trips the pool, no-ops identical writes, and surfaces damage", async () => {
     const agentDir = makeTempDir();
     expect(loadObservationPool(agentDir)).toEqual({});

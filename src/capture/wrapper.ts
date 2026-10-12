@@ -7,7 +7,7 @@ let processWorkLoad: Promise<typeof import("../residency/process-work.js")> | un
 const loadProcessWork = () => processWorkLoad ??= import("../residency/process-work.js")
   .catch((error: unknown) => { processWorkLoad = undefined; throw error; });
 
-// Local mirror of wrapRegisteredTool/wrapToolDefinition (pi 0.84.2,
+// Local mirror of wrapRegisteredTool/wrapToolDefinition (pi 0.99.0,
 // core/extensions/wrapper.js and core/tools/tool-definition-wrapper.js).
 // Captured tools must execute with exactly the host wrapper semantics —
 // extension runner context injection and post-execution addedToolNames merge —
@@ -26,6 +26,7 @@ export interface WrappedRegisteredTool {
   label: string | undefined;
   description: string | undefined;
   parameters: unknown;
+  outputSchema: unknown;
   constrainedSampling: unknown;
   prepareArguments: ((args: Record<string, unknown>) => unknown) | undefined;
   executionMode: unknown;
@@ -34,7 +35,7 @@ export interface WrappedRegisteredTool {
 
 const wrapToolDefinition = (
   definition: ToolDefinition<any, any, any>,
-  ctxFactory: () => unknown,
+  ctxFactory: (toolCallId: unknown, signal: unknown) => unknown,
 ): WrappedRegisteredTool => {
   const execute = definition.execute as unknown as WrappedExecute;
   return {
@@ -42,11 +43,12 @@ const wrapToolDefinition = (
     label: definition.label,
     description: definition.description,
     parameters: definition.parameters,
+    outputSchema: definition.outputSchema,
     constrainedSampling: definition.constrainedSampling,
     prepareArguments: definition.prepareArguments,
     executionMode: definition.executionMode,
     execute: (toolCallId, params, signal, onUpdate, ctx) =>
-      execute(toolCallId, params, signal, onUpdate, ctx ?? ctxFactory()),
+      execute(toolCallId, params, signal, onUpdate, ctx ?? ctxFactory(toolCallId, signal)),
   };
 };
 
@@ -57,7 +59,9 @@ export const wrapRegisteredToolForCapture = (
 ): WrappedRegisteredTool => {
   const tool = wrapToolDefinition(
     registeredTool.definition as ToolDefinition<any, any, any>,
-    () => runner.createContext(),
+    (id, signal) => runner.createToolContext
+      ? runner.createToolContext(id as string, signal as AbortSignal | undefined)
+      : runner.createContext(),
   );
   const execute = tool.execute;
   return {

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Decision profiles v1",
+  "description": "Portable trusted decision targets. The native resolver remains authoritative for provider compatibility, endpoint policy, and request limits. Documents are limited to 65536 UTF-8 bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "profiles"],
+  "properties": {
+    "version": { "const": 1 },
+    "defaultProfile": { "$ref": "#/$defs/profileName" },
+    "profiles": {
+      "type": "object",
+      "maxProperties": 128,
+      "propertyNames": { "$ref": "#/$defs/profileName" },
+      "additionalProperties": { "$ref": "#/$defs/target" }
+    }
+  },
+  "$defs": {
+    "profileName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "not": { "enum": ["__proto__", "prototype", "constructor"] }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "api": { "enum": ["system-one", "cloudflare", "openai-decisions", "vercel-evaluate", "llama-cpp", "llama-system-one", "anthropic", "google"] },
+        "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "endpoint": { "type": "string", "minLength": 1 },
+        "allowLocal": { "type": "boolean" },
+        "allowGenerated": { "type": "boolean" },
+        "providerOptions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/json" } },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 }
+      }
+    },
+    "json": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "number" },
+        { "type": "string" },
+        { "type": "array", "items": { "$ref": "#/$defs/json" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/json" } }
+      ]
+    }
+  }
+}

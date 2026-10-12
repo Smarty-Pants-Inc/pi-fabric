@@ -36,12 +36,14 @@ Under enforce mode, discovery and workflow display operations still work, along 
 - `pi.read`, `pi.grep`, `pi.find`, `pi.ls`;
 - `memory.recall`, `memory.expand`, `memory.sessions`;
 - `state.get`, `state.history`, `state.complexity`;
-- `mesh.self`, `mesh.read`, `mesh.members`, `mesh.get`, `mesh.list`;
-- `compact.status`;
+- `mesh.self`, `mesh.read`, `mesh.members`, `mesh.get`, `mesh.list`, `mesh.scheduled`, `mesh.grants`;
+- `decisions.list`;
+- `programs.list`, `programs.get`;
+- `compact.status`, `thinking.status`;
 - `components.list`, `components.status`, `components.graph`;
 - `schema.status`, `schema.hypothesize`, `schema.verify`, `schema.commit`, `schema.abort`.
 
-The gate blocks `pi.edit`, `pi.write`, `pi.bash`, `pi.powershell`, all agent/actor actions, mesh and state writes or execution, `compact.request`, `compact.cancel`, `components.reload`, MCP, captured extensions, and every external provider, whatever risk it declares. Enforce sessions keep declarative component entries in configuration without activating them, and registered definitions stay visible to diagnostics. A provider that claims `risk: "read"` still fails this exact-reference policy. Fabric records guard failures in the existing typed execution trace with `failureStage: "guard"`.
+The gate blocks `pi.edit`, `pi.write`, `pi.bash`, `pi.powershell`, all agent/actor actions, mesh and state writes or execution, `compact.request`, `compact.cancel`, `thinking.set`, `thinking.reset`, `decisions.raise`, `decisions.wait`, `decisions.answer`, `decisions.escalate`, `decisions.cancel`, `programs.save`, `programs.run`, `components.reload`, MCP, captured extensions, and every external provider, whatever risk it declares. Enforce sessions keep declarative component entries in configuration without activating them, and registered definitions stay visible to diagnostics. A provider that claims `risk: "read"` still fails this exact-reference policy. Fabric records guard failures in the existing typed execution trace with `failureStage: "guard"`.
 
 An enforce session never restores persistent actors, and host-event actor dispatch stays off. Fabric disables agent execution, so the gate also blocks agent actions. Capture `keepVisible`, descriptor risk, claimed source metadata, or tool visibility cannot authorize a second top-level path. Fabric blocks a colliding external or SDK tool named `fabric_exec` unless Pi's canonical `sourceInfo.path` identifies this extension's entry exactly.
 

@@ -20,6 +20,8 @@ const isWork = (event: MeshEvent): boolean => event.topic.startsWith(WORK_TOPIC_
 export class ActorMeshMonitor {
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor");
   #safetyNetTimer: NodeJS.Timeout | undefined;
+  #dueTimer: NodeJS.Timeout | undefined;
+  #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #stamp: string | undefined;
   #needsPoll = true;
@@ -46,7 +48,7 @@ export class ActorMeshMonitor {
   #lastCheckpointAt = Date.now();
 
   constructor(
-    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor">>,
+    readonly mesh: Pick<MeshStore, "root" | "latestOffset" | "tail"> & Partial<Pick<MeshStore, "read" | "oldestSequence" | "nextEventAfter" | "latestCursor" | "nextScheduleDueAt" | "releaseDueSchedules">>,
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
@@ -93,7 +95,8 @@ export class ActorMeshMonitor {
       // is a wake, not evidence that nothing changed. The stamp filters duplicates.
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
         const name = filename == null ? undefined : path.basename(filename.toString());
-        if (name !== undefined && name !== "events.jsonl" && name !== "generation") return;
+        // schedules.json re-arms the due timer when another process schedules.
+        if (name !== undefined && name !== "events.jsonl" && name !== "generation" && name !== "schedules.json") return;
         this.#schedule();
       });
       this.#watcher = watcher;
@@ -122,6 +125,8 @@ export class ActorMeshMonitor {
     this.#closed = true;
     if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
     this.#safetyNetTimer = undefined;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
     this.#watcher?.close();
     this.#watcher = undefined;
     if (this.#started) this.#persistCursor(true);
@@ -158,6 +163,22 @@ export class ActorMeshMonitor {
     this.#watcher = undefined;
     this.#startSafetyNet();
     this.schedule();
+  }
+
+  // A schedule falling due changes no file, so wake at its due time instead of
+  // waiting for the reconcile interval.
+  #armDue(dueAt: number | undefined): void {
+    if (dueAt === this.#dueAt) return;
+    if (this.#dueTimer) clearTimeout(this.#dueTimer);
+    this.#dueTimer = undefined;
+    this.#dueAt = dueAt;
+    if (dueAt === undefined || this.#closed) return;
+    this.#dueTimer = setTimeout(() => {
+      this.#dueTimer = undefined;
+      this.#dueAt = undefined;
+      this.schedule();
+    }, Math.min(Math.max(0, dueAt - Date.now()), 2_147_000_000));
+    this.#dueTimer.unref();
   }
 
   #startSafetyNet(): void {
@@ -202,6 +223,17 @@ export class ActorMeshMonitor {
     this.#needsPoll = true;
     this.#polling = true;
     try {
+      // Whichever process polls first releases due schedules; the store lock
+      // makes the release exactly-once, and this poll's tail then sees them.
+      // The lockless due check keeps an idle poll synchronous.
+      let dueAt: number | undefined;
+      try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      if (dueAt !== undefined && dueAt <= Date.now()) {
+        await this.mesh.releaseDueSchedules?.().catch(() => undefined);
+        if (this.#closed) return;
+        try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
+      }
+      this.#armDue(dueAt);
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.

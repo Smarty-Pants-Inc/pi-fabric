@@ -7,10 +7,22 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } from "../config.js";
 import type { FabricKernel } from "../runtime/kernel.js";
+import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
-import type { FabricThinking } from "../thinking.js";
+import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { InheritedSessionPin } from "./session-pins.js";
+import type { AgentWorktreeResult } from "./worktree-manager.js";
+
+/** Fabric run transports plus adapter-owned ("hosted") runs. */
+export type AgentRunTransport = FabricAgentTransport | "hosted";
+
+/**
+ * A terminal outcome Fabric cannot vouch for: the run may or may not have done
+ * its work (an interrupted claimed request, an unreachable hosted run). Fabric
+ * never replays such work.
+ */
+export type FabricRunOutcome = "indeterminate";
 
 export type AgentRunStatus =
   | "queued"
@@ -92,6 +104,8 @@ export interface AgentRunRequest {
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
+  /** Child thinking bounds; must lie inside the caller's effective bounds. */
+  thinkingBounds?: FabricThinkingBounds;
   tools?: string[];
   timeoutMs?: number;
   extensions?: boolean;
@@ -99,11 +113,26 @@ export interface AgentRunRequest {
   /** Leaf or recursive execution cwd; relative to the immediate caller, independent of project/mesh lineage. */
   cwd?: string;
   worktree?: boolean;
+  /** Shell command run in a new worktree before launch; overrides agents.worktree.setup. */
+  worktreeSetup?: string;
+  /** Write confinement enforced in the Pi child; see child-env.ts. */
+  readOnly?: boolean;
+  writableRoots?: string[];
+  shell?: "deny" | "unconfined";
+  /** Narrow the host-issued scope for the child; omitted inherits it unchanged. See src/scope.ts. */
+  scope?: { grants: FabricScopeGrant[] };
+  /**
+   * Host-only full parent scope forwarded to a host without this session's
+   * scope (resident host, actor turns); never a provider argument.
+   */
+  inheritedScope?: FabricScope;
   residency?: FabricParticipantResidency;
   schema?: Record<string, unknown>;
   /** With a schema on the Pi runner: the result is one fabric_reply tool call (smarty-dev#967). */
   replyTool?: boolean;
   systemPrompt?: string;
+  /** Opt in to Claude Code transcript persistence for hook-based observability. */
+  persistSession?: boolean;
   sessionFile?: string;
   /** Host-owned actor activation policy, not a one-shot provider argument. */
   inferenceContext?: "full-history" | "activation";
@@ -127,6 +156,14 @@ export interface AgentRunRequest {
   bashTimeoutSeconds?: number;
   /** Pi runs: seconds without output before a bash call without a timeout is killed (default 180); 0 = none. */
   bashIdleSeconds?: number;
+  /** Host-created fork of the caller branch ending at its last completed turn (seed: "branch"). */
+  forkSeed?: AgentForkSeed;
+}
+
+export interface AgentForkSeed {
+  sourceSessionId: string;
+  sourceSessionFile?: string;
+  sourceBranch: SessionEntry[];
 }
 
 export interface AgentUsage {
@@ -179,11 +216,13 @@ export interface AgentRunRecord {
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
-  transport: FabricAgentTransport;
+  transport: AgentRunTransport;
   cwd: string;
   model?: string;
   modelReason?: string;
   thinking?: FabricThinking;
+  /** Set only when the requested level was clamped into thinking bounds. */
+  requestedThinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
   capabilityRequirements?: string[];
@@ -213,12 +252,19 @@ export interface AgentRunRecord {
   value?: unknown;
   error?: string;
   /** Machine-readable terminal cause for a whitespace-only tool-call runaway. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED";
+  /**
+   * CONTEXT_OVERFLOW (smarty-dev#3238): set by the worker only from a structured overflow signal
+   * (Pi's own window refusal, pi-ai isContextOverflow on the assistant message, or the activation
+   * window's nonce-bound refusal frame), never from free error text.
+   */
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW";
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];
   stderr?: string;
   exitCode?: number | null;
   usage: AgentUsage;
+  /** Actor runs: the last assistant turn's context tokens and the child model's window (smarty-dev#3238). */
+  contextUsage?: { tokens: number; contextWindow: number };
   budget?: FabricBudgetSummary;
   /** Transport identity (e.g. process PID), not the native Pi session. */
   sessionId?: string;
@@ -237,11 +283,23 @@ export interface AgentRunRecord {
   logFile?: string;
   nestedAgents?: AgentRunRecord[];
   pendingMessages?: { steering: string[]; followUp: string[] };
+  /** Set while a routed child dialog waits for an answer (status detail waiting_for_answer). */
+  blockedOn?: { decisionId?: string; since: number };
   compaction?: AgentCompactionStatus;
   /** Unconsumed outcome retained for its exact bound Main root/session. */
   completionDelivery?: { status: "undelivered"; addressedTo: string; redeliveredFrom?: string };
   /** Terminal event-log optimization was skipped; the full original log remains. */
   compactionSkipped?: string;
+  /** Settlement diff summary of a worktree: true run; `worktree` stays the path. */
+  worktreeResult?: AgentWorktreeResult;
+  /** Hosted runs: the adapter locator, persisted before the run is submitted. */
+  hosted?: { locator: unknown };
+  /** A hosted run the adapter reports parked; still running, not dead. */
+  sleeping?: true;
+  /** Set on terminal records whose effect Fabric cannot confirm. */
+  outcome?: FabricRunOutcome;
+  /** A hosted runner's failure hint; Fabric itself never retries. */
+  retryable?: boolean;
 }
 
 export interface AgentRunResult extends AgentRunRecord {
@@ -274,11 +332,13 @@ export interface AgentHandleInfo {
   runner: FabricAgentRunner;
   /** Resolved Fabric kernel; absent for runners without Fabric. */
   kernel?: FabricKernel;
-  transport: FabricAgentTransport;
+  transport: AgentRunTransport;
   cwd: string;
   model?: string;
   modelReason?: string;
   thinking?: FabricThinking;
+  /** Set only when the requested level was clamped into thinking bounds. */
+  requestedThinking?: FabricThinking;
   actorId?: string;
   actorName?: string;
   capabilityRequirements?: string[];
@@ -340,7 +400,11 @@ export interface AgentWorkerOptions {
   model?: string;
   modelReason?: string;
   thinking?: string;
+  /** Serialized effective bounds forwarded as PI_FABRIC_THINKING_BOUNDS. */
+  thinkingBounds?: string;
   systemPrompt?: string;
+  persistSession?: boolean;
+  modelAdmission?: "strict" | "permissive";
   sessionFile?: string;
   inferenceContext?: "full-history" | "activation";
   sessionExportFile?: string;
@@ -355,6 +419,8 @@ export interface AgentWorkerOptions {
   runnerSessionId?: string;
   runRoot?: string;
   steerFile?: string;
+  /** Present when agents.childQuestions is "route": child dialogs go to the parent with this default deadline. */
+  childQuestionTimeoutMs?: number;
   transport: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
@@ -364,6 +430,12 @@ export interface AgentWorkerOptions {
   /** Observed native Pi session history carried across a same-run worker relaunch. Not a resume target. */
   runnerSessionIds?: string[];
   carryOver?: AgentRunCarryOver;
+  /** Serialized PI_FABRIC_WRITE_POLICY; Pi children also load the write guard. */
+  writePolicy?: string;
+  /** Serialized PI_FABRIC_LINEAGE. */
+  lineage?: string;
+  /** Serialized PI_FABRIC_SCOPE; absent clears any inherited scope variables. */
+  scope?: string;
 }
 
 /**
@@ -411,7 +483,7 @@ export type AgentTransportObservation =
 export interface AgentTransportHandle {
   /** Actual worker release, not the parent manager's loaded generation. */
   fabricRelease?: string;
-  kind: FabricAgentTransport;
+  kind: AgentRunTransport;
   sessionId?: string;
   attachCommand?: string;
   /** Event custody is opt-in only after a verified, owned cgroup-v2 receipt.
@@ -447,6 +519,8 @@ export interface AgentTransportHandle {
    * observation failure rejects, never authorizes collection/replacement.
    * Unverified scopes and unscoped workers omit this field entirely. */
   treeClosed?: Promise<void>;
+  /** Bounded diagnostic tail for workers that fail before writing a status record. */
+  readStderr?(): string;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;
   stop(options?: AgentTransportObservationOptions): Promise<void>;
 }
@@ -522,6 +596,23 @@ export interface AgentFollowUpRunningWarning {
   status: "running";
   message: string;
 }
+
+/** A routed child dialog (agents.childQuestions "route"); `question` is the raw worker payload. */
+export interface AgentChildQuestionRequest {
+  runId: string;
+  name: string;
+  actorId?: string;
+  question: Record<string, unknown>;
+  /** Aborted when the run settles; the router must stop asking. */
+  signal: AbortSignal;
+  /** Report the durable decision backing a headless question. */
+  onDecision(decisionId: string): void;
+}
+
+export type AgentChildQuestionResponse =
+  | { value: string }
+  | { confirmed: boolean }
+  | { cancelled: true };
 
 export interface AgentSteerResult {
   deadlineAt?: number;

@@ -112,7 +112,7 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
     const actor = await residentHosts[0]!.actors.create({ name: "review-actor", instructions: "Review offline", residency: "durable",
       model: `${faux.getModel().provider}/${faux.getModel().id}`, tools: [] });
     const actorSession = actor.sessionFile;
-    await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("activate", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext());
+    await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("activate", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext() as never);
     const before = states[0]!;
     const retired = session.extensionRunner!;
     const getActiveTools = retired.getActiveTools.bind(retired);
@@ -140,7 +140,7 @@ it("reloads a real resident Pi host while a process-backed browser call is in fl
     await waitFor(() => residentHosts[1]!.actors.status(actor.id).status === "dormant");
     await new Promise(resolve => setImmediate(resolve));
     expect(staleReads).toBe(0);
-    await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("fresh", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext());
+    await session.extensionRunner!.getToolDefinition("fabric_exec")!.execute("fresh", { code: "return 1" }, undefined, undefined, session.extensionRunner!.createContext() as never);
     const fresh = states.at(-1)!;
     await expect(fresh.registry.invoke("extensions.browser_child", {}, { ...invocation, extensionContext: session.extensionRunner!.createContext() }))
       .resolves.toMatchObject({ text: "fresh child", isError: false });

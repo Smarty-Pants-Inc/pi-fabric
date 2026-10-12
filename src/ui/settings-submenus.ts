@@ -208,11 +208,13 @@ export const sectionSubmenu = (
   description: string,
   items: SettingItem[] | (() => SettingItem[]),
   persist: (id: string, value: string) => void,
+  // A factory can defer discovery without opting into rebuilding static editor rows.
+  options: { refreshOnChange?: boolean } = {},
 ): SettingsSubmenu => (_currentValue, done) => {
   const getItems = () => markDrillIn(typeof items === "function" ? items() : items);
   // Match the root page: sections get type-to-search filtering too.
   return new SectionSubmenu(theme, title, description, getItems(), persist, () => done(), true,
-    typeof items === "function" ? getItems : undefined);
+    typeof items === "function" && options.refreshOnChange !== false ? getItems : undefined);
 };
 
 abstract class NumericInputSubmenu extends Container {

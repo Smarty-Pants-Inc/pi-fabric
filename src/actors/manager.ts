@@ -1188,6 +1188,13 @@ export class ActorManager {
       .map((actor) => this.#publicInfo(actor, true, registryView));
   }
 
+  /** Resident exit counts every owned actor, including idle/stopped actors, not just runs. */
+  hasOwnedActors(): boolean {
+    this.#syncActorsFromRegistry();
+    this.#refreshOwnership(undefined, false);
+    return [...this.#actors.values()].some(actor => this.#canManageCached(actor.id));
+  }
+
   /** Idle-exit needs metadata, not message heads, bindings or complete public records. */
   hasActiveDurableActor(): boolean {
     this.#syncActorsFromRegistry();

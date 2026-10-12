@@ -247,6 +247,8 @@ export interface StateBackendOptions {
   busyTimeoutMs?: number;
   /** shadow: the budget of one shadow write (never the caller's). Default 250 ms. */
   shadowBudgetMs?: number;
+  /** sqlite: a writer-lock hold longer than this emits a `held` lock event. Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
 }
 
 // ------------------------------------------------------------------ implementation (L2a)
@@ -451,6 +453,7 @@ const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = optio
   ...(lockTimeoutMs !== undefined ? { lockTimeoutMs } : {}),
   ...(options.busyTimeoutMs !== undefined ? { busyTimeoutMs: options.busyTimeoutMs } : {}),
   ...(options.writeSignal ? { writeSignal: options.writeSignal } : {}),
+  ...(options.lockHeldEventMs !== undefined ? { lockHeldEventMs: options.lockHeldEventMs } : {}),
 });
 
 /**
@@ -693,6 +696,7 @@ export class SqliteStateBackend implements StateBackend {
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
           ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
+          ...(input.lockClass ? { lockClass: input.lockClass } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;

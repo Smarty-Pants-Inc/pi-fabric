@@ -17,6 +17,13 @@ export interface CapturedToolEntry {
 /** Whether Pi currently offers a registered tool (smarty-dev#5492). */
 export type CapturedToolVisibility = (name: string) => boolean;
 
+// Only the error's name or code: its message may carry host detail.
+const visibilityErrorLabel = (error: unknown): string => {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" || typeof code === "number") return String(code);
+  return error instanceof Error ? error.name : typeof error;
+};
+
 export class CapturedToolCatalog {
   readonly #tools = new Map<string, CapturedToolEntry>();
   #registered: RegisteredTool[] = [];
@@ -26,6 +33,11 @@ export class CapturedToolCatalog {
   // initialized) means "no host filter". Fabric must not list, describe, prompt
   // for or invoke a tool its owning extension hid (smarty-dev#5492).
   #hostVisibility: (() => CapturedToolVisibility | undefined) | undefined;
+  // Once the source has answered, a later failure must fail closed: reuse the
+  // last known-good visible set, else hide every tool (PR #567 review).
+  #hostVisibilityReady = false;
+  #lastVisible: ReadonlySet<string> | undefined;
+  #visibilityFailureWarned = false;
   #visibleSignature: string | undefined;
   readonly #listeners = new Set<() => void>();
   // The ExtensionRunner observed during the last tool refresh. Stored even
@@ -128,6 +140,7 @@ export class CapturedToolCatalog {
   setHostVisibility(source: (() => CapturedToolVisibility | undefined) | undefined): void {
     this.#hostVisibility = source;
     this.#visibleSignature = undefined;
+    this.#lastVisible = undefined;
   }
 
   // Re-read the host's offered set and notify observers (tools.catalog,
@@ -181,10 +194,27 @@ export class CapturedToolCatalog {
   }
 
   #visibility(): CapturedToolVisibility | undefined {
+    const source = this.#hostVisibility;
+    if (!source) return undefined;
     try {
-      return this.#hostVisibility?.();
-    } catch {
-      return undefined;
+      const visible = source();
+      if (!visible) return undefined;
+      const offered = new Set(this.listRegistered().map((entry) => entry.name).filter((name) => visible(name)));
+      this.#lastVisible = offered;
+      this.#hostVisibilityReady = true;
+      return (name) => offered.has(name);
+    } catch (error) {
+      // Before the first good read Pi's runtime is still initializing
+      // (getActiveTools throws during extension loading): no host filter yet.
+      if (!this.#hostVisibilityReady) return undefined;
+      if (!this.#visibilityFailureWarned) {
+        this.#visibilityFailureWarned = true;
+        console.warn(
+          `pi-fabric: reading Pi's active tool set failed (${visibilityErrorLabel(error)}); hiding extension tools not known to be visible`,
+        );
+      }
+      const lastVisible = this.#lastVisible;
+      return lastVisible ? (name) => lastVisible.has(name) : () => false;
     }
   }
 

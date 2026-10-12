@@ -209,6 +209,87 @@ describe("extension-hidden tools (smarty-dev#5492)", () => {
     expect(names(catalog)).toEqual(["fovea_focus"]);
   });
 
+  // PR #567 review (Astra): after the first good read a throwing source must
+  // fail closed, never turn into "no filter".
+  const flakySource = (host: { getActiveTools: () => string[] }) => {
+    const control = { failing: false };
+    const source = hostToolVisibility({
+      getActiveTools: () => {
+        if (control.failing) throw Object.assign(new Error("secret host detail /srv/x"), { code: "EHOSTDOWN" });
+        return host.getActiveTools();
+      },
+    });
+    return { control, source };
+  };
+
+  it("fails closed when the active-tool read throws after a good read: hidden stay hidden and refused", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { host, catalog, hide } = setup();
+    const { control, source } = flakySource(host);
+    catalog.setHostVisibility(source);
+    hide("openai_image", "openai_decide");
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_websearch", "read"]); // good read
+
+    control.failing = true;
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_websearch", "read"]);
+    expect(catalog.get("openai_image")).toBeUndefined();
+    expect(catalog.get("openai_websearch")).toBeDefined();
+    expect(() => catalog.require("openai_image")).toThrow(/hidden by its extension/);
+    const provider = new CapturedToolsProvider(catalog);
+    executed.length = 0;
+    await expect(provider.invoke("openai_image", {}, context)).rejects.toThrow(/hidden by its extension/);
+    await expect(provider.invoke("openai_websearch", {}, context)).resolves.toBeDefined();
+    expect(executed).toEqual(["openai_websearch"]);
+    expect(roster(catalog)).not.toContain("openai_image");
+
+    // Warned once, with the error code only.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("EHOSTDOWN");
+    expect(String(warn.mock.calls[0]?.[0])).not.toContain("secret host detail");
+
+    // No known-good set for a replacement source that throws: hide every tool.
+    catalog.setHostVisibility(() => { throw new Error("broken"); });
+    expect(names(catalog)).toEqual([]);
+    expect(() => catalog.require("openai_websearch")).toThrow(/hidden by its extension/);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps today's no-filter behaviour while the source throws before any good read (startup)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { host, catalog, hide } = setup();
+    const { control, source } = flakySource(host);
+    control.failing = true;
+    catalog.setHostVisibility(source);
+    hide("openai_image");
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_decide", "openai_image", "openai_websearch", "read"]);
+    expect(catalog.get("openai_image")).toBeDefined();
+    expect(warn).not.toHaveBeenCalled();
+    // Once Pi's runtime is ready its active set filters as usual.
+    control.failing = false;
+    expect(names(catalog)).not.toContain("openai_image");
+  });
+
+  it("uses the fresh active set again once the failing source recovers", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { host, catalog, hide } = setup();
+    const { control, source } = flakySource(host);
+    catalog.setHostVisibility(source);
+    hide("openai_image");
+    expect(names(catalog)).not.toContain("openai_image");
+    control.failing = true;
+    expect(names(catalog)).not.toContain("openai_image");
+
+    // Recovery: the extension re-offers openai_image and hides openai_websearch.
+    host.setActiveTools([...host.getActiveTools().filter((name) => name !== "openai_websearch"), "openai_image"]);
+    control.failing = false;
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_decide", "openai_image", "read"]);
+    expect(catalog.get("openai_websearch")).toBeUndefined();
+    // A later failure falls back to that fresh set, not the older one.
+    control.failing = true;
+    expect(names(catalog)).toEqual(["fovea_focus", "openai_decide", "openai_image", "read"]);
+  });
+
   it("leaves extension-hidden tools out of the fabric_exec system prompt section", async () => {
     const handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
     const pi = {

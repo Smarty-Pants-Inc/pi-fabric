@@ -55,9 +55,10 @@ describe("live actor remove without the Main publication fence", () => {
       try {
         const name = `upgrade-${shape}-${String(flag)}-${residency}`;
         const actor = await actorWithTree(f, name);
-        // The upgrade: the old host is gone (a crash) leaving its pending removal; a new one starts on the root and
-        // finishes what it inherits.
-        await f.killResident();
+        // The upgrade: the old release's host stops cleanly, leaving its pending removal; a new one starts on the root and
+        // finishes what it inherits. (A clean stop, not a crash: Windows' startup lock refuses to restart over a
+        // crash-shaped record, host.ts #acquireWindowsLock; the upgrade does not depend on how the old host ended.)
+        await f.stopResident();
         await pendingRemoval(f, actor, name, shape, flag, residency);
         restarted = new ResidentHost(f.config, () => {});
         await restarted.start(); // its start finishes inherited removals in the background

@@ -81,7 +81,10 @@ export const fixture = async (options: { actorRoot?: string } = {}) => {
     // Its Main is gone too: a stale root participant whose recorded Main pid no longer exists.
     mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
   };
-  return { config, host, cli, create, registered, archives, mainParticipant, killResident, confirmed, close: async () => {
+  /** A clean stop of this process's resident host (its claim released), so a new host can restart on the root here,
+   * on every platform: Windows' startup lock refuses a crash-shaped record (host.ts #acquireWindowsLock). */
+  const stopResident = async () => { await host.close(); closed = true; };
+  return { config, host, cli, create, registered, archives, mainParticipant, killResident, stopResident, confirmed, close: async () => {
     if (!closed) { for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true); await host.close(); }
     fs.rmSync(root, { recursive: true, force: true });
   }, root };

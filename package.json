@@ -67,6 +67,7 @@
     "config/landlock-roles.json",
     "native/fabric-landlock.c",
     "native/fabric-mesh-lease.c",
+    "native/fabric-win-remove.c",
     "skillsets/",
     "docs/",
     "README.md",

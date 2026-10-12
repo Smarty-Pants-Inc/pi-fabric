@@ -78,6 +78,9 @@ type FabricActorScope = "project" | "session";
 
 export type FabricPythonRuntime = "cpython" | "monty";
 
+/** Whether pi.powershell and extension powershell overrides may run (smarty-dev#9826). */
+export type FabricPowerShellPolicy = "refuse" | "allow";
+
 interface FabricExecutorConfig {
   kernel: FabricKernel;
   pythonRuntime: FabricPythonRuntime;
@@ -112,6 +115,11 @@ interface FabricExecutorConfig {
   shellHangMs: number;
   /** Linux filesystem confinement for local pi.bash; no audit-only kernel mode. */
   landlock: LandlockSettings;
+  /** pi.powershell and every captured or extension powershell override are
+   * refused unless the host profile sets "allow" (smarty-dev#9826). No guard
+   * judges PowerShell grammar, so "allow" accepts that gap. Host-only: the
+   * project layer cannot opt in. */
+  powershell: FabricPowerShellPolicy;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -426,12 +434,18 @@ export interface FabricActorsConfig {
   transientBlockMaxMs?: number;
 }
 
-export type MeshLockProtocol = 1 | 2;
+/**
+ * 1: the B68 wire; 2: a complete owner published by rename, with the holder's process incarnation; 3: protocol 2 plus
+ * the holder's PID namespace on its own line (smarty-dev#9569), so a reclaimer uses pid evidence only in its own
+ * namespace, and processes from before protocol 3 cannot parse (so never reclaim) its records. Switch a root to 3 once
+ * its writers run a release that knows it.
+ */
+export type MeshLockProtocol = 1 | 2 | 3;
 
 const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   if (value === undefined) return 1;
-  if (value === 1 || value === 2) return value;
-  throw new Error("mesh.lockProtocol must be 1 or 2");
+  if (value === 1 || value === 2 || value === 3) return value;
+  throw new Error("mesh.lockProtocol must be 1, 2 or 3");
 };
 
 /** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */
@@ -666,6 +680,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     humanWaitRefs: ["extensions.ask"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     landlock: { mode: "off", disabled: false },
+    powershell: "refuse",
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -1308,6 +1323,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         disabled: landlock.disabled === true,
         ...(landlock.allowEscape === true ? { allowEscape: true } : {}),
       },
+      // Fail closed: anything but the exact opt-in refuses PowerShell (smarty-dev#9826).
+      powershell: executor.powershell === "allow" ? "allow" : "refuse",
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
@@ -2145,6 +2162,8 @@ const resolveFabricConfig = (
       delete landlock.allowEscape; // Only root policy can grant a per-command escape.
       if (landlock.mode !== "enforce") delete landlock.mode;
       executor.landlock = landlock;
+      // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
+      delete executor.powershell;
       document.executor = executor;
     }
     merged = mergeObjects(merged, document);

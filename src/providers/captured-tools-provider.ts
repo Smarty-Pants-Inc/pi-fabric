@@ -2,10 +2,12 @@ import path from "node:path";
 import { nativeToolResult } from "../core/native-tool-result.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { runAbortable, shareCancellationEffects, throwIfAborted } from "../async-settlement.js";
-import type { AgentToolResult, SourceInfo } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionRunner, SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CapturedToolCatalog, type CapturedToolEntry } from "../capture/catalog.js";
 import { classifyPiBashError, classifyPiBashResult, piBashResultError } from "../core/pi-bash-error.js";
 import { isPiShellToolName } from "../core/pi-tools.js";
+import { assertShellToolPermitted, preflightShellCall } from "./shell-preflight.js";
+import type { FabricPowerShellPolicy } from "../config.js";
 import type {
   FabricActionDescriptor,
   FabricInvocationContext,
@@ -100,10 +102,26 @@ export class CapturedToolsProvider implements FabricProvider {
   readonly #lifetime = new AbortController();
   readonly #allowedTools = readChildToolAllowlist();
 
+  readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
+  readonly #omitFromDiscovery: (entry: CapturedToolEntry) => boolean;
+
+  /**
+   * Without getPowerShellPolicy a captured powershell override is refused (smarty-dev#9826).
+   * A bare function is the discovery-filter-only form (native MCP tools stay out of discovery).
+   */
   constructor(
     readonly catalog: CapturedToolCatalog,
-    private readonly omitFromDiscovery: (entry: CapturedToolEntry) => boolean = () => false,
-  ) {}
+    options:
+      | {
+          getPowerShellPolicy?: (() => FabricPowerShellPolicy) | undefined;
+          omitFromDiscovery?: ((entry: CapturedToolEntry) => boolean) | undefined;
+        }
+      | ((entry: CapturedToolEntry) => boolean) = {},
+  ) {
+    const normalized = typeof options === "function" ? { omitFromDiscovery: options } : options;
+    this.#getPowerShellPolicy = normalized.getPowerShellPolicy;
+    this.#omitFromDiscovery = normalized.omitFromDiscovery ?? (() => false);
+  }
 
   async close(): Promise<void> {
     this.#lifetime.abort(new Error("Captured extension tool session closed"));
@@ -115,7 +133,7 @@ export class CapturedToolsProvider implements FabricProvider {
   ): Promise<FabricActionDescriptor[]> {
     const query = request.query?.trim().toLowerCase();
     const descriptors = this.catalog.list().filter((entry) =>
-      (!this.#allowedTools || this.#allowedTools.has(entry.name)) && !this.omitFromDiscovery(entry),
+      (!this.#allowedTools || this.#allowedTools.has(entry.name)) && !this.#omitFromDiscovery(entry),
     ).map(descriptorFrom);
     if (!query) return descriptors;
     return descriptors.filter((descriptor) =>
@@ -151,6 +169,8 @@ export class CapturedToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
   ): Promise<unknown> {
     this.#assertAllowed(actionName);
+    // smarty-dev#9826: refuse a powershell override before its lifecycle starts.
+    assertShellToolPermitted(actionName, this.#getPowerShellPolicy?.());
     // Include provider custody even for host-direct calls without a turn signal.
     // Queued work and non-cooperative late results cannot use a retired runner.
     context = { ...context, signal: shareCancellationEffects(AbortSignal.any([
@@ -219,23 +239,45 @@ export class CapturedToolsProvider implements FabricProvider {
     let settled = false;
     const retired = (): boolean => settled || context.signal?.aborted === true;
     try {
-      const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-        type: "tool_call",
-        toolName: entry.name,
-        toolCallId,
-        input: args,
-      }));
-      context.updateArguments?.(args);
-      if (preflight?.block) {
-        throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+      let executionContext: ReturnType<ExtensionRunner["createContext"]> | undefined;
+      if (isPiShellToolName(entry.name)) {
+        // smarty-dev#8606: a shell override takes the same preflight as pi.bash
+        // and pi.powershell. The hook sees a copy, and any hook change to the
+        // judged call (command, cwd or any other argument) refuses it.
+        const sessionContext = runner.createContext();
+        args = await preflightShellCall({
+          name: entry.name,
+          args,
+          sessionCwd: sessionContext.cwd,
+          toolCallId,
+          runner,
+          signal: context.signal,
+          blocked: `Captured tool ${entry.name} was blocked`,
+          onBlock: () => context.updateArguments?.(args),
+          powershell: this.#getPowerShellPolicy?.(),
+        });
+        context.updateArguments?.(args);
+        // Only the judged cwd runs. Upstream 0.110 hands shells a per-call tool
+        // context; keep its accessors by layering the judged cwd over it.
+        const requestedCwd = args.cwd;
+        if (typeof requestedCwd === "string") {
+          executionContext = Object.defineProperty(Object.create(runner.createToolContext
+            ? runner.createToolContext(toolCallId, context.signal)
+            : sessionContext), "cwd", { value: requestedCwd, enumerable: true });
+        }
+      } else {
+        const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+          type: "tool_call",
+          toolName: entry.name,
+          toolCallId,
+          input: args,
+        }));
+        context.updateArguments?.(args);
+        if (preflight?.block) {
+          throw new Error(preflight.reason || `Captured tool ${entry.name} was blocked`);
+        }
       }
       executionStarted = true;
-      const requestedCwd = args.cwd;
-      const executionContext = isPiShellToolName(entry.name) && typeof requestedCwd === "string"
-        ? Object.defineProperty(Object.create(runner.createToolContext
-            ? runner.createToolContext(toolCallId, context.signal)
-            : runner.createContext()), "cwd", { value: requestedCwd, enumerable: true })
-        : undefined;
       result = await runAbortable(context.signal, () =>
         wrappedTool.execute(toolCallId, args, context.signal, (partialResult) => {
         if (retired()) return;

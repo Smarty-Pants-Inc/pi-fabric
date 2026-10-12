@@ -6,21 +6,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { censusSync as writerCensusSync, type CensusWriter } from "./writer-census.js";
+import { MeshLockRecoverRefusedError, recoverMeshLock } from "./lock-recover.js";
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
 import { BUILTIN_READERS, installReaderProof, probeStateDbLeases, scanStateDbHolders, watchStateDbLeases, type StateDbLeaseWatch, type LeaseProbeOptions, type ProcScanOptions, type StateDbHolder, isReaderName, proveFabricReader, readerReadiness, recordSwitch, requiredReaders,
   type InstalledReader, type ReaderBackend, type ReaderReadiness, type RequiredReader } from "./reader-proof.js";
 
-const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof"] as const;
+const COMMANDS = ["census", "import", "status", "cutover", "rollback", "abort-rollback", "reader-proof", "lock-recover"] as const;
 type Command = typeof COMMANDS[number];
 
 const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback|abort-rollback> --root DIR [--json]
-                          [--lock-protocol 1|2] [--lock-timeout-ms N] [--accept-unready NAME,...]
+                          [--lock-protocol 1|2|3] [--lock-timeout-ms N] [--accept-unready NAME,...]
                           [--require-reader NAME=INSTALL_ROOT]...
        fabric-mesh-backend import --scratch-proof-from STATE_JSON [--scratch-parent DIR] [--json]
        fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
        fabric-mesh-backend reader-proof --root DIR --name NAME --proof-file FILE [--json]
+       fabric-mesh-backend lock-recover --root DIR --lock mesh|custody --holder TOKEN [--unsafe-holder-stopped] [--json]
 
   census          the ADVISORY writer census (writer-census.ts): the processes it attributed (mode,
                   release) and the evidence it could not. Informational; always exit 0 when it ran.
@@ -36,6 +38,13 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
                   scratch copy of state.json), then writes readers/fabric-<release>.json.
                   --proof-file: installs the proof a non-Fabric reader made with its own read code.
                   Both write under the migration fence (custody.lock, then .lock).
+  lock-recover    (smarty-dev#9569) recover a .lock or custody.lock that automatic recovery refuses: a holder of
+                  another PID namespace (container, VM, other host) or an unprovable one. It acts only on the
+                  named --holder token, only when that holder is provably dead here: our own PID namespace, its pid
+                  gone (ESRCH), and the mesh root on a host-local filesystem (Linux; never on macOS or Windows). No
+                  earlier-boot inference. Run it inside the holder's namespace when you can.
+                  --unsafe-holder-stopped recovers on YOUR word that the holder is stopped; if it still runs, its
+                  release can remove its successor's lock and two writers can run.
 
 Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refuse (exit 3) unless
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
@@ -85,10 +94,11 @@ export const meshWriterCensusSync = (root: string): MeshWriterCensusSync => () =
 };
 
 interface Options {
-  command: Command; root: string; json: boolean; lockProtocol: 1 | 2; lockTimeoutMs?: number;
+  command: Command; root: string; json: boolean; lockProtocol: 1 | 2 | 3; lockTimeoutMs?: number;
   acceptUnready: string[]; requireReaders: InstalledReader[]; name?: string; backend?: ReaderBackend; readerVersion?: string; proofFile?: string;
   /** smarty-dev#9404: import a fresh scratch copy of this state.json, gate skipped; `root` is then unset until made. */
   scratchProofFrom?: string; scratchParent?: string;
+  lock?: "mesh" | "custody"; holder?: string; unsafeHolderStopped?: boolean;
 }
 
 class UsageError extends Error {}
@@ -99,7 +109,7 @@ const parseArgs = (argv: string[]): Options | "help" => {
   if (!COMMANDS.includes(command as Command)) throw new UsageError(`Unknown command ${String(command)}`);
   let root: string | undefined;
   let json = false;
-  let lockProtocol: 1 | 2 = 1;
+  let lockProtocol: 1 | 2 | 3 = 1;
   let lockTimeoutMs: number | undefined;
   let acceptUnready: string[] = [];
   let name: string | undefined;
@@ -108,16 +118,20 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let proofFile: string | undefined;
   let scratchProofFrom: string | undefined;
   let scratchParent: string | undefined;
+  let lock: "mesh" | "custody" | undefined;
+  let holder: string | undefined;
+  let unsafeHolderStopped = false;
   const requireReaders: InstalledReader[] = [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
+    if (flag === "--unsafe-holder-stopped") { unsafeHolderStopped = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
     else if (flag === "--lock-protocol") {
-      if (value !== "1" && value !== "2") throw new UsageError("--lock-protocol must be 1 or 2");
-      lockProtocol = value === "2" ? 2 : 1;
+      if (value !== "1" && value !== "2" && value !== "3") throw new UsageError("--lock-protocol must be 1, 2 or 3");
+      lockProtocol = value === "3" ? 3 : value === "2" ? 2 : 1;
     } else if (flag === "--lock-timeout-ms") {
       const number = Number(value);
       if (!Number.isFinite(number) || number < 100) throw new UsageError(`Bad --lock-timeout-ms ${value}`);
@@ -133,6 +147,10 @@ const parseArgs = (argv: string[]): Options | "help" => {
     else if (flag === "--proof-file") proofFile = value;
     else if (flag === "--scratch-proof-from") scratchProofFrom = value;
     else if (flag === "--scratch-parent") scratchParent = value;
+    else if (flag === "--lock") {
+      if (value !== "mesh" && value !== "custody") throw new UsageError("--lock must be mesh or custody");
+      lock = value;
+    } else if (flag === "--holder") holder = value;
     else if (flag === "--require-reader") {
       const [readerName, installRoot] = [value.slice(0, value.indexOf("=")), value.slice(value.indexOf("=") + 1)];
       // Flags only ADD readers: a built-in's trusted root can never be replaced from the command line.
@@ -146,6 +164,7 @@ const parseArgs = (argv: string[]): Options | "help" => {
     }
     else throw new UsageError(`Bad argument: ${flag}`);
   }
+  if (command !== "lock-recover" && (lock || holder || unsafeHolderStopped)) throw new UsageError("--lock, --holder and --unsafe-holder-stopped are for lock-recover");
   if (scratchProofFrom !== undefined || scratchParent !== undefined) {
     if (command !== "import" || scratchProofFrom === undefined || root !== undefined || acceptUnready.length > 0 || requireReaders.length > 0) {
       throw new UsageError("--scratch-proof-from STATE_JSON [--scratch-parent DIR] is for import only, without --root, --accept-unready or --require-reader");
@@ -158,10 +177,12 @@ const parseArgs = (argv: string[]): Options | "help" => {
   if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
     throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
   }
+  if (command === "lock-recover" && (!lock || !holder)) throw new UsageError("lock-recover needs --lock mesh|custody and --holder TOKEN");
   return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
     ...(proofFile === undefined ? {} : { proofFile }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
-    ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }) };
+    ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }),
+    ...(lock === undefined ? {} : { lock }), ...(holder === undefined ? {} : { holder }), ...(unsafeHolderStopped ? { unsafeHolderStopped } : {}) };
 };
 
 const formatStatus = (status: MeshBackendStatus): string => {
@@ -507,6 +528,23 @@ export const main = async (argv: string[], io: {
     ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }),
   };
   try {
+    if (options.command === "lock-recover") {
+      // Not under the migration fence: it recovers one of the fence's own locks. Never runs the census either.
+      try {
+        const recovered = await recoverMeshLock(options.root, { lock: options.lock!, holder: options.holder!,
+          ...(options.unsafeHolderStopped ? { unsafeHolderStopped: true } : {}) });
+        // pi-fabric#923: every recovery prints its audit line (who, from where); the unsafe one is an ALARM.
+        warn(`fabric-mesh-backend: ${recovered.warning ? `ALARM ${recovered.warning}` : `recovered ${recovered.lock}`}; audit ${JSON.stringify(recovered.audit)}\n`);
+        write(`${options.json ? JSON.stringify({ command: "lock-recover", ok: true, ...recovered }, null, 2)
+          : `lock-recover done (${recovered.mode}): ${recovered.lock} -> ${recovered.fence}`}\n`);
+        return 0;
+      } catch (error) {
+        if (!(error instanceof MeshLockRecoverRefusedError)) throw error;
+        if (options.json) write(`${JSON.stringify({ command: "lock-recover", ok: false, refused: true, code: error.code, error: error.message }, null, 2)}\n`);
+        warn(`fabric-mesh-backend: lock-recover refused: ${error.message}\n`);
+        return 3;
+      }
+    }
     if (options.command === "census") {
       // Advisory (smarty-dev#6982): exit 0 whatever it shows; an empty report proves nothing.
       const report = await library.census!();

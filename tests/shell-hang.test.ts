@@ -22,7 +22,7 @@ const invokeBash = async (
   jobs = new FabricShellJobStore(),
 ) => {
   stores.push(jobs);
-  const provider = new PiToolsProvider(process.cwd(), undefined, undefined, {
+  const provider = new PiToolsProvider(process.cwd(), undefined, undefined, { allowUnhookedTools: true,
     powerShellToolDefinitionFactory: undefined,
     getShellHangMs: () => hangMs,
     shellJobs: jobs,

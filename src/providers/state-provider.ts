@@ -11,6 +11,7 @@ import {
   STATE_BINDING_VALUE_MAX_CHARS,
 } from "../state/binding.js";
 import { StateStore, type StateTransitionKind } from "../state/store.js";
+import type { ShellCommandPreflight } from "./shell-preflight.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 
 const STATE_ENTITY_ID = "fabric-state";
@@ -220,17 +221,34 @@ export class StateProvider implements FabricProvider {
   // Whether `pi` exists inside fabric_exec; selects the recovery hint wording.
   readonly #piTools: () => boolean;
 
+  // state.verify/checkGoal run model-supplied shell commands. They pass the
+  // same tool_call preflight as pi.bash, or fail closed (smarty-dev#8606).
+  readonly #shellPreflight: ShellCommandPreflight | undefined;
+  readonly #allowUnhookedTools: boolean;
+
   constructor(
     store: MeshStore,
     identity: MeshIdentity,
     // A bare function is the earlier piTools-only form.
     options: { schemaMode?: FabricSchemaMode; piTools?: () => boolean } | (() => boolean) = {},
+    shell: { preflight?: ShellCommandPreflight; /** Test-only, like PiToolsProvider's. */ allowUnhookedTools?: boolean } = {},
   ) {
     const normalized = typeof options === "function" ? { piTools: options } : options;
     this.#store = new StateStore(store);
     this.#identity = identity;
     this.#piTools = normalized.piTools ?? (() => true);
     this.#schemaMode = normalized.schemaMode;
+    this.#shellPreflight = shell.preflight;
+    this.#allowUnhookedTools = shell.allowUnhookedTools === true;
+  }
+
+  #preflightCommand(action: string, context: FabricInvocationContext): ((command: string, index: number) => Promise<void>) | undefined {
+    if (this.#shellPreflight) {
+      const preflight = this.#shellPreflight;
+      return (command, index) => preflight(command, context, `state.${action}`, index);
+    }
+    if (this.#allowUnhookedTools) return undefined;
+    throw new Error(`state.${action} is unavailable until extension tool hooks initialize; retry once tools are ready`);
   }
 
   get state(): StateStore {
@@ -352,6 +370,7 @@ export class StateProvider implements FabricProvider {
           : undefined;
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
         const includeArchived = args.includeArchived === true;
+        const preflightCommand = this.#preflightCommand("verify", context);
         // The store validates the binding and fails closed on malformed input.
         const binding = args.binding as Record<string, string> | undefined;
         context.activity?.({
@@ -361,6 +380,7 @@ export class StateProvider implements FabricProvider {
           name: "verify",
         });
         const result = await this.#store.verify({
+          ...(preflightCommand ? { preflightCommand } : {}),
           ...(labels ? { labels } : {}),
           includeArchived,
           cwd: context.cwd,
@@ -397,7 +417,9 @@ export class StateProvider implements FabricProvider {
       }
       case "checkGoal": {
         const timeoutMs = typeof args.timeoutMs === "number" ? args.timeoutMs : undefined;
+        const preflightCommand = this.#preflightCommand("checkGoal", context);
         const result = await this.#store.checkGoal({
+          ...(preflightCommand ? { preflightCommand } : {}),
           cwd: context.cwd,
           ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(context.signal ? { signal: context.signal } : {}),

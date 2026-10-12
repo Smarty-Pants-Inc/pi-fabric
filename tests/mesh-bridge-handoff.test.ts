@@ -293,7 +293,7 @@ describe("hub handoff of a moved Main's native identity (smarty-dev#9074)", () =
       ["handoff", ["--mesh", f.hub.root, "--session", f.stale.sessionId, "--link"], "Bad argument: --link"],
       ["handoff-revoke", ["--mesh", f.hub.root], "--session is required"],
       ["handoff-list", [], "--mesh is required"],
-      ["handoff-list", ["--mesh", f.hub.root, "--lock-protocol", "3"], "--lock-protocol must be 1 or 2"],
+      ["handoff-list", ["--mesh", f.hub.root, "--lock-protocol", "4"], "--lock-protocol must be 1, 2 or 3"],
     ];
     for (const [mode, flags, message] of cases) {
       const run = await cliJson(mode, ...flags);

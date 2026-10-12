@@ -40,7 +40,8 @@ const harness = (name: string) => {
     format: 1, rootId: `session:${sessionId}`, sessionId, cwd: root, projectRoot: root, meshRoot,
     actorRoot: path.join(root, "actors"), sessionActorRoot: path.join(root, "session-actors"), residencyRoot,
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+    // A dead root retires after residentIdleExitMs; keep the window inside the 60 s clock jump below.
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, residentIdleExitMs: 30_000 }, retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
   };

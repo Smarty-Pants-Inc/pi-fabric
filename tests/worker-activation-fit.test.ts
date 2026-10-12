@@ -22,7 +22,7 @@ type Usage = { input: number; cacheRead: number; output: number };
 // reasoning: per item thinkingSignature (JSON.stringify(reasoning item)) lengths; summary: per item text.
 type Turn = { decision: number; results: number[]; reasoning?: number[]; summary?: number[]; usage?: Usage };
 type Scenario = { api: "openai-completions" | "openai-responses"; turns: Turn[]; final?: Turn; systemPad: number;
-  custom?: number; user?: number; argsChars?: number };
+  systemTarget?: number; custom?: number; user?: number; argsChars?: number };
 type Payload = { req: number; tokens: number; tool: number; assistant: number; user: number; system: number; schema: number;
   reasoning: number; toolCall: number; other: number; encryptedChars: number; contentEstimate: number; usagePrev?: number;
   detailsOnWire: boolean; toolMessages: number; excerpts: number; fullLatest: boolean; compactions: number;
@@ -40,9 +40,9 @@ type Evidence = { payloads: Payload[]; boundaries: Boundary[]; errors?: string[]
 const REAL = { usageFinal: { input: 1_312 + 91_648, cacheRead: 91_648, output: 4_058 }, usageFinalTotal: 97_018, usagePeak: 143_324,
   reasoningItems: 112, signatureChars: 755_244, thinkingChars: 8_368, toolTextChars: 604_856, toolCallArgsChars: 21_064,
   custom: 20_082, user: 2_166, mainCharPreflight: 274_359, systemSections: 82_540 };
-// Pi's native rendered system prompt here is 1,894 chars; the real actor rendered its 82,540-char
-// system.sections. DISCLOSED appended system text brings the rendered system to the real size (asserted).
-const NATIVE_SYSTEM = 1_894;
+// The real actor rendered an 82,540-char system.sections. Pi's native rendered system prompt differs by host
+// version, so an unprompted native probe session sizes the DISCLOSED pad from its actual systemPrompt.
+// The activation's rendered system is exactly the recorded size (asserted).
 const LARGE_FILE = 60_000; // native read truncates to ~51.2k delivered chars with its 50KB notice (parent probe: 51,273)
 const LARGE_AT = new Set([3, 11, 19, 27, 35, 43, 51, 62]); // the final batch carries one large read
 const LARGE_DELIVERED = 51_189; // measured delivered size of a LARGE_FILE read (asserted against the run)
@@ -68,7 +68,7 @@ const realRun = (): Scenario => {
     results: Array.from({ length: i < 14 ? 2 : 1 }, () => (LARGE_AT.has(n++) ? LARGE_FILE : small[k++]!)),
     reasoning: sigs.slice(r, r + c), summary: sums.slice(r, (r += c)), usage: usageAt(i + 1) }));
   return { api: "openai-responses", turns, final: { decision: 15, results: [], usage: usageAt(50) },
-    systemPad: REAL.systemSections - NATIVE_SYSTEM - "SYSTEM_PAD ".length - 2,
+    systemPad: 0, systemTarget: REAL.systemSections,
     custom: REAL.custom, user: REAL.user, argsChars: REAL.toolCallArgsChars };
 };
 
@@ -95,7 +95,7 @@ const fitting = (): Scenario => ({ api: "openai-completions", systemPad: 0,
 const roots: string[] = [];
 afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
-function drive({ api, turns, final, systemPad, custom = 0, user = 0, argsChars }: Scenario): Evidence {
+function drive({ api, turns, final, systemPad, systemTarget = 0, custom = 0, user = 0, argsChars }: Scenario): Evidence {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-actfit-"));
   roots.push(dir);
   fs.symlinkSync(path.resolve("node_modules"), path.join(dir, "node_modules"), "junction");
@@ -281,14 +281,27 @@ function drive({ api, turns, final, systemPad, custom = 0, user = 0, argsChars }
       });
       pi.on('before_provider_request', event => { lastPayload = event.payload; measure(event.payload); });
     };
-    const loader = new DefaultResourceLoader({cwd: root, agentDir: root, noSkills: true, noPromptTemplates: true, noThemes: true,
-      noContextFiles: true, appendSystemPrompt: ${systemPad} ? [${JSON.stringify("SYSTEM_PAD ")} + 's'.repeat(${systemPad})] : [],
-      extensionFactories: [{name: 'fit-before', factory: before}, {name: 'activation-window', factory: hook}, {name: 'fit-after', factory: after}]});
+    const resources = (pad, extensionFactories) => ({cwd: root, agentDir: root, noSkills: true, noPromptTemplates: true, noThemes: true,
+      noContextFiles: true, appendSystemPrompt: pad === undefined ? [] : [${JSON.stringify("SYSTEM_PAD ")} + 's'.repeat(pad)], extensionFactories});
+    const open = async (loader, sessionManager) => (await createAgentSession({cwd: root, agentDir: root, modelRuntime,
+      model: modelRuntime.getModel('fit-test', 'offline'), resourceLoader: loader, tools: ['read'], sessionManager,
+      settingsManager: SettingsManager.inMemory({compaction: {enabled: false}, retry: {enabled: false}})})).session;
+    let pad = ${systemPad} || undefined;
+    if (${systemTarget}) {
+      // DISCLOSED pad sized from this host's actual natively rendered system prompt (an unbound, unprompted
+      // probe session with an empty pad), so the rendered system is exactly the target on every host version.
+      const probeLoader = new DefaultResourceLoader(resources(0, []));
+      await probeLoader.reload();
+      const probe = await open(probeLoader, SessionManager.inMemory(root));
+      pad = ${systemTarget} - probe.systemPrompt.length;
+      probe.dispose();
+      if (pad < 0) throw new Error('system target below the native system prompt');
+    }
+    const loader = new DefaultResourceLoader(resources(pad,
+      [{name: 'fit-before', factory: before}, {name: 'activation-window', factory: hook}, {name: 'fit-after', factory: after}]));
     await loader.reload();
     const sessionManager = SessionManager.inMemory(root);
-    ({session} = await createAgentSession({cwd: root, agentDir: root, modelRuntime, model: modelRuntime.getModel('fit-test', 'offline'),
-      resourceLoader: loader, tools: ['read'], sessionManager,
-      settingsManager: SettingsManager.inMemory({compaction: {enabled: false}, retry: {enabled: false}})}));
+    session = await open(loader, sessionManager);
     const errors = [];
     await session.bindExtensions({mode: 'rpc', onError: error => errors.push(String(error.error ?? error))});
     // Session-side composition (raw append-only messages, not the projected wire).
@@ -379,7 +392,7 @@ describe("activation window fits a long native activation (smarty-dev#10560)", (
     expect(Math.abs(t.toolTextChars - REAL.toolTextChars) / REAL.toolTextChars, JSON.stringify(s.largestResults)).toBeLessThan(0.005);
     expect(Math.abs(t.toolCallArgsChars - REAL.toolCallArgsChars) / REAL.toolCallArgsChars).toBeLessThan(0.02);
     expect(t.detailsChars).toBeGreaterThan(0);
-    expect(Math.abs(t.systemChars - REAL.systemSections), String(t.systemChars)).toBeLessThan(100);
+    expect(t.systemChars).toBe(REAL.systemSections);
     expect(Math.max(...t.usage)).toBeLessThanOrEqual(REAL.usagePeak);
     // Wire: reasoning replayed as parsed items; read details never sent; dispatched body == observed payload.
     for (const p of e.payloads) {
@@ -390,6 +403,7 @@ describe("activation window fits a long native activation (smarty-dev#10560)", (
     expect(e.refusal, JSON.stringify({ refusal: s.refusal, last: s.last, usage: t.usage.slice(-3) })).toBeUndefined();
     expect(e.status, e.stderr).toBe(0);
     expect(e.served).toBe(50);
+    expect(s.compactions).toHaveLength(0); // no false compaction: usage never approaches the window
     expect(t.usage.at(-1)).toBe(REAL.usageFinalTotal);
     expect(Math.max(...t.usage)).toBe(REAL.usagePeak);
   }, GUARD_MS + 30_000);

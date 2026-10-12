@@ -326,17 +326,20 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
               throw new Error("Activation window requires a JSON provider request object");
             }
             // Estimate only; the admitted snapshot below still dispatches every byte. Qualified Responses
-            // APIs replay opaque reasoning as direct input[] items, billed by provider usage (anchored
-            // below), not characters. No other field, even one named encrypted_content, is exempt.
+            // APIs replay opaque reasoning as direct input[] items, billed by provider usage, not characters.
+            // Only a trustworthy same-model usage anchor may exclude it (wireTokens: the normalized growth
+            // baseline). No other field, even one named encrypted_content, is exempt.
+            const fullTokens = estimateTextTokens(encoded);
             const input = RESPONSES.has(model.api) ? (admitted as { input?: unknown }).input : undefined;
-            const wireTokens = estimateTextTokens(!Array.isArray(input) ? encoded : JSON.stringify({ ...admitted, input:
+            const wireTokens = !Array.isArray(input) ? fullTokens : estimateTextTokens(JSON.stringify({ ...admitted, input:
               input.map((item: Record<string, unknown> | null) => item && typeof item === "object" && !Array.isArray(item) &&
                 item.type === "reasoning" && typeof item.encrypted_content === "string" ? { ...item, encrypted_content: "" } : item) }));
             // The last same-model report plus all growth since its dispatch (new content, callback or prefix
-            // expansions anywhere). Shrinks earn no credit; without a matching report, the wire estimate.
+            // expansions anywhere). Shrinks earn no credit. Without a valid, unambiguous same-model report
+            // (none, invalid, zero, error/aborted, foreign model, side request), the full encoded estimate.
             const modelKey = JSON.stringify([model.provider, model.id, model.api]);
             const anchor = lastPayload?.modelKey === modelKey ? lastPayload : undefined;
-            const tokens = anchor?.reportedTokens === undefined ? wireTokens
+            const tokens = anchor?.reportedTokens === undefined ? fullTokens
               : Math.max(wireTokens, anchor.reportedTokens + Math.max(0, wireTokens - anchor.wireTokens));
             if (tokens > model.contextWindow) {
               reportWindowRefusal(tokens, model.contextWindow);

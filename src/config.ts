@@ -426,12 +426,18 @@ export interface FabricActorsConfig {
   transientBlockMaxMs?: number;
 }
 
-export type MeshLockProtocol = 1 | 2;
+/**
+ * 1: the B68 wire; 2: a complete owner published by rename, with the holder's process incarnation; 3: protocol 2 plus
+ * the holder's PID namespace on its own line (smarty-dev#9569), so a reclaimer uses pid evidence only in its own
+ * namespace, and processes from before protocol 3 cannot parse (so never reclaim) its records. Switch a root to 3 once
+ * its writers run a release that knows it.
+ */
+export type MeshLockProtocol = 1 | 2 | 3;
 
 const meshLockProtocol = (value: unknown): MeshLockProtocol => {
   if (value === undefined) return 1;
-  if (value === 1 || value === 2) return value;
-  throw new Error("mesh.lockProtocol must be 1 or 2");
+  if (value === 1 || value === 2 || value === 3) return value;
+  throw new Error("mesh.lockProtocol must be 1, 2 or 3");
 };
 
 /** Keyed mesh state backend (smarty-dev#6477 L2a): see src/mesh/state-backend.ts. */

@@ -205,6 +205,39 @@ describe.skipIf(process.platform !== "linux")("worker execution group identity",
     expect(scans()).toBe(1);
   });
 
+  it("runs the full /proc scan when a leader thread's children read vanishes, the leader's stat present", () => {
+    const { processes, group, readdir, read } = setup();
+    const scans = () => readdir.mock.calls.filter(([dir]) => String(dir) === "/proc").length;
+    // A normal tree is fully covered by the walk: no host-wide scan.
+    group.observe();
+    expect(group.members()).toEqual([100]);
+    expect(scans()).toBe(0);
+    // The leader gains thread 150; new child 101 is listed only under that thread,
+    // and 150 exits mid-read: its task/150/children read fails with ENOENT.
+    processes.set(101, { started: "thread-child-birth", group: 100, parent: 100 });
+    const baseDir = readdir.getMockImplementation()!;
+    readdir.mockImplementation((...args: Parameters<typeof fs.readdirSync>) =>
+      String(args[0]) === "/proc/100/task" ? ["100", "150"] as never : baseDir(...args));
+    const base = read.getMockImplementation()!;
+    let armed = true;
+    read.mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+      const file = String(args[0]);
+      if (file === "/proc/100/task/100/children") return "";
+      if (file === "/proc/100/task/150/children") {
+        if (armed) { armed = false; throw Object.assign(new Error("gone"), { code: "ENOENT" }); }
+        return "101";
+      }
+      return base(...args);
+    });
+    // The partial walk ([100]) is nonempty, yet must not be trusted.
+    expect(group.members().sort()).toEqual([100, 101]);
+    expect(armed).toBe(false);
+    expect(scans()).toBe(1);
+    // No vanishing now: the walk alone covers the group.
+    expect(group.members().sort()).toEqual([100, 101]);
+    expect(scans()).toBe(1);
+  });
+
   it("refuses a group whose recorded member moved to a foreign group", () => {
     const { processes, group, kill } = setup();
     processes.set(100, { started: "leader-birth", group: 200 });

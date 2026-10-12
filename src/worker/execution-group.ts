@@ -54,10 +54,12 @@ const childrenOf = (pid: number): { pids: number[]; vanished: boolean } => {
 
 /** Every live process reachable from roots by parent links (roots included).
  * incomplete is true when members is a partial view that must never be trusted:
- * WALK_LIMIT stopped the walk with unvisited pids still queued, or a non-leader
- * node vanished (ENOENT/ESRCH) before its stat or children were read, so its
- * children were re-parented away from the walked tree (to init or a subreaper).
- * A vanished leader keeps its existing handling: the exit handler adopts. */
+ * WALK_LIMIT stopped the walk with unvisited pids still queued, a non-leader
+ * node vanished (ENOENT/ESRCH) before its stat was read, or any node's task or
+ * task/<tid>/children read vanished (the leader included: a thread that exited
+ * mid-read may have held children), so children were re-parented away from the
+ * walked tree (to init or a subreaper). Only a leader whose own stat is gone
+ * keeps its existing handling: the exit handler adopts. */
 const descendants = (leader: number, roots: Iterable<number>): { members: Member[]; incomplete: boolean } => {
   const seen = new Set<number>();
   const found: Member[] = [];
@@ -71,7 +73,7 @@ const descendants = (leader: number, roots: Iterable<number>): { members: Member
     if (!value) { if (pid !== leader) vanished = true; continue; }
     found.push(value);
     const children = childrenOf(pid);
-    if (children.vanished && pid !== leader) vanished = true;
+    if (children.vanished) vanished = true;
     queue.push(...children.pids);
   }
   return { members: found, incomplete: vanished || queue.some(pid => !seen.has(pid)) };
@@ -131,7 +133,7 @@ export const executionGroup = (child: ChildProcess) => {
       current = inGroup(walk.members);
       // A vanished member may have orphaned unrecorded children, an empty walk
       // is about to latch, and an incomplete walk (cut off at WALK_LIMIT, or a
-      // non-leader node vanished mid-walk) omitted members: only then confirm
+      // node or thread vanished mid-walk) omitted members: only then confirm
       // with one host-wide scan. Never trust a partial walk.
       const now = new Set(current.map(value => value.pid));
       if (walk.incomplete || !current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());

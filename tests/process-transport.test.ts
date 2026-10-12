@@ -284,10 +284,22 @@ describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4
     expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
   });
   it("unconfirmed scope teardown vetoes fallback and retains custody debt", async () => {
-    const f = fixture("trap '' TERM; while :; do :; done"); const debt = vi.fn();
-    await expect(new ProcessTransport("batch.slice").launch({ ...f.request, onUnconfirmedExit: debt }))
-      .rejects.toThrow("termination is unconfirmed");
-    expect(debt).toHaveBeenCalledOnce(); expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+    // The stub ignores TERM by design, so the transport leaves it running: record its pid and end it here, or it spins
+    // at 100% CPU in its own process group after the root is removed (Ryzen 2: 24 h, smarty-dev#4383).
+    const f = fixture(`echo $$ > "\${0%/*}/stub.pid"; trap '' TERM; while :; do :; done`); const debt = vi.fn();
+    try {
+      await expect(new ProcessTransport("batch.slice").launch({ ...f.request, onUnconfirmedExit: debt }))
+        .rejects.toThrow("termination is unconfirmed");
+      expect(debt).toHaveBeenCalledOnce(); expect(fs.existsSync(path.join(f.root, "started"))).toBe(false);
+    } finally {
+      const pidFile = path.join(f.root, "stub.pid");
+      const stub = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8").trim()) : undefined;
+      if (stub) {
+        try { process.kill(stub, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        // Gone before the next test: nothing outlives this fixture.
+        await vi.waitFor(() => expect(() => process.kill(stub, 0)).toThrow(expect.objectContaining({ code: "ESRCH" })), { timeout: 2_000 });
+      }
+    }
   }, 20_000);
 
   it("is off by default", async () => {

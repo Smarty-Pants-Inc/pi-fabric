@@ -79,16 +79,21 @@ const liveWorker = () => {
  * A launched (managed) run whose contact is lost with `reason` (default the ENODEV observation failure), with the
  * worker's saved answer. `closedWhileAlive`: the transport reports the run closed at once while its pid still lives.
  */
-const lostContactRun = async (options: { reason?: string; closedWhileAlive?: boolean; failCompletedSaves?: { on: boolean } } = {}) => {
+const lostContactRun = async (options: { reason?: string; closedWhileAlive?: boolean; failCompletedSaves?: { on: boolean; remaining?: number } } = {}) => {
+  const alarms: Array<{ kind?: string; runId?: string }> = [];
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-permits-"));
   roots.push(root);
   const settledResults: Array<{ id: string; status: string; text?: string }> = [];
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
     onSettled: result => {
-      if (result.status === "completed" && options.failCompletedSaves?.on) throw new Error("archive or routing failed");
+      const failing = options.failCompletedSaves;
+      if (result.status === "completed" && failing?.on && (failing.remaining === undefined || failing.remaining-- > 0)) {
+        throw new Error("archive or routing failed");
+      }
       settledResults.push({ id: result.id, status: result.status, ...(result.text ? { text: result.text } : {}) });
     },
+    onAdmissionAlarm: alarm => alarms.push(alarm),
   });
   managers.push(manager);
   const worker = liveWorker();
@@ -106,7 +111,7 @@ const lostContactRun = async (options: { reason?: string; closedWhileAlive?: boo
     updatedAt: Date.now(), turns: 0, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }));
   fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: handle.id, outcome: "completed", text: "SAVED" }));
   const saved = () => settledResults.filter(result => result.id === handle.id && result.status === "completed");
-  return { manager, root, handle, directory, worker, saved };
+  return { manager, root, handle, directory, worker, saved, alarms };
 };
 
 describe("held admission permits (smarty-dev#9855)", () => {
@@ -269,6 +274,40 @@ describe("a lost-contact run's saved answer", () => {
     expect(manager.heldPermits()).toBe(0);
     expect(next.status).not.toBe("queued");
     await manager.stop(next.id).catch(() => undefined);
+  }, 60_000);
+});
+
+// pi-fabric#939 round 4 P1-2: a failing recovered-answer save retries on its own (bounded backoff) and alarms the owner
+// once, while a waiter is queued; no spawn event is needed.
+describe("a recovered answer whose save fails", () => {
+  onLinux("fails twice, then the bounded retry delivers it once and admits the queued waiter, with one owner alarm", async () => {
+    const failing = { on: true, remaining: 2 };
+    const { manager, handle, worker, saved, alarms } = await lostContactRun({ failCompletedSaves: failing });
+    const waiter = await manager.spawn({ task: "waiter", transport: "process" }); // queued behind the held permit
+    expect(waiter.status).toBe("queued");
+    await worker.exit();
+    await manager.wait(handle.id, { timeoutMs: 15_000 });
+    await vi.waitFor(() => expect(saved()).toHaveLength(1), { timeout: 15_000, interval: 50 });
+    await vi.waitFor(() => expect(manager.status(waiter.id).status).not.toBe("queued"), { timeout: 5_000, interval: 50 });
+    expect(manager.heldPermits()).toBe(0);
+    expect(failing.remaining).toBeLessThanOrEqual(0);
+    expect(alarms.filter(alarm => alarm.kind === "recovered-answer-save-failed")).toEqual([expect.objectContaining({ runId: handle.id })]);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect(saved()).toHaveLength(1);
+    await manager.stop(waiter.id).catch(() => undefined);
+  }, 60_000);
+
+  onLinux("a permanent failure keeps the permit and raises one owner alarm", async () => {
+    const { manager, handle, worker, saved, alarms } = await lostContactRun({ failCompletedSaves: { on: true } });
+    const waiter = await manager.spawn({ task: "waiter", transport: "process" });
+    await worker.exit();
+    await manager.wait(handle.id, { timeoutMs: 15_000 });
+    await new Promise(resolve => setTimeout(resolve, 4_000)); // the first retries (1 s, 2 s) also fail
+    expect(saved()).toHaveLength(0);
+    expect(manager.heldPermits()).toBe(1);
+    expect(manager.status(waiter.id).status).toBe("queued");
+    expect(alarms.filter(alarm => alarm.kind === "recovered-answer-save-failed")).toHaveLength(1);
+    await manager.stop(waiter.id).catch(() => undefined);
   }, 60_000);
 });
 

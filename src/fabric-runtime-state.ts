@@ -1031,8 +1031,10 @@ export class FabricRuntimeState {
           console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
-        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: "fabric.alarm.agent-admission", kind: "agent-admission-held",
-          from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
+        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
+        const owner = alarm.kind === "recovered-answer-save-failed";
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: owner ? "ops.owner" : "fabric.alarm.agent-admission",
+          kind: owner ? "actor.alarm" : "agent-admission-held", from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },

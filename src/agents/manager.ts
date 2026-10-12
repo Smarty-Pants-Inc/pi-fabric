@@ -150,6 +150,9 @@ const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
 /** smarty-dev#9855: a standing held-permit alarm repeats this often. */
 const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
+/** pi-fabric#939 round 4: a failed recovered-answer save retries after 1, 2, 4, 8 and 16 s (5 tries). */
+const RECOVERY_RETRY_MAX = 5;
+const RECOVERY_RETRY_BASE_MS = 1_000;
 /** The first call runs `release`; later calls do nothing (a permit is released at most once). */
 const once = (release: () => void): (() => void) => {
   let done = false;
@@ -328,6 +331,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   recoveredAnswer?: boolean;
   /** Round 3: that delivery's save succeeded; only its completed mark is left. */
   recoveredSaved?: boolean;
+  /** Round 4: the bounded save retry (one one-shot timer) and its one owner alarm. */
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
   id: string;
   name: string;
   task: string;
@@ -1807,7 +1814,7 @@ export class AgentManager {
       if (!record) continue;
       // Then prove, save, mark completed, release: a saved answer the spawner never got goes through its completion
       // path first (round 2), once; any failure keeps the permit and is retried.
-      if (!this.#deliverRecoveredAnswer(managed, record)) continue;
+      if (!this.#deliverRecoveredAnswer(managed, record)) { this.#retryRecoveredAnswer(managed); continue; }
       if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
       const permit = managed.heldPermit;
       delete managed.heldPermit;
@@ -1852,6 +1859,32 @@ export class AgentManager {
       try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
     }
     return true;
+  }
+
+  /**
+   * pi-fabric#939 round 4: a held run whose recovered answer could not be saved retries on its own, not only on a later
+   * spawn: one one-shot timer per held run, backoff 1, 2, 4, 8, 16 s, at most RECOVERY_RETRY_MAX tries (a reviewed
+   * bounded retry, not a poll). The FIRST failure sends one owner alarm naming the run, whatever the held count. After
+   * the last try the permit stays held (the next spawn or close event still re-checks).
+   */
+  #retryRecoveredAnswer(managed: ManagedAgent): void {
+    if (!managed.recoveryAlarmed) {
+      managed.recoveryAlarmed = true;
+      const alarm: AgentAdmissionAlarm = { kind: "recovered-answer-save-failed", runId: managed.id,
+        heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
+        message: `run ${managed.id}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
+          "while the save is retried (smarty-dev#9855)" };
+      console.warn(`[pi-fabric] ${alarm.message}`);
+      try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
+    }
+    const tries = managed.recoveryRetries ?? 0;
+    if (managed.recoveryTimer || tries >= RECOVERY_RETRY_MAX || this.#closing) return;
+    managed.recoveryRetries = tries + 1;
+    managed.recoveryTimer = setTimeout(() => {
+      delete managed.recoveryTimer;
+      if (!this.#closing) this.#releaseProvenGone();
+    }, RECOVERY_RETRY_BASE_MS * 2 ** tries);
+    managed.recoveryTimer.unref?.();
   }
 
   /** One alarm when held permits reach half of maxConcurrent, again every 6 h while they stay there. */

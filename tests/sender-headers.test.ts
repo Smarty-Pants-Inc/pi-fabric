@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import senderHeadersHook, {
-  resolveSenderHeaders, SENDER_VALUE_MAX_LENGTH, senderHeaderValue, senderSpawner, smartyTaskLane,
+  applySenderHeaders, resolveSenderHeaders, SENDER_VALUE_MAX_LENGTH, senderHeaderValue, senderSpawner, smartyTaskLane,
 } from "../src/guards/sender-headers.js";
 import piFabric from "../src/index.js";
 
@@ -125,6 +125,38 @@ describe("sender headers (smarty-dev#6207)", () => {
     for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown();
     return result as Array<(event: { headers: Record<string, string> }) => unknown>;
   };
+
+  it("removes pre-populated reserved keys in any letter case when omitted, and replaces them when resolved", () => {
+    // Omitted: a Main with a role but no name and no spawner; stale and caller-supplied keys must go.
+    clean({ SMARTY_ROLE: "project-agent@abc" });
+    const omitted: Record<string, string | null> = {
+      Authorization: "unmodified", "X-Smarty-Role": "stale", "x-smarty-agent": "caller", "X-SMARTY-SPAWNER": "forged",
+    };
+    applySenderHeaders(omitted, process.env, undefined);
+    expect(omitted).toEqual({ Authorization: "unmodified", "X-Smarty-Role": "project-agent" });
+    // Present: a Fabric child resolving all three; every other-case duplicate is replaced, not kept beside.
+    clean({ PI_FABRIC_PARENT_RUN: "run-3", PI_FABRIC_TASK_PROCESS_CHILD: "1", PI_FABRIC_AGENT_NAME: "child-a", PI_FABRIC_SPAWNER_NAME: "main-b" });
+    const present: Record<string, string | null> = {
+      "x-smarty-role": "stale", "X-Smarty-Agent": "caller", "x-SMARTY-agent": "dup", "X-Smarty-Spawner": "forged", Accept: "*/*",
+    };
+    applySenderHeaders(present);
+    expect(present).toEqual({ Accept: "*/*", "X-Smarty-Role": "task", "X-Smarty-Agent": "child-a", "X-Smarty-Spawner": "main-b" });
+  });
+
+  it("both hooks (worker -e and the Main's entry) drop reserved keys their resolver omits", async () => {
+    clean({ PI_FABRIC_PARENT_RUN: "run-3", PI_FABRIC_AGENT_NAME: "child-a" });
+    let hook: ((event: { headers: Record<string, string> }) => unknown) | undefined;
+    senderHeadersHook({ on: (_event: string, handler: typeof hook) => { hook = handler; } } as unknown as ExtensionAPI);
+    const worker: Record<string, string> = { "x-smarty-spawner": "forged", "X-SMARTY-ROLE": "stale", Authorization: "unmodified" };
+    hook?.({ headers: worker });
+    expect(worker).toEqual({ Authorization: "unmodified", "X-Smarty-Agent": "child-a" });
+    clean();
+    const main = await fabricHeaderHandlers();
+    expect(main.length).toBeGreaterThan(0);
+    const headers: Record<string, string> = { "x-smarty-role": "stale", "X-Smarty-Agent": "old", "x-SMARTY-spawner": "forged" };
+    for (const handler of main) await handler({ headers });
+    expect(headers).toEqual({ "X-Smarty-Agent": "herdr-main-7" });
+  });
 
   it("Fabric's entry registers the hook in a Main, and leaves worker children to their -e hook", async () => {
     clean({ SMARTY_ROLE: "project-agent@abc" });

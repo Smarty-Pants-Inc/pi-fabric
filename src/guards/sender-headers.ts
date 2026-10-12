@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 
 /**
  * smarty-dev#6207: every model request names its sender. Names only, never secrets;
@@ -71,11 +72,30 @@ export const resolveSenderHeaders = (env: NodeJS.ProcessEnv = process.env, sessi
   return headers;
 };
 
+const RESERVED_SENDER_HEADERS: ReadonlySet<string> = new Set(Object.values(SENDER_HEADER_NAMES).map(name => name.toLowerCase()));
+
+/**
+ * The one header write both hooks share (the Main's and every worker child's): Pi's header map is
+ * mutated in place. HTTP header names are case-insensitive, so every reserved X-Smarty-* key
+ * already present, in any letter case, is removed first: a value this request's resolver omits
+ * never leaves a stale or caller-supplied attribution behind.
+ */
+export const applySenderHeaders = (
+  headers: Record<string, string | null>, env: NodeJS.ProcessEnv = process.env, sessionName?: string,
+): void => {
+  for (const name of Object.keys(headers)) if (RESERVED_SENDER_HEADERS.has(name.toLowerCase())) delete headers[name];
+  Object.assign(headers, resolveSenderHeaders(env, sessionName));
+};
+
+/** The hook's stable package-local path beside a Fabric entry module (src/*.ts or dist/*.js): the worker's -e. */
+export const senderHeaderHookPath = (entryUrl: string): string => fileURLToPath(new URL(
+  entryUrl.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js", entryUrl));
+
 /** Loaded by the Main (Fabric's entry) and by every Pi worker child (explicit -e). */
 export default function senderHeadersHook(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", event => {
     // Pi ignores returns from this hook: mutate the supplied header map in place.
     // Resolved per request: a Main's session name can change during the session.
-    Object.assign(event.headers, resolveSenderHeaders(process.env, pi.getSessionName?.()));
+    applySenderHeaders(event.headers, process.env, pi.getSessionName?.());
   });
 }

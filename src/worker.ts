@@ -54,6 +54,7 @@ import { syncPathNamespace } from "./core/atomic-write.js";
 import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
+import { senderHeaderHookPath } from "./guards/sender-headers.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -194,10 +195,7 @@ const PI_BACKED_RUNNERS: ReadonlySet<string> = new Set(["pi", "pi-durable"]);
  */
 const senderHeaderHookArguments = (runner: string): string[] => {
   if (!PI_BACKED_RUNNERS.has(runner)) return [];
-  const hookPath = fileURLToPath(new URL(
-    import.meta.url.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js",
-    import.meta.url,
-  ));
+  const hookPath = senderHeaderHookPath(import.meta.url);
   if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
   return ["-e", hookPath];
 };

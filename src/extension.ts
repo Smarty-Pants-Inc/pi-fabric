@@ -256,8 +256,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   if (!process.env.PI_FABRIC_PARENT_RUN?.trim() && !process.env.PI_FABRIC_ACTOR_ID?.trim()) {
     const senderHeadersUrl = new URL(entryUrl.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js", entryUrl).href;
     pi.on("before_provider_headers", async event => {
-      const { resolveSenderHeaders } = await import(senderHeadersUrl) as typeof import("./guards/sender-headers.js");
-      Object.assign(event.headers, resolveSenderHeaders(process.env, pi.getSessionName?.()));
+      const { applySenderHeaders } = await import(senderHeadersUrl) as typeof import("./guards/sender-headers.js");
+      applySenderHeaders(event.headers, process.env, pi.getSessionName?.());
     });
   }
   if (!options.managedHost) registerJevAuth(pi);

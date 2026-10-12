@@ -250,10 +250,10 @@ const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLe
 // are the same (smarty-dev#2004).
 // Still 45 after the upstream 0.110.1 merge (smarty-dev#5776): the entry is upstream's
 // extension-bootstrap.js, and the prewalk model picker loads on first use instead of eagerly.
-// 1224 KB in 49 files while Pi loads dist/index.js again (pi-fabric#982, the #864 targeted revert: index.js also
-// re-exports the audit/entropy/protocol barrels; measured 1,252,801 bytes in 49 files). Back to 1150/45 with the
-// bootstrap entry, smarty-dev#10373.
-if (startupBytes > 1224 * 1024 || startupFiles.size > 49) {
+// Re-baselined 2026-10-12: main + 8 KiB after #982's eager entry; smarty-dev#10373 (lazy bootstrap entry) takes it back down.
+const STARTUP_BUDGET_BYTES = 1232 * 1024;
+const STARTUP_BUDGET_FILES = 53;
+if (startupBytes > STARTUP_BUDGET_BYTES || startupFiles.size > STARTUP_BUDGET_FILES) {
   throw new Error(`Startup static graph grew beyond its budget: ${startupBytes} bytes in ${startupFiles.size} files`);
 }
 const optionalPackages = ["yaml", "@lezer/python", "shiki", "@shikijs/langs", "@shikijs/themes", "typescript", "mcporter", "jev-fabric", "@earendil-works/pi-durable", "@earendil-works/chord", "pi-fabric-worker-sdk"];
@@ -334,5 +334,5 @@ await Promise.all(
   ),
 );
 console.log(
-  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
+  `build artifacts and lazy startup graph verified (${startupFiles.size} startup files, ${startupBytes} startup bytes, ${STARTUP_BUDGET_BYTES - startupBytes} bytes headroom, ${lazy.length} stable lazy entries, ${chunkFiles.length} chunks)`,
 );

@@ -225,8 +225,9 @@ interface ManagedActor {
   preparing?: { phase: string; startedAt: number; attempts: number; runId?: string; queuePosition?: number };
   inFlightRun?: { id: string; startedAt: number };
   /** Set by a removal that returned before its in-flight run ended; persisted, so a restart finishes it. */
-  /** operatorCheck: an operator remove; its dead-root check must run again before the tree delete (smarty-dev#8090). */
-  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; operatorCheck?: true };
+  /** operatorCheck: an operator remove; its dead-root check must run again before the tree delete (smarty-dev#8090).
+   * Always written explicitly; on load only an explicit `false` means no check (a record from before it: true). */
+  removal?: { requestedAt: number; runId?: string; runStartedAt?: number; operatorCheck: boolean };
   lastError?: string;
   /** Why a stopped actor stopped; only host-exit is restarted by its session's next start (smarty-dev#9241). */
   stopReason?: FabricActorStopReason;
@@ -258,8 +259,10 @@ interface RemovalCleanup {
   pending?: string;
   owner?: { name: string; rootId: string; residency: FabricParticipantResidency; requestedAt: number };
   /** An operator remove (smarty-dev#8090): durable, so a restarted owner never deletes the tree without the
-   * operator's dead-root check; it keeps the cleanup pending until an operator remove runs that check again. */
-  operatorCheck?: true;
+   * operator's dead-root check; it keeps the cleanup pending until an operator remove runs that check again. Always
+   * written as a boolean; read fail closed: only an explicit `false` (a marker from before it, or a malformed value:
+   * true). */
+  operatorCheck: boolean;
 }
 
 type RemovalResult = { removed: boolean; cleaned?: boolean; pending?: string };
@@ -2579,7 +2582,7 @@ export class ActorManager {
       const inFlightRun = running.inFlightRun;
       actor.removal = {
         requestedAt: Date.now(),
-        ...(this.#removalChecks.has(actor.id) ? { operatorCheck: true as const } : {}),
+        operatorCheck: this.#removalChecks.has(actor.id),
         ...(inFlightRun ? { runId: inFlightRun.id, runStartedAt: inFlightRun.startedAt } : {}),
       };
       // The marker is the durable revocation: a restarted owner finishes the removal from it. The
@@ -2739,16 +2742,16 @@ export class ActorManager {
     try {
       const file = this.#cleanupPath(id);
       if (!fs.lstatSync(file).isFile()) return undefined; // Never follow marker symlinks.
-      const cleanup = JSON.parse(fs.readFileSync(file, "utf8")) as RemovalCleanup | null;
+      const cleanup = JSON.parse(fs.readFileSync(file, "utf8")) as (Omit<RemovalCleanup, "operatorCheck"> & { operatorCheck?: unknown }) | null;
       if (!cleanup || cleanup.id !== id || cleanup.sessionDir !== path.join(this.#actorRoot, id) ||
           typeof cleanup.presenceKey !== "string" || !/^actors\/[^/]+\/[^/]+$/.test(cleanup.presenceKey) ||
           !cleanup.presenceKey.endsWith(`/${id}`) ||
-          (cleanup.operatorCheck !== undefined && cleanup.operatorCheck !== true) ||
           (cleanup.lastRunId !== undefined && typeof cleanup.lastRunId !== "string") ||
           (cleanup.owner !== undefined && (!cleanup.owner || typeof cleanup.owner.name !== "string" ||
             typeof cleanup.owner.rootId !== "string" || !["session", "durable"].includes(cleanup.owner.residency) ||
             !Number.isFinite(cleanup.owner.requestedAt)))) return undefined;
-      return cleanup;
+      // Fail closed (pi-fabric#952 round 3): a marker from before the flag, or a malformed one, needs the check.
+      return { ...cleanup, operatorCheck: cleanup.operatorCheck !== false };
     } catch { return undefined; } // Skip only this unreadable/malformed marker.
   }
 
@@ -2804,7 +2807,9 @@ export class ActorManager {
     const remove = () => fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
     // An operator remove whose check did not survive a host restart: keep the tree until an operator remove runs the
     // dead-root check again (an automatic re-check after a restart is smarty-dev#10051).
-    if (cleanup.operatorCheck && !this.#removalChecks.has(cleanup.id)) {
+    // Fail closed: only an explicit false, or a session actor, needs no check. An operator remove exists only for a
+    // durable actor (host.ts), so a session actor's removal never carries one; an unknown residency needs the check.
+    if (cleanup.operatorCheck !== false && cleanup.owner?.residency !== "session" && !this.#removalChecks.has(cleanup.id)) {
       throw new Error("the operator's dead-root check was lost with a host restart; the tree is kept until " +
         "`fabric-actors remove --confirm-dead-root` runs it again");
     }
@@ -2834,11 +2839,13 @@ export class ActorManager {
     }
     const cleanup: RemovalCleanup = saved ?? {
       id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
-      ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
+      ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}), operatorCheck: false,
     };
     cleanup.owner ??= { name: actor.name, rootId: actor.rootId, residency: actor.residency,
       requestedAt: actor.removal?.requestedAt ?? Date.now() };
-    if (this.#removalChecks.has(actor.id) || actor.removal?.operatorCheck) cleanup.operatorCheck = true;
+    // Explicit on every write; once required it stays required (an accepted removal record carries it too).
+    cleanup.operatorCheck = cleanup.operatorCheck !== false || this.#removalChecks.has(actor.id) ||
+      (actor.removal !== undefined && actor.removal.operatorCheck !== false);
     // Re-establish the barrier on every attempt, including a marker left by a failed rename
     // directory sync. A visible marker alone is not proof that the obligation is durable.
     if (this.#persistent && this.meshConfig.enabled) {
@@ -5785,8 +5792,9 @@ export class ActorManager {
                 requestedAt: record.removal.requestedAt,
                 ...(typeof record.removal.runId === "string" ? { runId: record.removal.runId } : {}),
                 ...(typeof record.removal.runStartedAt === "number" ? { runStartedAt: record.removal.runStartedAt } : {}),
-                // Fail closed: any operatorCheck value (even a malformed one) keeps the operator's check required.
-                ...(record.removal.operatorCheck !== undefined ? { operatorCheck: true as const } : {}),
+                // Fail closed (pi-fabric#952 round 3): only an explicit false means no operator check; a record from
+                // before the flag (no field) or a malformed value keeps the check required.
+                operatorCheck: record.removal.operatorCheck !== false,
               },
             }
           : {}),

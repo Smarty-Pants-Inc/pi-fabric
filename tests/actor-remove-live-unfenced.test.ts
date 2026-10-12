@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
+import { ResidentHost } from "../src/residency/host.js";
 import { fixture } from "./helpers/dead-root-fixture.js";
+import { actorWithTree, pendingRemoval } from "./helpers/pending-removal.js";
 
 // pi-fabric#952 round 2 (smarty-dev#8090): where the Main publication fence is unavailable (Windows: no flock,
 // smarty-dev#7858), a live remove never deletes the tree outside the fence. It revokes, keeps the tree, leaves the
@@ -37,6 +39,39 @@ describe("live actor remove without the Main publication fence", () => {
       await f.close();
     }
   }, 60_000);
+
+  // A restarted owner (finishPendingRemovals) with pre-change state: only an explicit false finishes on its own.
+  for (const [label, shape, flag, kept] of [
+    ["a pre-change cleanup marker (no operatorCheck field)", "marker", undefined, true],
+    ["a pre-change accepted-removal record (no operatorCheck field)", "record", undefined, true],
+    ["a cleanup marker with a non-boolean operatorCheck", "marker", "no", true],
+    ["a cleanup marker with an explicit operatorCheck: false", "marker", false, false],
+  ] as const) {
+    it(`after an upgrade, ${label} ${kept ? "keeps the tree until an operator rerun" : "still finishes on its own"}`, async () => {
+      const f = await fixture();
+      let restarted: ResidentHost | undefined;
+      try {
+        const name = `upgrade-${shape}-${String(flag)}`;
+        const actor = await actorWithTree(f, name);
+        // The upgrade: the old host is gone (a crash) leaving its pending removal; a new one starts on the root and
+        // finishes what it inherits.
+        await f.killResident();
+        await pendingRemoval(f, actor, name, shape, flag);
+        restarted = new ResidentHost(f.config, () => {});
+        await restarted.start(); // its start finishes inherited removals in the background
+        const host = restarted;
+        await vi.waitFor(() => expect(kept
+          ? /dead-root check was lost/.test(host.actors.cleanupObligation(actor.id)?.removal?.state ?? "") || !fs.existsSync(actor.dir)
+          : !fs.existsSync(actor.dir) || /cleanup failed/.test(host.actors.cleanupObligation(actor.id)?.removal?.state ?? "")).toBe(true),
+        { timeout: 20_000, interval: 50 });
+        expect(fs.existsSync(actor.dir), "the actor tree").toBe(kept);
+        if (kept) {
+          expect(fs.readFileSync(path.join(actor.dir, "session.jsonl"), "utf8")).toBe("history\n");
+          expect(restarted.actors.cleanupObligation(actor.id)?.removal?.state).toMatch(/dead-root check was lost/);
+        } else expect(restarted.actors.cleanupObligation(actor.id)).toBeUndefined();
+      } finally { await restarted?.close(); await f.close(); }
+    }, 60_000);
+  }
 
   it("a removal marker with a malformed operator flag keeps the tree (fail closed)", async () => {
     const f = await fixture();

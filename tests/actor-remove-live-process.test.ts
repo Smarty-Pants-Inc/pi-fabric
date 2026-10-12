@@ -6,6 +6,7 @@ import { mainPublicationFencePath, mainPublicationFenced } from "../src/topology
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { fixture, rootParticipantKey, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 import { processHarness } from "./helpers/process-harness.js";
+import { actorWithTree, pendingRemoval } from "./helpers/pending-removal.js";
 
 // smarty-dev#8090 + #8082: the resident host's LIVE operator remove across real processes. The resident host (the
 // remover) and the root's Main are separate processes. The host holds the root's Main publication fence across its
@@ -106,6 +107,38 @@ describe.skipIf(process.platform !== "linux")("live actor remove across processe
       const rerun = h.remover("none", removeArgs(f, actor.id));
       expect(await rerun.next("exit")).toMatchObject({ code: 0, err: "" });
       expect(fs.existsSync(actor.dir)).toBe(false);
+      expect(fenced(f)).toBe(false);
+    } finally { await h.close(); await f.close(); }
+  }, 150_000);
+
+  it("after an upgrade, pre-change pending removals (no operator flag) keep their trees while the Main lives; an operator rerun with the Main dead deletes them", async () => {
+    const f = await fixture();
+    const h = processHarness();
+    try {
+      const marker = await actorWithTree(f, "pre-change-marker");
+      const record = await actorWithTree(f, "pre-change-record");
+      await f.killResident(); // the old release's host is gone, its removals pending
+      await pendingRemoval(f, marker, "pre-change-marker", "marker");
+      await pendingRemoval(f, record, "pre-change-record", "record");
+      const main = await h.main(f.config.meshRoot, f.config.rootId);
+      expect(await main.publish()).toMatchObject({ ok: true }); // the root's Main is alive
+      await h.host(f.config.residencyRoot, "none"); // the upgraded host starts and finishes what it inherits
+      const states = () => {
+        try { return (JSON.parse(fs.readFileSync(residentRemovalsPath(f.config.residencyRoot), "utf8")) as { removals: { id: string; state: string }[] })
+          .removals.filter(removal => /check was lost/.test(removal.state)).map(removal => removal.id); } catch { return []; }
+      };
+      await vi.waitFor(() => expect([marker, record].every(actor => !fs.existsSync(actor.dir) || states().includes(actor.id))).toBe(true),
+        { timeout: 30_000, interval: 100 });
+      for (const actor of [marker, record]) {
+        expect(fs.existsSync(actor.dir), `${actor.id}: the live Main's actor tree after the upgrade`).toBe(true);
+        expect(history(actor.dir)).toBe("history\n");
+      }
+      await main.stop();
+      for (const actor of [marker, record]) {
+        const rerun = h.remover("none", removeArgs(f, actor.id));
+        expect(await rerun.next("exit")).toMatchObject({ code: 0, err: "" });
+        expect(fs.existsSync(actor.dir)).toBe(false);
+      }
       expect(fenced(f)).toBe(false);
     } finally { await h.close(); await f.close(); }
   }, 150_000);

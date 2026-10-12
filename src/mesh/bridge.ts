@@ -42,6 +42,7 @@ const DEFAULT_PRESENCE_MS = 5_000;
 const LEGACY_POLL_MS = 250;
 /** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
 const MAX_AWAITING_ACKS = 4_096;
+type Direction = "toRemote" | "toLocal";
 /** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
 const AWAITING_ACK_MS = 15 * 60_000;
 /** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
@@ -1512,6 +1513,11 @@ export class MeshBridge {
   #expiryAt = Infinity;
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
   #running: Promise<void> = Promise.resolve();
+  /** run()'s two direction loops (smarty-dev#9751); stop() fences on them too. */
+  #directions: Promise<void> = Promise.resolve();
+  readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionWake: Partial<Record<Direction, () => void>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
@@ -1793,16 +1799,75 @@ export class MeshBridge {
     if (!this.#cursor) await this.start();
     if (this.#presenceDue()) await this.syncPresence();
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
-    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
-      const { remote } = await this.#authority(refreshIfStale);
-      return { recipients: remoteAddresses(remote) };
-    });
-    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
-      const { local, remote } = await this.#authority(refreshIfStale);
-      // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
-      return { recipients: addresses(local), senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved) };
-    });
+    const toRemote = await this.#direction("toRemote");
+    const toLocal = await this.#direction("toLocal");
     return { toRemote: toRemote.forwarded, toLocal: toLocal.forwarded, dropped: toRemote.dropped + toLocal.dropped };
+  }
+
+  #direction(direction: Direction): Promise<{ forwarded: number; dropped: number }> {
+    return direction === "toRemote"
+      ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
+        const { remote } = await this.#authority(refreshIfStale);
+        return { recipients: remoteAddresses(remote) };
+      })
+      : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
+        const { local, remote } = await this.#authority(refreshIfStale);
+        // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
+        return { recipients: addresses(local), senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved) };
+      });
+  }
+
+  /**
+   * smarty-dev#9751: run()'s drain of one direction, independent of the other. Each loop is sequential (one page in
+   * flight; pages are bounded by BRIDGE_PAGE_BYTES and the source's read limit), with its own cursor that moves only
+   * after a publish succeeds, in order, so nothing in one direction (a slow page read, a stalled publish, a long
+   * catch-up) can hold the other back. A retryable busy backs this direction off alone; any other error ends run()
+   * as before (a closed transport fails both directions, and the supervisor restarts the bridge).
+   */
+  async #directionLoop(direction: Direction, running: () => boolean): Promise<void> {
+    let retryMs = LOCK_RETRY_MIN_MS;
+    let walCapDelay: number | undefined;
+    let reported = false; // one log line per busy streak, as run() logs its own
+    while (running()) {
+      this.#directionPending[direction] = false;
+      this.#directionBackoff[direction] = false;
+      let delay: number | undefined;
+      try {
+        await this.#direction(direction);
+        retryMs = LOCK_RETRY_MIN_MS;
+        walCapDelay = undefined;
+        reported = false;
+        // A factory-rate deferral retries when its token is due: one timer, no notification needed.
+        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.max(0, this.#factoryRetryAt - this.#now());
+        if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
+      } catch (error) {
+        if (!running()) return;
+        if (!isMeshRetryableBusy(error)) {
+          this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
+          this.#wake?.();
+          return;
+        }
+        this.#directionBackoff[direction] = true;
+        if (isMeshStateWalCap(error)) delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        else delay = retryMs;
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        if (!reported) {
+          this.#log(`${isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout"} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          reported = true;
+        }
+      }
+      if (!running()) return;
+      if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        this.#directionWake[direction] = () => {
+          if (timer !== undefined) clearTimeout(timer);
+          delete this.#directionWake[direction];
+          resolve();
+        };
+        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(), Math.min(delay, 2_147_483_647));
+      });
+    }
   }
 
   async #forward(
@@ -2066,6 +2131,16 @@ export class MeshBridge {
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
     let backingOff = false;
+    // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
+    // which also does that direction's catch-up: no sequential drain first.
+    let ended = false;
+    const running = (): boolean => !this.#stopped && !ended;
+    const wakeDirections = (): void => {
+      for (const direction of ["toRemote", "toLocal"] as const) {
+        this.#directionPending[direction] = true;
+        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.();
+      }
+    };
     this.#notificationMode = true;
     const changed = (kind: BridgeChange): void => {
       if (kind === "lease") {
@@ -2079,6 +2154,7 @@ export class MeshBridge {
       this.#changesPending = true;
       if (kind === "presence") this.#presenceVersion++;
       if (!backingOff) this.#wake?.();
+      wakeDirections();
     };
     const failed = (error: Error): void => {
       this.#notificationError ??= error;
@@ -2104,7 +2180,9 @@ export class MeshBridge {
             }
             unsubscribers.push(unsubscribe ?? (() => undefined));
           }
-          if (!this.#stopped) await (started ? this.step() : this.start());
+          if (this.#stopped) return;
+          if (!started) await this.start();
+          else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.
         this.#running = pass.then(() => undefined, () => undefined);
@@ -2115,13 +2193,15 @@ export class MeshBridge {
           reportedTimeout = false;
           walCapDelay = undefined;
           retryMs = LOCK_RETRY_MIN_MS;
-          if (!started) { started = true; continue; } // drain events arriving during startup
+          if (!started) {
+            started = true;
+            this.#directions = Promise.all([this.#directionLoop("toRemote", running), this.#directionLoop("toLocal", running)])
+              .then(() => undefined, () => undefined);
+          }
           const deadline = Math.min(this.#expiryAt,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
           if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
-          // A factory-rate deferral retries when its token is due: one timer, no notification needed.
-          if (this.#factoryWaiting) delay = Math.min(delay ?? Infinity, Math.max(0, this.#factoryRetryAt - this.#now()));
         } catch (error) {
           if (this.#stopped) return;
           if (!isMeshRetryableBusy(error)) throw error;
@@ -2155,6 +2235,8 @@ export class MeshBridge {
         });
       }
     } finally {
+      ended = true;
+      for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
       for (const unsubscribe of unsubscribers) unsubscribe();
       this.#notificationMode = false;
     }
@@ -2179,10 +2261,13 @@ export class MeshBridge {
     };
     this.#stopped = true;
     this.#wake?.();
+    for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
     await within(this.#running);
+    await within(this.#directions);
     await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
+    await within(this.#directions);
     const { local } = this.options;
     await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
       this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);

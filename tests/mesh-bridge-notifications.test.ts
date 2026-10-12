@@ -90,6 +90,74 @@ const launch = async (bridge: MeshBridge) => {
   return { steps, running, failure: () => failure };
 };
 
+// smarty-dev#9751: a hub sender that is no participant (a factory host) gets the ACK of a command this link carried;
+// an ACK for a command the link never carried still does not cross.
+describe("ACK relay to a non-participant hub sender (smarty-dev#9751)", () => {
+  it("relays the ACK of a carried command to its factory-host replyTo, and nothing else to that name", async () => {
+    const f = fixture();
+    await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const other = await native(f.far, "other");
+    const factory: MeshIdentity = { id: "factory-host:ryzen1", name: "factory-host", kind: "agent" };
+    const live = await launch(f.bridge);
+    await f.hub.publish({ topic: "fabric.control.command", kind: "steer", from: factory, to: lane.id,
+      data: { version: 1, commandId: "c-carried", replyTo: factory.id, targetId: lane.id, operation: "steer" } });
+    await until(() => events(f.far).some(event => event.topic === "fabric.control.command"));
+    const ack = (commandId: string, from = lane) => f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: from.identity, to: factory.id,
+      data: { version: 1, commandId, targetId: lane.id, accepted: true, result: { secret: true } } });
+    await ack("c-unknown");
+    await ack("c-carried", other);        // (b) not from the owner the command was addressed to
+    await ack("c-carried");
+    await until(() => events(f.hub).some(event => event.topic === "fabric.control.ack"));
+    await settle();
+    const relayed = events(f.hub).filter(event => event.topic === "fabric.control.ack");
+    expect(relayed.map(event => [(event.data as { commandId: string }).commandId, event.from.id])).toEqual([["c-carried", lane.id]]);
+    // (c) a relayed ACK carries the outcome only, never the command's result payload
+    expect(relayed[0]!.data).toMatchObject({ commandId: "c-carried", targetId: lane.id, accepted: true });
+    expect(relayed[0]!.data).not.toHaveProperty("result");
+    expect(live.failure()).toBeUndefined();
+  });
+
+  // pi-fabric#928 SEC P1 (a): a replyTo that is no single session or factory host (an org, topic or broadcast
+  // name) is never relayed to, even when it is the sender's own id.
+  it("relays no ACK to a non-unicast replyTo", async () => {
+    const f = fixture();
+    await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const broadcast: MeshIdentity = { id: "org:smarty-pants", name: "org", kind: "agent" };
+    const live = await launch(f.bridge);
+    await f.hub.publish({ topic: "fabric.control.command", kind: "steer", from: broadcast, to: lane.id,
+      data: { version: 1, commandId: "c-org", replyTo: broadcast.id, targetId: lane.id, operation: "steer" } });
+    await until(() => events(f.far).some(event => event.topic === "fabric.control.command"));
+    await f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: lane.identity, to: broadcast.id,
+      data: { version: 1, commandId: "c-org", targetId: lane.id, accepted: true } });
+    await sleep(500);
+    expect(events(f.hub).filter(event => event.topic === "fabric.control.ack")).toEqual([]);
+    expect(live.failure()).toBeUndefined();
+  });
+
+  // pi-fabric#928 review P1: a command whose replyTo names someone else (here another hub session, not its sender)
+  // records nothing, so its ACK never reaches that address through the relay.
+  it("relays no ACK to a replyTo that is not the command's own sender", async () => {
+    const f = fixture();
+    await native(f.hub, "lead");
+    const lane = await native(f.far, "lane");
+    const factory: MeshIdentity = { id: "factory-host:ryzen1", name: "factory-host", kind: "agent" };
+    const victim = "session:victim-00000000";
+    const live = await launch(f.bridge);
+    await f.hub.publish({ topic: "fabric.control.command", kind: "steer", from: factory, to: lane.id,
+      data: { version: 1, commandId: "c-crafted", replyTo: victim, targetId: lane.id, operation: "steer" } });
+    await until(() => events(f.far).some(event => event.topic === "fabric.control.command"));
+    for (const to of [victim, factory.id]) {
+      await f.far.publish({ topic: "fabric.control.ack", kind: "ack", from: lane.identity, to,
+        data: { commandId: "c-crafted", targetId: lane.id, accepted: true, result: { secret: true } } });
+    }
+    await sleep(500);
+    expect(events(f.hub).filter(event => event.topic === "fabric.control.ack")).toEqual([]);
+    expect(live.failure()).toBeUndefined();
+  });
+});
+
 describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   it("exits a native process with no watches when stdin ends before a queued hello runs", () => {
     const f = fixture(false);

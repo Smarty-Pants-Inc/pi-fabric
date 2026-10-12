@@ -1800,6 +1800,42 @@ describe("FabricControlPlane", () => {
     expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toEqual([]);
   });
 
+  // smarty-dev#9751: a command a bridge delivered long after its deadline (its bridged copy is new on this mesh)
+  // used to be skipped like history, with no ACK: its sender never learnt. It now gets the expired ACK.
+  it("answers a command a bridge delivered past its deadline with an expired ACK, never a silent skip", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);
+    await store.publish({
+      topic: "fabric.control.command",
+      kind: "steer",
+      from: identity("host:sender"),
+      to: "host:receiver",
+      data: {
+        version: 1,
+        commandId: "command:late",
+        targetId: "agent:target",
+        operation: "steer",
+        replyTo: "host:sender",
+        message: "late",
+        requestedAt: Date.now() - 11 * 60_000,                 // a 30 s command, carried 11 min late
+        deadlineAt: Date.now() - 11 * 60_000 + 30_000,
+        bridge: { from: "qs32729", id: "evt-remote" },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(expect.objectContaining({
+      to: "host:sender",
+      data: expect.objectContaining({ commandId: "command:late", accepted: false, error: "Fabric control command expired" }),
+    }));
+  });
+
   it("final-drains a command published immediately before close", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);

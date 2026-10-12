@@ -1242,6 +1242,19 @@ export class AgentManager {
     return pending;
   }
 
+  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined }>();
+
+  /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
+   * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
+   * contact not lost). Undefined: no live handle, or a transport without a local process. */
+  workerIdentity(runId: string): { pid: number; startTime: string | undefined; open: boolean } | undefined {
+    const managed = this.#runs.get(runId);
+    const identity = managed?.transport ? this.#workerIdentities.get(managed.transport) : undefined;
+    if (!managed || !identity) return undefined;
+    const open = !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
+    return { ...identity, open };
+  }
+
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
     if (this.#closing) throw new Error("Fabric agent manager is closing");
     const signal = request.signal ? AbortSignal.any([request.signal, this.#closeAbort.signal]) : this.#closeAbort.signal;
@@ -1251,6 +1264,10 @@ export class AgentManager {
       const transport = await pending;
       // Includes launches that race close, before a ManagedAgent can own them.
       this.#unregisteredTransports.add(transport);
+      // The launched worker's identity, from this host's own spawn (never the worker's status file): its pid and
+      // kernel start time, read now, while this process still holds the unreaped child (smarty-dev#9332).
+      const pid = transport.kind === "process" ? Number(transport.sessionId) : NaN;
+      if (Number.isSafeInteger(pid) && pid > 1) this.#workerIdentities.set(transport, { pid, startTime: processStartTime(pid) });
       return transport;
     } finally {
       this.#launches.delete(pending);

@@ -467,11 +467,15 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const report = take("--report");
   const value = take("--runs-older-than");
   const [root, mode = "--dry-run"] = args;
-  // --apply is back for the deleters that remove through verifiedRemove (smarty-dev#7916): all of this sweep's.
+  // --apply is refused until every destructive callback acts through a held directory fd: the identity checks here
+  // are still path-based, so a same-UID swap after them could redirect a removal (smarty-dev#7916 PR-b).
   const runRetentionMs = value === undefined ? undefined : Number(value);
   if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
       (runRetentionMs !== undefined && (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 60 * 60 * 1_000))) {
-    console.error("Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run|--apply] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
+    console.error("Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
+  } else if (mode === "--apply") {
+    console.error("retention-cli: --apply is disabled until smarty-dev#7916 PR-b (verified dirfd removal) lands; nothing was changed. Use --dry-run.");
+    process.exitCode = 2;
   } else {
     try {
       const result = await sweepMeshRetention(path.resolve(root), {

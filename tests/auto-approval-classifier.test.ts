@@ -3,11 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FabricAutoApprovalClassifier } from "../src/core/auto-approval-classifier.js";
 import type { ResolvedFabricAction } from "../src/core/action-registry.js";
 
-const completeSimple = vi.hoisted(() => vi.fn());
-vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@earendil-works/pi-ai/compat")>()),
-  completeSimple,
-}));
+const completeSimple = vi.fn();
 
 const model = {
   provider: "anthropic",
@@ -45,6 +41,7 @@ const context = (): ExtensionContext => ({
   model,
   modelRegistry: {
     find: vi.fn(() => model),
+    streamSimple: (...args: unknown[]) => ({ result: () => completeSimple(...args) }),
     getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "secret" })),
   },
   sessionManager: {
@@ -135,10 +132,10 @@ describe("FabricAutoApprovalClassifier", () => {
       usage,
     }));
     const streamSimple = vi.fn(() => ({ result: providerResult }));
-    const getProvider = vi.fn(() => ({ streamSimple }));
+    const getProvider = vi.fn(() => { throw new Error("Do not bypass ModelRegistry transcript normalization"); });
     const ctx = context();
     Object.assign(ctx, { model: customModel });
-    Object.assign(ctx.modelRegistry, { getProvider });
+    Object.assign(ctx.modelRegistry, { getProvider, streamSimple });
 
     const result = await new FabricAutoApprovalClassifier().classify(
       action,
@@ -147,7 +144,7 @@ describe("FabricAutoApprovalClassifier", () => {
     );
 
     expect(result.model).toBe("custom-provider/custom-classifier");
-    expect(getProvider).toHaveBeenCalledWith("custom-provider");
+    expect(getProvider).not.toHaveBeenCalled();
     expect(streamSimple).toHaveBeenCalledWith(
       customModel,
       expect.objectContaining({ tools: [expect.objectContaining({ name: "classify_result" })] }),
@@ -155,6 +152,34 @@ describe("FabricAutoApprovalClassifier", () => {
     );
     expect(providerResult).toHaveBeenCalledOnce();
     expect(completeSimple).not.toHaveBeenCalled();
+  });
+
+  it("normalizes classifier system instructions and tools through a real Pi 0.99 runtime", async () => {
+    const { ModelRuntime, ModelRegistry } = await import("@earendil-works/pi-coding-agent");
+    const { InMemoryCredentialStore, InMemoryModelsStore, createAssistantMessageEventStream, getCurrentTools, getCurrentSystemPrompt } = await import("@earendil-works/pi-ai");
+    const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(), modelsPath: null, refreshOnCreate: false });
+    let normalized = false;
+    runtime.registerProvider("classifier-fixture", {
+      api: "classifier-fixture", apiKey: "offline", baseUrl: "http://invalid.local",
+      models: [{ ...model, id: "fixture", api: "classifier-fixture", input: ["text"], reasoning: false }],
+      streamSimple(selected, transcript) {
+        expect(getCurrentTools(transcript.messages).map((tool) => tool.name)).toEqual(["classify_result"]);
+        expect(getCurrentSystemPrompt(transcript.messages)).toContain("routine");
+        expect(transcript.messages[0]?.role).toBe("system");
+        normalized = true;
+        const message: import("@earendil-works/pi-ai").AssistantMessage = {
+          role: "assistant", api: selected.api, provider: selected.provider, model: selected.id, timestamp: Date.now(), usage,
+          content: [{ type: "toolCall", id: "verdict", name: "classify_result", arguments: { decision: "allow", reason: "Offline native contract" } }], stopReason: "toolUse",
+        };
+        const stream = createAssistantMessageEventStream();
+        stream.push({ type: "start", partial: { ...message, stopReason: "pending" } });
+        stream.push({ type: "done", reason: "toolUse", message }); stream.end(); return stream;
+      },
+    });
+    const ctx = context();
+    Object.assign(ctx, { model: runtime.getModel("classifier-fixture", "fixture"), modelRegistry: new ModelRegistry(runtime) });
+    await expect(new FabricAutoApprovalClassifier().classify(action, { command: "bun test" }, ctx)).resolves.toMatchObject({ decision: "allow" });
+    expect(normalized).toBe(true);
   });
 
   it("fails closed when structured output is missing", async () => {

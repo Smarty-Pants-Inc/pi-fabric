@@ -1154,7 +1154,7 @@ return "done";
     expect(request).toMatchObject({ task: "map", cwd: "target", worktree: true, runner: "pi", recursive: true });
   });
 
-  it("counts rlm.query usage and forces the Pi runner", async () => {
+  it("counts rlm.query usage and defaults to the Pi runner (fork default; pi-durable is opt-in)", async () => {
     let request: Record<string, unknown> | undefined;
     const result = await new QuickJsRuntime().execute(
       `await rlm.query({ task: "map" }); return budget.spent();`,
@@ -1170,6 +1170,17 @@ return "done";
     expect(result.error).toBeUndefined();
     expect(result.value).toBe(10);
     expect(request).toMatchObject({ task: "map", runner: "pi", recursive: true });
+  });
+
+  it("keeps explicit legacy Pi selection and rejects non-recursive runners for RLM", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const result = await new QuickJsRuntime().execute(
+      `await rlm.query({ task: "map", runner: "pi" }); try { await rlm.query({ task: "map", runner: "claude" }); } catch (error) { return error.message; }`,
+      async (_ref, args) => { calls.push(args); return { status: "completed", text: "done" }; }, options,
+    );
+    expect(result.value).toContain("requires a Pi runner");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ runner: "pi", recursive: true });
   });
 
   it("preempts the council synthesizer when roles exhaust the token budget", async () => {

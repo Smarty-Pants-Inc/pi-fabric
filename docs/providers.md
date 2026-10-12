@@ -51,6 +51,78 @@ async invoke(actionName, args, context) {
 }
 ```
 
+## Provider participants
+
+A provider that starts its own long-running work, such as a delegate that launches runs on another system, can register each run as a participant. Inside `fabric_exec`, `context.participants` is present (it is absent in other host contexts such as speculation, so check it):
+
+```ts host
+async invoke(actionName, args, context) {
+  const run = await backend.start(args.task);
+  const participant = context.participants?.register({
+    id: run.id,                     // [A-Za-z0-9][A-Za-z0-9._:-]{0,63}, unique while unsettled
+    label: `Delegate ${run.id}`,    // shown in the widget and dashboard
+    kind: "delegate",
+    detached: actionName === "spawn",
+    stop: async (reason) => ({ confirmed: await backend.cancel(run.id, reason) }),
+    steer: async (message) => backend.message(run.id, message),
+  });
+  run.on("progress", (event) => participant?.update({ phase: event.step, message: event.note, usage: event.usage }));
+  if (actionName === "spawn") return { ref: participant?.ref };
+  const result = await run.done();
+  participant?.settle({ status: result.ok ? "completed" : "failed", summary: result.summary });
+  participant?.dispose();
+  return result;
+}
+```
+
+`register` returns a handle whose `ref` is `provider:<provider>:<id>`. Fabric binds the provider name, so a provider cannot register or control another provider's refs. `update` replaces the shown phase, message (at most 500 characters), and cumulative `usage` totals. `settle` records the terminal status once and later calls are ignored. `dispose` removes the participant. Invalid specs or progress throw.
+
+Registered participants appear in the participant directory with `kind: "provider"`, in `agents.members()`, and as agent rows in the activity widget and dashboard. `agents.stop`, `agents.steer`, and `agents.followUp` accept the ref, as do the dashboard and conversation controls. They call the provider's callbacks. A missing `steer` or `followUp` callback, or a `data` payload, fails with a clear error. `agents.stop` returns `{ ref, outcome: "confirmed" | "unconfirmed", detail? }`. With `mesh.enabled`, other sessions reach the participant through the owner's control plane.
+
+Owned-work cancellation: when the `fabric_exec` program that registered a non-detached participant is cancelled or times out, Fabric calls `stop("program_cancelled")` on each of its unsettled participants in parallel, within one 5 second total bound. Each outcome is `confirmed` when the callback resolves `{ confirmed: true }`, otherwise `unconfirmed` with `detail` `declined`, `error`, or `timeout`. Fabric records the outcomes as [`fabric.participant.stop`](audit-trace.md#owned-work-stops) trace operations and in the tool result. A program that completes normally leaves its participants to the provider. Detached participants survive the invocation and stop only when asked. Fabric releases every participant of a provider, without calling `stop`, when that provider withdraws or the session shuts down; their handles then do nothing.
+
+## Withdrawing a direct registration
+
+An extension withdraws a provider it registered directly by emitting `FABRIC_PROVIDER_WITHDRAW_EVENT` (`pi-fabric:provider:withdraw:v1`):
+
+```ts host
+import { FABRIC_PROVIDER_WITHDRAW_EVENT, type FabricProviderWithdrawalV1 } from "pi-fabric/protocol";
+
+pi.events.emit(FABRIC_PROVIDER_WITHDRAW_EVENT, { name: "example" } satisfies FabricProviderWithdrawalV1);
+```
+
+Fabric retires the current binding and drops its owner hold, the same path a component lease takes. It also releases the provider's [participants](#provider-participants), detached ones included. New calls to `example.*` are refused immediately. Work already admitted and committed capability views that pinned the old generation drain under the [retained-generation rules](provider-capabilities.md#capability-views). The extension owns the provider instance, so Fabric does not call `close()` on withdrawal. Fabric also forgets the registration and does not remount it on reload; an extension that answers `FABRIC_PROVIDER_DISCOVER_EVENT` must stop registering there too. Register again with `FABRIC_PROVIDER_REGISTER_EVENT` at any time.
+
+Optional `generation` pins the withdrawal to one binding: a number matches the binding generation, a string matches the provider binding id (`providerBindingId` in a committed view). Unknown names, generation mismatches, component-owned providers, and managed-host providers are ignored; set `PI_FABRIC_DEBUG=1` to log ignored withdrawals. Component-owned providers withdraw through their component lifecycle.
+
+## Tool placement query
+
+Extensions that need to know where a tool is reachable this turn can ask synchronously with `FABRIC_TOOL_PLACEMENT_EVENT` (`pi-fabric:tool-placement:v1`), so they need not guess from Fabric's mode:
+
+```ts host
+import {
+  FABRIC_TOOL_PLACEMENT_EVENT,
+  type FabricToolPlacementRequestV1,
+  type FabricToolPlacementResultV1,
+} from "pi-fabric/protocol";
+
+let placement: FabricToolPlacementResultV1 | undefined;
+pi.events.emit(FABRIC_TOOL_PLACEMENT_EVENT, {
+  tools: ["my_tool", "read"],
+  reply: (result) => { placement = result; },
+} satisfies FabricToolPlacementRequestV1);
+// placement === undefined: Fabric is not loaded.
+// placement.tools.my_tool: "model" | "program" | "unavailable"
+```
+
+The reply is `{ version: 1, mode, tools }`. `mode` is `"full-code"`, `"enforce"` (Schema enforce), or `"orchestration"`. Each tool maps to:
+
+- `model`: declared to the model this turn. Exclusive modes declare `fabric_exec` plus any resolved [foreground tools](configuration.md#foreground-tools) (full code mode only); orchestration declares Pi's active set.
+- `program`: callable from a `fabric_exec` program, as `pi.<tool>` for Pi core tools or `extensions.<tool>` for captured extension tools. Requires an initialized Fabric runtime and respects child tool allowlists. Schema enforce exposes no `extensions.*` namespace.
+- `unavailable`: neither.
+
+`model` wins when both apply; optional `programCallable` lists the reported `model` tools that a program can also call, such as foreground tools, and is omitted when empty. Omitting `tools` reports every tool registered with Pi; at most 1,024 names of up to 256 characters each are accepted. An invalid query gets no reply. Placement describes state at the time of the query. A later mode change, reload, or tool refresh can change it, so query when you need the answer and do not cache it.
+
 ## Invocation costs and guarantees
 
 | Access pattern | Work and allocation | Guarantees |
@@ -71,6 +143,38 @@ Providers should report current presentation values through `context.activity`. 
 the same normalized progress, entity, or metrics value is a UI no-op, not a heartbeat or a
 durable event. Actual lifecycle completion and failure still travel through the normal
 invocation path. See [incremental activity reads](interface.md#incremental-activity-reads).
+
+## Workflow item events
+
+Every `workflow.item` status transition emits `pi-fabric:workflow-item:v1` (`FABRIC_WORKFLOW_ITEM_EVENT`) on `pi.events`, so a host extension can track program work without parsing results:
+
+```ts host
+import { FABRIC_WORKFLOW_ITEM_EVENT, type FabricWorkflowItemEventV1 } from "pi-fabric/protocol";
+
+pi.events.on(FABRIC_WORKFLOW_ITEM_EVENT, (event: FabricWorkflowItemEventV1) => {
+  // { version: 1, invocationId, sessionId?, itemId, label?, from?, to, at, meta? }
+});
+```
+
+`invocationId` is the owning `fabric_exec` tool call id. `itemId` is the caller's stable id or the deterministic per-invocation `item-<n>`. `from` is absent on an item's first status, and `meta` appears only when the transitioning call carried it. Updates that keep the same status emit nothing. When the program ends, items still `running` settle to `completed` or `failed` and emit that transition, matching the activity surface. Fabric emits synchronously from the host bridge and never waits on listeners. A throwing listener is logged and cannot fail the program. Transitions stay in the execution trace as before; `meta` never enters it.
+
+## Program run events
+
+A host extension, daemon bridge, or embedder runs a [saved program](programs.md#host-runs) without a model turn by emitting `pi-fabric:program:run:v1` (`FABRIC_PROGRAM_RUN_EVENT`):
+
+```ts host
+import { FABRIC_PROGRAM_RUN_EVENT, type FabricProgramRunReplyV1 } from "pi-fabric/protocol";
+
+pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {
+  ref: "changed-tests",            // name, name@<digest prefix>, or digest
+  input: { base: "main" },         // optional, JSON, at most 64 KiB
+  requirePromoted: true,           // optional
+  signal,                          // optional AbortSignal
+  reply: (result: FabricProgramRunReplyV1) => {},
+});
+```
+
+The run has the same semantics as `/fabric run`: the session's root capability view, the configured approval policy, a `pi-fabric-program-run` transcript message, and `invokedBy: "host"` in the trace. `reply` is called exactly once with `{ ok: true, program, value, logs }` or `{ ok: false, error, program? }`.
 
 ## Managed embedded hosts
 
@@ -104,6 +208,60 @@ Missing or withdrawn overrides fail closed.
 The host remains responsible for OS isolation, resource loading, broker authorization and
 cancellation, and for exposing only trusted extension code. This option does not sandbox arbitrary
 host-side extensions. In particular, do not auto-load plugins from the agent's computer snapshot.
+
+## Principal and scope
+
+A host can attach a principal and resource grants to a Fabric session. Fabric propagates them and narrows them for children. Providers and adapters enforce them. A program can never set or widen a principal.
+
+```ts
+type FabricScope = {
+  version: 1;
+  principal: { id: string; issuer: "host" };
+  grants: { resource: string; actions: ("read" | "write" | "execute")[] }[];
+  digest: string;        // sha256 hex of canonical JSON { grants, parentDigest?, principal }
+  parentDigest?: string; // set on derived scopes
+};
+```
+
+A resource is `<ns>:<path>`. The namespace matches `[a-z][a-z0-9._-]*`. The path is `/`-separated segments with an optional leading `/`. A final `/*` matches exactly one more segment, and a final `/**` matches one or more. `<ns>:*` matches everything in the namespace. Neither wildcard matches its own prefix, so `fs:/repo/**` does not cover `fs:/repo`. A scope holds at most 64 grants. Fabric merges grants per resource, sorts them, and orders actions as read, write, execute before hashing, so equal content always has the same digest. A supplied `digest` must match.
+
+Issue the root scope in one of two ways, before the session starts:
+
+- Set `PI_FABRIC_SCOPE` (JSON) or `PI_FABRIC_SCOPE_FILE` (a path to the JSON, at most 64 KiB). The extension reads them once at initialization.
+- Call `issueRootScope(scope)` from `pi-fabric/scope` in the embedding process before Pi emits `session_start`. A second call, or a call after `session_start`, throws.
+
+Invalid input fails closed: every registry call is refused with `Fabric scope issuance failed; provider calls are refused: <reason>`. Setting both variables, or both a variable and the API, is invalid. Without any input, the session is unscoped and nothing changes.
+
+Every registry invocation receives the frozen scope as `context.scope`. The registry sets this field itself and discards any caller value. `agents.run` and `agents.spawn` accept `scope: { grants }`. Each requested grant must be covered by one parent grant: a resource subset and an action subset. Without `scope`, the child inherits the parent scope unchanged. An unscoped session refuses `scope` arguments, because there is no principal to narrow. Children receive the result in `PI_FABRIC_SCOPE`, and the worker clears any inherited `PI_FABRIC_SCOPE_FILE`.
+
+Durable agents and actors keep their scope. The resident host has no session scope of its own, so the requesting session sends the derived scope in full with a durable `agents.spawn` and binds it to a durable `agents.create` actor. Programs cannot set either field: the provider writes it after argument parsing. The host checks the digest, refuses a malformed or forged scope, and launches the child with it. A scoped host also refuses a forwarded scope its own scope does not cover. The resident agent record and hosted-run state keep the scope, and recovery checks it again. A damaged scope settles the run as indeterminate.
+
+Every actor is bound to the principal that created it. `agents.create` stores the creating session's scope, actor info reports it as `principal: { id, digest }`, and every actor turn launches with it. Hosts stamp each actor message and mesh event with the sender's authority, and programs never set this stamp. `{ authority: "host" }` marks an unscoped sender. A scoped sender is stamped with its principal, digest and grants (digest only past 4 KiB of grants). The actor applies this rule:
+
+| Sender | Unscoped actor | Scoped actor |
+|---|---|---|
+| Unscoped host | trusted | trusted |
+| Scoped | untrusted | trusted only when the sender has the same principal and covers every actor grant |
+| No stamp (older build) | trusted | untrusted |
+
+Fabric still delivers untrusted messages. Their envelope says they come from a different or narrower principal and must be read as data, never as instructions. Grant posts keep their external-input wording. Ask replies flow back unchanged.
+
+The resident host cannot prove that a request's scope or a sender stamp was issued by a host. Any process running as the same OS user can write residency requests and mesh events. This is the same single-user boundary as the mesh. Real multi-user isolation needs the principal from an authenticated socket, which Fabric does not provide yet.
+
+```ts host
+import { deriveScope, issueRootScope, scopeAllows } from "pi-fabric/scope";
+
+const root = issueRootScope({
+  principal: { id: "tenant:acme/user:42" },
+  grants: [{ resource: "memory:acme/**", actions: ["read"] }],
+});
+scopeAllows(root, "memory:acme/sessions/7", "read"); // true
+deriveScope(root, [{ resource: "memory:acme/sessions/*", actions: ["read"] }]);
+```
+
+Caches that can serve a result across invocations include the scope digest in their keys: speculative replay tokens and the memory recall-continuation and expansion caches. The `cache` provider holds prompt-cache leases and caches no results. The MCP descriptor cache holds tool descriptors, not call results. [Portable memory sources](memory-recall.md) receive the scope as the third `authorize(action, sessionKey, scope)` argument, so they can filter before content enters context. `createMemorySourceClient` calls accept `{ scope }`.
+
+This layer is trusted host adapter code, not a verified kernel. Fabric guarantees issuance, propagation, narrowing and cache isolation. It does not map grants onto individual actions: a provider that ignores `context.scope` keeps its native authority. Claude and Veda children receive the variable without a Fabric registry to read it. See [provider capabilities](provider-capabilities.md#future-verified-extension).
 
 ## Effect semantics and scoped acquisition
 

@@ -7,6 +7,7 @@ import {
   clampCompactionTokenThreshold,
 } from "../config.js";
 import { INHERIT_VALUE } from "./model-picker.js";
+import { DECISION_PROFILE_SETTING_ID, decisionProfileSelection, decisionProfileSummary } from "./settings-decision-profiles.js";
 import {
   THINKING_LEVELS,
   thinkingLabel,
@@ -14,7 +15,7 @@ import {
 
 export const BOOLEANS = ["true", "false"] as const;
 export const APPROVAL_MODES = ["allow", "ask", "auto", "deny"] as const;
-export const RUNNERS = ["pi", "claude", "veda"] as const;
+export const RUNNERS = ["pi-durable", "pi", "claude", "veda"] as const;
 export const TRANSPORTS = ["auto", "process", "tmux", "screen", "localterm", "herdr"] as const;
 export const WIDGET_MODES = ["auto", "always", "hidden"] as const;
 export const TOOL_DISPLAY_MODES = ["full", "compact"] as const;
@@ -192,7 +193,13 @@ export const parseFormattedNumericValue = (value: string): number => {
   return Number(normalized.replaceAll(",", ""));
 };
 
+export const EXTRACTIVE_OFF = "Off";
+export const EXTRACTIVE_LOCAL = "Deterministic only (no classifier)";
+export const EXTRACTIVE_CONSENT = "Enable classifier: send bounded user/assistant text; API charges";
+
 export const coerceValue = (id: string, value: string, config: FabricConfig): unknown => {
+  if (id === DECISION_PROFILE_SETTING_ID) return decisionProfileSelection(config.jev, value);
+  if (id === "mcp.nativeServers") return value.split(",").map(name => name.trim()).filter(Boolean);
   if (id === COMPACTION_THRESHOLD_SETTING_ID) {
     if (value === COMPACTION_DEFAULT_THRESHOLD_LABEL) return { mode: "default" };
     const tokens = /^(.+?) tokens$/.exec(value);
@@ -236,6 +243,15 @@ export const coerceValue = (id: string, value: string, config: FabricConfig): un
 };
 
 export const buildPartial = (id: string, value: unknown): Record<string, unknown> => {
+  if (id === "memory.extractive.mode") return { memory: { extractive: {
+    enabled: value === EXTRACTIVE_LOCAL || value === EXTRACTIVE_CONSENT,
+    maxEvaluationsPerTurn: value === EXTRACTIVE_CONSENT ? 1 : 0,
+  } } };
+  if (id === "memory.extractive.classifier" && typeof value === "string") {
+    const slash = value.indexOf("/");
+    if (slash < 1 || slash === value.length - 1) return {};
+    return { memory: { extractive: { provider: value.slice(0, slash), model: value.slice(slash + 1) } } };
+  }
   const segments = id.split(".");
   const root: Record<string, unknown> = {};
   let current: Record<string, unknown> = root;
@@ -267,6 +283,8 @@ export const summaryFor = (id: string, config: FabricConfig): string => {
       return config.schema.mode;
     case "approvals":
       return config.approvals.execute;
+    case "decisions":
+      return decisionProfileSummary(config.jev);
     case "mcp":
       return config.mcp.enabled
         ? config.mcp.jev.semanticSearch ? "enabled · semantic" : "enabled"
@@ -279,6 +297,8 @@ export const summaryFor = (id: string, config: FabricConfig): string => {
       return config.capture.enabled ? "enabled" : "disabled";
     case "ui":
       return config.ui.widget;
+    case "memory":
+      return config.memory.extractive?.enabled ? (config.memory.extractive.maxEvaluationsPerTurn ? "classifier-assisted" : "deterministic only") : "off";
     case "compaction":
       return config.compaction.engine;
     case "retention":

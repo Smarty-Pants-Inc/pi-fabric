@@ -8,6 +8,7 @@ export type { FabricSpeculationConfig };
 
 /** One literal-argument call discovered in the partially streamed program. */
 export interface FabricSpeculationCandidate {
+  nativeToolResult?: boolean;
   ref: string;
   args: Record<string, unknown>;
 }

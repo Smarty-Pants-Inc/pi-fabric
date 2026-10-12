@@ -4,7 +4,7 @@
 // non-Fabric readers with trusted install roots. Each one needs a valid proof in `<mesh>/readers/`,
 // written under the migration fence; the switch re-checks them under that fence right before each
 // flag commit. File format and the writer protocol: docs/mesh-backend.md.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -222,7 +222,7 @@ export const scanStateDbHolders = (root: string, scan: ProcScanOptions = {}): { 
       // an unreadable fd dir whose process holds state.db open WITHOUT any SQLite lock (not a WAL
       // connection) is not detected HERE; WAL connections always hold a lock on -shm, which /proc/locks shows.
       // The write-lease probe (probeStateDbLeases) catches such a holder when it opened before the probe;
-      // one that opens after it, under the fence and before the commit, remains undetected.
+      // one that opens after it, under the fence and before the commit, the lease watch catches (smarty-dev#8116).
       // Without /proc/locks an unreadable fd directory may hide a holder: fail closed.
       if (locksError !== undefined) {
         hold(pid, `ambiguous state.db holder: pid ${pid} (${comm(pid)}) ${fdDir} unreadable (${errno(error)}) and /proc/locks unusable (${locksError})`);
@@ -258,7 +258,62 @@ export const embeddedNativeDigests = (): Record<string, string> => {
 /** Injection points of the lease probe (tests). */
 export interface LeaseProbeOptions { platform?: NodeJS.Platform; helper?: string; procRoot?: string; leasesEnable?: string;
   /** Tests: the expected sha256 instead of the embedded one. */ expectedDigest?: string;
-  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void }
+  /** Tests: runs after the helper fd is hashed and before it is executed (the swap test). */ afterHash?: () => void;
+  /** Tests: the install root above `helper` (default: its directory for an injected helper, else installRoot()). */ trustRoot?: string;
+  /** Tests (pi-fabric#881): run inside the switch's fenced watch, right before and after its final report. */
+  beforeReport?: () => void; afterReport?: () => void }
+
+/**
+ * The trusted install root (smarty-dev#8145): the package directory, two levels above this module both in
+ * src/ (src/mesh/) and in the bundle (dist/<dir>/). Above it, a release directory or node_modules is the
+ * installer's; inside it, nothing may be writable by another user.
+ */
+export const installRoot = (): string => fileURLToPath(new URL("../..", import.meta.url));
+
+/**
+ * Why `file` is unsafe to trust, or undefined: on its REAL path (ancestor symlinks resolved), the file and
+ * every directory up to and including the real `root` must be inside `root`, no symlink, owned by this
+ * user (or root) and not group/other-writable. With `fd`, the checked file must be the opened one.
+ */
+export const unsafeChain = (file: string, root: string, fd?: number,
+  /** Tests: an injected lstat (root ownership cannot be made in a test). */ lstat: (at: string) => fs.Stats = at => fs.lstatSync(at)): string | undefined => {
+  let real: string, top: string;
+  try { real = fs.realpathSync(file); top = fs.realpathSync(root); }
+  catch (error) { return `${file} cannot be resolved (${errno(error)})`; }
+  const inside = path.relative(top, real);
+  if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return `${real} (from ${file}) is outside the install root ${top}`;
+  // pi-fabric#880 review round 4: no symlink at or below the root on the LEXICAL path either: whoever writes a
+  // link's parent could swap it after the realpath (bin/fabric-mesh-backend checks the same before loading).
+  const lexical = path.relative(root, file);
+  if (!lexical.startsWith("..") && !path.isAbsolute(lexical)) {
+    let at = root;
+    for (const part of lexical.split(path.sep)) {
+      at = path.join(at, part);
+      if (fs.lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) return `${at} is a symlink inside the install root`;
+    }
+  }
+  const euid = process.geteuid?.();
+  let above = false;
+  for (let at = real; ; at = path.dirname(at)) {
+    let stat: fs.Stats;
+    try { stat = lstat(at); } catch (error) { return `${at} cannot be checked (${errno(error)})`; }
+    if (at === real && fd !== undefined) {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino) return `${file} changed while it was checked`;
+    }
+    // Above the install root (pi-fabric#880 review rounds 2 and 7): another user who can write ANY ancestor can
+    // rename the package away and put another in place, so the walk goes all the way to / and never stops early.
+    // Every ancestor is a real directory, ours or root's, not group/other-writable. ponytail: a root-owned
+    // STICKY one (/tmp) passes: there only an entry's owner can rename it, and the entry below was checked.
+    // The same rule as bin/fabric-mesh-backend (unsafeAbove), duplicated there on purpose.
+    const sticky = above && stat.uid === 0 && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+    const why = sticky ? undefined : stat.isSymbolicLink() ? "a symlink" : ownership(stat, stat.uid === 0 ? 0 : euid)
+      ?? (above && !stat.isDirectory() ? "not a directory" : undefined);
+    if (why) return `${at} is ${why}`;
+    if (at === top) above = true;
+    if (at === path.dirname(at)) return undefined;
+  }
+};
 
 /** The installed lease helper, built beside fabric-landlock (scripts/build-landlock.mjs). */
 export const leaseHelperPath = (): string => fileURLToPath(new URL("../../dist/native/fabric-mesh-lease", import.meta.url));
@@ -277,8 +332,40 @@ const LEASE_DOC = "smarty-dev#7936";
 export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}): StateDbHolder[] => {
   const files = SQLITE_FILES.map(name => path.join(root, name)).filter(file => fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined);
   if (files.length === 0) return [];
-  const unavailable = (why: string): StateDbHolder[] =>
-    [{ pid: 0, name: "holder@lease-probe", reason: `state.db lease probe unavailable (${LEASE_DOC}): ${why}` }];
+  const fd = verifiedLeaseHelper(root, files, probe);
+  if (typeof fd !== "number") return fd;
+  let result: { error?: Error; status: number | null; stdout: string };
+  try { result = spawnSync("/proc/self/fd/3", files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe", fd] }); }
+  finally { fs.closeSync(fd); }
+  if (result.error || (result.status !== 0 && result.status !== 3)) {
+    return leaseUnavailable(`helper failed (${result.error?.message ?? `exit ${String(result.status)}`}${result.stdout ? `: ${result.stdout.trim()}` : ""})`);
+  }
+  return leaseVerdicts(root, files, result.stdout.split("\n").filter(Boolean));
+};
+
+const leaseUnavailable = (why: string): StateDbHolder[] =>
+  [{ pid: 0, name: "holder@lease-probe", reason: `state.db lease probe unavailable (${LEASE_DOC}): ${why}` }];
+
+/** The probe's "free|held|absent FILE" lines as holders; anything else, or a file missing, is unavailable. */
+const leaseVerdicts = (root: string, files: readonly string[], lines: readonly string[]): StateDbHolder[] => {
+  const holders: StateDbHolder[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const match = /^(free|held|absent) (.+)$/.exec(line);
+    if (!match || !files.includes(match[2]!)) return leaseUnavailable(`unexpected helper output: ${line}`);
+    seen.add(match[2]!);
+    if (match[1] === "held") {
+      holders.push({ pid: 0, name: `holder@lease:${path.relative(root, match[2]!)}`,
+        reason: `unidentified holder of ${match[2]} (a write lease was refused: another process has it open; ${LEASE_DOC})` });
+    }
+  }
+  if (seen.size !== files.length) return leaseUnavailable("the helper did not report every file");
+  return holders;
+};
+
+/** The lease helper opened, verified and ready to execute as /proc/self/fd/3, or why the probe cannot run. */
+const verifiedLeaseHelper = (root: string, files: readonly string[], probe: LeaseProbeOptions): number | StateDbHolder[] => {
+  const unavailable = leaseUnavailable;
   if ((probe.platform ?? process.platform) !== "linux") return unavailable("not Linux");
   const procRoot = probe.procRoot ?? "/proc";
   const ownFds = path.join(procRoot, "self", "fd");
@@ -305,31 +392,120 @@ export const probeStateDbLeases = (root: string, probe: LeaseProbeOptions = {}):
   let fd: number;
   try { fd = fs.openSync(helper, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
   catch (error) { return unavailable(`helper integrity: ${helper} cannot be opened (${errno(error)})`); }
-  let result: { error?: Error; status: number | null; stdout: string };
+  let verified = false;
   try {
+    // smarty-dev#8145: another user who can write the helper, the gate's own module, or any directory
+    // above them up to the install root could change what runs: refuse unless the whole chain is ours.
+    const unsafe = unsafeChain(helper, probe.trustRoot ?? (probe.helper ? path.dirname(probe.helper) : installRoot()), fd)
+      ?? unsafeChain(fileURLToPath(import.meta.url), installRoot());
+    if (unsafe) return unavailable(`helper integrity: ${unsafe}`);
     const actual = createHash("sha256").update(fs.readFileSync(fd)).digest("hex");
     if (actual !== expected) return unavailable(`helper integrity: ${helper} sha256 ${actual} does not match the embedded digest ${expected}`);
     probe.afterHash?.();
     // No fd exec, no probe: there is no copy and no path exec (fail closed).
     if (!fs.existsSync(path.join(procRoot, "self", "fd"))) return unavailable("helper integrity: /proc/self/fd exec is unavailable");
-    result = spawnSync("/proc/self/fd/3", files, { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe", fd] });
-  } finally { fs.closeSync(fd); }
-  if (result.error || (result.status !== 0 && result.status !== 3)) {
-    return unavailable(`helper failed (${result.error?.message ?? `exit ${String(result.status)}`}${result.stdout ? `: ${result.stdout.trim()}` : ""})`);
-  }
-  const holders: StateDbHolder[] = [];
-  const seen = new Set<string>();
-  for (const line of result.stdout.split("\n").filter(Boolean)) {
-    const match = /^(free|held|absent) (.+)$/.exec(line);
-    if (!match || !files.includes(match[2]!)) return unavailable(`unexpected helper output: ${line}`);
-    seen.add(match[2]!);
-    if (match[1] === "held") {
-      holders.push({ pid: 0, name: `holder@lease:${path.relative(root, match[2]!)}`,
-        reason: `unidentified holder of ${match[2]} (a write lease was refused: another process has it open; ${LEASE_DOC})` });
+    verified = true;
+    return fd;
+  } finally { if (!verified) fs.closeSync(fd); }
+};
+
+/** The fenced lease watch of a switch (smarty-dev#8116). */
+export interface StateDbLeaseWatch {
+  /** The lease probe's verdict, taken after the watches went up. */
+  holders: StateDbHolder[];
+  /** Every open since the probe but the probe's own; synchronous. Call it before this process opens any of the files. */
+  check(): StateDbHolder[];
+  stop(): void;
+}
+const WATCH_DOC = "smarty-dev#8116";
+const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+/**
+ * smarty-dev#8116: the lease probe, run by the helper in --watch mode. Its inotify watches (every SQLite
+ * file's directory, each existing file's inode) go up BEFORE the probe, so a later open by any process,
+ * dumpable or not, with or without SQLite locks, is an event. `check()` asks the helper for its counts:
+ * opens minus closes by name, minus this process's own open fds on those paths, must be zero; an inode
+ * opened through another name (a hard link), a moved file, a lost event (queue overflow), a directory that
+ * appeared, or a helper that does not answer is never ready. Call it only while this process holds none
+ * of the files (as the probe); afterwards its own SQLite fds are subtracted.
+ */
+export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions = {}): Promise<StateDbLeaseWatch> => {
+  const files = SQLITE_FILES.map(name => path.join(root, name));
+  const failed = (holders: StateDbHolder[]): StateDbLeaseWatch => ({ holders, check: () => holders, stop: () => {} });
+  // Off Linux there is neither a lease nor inotify: the probe's own verdict stands (as before smarty-dev#8116).
+  if ((probe.platform ?? process.platform) !== "linux") return failed(probeStateDbLeases(root, probe));
+  const fd = verifiedLeaseHelper(root, files, probe);
+  if (typeof fd !== "number") return failed(fd);
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lease-watch-"));
+  const control = path.join(scratch, "control");
+  const output = path.join(scratch, "output");
+  let child: ReturnType<typeof spawn> | undefined;
+  const stop = (): void => {
+    try { child?.kill("SIGKILL"); } catch { /* gone */ }
+    fs.rmSync(scratch, { recursive: true, force: true });
+  };
+  try {
+    fs.mkdirSync(control, { mode: 0o700 });
+    const out = fs.openSync(output, "wx", 0o600);
+    try { child = spawn("/proc/self/fd/3", ["--watch", String(process.pid), control, ...files], { stdio: ["ignore", out, "ignore", fd] }); }
+    finally { fs.closeSync(out); fs.closeSync(fd); }
+    child.on("error", () => undefined);
+    const lines = (): string[] => fs.readFileSync(output, "utf8").split("\n");
+    const deadline = Date.now() + 10_000;
+    while (!lines().includes("watching")) {
+      if (child.exitCode !== null || Date.now() > deadline) {
+        stop();
+        return failed(leaseUnavailable(`lease watch did not start (${lines().join(" ").trim() || `exit ${String(child.exitCode)}`}; ${WATCH_DOC})`));
+      }
+      await new Promise(resolve => setTimeout(resolve, 5));
     }
+    const all = lines();
+    const holders = leaseVerdicts(root, files, all.slice(0, all.indexOf("watching")));
+    let seq = 0;
+    const check = (): StateDbHolder[] => {
+      seq += 1;
+      const from = lines().length - 1;
+      try { fs.writeFileSync(path.join(control, `go${seq}`), ""); }
+      catch (error) { return leaseUnavailable(`lease watch control failed (${errno(error)}; ${WATCH_DOC})`); }
+      const until = Date.now() + 10_000;
+      let report: string[] | undefined;
+      while (!report) {
+        const now = lines();
+        const end = now.indexOf(`end ${seq}`, from);
+        if (end >= 0) report = now.slice(from, end);
+        else if (Date.now() > until) return leaseUnavailable(`the lease watch did not report (${WATCH_DOC})`);
+        else sleepSync(2);
+      }
+      const result: StateDbHolder[] = [];
+      const hold = (file: string, why: string): void => {
+        result.push({ pid: 0, name: `holder@lease:${path.relative(root, file)}`, reason: `unidentified holder of ${file} (${why}; ${WATCH_DOC})` });
+      };
+      for (const line of report) {
+        // pi-fabric#881 (Astra P1): the report comes before this process's first own open (the caller's contract), so
+        // every open but the probe's own is foreign. No close is netted and nothing is subtracted: inotify merges an
+        // event with an identical one at the queue tail, whoever opened. Fail closed.
+        const opens = /^opens (\d+) (\d+) (.+)$/.exec(line);
+        const flag = /^(alias|moved|deleted|attrib) (.+)$/.exec(line);
+        if (opens && files.includes(opens[3]!)) {
+          const others = Number(opens[1]) - Number(opens[2]);
+          if (others > 0) hold(opens[3]!, `${others} open(s) since the lease probe`);
+        } else if (flag && files.includes(flag[2]!)) {
+          // smarty-dev#9473: a mode, owner or link-count change fails closed like an open; pi-fabric#881 round 4: so does a
+          // removed name (a hard link elsewhere can keep its inode open, uncounted).
+          hold(flag[2]!, flag[1] === "alias" ? "opened through another name (a hard link) since the lease probe"
+            : flag[1] === "deleted" ? "its name was removed since the lease probe (a hard link may keep the inode open)"
+            : flag[1] === "attrib" ? "its mode, owner or link count changed since the lease probe" : "moved since the lease probe");
+        } else return leaseUnavailable(`the lease watch reported ${line === "overflow" ? "lost events (inotify queue overflow)" : line === "newdir" ? "a new state-shadow directory"
+          : line === "invalidated" ? "a watched directory or file moved, deleted or replaced"
+            : line === "attribdir" ? "a watched directory's mode, owner or link count changed" : `"${line}"`} (${WATCH_DOC})`);
+      }
+      return result;
+    };
+    return { holders, check, stop };
+  } catch (error) {
+    stop();
+    return failed(leaseUnavailable(`lease watch failed (${errno(error)}; ${WATCH_DOC})`));
   }
-  if (seen.size !== files.length) return unavailable("the helper did not report every file");
-  return holders;
 };
 
 /**

@@ -11,6 +11,7 @@ import { FabricExecutionService } from "../src/execution-service.js";
 import { FabricActivityStore } from "../src/activity/store.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { FabricActionDescriptor } from "../src/protocol.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 const roots: string[] = [];
 const registries: ActionRegistry[] = [];
@@ -24,7 +25,7 @@ const fixture = (pythonRuntime: FabricPythonRuntime) => {
   roots.push(cwd);
   const registry = new ActionRegistry();
   registries.push(registry);
-  registry.register(new PiToolsProvider(cwd));
+  registry.register(new PiToolsProvider(cwd, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
   const config = normalizeFabricConfig({ executor: { kernel: "python", ...(pythonRuntime === "cpython" ? { pythonRuntime } : { cpython: { binary: "/nonexistent/python3" } }), memoryLimitBytes: 256 * 1024 * 1024 } });
   const activity = new FabricActivityStore();
   const service = new FabricExecutionService(registry, config, activity);

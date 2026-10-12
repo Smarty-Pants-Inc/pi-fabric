@@ -137,7 +137,7 @@ export interface MeshBackendOptions {
   /** Receives the advisory census report of each operation (logs, the CLI). Never throws into it. */
   onAdvisory?: (advisory: MeshCensusAdvisory) => void;
   /** The mesh `.lock` protocol of the fleet. Default 1 (as mesh-bridge). */
-  lockProtocol?: 1 | 2;
+  lockProtocol?: 1 | 2 | 3;
   /** Budget for each fence lock (`custody.lock`, then `.lock`). Default 60 s. */
   lockTimeoutMs?: number;
   /** Synchronous SQLite busy handler of the tool's own connection. Default 5,000 ms. */

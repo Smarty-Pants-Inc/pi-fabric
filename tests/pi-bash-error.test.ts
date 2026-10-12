@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { classifyPiBashError, piBashExitMetadata, piBashResultError } from "../src/core/pi-bash-error.js";
+import { classifyPiBashResult, classifyPiBashError, piBashExitMetadata, piBashResultError } from "../src/core/pi-bash-error.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { NodeProcessRuntime } from "../src/runtime/node-process-runtime.js";
 
 describe("native bash exit classification", () => {
+  it("classifies 0.99 structured failures before display middleware", () => {
+    const original = classifyPiBashResult({ isError: true, content: [{ type: "text", text: "private\n\nCommand exited with code 7" }], structuredContent: { exit_code: 7, output: "private" } });
+    expect(piBashExitMetadata(original)).toEqual({ exitCode: 7, output: "private" });
+    expect(piBashExitMetadata(piBashResultError(original, "[redacted]"))).toEqual({ exitCode: 7, output: "[redacted]" });
+  });
+  it.each([undefined, 0, -1, "7", NaN])("does not infer a structured exit from text with invalid status %s", (exit_code) => {
+    const error = classifyPiBashResult({ isError: true, content: [{ type: "text", text: "Command exited with code 7" }], structuredContent: { exit_code } });
+    expect(piBashExitMetadata(error)).toBeUndefined();
+  });
   it.each([
     "Command timed out after 1 seconds",
     "Command aborted",

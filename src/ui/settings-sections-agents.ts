@@ -38,7 +38,7 @@ export const buildPrewalkSection = (
       theme,
       "Prewalk",
       "Automatic continuation at the completed outer fabric_exec boundary.",
-      [
+      () => [
         setting("prewalk.enabled", "Enabled", config.prewalk.enabled === false ? "false" : "true", {
           description:
             "Master switch for prewalk. When off, manual arming, session auto-arm, and boundary claims are all inert until re-enabled. Same effect as /fabric prewalk --disable and --enable; a live arm is cancelled on disable.",
@@ -127,6 +127,7 @@ export const buildPrewalkSection = (
         ),
       ],
       persist,
+      { refreshOnChange: false },
     ),
   });
 };
@@ -160,7 +161,7 @@ export const buildAgentsSection = (
       theme,
       "Agents",
       "One-shot child agents spawned from inside fabric_exec.",
-      [
+      () => [
         setting("agents.enabled", "Enabled", config.agents.enabled ? "true" : "false", {
           description: "Enable agent spawning via workflow.agent() and agents.run().",
           values: BOOLEANS,
@@ -332,6 +333,7 @@ export const buildAgentsSection = (
         }),
       ],
       persist,
+      { refreshOnChange: false },
     ),
   });
 };

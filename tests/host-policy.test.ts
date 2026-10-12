@@ -433,7 +433,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
     const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
     const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
-    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+    const provider = new PiToolsProvider(cwd, undefined, undefined, { allowUnhookedTools: true,
       powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
       getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
     });
@@ -495,7 +495,7 @@ describe.runIf(process.platform !== "win32")("root-owned host policy (#7591)", (
     const { SessionManager, createExtensionRuntime, ExtensionRunner } = await import("@earendil-works/pi-coding-agent");
     const runtime = createExtensionRuntime(); runtime.getThinkingLevel = () => "off";
     const runner = new ExtensionRunner([], runtime, cwd, SessionManager.inMemory(cwd), {} as never);
-    const provider = new PiToolsProvider(cwd, undefined, undefined, {
+    const provider = new PiToolsProvider(cwd, undefined, undefined, { allowUnhookedTools: true,
       powerShellToolDefinitionFactory: undefined, getShellHangMs: () => 0,
       getLandlockSettings: () => config.liveLandlockSettings(loaded, agentDir),
     });

@@ -14,7 +14,7 @@ afterEach(async () => { await Promise.all(providers.splice(0).map(p => p.close()
 describe("Jev reactive programs", () => {
   it("exposes all lifecycle actions and inferred Choice/Noul/Score types", async () => {
     const { provider } = setup();
-    expect((await provider.list({})).map(d => d.name)).toEqual(["evaluate", "run", "spawn", "status", "wait", "join", "advise", "stop"]);
+    expect((await provider.list({})).map(d => d.name)).toEqual(["decide", "resolveDecision", "decisionProviders", "models", "evaluate", "run", "spawn", "status", "wait", "join", "advise", "stop"]);
     const checked = typeCheckFabricCode(`const r = await jev.evaluate({state: "hello", questions: {
       yes: {type:"noul", instructions:"Is this a greeting?"},
       pick: {type:"choice", instructions:"Which?", criteria:{a:null,b:null}},

@@ -938,9 +938,9 @@ const prepared = new Map<string, NatsStateBackend>();
 export const preparedNatsStateBackend = (root: string): NatsStateBackend | undefined => prepared.get(path.resolve(root));
 
 /** Minimum server: 2.14.7, as smarty-dev#7504 requires (per-message TTL and delete markers since 2.11; the KV leases of phase 2). */
-export const MIN_SERVER = [2, 14, 7];
+export const MIN_SERVER: readonly number[] = Object.freeze([2, 14, 7]); // frozen: no in-process write lowers the floor
 // Strict semver (pi-fabric#937 round 1): a prerelease (2.14.7-rc.1) is below its release; an unparseable version refuses.
-const versionAtLeast = (version: string, minimum: number[]): boolean => {
+const versionAtLeast = (version: string, minimum: readonly number[]): boolean => {
   const have = semverValid(version.replace(/^v/, ""));
   return have !== null && semverGte(have, minimum.join("."));
 };
@@ -1116,9 +1116,11 @@ const loopbackAddress = (address: string): boolean => {
   const bare = address.replace(/^\[|\]$/g, "").toLowerCase();
   if (net.isIPv4(bare)) return bare.split(".")[0] === "127";
   if (!net.isIPv6(bare)) return false;
-  if (bare === "::1") return true;
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(bare);
-  return mapped !== null && mapped[1]!.split(".")[0] === "127";
+  // The WHATWG URL parser canonicalizes every IPv6 spelling (zero-padded, uppercase, uncompressed, dotted IPv4-mapped)
+  // to one form: ::1, or ::ffff:7fXX:XXXX for an IPv4-mapped 127/8 address (pi-fabric#937 round 4).
+  let canonical: string;
+  try { canonical = new URL(`http://[${bare}]`).hostname.slice(1, -1); } catch { return false; }
+  return canonical === "::1" || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(canonical);
 };
 
 /**
@@ -1149,6 +1151,15 @@ export const assertNatsTransportSecure = async (url: string, secureScheme: "tls:
   parsed.hostname = net.isIPv6(pinned) ? `[${pinned}]` : pinned;
   return parsed.toString();
 };
+
+/**
+ * The nats.js connect() options (pi-fabric#937 round 4): only the validated, pinned `servers`. `ignoreClusterUpdates`
+ * keeps a server's INFO `connect_urls` (cluster gossip) out of the reconnect list, so a seed cannot send the client to
+ * a peer that was never checked for loopback, TLS or auth.
+ */
+export const natsConnectOptions = (servers: readonly string[], tls?: NatsTlsFiles) => ({
+  servers: [...servers], ignoreClusterUpdates: true as const, ...(tls === undefined ? {} : { tls: { ...tls } }),
+});
 
 /** A URL whose host is a loopback IP literal (no lookup). */
 const loopbackUrl = (url: string): boolean => {

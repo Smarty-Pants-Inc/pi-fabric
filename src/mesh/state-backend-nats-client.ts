@@ -6,7 +6,7 @@ import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
 import {
-  guardNatsPort, NatsWrongLastSequenceError, redactNatsError, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
+  guardNatsPort, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError, type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
 
 /** NATS JetStream API error codes used here. */
@@ -31,7 +31,7 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
   let nc: Awaited<ReturnType<typeof connect>>;
   let jsm: Awaited<ReturnType<typeof jetstreamManager>>;
   try {
-    nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) });
+    nc = await connect(natsConnectOptions(servers, options.tls));
     jsm = await jetstreamManager(nc);
   } catch (error) { throw redactNatsError(error); }
   const js = jetstream(nc);

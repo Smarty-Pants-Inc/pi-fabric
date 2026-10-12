@@ -3,7 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
-  MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
+  MAX_MESSAGE_BYTES, MIN_SERVER, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
   guardNatsPort, NatsStateBackend, natsStreamName, NatsWrongLastSequenceError, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
@@ -1139,5 +1139,28 @@ describe("JetStream backend: round 3 (pi-fabric#937)", () => {
     const keyed = await rejected(new Error(`proxy-authorization: px555 cookie: a=ck111; b=ck222\nsecret=sec333 api_key=ak444 Authorization: Bearer abc999`));
     expect(keyed.message).toContain("cookie: ***");
     expectNoSecret("keys", keyed);
+  });
+});
+
+describe("JetStream backend: round 4 (pi-fabric#937)", () => {
+  it("P2 (a): every spelling of an IPv4-mapped loopback address is loopback; a mapped off-host address is not", async () => {
+    for (const host of ["::ffff:7f00:1", "::ffff:7f00:0001", "::FFFF:7F00:1", "::ffff:127.0.0.1", "0:0:0:0:0:ffff:7f00:1", "::ffff:7fff:fffe", "0:0:0:0:0:0:0:1"]) {
+      await expect(assertNatsTransportSecure(`nats://[${host}]:4222`, "tls:", resolver), host).resolves.toBeTypeOf("string");
+      // The auth check counts it as local too: no auth required.
+      await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: [`tls://[${host}]:4222`], lookup: resolver }), host)
+        .resolves.toBeInstanceOf(NatsStateBackend);
+    }
+    for (const host of ["::ffff:a00:1", "::ffff:8000:1", "::ffff:10.0.0.1", "::2"]) {
+      await expect(assertNatsTransportSecure(`nats://[${host}]:4222`, "tls:", resolver), host).rejects.toBeInstanceOf(MeshStateNatsInsecureError);
+    }
+  });
+
+  it("P2 (b): MIN_SERVER is frozen: a write throws and the floor stays 2.14.7", async () => {
+    expect(Object.isFrozen(MIN_SERVER)).toBe(true);
+    expect(() => { (MIN_SERVER as number[])[1] = 0; }).toThrow(TypeError);
+    expect([...MIN_SERVER]).toEqual([2, 14, 7]);
+    const server = fakeJetStream();
+    server.version = "2.14.6";
+    await expect(open(server)).rejects.toThrow(/older than 2\.14\.7/);
   });
 });

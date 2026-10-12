@@ -4617,10 +4617,11 @@ export class ActorManager {
       ...(addressed ? { outcomeSend: { eventId: event.id, to: actor.id, from: event.from.id, mode: "publish" as const } } : {}),
       // A durable host never holds the shared cursor for one actor's full queue: past it, work
       // waits in that actor's dead-letter file (smarty-dev#816). Only a non-persistent host,
-      // which has no such file, keeps fleet.* work in the mesh until there is room (#754). Only fleet.*:
-      // #554 round 2 P2, a sick actor's full queue must not pin the shared cursor for everyone. An
-      // addressed event past the queue and overflow is dropped with a failed delivery outcome instead.
-      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") ? { holdWhenFull: true } : {}),
+      // which has no such file, keeps unaddressed fleet.* work in the mesh until there is room (#754).
+      // Only fleet.*: #554 round 2 P2, a sick actor's full queue must not pin the shared cursor for
+      // everyone. An addressed event past the queue and overflow, on any topic (fleet.* included,
+      // PR #551 review P1), is dropped with one failed delivery outcome instead.
+      ...(this.#persistent ? { deadLetter: true } : event.topic.startsWith("fleet.") && !addressed ? { holdWhenFull: true } : {}),
       // A JSON tuple, not a joined string: topics may contain ':' and string values anything,
       // so a joined key could merge two topics' subjects. Keeps the value's type.
       ...(key === undefined ? {} : { coalesceKey: JSON.stringify(["mesh", event.topic, key]) }),

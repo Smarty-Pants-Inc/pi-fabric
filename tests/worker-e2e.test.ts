@@ -276,6 +276,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-restart-exit",
+      // Same load-timing budget as terminated-recover and kill-worker (smarty-dev#10379): on a loaded
+      // Windows runner, worker and fake Pi startup can use most of the shared 2 s before the restart.
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("failed");
         expect(r.error).toContain("Error: Terminated");

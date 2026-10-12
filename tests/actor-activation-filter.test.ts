@@ -12,7 +12,7 @@ import {
 } from "../src/actors/activation-filter.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 
 // Real queued-item envelopes from fleet run records (smarty-dev#1579 item 4).
 const fixture = JSON.parse(fs.readFileSync(path.resolve("tests/fixtures/activation-filter-envelopes.json"), "utf8")) as {
@@ -219,13 +219,13 @@ afterEach(async () => {
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-"))) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-activation-filter-")), actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
-  const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+  const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit }, agents, () => {}, {
     actorRoot: path.join(root, "actors"), persistent: true,
   });
   closers.push(async () => { await actors.close(); await agents.close(); });
@@ -253,6 +253,111 @@ const publish = (mesh: MeshStore, item: { payload: Record<string, any> }, topic 
   mesh.publish({ topic, kind: item.payload.kind, from, ...(item.payload.text ? { text: item.payload.text } : {}), data: item.payload.data });
 const filtered = (actors: ActorManager, id: string) =>
   actors.messages(id).filter((message) => message.reason?.startsWith("filtered: "));
+
+type QueueSnapshot = { items: Array<{ id: string; source: string; payload: MeshEvent }>; processedKeys?: string[] };
+const queueSnapshot = (root: string, id: string) => {
+  const directory = path.join(root, "actors", id);
+  const name = fs.readdirSync(directory).find(file => file.startsWith("queue-") && file.endsWith(".json"));
+  expect(name).toBeDefined();
+  const file = path.join(directory, name!);
+  return { file, saved: JSON.parse(fs.readFileSync(file, "utf8")) as QueueSnapshot };
+};
+const WAIT_FILTER: FabricActorActivationFilter = [{ id: "wait", topic: ["filter-queued.work"], kind: ["wait"] }];
+const queuedEvent = (mesh: MeshStore, index: number, waiting: boolean) =>
+  mesh.publish({ topic: "filter-queued.work", kind: waiting ? "wait" : "work", from, data: { key: `event-${index}`, marker: `event-${index}` } });
+
+// smarty-dev#10630: use the real manager, mesh store, registry and queue checkpoint; no mocks.
+const holdWorker = async (actors: ActorManager, root: string, id: string) => {
+  const release = path.join(root, "release-worker");
+  closers.unshift(async () => { fs.writeFileSync(release, "release"); });
+  actors.tell(id, "LIVE_WITH_PROGRESS", { fakeWorkerReleasePath: release });
+  await waitFor(() => actors.status(id).status === "running");
+  return () => fs.writeFileSync(release, "release");
+};
+describe("setting activation filters on accepted queues", () => {
+  it("prunes six of ten queued items, preserving FIFO, receipts and head-skip processed keys", async () => {
+    const { root, mesh, actors, agents } = setup(undefined, 10);
+    const actor = await actors.create({ name: "queued-supervisor", instructions: "Supervise.", topics: ["filter-queued.work"],
+      coalesce: false, dedupeKey: "data.key", residency: "durable" });
+    await queuedEvent(mesh, -1, false);
+    await waitFor(() => actors.messages(actor.id).some(message => message.direction === "out") && actors.status(actor.id).status === "idle");
+    const release = await holdWorker(actors, root, actor.id);
+    const matches = new Set([0, 2, 3, 5, 7, 9]);
+    for (let index = 0; index < 10; index++) await queuedEvent(mesh, index, matches.has(index));
+    await waitFor(() => actors.status(actor.id).queued === 10);
+    const before = queueSnapshot(root, actor.id);
+    expect(before.saved.processedKeys).toEqual([JSON.stringify(["mesh-dedupe", "data.key", "filter-queued.work", "event--1"])]);
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
+    expect(changed.queued).toBe(4);
+    expect(changed.status).toBe("running"); // setting the filter never consumes the active caller's work
+    expect(changed.filterSkipped.count).toBe(6);
+    expect(changed.filteredCount).toBe(6);
+    const after = queueSnapshot(root, actor.id).saved;
+    expect(after.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.data))
+      .toEqual([1, 4, 6, 8].map(index => ({ key: `event-${index}`, marker: `event-${index}` })));
+    expect(after.processedKeys).toEqual(before.saved.processedKeys);
+    const skippedItems = before.saved.items.filter(item => item.payload.kind === "wait");
+    const receipts = filtered(actors, actor.id).map(({ source, reason, data }) => ({ source, reason, data }));
+    expect(receipts).toEqual(skippedItems.map(item => ({ source: item.source, reason: "filtered: wait", data: { filteredItemId: item.id } })));
+    expect(changed.filterSkipped).toMatchObject({ lastKey: skippedItems.at(-1)!.payload.id, lastTopic: "filter-queued.work", lastAt: changed.lastFilteredAt });
+    expect(runDirs(root, actor.id)).toHaveLength(1); // only the completed seed is archived; the caller is still active
+
+    // Stop admission/drain at the release boundary only AFTER all events are queued.
+    actors.pauseForRelease();
+    release();
+    await waitFor(() => actors.inFlightCount() === 0);
+    await actors.close();
+    closers.length = 0;
+    await agents.close();
+    // Put the same six accepted items at a restarted manager's head. This exercises
+    // actual head skips, not a mock or another call to the setter under test.
+    fs.writeFileSync(before.file, JSON.stringify({ ...before.saved, items: skippedItems }));
+    const again = setup(root, 10).actors;
+    await waitFor(() => again.status(actor.id).queued === 0 && filtered(again, actor.id).length === 12);
+    expect(filtered(again, actor.id).slice(-6).map(({ source, reason, data }) => ({ source, reason, data }))).toEqual(receipts);
+    expect(queueSnapshot(root, actor.id).saved.processedKeys).toEqual(after.processedKeys);
+    expect(runDirs(root, actor.id)).toHaveLength(2);
+  }, 30_000);
+
+  it("prunes queue and overflow together without changing survivor run order", async () => {
+    const { root, mesh, actors } = setup(undefined, 2);
+    const actor = await actors.create({ name: "overflow-supervisor", instructions: "Supervise.", topics: ["filter-queued.work"], coalesce: false });
+    const release = await holdWorker(actors, root, actor.id);
+    const matches = new Set([0, 2, 3, 5, 7, 9]);
+    for (let index = 0; index < 10; index++) await queuedEvent(mesh, index, matches.has(index));
+    await waitFor(() => actors.status(actor.id).queued === 10); // two in queue, eight in overflow
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
+    expect(changed).toMatchObject({ queued: 4, filterSkipped: { count: 6 } });
+    expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => (item.payload.data as { marker: string }).marker))
+      .toEqual(["event-1", "event-4", "event-6", "event-8"]);
+    release();
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.messages(actor.id).filter(message => message.direction === "out" && message.source.startsWith("mesh:")).length === 4);
+    expect(runTasks(root, actor.id).map(task => task.match(/"marker": "([^"]+)"/)?.[1]).filter(Boolean))
+      .toEqual(["event-1", "event-4", "event-6", "event-8"]);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(6);
+  }, 30_000);
+
+  it("replays a pre-existing dead letter exactly once when pruning frees queue and overflow", async () => {
+    const { root, mesh, actors } = setup(undefined, 2);
+    const actor = await actors.create({ name: "dead-letter-supervisor", instructions: "Supervise.", topics: ["filter-queued.work"], coalesce: false });
+    const release = await holdWorker(actors, root, actor.id);
+    for (let index = 0; index < 18; index++) await queuedEvent(mesh, index, true);
+    const real = await queuedEvent(mesh, 18, false);
+    const deadLetter = path.join(root, "actors", actor.id, "dead-letter.jsonl");
+    await waitFor(() => actors.status(actor.id).queued === 18 && fs.existsSync(deadLetter) && fs.readFileSync(deadLetter, "utf8").includes(real.id));
+    expect(fs.readFileSync(deadLetter, "utf8").trim().split("\n")).toHaveLength(1);
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
+    expect(changed).toMatchObject({ queued: 1, filterSkipped: { count: 18 } });
+    expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
+    expect(fs.existsSync(deadLetter)).toBe(false);
+    await actors.setActivationFilter(actor.id, WAIT_FILTER); // no second replay on re-apply
+    expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
+    release();
+    await waitFor(() => actors.status(actor.id).status === "idle" && actors.messages(actor.id).some(message => message.direction === "out" && message.source === "mesh:filter-queued.work"));
+    expect(runDirs(root, actor.id)).toHaveLength(2); // active caller plus the one replayed real event
+    expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.source === "mesh:filter-queued.work")).toHaveLength(1);
+  }, 30_000);
+});
 
 describe("actor activation filter in ActorManager", () => {
   it("skips matching events with no model run, logs and counts each skip, and runs the rest", async () => {

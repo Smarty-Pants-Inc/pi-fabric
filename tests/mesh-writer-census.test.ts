@@ -268,7 +268,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 }, absent: "lockProtocol" },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 }, absent: "lockProtocol" },
     { label: "lock protocol 0", fields: { lockProtocol: 0 }, absent: "lockProtocol" },
     { label: "a string lock protocol", fields: { lockProtocol: "2" }, absent: "lockProtocol" },
     { label: "an unsupported backend", fields: { stateBackend: "redis" }, absent: "stateBackend" },
@@ -291,7 +291,7 @@ describe("mesh writer census", () => {
   });
 
   it.each([
-    { label: "lock protocol 3", fields: { lockProtocol: 3 } },
+    { label: "lock protocol 4", fields: { lockProtocol: 4 } },
     { label: "an unsupported backend", fields: { stateBackend: "redis" } },
   ])("drops lease writer metadata with $label", async ({ fields }) => {
     const mesh = root();

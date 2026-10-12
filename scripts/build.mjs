@@ -55,6 +55,7 @@ const lazyEntryPoints = [
   "src/residency/wake.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",
+  "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",

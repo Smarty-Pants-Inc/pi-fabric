@@ -496,7 +496,7 @@ export const validWriterHost = (value: unknown): value is string => typeof value
 export const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 
 /** The mesh lock protocols this release understands. */
-export const validWriterLockProtocol = (value: unknown): value is 1 | 2 => value === 1 || value === 2;
+export const validWriterLockProtocol = (value: unknown): value is 1 | 2 | 3 => value === 1 || value === 2 || value === 3;
 
 /** The keyed-state backends this release understands. */
 export const validWriterStateBackend = (value: unknown): value is "file" | "shadow" | "sqlite" =>

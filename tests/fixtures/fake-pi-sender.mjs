@@ -13,5 +13,6 @@ if (hookPath) {
   headers = { "X-Session-Id": "unmodified" };
   await handler?.({ type: "before_provider_headers", headers });
 }
-process.stdout.write(JSON.stringify({ type: "fake_sender_headers", hookLoaded: Boolean(hookPath), headers }) + "\n");
+const senderHooks = argv.filter((arg, index) => argv[index - 1] === "-e" && arg.replaceAll("\\", "/").endsWith("/guards/sender-headers.js"));
+process.stdout.write(JSON.stringify({ type: "fake_sender_headers", hookLoaded: Boolean(hookPath), senderHooks, headers }) + "\n");
 await import("./fake-pi-model.mjs");

@@ -182,6 +182,25 @@ const loadVedaCli = async (): Promise<VedaCliModule> => {
   return import(sourceModulePath) as Promise<VedaCliModule>;
 };
 
+/**
+ * Every runner whose child is Pi: the pi CLI (or Fabric's task entry) and the pi-durable SDK
+ * worker, which loads each explicit -e path into its session's extension list.
+ */
+const PI_BACKED_RUNNERS: ReadonlySet<string> = new Set(["pi", "pi-durable"]);
+/**
+ * smarty-dev#6207: the one launch rule for the sender-header hook. Every Pi-backed child names
+ * its sender, also with --no-extensions (an explicit -e still loads). The Main's own hook skips
+ * worker children, so a runner missing here would send no sender headers at all.
+ */
+const senderHeaderHookArguments = (runner: string): string[] => {
+  if (!PI_BACKED_RUNNERS.has(runner)) return [];
+  const hookPath = fileURLToPath(new URL(
+    import.meta.url.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js",
+    import.meta.url,
+  ));
+  if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
+  return ["-e", hookPath];
+};
 const MAX_STDERR_CHARS = 20_000;
 const STEER_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_STEER_LINE_BYTES = 64 * 1024;
@@ -342,7 +361,7 @@ const main = async (): Promise<void> => {
     writeRunRecord,
   } = loadedRunRecordHelpers;
   const options = optionHelpers.parseWorkerOptions();
-  const isPi = options.runner === "pi" || options.runner === "pi-durable";
+  const isPi = PI_BACKED_RUNNERS.has(options.runner);
   const sessionExporter = options.sessionExportFile
     ? new sessionExportHelpers.SessionExporter({
         file: options.sessionExportFile,
@@ -564,15 +583,8 @@ const main = async (): Promise<void> => {
     // Explicit -e is loaded even with --no-extensions: attribution is not optional.
     piArguments.push("-e", hookPath);
   }
-  if (options.runner === "pi") {
-    // smarty-dev#6207: every Pi child names its sender, also with --no-extensions (explicit -e loads).
-    const hookPath = fileURLToPath(new URL(
-      import.meta.url.endsWith(".ts") ? "./guards/sender-headers.ts" : "./guards/sender-headers.js",
-      import.meta.url,
-    ));
-    if (!fs.existsSync(hookPath)) throw new Error("Sender header hook is missing");
-    piArguments.push("-e", hookPath);
-  }
+  // smarty-dev#6207: one rule for every Pi-backed runner (pi CLI or task entry, pi-durable SDK worker).
+  piArguments.push(...senderHeaderHookArguments(options.runner));
   if (options.writePolicy) {
     // The guard loads even with --no-extensions; other runners cannot enforce it.
     if (!isPi) throw new Error(`Write confinement requires the Pi runner, not ${options.runner}`);

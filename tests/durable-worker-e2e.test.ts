@@ -19,7 +19,7 @@ beforeAll(async () => {
   fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "junction");
   fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');
   await build({
-    entryPoints: ["src/worker.ts", "src/durable/worker.ts", "src/agents/write-guard.ts",
+    entryPoints: ["src/worker.ts", "src/durable/worker.ts", "src/agents/write-guard.ts", "src/guards/sender-headers.ts",
       "src/agents/compact-control.ts", "src/agents/claude-cli.ts", "src/agents/veda-cli.ts",
       ...fs.readdirSync("src/worker").filter(name => name.endsWith(".ts")).map(name => `src/worker/${name}`)],
     outdir: path.join(root, "build"), outbase: "src", bundle: true, packages: "external",

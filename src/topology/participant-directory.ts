@@ -246,10 +246,18 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const participantKind = (value: unknown): FabricParticipantKind | undefined =>
-  value === "root" || value === "agent" || value === "actor" ? value : undefined;
+  value === "root" || value === "agent" || value === "actor" || value === "provider"
+    ? value
+    : undefined;
+
+// Inlined RUNNER_ID_PATTERN (src/agents/runner-registry.ts).
+const RUNNER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const isRunnerId = (value: unknown): value is string =>
+  typeof value === "string" && value.length <= 64 && RUNNER_ID_PATTERN.test(value);
 
 const transports = new Set([
   "host",
+  "hosted",
   "auto",
   "process",
   "tmux",
@@ -335,7 +343,9 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
       (typeof value.ownerIncarnation !== "string" || !value.ownerIncarnation.length || value.ownerIncarnation.length > 128)) ||
     typeof value.name !== "string" ||
     typeof value.status !== "string" ||
-    (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
+    (kind === "provider"
+      ? value.runner !== undefined || typeof value.provider !== "string"
+      : !isRunnerId(value.runner)) ||
     typeof value.transport !== "string" ||
     !transports.has(value.transport) ||
     !Array.isArray(value.capabilities) ||
@@ -478,7 +488,7 @@ const legacyActorFromEntry = (
   if (
     typeof value.id !== "string" ||
     typeof value.name !== "string" ||
-    (value.runner !== "pi" && value.runner !== "claude" && value.runner !== "veda") ||
+    !isRunnerId(value.runner) ||
     typeof value.status !== "string"
   ) {
     return undefined;
@@ -505,7 +515,7 @@ const legacyActorFromEntry = (
     transport: "host",
     capabilities: [
       ...(active ? (["steer", "followUp"] as const) : []),
-      ...(value.runner === "pi" ? (["fabric"] as const) : []),
+      ...(value.runner === "pi" || value.runner === "pi-durable" ? (["fabric"] as const) : []),
     ],
     startedAt: typeof value.createdAt === "number" ? value.createdAt : entry.updatedAt,
     updatedAt: entry.updatedAt,
@@ -637,6 +647,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #publicationRetrying: Promise<void> | undefined;
+  /** smarty-dev#8880: a publication retry's admission, awaited by #refresh after selection, right before the fence. */
+  #admitBeforeCommit: (() => Promise<void>) | undefined;
+  /** The admission #refresh is waiting for: an explicit refresh() that joins stops the wait (interrupt). */
+  #admitting: { interrupt: () => void; admitted: Promise<void> } | undefined;
+  /** The last admission started for a retry; #retryPublication awaits it, so close/quiesce drain it. */
+  #admitted: Promise<void> | undefined;
   #publicationRetryDelay = 750;
   /** When the last change-driven refresh started (the throttle's reference). */
   #changeRefreshAt = 0;
@@ -901,6 +917,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       ? publication.finally(() => this.#renewActors())
       : Promise.all([renewing, publication]).then(() => undefined);
     if (this.#refreshing) {
+      // smarty-dev#8880: an explicit refresh does not wait for a retry's admission window; the heartbeat
+      // timer never calls refresh() while a retry runs, so only an explicit caller gets here. Its try goes now.
+      this.#admitting?.interrupt();
       // A key waiter is still a live host. Do not turn this into a mesh-lock bypass:
       // confirmation remains gated on the shared write; shared-lock-only waits still lapse.
       if (this.#fileWork > 0 && this.options.enabled && !this.#quiescing) await this.#renewFileLease();
@@ -1066,11 +1085,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try {
       // The failed fence has fully unwound. A FIFO mesh ticket can now wait without
       // occupying either actor registry; admission is not itself a heartbeat receipt.
-      await this.options.waitForPublicationRetry!();
+      // Admission releases mesh BEFORE registries are taken, preserving #504/#531 and the registry -> mesh
+      // lock order. Without a prepared fence, #refresh runs inside the publication fence: admit first.
+      if (!this.options.preparePublicationFence) {
+        await this.options.waitForPublicationRetry!();
+        if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
+        await this.refresh();
+        return;
+      }
+      // smarty-dev#8880: with a prepared fence, selection runs outside every fence, so the admission is
+      // awaited inside #refresh, after selection and right before the fence: the short free window it opens
+      // goes to the fence and the mesh try, not to selection. No fence is held while it waits.
       if (this.#closed || this.#quiescing || !isMeshLockTimeout(this.#refreshError)) return;
-      // Release mesh BEFORE taking registries. Re-select every actor under fresh
-      // registry custody, preserving #504/#531 and the registry -> mesh lock order.
-      await this.refresh();
+      this.#admitBeforeCommit = this.options.waitForPublicationRetry!;
+      try { await this.refresh(); }
+      finally {
+        this.#admitBeforeCommit = undefined;
+        const admitted = this.#admitted; this.#admitted = undefined;
+        await admitted?.catch(() => undefined); // an interrupted admission still finishes inside this retry
+      }
     } catch (error) {
       if (!isMeshLockTimeout(error)) this.#refreshError = error;
       this.#backgroundRefresh.failure(error);
@@ -1909,7 +1942,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const desired = new Map<string, FabricParticipantRecord>();
     for (const source of this.#sources) {
       for (const candidate of source()) {
-        const { task: _task, text: _text, error: _error, ...operational } = candidate as
+        const {
+          task: _task,
+          text: _text,
+          error: _error,
+          ownerIncarnation: _incarnation,
+          ...operational
+        } = candidate as
           FabricParticipantRecord & { task?: unknown; text?: unknown; error?: unknown };
         const record: FabricParticipantRecord = {
           ...operational,
@@ -2340,6 +2379,24 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ids.size > 0 ? ids : undefined;
     })();
+    // smarty-dev#8880: a publication retry waits for its admission here, after selection, so only the
+    // registry fences stand between the free mesh window and the 50 ms try. The decision stays under the
+    // fence: validPublication (registry generations captured before selection) and the commit's CAS
+    // refuse anything the wait changed, and a changed preparation re-selects without a second wait.
+    // ponytail: the selected source timestamps are at most one admission wait old; host lease expiry
+    // is still computed at commit (leaseAt).
+    const admit = validPublication && this.options.withPublicationFence ? this.#admitBeforeCommit : undefined;
+    if (admit) {
+      this.#admitBeforeCommit = undefined;
+      let interrupt!: () => void;
+      const interrupted = new Promise<void>(resolve => { interrupt = resolve; });
+      const admitted = admit();
+      this.#admitted = admitted;
+      this.#admitting = { interrupt, admitted };
+      try { await Promise.race([admitted, interrupted]); }
+      finally { this.#admitting = undefined; }
+      if (this.#closed) return false;
+    }
     const committed = validPublication && this.options.withPublicationFence
       ? await this.options.withPublicationFence(commitPrepared, fencedActors) : await commitPrepared();
     // The shared receipt already committed. Copies recheck that exact receipt

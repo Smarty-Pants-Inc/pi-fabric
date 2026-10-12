@@ -9,7 +9,7 @@ const hostPackage = "@earendil-works/pi-coding-agent";
 const entries = [
   "ui/dashboard.js", "ui/model-picker.js", "ui/settings.js", "ui/shell-tasks.js",
   "ui/conversation.js", "ui/conversation-host.js", "ui/conversation-targets.js",
-  "ui/conversation-chrome.js", "ui/conversation-native-reader.js",
+  "ui/conversation-chrome.js", "ui/conversation-native-reader.js", "ui/image-overlays.js",
 ].map((file) => join(dist, file));
 const missing = entries.filter((file) => !existsSync(file));
 if (missing.length > 0) {

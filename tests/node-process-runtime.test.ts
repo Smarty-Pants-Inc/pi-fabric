@@ -123,6 +123,12 @@ describe("NodeProcessRuntime", () => {
     expect(result).toMatchObject({terminationReason:"completed", value:{ref:"records.read", args:{after:3}}});
   });
 
+  it("routes the thinking primitive through the shared guest setup", async () => {
+    const result = await new NodeProcessRuntime().execute('return thinking.status();',
+      async (ref, args) => ({ref, args}), options);
+    expect(result).toMatchObject({terminationReason:"completed", value:{ref:"thinking.status", args:{}}});
+  });
+
   it("routes the cache primitive through the shared guest setup", async () => {
     const result = await new NodeProcessRuntime().execute('return cache.status({target:"self"});',
       async (ref, args) => ({ref, args}), options);
@@ -277,19 +283,23 @@ return { texts, walk };
     expect(result.value).toBe(1);
   });
 
-  it("waits for issued host calls before completing", async () => {
+  it("cancels unawaited host calls on successful completion", async () => {
     let settled = false;
+    let cancelled = false;
     const result = await new NodeProcessRuntime().execute(
       'void tools.call({ ref: "demo.background" }); return "done";',
-      async () => {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        settled = true;
+      async (_ref, _args, signal) => {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => { settled = true; resolve(); }, 1_000);
+          signal.addEventListener("abort", () => { cancelled = true; clearTimeout(timer); reject(signal.reason); }, { once: true });
+        });
       },
       options,
     );
 
     expect(result.value).toBe("done");
-    expect(settled).toBe(true);
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(true);
   });
 
   it("does not wait for a non-cooperative sibling host call after guest failure", async () => {
@@ -421,19 +431,23 @@ return { models, process: typeof process };
     expect(result.value).toBe(content);
   });
 
-  it("waits for issued host calls before completing", async () => {
+  it("cancels unawaited host calls on successful completion", async () => {
     let settled = false;
+    let cancelled = false;
     const result = await new BunProcessRuntime().execute(
       'void tools.call({ ref: "demo.background" }); return "done";',
-      async () => {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-        settled = true;
+      async (_ref, _args, signal) => {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => { settled = true; resolve(); }, 1_000);
+          signal.addEventListener("abort", () => { cancelled = true; clearTimeout(timer); reject(signal.reason); }, { once: true });
+        });
       },
       options,
     );
 
     expect(result.value).toBe("done");
-    expect(settled).toBe(true);
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(true);
   });
 
   it("forcibly terminates synchronous infinite loops", async () => {

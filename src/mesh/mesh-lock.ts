@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -231,7 +232,15 @@ export class MeshLock {
     const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     const ownerRecord = `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
+    // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
+    // reclaimed, remove its successor's lock. Before a pin exists, and off Linux, the release is main's below.
+    let pin: number | undefined;
     const releaseOwned = (): void => {
+      const held = pin;
+      pin = undefined;
+      if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
+      // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
       try {
         if (fs.readFileSync(ownerPath, "utf8") === ownerRecord) {
           // Detach the complete owned directory before unlinking anything inside it.
@@ -328,6 +337,19 @@ export class MeshLock {
           if (ticket.queued) await ticket.wait(Math.min(10, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
           else await delay(retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()), this.#writeAbortSignal);
         }
+      }
+      pin = pinFenceLock(this.#lockPath, ownerRecord);
+      // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
+      // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
+      // /proc/self/fd/<fd>/owner. If `<lock>/owner` is still OUR record we hold the lock we just created (no
+      // successor can acquire while it is there): release it by name (main's release) and fail retryably; never
+      // run the section unpinned on Linux. Not ours: reclaimed before entry, so release nothing.
+      if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux")) {
+        pin = undefined;
+        let ours = false;
+        try { ours = fs.readFileSync(ownerPath, "utf8") === ownerRecord; } catch { /* unreadable: not provably ours */ }
+        if (ours) releaseOwned();
+        throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
       }
       if (timed) lockHeldAt = performance.now();
       try {

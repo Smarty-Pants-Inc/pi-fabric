@@ -227,6 +227,12 @@ describe.skipIf(!hasPython)("CPythonRuntime", { timeout: HANG_GUARD_MS + 30_000 
     });
   });
 
+  it("routes the thinking primitive through the same host bridge", async () => {
+    expect(await run('return await thinking.set(level="high", scope="turn")')).toMatchObject({
+      terminationReason: "completed", value: { ref: "thinking.set", args: { level: "high", scope: "turn" } },
+    });
+  });
+
   it("supports async bodies, native stdlib, dictionary results and fresh invocations", async () => {
     const runtime = new CPythonRuntime(binary);
     const result = await runtime.execute('import json\nlocal = 12\nreturn {"items": json.loads("[1,2]"), "call": await schema.status()}', echo, options);

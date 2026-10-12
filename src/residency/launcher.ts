@@ -22,6 +22,7 @@ import {
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import { ownedStat } from "../storage/scratch.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { pruneResidentGenerations, writeResidentGenerationExit } from "./generation-exit.js";
 import type { FabricHostLease } from "../topology/host-leases.js";
 
 const NODE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
@@ -60,6 +61,8 @@ interface Attempt {
   native: ResidentChildLifetime;
   stop?: Promise<void>;
   seenOwner: boolean;
+  /** The generation this child owned (its owner.json), for its exit record (smarty-dev#7950). */
+  generation?: Pick<ResidentHostOwner, "token" | "hostId" | "pid" | "processStartTime">;
   claimedOwner: boolean;
   closingInput: boolean;
   processes: Map<number, OwnedProcess>;
@@ -320,13 +323,23 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     });
     const logFile = path.join(root, plan ? `child-${plan.id}-${kind}.log` : "child-stderr.log");
     pruneResidentChildLogs(root, logFile);
+    pruneResidentGenerations(root);
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child),
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, error); });
     void attempt.native.exit.then(({ code, signal }) => {
-      // #2010: after a clean owned release this directory may already belong
-      // to the next generation. Do not make a late diagnostic mutation there.
-      if (!attempt.seenOwner || code !== 0 || signal) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
+      // #2010: after an owned child exits this directory may already belong to the next generation: never append to
+      // its launcher.log. smarty-dev#7950: the exit goes to the child's own generation record instead, created once
+      // (O_EXCL) and only if the host did not write its own reason first. A kill before the next observe() poll is
+      // still caught: owner.json then still names this exact child (pid and birth); a successor's never does.
+      const owner = attempt.generation ? undefined : readOwner();
+      const birth = attempt.processes.get(child.pid!)?.processStartTime;
+      if (owner && owner.pid === child.pid && (!birth || !owner.processStartTime || owner.processStartTime === birth)) attempt.generation = owner;
+      if (attempt.generation) {
+        const { token, hostId, pid, processStartTime: start } = attempt.generation;
+        writeResidentGenerationExit(root, { generation: token, reason: "unreported", writer: "launcher", hostId, pid,
+          ...(start ? { processStartTime: start } : {}), code, signal });
+      } else if (!attempt.seenOwner) trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: false });
     });
     child.once("spawn", () => {
       const birth = child.pid ? processStartTime(child.pid) : undefined;
@@ -345,6 +358,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
+    if (owner && live === attempt.child.pid && !attempt.generation) attempt.generation = owner;
     if (observation.closeInput && !attempt.closingInput) { attempt.closingInput = true; attempt.child.stdin?.end(); }
   };
   const assertFenceFree = async (inode: fs.Stats): Promise<void> => {

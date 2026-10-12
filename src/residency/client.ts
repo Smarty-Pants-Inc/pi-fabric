@@ -27,6 +27,7 @@ import {
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
+import { residentGenerationRecords } from "./generation-exit.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
@@ -375,6 +376,15 @@ export class ResidencyClient {
         return owner;
       }
       const failure = readJson<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(this.#errorPath);
+      // smarty-dev#7950: a host that failed after it claimed the root writes its own generation's error.json; only
+      // this launcher's child counts (pid and birth), never an older generation's record.
+      const hostFailure = residentGenerationRecords<{ error?: unknown; launcherPid?: number; launcherBirth?: string }>(
+        this.options.config.residencyRoot, "error.json", 3).map(entry => entry.record)
+        .find(record => record?.launcherPid === launcher.pid && record.launcherBirth === launcherBirth);
+      if (typeof hostFailure?.error === "string") {
+        await this.#stopStartingLauncher();
+        throw new Error(`Fabric resident host failed to start: ${hostFailure.error}`);
+      }
       // An exiting prior launcher can race this start after error.json was
       // cleared. Its root diagnostic is not evidence about our owned attempt.
       if (typeof failure?.error === "string" && (failure.launcherPid === undefined ||
@@ -405,9 +415,16 @@ export class ResidencyClient {
     const childOutput = readIfPresent("child-stderr.log");
     const launcherLog = readIfPresent("launcher.log").split("\n").slice(-6).join("\n");
     const ownerState = readIfPresent("owner.json").slice(0, 300);
+    // smarty-dev#7950: an owned child's exit (and the host's own failure) is in its generation's records, not in
+    // launcher.log: the newest of each, so a quiet crash after the claim is diagnosable from the error alone.
+    const newest = (name: "exit.json" | "error.json"): string =>
+      residentGenerationRecords(this.options.config.residencyRoot, name)[0]?.text.slice(0, 400) ?? "";
+    const generationExit = newest("exit.json"), generationError = newest("error.json");
     const diagnostics = [
       childOutput ? `Child output: ${childOutput.slice(-500)}` : "",
       launcherLog ? `Launcher log: ${launcherLog}` : "",
+      generationExit ? `Last generation exit: ${generationExit}` : "",
+      generationError ? `Last generation error: ${generationError}` : "",
       ownerState ? `Owner state: ${ownerState}` : "Owner state: absent",
     ].filter(Boolean).join(" | ");
     throw new Error(`${launcherExited ? "Launcher exited while starting" : `Timed out after ${budget}ms starting`} Fabric resident host ${this.hostId}. ${diagnostics}`);

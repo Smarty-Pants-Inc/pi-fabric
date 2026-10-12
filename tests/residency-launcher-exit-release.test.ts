@@ -1,11 +1,12 @@
 import fs from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentManager } from "../src/agents/manager.js";
-import { reportResidentExit, runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { residentGenerationRecords } from "../src/residency/generation-exit.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
 const waitFor = async (predicate: () => boolean, boundMs: number): Promise<void> => {
@@ -23,12 +24,9 @@ const snapshot = (directory: string, files = new Map<string, string>()): Map<str
   }
   return files;
 };
-const exitLines = (residencyRoot: string): Array<Record<string, unknown>> => {
-  try {
-    return fs.readFileSync(path.join(residencyRoot, "launcher.log"), "utf8").trim().split("\n").filter(Boolean)
-      .map(line => JSON.parse(line) as Record<string, unknown>).filter(row => row.event === "resident-exit");
-  } catch { return []; }
-};
+/** smarty-dev#7950: the host's exit is its generation's exit record (no longer a launcher.log line). */
+const exitLines = (residencyRoot: string): Array<Record<string, unknown>> =>
+  residentGenerationRecords<Record<string, unknown>>(residencyRoot, "exit.json", 10).map(entry => entry.record ?? {});
 afterEach(() => { vi.restoreAllMocks(); });
 
 const harness = (name: string) => {
@@ -61,11 +59,10 @@ const harness = (name: string) => {
 };
 
 // smarty-dev#7770: a clean idle exit must not look like an outside kill. The
-// host names it in launcher.log itself, synchronously, while it owns the root.
-// ponytail: Windows has no O_NOFOLLOW/O_NONBLOCK, so the host skips the line there
-// by design (fail closed); a Windows-safe open is cut to smarty-dev#7950.
+// host names it itself, synchronously, while it owns the root: since smarty-dev#7950
+// in its generation's exit record (O_EXCL), on every platform.
 const posix = process.platform !== "win32";
-it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written before owner.json is removed", { timeout: 60_000 }, async () => {
+it("an idle exit leaves one idle-exit record of the host, written before owner.json is removed", { timeout: 60_000 }, async () => {
   const h = harness("idle");
   try {
     const run = runResidentHostFromConfigPath(h.configPath);
@@ -74,26 +71,12 @@ it.skipIf(!posix)("an idle exit leaves one resident-exit idle-exit line, written
     const now = Date.now.bind(Date);
     vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
     await run;
-    expect(h.atRelease.lines).toEqual([expect.objectContaining({ event: "resident-exit", reason: "idle-exit", pid: process.pid })]);
+    expect(h.atRelease.lines).toEqual([expect.objectContaining({ reason: "idle-exit", writer: "host", pid: process.pid })]);
     expect(exitLines(h.residencyRoot)).toHaveLength(1);
     expect(h.late()).toEqual([]);
-  } finally {
-    vi.restoreAllMocks();
-    fs.rmSync(h.root, { recursive: true, force: true });
-  }
-});
-
-it.skipIf(posix)("win32: an idle exit writes no exit line (no O_NOFOLLOW) and the release proceeds", { timeout: 60_000 }, async () => {
-  const h = harness("idle-win32");
-  try {
-    const run = runResidentHostFromConfigPath(h.configPath);
-    await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
-    const now = Date.now.bind(Date);
-    vi.spyOn(Date, "now").mockImplementation(() => now() + 60_000);
-    await run;
-    expect(h.atRelease.lines).toEqual([]);
-    expect(exitLines(h.residencyRoot)).toEqual([]);
-    expect(fs.existsSync(h.ownerPath)).toBe(false);
+    // Nothing of it in the shared launcher.log any more.
+    expect(fs.existsSync(path.join(h.residencyRoot, "launcher.log")) ? fs.readFileSync(path.join(h.residencyRoot, "launcher.log"), "utf8") : "")
+      .not.toContain("resident-exit");
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
@@ -112,12 +95,13 @@ it("a failure from close() after the release writes no exit line after the relea
     await waitFor(() => fs.existsSync(h.ownerPath), 30_000);
     controller.abort();
     await expect(run).rejects.toThrow("injected teardown failure");
-    // The line is POSIX-only (see `posix`); on win32 nothing is written.
-    const expected = posix ? [expect.objectContaining({ event: "resident-exit", reason: "stopped" })] : [];
+    const expected = [expect.objectContaining({ reason: "stopped", writer: "host" })];
     expect(h.atRelease.lines).toEqual(expected);
     expect(exitLines(h.residencyRoot)).toEqual(expected);
-    // Only main's own error.json write may follow the release; never launcher.log.
-    expect(h.late().filter(file => path.basename(file) !== "error.json")).toEqual([]);
+    // After the release only this generation's own error record may appear: never a shared root file.
+    expect(h.late().filter(file => !file.includes(`${path.sep}generations${path.sep}`))).toEqual([]);
+    expect(fs.existsSync(path.join(h.residencyRoot, "error.json"))).toBe(false);
+    expect(residentGenerationRecords<{ error: string }>(h.residencyRoot, "error.json")[0]?.record?.error).toBe("injected teardown failure");
   } finally {
     vi.restoreAllMocks();
     fs.rmSync(h.root, { recursive: true, force: true });
@@ -151,6 +135,9 @@ it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as
       await expect(run).resolves.toBeUndefined(); // Already running: a silent return, as on main.
     }
     for (const [file, bytes] of Object.entries(files)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    // smarty-dev#7950: and nothing new in the root: no error.json, no generation of its own.
+    expect(fs.existsSync(path.join(h.residencyRoot, "error.json"))).toBe(false);
+    expect(fs.existsSync(path.join(h.residencyRoot, "generations"))).toBe(false);
   } finally {
     if (previous === undefined) delete process.env.PI_FABRIC_RESIDENT_LAUNCHER; else process.env.PI_FABRIC_RESIDENT_LAUNCHER = previous;
     holder?.kill("SIGKILL");
@@ -159,107 +146,13 @@ it.each(posix ? ["launch-context", "lock-busy"] as const : ["launch-context"] as
   }
 });
 
-// Platform-neutral: a missing flag fails closed (on win32 both are missing).
-it.each(["O_NOFOLLOW", "O_NONBLOCK"] as const)("skips the write without %s (fail closed)", flag => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-exit-file-"));
-  try {
-    const constants: Partial<typeof fs.constants> = { ...fs.constants };
-    delete constants[flag];
-    reportResidentExit(root, "idle-exit", undefined, constants);
-    expect(fs.existsSync(path.join(root, "launcher.log"))).toBe(false);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-describe.skipIf(!posix)("resident-exit line file safety (POSIX: FIFO, symlink, mode)", () => {
-  const dir = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "resident-exit-file-"));
-
-  it("returns at once and writes nothing when launcher.log is a FIFO with no reader", { timeout: 15_000 }, async () => {
-    const root = dir();
-    const log = path.join(root, "launcher.log");
-    execFileSync("mkfifo", [log]);
-    // Safety net: a regression would block the open; a late reader unblocks it so the test fails on time.
-    const rescue = spawn("sh", ["-c", `sleep 3; cat '${log}' > '${path.join(root, "drained")}'`], { stdio: "ignore" });
-    try {
-      const started = Date.now();
-      reportResidentExit(root, "idle-exit");
-      expect(Date.now() - started).toBeLessThan(1_000);
-      expect(fs.lstatSync(log).isFIFO()).toBe(true);
-    } finally {
-      rescue.kill("SIGKILL");
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a FIFO launcher.log that has a reader, writing nothing", { timeout: 15_000 }, async () => {
-    const root = dir();
-    const log = path.join(root, "launcher.log"), drained = path.join(root, "drained");
-    execFileSync("mkfifo", [log]);
-    const reader = spawn("sh", ["-c", `cat '${log}' > '${drained}'`], { stdio: "ignore" });
-    try {
-      await new Promise(resolve => setTimeout(resolve, 300)); // reader is blocked in open
-      reportResidentExit(root, "idle-exit");
-      await new Promise<void>(resolve => { reader.once("exit", () => resolve()); setTimeout(() => { reader.kill("SIGKILL"); }, 2_000); });
-      expect(fs.readFileSync(drained, "utf8")).toBe("");
-    } finally {
-      reader.kill("SIGKILL");
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("writes nothing and reports on stderr when owned() fails at the open", () => {
-    const root = dir();
-    const lines: string[] = [];
-    const write = process.stderr.write.bind(process.stderr);
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
-      lines.push(String(chunk));
-      return write(chunk, ...rest);
-    }) as typeof process.stderr.write);
-    try {
-      reportResidentExit(root, "idle-exit", () => false);
-      expect(fs.existsSync(path.join(root, "launcher.log"))).toBe(false);
-      expect(lines.join("")).toContain("Fabric resident host exit (idle-exit) without a proven root fence");
-    } finally { vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
-  });
-
-  it("does not follow a symlinked launcher.log", () => {
-    const root = dir();
-    try {
-      const target = path.join(root, "elsewhere.log");
-      fs.writeFileSync(target, "");
-      fs.symlinkSync(target, path.join(root, "launcher.log"));
-      reportResidentExit(root, "idle-exit");
-      expect(fs.readFileSync(target, "utf8")).toBe("");
-      expect(fs.lstatSync(path.join(root, "launcher.log")).isSymbolicLink()).toBe(true);
-    } finally { fs.rmSync(root, { recursive: true, force: true }); }
-  });
-
-  it("tightens an existing 0644 launcher.log to 0600 and appends one line", () => {
-    const root = dir();
-    try {
-      const log = path.join(root, "launcher.log");
-      fs.writeFileSync(log, `${JSON.stringify({ event: "launcher-started" })}\n`);
-      fs.chmodSync(log, 0o644);
-      reportResidentExit(root, "stopped");
-      expect(fs.statSync(log).mode & 0o777).toBe(0o600);
-      const lines = fs.readFileSync(log, "utf8").trim().split("\n");
-      expect(lines).toHaveLength(2);
-      expect(JSON.parse(lines[1]!)).toMatchObject({ event: "resident-exit", reason: "stopped", pid: process.pid });
-    } finally { fs.rmSync(root, { recursive: true, force: true }); }
-  });
-});
+// The record's file safety (O_EXCL: no symlink follow, no FIFO block, once per generation) is in
+// tests/residency-generation-exit.test.ts (smarty-dev#7950).
 
 // host.lock replaced after this host locked its old inode: the old fd is no
-// fence. beforeRelease must not write the successor's launcher.log.
+// fence. Its exit and error records go to its own generation only (smarty-dev#7950),
+// so the successor's files stay byte-identical with no fence check at all.
 describe.skipIf(!posix)("resident exit without a proven fence", () => {
-  const captureStderr = (): string[] => {
-    const lines: string[] = [];
-    const write = process.stderr.write.bind(process.stderr);
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
-      lines.push(String(chunk));
-      return write(chunk, ...rest);
-    }) as typeof process.stderr.write);
-    return lines;
-  };
   const successor = (residencyRoot: string, ownerPath: string, withOwner: boolean): Record<string, string> => {
     // A new host.lock inode, as a successor generation would establish.
     const replacement = path.join(residencyRoot, "host.lock.next");
@@ -275,7 +168,6 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
 
   it("a startup failure after host.lock is replaced leaves the successor's files byte-identical", { timeout: 60_000 }, async () => {
     const h = harness("replaced-start");
-    const stderr = captureStderr();
     let files: Record<string, string> | undefined;
     const mkdirSync = fs.mkdirSync;
     vi.spyOn(fs, "mkdirSync").mockImplementation(((dir: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
@@ -289,16 +181,15 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
       await expect(runResidentHostFromConfigPath(h.configPath)).rejects.toThrow("injected start failure");
       expect(files).toBeDefined();
       for (const [file, bytes] of Object.entries(files!)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
-      expect(stderr.join("")).toContain("Fabric resident host exit (error) without a proven root fence");
+      expect(fs.existsSync(path.join(h.residencyRoot, "error.json"))).toBe(false);
     } finally {
       vi.restoreAllMocks();
       fs.rmSync(h.root, { recursive: true, force: true });
     }
   });
 
-  it("a stop after host.lock is replaced writes no exit line, even with its own owner.json", { timeout: 60_000 }, async () => {
+  it("a stop after host.lock is replaced leaves the successor's files byte-identical; its exit goes to its own generation", { timeout: 60_000 }, async () => {
     const h = harness("replaced-stop");
-    const stderr = captureStderr();
     const controller = new AbortController();
     try {
       const run = runResidentHostFromConfigPath(h.configPath, controller.signal);
@@ -307,7 +198,7 @@ describe.skipIf(!posix)("resident exit without a proven fence", () => {
       controller.abort();
       await run;
       for (const [file, bytes] of Object.entries(files)) expect(fs.readFileSync(file, "utf8")).toBe(bytes);
-      expect(stderr.join("")).toContain("Fabric resident host exit (stopped) without a proven root fence");
+      expect(exitLines(h.residencyRoot)).toEqual([expect.objectContaining({ reason: "stopped", writer: "host" })]);
     } finally {
       vi.restoreAllMocks();
       fs.rmSync(h.root, { recursive: true, force: true });

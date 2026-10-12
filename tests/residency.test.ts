@@ -52,6 +52,7 @@ import type { FabricActorMessage } from "../src/actors/types.js";
 import { newResidentRequestId, RESIDENT_EXPIRING_COMMAND_FORMAT } from "../src/residency/request-expiry.js";
 import { pathToFileURL } from "node:url";
 import { stopAllOwned } from "./helpers/owned-processes.js";
+import { createResidentGeneration, writeResidentGenerationError, writeResidentGenerationExit } from "../src/residency/generation-exit.js";
 
 const repo = process.cwd();
 const hostPath = path.resolve("dist/residency/launcher.js");
@@ -340,6 +341,31 @@ describe.skipIf(process.platform === "win32")("resident host start timeout", () 
       const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
       // SIGTERM went to the whole group before the rejection; wait for both exits.
       await waitFor(() => !alive(launcher) && !alive(child), 30_000);
+    } finally {
+      await client.close();
+      await state.participants.close();
+    }
+  });
+
+  // smarty-dev#7950: an owned child's quiet crash is no longer a launcher.log line but its generation's exit record;
+  // the start error still carries it (and the host's own error record), so the failure is diagnosable from it alone.
+  it("names the last generation's exit and error records in the start error", async () => {
+    const state = await rootHarness("resident-start-generation");
+    const root = state.config.residencyRoot;
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    createResidentGeneration(root, "previous-generation-0001");
+    writeResidentGenerationExit(root, { generation: "previous-generation-0001", reason: "unreported", writer: "launcher", pid: 4242, code: null, signal: "SIGKILL" });
+    writeResidentGenerationError(root, { generation: "previous-generation-0001", error: "previous host failed to restore", occurredAt: Date.now() });
+    const client = new ResidencyClient({
+      config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent,
+      hostPath: path.resolve("tests/fixtures/stalled-launcher.mjs"), startupTimeoutMs: 300,
+    });
+    try {
+      const failure = String(await client.ensureHost().catch(error => error));
+      expect(failure).toMatch(/Timed out after \d+ms starting Fabric resident host/);
+      expect(failure).toMatch(/Last generation exit: .*"generation":"previous-generation-0001".*"signal":"SIGKILL"/);
+      expect(failure).toContain("Last generation error: ");
+      expect(failure).toContain("previous host failed to restore");
     } finally {
       await client.close();
       await state.participants.close();

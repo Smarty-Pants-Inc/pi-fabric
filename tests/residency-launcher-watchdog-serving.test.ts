@@ -16,6 +16,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { liveControlOwnerIncarnation } from "./helpers/live-control-owner.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { launchLog, same } from "./helpers/owned-processes.js";
+import { residentGenerationRecords } from "../src/residency/generation-exit.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const live = (pid: number): boolean => {
@@ -177,7 +178,9 @@ if(process.argv.includes(${JSON.stringify(path.resolve("dist/residency/pi-entry.
       expect(fs.readFileSync(path.join(config.residencyRoot, "maintenance-ready.json"), "utf8"), "delayed child must not publish readiness").toBe(readyBefore);
       expect(inferences, "delayed child must not replay acknowledged work").toBe(1);
       expect(JSON.parse(fs.readFileSync(ownerFile, "utf8")).token).toBe(owner.token);
-      const refusal = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "error.json"), "utf8"));
+      // smarty-dev#7950: the refusal under the fence is the delayed host's own generation error record.
+      const refusal = residentGenerationRecords<{ error: string; launcherPid?: number }>(config.residencyRoot, "error.json", 10)
+        .map(entry => entry.record).find(record => record?.launcherPid === delayed.pid)!;
       expect(refusal.error).toContain("watchdog custody");
       expect(refusal.launcherPid).toBe(delayed.pid);
       expect(fs.existsSync(path.join(config.residencyRoot, "watchdog-custody.json"))).toBe(true);

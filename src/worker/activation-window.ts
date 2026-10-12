@@ -88,6 +88,8 @@ export class ActivationWindow {
   }
 }
 
+const RESPONSES = new Set(["openai-responses", "azure-openai-responses", "openai-codex-responses"]);
+
 // ponytail: Pi catches extension exceptions and continues with the old context.
 // A synchronous exit of this disposable child is the fail-closed boundary, not
 // throw/abort/shutdown (which can leave a request or automatic retry runnable).
@@ -143,7 +145,10 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     }
     // Bun source workers use native package imports (no Jiti root alias) and
     // do not yet implement findPackageJSON; Node hosts take the bound path above.
-    const { estimateTextTokens } = await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
+    const { calculateContextTokens, estimateMessageTokens, estimateTextTokens } =
+      await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
+    const content = (messages: Parameters<typeof estimateMessageTokens>[0][]): number =>
+      messages.reduce((tokens, message) => message.role === "system" ? tokens : tokens + estimateMessageTokens(message), 0);
     pi.on("session_start", (_event, ctx) => {
       try {
         const hook = fs.realpathSync(fileURLToPath(import.meta.url));
@@ -194,14 +199,32 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
       for (const restore of guarded.values()) restore();
       guarded.clear();
     });
-    let lastPayload: { tokens: number; contextWindow: number; overheadTokens: number } | undefined;
+    // wireTokens: the admitted wire estimate (qualified opaque reasoning excluded). reportedTokens: the
+    // provider usage of exactly this dispatch, bound to its provider/model/api (not its window).
+    let lastPayload: { tokens: number; wireTokens: number; modelKey: string; reportedTokens?: number | undefined;
+      contextWindow: number; overheadTokens: number } | undefined;
+    let admissions = 0;
     pi.on("turn_end", async event => {
       try {
-        if (!window || !lastPayload || !event.toolResults.length) return;
-        // Measure the actual last dispatched payload plus this completed batch,
-        // not usage from before the tools or a carried journal's token count.
-        const completedBatch = convertToLlm([event.message, ...event.toolResults]);
-        const nextTokens = lastPayload.tokens + estimateTextTokens(JSON.stringify(completedBatch));
+        // A side request admitted in the same turn makes the response/dispatch pairing ambiguous.
+        const single = admissions === 1;
+        admissions = 0;
+        if (!window || !lastPayload) return;
+        const message = event.message;
+        if (single && message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted" &&
+            JSON.stringify([message.provider, message.model, message.api]) === lastPayload.modelKey) {
+          const { input, output, cacheRead, cacheWrite } = message.usage ?? {};
+          const parts = [input, output, cacheRead, cacheWrite];
+          const reported = parts.every(n => typeof n === "number" && Number.isFinite(n) && n >= 0)
+            ? Math.max(calculateContextTokens(message.usage), input! + output! + cacheRead! + cacheWrite!) : 0;
+          if (Number.isFinite(reported) && reported > 0) lastPayload.reportedTokens = reported;
+        }
+        if (!event.toolResults.length) return;
+        // Usage already includes this response's output; otherwise the last admitted estimate plus
+        // its content. Wire content only: no signatures or tool details (never sent).
+        const nextTokens = lastPayload.reportedTokens !== undefined
+          ? lastPayload.reportedTokens + content(convertToLlm(event.toolResults))
+          : lastPayload.tokens + content(convertToLlm([event.message, ...event.toolResults]));
         if (nextTokens < lastPayload.contextWindow * 0.8) return;
         // Stable package-local first-use edge; idle activation registration stays cheap.
         const { compactActivationTools } = await import("./activation-compaction.js");
@@ -210,7 +233,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         window.project(event.context.contextMessages.filter(message => !isSystem(message)));
         let plan = compactActivationTools(event);
         const retained = plan?.messages ?? event.context.contextMessages.filter(message => !isSystem(message));
-        const projectedTokens = lastPayload.overheadTokens + estimateTextTokens(JSON.stringify(convertToLlm(retained))) +
+        const projectedTokens = lastPayload.overheadTokens + content(convertToLlm(retained)) +
           estimateTextTokens(plan?.summary ?? "");
         // Prefer preserving the latest batch. Only compact it when the bounded
         // older history still cannot fit; keep every raw output in the journal.
@@ -286,8 +309,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
               data = parameters;
             }
             // Estimate all context-bearing data: system/messages, tool schemas,
-            // and API-specific fields, with no stale assistant-usage shortcut.
-            // JSON framing is conservative; unknown non-JSON data fails closed.
+            // and API-specific fields. JSON framing is conservative; unknown
+            // non-JSON data fails closed.
             const encoded = JSON.stringify(data, (_key, value: unknown) => {
               if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" ||
                   (typeof value === "number" && !Number.isFinite(value)) ||
@@ -302,13 +325,26 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (!admitted || typeof admitted !== "object" || Array.isArray(admitted)) {
               throw new Error("Activation window requires a JSON provider request object");
             }
-            const tokens = estimateTextTokens(encoded);
+            // Estimate only; the admitted snapshot below still dispatches every byte. Qualified Responses
+            // APIs replay opaque reasoning as direct input[] items, billed by provider usage (anchored
+            // below), not characters. No other field, even one named encrypted_content, is exempt.
+            const input = RESPONSES.has(model.api) ? (admitted as { input?: unknown }).input : undefined;
+            const wireTokens = estimateTextTokens(!Array.isArray(input) ? encoded : JSON.stringify({ ...admitted, input:
+              input.map((item: Record<string, unknown> | null) => item && typeof item === "object" && !Array.isArray(item) &&
+                item.type === "reasoning" && typeof item.encrypted_content === "string" ? { ...item, encrypted_content: "" } : item) }));
+            // The last same-model report plus all growth since its dispatch (new content, callback or prefix
+            // expansions anywhere). Shrinks earn no credit; without a matching report, the wire estimate.
+            const modelKey = JSON.stringify([model.provider, model.id, model.api]);
+            const anchor = lastPayload?.modelKey === modelKey ? lastPayload : undefined;
+            const tokens = anchor?.reportedTokens === undefined ? wireTokens
+              : Math.max(wireTokens, anchor.reportedTokens + Math.max(0, wireTokens - anchor.wireTokens));
             if (tokens > model.contextWindow) {
               reportWindowRefusal(tokens, model.contextWindow);
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
-            const conversationTokens = estimateTextTokens(JSON.stringify(context.messages.filter(message => message.role !== "system")));
-            lastPayload = { tokens, contextWindow: model.contextWindow, overheadTokens: Math.max(0, tokens - conversationTokens) };
+            admissions++;
+            lastPayload = { tokens, wireTokens, modelKey, contextWindow: model.contextWindow,
+              overheadTokens: Math.max(0, wireTokens - content(context.messages)) };
             // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
             if (!google) return admitted;

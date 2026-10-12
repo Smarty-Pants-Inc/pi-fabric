@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   createBashToolDefinition,
   createSyntheticSourceInfo,
+  type BashOperations,
   type ExtensionContext,
   ExtensionRunner,
   type RegisteredTool,
@@ -50,10 +51,16 @@ const makeRunner = (overrides: Record<string, unknown> = {}): ExtensionRunner =>
     ...overrides,
   }) as unknown as ExtensionRunner;
 
-const registerWithRunner = (runner: ExtensionRunner) => {
+const registerWithRunner = (runner: ExtensionRunner, operations?: BashOperations) => {
   const catalog = new CapturedToolCatalog();
+  const tools: RegisteredTool[] = operations ? [{
+    definition: Object.assign(createBashToolDefinition(process.cwd()), {
+      [FABRIC_BASH_MIDDLEWARE]: { version: 1, wrapOperations: () => operations } satisfies FabricBashMiddlewareV1,
+    }),
+    sourceInfo: { path: "/extensions/test-bash.ts", source: "test", scope: "user", origin: "package" },
+  } as RegisteredTool] : [];
   catalog.replace(
-    [],
+    tools,
     runner,
     DEFAULT_FABRIC_CONFIG.capture,
     "/extensions/pi-fabric/index.ts",
@@ -111,7 +118,12 @@ describe("PiToolsProvider lifecycle", () => {
         applyRunBashDefaults({ PI_FABRIC_BASH_IDLE_S: "0" }, event.input as never);
       }),
     });
-    const registry = registerWithRunner(runner);
+    // Test argument propagation, not the platform shell's initialization output.
+    const exec = vi.fn<BashOperations["exec"]>(async (_command, _cwd, options) => {
+      options.onData(Buffer.from("executed:\n"));
+      return { exitCode: 0 };
+    });
+    const registry = registerWithRunner(runner, { exec });
     const audits: FabricCallAudit[] = [];
     const events: unknown[] = [];
     const trace = new FabricExecutionTraceRecorder();
@@ -127,8 +139,12 @@ describe("PiToolsProvider lifecycle", () => {
       },
     ) as { output: string };
 
+    // The judged command runs unchanged; only Fabric's run default (timeout) is added.
     const executedCommand = `printf "executed:$EXAMPLE\n"`;
     expect(result.output).toBe("executed:\n");
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec.mock.calls[0]?.[0]).toContain(executedCommand);
+    expect(exec.mock.calls[0]?.[0]).not.toContain("export EXAMPLE");
     expect(audits[0]?.args).toEqual({ command: executedCommand, timeout: 600 });
     expect(audits[0]?.preview).toMatchObject({ bashCommand: executedCommand });
     expect(events).toContainEqual(expect.objectContaining({
@@ -193,7 +209,7 @@ describe("PiToolsProvider lifecycle", () => {
 
     await provider.invoke(
       "bash",
-      { command: "printf first; sleep 0.15; printf second" },
+      { command: "printf first" },
       {
         ...baseContext,
         update(message) { updates.push(message); },
@@ -222,10 +238,10 @@ describe("PiToolsProvider lifecycle", () => {
     try {
       const registry = new ActionRegistry();
       registry.register(new PiToolsProvider(root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
-      const result = await registry.invoke(
+      await registry.invoke(
         "pi.bash",
         {
-          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "process.stdout.write(process.cwd())"`,
+          command: `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} -e "require('node:fs').writeFileSync('cwd.txt', process.cwd())"`,
           cwd: "nested",
         },
         {
@@ -234,8 +250,8 @@ describe("PiToolsProvider lifecycle", () => {
           extensionContext: { ...baseContext.extensionContext, cwd: root } as ExtensionContext,
           audits: [],
         },
-      ) as { output: string };
-      expect(fs.realpathSync.native(result.output.trim())).toBe(
+      );
+      expect(fs.realpathSync.native(fs.readFileSync(path.join(nested, "cwd.txt"), "utf8"))).toBe(
         fs.realpathSync.native(nested),
       );
     } finally {

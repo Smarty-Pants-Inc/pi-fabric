@@ -30,7 +30,7 @@ describe("CompactProvider", () => {
     const { provider } = setup();
     const listed = await provider.list({}, context);
     const names = listed.map((d) => d.name);
-    expect(names).toEqual(["request", "status", "cancel"]);
+    expect(names).toEqual(["request", "status", "pressure", "carry", "cancel"]);
     const byName = new Map(listed.map((d) => [d.name, d]));
     expect(byName.get("request")?.risk).toBe("write");
     expect(byName.get("status")?.risk).toBe("read");
@@ -80,7 +80,8 @@ describe("CompactProvider", () => {
 
   it("status returns the controller status snapshot", async () => {
     const { provider } = setup();
-    expect(await provider.invoke("status", {}, context)).toEqual({});
+    // Owner is "none" without a session branch; the reserve defaults to off.
+    expect(await provider.invoke("status", {}, context)).toEqual({ owner: "none", outputReserveTokens: 0 });
     await provider.invoke("request", { reason: "x" }, context);
     const status = (await provider.invoke("status", {}, context)) as {
       pending?: { reason?: string };

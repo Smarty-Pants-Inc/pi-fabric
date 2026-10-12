@@ -1326,6 +1326,31 @@ describe("StateProvider", () => {
     }
   });
 
+  it("keeps the shell preflight with the options form (schemaMode) the runtime wires (#8606)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-state-options-"));
+    const marker = path.join(root, "ran");
+    try {
+      const commandContext = { ...context, cwd: root };
+      const command = `git stash list > '${marker}'`;
+      const unhooked = new StateProvider(createStore(), identity, { schemaMode: "off", piTools: () => true });
+      await unhooked.invoke("transition", { label: "init", to: "drafted", summary: "draft", evidence: [command] }, commandContext);
+      await expect(unhooked.invoke("verify", {}, commandContext)).rejects.toThrow("state.verify is unavailable until extension tool hooks initialize");
+      const runner = { emitToolCall: vi.fn(async () => ({ block: true, reason: "guard refused git stash" })) };
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([], runner as never, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const guarded = new StateProvider(createStore(), identity, { schemaMode: "off", piTools: () => true },
+        { preflight: createShellCommandPreflight(catalog) });
+      await guarded.invoke("transition", { label: "init", to: "drafted", summary: "draft", evidence: [command] }, commandContext);
+      await expect(guarded.invoke("verify", {}, commandContext)).rejects.toThrow("guard refused git stash");
+      await guarded.invoke("goal", { check: command }, commandContext);
+      await expect(guarded.invoke("checkGoal", {}, commandContext)).rejects.toThrow("guard refused git stash");
+      expect(runner.emitToolCall).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a state command that a tool_call hook rewrites, so nothing claims the original (#8606 P1-B)", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-state-rewrite-"));
     const marker = path.join(root, "rewritten-ran");

@@ -572,14 +572,17 @@ export class MemoryProvider implements FabricProvider {
     args: Record<string, unknown>,
     invocationContext: FabricInvocationContext,
   ): Promise<unknown> {
+    const context = invocationContext.scope
+      ? { ...this.context, fabricScope: invocationContext.scope }
+      : this.context;
     try {
       switch (actionName) {
         case "recall":
-          return await processMemoryRecall(args, invocationContext, this.context, this.cache);
+          return await processMemoryRecall(args, invocationContext, context, this.cache);
         case "expand":
-          return await processMemoryExpand(args, this.context, this.cache, invocationContext.signal);
+          return await processMemoryExpand(args, context, this.cache, invocationContext.signal);
         case "sessions":
-          return await processMemorySessions(args, this.context, invocationContext.signal);
+          return await processMemorySessions(args, context, invocationContext.signal);
         default:
           throw new Error(`Unknown memory action: ${actionName}`);
       }

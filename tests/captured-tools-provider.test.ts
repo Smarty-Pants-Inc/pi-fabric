@@ -169,7 +169,8 @@ describe("CapturedToolsProvider", () => {
       code: 'await tools.call({ ref: "extensions.screenshot", args: {} }); await tools.call({ ref: "extensions.screenshot", args: {} }); return "done";',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+      tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+    } as unknown as import("@earendil-works/pi-coding-agent").ExtensionToolContext);
     expect(output).not.toMatchObject({ isError: true });
     expect(output.content.filter((part) => part.type === "image")).toEqual([finalImage, finalImage]);
     vi.mocked(runner.emitToolResult).mockResolvedValueOnce({ content: [text, finalImage], isError: true });
@@ -177,7 +178,8 @@ describe("CapturedToolsProvider", () => {
       code: 'return await tools.call({ ref: "extensions.screenshot", args: {} });',
     }, undefined, undefined, {
       cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture" },
-    } as ExtensionContext);
+      tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+    } as unknown as import("@earendil-works/pi-coding-agent").ExtensionToolContext);
     expect(failedOutput).toMatchObject({ isError: true });
     expect(failedOutput.content.filter((part) => part.type === "image")).toEqual([finalImage]);
   });
@@ -523,7 +525,12 @@ describe("CapturedToolsProvider", () => {
       sourceInfo: createSyntheticSourceInfo("/extensions/powershell-override.ts", { source: "test" }),
     }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
     const args = { command: "Write-Output ok" };
-    for (const provider of [new CapturedToolsProvider(catalog), new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse" })]) {
+    for (const provider of [
+      new CapturedToolsProvider(catalog),
+      new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse" }),
+      // Main's discovery filter (bare-function form) keeps the default refusal.
+      new CapturedToolsProvider(catalog, () => false),
+    ]) {
       await expect(provider.invoke("powershell", { ...args }, context)).rejects.toThrow("smarty-dev#9826");
       // Through pi.powershell too: a provider without the opt-in refuses before delegating.
       await expect(new PiToolsProvider(process.cwd(), catalog, provider).invoke("powershell", { ...args }, context))
@@ -532,8 +539,12 @@ describe("CapturedToolsProvider", () => {
     expect(runs).toEqual([]);
     expect(toolNames).toEqual([]);
     expect(runner.emit).not.toHaveBeenCalled();
-    const optedIn = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "allow" });
-    const result = await optedIn.invoke("powershell", { ...args }, context);
+    // The runtime passes both options; the discovery filter does not touch the policy.
+    const hidden = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "refuse", omitFromDiscovery: () => true });
+    expect(await hidden.list({}, context)).toEqual([]);
+    await expect(hidden.invoke("powershell", { ...args }, context)).rejects.toThrow("smarty-dev#9826");
+    const optedIn = new CapturedToolsProvider(catalog, { getPowerShellPolicy: () => "allow", omitFromDiscovery: () => false });
+    const result = await optedIn.invoke("powershell", { ...args }, context) as { text: string };
     expect(result.text).toBe("ran Write-Output ok");
     expect(runs).toEqual(["Write-Output ok"]);
     expect(toolNames).toEqual(["bash", "powershell"]);

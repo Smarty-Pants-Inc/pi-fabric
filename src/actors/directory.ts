@@ -3,6 +3,21 @@ import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } fro
 import { ActorManager } from "./manager.js";
 import { SessionActorOrphans } from "./session-orphans.js";
 
+/**
+ * Run every halt step even when one throws, then report every failure at once: a scope
+ * that cannot save its cancellation must not leave later scopes running (smarty-dev#7706).
+ */
+export function haltEvery(steps: ReadonlyArray<() => number>): number {
+  let halted = 0;
+  const errors: unknown[] = [];
+  for (const step of steps) {
+    try { halted += step(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length) throw new AggregateError(errors, errors.map(error => error instanceof Error ? error.message : String(error)).join("; "));
+  return halted;
+}
+
 export interface ActorDirectoryRoots {
   project: string;
   session: string;
@@ -172,7 +187,9 @@ export class ActorDirectory extends ActorManager {
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
-  override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
+  override haltAll(): { halted: number } {
+    return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
+  }
   override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }
   override removalSettled(id: string): Promise<void> | undefined { return super.removalSettled(id) ?? this.#secondary.removalSettled(id); }
   override async finishPendingRemovals(): Promise<void> { await super.finishPendingRemovals(); await this.#secondary.finishPendingRemovals(); }

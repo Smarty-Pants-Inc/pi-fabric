@@ -45,7 +45,9 @@ export interface DeleterTally {
   /** Bytes held by refused targets, by reason, where the deleter measured them. */
   refusedBytes: Record<string, number>;
   examples: Record<string, string[]>;
-  /** Graveyard paths of refused targets left moved there (callers may discard `result.graveyard`). */
+  /** Graveyard paths of refused targets left moved there (callers may discard `result.graveyard`), resolved from the
+   * held container at refusal time. Where that location cannot be proven, an `unresolved: ...` entry names the held
+   * container's dev/ino and the entry name instead of a path. */
   graveyards?: string[];
 }
 let tally: Record<string, DeleterTally> | undefined;
@@ -103,6 +105,23 @@ const same = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino ===
  * earlier, and only the owner or root can change the mode. A POSIX ACL that grants another user write shows as the
  * group write bit (the ACL mask), so it is refused too. (pi-fabric#850 round 1 P1.) */
 const closed = (stat: fs.Stats): boolean => (stat.mode & 0o022) === 0;
+/** Where a held graveyard entry is now (old audit finding 3): the opened container's current path, read from its
+ * /proc/self/fd link and proven to be that container by dev/ino (before and after the entry check), joined with the
+ * entry name, proven to be the same object as the name below the fd. The lexical path built before proceed() can be
+ * stale: the container can be renamed while pinned. Undefined when that cannot be proven (also a deleted container,
+ * whose link ends in " (deleted)"). Reporting only: nothing is moved or deleted here. */
+const located = (grave: number, entryName: string): string | undefined => {
+  try {
+    const dir = fs.readlinkSync(at(grave));
+    if (!path.isAbsolute(dir)) return undefined;
+    const held = fs.fstatSync(grave);
+    const container = (): boolean => { const now = fs.lstatSync(dir); return now.isDirectory() && same(now, held); };
+    if (!container()) return undefined;
+    const file = path.join(dir, entryName);
+    if (!same(fs.lstatSync(file), fs.lstatSync(at(grave, entryName)))) return undefined;
+    return container() ? file : undefined;
+  } catch { return undefined; }
+};
 const kind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
 /** The judged inode, ours, same type, same mtime (also after the graveyard move: a rename keeps the mtime). */
 const verify = (file: string, judged: fs.Stats, uid: number): void => {
@@ -335,14 +354,24 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   const name = path.basename(target);
   if (!name || name === "." || name === ".." || path.dirname(target) === target) return no("invalid target name");
   let parent: number | undefined, grave: number | undefined, graveName: string | undefined, moved: string | undefined;
-  let graveStat: fs.Stats | undefined;
+  let graveStat: fs.Stats | undefined, parentStat: fs.Stats | undefined;
+  /** The held parent is still ours, a directory and closed (no group/other write): rechecked on the fd right before
+   * each step that changes its namespace after proceed() (rollback, container cleanup), so a chmod since the open
+   * stops them. It does not exclude our own uid or root (not atomic with the name operation). */
+  const parentHeld = (): boolean => {
+    try { const now = fs.fstatSync(parent!); return now.isDirectory() && now.uid === parentStat!.uid && closed(now); }
+    catch { return false; }
+  };
   try {
     verifiedRemoveTestHooks.beforeOpen?.(target);
     const uid = process.geteuid();
     try { parent = fs.openSync(path.dirname(target), fs.constants.O_RDONLY | NOFOLLOW | DIRECTORY); }
     catch (error) { return no(`parent open failed (${code(error)})`); }
-    const parentStat = fs.fstatSync(parent);
+    parentStat = fs.fstatSync(parent);
     if (parentStat.uid !== uid) return no("parent directory is not owned by this user");
+    // Old audit finding 1: a user-owned parent other uids can write would expose rollback and container cleanup (name
+    // operations) to their creates/replaces. Refused before any move or delete; no mode is changed.
+    if (!parentStat.isDirectory() || !closed(parentStat)) return no("parent directory is writable by group or others");
     // The pin must resolve to the opened directory, or no directory-relative step is possible.
     try { if (!same(fs.statSync(at(parent)), parentStat)) return no("/proc/self/fd does not resolve the parent; nothing is deleted"); }
     catch { return no("/proc/self/fd is unavailable; nothing is deleted"); }
@@ -368,7 +397,17 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     const entryName = `${name}.${randomUUID()}`;
     fs.renameSync(at(parent, name), at(grave, entryName));
     moved = entryName;
-    const graveyard = path.join(path.dirname(target), graveName, moved);
+    /** A refusal that leaves the entry in the graveyard, reported where it actually is now (see `located`). */
+    const left = (reason: string): VerifiedRemoveResult => {
+      const file = located(grave!, entryName);
+      if (file !== undefined) return no(reason, file);
+      let held = "unknown";
+      try { const stat = fs.fstatSync(grave!); held = `dev ${stat.dev} ino ${stat.ino}`; } catch { /* reported as unknown */ }
+      const category = `${reason}; graveyard location unresolved`;
+      countRefusal(deleter, category, target);
+      if (tally) (entry(deleter).graveyards ??= []).push(`unresolved: held graveyard container ${held}, entry ${entryName}`);
+      return { removed: false, reason: `${category} (held container ${held}, entry ${entryName})` };
+    };
     // The full no-delete revalidation of the snapshot, below the private graveyard.
     const recheck = (): void => {
       verify(at(grave!, moved!), judged, uid);
@@ -379,7 +418,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       // Whatever we moved is not the judged inode: it stays in the graveyard, untouched and reported.
       const reason = error instanceof Refusal ? error.message : `verify failed (${code(error)})`;
       moved = undefined;
-      return no(`${reason} (swapped during removal; left in the graveyard)`, graveyard);
+      return left(`${reason} (swapped during removal; left in the graveyard)`);
     }
     let keep: boolean;
     try { keep = options.proceed ? !options.proceed() : false; } catch { keep = true; }
@@ -389,14 +428,15 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     catch (error) {
       const reason = error instanceof Refusal ? error.message : `verify failed (${code(error)})`;
       moved = undefined;
-      return no(`${reason} (changed during removal; left in the graveyard)`, graveyard);
+      return left(`${reason} (changed during removal; left in the graveyard)`);
     }
     if (keep) {
       // Back to its name, never over anything that appeared there: link fails on EEXIST; a directory moves back
       // only while the name is absent. Otherwise it stays in the graveyard and is reported.
+      if (!parentHeld()) return left("kept by the final check; parent directory is writable by group or others, left in the graveyard");
       try {
         if (judged.isDirectory()) {
-          try { fs.lstatSync(at(parent, name)); return no("kept by the final check; name is taken, left in the graveyard", graveyard); }
+          try { fs.lstatSync(at(parent, name)); return left("kept by the final check; name is taken, left in the graveyard"); }
           catch (error) { if (code(error) !== "ENOENT") throw error; }
           fs.renameSync(at(grave, moved), at(parent, name));
         } else {
@@ -407,14 +447,14 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
         return no("kept by the final check");
       } catch (error) {
         moved = undefined;
-        return no(`kept by the final check; move back failed (${code(error)}), left in the graveyard`, graveyard);
+        return left(`kept by the final check; move back failed (${code(error)}), left in the graveyard`);
       }
     }
     try { removeTree(grave, moved, snap, uid, 0); }
     catch (error) {
       const reason = error instanceof Refusal ? error.message : `removal failed (${code(error)})`;
       moved = undefined;
-      return no(`${reason}; the rest is left in the graveyard`, graveyard);
+      return left(`${reason}; the rest is left in the graveyard`);
     }
     moved = undefined;
     countRemoval(deleter, bytes);
@@ -423,10 +463,11 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
   } finally {
     if (grave !== undefined) fs.closeSync(grave);
+    // Cleanup changes the parent's namespace: only while the held parent is still ours and closed (else it stays).
     // An empty graveyard goes; one that holds a reported entry stays (rmdir fails closed on any entry). The name is
     // removed only while it is still the container we opened (dev/ino/uid/directory/private): a replacement stays.
     if (parent !== undefined) {
-      if (graveName !== undefined && moved === undefined && graveStat !== undefined) {
+      if (graveName !== undefined && moved === undefined && graveStat !== undefined && parentHeld()) {
         try {
           const now = fs.lstatSync(at(parent, graveName));
           if (now.isDirectory() && same(now, graveStat) && now.uid === graveStat.uid && (now.mode & 0o077) === 0) fs.rmdirSync(at(parent, graveName));

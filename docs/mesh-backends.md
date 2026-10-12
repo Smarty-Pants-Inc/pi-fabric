@@ -195,3 +195,31 @@ this reason. An R3 cluster needs these TCP ports opened on `tailscale0` only:
 
 That ACL change needs the product owner's yes (smarty-dev#7504 c6095415747). Until then, tests run
 on one host, or across hosts through `ssh -L` tunnels.
+
+## Authentication (phase 1: smarty-dev#7504, docs/designs/nats-auth-7504.md)
+
+NATS decentralized auth: one operator, one account per org, one user per launch, principal device or
+maintainer job. Each user is signed by its account's scoped signing key for its role (`agent`,
+`principal`, `maintainer`), so the server applies the role's permission template. An agent user is
+bound to its mesh roots by `mesh:<32 hex>` tags (the hex of `natsStreamName`); it reaches only those
+streams and never creates, updates, purges or deletes one. Every role subscribes only to
+`_INBOX.<its user key>`. All nodes use the built-in **full** resolver; a revocation is a re-signed
+account JWT pushed on `$SYS.REQ.CLAIMS.UPDATE` (measured on one node: the live connection closes
+at once and a reconnect is refused).
+
+- `pi-fabric nats mint --role R --name N [--mesh HEX]... (--local | --account A --scope-seed-env V)`
+  mints a user in memory and writes its creds to stdout (a pipe, never a terminal).
+- `pi-fabric nats server-config ...` prints one node's config: operator mode, full resolver, and
+  routes with mutual TLS (`verify_cert_and_check_known_urls`, no route password).
+- **Single machine (self-hosting).** `pi-fabric nats init --local` writes a local operator, the
+  system account and one org account with the 3 role keys to `~/.config/fabric/nats` (dir 0700,
+  files 0600, the user's own trust), and a single-node config bound to 127.0.0.1;
+  `pi-fabric nats serve --local` runs that node. Same code path as the fleet; only key custody
+  differs. Any process of that Unix user can read the keys and mint: per-launch users there give
+  attribution and separation against mistakes, not against a hostile same-UID process. A fleet
+  host refuses it (`PI_FABRIC_NATS_CUSTODY=fleet`).
+- A connection that carries creds (`creds` in `openNatsStateBackend`) refuses creds within 1 h of
+  their `exp` (`FABRIC_MESH_STATE_NATS_CREDS_EXPIRED`).
+- Phase 2 (before any fleet root switches): FD 3 delivery and the launch graph, the maintainer
+  compaction job (agents lose purge), the branch's `create: false` open, and the role matrix in
+  place of the `FABRIC_MESH_*` rule above, which matches no subject.

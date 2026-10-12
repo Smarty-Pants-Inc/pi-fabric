@@ -166,6 +166,51 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  nats-auth:
+    # NATS decentralized auth (smarty-dev#7504; docs/designs/nats-auth-7504.md): a loopback node in operator mode with the
+    # full resolver, made by `pi-fabric nats init --local`. T2 role matrix, T3, T4 revocation, T5 expiry, T6 org isolation,
+    # T8 the mesh state backend over minted creds, and the nsc parity check of our JWT encoder (gate G-7). The pinned
+    # nats-server and nsc binaries are checked against their published SHA256SUMS and our recorded digests. Separate from
+    # `check`; not a required check. NATS_SERVER_REQUIRED=1 fails it if the server is missing.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install pinned nats-server and nsc
+        shell: bash
+        run: |
+          stage="$RUNNER_TEMP/nats-release"
+          mkdir -p "$stage"
+          cd "$stage"
+          server="nats-server-v2.14.7-linux-amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o SHA256SUMS https://github.com/nats-io/nats-server/releases/download/v2.14.7/SHA256SUMS
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$server" "https://github.com/nats-io/nats-server/releases/download/v2.14.7/$server"
+          awk -v archive="$server" '$2 == archive { print }' SHA256SUMS | sha256sum --check --strict -
+          printf 'e5c20b1cb2c0566b54c544312e91e011f9e130c5c80f16a14f4cf28ef30b8be2  %s\n' "$server" | sha256sum --check --strict -
+          tar -xzf "$server"
+          nsc="nsc-linux-amd64.zip"
+          curl --proto '=https' --tlsv1.2 -fsSL -o SHA256SUMS-nsc.txt https://github.com/nats-io/nsc/releases/download/v2.15.0/SHA256SUMS-nsc.txt
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$nsc" "https://github.com/nats-io/nsc/releases/download/v2.15.0/$nsc"
+          awk -v archive="$nsc" '$2 == archive { print }' SHA256SUMS-nsc.txt | sha256sum --check --strict -
+          printf '7d55eda757dc9f233675a3038fcf8779bcda99753b1603f7009fc8537e126b7e  %s\n' "$nsc" | sha256sum --check --strict -
+          python3 -m zipfile -e "$nsc" nsc
+          chmod 0755 nsc/nsc
+          echo "NATS_BIN=$stage/nats-server-v2.14.7-linux-amd64/nats-server" >> "$GITHUB_ENV"
+          echo "NSC_BIN=$stage/nsc/nsc" >> "$GITHUB_ENV"
+      # The single-machine path runs the real bin (dist/cli/index.js).
+      - name: Build
+        run: bun run build
+      - name: NATS auth on a loopback node, and nsc parity
+        env:
+          NATS_SERVER_REQUIRED: '1'
+        run: bunx vitest run tests/nats-auth.test.ts tests/nats-auth-server.test.ts
+
   mesh-lock-bench:
     # The mesh lock benchmark ratchet (smarty-dev#6676, docs/mesh-lock-bench.md): fails a >10%
     # regression of the deterministic per-op lock metrics against bench/mesh-lock-baseline.json.

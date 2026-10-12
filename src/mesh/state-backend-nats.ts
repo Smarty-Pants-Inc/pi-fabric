@@ -966,6 +966,8 @@ export interface OpenNatsStateBackendOptions {
   acceptPeriodicSync?: boolean;
   /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
   tls?: NatsTlsFiles;
+  /** Host-only: the minted user's `.creds` text, in memory (smarty-dev#7504 auth; never from the mesh directory). */
+  creds?: string;
 }
 
 export interface NatsTlsFiles { caFile?: string; certFile?: string; keyFile?: string }
@@ -1018,7 +1020,7 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
   const tls = options.tls ?? ((options.servers ?? []).some(server => /^tls:\/\//i.test(server)) ? {} : undefined);
   const port = options.port ?? await (await import("./state-backend-nats-client.js")).connectJetStream(options.servers ?? [], {
     ...(options.monitoringUrl === undefined ? {} : { monitoringUrl: options.monitoringUrl }),
-    ...(tls === undefined ? {} : { tls }) });
+    ...(tls === undefined ? {} : { tls }), ...(options.creds === undefined ? {} : { creds: options.creds }) });
   try {
     const server = await port.server();
     if (!versionAtLeast(server.version, MIN_SERVER)) throw new MeshStateNatsRefusedError(`nats-server ${server.version} is older than ${MIN_SERVER.join(".")}`);

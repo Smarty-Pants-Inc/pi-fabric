@@ -1,7 +1,7 @@
 // The real JetStreamPort of the NATS mesh state backend (smarty-dev#7504): the official nats.js v3 client
 // (@nats-io/transport-node, @nats-io/jetstream). Loaded only by `openNatsStateBackend` (a lazy entry point), so the
 // startup graph never includes it.
-import { connect } from "@nats-io/transport-node";
+import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
@@ -21,11 +21,23 @@ export interface ConnectJetStreamOptions {
   monitoringUrl?: string;
   /** Set: every connection must be TLS (these files, or the system CAs for `{}`). */
   tls?: NatsTlsFiles;
+  /**
+   * The user's `.creds` text (smarty-dev#7504 auth: a minted user, held in memory only). The connection authenticates
+   * with it and uses the private inbox `_INBOX.<its user key>`, the only inbox its role may subscribe to. Creds past
+   * Fabric's cutoff (exp - 1 h) refuse before connecting.
+   */
+  creds?: string;
 }
 
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
-  const nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }) });
+  let auth: { authenticator: ReturnType<typeof credsAuthenticator>; inboxPrefix: string } | undefined;
+  if (options.creds !== undefined) {
+    const { natsCredsIdentity } = await import("./nats-auth.js");
+    const { userKey } = natsCredsIdentity(options.creds);
+    auth = { authenticator: credsAuthenticator(new TextEncoder().encode(options.creds)), inboxPrefix: `_INBOX.${userKey}` };
+  }
+  const nc = await connect({ servers, ...(options.tls === undefined ? {} : { tls: { ...options.tls } }), ...(auth ?? {}) });
   const js = jetstream(nc);
   const jsm = await jetstreamManager(nc);
   return {

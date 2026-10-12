@@ -14,9 +14,13 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // when nothing changed. These tests keep each guarantee those reads gave, with the reads gone.
 const roots: string[] = [];
 const directories: ParticipantDirectory[] = [];
+const stores: MeshStore[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(directories.splice(0).map((directory) => directory.close()));
+  // Release each state.db handle after its directory stops and before its root goes: Windows refuses
+  // to delete an open SQLite file (EPERM).
+  for (const store of stores.splice(0)) try { store.closeState(); } catch { /* closed by the test */ }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -35,7 +39,11 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-idle-refresh-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
-    const store = (): MeshStore => new MeshStore(meshRoot, 64 * 1024, 1_000, backend === "sqlite" ? { stateBackend: "sqlite" } : {});
+    const store = (): MeshStore => {
+      const created = new MeshStore(meshRoot, 64 * 1024, 1_000, backend === "sqlite" ? { stateBackend: "sqlite" } : {});
+      stores.push(created);
+      return created;
+    };
     const collisions: FabricRootCollision[] = [];
     const directory = (name: string, sessionId = name, onRootCollision?: (collision: FabricRootCollision) => void) => {
       const identity = identityOf(name);

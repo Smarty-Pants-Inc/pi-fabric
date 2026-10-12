@@ -45,6 +45,7 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
+import { registerLazyPerCallRouter } from "./agents/per-call-route-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold, type AutoCompactionTrigger } from "./compaction/threshold.js";
 import type { CompactionOwnerObserver } from "./compaction/owner.js";
@@ -675,6 +676,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     });
     if (!current()) return false;
     if (outcome.status === "compiled" && outcome.artifact) {
+      // Proof-checked plans are usable now, before the persist waits on another process's compiled.lock (its retry
+      // budget is timer-bound and slow on Windows); the persisted file replaces it below once saved.
+      if (current()) setActiveCompiledSurface(outcome.artifact);
       try {
         const saved = await saveCompiledSurfaceAsync(agentDir, outcome.artifact);
         if (current()) {
@@ -691,9 +695,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         }
       } catch (error) {
         if (!(error instanceof FileLockTimeoutError)) throw error;
-        // Proof-checked plans are usable now; durable persistence can catch up
-        // later without blocking this session on another process's writer.
-        if (current()) setActiveCompiledSurface(outcome.artifact);
+        // Already active (above); durable persistence catches up later without blocking this session.
         retry = true;
       }
     }
@@ -1339,6 +1341,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     onYield: () => {
       compactionYieldPending = true;
     },
+  });
+
+  // Per-call model routing, shadow only (smarty-dev#2890): inert and unloaded unless
+  // agents.modelRouting.perCall.mode is "shadow"; never changes the model or the context.
+  registerLazyPerCallRouter(pi, () => {
+    const config = state.cwd ? state.config : state.provisionalConfig();
+    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev };
   });
 
   // No extractive module import, branch read or model call until explicit opt-in

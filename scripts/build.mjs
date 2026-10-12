@@ -2,7 +2,7 @@
 import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildLandlock } from "./build-landlock.mjs";
+import { buildLandlock, stripGroupOtherWrite } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -52,6 +52,7 @@ const primaryEntryPoints = [
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
   "src/residency/launcher-owner.ts",
+  "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
@@ -76,6 +77,7 @@ const lazyEntryPoints = [
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/per-call-route.ts",
   "src/agents/spawn-router.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
@@ -335,3 +337,6 @@ if (unstableLazyImports.length > 0) {
     `Package-local dynamic imports must use stable entry paths:\n${unstableLazyImports.join("\n")}`,
   );
 }
+
+// Last: nothing in dist/ may be writable by another user (smarty-dev#8145; assert-build-artifacts.mjs checks).
+stripGroupOtherWrite("dist");

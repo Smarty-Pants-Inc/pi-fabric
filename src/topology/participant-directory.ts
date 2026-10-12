@@ -7,7 +7,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.j
 import { participantProject, ParticipantRoleGrant, repositoryOf } from "./project-identity.js";
 import { mainPublicationFenced, MainPublicationFencedError } from "./main-publication-fence.js";
 import type { FabricMainAgentInfo } from "../main-agent.js";
-import { assertMeshStateReadable, MeshStore, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
+import { assertMeshStateReadable, MeshStore, meshOutageAlarmSink, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
   FabricHostRecord,
   FabricParticipantInfo,
@@ -599,12 +599,17 @@ export interface ParticipantDirectoryOptions {
 /** Heartbeats a retired lifecycle may skip quietly (a rebind is normally immediate). */
 export const LIFECYCLE_LOST_TICKS = 2;
 
+/** Pi's error for a ctx or pi used after session replacement or reload (ExtensionRunner.invalidate). */
+export const isStaleExtensionContextError = (error: unknown): boolean =>
+  error instanceof Error && /extension ctx is stale after session replacement or reload/.test(error.message);
+
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
 
 export class ParticipantDirectory implements FabricParticipantSource {
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
   readonly ownerIncarnation = randomUUID();
-  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh");
+  readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
   #startedAt = Date.now();
@@ -624,6 +629,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedCollisions = new Set<string>();
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
+  /** The heartbeat was stopped by suspend() (a retired owner lifecycle), not by close(). */
+  #suspended = false;
   #closed = false;
   #leaseAbort = new AbortController();
   #leaseClaimed = false;
@@ -710,6 +717,97 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** True while no live lifecycle could be resolved for more than LIFECYCLE_LOST_TICKS heartbeats. */
   get degraded(): boolean { return this.#degraded; }
 
+  /** Whether this directory currently owns an armed heartbeat timer (smarty-dev#10004). */
+  get heartbeatArmed(): boolean { return this.#timer !== undefined; }
+
+  // The one heartbeat timer. Every tick reads the owner's lifecycle first and skips when it
+  // retired; the background work itself runs through #runBackground (smarty-dev#5962/#10004).
+  #armHeartbeat(): void {
+    if (this.#timer) return;
+    this.#timer = setInterval(() => {
+      if (this.#closed) return;
+      const live = this.#live();
+      this.#lifecycleTick(live);
+      if (!live) return;
+      void this.#renewActors();
+      // The retry runner coalesces shared publication, not independent liveness.
+      // Renew through per-key waits even when run() skips an in-flight refresh;
+      // shared-lock-only waits still lapse and confirmation still needs its lock.
+      if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) {
+        void this.#renewFileLease().catch(error => {
+          this.#refreshError = this.#superseded ?? error;
+          this.#routingReadAt = 0;
+          if (this.#retiredDuring(error)) return;
+          this.#backgroundRefresh.failure(error);
+        });
+        return;
+      }
+      if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
+    }, this.#heartbeatMs);
+    this.#timer.unref();
+  }
+
+  /**
+   * A background refresh whose owner lifecycle retired while it ran is a quiet skip, never a
+   * "background operation failed" line every heartbeat (smarty-dev#10004). Pi's stale-ctx error is
+   * proof that the ctx or pi a source reached is gone: stop this heartbeat until a live rebind.
+   */
+  #runBackground(operation: () => Promise<void>): void {
+    void this.#backgroundRefresh.run(async () => {
+      try { await operation(); }
+      catch (error) {
+        if (this.#retiredDuring(error)) return;
+        throw error;
+      }
+    }, false);
+  }
+
+  #retiredDuring(error: unknown): boolean {
+    if (isStaleExtensionContextError(error)) {
+      this.#lifecycleRetired();
+      return true;
+    }
+    return !this.#closed && !this.#live();
+  }
+
+  #lifecycleRetired(): void {
+    this.suspend();
+    if (this.#degraded) return;
+    this.#degraded = true;
+    const ticks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1);
+    console.warn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
+      `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
+    try { this.options.onLifecycleLost?.(ticks); } catch { /* the warning above already surfaced it */ }
+  }
+
+  /**
+   * Stop this directory's background heartbeat now, without withdrawing anything: its owner
+   * lifecycle retired (reload, session replacement, teardown). Explicit refresh(), quiesce()
+   * and close() still publish. resume() re-arms exactly one timer (smarty-dev#10004).
+   */
+  suspend(): void {
+    if (this.#closed) return;
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = undefined;
+      this.#suspended = true;
+    }
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+    this.#refreshScheduled = false;
+    this.#cancelPublicationRetry();
+  }
+
+  /** A live owner lifecycle rebound this directory: re-arm its single heartbeat and publish. */
+  resume(): void {
+    if (!this.#suspended || this.#closed || this.#superseded || !this.options.enabled) return;
+    this.#suspended = false;
+    this.#retiredTicks = 0;
+    this.#degraded = false;
+    this.#armHeartbeat();
+    this.scheduleRefresh();
+  }
+
   #lifecycleTick(live: boolean): void {
     if (live) {
       this.#retiredTicks = 0;
@@ -756,28 +854,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // timer also retries a failed initial publish so the host can join later.
       this.#retiredTicks = 0;
       this.#degraded = false;
-      this.#timer = setInterval(() => {
-        if (this.#closed) return;
-        const live = this.#live();
-        this.#lifecycleTick(live);
-        if (!live) return;
-        void this.#renewActors();
-        // The retry runner coalesces shared publication, not independent liveness.
-        // Renew through per-key waits even when run() skips an in-flight refresh;
-        // shared-lock-only waits still lapse and confirmation still needs its lock.
-        if (this.#refreshing && this.#fileWork > 0 && !this.#quiescing) {
-          void this.#renewFileLease().catch(error => {
-            this.#refreshError = this.#superseded ?? error;
-            this.#routingReadAt = 0;
-            this.#backgroundRefresh.failure(error);
-          });
-          return;
-        }
-        if (!this.#publicationRetryTimer && !this.#publicationRetrying) {
-          void this.#backgroundRefresh.run(() => this.refresh(), false);
-        }
-      }, this.#heartbeatMs);
-      this.#timer.unref();
+      this.#suspended = false;
+      this.#armHeartbeat();
       this.#installExitHook();
     }
     await this.refresh();
@@ -871,7 +949,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshScheduled = false;
       this.#refreshTimer = undefined;
       if (!this.#live()) return;
-      void this.#backgroundRefresh.run(() => this.#runRefresh(false), false);
+      this.#runBackground(() => this.#runRefresh(false));
     };
     const wait = this.#changeRefreshAt + CHANGE_REFRESH_MIN_MS - Date.now();
     if (wait <= 0) {
@@ -1851,6 +1929,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#publicationRetrying;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    this.#suspended = false;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;

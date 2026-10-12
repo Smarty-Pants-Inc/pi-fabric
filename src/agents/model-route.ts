@@ -8,6 +8,8 @@ import { runAbortable } from "../async-settlement.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import type { FabricThinking } from "../thinking.js";
 import type { AgentRunResult } from "./types.js";
+import type { PerCallRoutingConfig } from "./per-call-config.js";
+export type { PerCallRoutingConfig } from "./per-call-config.js";
 
 export interface RouteCandidate { model: string; effort: FabricThinking }
 export interface ModelRoutingConfig {
@@ -21,6 +23,8 @@ export interface ModelRoutingConfig {
   revertReset?: Record<string, string>;
   /** Legacy false remains shadow-only for unlisted classes; true is never accepted. */
   live?: false;
+  /** Per-call routing inside one session (smarty-dev#2890, #6062). Shadow only: decide and log, never setModel. */
+  perCall?: PerCallRoutingConfig;
 }
 export type RouteReason = "live-choice" | "admission-blocked" | "admission-state-error" | "shadow-choice" | "excluded-protected" | "excluded-unknown" | "excluded-class" |
   "judgment-agent" | "low-confidence" | "jev-error" | "jev-timeout" | "malformed" | "invalid-candidates" | "record-failed";

@@ -2,7 +2,10 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
-import { MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation, readPhysicalHostIdentity, readPhysicalMachineId, validBootId } from "../core/atomic-write.js";
+import {
+  alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
+  readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
+} from "../core/atomic-write.js";
 
 /**
  * File custody lock (smarty-dev#6477 L5). `exclusive()` users that only guard files beside the
@@ -45,6 +48,8 @@ export interface MeshCustodyStore {
   exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T>;
   /** The active MeshStore.withTryLock budget, if any: custody honours it like the mesh lock. */
   readonly tryLockBudgetMs?: number | undefined;
+  /** The mesh lock protocol; custody records follow it (protocol 3 names the holder's PID namespace). */
+  readonly lockProtocol?: 1 | 2 | 3;
 }
 
 const errorCode = (error: unknown): string | undefined =>
@@ -59,7 +64,7 @@ const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(r
 
 /** Holds the custody lock of a mesh root until the returned release is called. */
 export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_LOCK_TIMEOUT_MS,
-  options: { hostQualified?: boolean; ownIncarnation?: string | undefined } = {}): Promise<() => void> => {
+  options: { hostQualified?: boolean; ownIncarnation?: string | undefined; lockProtocol?: 1 | 2 | 3 } = {}): Promise<() => void> => {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
   const ownerPath = path.join(lock, "owner");
@@ -71,13 +76,22 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     : await ownProcessIncarnation().catch(() => undefined);
   const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
   const machineId = physical?.machineId ?? (options.hostQualified ? readPhysicalMachineId() : undefined);
+  // Protocol 3 (smarty-dev#9569): the holder's PID namespace on one more line (plain: 6 fields, hostQualified: 8),
+  // so readers from before protocol 3, which accept only 4/5 or 7 fields, never reclaim it.
+  // The namespace reader is a lazy module (startup graph budget): loaded only for a protocol-3 record.
+  const namespace = options.lockProtocol === 3
+    ? await import("../core/pid-namespace.js").then(module => module.ownPidNamespace()).catch(() => undefined) : undefined;
+  const nsLine = options.lockProtocol === 3 ? `${namespace ?? ""}\n` : "";
   const record = options.hostQualified
-    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${machineId ?? ""}\n${physical?.bootId ?? ""}\n`
-    : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
+    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${machineId ?? ""}\n${physical?.bootId ?? ""}\n${nsLine}`
+    : options.lockProtocol === 3
+      ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${nsLine}`
+      : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
   const readOwner = (): string | undefined => {
     try { return fs.readFileSync(ownerPath, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
   };
+  const blocked: StaleLockNote = {};
   let attempts = 0;
   let maxGapMs = 0;
   let lastAttemptAt = Date.now();
@@ -103,7 +117,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       fs.rmSync(staging, { recursive: true, force: true });
     }
     try {
-      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified)) continue;
+      if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
         try { console.warn(`[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
@@ -113,7 +127,13 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     if (Date.now() >= deadline) {
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
       const pid = owner?.split("\n")[1];
-      throw new MeshLockTimeoutError(` (custody lock ${lock}${pid ? `, held by pid ${pid}` : ""})`, attempts, maxGapMs);
+      const holder = ` (custody lock ${lock}${pid ? `, held by pid ${pid}` : ""})`;
+      if (blocked.verdict) {
+        const refused = new MeshLockForeignHolderError(holder, attempts, maxGapMs, blocked.verdict, blocked.namespace ?? "", lock, blocked.token ?? "");
+        alarmForeignHolder(refused);
+        throw refused;
+      }
+      throw new MeshLockTimeoutError(holder, attempts, maxGapMs);
     }
     await delay(Math.min(Math.max(0, deadline - Date.now()), 5 + Math.floor(Math.random() * 20)));
   }
@@ -160,7 +180,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
 // once by renaming it to a retained, identity-named fence (as the mesh lock does): a paused
 // second recoverer cannot rename a successor onto the same nonempty fence.
 const clearDeadCustodyLock = async (lock: string, readOwner: () => string | undefined, deadline: number,
-  ownStart: string | undefined, hostQualified = false): Promise<boolean> => {
+  ownStart: string | undefined, hostQualified = false, note: StaleLockNote = {}, lockProtocol: 1 | 2 | 3 = 1): Promise<boolean> => {
+  delete note.verdict; delete note.namespace; delete note.token; // describes the CURRENT holder only
+  let pin: { unchanged(): boolean; close(): void } | undefined;
   try {
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
@@ -180,12 +202,30 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     // machine evidence is still mandatory when boot/process identity is unavailable.
     const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
     const machineId = physical?.machineId ?? (hostQualified ? readPhysicalMachineId() : undefined);
-    if (hostQualified && (!machineId || fields.length !== 7 || fields[4] !== machineId)) return false;
+    if (hostQualified && (!machineId || (fields.length !== 7 && fields.length !== 8) || fields[4] !== machineId)) return false;
     const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
-    const previousBoot = bootKnown && fields[5] !== physical!.bootId;
+    let previousBoot = bootKnown && fields[5] !== physical!.bootId;
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||
-      (fields.length !== 4 && fields.length !== 5 && !(hostQualified && fields.length === 7))) return false;
-    if (hostQualified && !bootKnown) {
+      (hostQualified ? fields.length !== 7 && fields.length !== 8 : fields.length !== 4 && fields.length !== 5 && fields.length !== 6)) return false;
+    // smarty-dev#9569: a protocol-3 record names its holder's PID namespace. Before EVERY branch below (the plain one,
+    // and hostQualified with known, previous or unknown boot): pid evidence only for our namespace.
+    const recordNamespace = hostQualified ? (fields.length === 8 ? fields[6]! : null) : (fields.length === 6 ? fields[4]! : null);
+    // pi-fabric#923 (fabric-store decision): under protocol 3 no previous-boot inference at all. Two running VM clones
+    // share a machine id with different boot ids, so "another boot" does not prove the holder dead.
+    if (lockProtocol === 3) previousBoot = false;
+    if (recordNamespace !== null || lockProtocol === 3) {
+      const namespaces = await import("../core/pid-namespace.js");
+      // Under protocol 3 a record without a namespace is UNPROVEN too: recovered only by the operator.
+      const result = recordNamespace === null ? { verdict: "unproven" as const }
+        : namespaces.reclaimVerdict(recordNamespace, await namespaces.ownNamespaceForReclaim(deadline, false), path.dirname(lock));
+      pin = "pin" in result ? result.pin : undefined;
+      const verdict = result.verdict;
+      if (verdict !== "pid") {
+        note.verdict = verdict; note.namespace = recordNamespace ?? ""; note.token = token!;
+        return false;
+      }
+    }
+    if (hostQualified && !bootKnown && !previousBoot) {
       // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE
       // holder. Do not compare incarnations or infer a reboot from missing evidence.
       const ownerStat = fs.lstatSync(path.join(lock, "owner"));
@@ -201,12 +241,14 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     }
     const current = fs.lstatSync(lock);
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+    // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
+    if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
     fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
     return true;
   } catch (error) {
     if (error instanceof MeshCustodyUnrecoverableError) throw error;
     return false;
-  }
+  } finally { pin?.close(); }
 };
 
 /**
@@ -216,7 +258,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
  */
 export const withMeshCustody = async <T>(mesh: MeshCustodyStore, operation: () => T, timeoutMs?: number): Promise<T> => {
   const budget = Math.min(timeoutMs ?? CUSTODY_LOCK_TIMEOUT_MS, mesh.tryLockBudgetMs ?? Number.POSITIVE_INFINITY);
-  const release = await acquireMeshCustodyLock(mesh.root, budget);
+  const release = await acquireMeshCustodyLock(mesh.root, budget, { lockProtocol: mesh.lockProtocol ?? 1 });
   try {
     if (meshCustodyMode() === "own") return operation();
     return await (timeoutMs === undefined ? mesh.exclusive(operation) : mesh.exclusive(operation, timeoutMs));

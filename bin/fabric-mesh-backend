@@ -1,6 +1,77 @@
 #!/usr/bin/env node
 // Import, cutover and rollback of a mesh root's state backend with the R1 fence (smarty-dev#6477 L4b).
-import { main } from "../dist/mesh/mesh-backend-cli.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+// pi-fabric#880 / smarty-dev#8145: before ANY package code loads, refuse when another user could have changed
+// this shim, the gate bundle or the lease helper. From ONE canonical package root (below), each file is walked
+// DOWN component by component with lstat: no symlink, ours (or root), not group/other-writable. Above the root,
+// EVERY ancestor up to / (pi-fabric#880 round 7: never stopping early) must be a real directory, ours (or
+// root's) and not group/other-writable, except a root-owned STICKY one (/tmp): there only an entry's owner
+// can rename it, and the entry directly below it was already checked as ours or root's.
+// ponytail: duplicated on purpose from src/mesh/reader-proof.ts (unsafeChain), which stays as defence in depth:
+// this check must not depend on the code it protects. Node builtins only, and no realpath of a checked file:
+// the import uses exactly the walked string. Without POSIX owners (Windows) there is nothing to check here;
+// the gate itself fails closed there.
+// <chain-check> (tests/mesh-backend-readiness.test.ts runs this exact text with an injected lstat)
+const unsafeEntry = (at, stat, euid = process.geteuid()) => {
+  if (!stat) return `${at} is missing`;
+  if (stat.isSymbolicLink()) return `${at} is a symlink inside the install root`;
+  if (stat.uid !== 0 && stat.uid !== euid) return `${at} is owned by uid ${stat.uid}, not ${euid}`;
+  if ((stat.mode & 0o022) !== 0) return `${at} is group/other-writable (mode ${(stat.mode & 0o777).toString(8)})`;
+  return undefined;
+};
+const unsafeAbove = (root, lstat = (at) => fs.lstatSync(at), euid = process.geteuid()) => {
+  for (let at = path.dirname(root); ; at = path.dirname(at)) {
+    const stat = lstat(at);
+    const sticky = stat.uid === 0 && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+    if (!sticky) {
+      const why = unsafeEntry(at, stat, euid) ?? (stat.isDirectory() ? undefined : `${at} is not a directory`);
+      if (why) return why;
+    }
+    if (at === path.dirname(at)) return undefined;
+  }
+};
+// </chain-check>
+const unsafeBelow = (root, file) => {
+  let at = root;
+  let why = unsafeEntry(at, fs.lstatSync(at, { throwIfNoEntry: false }));
+  for (const part of path.relative(root, file).split(path.sep)) {
+    if (why) return why;
+    at = path.join(at, part);
+    why = unsafeEntry(at, fs.lstatSync(at, { throwIfNoEntry: false }));
+  }
+  return why;
+};
+const shim = fileURLToPath(import.meta.url);
+// pi-fabric#880 review round 5: with --preserve-symlinks-main the shim's URL can name an ALIAS (a symlinked
+// package root, or npm's .bin link). ponytail: everything below uses ONE canonical root, the package directory
+// of the shim's REAL file (<root>/bin/fabric-mesh-backend), and only canonical paths are used after the
+// check, so no alias is ever resolved again; an alias above the root is then irrelevant.
+const canonicalShim = (() => { try { return fs.realpathSync(shim); } catch { return shim; } })();
+const root = path.dirname(path.dirname(canonicalShim));
+const bundle = path.join(root, "dist/mesh/mesh-backend-cli.js");
+if (process.geteuid) {
+  const refuse = (why) => {
+    process.stderr.write(`fabric-mesh-backend: refused before loading: helper integrity: ${why}\n`);
+    process.exit(3);
+  };
+  const helper = path.join(root, "dist/native/fabric-mesh-lease");
+  // The real shim must sit at <root>/bin/fabric-mesh-backend: anything else is an alias inside a package.
+  if (path.basename(canonicalShim) !== "fabric-mesh-backend" || path.basename(path.dirname(canonicalShim)) !== "bin") {
+    refuse(`${shim} reaches ${canonicalShim}, not <package>/bin/fabric-mesh-backend`);
+  }
+  // The bundle imports node builtins only (no chunk): the shim, the bundle and the helper are the whole chain.
+  const above = unsafeAbove(root);
+  if (above) refuse(above);
+  for (const file of [canonicalShim, bundle, ...fs.lstatSync(helper, { throwIfNoEntry: false }) ? [helper] : []]) {
+    const why = unsafeBelow(root, file);
+    if (why) refuse(why);
+  }
+}
+// Load exactly the walked string, never a relative specifier, a realpath or an alias resolved again later.
+const { main } = await import(pathToFileURL(bundle).href);
 try { process.exitCode = await main(process.argv.slice(2)); }
 catch (error) {
   process.stderr.write(`fabric-mesh-backend: ${error instanceof Error ? error.message : String(error)}\n`);

@@ -9,7 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { mainExecutionCeilingAbortReason, withoutMainExecutionCeiling } from "../async-settlement.js";
 import type { FabricActorRunBinding, FabricActorBindingProvenance } from "../actors/types.js";
-import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
@@ -442,7 +442,8 @@ export class FabricControlPlane {
   #timer: NodeJS.Timeout | undefined;
   #leaseWatchdog: NodeJS.Timeout | undefined;
   #polling: Promise<void> | undefined;
-  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll");
+  readonly #backgroundPoll = new MeshBackgroundRetry("control claim/ack poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   // Cancellation may become publishable after close, when an admitted command finally commits.
   // Its queue owns that final obligation until success/deadline; idle has no timer or resources.
   readonly #backgroundCancellations = new MeshBackgroundQueue("control cancellation");
@@ -1166,8 +1167,12 @@ export class FabricControlPlane {
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
     const key = ownedKey;
-    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes.
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return;
+    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
+    // bridge delivered late (its bridged copy was published here just now, smarty-dev#9751) is not history:
+    // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
+    const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
+      now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
+    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
     const duplicate = this.#sharedClaims.has(ownedKey)

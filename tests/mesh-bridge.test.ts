@@ -1074,7 +1074,9 @@ describe("mesh bridge", () => {
       await waitFor(() => calls >= 4); // three refusals retried on later cycles, then the start pass reads the cursor
       const capLogs = logs.filter((line) => line.includes("mesh state WAL cap; retrying"));
       expect(capLogs).toHaveLength(1); // three refusals within a minute: one line
-      expect(capLogs[0]).toContain("WAL readers: pid 4242 (pinner)");
+      // pi-fabric#893 round 3: sizes and a reader count only, never the readers' pids or command lines.
+      expect(capLogs[0]).toContain("WAL reader(s)");
+      expect(capLogs[0]).not.toMatch(/4242|pinner/);
       expect(isMeshRetryableBusy(new MeshStateWalCapError(2, 1))).toBe(true);
       // Backed off, never a tight loop: waits of 40, 80, 160 ms between the four calls.
       expect(capLogs[0]).toContain("retrying in 40 ms");
@@ -1803,6 +1805,30 @@ describe("mesh bridge", () => {
     expect(argv).toEqual(expect.arrayContaining(["-p", "2222", "-i", "/k", "UserKnownHostsFile=/kh", "StrictHostKeyChecking=yes"]));
     expect(() => transportCommand(new Map([["ssh", "-oProxyCommand=x"]]), [])).toThrow(/a host, not an option/);
     expect(() => transportCommand(new Map([["ssh", "forge"], ["ssh-port", "22 -oX"]]), [])).toThrow(/port number/);
+  });
+});
+
+// pi-fabric#893 round 4: a work host's mesh-outage alarm reaches its hub recipient; nothing else rides that topic.
+describe("mesh-outage alarms across the bridge (pi-fabric#893)", () => {
+  const CHIEF = "session:0a1b2c3d-0000-4000-8000-00000000c0f5";
+  it("carries a remote outage alarm and its recovery to a canonical hub recipient, and refuses any other kind", async () => {
+    const { hub, far, bridge, remote } = setup(undefined, { realPipe: true });
+    await addRoot(hub, "chief", 15_000, { id: CHIEF, sessionId: "chief" });
+    const spoke = await addRoot(far, "forge-main");
+    await remote.hello();
+    await bridge.start();
+    await bridge.step();
+    const topic = "fabric.alarm.mesh-outage";
+    await far.publish({ topic, kind: "mesh-outage", from: spoke.identity, to: CHIEF, data: { label: "inbox", state: "outage" } });
+    await far.publish({ topic, kind: "mesh-recovered", from: spoke.identity, to: CHIEF, data: { label: "inbox", state: "recovered" } });
+    await far.publish({ topic, kind: "ask", from: spoke.identity, to: CHIEF, text: "not an alarm" });
+    await bridge.step();
+    expect(on(hub, topic).map((event) => [event.kind, event.to])).toEqual([["mesh-outage", CHIEF], ["mesh-recovered", CHIEF]]);
+    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "org" })).toBe(false); // a bare name is not a target
+    expect(isBridgedTopic({ topic, kind: "mesh-outage" })).toBe(false);
+    expect(isBridgedTopic({ topic, kind: "mesh-outage", to: "topic:fabric.alarm.mesh-ops" })).toBe(false); // round 5: session only
+    expect(() => checkBridgePublish({ topic, kind: "ask", from: spoke.identity, to: CHIEF, data: { bridge: { from: "forge", id: "x" } } }))
+      .toThrow(/topic is not allowed/);
   });
 });
 

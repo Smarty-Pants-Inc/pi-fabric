@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -44,6 +44,7 @@ const lazy = [
   "lifecycle/reload-slots.js",
   "coordination/unverified-ids.js",
   "agents/model-route.js",
+  "agents/per-call-route.js",
   "agents/spawn-router.js",
   "durable/worker-host.js",
   "native-discovery.js",
@@ -134,6 +135,19 @@ if (process.platform === "linux") {
     throw new Error(`Native helpers are unpinned (${manifest.compiler}); CI and FABRIC_NATIVE_CC_PINNED=1 builds require the pinned zig (smarty-dev#8121)`);
   }
   if (!pinned) console.warn(`[pi-fabric] native helpers are UNPINNED (${manifest.compiler}): a local build only (smarty-dev#8121)`);
+  // smarty-dev#8145: the lease probe refuses a helper or gate bundle whose chain up to the package root
+  // another user can write: the package root, and everything in dist/, ours, no group/other write, no symlink.
+  const owned = (file, label) => {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`${label} must not be a symlink`);
+    if ((stat.mode & 0o022) !== 0 || stat.uid !== process.geteuid()) {
+      throw new Error(`${label} must be owned by uid ${process.geteuid()} and not group/other-writable (uid ${stat.uid}, mode ${(stat.mode & 0o777).toString(8)})`);
+    }
+    if (stat.isDirectory()) for (const name of readdirSync(file)) owned(join(file, name), `${label}/${name}`);
+  };
+  owned(dist, "dist");
+  const top = lstatSync(root);
+  if ((top.mode & 0o022) !== 0 || top.uid !== process.geteuid()) throw new Error(`the package root ${root} must be owned by uid ${process.geteuid()} and not group/other-writable`);
   for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {
@@ -145,6 +159,8 @@ if (process.platform === "linux") {
   if (!cli.includes(`"fabric-mesh-lease":"${manifest.helpers["fabric-mesh-lease"]}"`)) {
     throw new Error("dist/mesh/mesh-backend-cli.js does not embed the fabric-mesh-lease digest of the build manifest (a lost esbuild define)");
   }
+  // bin/fabric-mesh-backend checks this one bundle before it loads it (pi-fabric#880): it must import no package file.
+  if (/\bfrom\s*["']\.|\bimport\s*\(\s*["']\./.test(cli)) throw new Error("dist/mesh/mesh-backend-cli.js imports a package file: bin/fabric-mesh-backend's pre-load check would not cover it");
 }
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
@@ -266,6 +282,9 @@ if (actorBashHookFiles.size !== 1) {
 const routeHookFiles = staticClosure([join(dist, "guards/model-route-hook.js")]);
 if (routeHookFiles.size !== 1) throw new Error("Model route hook must remain standalone");
 if (initialSource.includes("src/agents/model-route.ts")) throw new Error("Model routing escaped into startup graph");
+if (initialSource.includes("src/agents/per-call-route.ts") || initialSource.includes("src/jev/gateway-transport.ts")) {
+  throw new Error("Per-call routing escaped into startup graph");
+}
 if ([...staticClosure([join(dist, "index.js"), join(dist, "fabric-runtime-state.js")])]
   .some(file => readFileSync(file, "utf8").includes("src/agents/spawn-router.ts"))) {
   throw new Error("Spawn router adapter escaped into the eager/provider static graph");

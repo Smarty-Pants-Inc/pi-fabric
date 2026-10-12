@@ -117,7 +117,7 @@ export class JevProvider implements FabricProvider {
       case "evaluate": {
         const dispatch = await this.#dispatchFor(context.parentToolCallId);
         this.#transport = dispatch ? "jev-fabric" : "fabric";
-        return this.client.evaluate(args as unknown as JevRequest, context.signal ?? new AbortController().signal, dispatch);
+        return this.client.evaluate(args as unknown as JevRequest, context.signal ?? new AbortController().signal, dispatch ? { dispatch } : {});
       }
       case "run": return this.manager.launch(args as unknown as JevLaunch, context, false);
       case "spawn": return this.manager.launch(args as unknown as JevLaunch, context, true);

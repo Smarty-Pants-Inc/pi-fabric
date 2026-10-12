@@ -148,6 +148,16 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
   });
 });
 
+it("normalizes the dead-root resident idle-exit policy, with an explicit disabled rollback", () => {
+  expect(DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({}).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 0 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1_234 } }).mesh.residentIdleExitMs).toBe(1_234);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: -1 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: "bad" } }).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1e12 } }).mesh.residentIdleExitMs).toBe(7 * 24 * 60 * 60_000);
+});
+
 it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
   expect(normalizeFabricConfig({ mesh: { idleReadCoalesceMs: 0 } }).mesh.idleReadCoalesceMs).toBe(0);
@@ -172,6 +182,31 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
     if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
     else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
   }
+});
+
+describe("executor.powershell opt-in (smarty-dev#9826)", () => {
+  it("defaults to refuse and accepts only the exact allow", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({}).executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({ executor: { powershell: "allow" } }).executor.powershell).toBe("allow");
+    for (const value of ["refuse", "Allow", "ALLOW", true, 1, "yes", null, {}]) {
+      expect(normalizeFabricConfig({ executor: { powershell: value } }).executor.powershell).toBe("refuse");
+    }
+  });
+  it("honors the host profile opt-in and ignores a project opt-in", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+    expect(loadGlobalFabricConfig(agentDir).executor.powershell).toBe("allow");
+    // A project layer cannot withdraw it either: the key is host-only.
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "refuse" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+  });
 });
 
 describe("Fabric configuration", () => {

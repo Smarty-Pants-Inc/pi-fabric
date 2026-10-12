@@ -43,13 +43,16 @@ import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
 import { lifecycleSourceIdentity, type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../lifecycle/types.js";
-import { MeshStore, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, RUNTIME_MESH_READ_CACHE_MS, type MeshBatchView, type MeshIdentity } from "../mesh/store.js";
 import { CommitOutbox, withStateFence } from "../mesh/commit-outbox.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
+import { RESIDENT_IDLE_EXIT_MS } from "../config.js";
+import { residentIdleExitPath, type ResidentIdleExit } from "./idle-exit.js";
 import { rootPresenceAlarms } from "../topology/stall-alarms.js";
 import { actorParticipantRecord, agentParticipantRecords } from "../topology/records.js";
 import {
@@ -88,15 +91,9 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
 const REQUEST_POLL_MS = 50;
-const IDLE_EXIT_MS = 30_000;
-// The request poll runs every REQUEST_POLL_MS, but its idle check need not rebuild the
-// fleet-wide actor ownership view that often: that view lists every project participant and
-// stats every host lease, so at 20 Hz it was most of an idle host's CPU (smarty-dev#6729).
-// Requests, admissions and agents are still checked on every tick; the actor check is
-// reused for at most this long, and an exit is always confirmed by a current actor check.
-// Every actor change signal (create, run start and end, stop, ownership) restarts the idle
-// window and drops the reused observation, so a run that starts and ends between two samples
-// still counts: the window always runs from the last real actor activity.
+// Keep fleet-wide ownership/root observations off the 20 Hz request poll (smarty-dev#6729).
+// Requests/admissions/agents remain exact on every tick; exit revalidates all observations.
+// Actor and request activity resets the window even when it starts/ends between samples.
 const IDLE_ACTOR_CHECK_MS = 1_000;
 // A stat stamp of config.json proves it unchanged only once the file is older than the
 // coarsest timestamp granularity a volume may have (FAT: 2 s). Until then a same-size
@@ -225,7 +222,7 @@ export const residentIdleDecision = (input: {
   const holdsSchedules = input.nextScheduleDueAt !== undefined && input.durableParticipants;
   const wakeAt = holdsSchedules ? input.nextScheduleDueAt : undefined;
   const busy = input.activeActor || input.activeAgent || input.pendingRequest || holdsSchedules;
-  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? IDLE_EXIT_MS);
+  const exit = !busy && input.now - input.idleSince >= (input.idleExitMs ?? RESIDENT_IDLE_EXIT_MS);
   return { busy, exit, ...(wakeAt !== undefined ? { wakeAt } : {}) };
 };
 
@@ -257,7 +254,8 @@ export class ResidentHost {
   readonly #agentsPath: string;
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
-  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery");
+  readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   // A delivery whose root is chosen on shared state is written after the commit that chose it
   // (smarty-dev#6477 R11); a crash in between leaves its row for the next flush to replay.
   #deliveryCommits!: CommitOutbox;
@@ -276,14 +274,17 @@ export class ResidentHost {
   readonly #creations = new Map<string, { result: Promise<ResidentCommandResponse>; completedAt?: number }>();
   #closed = false;
   #routeOwner?: ShadowRouteOwner;
-  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll");
+  readonly #backgroundRequests = new MeshBackgroundRetry("resident request poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   readonly #backgroundDeliveries = new MeshBackgroundQueue("resident completion/actor delivery");
   #started = false;
   #ready = false;
-  #idleSince = Date.now();
-  #activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
-  // Retention overlay of config.json, keyed by the file's identity (smarty-dev#6729).
-  #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"] } | undefined;
+  #idleSince: number | undefined;
+  #idleExitRequested = false;
+  #residentIdleExitMs = RESIDENT_IDLE_EXIT_MS;
+  #idleObservation = { at: Number.NEGATIVE_INFINITY, blocked: true, durable: true };
+  // Accepted policy overlay of config.json, keyed by file identity (smarty-dev#6729).
+  #retentionOverlay: { stamp: string; retention: ResidentHostConfig["retention"]; idleExitMs: number } | undefined;
   #admissions = 0;
   readonly #requestRetention: ResidentRequestRetention;
   #handover: ResidentHandoverPlan | undefined;
@@ -303,6 +304,7 @@ export class ResidentHost {
     readonly launch?: ResidentHostLaunchContext,
   ) {
     this.#staged = !!launch?.attempt;
+    this.#residentIdleExitMs = config.mesh.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS;
     this.hostId = residentHostId(config.rootId);
     this.identity = { id: this.hostId, name: "Fabric resident host", kind: "agent" };
     this.#ownerPath = path.join(config.residencyRoot, "owner.json");
@@ -455,7 +457,8 @@ export class ResidentHost {
         ...(overlay.modelGuidance ? { modelGuidance: overlay.modelGuidance } : {}),
         ...(overlay.kernel ? { kernel: overlay.kernel } : {}),
         ...(overlay.pythonRuntime ? { pythonRuntime: overlay.pythonRuntime } : {}),
-        ...(overlay.retention ? { retention: overlay.retention } : {}) };
+        ...(overlay.retention ? { retention: overlay.retention } : {}),
+        mesh: { ...config.mesh, residentIdleExitMs: overlay.mesh?.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS } };
     };
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
@@ -873,10 +876,11 @@ export class ResidentHost {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
-    if (this.#closed || this.#staged || this.#handover) {
+    if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
     }
     assertMeshConsumption(() => this.participants.canConsumeMesh());
+    this.#idleSince = undefined;
     this.#admissions++;
     try { return await this.#handleControl(command, from, signal, verification); }
     finally { this.#admissions--; }
@@ -1177,7 +1181,7 @@ export class ResidentHost {
   }
 
   async #pollRequests(): Promise<void> {
-    if (!this.#ready || this.#pollingRequests || this.#closed) return;
+    if (!this.#ready || this.#pollingRequests || this.#closed || this.#idleExitRequested) return;
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
@@ -1187,6 +1191,7 @@ export class ResidentHost {
       } catch {
         return;
       }
+      if (entries.length) this.#idleSince = undefined;
       for (const entry of entries.slice(0, 32)) {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
@@ -1256,38 +1261,68 @@ export class ResidentHost {
       stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       settled = BigInt(Math.floor(now)) * 1_000_000n - stat.mtimeNs >= BigInt(CONFIG_STAMP_SETTLE_MS) * 1_000_000n;
     } catch { /* Absent or unreadable: re-evaluate on every tick, as before. */ }
-    if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) return this.#retentionOverlay.retention;
-    const retention = this.#effectiveConfig?.().retention ?? this.config.retention;
+    if (stamp !== undefined && this.#retentionOverlay?.stamp === stamp) {
+      this.#residentIdleExitMs = this.#retentionOverlay.idleExitMs;
+      return this.#retentionOverlay.retention;
+    }
+    const config = this.#effectiveConfig?.() ?? this.config;
+    const retention = config.retention;
+    const configured = config.mesh.residentIdleExitMs;
+    const idleExitMs = typeof configured === "number" && Number.isFinite(configured) && configured >= 0
+      ? configured : RESIDENT_IDLE_EXIT_MS;
+    if (idleExitMs !== this.#residentIdleExitMs) this.#idleSince = undefined;
+    this.#residentIdleExitMs = idleExitMs;
     // Cache only a settled stamp: a file younger than the settle window is read on every tick.
-    this.#retentionOverlay = stamp !== undefined && settled ? { stamp, retention } : undefined;
+    this.#retentionOverlay = stamp !== undefined && settled ? { stamp, retention, idleExitMs } : undefined;
     return retention;
   }
 
   /** Actor activity seen through the manager's change signal: count the idle window from now and
    * take a current actor observation at the next idle check instead of the reused one. */
   #noteActorActivity(): void {
-    this.#idleSince = Date.now();
-    this.#activeActor = { at: Number.NEGATIVE_INFINITY, active: true };
+    this.#idleSince = undefined;
+    this.#idleObservation = { at: Number.NEGATIVE_INFINITY, blocked: true, durable: true };
   }
 
-  #hasActiveActor(now: number, current = false): boolean {
-    if (current || now - this.#activeActor.at >= IDLE_ACTOR_CHECK_MS) {
-      this.#activeActor = { at: now, active: this.actors.hasActiveDurableActor() };
+  #hasIdleBlocker(now: number, current = false): boolean {
+    if (current || now - this.#idleObservation.at >= IDLE_ACTOR_CHECK_MS) {
+      let blocked = true, durable = false;
+      try {
+        // get() honours Main's published reloadUntil and matching host-lease incarnation.
+        // A live Main host lease also vetoes exit if its participant publication is absent.
+        const root = this.participants.get(this.config.rootId, now, { fresh: true });
+        const lease = readHostLeaseCurrent(this.config.meshRoot, this.config.rootId);
+        let rootLive = !!root || !!(lease && lease.rootId === this.config.rootId &&
+          lease.identityId === this.config.rootId && lease.expiresAt >= now);
+        if (!lease) {
+          try { fs.lstatSync(hostLeasePath(this.config.meshRoot, this.config.rootId)); rootLive = true; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") rootLive = true; }
+        }
+        blocked = rootLive || this.actors.hasOwnedActors();
+        // Pending schedules hold a wake timer only for a durable actor (main's schedule rule).
+        durable = blocked && this.actors.hasActiveDurableActor();
+      } catch { /* Unknown ownership/liveness is not permission to exit. */ }
+      this.#idleObservation = { at: now, blocked, durable };
     }
-    return this.#activeActor.active;
+    return this.#idleObservation.blocked;
+  }
+
+  #hasPendingRequest(): boolean {
+    return !!(this.#pollingRequests || this.#admissions || this.#boundaryRequests.size) ||
+      [this.#requestsPath, this.#processingPath].some(directory => {
+        try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
+        catch { return true; } // Unreadable queues cannot certify emptiness.
+      });
   }
 
   #checkIdle(): void {
-    if (this.#closed || this.#staged || this.#handover) return;
+    if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover) {
+      this.#idleSince = undefined;
+      return;
+    }
     const now = Date.now();
-    const activeActor = this.#hasActiveActor(now);
-    const activeAgent = this.agents
-      .listForUi()
-      .some((agent) => agent.status === "queued" || agent.status === "running");
-    const pendingRequest = [this.#requestsPath, this.#processingPath].some((directory) => {
-      try { return fs.readdirSync(directory).some((entry) => entry.endsWith(".json")); }
-      catch { return false; }
-    });
+    const blocked = this.#hasIdleBlocker(now);
+    const activeAgent = this.agents.listForUi().some(agent => agent.status === "queued" || agent.status === "running");
     let nextScheduleDueAt: number | undefined;
     try {
       nextScheduleDueAt = this.mesh.nextScheduleDueAt();
@@ -1296,25 +1331,38 @@ export class ResidentHost {
     }
     const decision = residentIdleDecision({
       now,
-      idleSince: this.#idleSince,
-      activeActor,
+      idleSince: this.#idleSince ?? now,
+      activeActor: blocked,
       activeAgent,
-      pendingRequest,
-      durableParticipants: activeActor || activeAgent,
+      pendingRequest: this.#hasPendingRequest(),
+      durableParticipants: this.#idleObservation.durable || activeAgent,
       nextScheduleDueAt,
+      idleExitMs: this.#residentIdleExitMs,
     });
+    // Due schedules are released on time even while idle exit is disabled.
     this.#armScheduleWake(decision.wakeAt);
-    if (decision.busy || this.#admissions) {
-      this.#idleSince = now;
+    if (decision.busy || !this.#residentIdleExitMs) {
+      this.#idleSince = undefined;
       return;
     }
-    if (now - this.#idleSince < IDLE_EXIT_MS) return;
-    // Never exit on a reused actor observation: confirm with a current one.
-    if (this.#hasActiveActor(now, true)) {
-      this.#idleSince = now;
+    this.#idleSince ??= now;
+    const idleMs = now - this.#idleSince;
+    if (idleMs < this.#residentIdleExitMs) return;
+    // A disable/rollback may have arrived between maintenance and this deadline tick.
+    // Revalidate the accepted policy before committing retirement, not just on maintenance.
+    this.#currentRetention(now);
+    if (!this.#residentIdleExitMs || this.#idleSince === undefined || now - this.#idleSince < this.#residentIdleExitMs) return;
+    // Never retire from a reused observation, or after a request appeared during the fresh read.
+    if (this.#hasIdleBlocker(now, true) || this.#hasPendingRequest()) {
+      this.#idleSince = undefined;
       return;
     }
-    this.onIdle("idle-exit");
+    const marker: ResidentIdleExit = { format: 1, reason: "root-dead-idle", rootId: this.config.rootId,
+      pid: process.pid, token: this.#token, at: now, idleMs };
+    atomicWrite(residentIdleExitPath(this.config.residencyRoot), marker);
+    this.#idleExitRequested = true;
+    console.error(`resident exiting: root dead, no actors, idle ${Math.round(idleMs / 6_000) / 10} min`);
+    this.onIdle("idle-exit"); // runResidentHost joins close(): withdraw lease/owner, then release the host fence.
   }
 
   // Re-armed on every idle check: the due time of the earliest pending

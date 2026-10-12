@@ -3624,7 +3624,12 @@ return { first, second, tail: "continued" };`,
         await service.prewarm(mainContext);
         const run = vi.spyOn(agents, "run");
         const stop = vi.spyOn(agents, "stop");
-        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
+        // smarty-dev#10340: the live worker is held by the fake worker's release file, not by its 1.5 s timer. A slow
+        // guest start (CPython on Windows) once outlived the timer, so the queued ASK was answered before admission.
+        const releaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-early-ask-"));
+        const gate = { fakeWorkerReleasePath: path.join(releaseDir, "release") };
+        const releaseWorker = () => fs.writeFileSync(gate.fakeWorkerReleasePath, "");
+        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS", gate).catch(error => error) : undefined;
         if (queued) await waitFor(() => Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!);
         const activation = actors.status(actor.id).inFlightRun;
         let mainDeadlineAt: number | undefined;
@@ -3635,9 +3640,11 @@ return { first, second, tail: "continued" };`,
         });
         const timer = captureRuntimeDeadline(backend);
         const message = queued ? "queued advice" : "LIVE_WITHOUT_PROGRESS";
+        // The in-flight case's own live ASK is held by the same release file.
+        const data = queued ? "" : JSON.stringify(gate);
         const execution = executeAfterAdmission(signal => service.execute({
-          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)})`
-            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)} });`,
+          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)}${data ? `, data=${data}` : ""})`
+            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)}${data ? `, data: ${data}` : ""} });`,
           context: mainContext, signal, parentToolCallId: "early-runtime-ask", onPartial() {},
         }), () => timer.ready() && (queued ? actors.status(actor.id).queued === 1
           : Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!)), async () => {
@@ -3656,6 +3663,7 @@ return { first, second, tail: "continued" };`,
           const result = await execution;
           expect(result.error).toMatch(/MainExecutionCeilingError/);
           expect(result.trace.outcome).toBe("timed_out");
+          releaseWorker(); // the guest's deadline outcome is in: the accepted ASK work may finish now
           if (first) expect(await first).toMatchObject({ text: "live attempt 1 complete" });
           await waitFor(() => actorDeliveries.length === (queued ? 2 : 1) && actors.status(actor.id).status === "idle", 3_000);
           expect(actorDeliveries.map(delivery => delivery.message.text)).toEqual(queued
@@ -3664,11 +3672,13 @@ return { first, second, tail: "continued" };`,
           expect(run).toHaveBeenCalledTimes(queued ? 2 : 1);
           expect(stop).not.toHaveBeenCalled();
         } finally {
+          releaseWorker();
           timer.restore();
           await execution;
           await registry.close();
           if (first) await first;
           vi.unstubAllEnvs();
+          fs.rmSync(releaseDir, { recursive: true, force: true });
         }
     },
   );

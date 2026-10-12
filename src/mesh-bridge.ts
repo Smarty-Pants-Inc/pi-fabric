@@ -92,14 +92,14 @@ export const openBridgeStore = (
   usage: UsageFault = (message) => new Error(message),
 ): MeshStore => {
   const selected = flags.get("lock-protocol") ?? "1";
-  if (selected !== "1" && selected !== "2") throw usage("--lock-protocol must be 1 or 2");
+  if (selected !== "1" && selected !== "2" && selected !== "3") throw usage("--lock-protocol must be 1, 2 or 3");
   const capacity = flags.get("max-state-bytes");
   const maxStateBytes = capacity === undefined ? undefined : Number(capacity);
   if (maxStateBytes !== undefined && (!Number.isSafeInteger(maxStateBytes) || maxStateBytes < MAX_EVENT_BYTES * 2)) {
     throw usage(`--max-state-bytes must be a safe integer of at least ${MAX_EVENT_BYTES * 2}`);
   }
   return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
-    lockProtocol: selected === "1" ? 1 : 2,
+    lockProtocol: selected === "1" ? 1 : selected === "2" ? 2 : 3,
     ...(maxStateBytes === undefined ? {} : { maxStateBytes }),
     ...options,
   });

@@ -39,6 +39,13 @@ export interface RegisteredToolCaptureOptions {
 }
 
 const HUB_SYMBOL = Symbol.for("pi-fabric.registered-tool-capture.v1");
+/**
+ * Set by Fabric's native SDK task entry (src/worker/task-entry.ts) to the
+ * ExtensionRunner class of the SDK it runs. There process.argv[1] is the entry
+ * script, so neither argv lookup below finds the host package and the
+ * in-realm fallback patches Fabric's private peer copy instead (#8606).
+ */
+export const HOST_EXTENSION_RUNNER_SYMBOL = Symbol.for("pi-fabric.host-extension-runner.v1");
 const ANCHOR_SYMBOL = Symbol.for("pi-fabric.registered-tool-anchor.v1");
 
 const definitionDelegatesTo = (
@@ -196,8 +203,45 @@ const entryRealmPackageRoot = (): string | undefined => {
   return undefined;
 };
 
+// Every runner method Fabric's capture and its tool_call/tool_result paths call
+// on a captured runner (catalog, wrapper, shell preflight, providers).
+const CAPTURED_RUNNER_METHODS = [
+  "getAllRegisteredTools",
+  "getActiveTools",
+  "createContext",
+  "emit",
+  "emitToolCall",
+  "emitToolResult",
+] as const;
+
+/**
+ * The task entry's registration, validated. Absent means no native task entry.
+ * Anything else that is not a plain data property holding an ExtensionRunner
+ * constructor fails closed: capturing a bogus class would leave the live SDK
+ * runner unpatched and Fabric's shell paths outside the profile guards (#8606).
+ */
+export const registeredHostExtensionRunner = (): ExtensionRunnerConstructor | undefined => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, HOST_EXTENSION_RUNNER_SYMBOL);
+  if (!descriptor) return undefined;
+  const refuse = (reason: string): never => {
+    throw new Error(`Pi Fabric refuses the host ExtensionRunner registered under ${String(HOST_EXTENSION_RUNNER_SYMBOL)}: ${reason}`);
+  };
+  if (!("value" in descriptor)) refuse("it is an accessor, not a data property");
+  const value: unknown = descriptor.value;
+  if (typeof value !== "function") refuse("it is not a constructor");
+  const prototype = (value as { prototype?: unknown }).prototype;
+  if (typeof prototype !== "object" || prototype === null) refuse("its prototype is not an object");
+  const missing = CAPTURED_RUNNER_METHODS.filter(
+    (method) => typeof (prototype as Record<string, unknown>)[method] !== "function",
+  );
+  if (missing.length) refuse(`its prototype lacks ${missing.join(", ")}`);
+  return value as ExtensionRunnerConstructor;
+};
+
 const extensionRunnerConstructors = async (): Promise<ExtensionRunnerConstructor[]> => {
   const constructors = new Set<ExtensionRunnerConstructor>();
+  const registered = registeredHostExtensionRunner();
+  if (registered) constructors.add(registered);
   const packageRoots = new Set(
     [process.env.PI_PACKAGE_DIR, hostPackageRoot(), entryRealmPackageRoot()].filter(
       (root): root is string => typeof root === "string" && Boolean(root),

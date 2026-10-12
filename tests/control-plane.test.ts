@@ -1571,39 +1571,39 @@ describe("FabricControlPlane", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
-    const sender = plane(meshRoot, "host:sender");
+    // Identity validation is the subject, not filesystem throughput on shared CI runners.
+    const sender = plane(meshRoot, "host:sender", {}, { acknowledgementTimeoutMs: 5_000 });
     const receiver = plane(meshRoot, "host:receiver");
     const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
     sender.start(() => ({ accepted: false }));
     receiver.start(async (command) => {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // Publish the forgery before the owner can emit its authentic acknowledgement.
+      await store.publish({
+        topic: "fabric.control.ack",
+        kind: "accepted",
+        from: identity("host:bystander"),
+        to: "host:sender",
+        data: {
+          version: 1,
+          commandId: command.commandId,
+          targetId: command.targetId,
+          accepted: true,
+          messageId: "forged",
+        },
+      });
       return { accepted: true, messageId: "real:" + command.commandId };
     });
 
-    const request = sender.request("host:receiver", "agent:target", "steer", {
-      message: "focus", ownerIncarnation: receiver.incarnation });
-    await new Promise((resolve) => setTimeout(resolve, 35));
-    const command = store.read({ topic: "fabric.control.command", limit: 1 })[0];
-    const commandId = (command?.data as { commandId?: string } | undefined)?.commandId;
-    expect(commandId).toBeTypeOf("string");
-    await store.publish({
-      topic: "fabric.control.ack",
-      kind: "accepted",
-      from: identity("host:bystander"),
-      to: "host:sender",
-      data: {
-        version: 1,
-        commandId,
-        targetId: "agent:target",
-        accepted: true,
-        messageId: "forged",
-      },
-    });
-
-    await expect(request).resolves.toMatchObject({
+    await expect(
+      sender.request("host:receiver", "agent:target", "steer", { message: "focus", ownerIncarnation: receiver.incarnation }),
+    ).resolves.toMatchObject({
       acknowledged: true,
       messageId: expect.stringMatching(/^real:/),
     });
+    expect(store.read({ topic: "fabric.control.ack", after: 0 })).toMatchObject([
+      { from: { id: "host:bystander" }, data: { messageId: "forged" } },
+      { from: { id: "host:receiver" }, data: { messageId: expect.stringMatching(/^real:/) } },
+    ]);
   });
 
   it("recovers an unexpired current-incarnation command queued before polling starts", async () => {
@@ -1798,6 +1798,42 @@ describe("FabricControlPlane", () => {
 
     expect(receive).not.toHaveBeenCalled();
     expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toEqual([]);
+  });
+
+  // smarty-dev#9751: a command a bridge delivered long after its deadline (its bridged copy is new on this mesh)
+  // used to be skipped like history, with no ACK: its sender never learnt. It now gets the expired ACK.
+  it("answers a command a bridge delivered past its deadline with an expired ACK, never a silent skip", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-control-"));
+    roots.push(root);
+    const meshRoot = path.join(root, "mesh");
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const receiver = plane(meshRoot, "host:receiver");
+    const receive = vi.fn(() => ({ accepted: true }));
+    receiver.start(receive);
+    await store.publish({
+      topic: "fabric.control.command",
+      kind: "steer",
+      from: identity("host:sender"),
+      to: "host:receiver",
+      data: {
+        version: 1,
+        commandId: "command:late",
+        targetId: "agent:target",
+        operation: "steer",
+        replyTo: "host:sender",
+        message: "late",
+        requestedAt: Date.now() - 11 * 60_000,                 // a 30 s command, carried 11 min late
+        deadlineAt: Date.now() - 11 * 60_000 + 30_000,
+        bridge: { from: "qs32729", id: "evt-remote" },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(receive).not.toHaveBeenCalled();
+    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(expect.objectContaining({
+      to: "host:sender",
+      data: expect.objectContaining({ commandId: "command:late", accepted: false, error: "Fabric control command expired" }),
+    }));
   });
 
   it("final-drains a command published immediately before close", async () => {

@@ -13,6 +13,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../mesh/store.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
+import type { FabricMessageSender } from "../protocol.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -118,6 +119,8 @@ export interface FabricControlCommand {
   /** Commit time: preserves the existing full delivery/ACK budget after lock waits. */
   requestedAt: number;
   deadlineAt?: number;
+  /** The command event's host stamp, copied by the receiving owner; never read from command data. */
+  sender?: FabricMessageSender;
 }
 
 import type { FabricInterruptErrorCode } from "../interrupt-authority.js";
@@ -267,10 +270,12 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
     return undefined;
   }
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
+  // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
+  const { sender: _forged, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
-  return withFabricWakeAdmission({ ...data, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
-    ? copyFabricPrincipal(event.principal) : undefined } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
+  return withFabricWakeAdmission({ ...command, wakeCause, principal: event.verification === "mesh" || event.verification === "bridge"
+    ? copyFabricPrincipal(event.principal) : undefined, ...(event.sender ? { sender: event.sender } : {}) } as unknown as FabricControlCommand, wakeCause ? [wakeCause] : []);
 };
 
 interface FabricControlSeenRecord {
@@ -1161,8 +1166,12 @@ export class FabricControlPlane {
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
     );
     const key = ownedKey;
-    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes.
-    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4) return;
+    // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
+    // bridge delivered late (its bridged copy was published here just now, smarty-dev#9751) is not history:
+    // it gets the expired answer below, never a silent skip, so its sender and the fleet see it.
+    const lateDelivery = isObject(event.data) && isObject(event.data.bridge) &&
+      now - event.createdAt <= MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4;
+    if (now > deadlineAt + MAX_CONTROL_ACK_GRACE_MS + this.#pollMs * 4 && !lateDelivery) return;
     // Dedupe precedes the new-admission fence: completed earlier outcomes remain observable,
     // but their ACK names the claiming activation, never this publisher's new activation.
     const duplicate = this.#sharedClaims.has(ownedKey)

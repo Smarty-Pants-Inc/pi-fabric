@@ -5,7 +5,7 @@ import { ActorRegistryStore } from "../actors/registry-store.js";
 import { lockFile } from "../residency/file-lock.js";
 import { isMeshStateMovedMarker, readMeshStateMovedMarker } from "../mesh/backend-fence.js";
 import { meshStateDocumentProblem } from "../mesh/state-file.js";
-import { startRemovalTally, stopRemovalTally, type DeleterTally } from "./verified-remove.js";
+import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
@@ -50,10 +50,13 @@ export const MESH_RETENTION_APPROVAL = ".mesh-retention-approved.json";
 const applyRefusal = (meshRoot: string): string | undefined => {
   // Ownership of the mesh's files cannot be proven without a uid (Windows): --apply never deletes there (a dry run
   // still previews), whatever the marker says.
-  if (typeof process.getuid !== "function") return "file ownership cannot be proven on this platform; --apply deletes nothing";
-  // Verified removal is directory-relative through /proc/self/fd (smarty-dev#7916); elsewhere --apply stays off,
-  // as on main (smarty-dev#7858).
-  if (process.platform !== "linux") return "retention --apply needs Linux verified removal (smarty-dev#7858); --apply deletes nothing";
+  // smarty-dev#7858: on Windows the verified helper (present and digest-verified) proves owner SIDs and removes by
+  // handle; without it both gates stay closed.
+  const windows = process.platform === "win32" && windowsRemoveHelper() !== undefined;
+  if (typeof process.getuid !== "function" && !windows) return "file ownership cannot be proven on this platform; --apply deletes nothing";
+  // Verified removal is directory-relative through /proc/self/fd (smarty-dev#7916), or the Windows helper; elsewhere
+  // --apply stays off, as on main (smarty-dev#7858).
+  if (process.platform !== "linux" && !windows) return "retention --apply needs verified removal (Linux, or the Windows helper; smarty-dev#7858); --apply deletes nothing";
   if (!absent(path.join(meshRoot, MESH_RETENTION_HOLD))) return `deletions are held (${MESH_RETENTION_HOLD})`;
   const doubt = meshStateDoubt(meshRoot);
   if (doubt !== undefined) return `the mesh state is unknown (${doubt}); --apply deletes nothing`;
@@ -90,10 +93,11 @@ const readPrivate = (file: string, maxBytes = 64 * 1024): Record<string, unknown
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size > maxBytes || typeof process.getuid !== "function" || stat.uid !== process.getuid() ||
-        (stat.mode & 0o022) !== 0) {
-      throw new Error(`Unsafe record: ${file}`);
-    }
+    // Windows (smarty-dev#7858, pi-fabric#913): the verified helper proves on a handle that we own it and that no SID
+    // but ours, SYSTEM or Administrators may write it (the DACL); POSIX mode bits mean nothing there.
+    const owned = process.platform === "win32" ? windowsPrivate(file, fs.fstatSync(fd, { bigint: true }))
+      : typeof process.getuid === "function" && stat.uid === process.getuid() && (stat.mode & 0o022) === 0;
+    if (!stat.isFile() || stat.size > maxBytes || !owned) throw new Error(`Unsafe record: ${file}`);
     return JSON.parse(fs.readFileSync(fd, "utf8"));
   } finally { fs.closeSync(fd); }
 };
@@ -135,6 +139,8 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
 } = {}) => {
   const tally = startRemovalTally();
   registryParses = new Map(); registryRewalks = 0;
+  // The operator's sweep removes through the Windows helper (smarty-dev#7858); in-process sweeps do not.
+  setWindowsVerifiedRemoval(true);
   try {
     const result = await sweep(meshRoot, options);
     const parses = [...registryParses.values()];
@@ -143,7 +149,7 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
       rootRewalks: registryRewalks } };
     if (ownedStat(meshRoot)?.isDirectory()) { const refusal = applyRefusal(meshRoot); if (refusal !== undefined) summary.applyRefusal = refusal; }
     return { ...result, summary };
-  } finally { stopRemovalTally(); }
+  } finally { stopRemovalTally(); setWindowsVerifiedRemoval(false); }
 };
 /** The operator's lines: per deleter, then the one total (GiB) on its own line. */
 export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): string[] => {

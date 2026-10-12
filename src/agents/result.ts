@@ -128,6 +128,9 @@ export function validateAgentResult<T extends { status: string; text: string; va
     }
     record.value = value;
   } catch (error) {
+    // Fork (smarty-dev#576): a structured reply must end with one JSON value, so
+    // directive-mode prose fails loudly. Upstream's prose-to-action coercion
+    // (004d0475) is deliberately not adopted; see resolutions.md.
     record.status = "failed";
     const reason = error instanceof Error ? error.message : String(error);
     const output = record.text.trim();

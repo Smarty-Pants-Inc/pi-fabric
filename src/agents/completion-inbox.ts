@@ -81,8 +81,8 @@ export class AgentCompletionInbox {
       });
     subscribe("context", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
     subscribe("turn_start", (_event, ctx) => { this.#context = ctx; this.#confirmHeld(); });
-    subscribe("agent_settled", (_event, ctx) => {
-        if (this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
+    subscribe("agent_settled", (event, ctx) => {
+        if (event.aborted || this.#context.signal?.aborted || ctx.signal?.aborted) this.#suspended = true;
         this.#context = ctx;
         this.#confirmHeld();
         this.idleSignal();
@@ -262,6 +262,7 @@ export class AgentCompletionInbox {
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
+      if (this.#context.signal?.aborted) { this.#suspended = true; return; }
       if (this.#context.isIdle() && !this.#context.hasPendingMessages()) this.#flush();
       if (this.#receiptRetries.size) this.#schedule();
     }, IDLE_BATCH_MS);
@@ -327,6 +328,11 @@ export class AgentCompletionInbox {
       }
     } finally {
       this.#confirmHeld();
+    }
+    // A failed delivered receipt keeps its retry timer even with nothing left to send.
+    if (!this.#pending.size && !this.#receiptRetries.size && this.#timer) {
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
     }
   }
 }

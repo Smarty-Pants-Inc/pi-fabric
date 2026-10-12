@@ -46,6 +46,25 @@ export class ExecutionDeadline {
     return true;
   }
 
+  /** Human-wait pause clock (upstream deadline-pause.ts): budget left before the running deadline. */
+  remainingMs(): number { return this.#at - Date.now(); }
+
+  /**
+   * A host call waiting for a person suspends the program deadline. The host-owned
+   * absolute ceiling is never suspended: the deadline rises to it, not past it. An
+   * expired program stays expired.
+   */
+  suspend(): void {
+    if (this.reached) return;
+    this.#at = this.#clamp(Infinity);
+  }
+
+  /** Resume a suspended deadline with this budget from now, still clamped to the ceiling. */
+  resume(remainingMs: number): void {
+    if (this.#expiredReason) return;
+    this.#at = this.#clamp(Date.now() + Math.max(0, remainingMs));
+  }
+
   scheduleDeadline(expire: () => void, unref = false): void {
     this.clear();
     this.#timer = setTimeout(() => {

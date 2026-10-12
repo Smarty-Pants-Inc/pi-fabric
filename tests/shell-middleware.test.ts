@@ -10,6 +10,7 @@ import { readFabricBashMiddleware } from "../src/core/shell-middleware.js";
 import { FABRIC_BASH_MIDDLEWARE, type FabricBashMiddlewareV1 } from "../src/protocol.js";
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
+import { DurableShellBridge } from "../src/jev-fabric/bridge.js";
 
 const SECRET = "fabric-test-secret-not-a-credential";
 const registries: ActionRegistry[] = [];
@@ -101,6 +102,28 @@ const harness = (options: { middleware?: unknown; optIn?: boolean; hangMs?: numb
 };
 
 describe("cooperative bash middleware", () => {
+  it.skipIf(process.platform === "win32")("wraps durable jev-fabric operations with the same filters, prefix and spawn hook", async () => {
+    const h = harness();
+    const fake = new URL("./fixtures/fake-jev-fabric.mjs", import.meta.url).pathname;
+    const binary = path.join(h.cwd, "jev-fabric");
+    fs.writeFileSync(binary, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+    const jobs = h.provider.shellJobs;
+    jobs.durable = new DurableShellBridge(jobs, {
+      cwd: h.cwd, agentDir: path.join(h.cwd, "agent"), ownerId: "middleware-test",
+      settings: () => ({ binary, home: path.join(h.cwd, "home"), timeoutMs: 60_000 }),
+      middleware: () => readFabricBashMiddleware(h.catalog.get("bash")?.definition),
+    });
+    vi.stubEnv("FABRIC_TEST_SECRET", SECRET);
+    fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);
+    const result = await h.invoke({ command: 'cat fixture; printf "prefix=%s secret=%s\\n" "$FABRIC_PREFIX" "${FABRIC_TEST_SECRET:-unset}"', durable: true });
+    expect(result.details?.running).toBe(true);
+    await vi.waitFor(() => expect(jobs.list()[0]?.finishedAt).toBeDefined(), { timeout: 10_000 });
+    const output = await jobs.get(jobs.list()[0]!.id)!.outputText();
+    expect(output).toContain("[filtered]");
+    expect(output).toContain("prefix=kept secret=unset");
+    expect(output).not.toContain(SECRET);
+    expect(h.fallback).not.toHaveBeenCalled();
+  });
   it("delivers monitor events only after cooperative output filtering and hooks", async () => {
     const h = harness();
     fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);

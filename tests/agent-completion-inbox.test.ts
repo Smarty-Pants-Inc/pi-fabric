@@ -356,6 +356,61 @@ describe("AgentCompletionInbox", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("resumes after an automatically recovered error without requiring input", async () => {
+    const h = harness();
+    h.boundary("error");
+    h.inbox.enqueue(result("during-retry"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.boundary("stop");
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    h.idle(); h.emit("agent_settled", { aborted: false });
+    h.inbox.enqueue(result("after-recovery"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  // Upstream 1a78d011 rechecked on a 250 ms busy-retry timer; main (#868, smarty-dev#9271) polls
+  // nothing and delivers at the next busy-ending event, so this case is fitted to main's rule.
+  it.each(["busy", "queued input"])("delivers once %s clears, at the next busy-ending event, without polling", async blocked => {
+    const h = harness();
+    if (blocked === "queued input") { h.idle(); h.pending(); }
+    h.inbox.enqueue(result("a"));
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    h.idle(); h.pending(false);
+    h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("honors signal-free settled aborts even across subsequent healthy boundaries", async () => {
+    const h = harness();
+    h.emit("agent_settled", { aborted: true });
+    h.boundary("error"); h.boundary("stop");
+    h.inbox.enqueue(result("a")); h.idle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    h.emit("input");
+    expect(h.emit("before_agent_start")).toMatchObject({ message: { details: { ids: ["a"] } } });
+  });
+
+  // Fitted to main's rule (#868): the deferred check is the one idle check an enqueue arms.
+  it("cancels a deferred retry on close without acknowledging its result", async () => {
+    const h = harness(); const delivered = vi.fn();
+    h.inbox.enqueue(result("a"), delivered);
+    expect(vi.getTimerCount()).toBe(1);
+    h.inbox.close(); h.idle();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(delivered).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("checks the abort signal even before the aborted turn event arrives", async () => {
     const h = harness();
     Object.defineProperty(h.context, "signal", { value: AbortSignal.abort() });

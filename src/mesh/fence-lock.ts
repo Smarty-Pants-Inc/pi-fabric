@@ -16,7 +16,7 @@ import { MeshLock } from "./mesh-lock.js";
  */
 export interface MeshFenceOptions {
   /** The mesh `.lock` protocol. Default 1 (the migration tool's). */
-  lockProtocol?: 1 | 2;
+  lockProtocol?: 1 | 2 | 3;
   /** Budget for each fence lock (`custody.lock`, then `.lock`). */
   lockTimeoutMs: number;
 }
@@ -24,7 +24,7 @@ export interface MeshFenceOptions {
 /** Holds the fence across awaits until the operation settles. */
 export const holdMeshFence = async <T>(root: string, options: MeshFenceOptions,
   operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
-  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs);
+  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
   try {
     const lock = new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs }, () => undefined);
     return await lock.withLockAcrossAwait(async () => operation(lock), options.lockTimeoutMs, "other");

@@ -2,7 +2,6 @@
 // cases only when NATS_SERVER_URL and NATS_MONITOR_URL name a running server (JetStream with `sync_interval: always`,
 // an http monitor port); otherwise each suite shows one skipped case that names the reason. NATS_SERVER_REQUIRED=1
 // (the CI job) turns a missing server into a failure, so the job can never pass by skipping.
-import { randomUUID } from "node:crypto";
 import { it } from "vitest";
 import { openNatsStateBackend, type NatsStateBackend } from "../../src/mesh/state-backend-nats.js";
 
@@ -20,12 +19,10 @@ export const itFor = (kind: string) => it.skipIf(kind === "nats" && !natsConfigu
 /** One visible skipped case per suite that says why its nats cases did not run. */
 export const reportNatsSkip = (): void => { if (!natsConfigured) it.skip(natsSkipReason, () => undefined); };
 
-/** A fresh stream name per test: the conformance cases never share state on the server. */
-export const natsTestStream = (): string => `FABRIC_CONF_${randomUUID().replaceAll("-", "")}`;
-
-/** Prepares the root's NATS backend on its own stream, so `new MeshStore(root, …, { stateBackend: "nats" })` gets it. */
-export const prepareNatsRoot = (root: string, options: { stream?: string; lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
+/** Prepares the root's NATS backend, so `new MeshStore(root, …, { stateBackend: "nats" })` gets it. Its stream is
+ * derived from the root (pi-fabric#937): each test's fresh root has its own, so cases never share state on the server. */
+export const prepareNatsRoot = (root: string, options: { lockTimeoutMs?: number } = {}): Promise<NatsStateBackend> => {
   if (!natsConfigured) throw new Error(natsSkipReason);
-  return openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!, stream: options.stream ?? natsTestStream(),
+  return openNatsStateBackend({ root, servers: [natsServerUrl!], monitoringUrl: natsMonitorUrl!,
     ...(options.lockTimeoutMs === undefined ? {} : { lockTimeoutMs: options.lockTimeoutMs }) });
 };

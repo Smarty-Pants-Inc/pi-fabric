@@ -256,14 +256,21 @@ export const createDashboardSnapshot = (
         : agent;
     });
   const localAgentIds = new Set(localAgents.map((agent) => agent.id));
+  // Fork (smarty-dev#2004, #142 F3): the dashboard topology shows peer
+  // sessions' agents from the project directory; the widget alone narrows to
+  // this session's work (smarty-dev#1089). Upstream's snapshot-level root
+  // filter would drop peers from the topology, so only its provider rows are
+  // taken here.
   const remoteAgents: FabricUiAgent[] = participants
-    .filter((participant) => participant.kind === "agent" && !localAgentIds.has(participant.id))
+    .filter((participant) =>
+      (participant.kind === "agent" || participant.kind === "provider") &&
+      !localAgentIds.has(participant.id))
     .map((participant) => ({
       id: participant.id,
       name: participant.name,
       status: participant.status,
-      runner: participant.runner,
-      transport: participant.transport,
+      ...(participant.runner ? { runner: participant.runner } : {}),
+      transport: participant.provider ? `provider ${participant.provider}` : participant.transport,
       cwd: participant.cwd ?? "",
       ...(participant.model ? { model: participant.model } : {}),
       ...(participant.thinking ? { thinking: participant.thinking } : {}),

@@ -249,6 +249,11 @@ export class RootInbox {
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
     const pending = state.pending;
+    // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
+    // Resolve the batch's newly acked events before the cursor moves past them; next() then never
+    // sees them, and the journal dedups an id it already holds (exactly once per event id).
+    const consumed = pending ? ids.filter((id) => pending.ids.includes(id) && !this.#acks.has(id)) : [];
+    const delivered = consumed.length ? this.#reread(state.after, { ...pending!, ids: consumed }) : [];
     for (const id of ids) {
       if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
     }
@@ -257,6 +262,15 @@ export class RootInbox {
       delete state.pending;
     }
     this.#syncAcks();
+    for (const event of delivered) {
+      try {
+        appendDeliveryOutcome(this.mesh.root, { eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish" },
+          "delivered", "consumed by Main inbox as itself", this.#now());
+      } catch (error) {
+        // Observational evidence must never undo the ack that keeps the event from re-injection.
+        console.warn(`[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   /**

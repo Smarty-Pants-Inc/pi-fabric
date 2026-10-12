@@ -108,3 +108,47 @@ it("a targeted Main publish is delivered only when the session holds its dedupli
   expect(outcomes(root)).toEqual([{ eventId: event.id, to: me.id, from: "session:sender", mode: "publish", outcome: "delivered",
     reason: "consumed by Main inbox as itself", at: expect.any(Number) }]);
 });
+
+it("a targeted Main publish consumed through the normal inbox ack path records exactly one delivered outcome", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-publish-inbox-ack-")); roots.push(root);
+  const mesh = new MeshStore(root, 64 * 1024, 100);
+  const me = identity("session:main");
+  const box = new RootInbox(mesh, me, () => [me.id], { steerGraceMs: 0 });
+  closers.push(() => box.close()); box.start();
+  const event = await mesh.publish({ topic: "fleet.work", to: me.id, from: identity("session:sender"), text: "work" });
+  await vi.waitFor(async () => expect((await box.next(rootInboxSession([]))).events).toHaveLength(1));
+  expect(outcomes(root)).toEqual([]);
+  const message = rootInboxMessage([event]);
+  // extension.ts message_end: the inbox carrier entered a turn, so consumeRootInbox -> consume -> ack.
+  await box.consume(message.details.ids, message.details.receipts);
+  expect((mesh.get(box.key)?.value as { pending?: unknown }).pending).toBeUndefined();
+  const delivered = [{ eventId: event.id, to: me.id, from: "session:sender", mode: "publish", outcome: "delivered",
+    reason: "consumed by Main inbox as itself", at: expect.any(Number) }];
+  expect(outcomes(root)).toEqual(delivered);
+  // A repeated ack and later reconciles, with or without the carrier, never record it again.
+  await box.consume(message.details.ids, message.details.receipts);
+  expect((await box.next(rootInboxSession([{ type: "custom_message", ...message }]))).events).toEqual([]);
+  expect((await box.next(rootInboxSession([]))).events).toEqual([]);
+  expect(outcomes(root)).toEqual(delivered);
+});
+
+it("a partial inbox ack then next() records exactly one delivered outcome per event", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-publish-inbox-partial-")); roots.push(root);
+  const mesh = new MeshStore(root, 64 * 1024, 100);
+  const me = identity("session:main");
+  const box = new RootInbox(mesh, me, () => [me.id], { steerGraceMs: 0 });
+  closers.push(() => box.close()); box.start();
+  const first = await mesh.publish({ topic: "fleet.work", to: me.id, from: identity("session:one"), text: "one" });
+  const second = await mesh.publish({ topic: "fleet.work", to: me.id, from: identity("session:two"), text: "two" });
+  await vi.waitFor(async () => expect((await box.next(rootInboxSession([]))).events).toHaveLength(2));
+  await box.consume([first.id]);
+  expect((mesh.get(box.key)?.value as { pending?: { ids: string[] } }).pending?.ids).toEqual([first.id, second.id]);
+  expect(outcomes(root).map(row => [row.eventId, row.from, row.outcome])).toEqual([[first.id, "session:one", "delivered"]]);
+  const message = rootInboxMessage([first, second]);
+  expect((await box.next(rootInboxSession([{ type: "custom_message", ...message }]))).events).toEqual([]);
+  await box.consume(message.details.ids, message.details.receipts);
+  await box.next(rootInboxSession([{ type: "custom_message", ...message }]));
+  expect(outcomes(root).map(row => [row.eventId, row.from, row.mode, row.outcome])).toEqual([
+    [first.id, "session:one", "publish", "delivered"], [second.id, "session:two", "publish", "delivered"],
+  ]);
+});

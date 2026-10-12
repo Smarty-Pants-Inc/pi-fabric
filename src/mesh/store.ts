@@ -102,7 +102,7 @@ const scheduleErrorCode = (error: unknown): string | undefined =>
 const validWriterPid = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const validWriterHost = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 const validWriterStartedAt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
-const validWriterLockProtocol = (value: unknown): value is number => value === 1 || value === 2;
+const validWriterLockProtocol = (value: unknown): value is number => value === 1 || value === 2 || value === 3;
 /** Backends by danger to a cutover: sqlite and shadow write state without .lock (pi-fabric#638). */
 const writerBackendRank: Readonly<Record<string, number>> = { file: 0, shadow: 1, sqlite: 2 };
 const validWriterStateBackend = (value: unknown): value is string => typeof value === "string" && Object.hasOwn(writerBackendRank, value);
@@ -853,7 +853,7 @@ export class MeshStore {
     // only serializes two hosts on the same gate, never bypasses their lease-token checks.
     const domain = fs.existsSync(legacy) ? legacy
       : path.join(this.root, "host-lease-commits", hash.slice(0, 16));
-    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true });
+    const release = await acquireMeshCustodyLock(domain, lockTimeoutMs, { ...options, hostQualified: true, lockProtocol: this.#lock.lockProtocol });
     try { return await operation(); } finally { release(); }
   }
 

@@ -57,7 +57,7 @@ export type IncarnationCommandRunner = (
   options: { timeout: number; maxBuffer: number; windowsHide: boolean; signal: AbortSignal; env?: NodeJS.ProcessEnv },
 ) => Promise<string>;
 
-const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
+export const runIncarnationCommand: IncarnationCommandRunner = (executable, args, options) => new Promise((resolve, reject) => {
   childProcess.execFile(executable, args, { ...options, env: childProcessEnvironment(options.env), encoding: "utf8" }, (error, stdout) => {
     if (error) reject(error);
     else resolve(stdout);
@@ -134,6 +134,9 @@ const nativeReader = () => {
 export const processIncarnation = (pid: number, timeoutMs?: number): Promise<string | undefined> => nativeReader().read(pid, timeoutMs);
 /** Memoized lazily, not at import/registration/session start. */
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
+
+/** Why the last stale check left a holder alone (smarty-dev#9569): its namespace is foreign or unprovable. */
+export interface StaleLockNote { verdict?: "foreign" | "unproven"; namespace?: string; token?: string }
 
 export interface AtomicWriteOptions {
   // File mode for the committed file (default 0o600) and for mkdir -p of its
@@ -678,6 +681,52 @@ export class MeshLockTimeoutError extends Error {
     this.name = "MeshLockTimeoutError";
   }
 }
+
+/**
+ * A lock whose holder this process may not reclaim on pid evidence (smarty-dev#9569): another PID namespace, or one
+ * it cannot prove. Still a MeshLockTimeoutError (callers keep their retry handling), with its own code.
+ */
+export class MeshLockForeignHolderError extends MeshLockTimeoutError {
+  readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
+  /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
+  readonly recovery: string;
+  /** The same command as an argument vector: the safe form for a program to run. */
+  readonly recoveryArgv: string[];
+  constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
+    readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
+    super(holder, attempts, maxGapMs);
+    this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
+    const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
+    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", holderToken];
+    this.recovery = renderRecoveryCommand(this.recoveryArgv);
+    const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
+      : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
+    this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
+      `Recover it from inside the holder's namespace with: ${this.recovery} ; or, once the holder is STOPPED, add --unsafe-holder-stopped`;
+    this.name = "MeshLockForeignHolderError";
+  }
+}
+
+/**
+ * The recovery command for this platform's shell (pi-fabric#923 round 4). The root and the token come from disk, so
+ * each argument is single-quoted: POSIX (`'` becomes `'\''`) or PowerShell on Windows (`'` becomes `''`). A copied
+ * command then runs nothing else.
+ */
+export const renderRecoveryCommand = (argv: string[], platform: NodeJS.Platform = process.platform): string =>
+  argv.map(value => /^[A-Za-z0-9._/=+-]+$/.test(value) ? value // plain words stay bare (the command name too)
+    : platform === "win32" ? `'${value.replace(/'/g, "''")}'` : `'${value.replace(/'/g, "'\\''")}'`).join(" ");
+
+const alarmedHolders = new Set<string>();
+/**
+ * The lock-timeout alarm line for a holder this process may not reclaim, once per holder per process (the same
+ * `[pi-fabric] ALARM` path as custody-unrecoverable). A mesh publish cannot carry it: publishing takes the stuck lock.
+ */
+export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
+  const key = `${error.lockPath}\n${error.holderToken}`;
+  if (alarmedHolders.has(key)) return;
+  alarmedHolders.add(key);
+  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+};
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>

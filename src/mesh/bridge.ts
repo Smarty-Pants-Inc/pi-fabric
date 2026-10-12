@@ -40,6 +40,14 @@ const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
+/** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
+const MAX_AWAITING_ACKS = 4_096;
+/** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
+const AWAITING_ACK_MS = 15 * 60_000;
+/** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
+const UNICAST_REPLY_TO = /^(?:session|factory-host):[A-Za-z0-9._-]{1,128}$/;
+/** The outcome fields a relayed ACK carries (no result payload). */
+const RELAYED_ACK_FIELDS = new Set(["version", "commandId", "targetId", "ownerIncarnation", "accepted", "messageId", "error", "errorCode", "notRun"]);
 /** A bridge call the remote has not answered by then closes the transport. */
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
@@ -1514,6 +1522,8 @@ export class MeshBridge {
   #factoryRefilledAt = Number.NEGATIVE_INFINITY;
   /** A deferred factory event holds the inbound drain until this time (this bridge's clock). */
   #factoryWaiting = false;
+  /** Command id to the hub sender's replyTo, for commands this link carried out (smarty-dev#9751). */
+  readonly #awaitingAck = new Map<string, { replyTo: string; target: string; targetId: string; expiresAt: number }>();
   #factoryRetryAt = Number.NEGATIVE_INFINITY;
   #factoryDeferrals = 0;
   #factoryLoggedAt = Number.NEGATIVE_INFINITY;
@@ -1574,6 +1584,22 @@ export class MeshBridge {
    */
   #outbound(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): BridgePublish {
     const data = isObject(event.data) ? event.data : {};
+    // smarty-dev#9751: a hub sender that is no participant (a factory host) still gets the ACK of a command
+    // this link carried out for it. Only its own authenticated address: replyTo must be the carried command's
+    // sender, published natively on the hub (verification "mesh", never a bridged copy), so no command can
+    // point an ACK, and its result, at anyone else (pi-fabric#928 review P1). The record is bound to the
+    // command's target and expires; bounded, oldest first out.
+    if (direction === "toRemote" && event.topic === "fabric.control.command" && typeof data.commandId === "string" &&
+        data.replyTo === event.from.id && event.verification === "mesh" && UNICAST_REPLY_TO.test(data.replyTo) &&
+        typeof data.targetId === "string" && typeof event.to === "string") {
+      const now = this.#now();
+      this.#awaitingAck.delete(data.commandId);
+      this.#awaitingAck.set(data.commandId, { replyTo: event.from.id, target: event.to, targetId: data.targetId, expiresAt: now + AWAITING_ACK_MS });
+      for (const [id, awaited] of this.#awaitingAck) {
+        if (this.#awaitingAck.size <= MAX_AWAITING_ACKS && awaited.expiresAt > now) break;
+        this.#awaitingAck.delete(id);
+      }
+    }
     let from = event.from;
     if (direction === "toLocal" && rules.identities) {
       const identity = rules.identities.get(event.from.id);
@@ -1587,7 +1613,11 @@ export class MeshBridge {
       topic: event.topic, kind: event.kind, from, to: event.to!,
       ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
       ...(event.text !== undefined ? { text: event.text } : {}),
-      data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+      // An ACK that crosses only through the relay (its address is no hub recipient) carries just the outcome
+      // fields, never the command's result payload (pi-fabric#928 SEC P1).
+      data: { ...(direction === "toLocal" && event.topic === "fabric.control.ack" && !rules.recipients.has(event.to!)
+        ? Object.fromEntries(Object.entries(data).filter(([field]) => RELAYED_ACK_FIELDS.has(field))) : data),
+      bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
     } as BridgePublish;
   }
 
@@ -1976,6 +2006,16 @@ export class MeshBridge {
     return { forwarded, dropped };
   }
 
+  /** An inbound ACK for a command this link carried out, addressed to that command's replyTo (smarty-dev#9751). */
+  #awaitedAck(event: MeshEvent): boolean {
+    const commandId = isObject(event.data) ? event.data.commandId : undefined;
+    if (event.topic !== "fabric.control.ack" || typeof commandId !== "string" || !isObject(event.data)) return false;
+    const awaited = this.#awaitingAck.get(commandId);
+    // Only from the owner the command was addressed to, about the same target, to the sender itself.
+    return awaited !== undefined && awaited.expiresAt > this.#now() && awaited.replyTo === event.to &&
+      awaited.target === event.from.id && awaited.targetId === event.data.targetId;
+  }
+
   #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
     // This is control-plane routing metadata, not a business field on work events or ACKs.
     // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
@@ -1994,7 +2034,7 @@ export class MeshBridge {
     // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
     // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
     // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
-    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && isHubFactoryEvent(event)))) {
+    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
       return "not addressed across";
     }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";

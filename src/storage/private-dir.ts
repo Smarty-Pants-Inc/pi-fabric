@@ -186,10 +186,20 @@ const openHeld = (target: string, anchor: string | undefined, base: string): Pri
  * O_DIRECTORY|O_NOFOLLOW and required to be the same dev and ino as the lstat (a swap before the open refuses); a
  * created one is set to 0700 and a healed one tightened through that fd. Archive leaves are still created
  * O_EXCL|O_NOFOLLOW, by full path (writeArchiveFile).
- * ponytail: macOS has no traversable /dev/fd/N and Node has no openat, so a swap of an already validated ancestor
- * between its check and a later use remains possible there (a named residual, its own follow-up issue). Linux uses the
- * fd-pinned walk (openHeld). Strictly stronger than main, which validated nothing.
+ * ponytail: macOS has no traversable /dev/fd/N and Node 24 has no openat or mkdirat, so a validated ancestor could be
+ * swapped between its check and a later use by another uid that can write into it. The only such ancestor the rules
+ * allow is a root-owned sticky shared one (/tmp, /private/tmp), so this walk refuses to pass one (smarty-dev#9527,
+ * option 3): Fabric's private trees belong under $HOME or the per-user $TMPDIR (/var/folders/...), whose ancestors
+ * only root and our own uid can write (the accepted same-uid-or-root class, #7800). Linux uses the fd-pinned walk
+ * (openHeld) and keeps accepting sticky ancestors.
  */
+const refuseSharedSticky = (stat: fs.Stats, walked: string, target: string): void => {
+  if (stat.uid === 0 && (stat.mode & 0o1000) !== 0 && (stat.mode & 0o022) !== 0) {
+    throw new UnsafeDirectory(`${walked} is a shared sticky directory (mode ${(stat.mode & 0o7777).toString(8)}): on this platform `
+      + `Fabric cannot keep ${target} private under it. Use a directory under $HOME or the per-user $TMPDIR (/var/folders/...), `
+      + "for example by setting TMPDIR or PI_FABRIC_TMPDIR (smarty-dev#9527)");
+  }
+};
 const openWalked = (target: string, anchor: string | undefined): PrivateDirectory => {
   safeDirectory(fs.lstatSync("/"), "/");
   let fd = fs.openSync("/", NOFOLLOW_DIRECTORY);
@@ -223,6 +233,7 @@ const openWalked = (target: string, anchor: string | undefined): PrivateDirector
         if (created && opened.isDirectory() && opened.uid === process.getuid?.()) fs.fchmodSync(child, 0o700);
         else {
           const seen = privateDirTestHooks.stat?.(walked, opened) ?? opened;
+          refuseSharedSticky(seen, walked, target); // before anything is created below it
           safeDirectory(healable && underAnchor(walked, anchor) ? tighten(child, seen, walked) : seen, walked);
         }
       } catch (error) { fs.closeSync(child); throw error; }

@@ -230,7 +230,7 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect((await sweepMeshRetention(root, options)).changes.length).toBeGreaterThan(0);
   });
 
-  it("--apply is back: the CLI applies, prints the per-deleter summary and the GiB line, and the hourly sweep applies (smarty-dev#7916)", () => {
+  it("--apply refuses until #7916 PR-b and changes nothing; the dry run previews and the daily sweep only reports (smarty-dev#7916)", () => {
     const { root, actor } = make();
     const cli = path.resolve("src/storage/retention-cli.ts");
     const runner = `const { createJiti } = require("jiti"); const { pathToFileURL } = require("node:url");
@@ -243,14 +243,14 @@ createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.string
     expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would delete 1 \(3 bytes\), refused 0$/m);
     expect(dry.stderr).toMatch(/^WOULD_FREE_GIB=\d+\.\d{3}$/m);
     expect(fs.existsSync(old)).toBe(true);
+    const prior = fs.readFileSync(report, "utf8");
     const result = spawnSync(process.execPath, ["-e", runner, root, "--apply", "--report", report], { encoding: "utf8", timeout: 60_000 });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stderr).toMatch(/^pruneActorSessionBackups: deleted 1 \(3 bytes\), refused 0$/m);
-    expect(result.stderr).toMatch(/^FREED_GIB=\d+\.\d{3}$/m);
-    expect(JSON.parse(fs.readFileSync(report, "utf8")).dryRun).toBe(false);
-    expect(fs.existsSync(old)).toBe(false);
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/--apply is disabled until smarty-dev#7916 PR-b/);
+    expect(fs.readFileSync(report, "utf8")).toBe(prior);
+    expect(fs.existsSync(old)).toBe(true);
     const argv = meshRetentionSweepArgs(root, 7 * 86400000);
-    expect(argv).toEqual([root, "--apply", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, ".mesh-retention-report.json")]);
+    expect(argv).toEqual([root, "--dry-run", "--runs-older-than", String(7 * 86400000), "--report", path.join(root, ".mesh-retention-report.json")]);
   });
 
   it("refuses ambiguous identities and linked actor-reference trees without changing them", async () => {

@@ -228,7 +228,7 @@ jobs:
           NATS_SERVER_REQUIRED: '1'
           NATS_SERVER_URL: nats://127.0.0.1:4222
           NATS_MONITOR_URL: http://127.0.0.1:8222
-        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts
+        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
       - name: Server log
         if: failure()
         run: cat "$RUNNER_TEMP/nats.log"

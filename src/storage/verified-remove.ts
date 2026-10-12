@@ -26,9 +26,12 @@ import { fileURLToPath } from "node:url";
  * Directory-relative operations go through `/proc/self/fd/<fd>/<name>` (Node has no unlinkat or renameat; the same
  * pin as mesh/fence-lock.ts). Off Linux, or without getuid/geteuid (on any platform, Windows included), nothing is
  * deleted: the `fallback` option is kept for source compatibility and never invoked. smarty-dev#7858 carries the
- * verified path off Linux.
- * Every directory in the tree must be ours and closed (no group/other write), checked at the walk and again at each
- * removal step: no other uid can then change any entry, by path (the 0700 graveyard blocks it) or through a
+ * verified path off Linux. Managed scratch alone keeps main's path removal off Linux in its own sweep (pi-fabric#1014);
+ * it never reaches this helper there. Platform-cause refusals and every writable-entry refusal (initial or after the
+ * move) are counted and logged (`reportRemovalSkip`).
+ * Every entry in the tree (symbolic links excepted, never followed: see `entryClosed`) and the target itself must be
+ * ours and closed (no group/other write), checked at the walk, at each recheck and again at each removal step. For
+ * directories: no other uid can then change any entry, by path (the 0700 graveyard blocks it) or through a
  * descriptor opened earlier (write permission follows the current mode, which only the owner or root can change).
  * Residual: unlink and rmdir take a name, so only our own uid (which owns every entry already) or root can swap an
  * entry between a check and its unlink. No other user's file and nothing outside the graveyard can be reached.
@@ -76,6 +79,37 @@ export const countRefusal = (deleter: string, reason: string, target?: string, b
   if (target !== undefined) { const examples = item.examples[reason] ??= []; if (examples.length < 3) examples.push(target); }
 };
 
+/** pi-fabric#1014 SEC P2-2: a removal skipped for a platform cause (no ownership proof, no /proc/self/fd), a failed
+ * scratch path removal, or (round 1 P1) a target refused at any step because an entry is writable by group
+ * or others (for example a 0664 file created under umask 002, which this helper now refuses and never chmod-heals) is
+ * not silent where no report tally is on (in-process sweeps). `platformRemovalSkips` keeps its name for compatibility
+ * and now includes those writable-entry reasons. Cumulative counts by
+ * `deleter: reason` (fixed categories, so bounded), and one coalesced console warning per batch (a 1 s window, not per
+ * target) with each key's count and up to 3 example targets. Under a tally the report carries it instead (the caller
+ * counts it with countRefusal). The 1 s timer is referenced on purpose, so a short process that exits inside the window
+ * still emits the warning: at most a 1 s exit delay, and only after a skip (no timer at import, idle or startup). */
+const skipCounts: Record<string, number> = {};
+let pendingSkips: Map<string, { count: number; examples: string[] }> | undefined;
+export const platformRemovalSkips = (): Record<string, number> => ({ ...skipCounts });
+export const reportRemovalSkip = (deleter: string, reason: string, target: string): void => {
+  if (tally) return;
+  const key = `${deleter}: ${reason}`;
+  skipCounts[key] = (skipCounts[key] ?? 0) + 1;
+  if (!pendingSkips) {
+    pendingSkips = new Map();
+    setTimeout(() => {
+      const batch = pendingSkips!;
+      pendingSkips = undefined;
+      console.warn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${[...batch].map(([name, { count, examples }]) =>
+        `${name} x${count} (e.g. ${examples.join(", ")})`).join("; ")}`);
+    }, 1_000);
+  }
+  const item = pendingSkips.get(key) ?? { count: 0, examples: [] };
+  item.count++;
+  if (item.examples.length < 3) item.examples.push(target);
+  pendingSkips.set(key, item);
+};
+
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */
 export const verifiedRemoveTestHooks: { beforeOpen?: (target: string) => void;
   /** Windows: runs after the tree walk, right before the helper opens the entries (the ancestor-swap test). */
@@ -105,6 +139,20 @@ const same = (a: fs.Stats, b: fs.Stats): boolean => a.dev === b.dev && a.ino ===
  * earlier, and only the owner or root can change the mode. A POSIX ACL that grants another user write shows as the
  * group write bit (the ACL mask), so it is refused too. (pi-fabric#850 round 1 P1.) */
 const closed = (stat: fs.Stats): boolean => (stat.mode & 0o022) === 0;
+/** pi-fabric#1014 round 1 P1: EVERY entry kind must be closed, not only directories. Another uid may open a group/other-
+ * writable regular file (or FIFO, socket, device node) for write, and that descriptor writes after the final mtime check,
+ * so deleting it would delete new data. Refused at judgment, at each no-delete recheck and right before each unlink:
+ * this refuses an entry writable now or made writable since judgment. It does NOT prove no descriptor was opened while
+ * an earlier mode allowed it (chmod does not revoke open descriptors); that last-check window is #10678's design cut,
+ * not an atomic claim. A symbolic link IN the tree is exempt (owner decision); a symbolic link as the target is still
+ * refused (`verify`). Never chmod-healed. */
+const entryClosed = (stat: fs.Stats): void => {
+  // ponytail: a symlink's 0777 mode means nothing on Linux, and the dirfd unlink removes only the link (never followed), so no other-uid writer can reach target data through it.
+  if (stat.isSymbolicLink() || closed(stat)) return;
+  refuse(stat.isDirectory() ? "a directory in the tree is writable by group or others"
+    : stat.isFile() ? "a regular file in the tree is writable by group or others"
+    : "an entry in the tree is writable by group or others");
+};
 /** Where a held graveyard entry is now (old audit finding 3): the opened container's current path, read from its
  * /proc/self/fd link and proven to be that container by dev/ino (before and after the entry check), joined with the
  * entry name, proven to be the same object as the name below the fd. The lexical path built before proceed() can be
@@ -125,13 +173,17 @@ const located = (grave: number, entryName: string): string | undefined => {
 const kind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
 /** The judged inode, ours, same type, same mtime (also after the graveyard move: a rename keeps the mtime). */
 const verify = (file: string, judged: fs.Stats, uid: number): void => {
+  // The judged stat too: a root judged writable and chmod-closed before the open may still be held open for write by
+  // another uid (chmod does not revoke a descriptor), so the current mode alone is not enough.
+  if (judged.isSymbolicLink()) refuse("target is a symbolic link");
+  entryClosed(judged);
   const stat = fdStat(file, judged.isDirectory());
   if (stat.isSymbolicLink()) refuse("target is a symbolic link");
   if (stat.uid !== uid) refuse("target is not owned by this user");
   if (!same(stat, judged)) refuse("target inode was replaced since judgment");
   if (kind(stat) !== kind(judged)) refuse("type changed since judgment");
   if (stat.mtimeMs !== judged.mtimeMs) refuse("target was modified since judgment");
-  if (stat.isDirectory() && !closed(stat)) refuse("a directory in the tree is writable by group or others");
+  entryClosed(stat);
 };
 const open = (file: string): number => {
   try { return fs.openSync(file, O_PATH | NOFOLLOW | DIRECTORY); }
@@ -139,9 +191,13 @@ const open = (file: string): number => {
 };
 const snapOf = (stat: fs.Stats, children?: Map<string, Snap>): Snap =>
   ({ dev: stat.dev, ino: stat.ino, uid: stat.uid, kind: kind(stat), mtimeMs: stat.mtimeMs, children });
-/** Identity, owner and type; with `mtime` also the judged mtime. */
-const matches = (stat: fs.Stats, snap: Snap, mtime = true): boolean => stat.dev === snap.dev && stat.ino === snap.ino &&
-  stat.uid === snap.uid && kind(stat) === snap.kind && (!mtime || stat.mtimeMs === snap.mtimeMs);
+/** Closed mode first (throws a Refusal with the writable category, also when dev/ino/mtime match), then identity,
+ * owner and type; with `mtime` also the judged mtime. Every last check before an unlink or rmdir goes through here. */
+const matches = (stat: fs.Stats, snap: Snap, mtime = true): boolean => {
+  entryClosed(stat);
+  return stat.dev === snap.dev && stat.ino === snap.ino &&
+    stat.uid === snap.uid && kind(stat) === snap.kind && (!mtime || stat.mtimeMs === snap.mtimeMs);
+};
 const sameNames = (names: string[], children: Map<string, Snap>): void => {
   if (names.length !== children.size || names.some(name => !children.has(name))) refuse("the tree's entries changed since judgment");
 };
@@ -164,6 +220,7 @@ const verifyTree = (fd: number, uid: number, depth: number, children: Map<string
   for (const name of fs.readdirSync(at(fd))) {
     const stat = fs.lstatSync(at(fd, name));
     if (stat.uid !== uid) refuse("an entry in the tree is not owned by this user");
+    entryClosed(stat);
     if (!stat.isDirectory()) { children.set(name, snapOf(stat)); bytes += stat.isFile() ? stat.size : 0; continue; }
     const snap = snapOf(stat, new Map());
     children.set(name, snap);
@@ -178,7 +235,8 @@ const recheckTree = (fd: number, children: Map<string, Snap>, depth: number): vo
   sameNames(names, children);
   for (const name of names) {
     const snap = children.get(name)!;
-    if (!matches(fs.lstatSync(at(fd, name)), snap)) refuse("an entry in the tree changed since judgment");
+    const stat = fs.lstatSync(at(fd, name));
+    if (!matches(stat, snap)) refuse("an entry in the tree changed since judgment");
     if (snap.children) enter(fd, name, snap, child => recheckTree(child, snap.children!, depth + 1));
   }
 };
@@ -193,7 +251,8 @@ const removeTree = (parent: number, name: string, snap: Snap, uid: number, depth
   if (depth > MAX_DEPTH) refuse("tree is too deep");
   const held = fs.fstatSync(parent);
   if (held.uid !== uid || !closed(held)) refuse("a directory in the tree is writable by group or others");
-  if (!matches(fs.lstatSync(at(parent, name)), snap)) refuse("an entry in the tree changed since judgment");
+  const stat = fs.lstatSync(at(parent, name));
+  if (!matches(stat, snap)) refuse("an entry in the tree changed since judgment");
   if (!snap.children) { fs.unlinkSync(at(parent, name)); return; }
   const children = snap.children;
   enter(parent, name, snap, fd => {
@@ -201,8 +260,9 @@ const removeTree = (parent: number, name: string, snap: Snap, uid: number, depth
     sameNames(names, children);
     for (const child of names) removeTree(fd, child, children.get(child)!, uid, depth + 1);
   });
-  // Our own child removals changed its mtime: identity, owner and type only.
-  if (!matches(fs.lstatSync(at(parent, name)), snap, false)) refuse("an entry in the tree changed since judgment");
+  // Our own child removals changed its mtime: identity, owner, type and closed mode only.
+  const emptied = fs.lstatSync(at(parent, name));
+  if (!matches(emptied, snap, false)) refuse("an entry in the tree changed since judgment");
   fs.rmdirSync(at(parent, name));
 };
 
@@ -299,13 +359,17 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
 }): VerifiedRemoveResult => {
   const { deleter } = options;
   const no = (reason: string, graveyard?: string): VerifiedRemoveResult => {
+    // Every writable-entry refusal, before or after the move, is visible outside a tally (a no-op under one).
+    if (reason.includes("writable by group or others")) reportRemovalSkip(deleter, reason, target);
     countRefusal(deleter, reason, target);
     if (graveyard !== undefined && tally) (entry(deleter).graveyards ??= []).push(graveyard);
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
   // No ownership proof without getuid/geteuid: nothing is deleted on any platform, Windows included.
+  /** A platform-cause refusal: also counted and logged where no report tally is on (pi-fabric#1014). */
+  const skip = (reason: string): VerifiedRemoveResult => { reportRemovalSkip(deleter, reason, target); return no(reason); };
   if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
-    return no("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
+    return skip("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
   }
   // smarty-dev#7858: on Windows with the verified helper (unreachable while getuid is required).
   const windowsHelper = windowsVerified ? windowsRemoveHelper() : undefined;
@@ -349,7 +413,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     }
   }
   // The path-based fallback is never invoked (the latest platform decision): off Linux nothing is deleted.
-  if (process.platform !== "linux") return no("directory-relative removal needs Linux /proc/self/fd; nothing is deleted");
+  if (process.platform !== "linux") return skip("directory-relative removal needs Linux /proc/self/fd; nothing is deleted");
   if (!judged) return no("no judged stat");
   const name = path.basename(target);
   if (!name || name === "." || name === ".." || path.dirname(target) === target) return no("invalid target name");
@@ -373,8 +437,8 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     // operations) to their creates/replaces. Refused before any move or delete; no mode is changed.
     if (!parentStat.isDirectory() || !closed(parentStat)) return no("parent directory is writable by group or others");
     // The pin must resolve to the opened directory, or no directory-relative step is possible.
-    try { if (!same(fs.statSync(at(parent)), parentStat)) return no("/proc/self/fd does not resolve the parent; nothing is deleted"); }
-    catch { return no("/proc/self/fd is unavailable; nothing is deleted"); }
+    try { if (!same(fs.statSync(at(parent)), parentStat)) return skip("/proc/self/fd does not resolve the parent; nothing is deleted"); }
+    catch { return skip("/proc/self/fd is unavailable; nothing is deleted"); }
     verify(at(parent, name), judged, uid);
     let bytes = judged.isFile() ? judged.size : 0;
     const snap = snapOf(judged, judged.isDirectory() ? new Map() : undefined);
@@ -404,7 +468,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       let held = "unknown";
       try { const stat = fs.fstatSync(grave!); held = `dev ${stat.dev} ino ${stat.ino}`; } catch { /* reported as unknown */ }
       const category = `${reason}; graveyard location unresolved`;
-      countRefusal(deleter, category, target);
+      no(category); // the shared refusal side effects: one tally count, or (no tally) the writable-mode skip log
       if (tally) (entry(deleter).graveyards ??= []).push(`unresolved: held graveyard container ${held}, entry ${entryName}`);
       return { removed: false, reason: `${category} (held container ${held}, entry ${entryName})` };
     };
@@ -460,6 +524,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     countRemoval(deleter, bytes);
     return { removed: true, bytes };
   } catch (error) {
+    // Refusals reaching here precede the move (later ones are `left`); `no` reports writable-entry reasons.
     return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
   } finally {
     if (grave !== undefined) fs.closeSync(grave);

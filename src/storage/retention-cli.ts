@@ -122,10 +122,24 @@ export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled for 
 export interface MeshRetentionSummary {
   /** Per deleter: removed (dry run: would remove), bytes, refusals by reason (with up to 3 example paths). */
   deleters: Record<string, DeleterTally>;
-  /** Why --apply would refuse now (hold, epoch, state.json doubt, platform), or undefined. */
+  /** Underlying custody-gate doubt (hold, epoch, state.json, platform), or undefined. This is a preview diagnostic,
+   * not apply permission: the exported boundary and CLI still unconditionally refuse apply until #10678. */
   applyRefusal?: string;
   /** Actor registries read by this sweep: count, total parses, the most parses of one registry (1 unless it changed). */
   registries: { count: number; parses: number; maxParsesPerRegistry: number; rootRewalks: number };
+}
+/** Stable code of {@link MeshRetentionApplyDisabledError}. */
+export const MESH_RETENTION_APPLY_DISABLED_CODE = "ERR_MESH_RETENTION_APPLY_DISABLED";
+/** sweepMeshRetention(meshRoot, { dryRun: false }) rejects with this, before it reads the mesh or arms any deleter:
+ * apply stays disabled for every in-process caller (not only the CLI) until smarty-dev#10678 (owner-attributed
+ * callback fencing) lands. There is no bypass; a dry run (the default) still previews. */
+export class MeshRetentionApplyDisabledError extends Error {
+  readonly code = MESH_RETENTION_APPLY_DISABLED_CODE;
+  readonly issue = "smarty-dev#10678";
+  constructor() {
+    super("sweepMeshRetention: apply (dryRun: false) is disabled until smarty-dev#10678 (owner-attributed callback fencing) lands; nothing was read or changed. Use a dry run.");
+    this.name = "MeshRetentionApplyDisabledError";
+  }
 }
 // The last sweep's registry parse counts and root re-walks, for its summary (the sweep has many early returns).
 let registryParses: ReadonlyMap<string, number> = new Map();
@@ -137,12 +151,15 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   /** Removal age of a proven-dead resident root's runs (default: the live host's 24 h). */
   residentRunRetentionMs?: number;
 } = {}) => {
+  // smarty-dev#10678 (pi-fabric#1014 SEC P2-1): refuse at the first statement. The private sweep pins every callback
+  // to a literal dry run, so later reads of a caller-owned getter cannot enable an apply.
+  if (options.dryRun === false) throw new MeshRetentionApplyDisabledError();
   const tally = startRemovalTally();
   registryParses = new Map(); registryRewalks = 0;
   // The operator's sweep removes through the Windows helper (smarty-dev#7858); in-process sweeps do not.
   setWindowsVerifiedRemoval(true);
   try {
-    const result = await sweep(meshRoot, options);
+    const result = await sweep(meshRoot, options, true);
     const parses = [...registryParses.values()];
     const summary: MeshRetentionSummary = { deleters: tally, registries: {
       count: parses.length, parses: parses.reduce((sum, count) => sum + count, 0), maxParsesPerRegistry: Math.max(0, ...parses),
@@ -169,10 +186,10 @@ export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): st
   lines.push(`${dryRun ? "WOULD_FREE_GIB" : "FREED_GIB"}=${(bytes / 1024 ** 3).toFixed(3)}`);
   return lines;
 };
+// dryRun is the literal true until smarty-dev#10678: the apply branches below are kept for that protocol, unreachable.
 const sweep = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number; runRetentionMs?: number; residentRunRetentionMs?: number;
-}) => {
-  const dryRun = options.dryRun !== false;
+}, dryRun: true) => {
   const now = options.now ?? Date.now();
   const removedRuns: string[] = [];
   const changes: Array<{ path: string; beforeBytes: number; afterBytes: number }> = [];

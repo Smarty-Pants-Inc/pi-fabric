@@ -8,7 +8,7 @@ import {
 } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
 import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
-import { sweepMeshRetention } from "../src/storage/retention-cli.js";
+import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
 // smarty-dev#7916 acceptance: for each routed deleter, a swap between the judgment and the delete (file to symlink,
 // a replaced inode, a foreign owner, a refreshed mtime) deletes nothing; no getuid deletes nothing; a future-dated
@@ -143,17 +143,19 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = path.join(meshRoot, ".mesh-retention-sweep-10.json");
     return { target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
   },
-  "mesh --runs-older-than pass (sweepMeshRetention --apply)": () => {
-    const root = tmp("fabric-vr-mesh-");
-    const registry = path.join(root, "actors", "project");
-    const actor = path.join(registry, "actor");
-    write(path.join(registry, "actors.json"), JSON.stringify({ actors: [{ id: "actor", rootId: "session:dead", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest" }] }));
-    write(path.join(actor, "session.jsonl"), "live");
-    run(path.join(actor, "runs", "latest"));
-    const target = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 9 * DAY });
-    write(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
-    return { target, act: () => sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }) };
-  },
+};
+// The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
+// P2-1), so no helper seam can fire through it. The deleter it calls (pruneActorRunArchives) keeps the swap matrix above.
+const meshPass = () => {
+  const root = tmp("fabric-vr-mesh-");
+  const registry = path.join(root, "actors", "project");
+  const actor = path.join(registry, "actor");
+  write(path.join(registry, "actors.json"), JSON.stringify({ actors: [{ id: "actor", rootId: "session:dead", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest" }] }));
+  write(path.join(actor, "session.jsonl"), "live");
+  run(path.join(actor, "runs", "latest"));
+  const target = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 9 * DAY });
+  write(path.join(root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+  return { root, target };
 };
 
 describe.skipIf(process.platform !== "linux")("verified removal: every routed retention deleter (smarty-dev#7916)", () => {
@@ -188,6 +190,21 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     Object.defineProperty(process, "getuid", { value: undefined, configurable: true, writable: true });
     restores.push(() => Object.defineProperty(process, "getuid", { value: getuid, configurable: true, writable: true }));
     try { await act(); } catch { /* a refusal may throw; it must not delete */ }
+    expect(shape(target)).toEqual(before);
+  });
+
+  it("mesh --runs-older-than pass: a dry run plans the expired run; apply rejects before the helper's seam (smarty-dev#10678)", async () => {
+    const { root, target } = meshPass();
+    const before = shape(target);
+    const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(plan.removedRuns).toEqual([target]);
+    expect(shape(target)).toEqual(before);
+    const { verifiedRemoveTestHooks: hooks } = await import("../src/storage/verified-remove.js");
+    const seen: string[] = [];
+    hooks.beforeOpen = file => { seen.push(file); };
+    restores.push(() => { delete hooks.beforeOpen; });
+    await expect(sweepMeshRetention(root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY })).rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+    expect(seen).toEqual([]);
     expect(shape(target)).toEqual(before);
   });
 

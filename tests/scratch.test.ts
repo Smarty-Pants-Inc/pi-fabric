@@ -7,9 +7,10 @@ import { closeScratch, createScratch, SCRATCH_OWNER_FILE, sweepScratch } from ".
 import { NativeReaderCheckpoint } from "../src/ui/conversation-native-reader-checkpoint.js";
 
 const HOUR = 3_600_000;
-// Latest platform decision: verifiedRemove deletes only on Linux; elsewhere the same eligible roots are kept (no
-// path fallback is invoked). Planning and dry runs are unchanged everywhere.
-const verifiedDeletes = process.platform === "linux";
+// pi-fabric#1014: on Linux the verified helper removes (only with getuid proof); off Linux scratch keeps main's path
+// removal after its rechecks (tests/scratch-platform-retention.test.ts). Planning and dry runs are unchanged everywhere.
+// This suite performs real deletions of its own fixtures: hosted CI only, not run on agent hosts.
+const verifiedDeletes = process.platform !== "linux" || typeof process.getuid === "function";
 const roots: string[] = [];
 const sandbox = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-test-"));

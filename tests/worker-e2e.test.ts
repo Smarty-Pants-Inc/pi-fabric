@@ -276,6 +276,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-restart-exit",
+      // Like kill-worker: recovery here is not the run deadline. On a loaded Windows runner the fake child's
+      // terminate-and-restart can outlast a 2 s wall, so the generic deadline wins (timed_out) (pi-fabric#982, #967).
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("failed");
         expect(r.error).toContain("Error: Terminated");
@@ -283,6 +286,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-recover",
+      // Like kill-worker: recovery here is not the run deadline. On a loaded Windows runner the fake child's
+      // terminate-and-restart can outlast a 2 s wall, so the generic deadline wins (timed_out) (pi-fabric#982, #967).
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("completed");
         expect(r.error).toBeUndefined();

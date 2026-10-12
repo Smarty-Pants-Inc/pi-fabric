@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
+import { parsePerCallRouting } from "./agents/per-call-config.js";
 import { normalizeAgentRouterConfig, type FabricAgentRouterConfig } from "./agents/router-config.js";
 export type { FabricAgentRouterConfig } from "./agents/router-config.js";
 import { normalizeAgentPlacement, type AgentPlacementConfig } from "./agents/placement-config.js";
@@ -1475,6 +1476,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
                 }
                 return { ...routing.revertReset as Record<string, string> };
               })(),
+              ...(routing.perCall !== undefined ? { perCall: parsePerCallRouting(routing.perCall) } : {}),
               ...(typeof routing.pinModel === "string" ? { pinModel: routing.pinModel } : {}),
               ...(isFabricThinking(routing.pinThinking) ? { pinThinking: routing.pinThinking } : {}),
               shadowCandidates: Array.isArray(routing.shadowCandidates)
@@ -2173,6 +2175,12 @@ const resolveFabricConfig = (
       // Host-only: a workspace cannot opt into unguarded PowerShell (smarty-dev#9826).
       delete executor.powershell;
       document.executor = executor;
+      if (Object.hasOwn(document, "jev")) {
+        // Host-only: a lane cannot redirect Jev questions to another socket.
+        const jev = { ...objectValue(document.jev) };
+        delete jev.gatewaySocket;
+        document.jev = jev;
+      }
     }
     merged = mergeObjects(merged, document);
   }

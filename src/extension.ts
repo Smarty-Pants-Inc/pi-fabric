@@ -45,6 +45,7 @@ import {
   effectiveToolCaptureConfig,
 } from "./config.js";
 import { registerLazyCompactionHook } from "./compaction/lazy-hook.js";
+import { registerLazyPerCallRouter } from "./agents/per-call-route-hook.js";
 import { COMPACTION_FAILED_ALARM, registerCompactionRecovery } from "./compaction/recovery.js";
 import { compactAtConfiguredThreshold, type AutoCompactionTrigger } from "./compaction/threshold.js";
 import type { CompactionOwnerObserver } from "./compaction/owner.js";
@@ -1340,6 +1341,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     onYield: () => {
       compactionYieldPending = true;
     },
+  });
+
+  // Per-call model routing, shadow only (smarty-dev#2890): inert and unloaded unless
+  // agents.modelRouting.perCall.mode is "shadow"; never changes the model or the context.
+  registerLazyPerCallRouter(pi, () => {
+    const config = state.cwd ? state.config : state.provisionalConfig();
+    return { perCall: config.agents.modelRouting?.perCall, jev: config.jev };
   });
 
   // No extractive module import, branch read or model call until explicit opt-in

@@ -17,6 +17,7 @@ const lockKey = Symbol.for("pi-fabric.mesh.lock-stats");
 const registry = globalThis as typeof globalThis & { [lockKey]?: { flush(): void; dispose(): void } };
 import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
 import { importMeshState } from "../src/mesh/backend-migration.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 
 const roots: string[] = [];
 const tempRoot = (): string => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-verified-remove-")); roots.push(root); return root; };
@@ -133,6 +134,41 @@ describe("mesh judge-then-delete paths remove only the judged inode (smarty-dev#
     await run();
     // Gone, or (the import) its name now holds a different file the import wrote: the judged inode is removed.
     expect(!fs.existsSync(target) || fs.lstatSync(target).ino !== judgedInode).toBe(true);
+  });
+});
+
+// Actor binding lock recovery: a stale lock directory of a dead pid is removed; a fresh lock that a new owner created
+// under the same name after the judgment must survive (its owner still holds it, so this writer times out).
+describe("binding-store stale lock recovery removes only the judged lock (smarty-dev#8907)", () => {
+  const onLinux = process.platform === "linux" ? it : it.skip;
+  const staleLock = () => {
+    const root = tempRoot();
+    const store = new ActorBindingStore("session-a", root);
+    const lockPath = `${store.filePath!}.lock`;
+    fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, "owner"), `dead\n${deadPid()}\n${Date.now() - 60_000}\n`, { mode: 0o600 });
+    return { store, lockPath };
+  };
+  onLinux("a lock re-created by a live owner after the stale judgment survives", async () => {
+    const { store, lockPath } = staleLock();
+    const live = `live\n${process.pid}\n${Date.now()}\n`;
+    let swapped = false;
+    verifiedRemoveTestHooks.beforeOpen = file => {
+      if (file !== lockPath || swapped) return;
+      swapped = true;
+      // Another recoverer removed the stale lock, and a new live owner took the name.
+      fs.renameSync(lockPath, `${lockPath}.gone-${randomUUID()}`);
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner"), live, { mode: 0o600 });
+    };
+    await expect(store.setModel("actor-1", "model-a")).rejects.toThrow(/Timed out waiting for the Fabric actor binding lock/);
+    expect(swapped).toBe(true);
+    expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(live);
+  }, 15_000);
+  onLinux("with no swap, the stale lock is recovered and the write proceeds", async () => {
+    const { store, lockPath } = staleLock();
+    await expect(store.setModel("actor-1", "model-a")).resolves.toMatchObject({ model: "model-a" });
+    expect(fs.existsSync(lockPath)).toBe(false);
   });
 });
 

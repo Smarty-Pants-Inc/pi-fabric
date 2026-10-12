@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { removeJudged } from "../mesh/judged-remove.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 
 export interface ActorSessionBindingRecord {
@@ -212,15 +213,15 @@ export class ActorBindingStore {
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw error;
         try {
+          // smarty-dev#8907: the lock directory judged stale is the inode removed. Another recoverer can remove it
+          // and a new owner can create a fresh lock under the same name before this delete; that one stays.
+          const judged = fs.lstatSync(lockPath);
           const firstOwner = fs.readFileSync(ownerPath, "utf8");
           const [, pidText, createdText] = firstOwner.trim().split("\n");
           const stale = Date.now() - Number(createdText) > BINDING_STALE_LOCK_MS;
           if (stale && !processAlive(Number(pidText))) {
             const secondOwner = fs.readFileSync(ownerPath, "utf8");
-            if (secondOwner === firstOwner) {
-              fs.rmSync(lockPath, { recursive: true, force: true });
-              continue;
-            }
+            if (secondOwner === firstOwner && removeJudged(lockPath, judged, "actor-binding-lock")) continue;
           }
         } catch {
           // Lock creation or stale recovery raced; retry until the deadline.
@@ -236,6 +237,8 @@ export class ActorBindingStore {
     } finally {
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
+        // ponytail (smarty-dev#8907): this is the owner's own release, checked by its token, not an expiry judgment.
+        // While this owner lives, no recoverer removes or replaces its lock (that needs a dead pid).
         if (owner.startsWith(`${token}\n`)) {
           fs.rmSync(lockPath, { recursive: true, force: true });
         }

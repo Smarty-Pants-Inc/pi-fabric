@@ -153,7 +153,7 @@ describe("controller preview performance", () => {
     const { pending } = await h.open();
     const a = reads.mock.contexts[0] as NativeConversationReader;
     h.view().handleInput("saved draft");
-    h.view().handleInput("\x1b[H");
+    h.view().handleInput("\x1b[1;5H"); // Pi 1.1: tui.altScreen.top is Ctrl+Home
     const pinned = h.view().render(100);
     expect(a.last?.messages).toHaveLength(40);
     expect(pinned.join("\n")).toContain("message-0");

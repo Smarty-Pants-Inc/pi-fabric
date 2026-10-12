@@ -49,7 +49,7 @@ export const armFabricPrewalkSession = async (
         customType: PREWALK_ARMED_MESSAGE_TYPE,
         content: armedPrompt,
         display: false,
-        details: { mode: prewalk.mode, model: input.model },
+        details: { mode: prewalk.mode, model: input.model, requirePlan: prewalk.requirePlan },
       },
       { deliverAs: "nextTurn" },
     );

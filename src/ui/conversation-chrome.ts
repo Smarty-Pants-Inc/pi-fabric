@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ScrollViewScrollbar } from "@earendil-works/pi-tui";
 import { getConversationHost } from "./conversation-host.js";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { formatTokens, safeText } from "./format.js";
@@ -14,6 +15,7 @@ export interface FabricConversationAppearance {
   showImages?: boolean;
   imageWidthCells?: number;
   copyOnSelect?: boolean;
+  scrollbar?: ScrollViewScrollbar;
 }
 
 /** Read the host's public Pi settings without changing its editor or footer. */
@@ -24,6 +26,7 @@ export function readConversationAppearance(cwd: string, agentDir: string, projec
     codeBlockIndent: settings.getCodeBlockIndent(), hideThinkingBlock: settings.getHideThinkingBlock(),
     showImages: settings.getShowImages(), imageWidthCells: settings.getImageWidthCells(),
     copyOnSelect: settings.getFullscreenCopyOnSelect(),
+    scrollbar: settings.getFullscreenScrollbar(),
   };
 }
 

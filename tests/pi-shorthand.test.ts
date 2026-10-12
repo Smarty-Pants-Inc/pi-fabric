@@ -457,7 +457,7 @@ describe("pi expanded argument aliases", () => {
 });
 
 describe("tools discovery proxy", () => {
-  it("routes discovery, normalizes search shorthand, and rejects core-tool names with a pi hint", async () => {
+  it("routes discovery, normalizes search shorthand, and adds core-tool aliases", async () => {
     const checked = typeCheckFabricCode(
       'return tools.search("fovea");',
       GUEST_TYPE_DECLARATIONS,
@@ -468,13 +468,14 @@ describe("tools discovery proxy", () => {
       if (ref === "fabric.$providers") return [{ name: "pi", description: "Pi core" }];
       if (ref === "fabric.$list") return [];
       if (ref === "fabric.$search") return [{ ref: `extensions.${String(args.query)}_focus` }];
+      if (ref === "fabric.$nativeTool") return "native read";
       throw new Error("Unexpected call: " + ref);
     });
     const result = await new QuickJsRuntime().execute(
       'const p = await tools.providers();' +
         'const l = await tools.list({});' +
         'const s = await tools.search("fovea");' +
-        'let err = ""; try { tools.read({ path: "/x" }); } catch (e) { err = String(e); }' +
+        'const err = await tools.read({ path: "/x" });' +
         'return { providers: p.length, list: l.length, search: s[0].ref, err };',
       hostCall,
       options,
@@ -487,8 +488,8 @@ describe("tools discovery proxy", () => {
     expect(value.providers).toBe(1);
     expect(value.list).toBe(0);
     expect(value.search).toBe("extensions.fovea_focus");
-    expect(value.err).toContain("tools.read is not available");
-    expect(value.err).toContain("pi.read");
+    expect(value.err).toBe("native read");
+    expect(hostCall.mock.calls[3]?.slice(0, 2)).toEqual(["fabric.$nativeTool", {name: "read", args: {path: "/x"}}]);
   });
   it("names the native tool instead of pi in orchestration-only mode (smarty-dev#459)", async () => {
     const result = await new QuickJsRuntime().execute(

@@ -859,7 +859,7 @@ const registeredExecution = async (state: Awaited<ReturnType<typeof harness>>, m
   } as unknown as FabricInvocationContext["extensionContext"];
   let sequence = 0;
   return async (code: string, signal?: AbortSignal) => {
-    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context!);
+    const result = await tool.execute(`round4-${++sequence}`, { code }, signal, undefined, context! as never);
     // Pi's ToolDefinition return type omits the runtime-supported isError flag.
     return result as typeof result & { isError?: boolean };
   };

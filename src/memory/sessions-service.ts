@@ -33,7 +33,7 @@ export async function processMemorySessions(
   if (sourceId !== undefined) {
     try {
       const source = resolveRegisteredSource(context.sources, sourceId);
-      const { snapshots, coverageReasons } = await listHostSnapshots(source, limit, "list", signal);
+      const { snapshots, coverageReasons } = await listHostSnapshots(source, limit, "list", signal, context.fabricScope);
       const options = resolveIndexOptions(context.config, context.agentDir, branches);
       const index = loadHostTieredIndex(snapshots, options, false, undefined, coverageReasons);
       const shards = new Map(index.shards.map((shard) => [shard.sessionFile, shard]));

@@ -21,9 +21,9 @@ type BindingEvent is Data:
   Release{}
   Begin{cleanup: Bool}
   End{}
-  Close{}
+  Shut{}
   Complete{}
-  Fail{}
+  Abort{}
 
 type Command is Data:
   Denied{}
@@ -102,17 +102,17 @@ def step(event: BindingEvent, life: Life) -> Outcome:
       Outcome{life, Denied{}}
     case End{} Life{phase, owner, holds, 1n+calls, revoked}:
       Outcome{Life{phase, owner, holds, calls, revoked}, Granted{}}
-    case Close{} Life{Retiring{}, False{}, 0n, 0n, revoked}:
+    case Shut{} Life{Retiring{}, False{}, 0n, 0n, revoked}:
       Outcome{Life{Closing{}, False{}, 0n, 0n, revoked}, StartClose{}}
-    case Close{} _:
+    case Shut{} _:
       Outcome{life, Denied{}}
     case Complete{} Life{Closing{}, owner, holds, calls, revoked}:
       Outcome{Life{Closed{}, owner, holds, calls, revoked}, Granted{}}
     case Complete{} _:
       Outcome{life, Denied{}}
-    case Fail{} Life{Closed{}, owner, holds, calls, revoked}:
+    case Abort{} Life{Closed{}, owner, holds, calls, revoked}:
       Outcome{life, Denied{}}
-    case Fail{} Life{+phase, +owner, +holds, +calls, +revoked}:
+    case Abort{} Life{+phase, +owner, +holds, +calls, +revoked}:
       Outcome{Life{Failed{}, False{}, holds, calls, True{}}, Granted{}}
 
 def bindingStep(life: Life, event: BindingEvent) -> Outcome:

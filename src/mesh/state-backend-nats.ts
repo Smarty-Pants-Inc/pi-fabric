@@ -12,7 +12,6 @@ import dns from "node:dns";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { gte as semverGte, valid as semverValid } from "semver";
 import { captureStorageDelete, captureStoragePut, storageRevision } from "../verified/storage.js";
 import type { MeshIdentity } from "./event-log.js";
 import type {
@@ -940,10 +939,28 @@ export const preparedNatsStateBackend = (root: string): NatsStateBackend | undef
 /** Minimum server: 2.14.7, as smarty-dev#7504 requires (per-message TTL and delete markers since 2.11; the KV leases of phase 2). */
 export const MIN_SERVER: readonly number[] = Object.freeze([2, 14, 7]); // frozen: no in-process write lowers the floor
 // Strict semver (pi-fabric#937 round 1): a prerelease (2.14.7-rc.1) is below its release; an unparseable version refuses.
+// ponytail: no `semver` package here. This module is in the bridge's import graph, and bundled bridge copies resolve no
+// node_modules (pi-fabric#937 CI); the floor is one fixed release, so the strict SemVer 2.0.0 grammar `semver.valid` accepts
+// (a `v` prefix, no leading zeros, prerelease and build identifiers, at most 256 characters) is parsed here, and only
+// MAJOR.MINOR.PATCH plus "has a prerelease" decide (build metadata never does; against a release floor a prerelease
+// counts only when its MAJOR.MINOR.PATCH equals the floor). tests/state-backend-nats.test.ts checks it against semver.
+const NUMERIC = "0|[1-9]\\d*";
+const PRERELEASE_ID = `(?:${NUMERIC}|\\d*[A-Za-z-][0-9A-Za-z-]*)`;
+const STRICT_SEMVER = new RegExp(`^v?(${NUMERIC})\\.(${NUMERIC})\\.(${NUMERIC})(-${PRERELEASE_ID}(?:\\.${PRERELEASE_ID})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`);
 const versionAtLeast = (version: string, minimum: readonly number[]): boolean => {
-  const have = semverValid(version.replace(/^v/, ""));
-  return have !== null && semverGte(have, minimum.join("."));
+  const text = version.replace(/^v/, "").trim();
+  if (text.length > 256) return false;
+  const match = STRICT_SEMVER.exec(text);
+  if (!match) return false;
+  const have = [match[1], match[2], match[3]].map(Number);
+  if (!have.every(Number.isSafeInteger)) return false;
+  for (let index = 0; index < 3; index++) {
+    if (have[index] !== minimum[index]) return have[index]! > minimum[index]!;
+  }
+  return match[4] === undefined; // equal MAJOR.MINOR.PATCH: a prerelease is below the release
 };
+/** Test-only: the floor comparison (the semver parity check). */
+export const natsVersionAtLeastForTest = versionAtLeast;
 
 export interface OpenNatsStateBackendOptions {
   /** The mesh root this backend serves. Its stream is always derived from it (natsStreamName): no override, so two

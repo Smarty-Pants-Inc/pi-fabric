@@ -1,9 +1,10 @@
 import os from "node:os";
 import path from "node:path";
+import semver from "semver";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
-  MAX_MESSAGE_BYTES, MIN_SERVER, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
+  MAX_MESSAGE_BYTES, MIN_SERVER, natsVersionAtLeastForTest, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
   guardNatsPort, NatsStateBackend, natsStreamName, NatsWrongLastSequenceError, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
@@ -971,6 +972,28 @@ describe("JetStream backend: round 1 (pi-fabric#937)", () => {
     expectNoSecret(texts(read));
     expectNoSecret(texts(await backend.put({ key: "x/c", value: 1, identity }).catch(caught => caught as Error)));
     expectNoSecret([String(backend.diagnostics().nats?.failure)]);
+  });
+
+  it("the version floor without the semver package (pi-fabric#937 CI): 2.14.10 passes 2.14.7, 2.9.99 refuses, and it agrees with semver", async () => {
+    for (const version of ["2.14.10", "2.14.100", "2.20.0", "10.0.0"]) {
+      const server = fakeJetStream();
+      server.version = version;
+      await expect(open(server), version).resolves.toBeInstanceOf(NatsStateBackend);
+    }
+    for (const version of ["2.9.99", "2.13.99", "1.99.99", "2.14.6"]) {
+      const server = fakeJetStream();
+      server.version = version;
+      await expect(open(server), version).rejects.toThrow(/older than 2\.14\.7/);
+    }
+    // Parity with the semver package (the rule this replaced), on the edges a hand parser gets wrong.
+    const corpus = ["2.14.7", "v2.14.7", "vv2.14.7", " 2.14.7 ", "2.14.7+build.1", "2.14.7-rc.1", "2.14.7-rc.01", "2.14.7-0", "2.14.8-rc.1",
+      "2.14.10", "2.9.99", "02.14.7", "2.014.7", "2.14.07", "2.14", "2.14.7.1", "2.14.7-", "2.14.7+", "2.14.7-a..b", "2.14.7-x-y.1",
+      "3.0.0-alpha+exp.sha.5114f85", "2.15.0-rc.1", "9007199254740992.0.0", "", "garbage", `2.14.7-${"a".repeat(300)}`];
+    for (const version of corpus) {
+      const reference = semver.valid(version.replace(/^v/, ""));
+      const expected = reference !== null && semver.gte(reference, "2.14.7");
+      expect(natsVersionAtLeastForTest(version, MIN_SERVER), JSON.stringify(version)).toBe(expected);
+    }
   });
 
   it("CODE P2: a prerelease is below its release: 2.14.7-rc.1 and -beta refused, 2.14.7 and 2.14.8 accepted", async () => {

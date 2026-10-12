@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLockEvents, LOCK_EVENT_MAX_LINE_BYTES, LOCK_EVENTS_FILE, LOCK_EVENTS_ROTATE_BYTES, LOCK_EVENTS_ROTATE_LOCK,
-  LOCK_EVENTS_ROTATE_LOCK_STALE_MS, LOCK_HELD_EVENT_MS, lockEventLine, lockStatsHost, type LockEvent, type LockEvents,
+  LOCK_EVENTS_ROTATE_LOCK_STALE_MS, LOCK_EVENTS_WIN32_ROTATION_ISSUE, LOCK_HELD_EVENT_MS, lockEventLine, lockStatsHost, type LockEvent, type LockEvents,
 } from "../src/mesh/commit-stats.js";
 import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
@@ -43,6 +43,8 @@ const readEvents = (file: string): LockEvent[] => {
   });
 };
 const spin = (ms: number): void => { const until = performance.now() + ms; while (performance.now() < until) { /* hold */ } };
+// Rotation is disabled on Windows (scope cut, smarty-dev#10191): tests of a real rotation run elsewhere.
+const itRotates = it.skipIf(process.platform === "win32");
 const ownComm = (): string | undefined => {
   try { return fs.readFileSync(`/proc/${process.pid}/comm`, "utf8").trim(); } catch { return undefined; }
 };
@@ -146,7 +148,8 @@ describe("lock events across processes", () => {
 describe("lock events: rotation across processes", () => {
   // Review P2: rotation is serialized by an O_EXCL lock and re-checks the inode, so no appender can
   // rename a newer file over .1 or drop its line on ENOENT. Sized for exactly one rotation, so every
-  // line must be in events.jsonl or events.jsonl.1.
+  // line must be in events.jsonl or events.jsonl.1. Windows: rotation is disabled (smarty-dev#10191;
+  // CI lost ~46% of the lines here), so every line must be in events.jsonl and no .1 may exist.
   it("N concurrent appenders across a forced rotation lose no lines", async () => {
     const root = temp();
     fs.mkdirSync(path.join(root, "lock-stats"), { mode: 0o700 });
@@ -187,20 +190,28 @@ describe("lock events: rotation across processes", () => {
     });
     await Promise.all(children.map((entry) => entry.ready));
     fs.writeFileSync(go, "");
-    for (const result of await Promise.all(children.map((entry) => entry.done))) {
+    const results = await Promise.all(children.map((entry) => entry.done));
+    for (const result of results) {
       expect(result, result.stderr).toMatchObject({ code: 0 });
       expect(result.stdout).toContain("errors=0");
     }
     const file = eventsFile(root);
-    expect(fs.existsSync(`${file}.1`)).toBe(true); // the rotation happened
-    expect(fs.readdirSync(path.join(root, "lock-stats")).sort()).toEqual([LOCK_EVENTS_FILE, `${LOCK_EVENTS_FILE}.1`]);
+    if (process.platform === "win32") {
+      // The real Windows check: append only, no rename, no rotation lock; nothing is lost.
+      expect(fs.existsSync(`${file}.1`)).toBe(false);
+      expect(fs.readdirSync(path.join(root, "lock-stats"))).toEqual([LOCK_EVENTS_FILE]);
+      expect(results.some((result) => result.stderr.includes(LOCK_EVENTS_WIN32_ROTATION_ISSUE))).toBe(true);
+    } else {
+      expect(fs.existsSync(`${file}.1`)).toBe(true); // the rotation happened
+      expect(fs.readdirSync(path.join(root, "lock-stats")).sort()).toEqual([LOCK_EVENTS_FILE, `${LOCK_EVENTS_FILE}.1`]);
+    }
     const seen = [...readEvents(`${file}.1`), ...readEvents(file)].map((event) => `${event.holder.pid}:${event.heldMs}`);
     expect(seen).toHaveLength(writers * lines);
     expect(new Set(seen).size).toBe(writers * lines);
     for (const { pid } of children) for (let i = 0; i < lines; i++) expect(seen).toContain(`${pid}:${100 + i}`);
   }, 60_000);
 
-  it("a busy rotation lock defers rotation without losing the line; a crashed rotator's lock is broken", () => {
+  itRotates("a busy rotation lock defers rotation without losing the line; a crashed rotator's lock is broken", () => {
     const events = createLockEvents("1", { rotateBytes: 4096 })!;
     const root = temp();
     const directory = path.join(root, "lock-stats");
@@ -221,9 +232,9 @@ describe("lock events: rotation across processes", () => {
     expect(events.errors).toBe(0);
   });
 
-  // PR #905 Windows CI: a rename or an append racing another process's handle on events.jsonl fails
-  // with EPERM/EBUSY/EACCES there. Simulated on any OS: a refused rename skips the rotation, a refused
-  // append retries against the current file with a bounded backoff; no line is lost.
+  // PR #905 Windows CI: an append racing another process's handle on events.jsonl fails with
+  // EPERM/EBUSY/EACCES there. Simulated on any OS: rotation is disabled on win32 (smarty-dev#10191),
+  // a refused append retries against the current file with a bounded backoff; no line is lost.
   const oversized = (root: string): string => {
     fs.mkdirSync(path.join(root, "lock-stats"), { mode: 0o700 });
     const file = eventsFile(root);
@@ -235,27 +246,43 @@ describe("lock events: rotation across processes", () => {
     .filter((line) => line.startsWith("{")).map((line) => (JSON.parse(line) as LockEvent).heldMs);
   const refuse = (code: string): Error => Object.assign(new Error(`${code}: injected`), { code });
 
-  it("win32: a rename refused while another process holds the file skips the rotation; no line is lost", () => {
+  it("win32: rotation is disabled, the oversized file only grows, and one warning names smarty-dev#10191", () => {
     const sleeps: number[] = [];
-    const events = createLockEvents("1", { rotateBytes: 4096, platform: "win32", sleep: (ms) => sleeps.push(ms) })!;
+    const warnings: string[] = [];
+    const events = createLockEvents("1", { rotateBytes: 4096, platform: "win32", sleep: (ms) => sleeps.push(ms),
+      warn: (message) => warnings.push(message) })!;
     const root = temp();
     const file = oversized(root);
-    const original = fs.renameSync;
-    let refusals = 0;
-    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
-      if (String(to).endsWith(`${LOCK_EVENTS_FILE}.1`) && refusals < 3) throw refuse(["EPERM", "EBUSY", "EACCES"][refusals++]!);
-      original(from, to);
-    }) as typeof fs.renameSync);
+    const renames = vi.spyOn(fs, "renameSync");
+    const original = fs.openSync;
+    const opened: string[] = [];
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      opened.push(path.basename(String(target)));
+      return (original as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+    const before = fs.statSync(file).size;
     for (const heldMs of [2_001, 2_002, 2_003]) events.held(root, "mesh-lock", "publish", heldMs);
-    expect(refusals).toBe(3);
-    expect(fs.existsSync(`${file}.1`)).toBe(false); // every rotation skipped ...
-    expect(heldOf(file)).toEqual([2_001, 2_002, 2_003]); // ... no line lost
-    expect(fs.readdirSync(path.dirname(file))).toEqual([LOCK_EVENTS_FILE]); // the rotation lock was released
-    events.held(root, "mesh-lock", "publish", 2_004); // the window closed: this rotation succeeds
-    expect(heldOf(`${file}.1`)).toEqual([2_001, 2_002, 2_003]);
-    expect(readEvents(file).map((event) => event.heldMs)).toEqual([2_004]);
+    expect(renames).not.toHaveBeenCalled(); // no rename ...
+    expect(opened).toEqual([LOCK_EVENTS_FILE, LOCK_EVENTS_FILE, LOCK_EVENTS_FILE]); // ... and no rotation lock
+    expect(fs.existsSync(`${file}.1`)).toBe(false);
+    expect(fs.readdirSync(path.dirname(file))).toEqual([LOCK_EVENTS_FILE]);
+    expect(heldOf(file)).toEqual([2_001, 2_002, 2_003]); // the file grows, no line lost
+    expect(fs.statSync(file).size).toBeGreaterThan(before);
+    expect(warnings).toHaveLength(1); // once per process, not per line
+    expect(warnings[0]).toContain(LOCK_EVENTS_WIN32_ROTATION_ISSUE);
+    expect(LOCK_EVENTS_WIN32_ROTATION_ISSUE).toBe("smarty-dev#10191");
     expect(events.errors).toBe(0);
     expect(sleeps).toEqual([]);
+  });
+
+  it("win32: below the rotation size there is no warning", () => {
+    const warnings: string[] = [];
+    const events = createLockEvents("1", { platform: "win32", warn: (message) => warnings.push(message) })!;
+    const root = temp();
+    for (const heldMs of [2_101, 2_102]) events.held(root, "mesh-lock", "publish", heldMs);
+    expect(readEvents(eventsFile(root)).map((event) => event.heldMs)).toEqual([2_101, 2_102]);
+    expect(warnings).toEqual([]);
+    expect(events.errors).toBe(0);
   });
 
   it("win32: an append refused with EPERM/EBUSY/EACCES/ENOENT retries the current file with a bounded backoff", () => {
@@ -334,7 +361,7 @@ describe("lock events: rotation across processes", () => {
     expect(sleeps).toEqual([]);
   });
 
-  it("a newer, smaller file whose id matches the rotated one (id reuse or a Windows id collision) is never renamed over .1", () => {
+  itRotates("a newer, smaller file whose id matches the rotated one (id reuse or a Windows id collision) is never renamed over .1", () => {
     const events = createLockEvents("1", { rotateBytes: 4096 })!;
     const root = temp();
     const file = oversized(root);
@@ -465,7 +492,7 @@ describe("lock events in one process", () => {
     expect(createLockEvents("1")).toBeUndefined(); // captured once, including disabled
   });
 
-  it("rotates at 1 MiB to events.jsonl.1, keeping one old file", () => {
+  itRotates("rotates at 1 MiB to events.jsonl.1, keeping one old file", () => {
     expect(LOCK_EVENTS_ROTATE_BYTES).toBe(1024 * 1024);
     const events = createLockEvents("1")!;
     const root = temp();

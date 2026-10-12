@@ -443,6 +443,9 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
 // contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
 // appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept),
 // under a short O_EXCL rotation lock and only if the name still holds the oversized inode.
+// Windows: rotation is disabled (scope cut, smarty-dev#10191). Concurrent appenders across a forced
+// rotation lost ~46% of lines on Windows CI with no counted error, cause not found; there the file
+// only grows, and one warning per process says so once it passes the rotation size.
 // An I/O error never blocks or throws into the lock path: it is counted, and warned about at most
 // once a minute. Off with the minute files (PI_FABRIC_LOCK_STATS=0); `held` is also off with a
 // threshold of 0 (`lockHeldEventMs`). Bounded tries (registry-fenced or zero-wait callers and the
@@ -488,6 +491,8 @@ export interface LockEvents {
 export const LOCK_EVENTS_FILE = "events.jsonl";
 /** At this size the file is renamed to `events.jsonl.1`, replacing the older one. */
 export const LOCK_EVENTS_ROTATE_BYTES = 1024 * 1024;
+/** The follow-up issue that re-enables rotation on Windows, where it is disabled until then. */
+export const LOCK_EVENTS_WIN32_ROTATION_ISSUE = "smarty-dev#10191";
 /** Exclusive (O_EXCL) rotation lock beside the file: one rotator at a time across processes. */
 export const LOCK_EVENTS_ROTATE_LOCK = `${LOCK_EVENTS_FILE}.rotating`;
 /** A rotation lock older than this was left by a crashed rotator (a rotation takes microseconds). */
@@ -577,6 +582,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
   let errors = 0;
   let unwarned = 0;
   let warnedAt = Number.NEGATIVE_INFINITY;
+  let warnedUnrotated = false;
   let ownName: string | undefined;
   const self = (): string => ownName ??= lockEventProcessName(process.pid)
     ?? (process.title.trim().slice(0, PROCESS_NAME_MAX_CHARS) || "unknown");
@@ -663,10 +669,22 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       try { fs.unlinkSync(lock); } catch { /* A stale-lock breaker may have removed it. */ }
     }
   };
+  /** Windows: rotation is disabled; the first time the file passes the rotation size, warn once. */
+  const unrotated = (file: string): void => {
+    if (warnedUnrotated) return;
+    warnedUnrotated = true;
+    try {
+      warn(`mesh lock events: ${file} passed the ${rotateBytes}-byte rotation size; rotation is disabled on Windows `
+        + `until ${LOCK_EVENTS_WIN32_ROTATION_ISSUE}, so the file keeps growing`);
+    } catch { /* Diagnostics only. */ }
+  };
   const appendOnce = (file: string, data: Buffer): void => {
     let { descriptor, stat } = open(file);
     try {
-      if (stat.size > 0n && stat.size + BigInt(data.length) > BigInt(rotateBytes)) {
+      const oversized = stat.size > 0n && stat.size + BigInt(data.length) > BigInt(rotateBytes);
+      // Windows: append only (no rename, no rotation lock); see LOCK_EVENTS_WIN32_ROTATION_ISSUE.
+      if (oversized && windows) unrotated(file);
+      else if (oversized) {
         // Closed first, so the rename also works on Windows.
         fs.closeSync(descriptor);
         descriptor = -1;

@@ -110,7 +110,10 @@ that. Before an append that would take the file past 1 MiB, it is renamed to `ev
 exclusive lock file (`events.jsonl.rotating`, `O_EXCL`; one older than 10 s is a crashed rotator's
 and is broken), and only if `events.jsonl` still holds the oversized inode it saw, so a stale view
 never renames a newer file over `events.jsonl.1`. An append that finds the name gone mid-rotation
-retries once against the current `events.jsonl`; a second failure is counted. The file is created mode 0600, never through a
+retries once against the current `events.jsonl`; a second failure is counted. On Windows rotation is
+disabled until smarty-dev#10191 fixes it (concurrent appenders across a forced rotation lost about 46%
+of their lines on Windows CI, without a counted error): the file only grows, and each process warns
+once in `fabric-lock-stats.log` when it passes 1 MiB. The file is created mode 0600, never through a
 symlink, in the same private `lock-stats` directory as the minute files (same safety checks), and
 the minute-file reader and pruner ignore it. An I/O error is never thrown into, and never waits in,
 the lock path: it is counted and reported at most once a minute in the profile's private

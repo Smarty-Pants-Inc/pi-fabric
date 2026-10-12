@@ -7,6 +7,7 @@ type Step = {
   uses?: string;
   run?: string;
   if?: string;
+  env?: Record<string, string>;
   with?: Record<string, unknown>;
 };
 
@@ -29,6 +30,16 @@ describe("CI Node runtime prerequisites", () => {
     expect(steps[diagnostics].if).toBeUndefined();
     const prerequisites = steps.find((step: Step) => step.run?.includes("choco install ripgrep"));
     expect(prerequisites.run).toContain("mkdir -p /tmp");
+  });
+
+  it("runs the real-Pi extension-hidden-tools acceptance on Linux after the build (smarty-dev#5492)", () => {
+    const { steps } = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8")).jobs.check as { steps: Step[] };
+    const build = steps.findIndex((step) => step.run === "bun run build");
+    const realPi = steps.findIndex((step) => step.run === "bunx vitest run tests/extension-hidden-tools-real-pi.test.ts");
+    expect(build).toBeGreaterThanOrEqual(0);
+    expect(realPi).toBeGreaterThan(build);
+    expect(steps[realPi]!.if).toBe("runner.os == 'Linux'");
+    expect(steps[realPi]!.env).toEqual({ FABRIC_5492_REAL_PI: "1" });
   });
 
   // Our deliberately pinned jobs keep their own Node version (fork CI policy: our jobs stay as

@@ -237,6 +237,24 @@ export const createToolOwnershipReassertion = (options: {
   };
 };
 
+// Whether Pi currently offers a registered tool (smarty-dev#5492). An extension
+// hides a tool by dropping it from Pi's active set (pi.setActiveTools); the
+// host's tool allowlist does the same. Fabric itself never removes a tool from
+// that set: native prepareLoadout hides declarations while the tools stay
+// active, and FabricToolOwnership.apply only adds fabric_exec. So an inactive
+// registered tool was hidden by its extension or the host, never by Fabric's
+// own ownership, and stays hidden even while Fabric owns the model's tool
+// surface (full-code/enforce). Do not treat names Fabric routes through
+// fabric_exec as offered here: that would re-expose a tool its extension hid
+// after Fabric took ownership (PR #567 review P2).
+// Returns a per-read snapshot so one listing costs one active-set read.
+export const hostToolVisibility = (
+  host: Pick<FabricToolOwnershipHost, "getActiveTools">,
+) => (): ((name: string) => boolean) => {
+  const offered = new Set(host.getActiveTools());
+  return (name) => offered.has(name);
+};
+
 export class FabricToolOwnership {
   constructor(readonly host: FabricToolOwnershipHost) {}
 

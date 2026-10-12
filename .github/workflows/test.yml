@@ -107,6 +107,13 @@ jobs:
         env:
           FABRIC_8742_REAL_PI: '1'
         run: bunx vitest run tests/main-provider-dead-real-pi.test.ts
+      - name: Real Pi extension-hidden tools (smarty-dev#5492)
+        # A real Pi process (RPC mode) loads the built dist/ and a fixture extension that hides three of its
+        # tools through pi.setActiveTools; fabric_exec's catalog, the prompt roster and invocation must agree.
+        if: runner.os == 'Linux'
+        env:
+          FABRIC_5492_REAL_PI: '1'
+        run: bunx vitest run tests/extension-hidden-tools-real-pi.test.ts
       - name: Real Pi sender headers (smarty-dev#6207)
         # A real Pi process (RPC mode) loads the built dist/; a Main request and its process child's request
         # reach a local stub that records the HTTP headers: X-Smarty-* on the wire, once, never caller-set.

@@ -1069,7 +1069,7 @@ describe("JetStream backend: round 2 (pi-fabric#937)", () => {
     expectNoSecret("wrong", all(wrong));
   });
 
-  it("the sanitizer is total: a throwing toString, getter or proxy gives [unprintable error], never an exception", async () => {
+  it("the sanitizer is total: a throwing toString, getter or proxy never throws out of it", async () => {
     const hostile = { toString() { throw new Error(`toString ${credentialed}`); }, toJSON() { throw new Error("toJSON"); } };
     const port = fakeJetStream().port();
     const rejection = (pending: Promise<void>) =>
@@ -1077,7 +1077,9 @@ describe("JetStream backend: round 2 (pi-fabric#937)", () => {
     port.purge = async () => { throw hostile; };
     const fromObject = await rejection(guardNatsPort(port).purge("S", 1));
     expect(fromObject).toBeInstanceOf(Error);
-    expect(fromObject.message).toBe("[unprintable error]");
+    expect(fromObject.message).toBe("[object Object]"); // round 3: an object is never stringified, toString never called
+    port.purge = async () => { throw { get [Symbol.toStringTag]() { throw new Error(`tag ${credentialed}`); } }; };
+    expect((await rejection(guardNatsPort(port).purge("S", 1))).message).toBe("[unprintable error]");
 
     const field = Object.assign(new Error("x"), { code: hostile });
     Object.defineProperty(field, "message", { get() { throw new Error(`getter ${credentialed}`); } });
@@ -1085,7 +1087,7 @@ describe("JetStream backend: round 2 (pi-fabric#937)", () => {
     port.purge = async () => { throw field; };
     const fromFields = await rejection(guardNatsPort(port).purge("S", 1));
     expect(fromFields).toBeInstanceOf(Error);
-    expect([fromFields.name, fromFields.code]).toEqual(["[unprintable error]", "[unprintable error]"]);
+    expect([fromFields.name, fromFields.code]).toEqual(["[object Object]", "[object Object]"]);
     expectNoSecret("fields", [String(fromFields), fromFields.stack]);
 
     const trap = new Proxy(new Error("proxied"), { get() { throw new Error(`trap ${credentialed}`); }, ownKeys() { throw new Error("ownKeys"); } });
@@ -1099,7 +1101,43 @@ describe("JetStream backend: round 2 (pi-fabric#937)", () => {
     const consuming = fakeJetStream().port();
     consuming.consume = async (_stream, _after, _onMessage, onError) => { onError?.(hostile); onError?.(`string ${credentialed} token=tok111`); return { stop: async () => undefined }; };
     await guardNatsPort(consuming).consume("S", 0, () => undefined, error => seen.push(error));
-    expect(seen.map(error => (error as Error).message)).toEqual(["[unprintable error]", expect.stringContaining("string nats://")]);
+    expect(seen.map(error => (error as Error).message)).toEqual(["[object Object]", expect.stringContaining("string nats://")]);
     expectNoSecret("onError", seen.map(error => String(error)));
+  });
+});
+
+describe("JetStream backend: round 3 (pi-fabric#937)", () => {
+  const jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5In0.eyJzdWIiOiJVQUJDIn0.c2lnbmF0dXJlLXRocmVl";
+  const secrets = ["abc999", "Zm9vOmJhcjk5", jwt, "ck111", "ck222", "sec333", "ak444", "px555"];
+  const rejected = async (value: unknown): Promise<Error & Record<string, unknown>> => {
+    const port = fakeJetStream().port();
+    port.purge = async () => { throw value; };
+    return await guardNatsPort(port).purge("S", 1).then(() => { throw new Error("no throw"); }, (caught: unknown) => caught as Error & Record<string, unknown>);
+  };
+  const expectNoSecret = (label: string, error: Error & Record<string, unknown>) => {
+    const views = [String(error), error.stack, error.message, JSON.stringify(error), JSON.stringify(Object.entries(error)), JSON.stringify(error.cause)];
+    for (const view of views) for (const secret of secrets) expect(String(view), `${label}: ${secret}`).not.toContain(secret);
+  };
+
+  it("P1: a non-Error rejection is never serialized: only its type and allowlisted fields; values redacted by pattern too", async () => {
+    const authorization = await rejected({ authorization: "Bearer abc999", status: 401 });
+    expect(authorization.message).toBe("[object Object] {status: 401}");
+    expectNoSecret("authorization", authorization);
+
+    const unknownKey = await rejected({ whatever: jwt, name: "AuthFailure", code: "E_AUTH" });
+    expect(unknownKey.message).toBe("[object Object] {name: AuthFailure, code: E_AUTH}");
+    expectNoSecret("unknown key", unknownKey);
+
+    const bearer = await rejected("upstream said: Bearer abc999 (and Basic Zm9vOmJhcjk5)");
+    expect(bearer.message).toBe("upstream said: Bearer *** (and Basic ***)");
+    expectNoSecret("string", bearer);
+
+    // A name or code that is itself a credential is redacted; a long code is dropped.
+    expectNoSecret("name", await rejected({ name: "Bearer abc999", code: "x".repeat(65) + "ak444" }));
+
+    // The new keys, by name, in any text (an Error's message here).
+    const keyed = await rejected(new Error(`proxy-authorization: px555 cookie: a=ck111; b=ck222\nsecret=sec333 api_key=ak444 Authorization: Bearer abc999`));
+    expect(keyed.message).toContain("cookie: ***");
+    expectNoSecret("keys", keyed);
   });
 });

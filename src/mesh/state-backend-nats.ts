@@ -1012,7 +1012,11 @@ export const redactNatsUrl = (url: string): string => {
  */
 export const redactSecrets = (text: string): string => text
   .replace(/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, "-----*** (credentials block)-----")
-  .replace(/(["']?)\b(auth_token|token|password|pass|nkey|jwt|seed|credentials?)\1(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;"'}\]]+)/gi, "$1$2$1$3***")
+  // By value, wherever it appears (pi-fabric#937 round 3): HTTP Bearer and Basic credentials.
+  .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 ***")
+  // A cookie header's value runs to the end of the line (a=b; c=d).
+  .replace(/\b((?:set-)?cookie)(["']?\s*[=:]\s*)[^\r\n]*/gi, "$1$2***")
+  .replace(/(["']?)\b(proxy-authorization|authorization|auth_token|token|password|pass|nkey|jwt|seed|credentials?|secret|api[_-]?key)\1(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;"'}\]]+)/gi, "$1$2$1$3***")
   .replace(/\bS[UANOCXP][A-Z2-7]{50,}|\b[UANOCXP][A-Z2-7]{50,}/g, "***")
   .replace(/\beyJ[A-Za-z0-9_\-.=]{8,}/g, "***");
 
@@ -1025,7 +1029,7 @@ export const redactNatsUrls = (text: string): string => redactSecrets(text
  * NatsWrongLastSequenceError, still works), a redacted name, message, stack and `code`, the number and boolean own
  * fields (`transient`, `expected`, `afterLostAck`: no text), a sanitized `cause` and AggregateError `errors` (depth
  * cap 4), and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
- * its redacted String(). Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
+ * its printable() text: a string redacted, an object only its type and allowlisted fields. Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
  * "[unprintable error]").
  */
 export const redactNatsError = (error: unknown, depth = 0): Error => {
@@ -1033,13 +1037,24 @@ export const redactNatsError = (error: unknown, depth = 0): Error => {
   catch { return new Error("[unprintable error]"); }
 };
 
-/** Redacted text of any value, never throwing: JSON for a plain object, else String(), else "[unprintable error]". */
+/**
+ * Redacted text of any value, never throwing ("[unprintable error]"). A string goes through redactNatsUrls. An
+ * object or function is NEVER serialized (pi-fabric#937 round 3: a credential can sit under any key): only its type
+ * tag and an allowlist, `name`, a short `code`, and its number and boolean own fields, each redacted.
+ */
 const printable = (value: unknown): string => {
   try {
-    if (typeof value === "object" && value !== null && !(value instanceof Error)) {
-      try { const json = JSON.stringify(value); if (json !== undefined) return redactNatsUrls(json); } catch { /* String() next */ }
+    if (typeof value === "string") return redactNatsUrls(value);
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return String(value);
+    const record = value as Record<string, unknown>;
+    const fields: string[] = [];
+    for (const key of Object.keys(record).slice(0, 32)) {
+      const field = record[key];
+      if ((key === "name" || key === "code") && typeof field === "string" && field.length <= 64) fields.push(`${key}: ${redactNatsUrls(field)}`);
+      else if (typeof field === "number" || typeof field === "boolean") fields.push(`${redactNatsUrls(key.slice(0, 64))}: ${field}`);
     }
-    return redactNatsUrls(String(value));
+    const tag = redactNatsUrls(Object.prototype.toString.call(value).slice(0, 64));
+    return fields.length === 0 ? tag : `${tag} {${fields.join(", ")}}`;
   } catch { return "[unprintable error]"; }
 };
 

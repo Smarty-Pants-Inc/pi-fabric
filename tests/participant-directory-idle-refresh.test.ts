@@ -98,6 +98,37 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     clock.mockRestore();
   });
 
+  // Astra P2 on fd31b1c1: the state token moves on ANY commit, and a fleet commits an unrelated key every second.
+  it("keeps both derived answers across unrelated state commits, and re-derives on a participant change within one pass", async () => {
+    const { alpha, directory, mesh, collisions } = setup();
+    await directory("beta").start();
+    await directory("gamma").start();
+    await alpha.start();
+    await alpha.refresh();
+    const churn = identityOf("churn");
+    const reads = spyReads(mesh);
+    const listings = vi.spyOn(alpha, "list");
+    const shared = vi.spyOn(mesh, "listAllShared");
+    for (let tick = 1; tick <= 3; tick += 1) {
+      const before = mesh.stateToken();
+      await mesh.put({ key: "bench/churn", value: { tick }, identity: churn });
+      expect(mesh.stateToken({ fresh: true })).not.toBe(before);   // the store's change stamp moved
+      await alpha.refresh();
+    }
+    expect(listings).not.toHaveBeenCalled();        // no root-collision pass
+    expect(reads.copies()).toBe(0);                 // no JSON copy of any directory entry
+    expect(reads.sqliteScans()).toBe(0);            // nothing scanned state.db
+    // Per pass and derivation, only the change check: ONE uncopied selection of the host namespace (only
+    // the derivations read it); a full legacy-renewal scan, or list(), would select it again.
+    expect(shared.mock.calls.filter(([prefix]) => prefix === "topology/hosts/").length).toBe(3 * 2);
+    // A participant change amid the churn: the collision pass runs within one pass and reports it.
+    await directory("delta", "alpha").start();
+    await mesh.put({ key: "bench/churn", value: { tick: 4 }, identity: churn });
+    await alpha.refresh();
+    expect(listings).toHaveBeenCalledWith({ scope: "project", kinds: ["root"] });
+    expect(collisions).toEqual([expect.objectContaining({ reason: "duplicate-session", ids: ["session:alpha", "session:delta"] })]);
+  });
+
   it("reports a root collision, once, and a new colliding participant within one pass", async () => {
     const { alpha, directory, collisions } = setup();
     await directory("beta", "alpha").start();               // the same Pi session as alpha: a forked fixture
@@ -110,6 +141,42 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     await alpha.refresh();                                   // seen within one pass
     expect(collisions).toHaveLength(2);
     expect(collisions[1]).toMatchObject({ reason: "duplicate-session", ids: ["session:alpha", "session:gamma"] });
+  });
+
+  it("re-derives the legacy-renewal answer within one pass on a legacy-session, host or participant change amid churn", async () => {
+    const { alpha, mesh } = setup();
+    const policy = identityOf("policy");
+    const churn = identityOf("churn");
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files" }, identity: policy });
+    const alphaKey = "topology/participants/" + sha("session:alpha");
+    const dual = () => mesh.get(alphaKey, { fresh: true }) !== undefined;
+    let tick = 0;
+    const pass = async () => {
+      await mesh.put({ key: "bench/churn", value: { tick: tick += 1 }, identity: churn });
+      await alpha.refresh();
+      return dual();
+    };
+    await alpha.start();
+    expect(await pass()).toBe(false);                      // files only: no live old reader
+    expect(await pass()).toBe(false);                      // unrelated churn changes nothing
+    // A legacy session (a pre-directory Main's advertisement) appears: dual publication at once.
+    const old = identityOf("old-session");
+    await mesh.put({ key: "sessions/old-session", identity: old,
+      value: { id: old.id, sessionId: "old-session", cwd: "/tmp/project", startedAt: 1, status: "idle" } });
+    expect(await pass()).toBe(true);
+    await mesh.delete({ key: "sessions/old-session" });
+    expect(await pass()).toBe(false);                      // and back to files only when it goes
+    // A live pre-capability host record appears (no livenessLeaseFiles).
+    const host = identityOf("old-host");
+    const hostValue = (files?: 1) => ({ format: 1, id: host.id, rootId: host.id, identity: host, startedAt: 1,
+      updatedAt: Date.now(), expiresAt: Date.now() + 60_000, ...(files ? { livenessLeaseFiles: files } : {}) });
+    await mesh.put({ key: "topology/hosts/" + sha(host.id), identity: host, value: hostValue() });
+    expect(await pass()).toBe(true);
+    await mesh.put({ key: "topology/hosts/" + sha(host.id), identity: host, value: hostValue(1) });
+    expect(await pass()).toBe(false);                      // the host upgraded: files only again
+    // A participant of that live host without livenessLeaseFiles: an old reader again.
+    await mesh.put({ key: "topology/participants/" + sha(host.id), identity: host, value: rootRecord(host, "old-host") });
+    expect(await pass()).toBe(true);
   });
 
   it("sees a changed lease within one pass, and lets the old reader's expiry take effect on time without a change", async () => {

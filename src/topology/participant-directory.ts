@@ -81,6 +81,10 @@ const HOST_PREFIX = "topology/hosts/";
 const LINEAGE_CLOSURE_PREFIX = "topology/lineage-closures/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
+// smarty-dev#7978: the shared namespaces each derived peer answer reads (its participant-scoped change signal).
+const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT_PREFIX] as const;
+// list() (the root-collision report) also reads the legacy actor records.
+const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 // ponytail: bounded; it covers a few publish holds at today's ~250 ms (smarty-dev#8305); still far
 // under LOCK_TIMEOUT_MS 10 s. At 250 ms one hold ahead of the refresh failed the send (smarty-dev#6477).
@@ -253,10 +257,40 @@ const samePeerLeases = (
   return peers === 0;
 };
 
+/**
+ * Whether two selections of the shared entries a derived peer answer reads are the same state (smarty-dev#7978,
+ * Astra P2 on fd31b1c1). A commit to an unrelated key moves the state token but leaves every one of these
+ * entries the same frozen object (the snapshot is copy on write), so the check is an identity walk; an entry
+ * that is a different object is the same only with the same key, version, updatedAt and bytes (a full
+ * re-export, or a writer that rewrote a row without a new version, still counts as a change).
+ */
+const sameEntrySelections = (
+  left: readonly (readonly Readonly<MeshStateEntry>[])[], right: readonly (readonly Readonly<MeshStateEntry>[])[],
+): boolean => {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const before = left[index]!;
+    const after = right[index]!;
+    if (before.length !== after.length) return false;
+    for (let at = 0; at < before.length; at += 1) {
+      const was = before[at]!;
+      const is = after[at]!;
+      if (was !== is && (was.key !== is.key || was.version !== is.version || was.updatedAt !== is.updatedAt ||
+        JSON.stringify(was) !== JSON.stringify(is))) return false;
+    }
+  }
+  return true;
+};
+
 /** The change signals a derived peer answer was computed from (smarty-dev#7978). */
 interface PeerSignals {
-  /** The canonical state snapshot (stateToken): the same object until the store's change stamp moves. */
+  /**
+   * The canonical state snapshot (stateToken) last seen with these entries: a fast path only. A
+   * different token is a change only when the selected entries changed (Astra P2 on fd31b1c1).
+   */
   token: object;
+  /** The shared entries it read, by prefix (the participant, legacy-session, host and actor namespaces). */
+  entries: readonly (readonly Readonly<MeshStateEntry>[])[];
   /** The participant-file listing: the same array while no file changed. */
   files: readonly MeshStateEntry[];
   leases: ReadonlyMap<string, FabricHostLease>;
@@ -2780,7 +2814,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #rootCollisionSignals(root: FabricParticipantRecord, now: number): (PeerSignals & { local: string }) | undefined {
     const checkedAt = Date.now();
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
-      return { token: {}, files: [], leases: new Map(), local: "", at: now, checkedAt };
+      return { token: {}, entries: [], files: [], leases: new Map(), local: "", at: now, checkedAt };
     }
     // Exactly the reads list() makes for it (#parsed with the bounded, non-fresh read).
     const read = { fresh: false };
@@ -2790,10 +2824,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const local = JSON.stringify([root.id, root.name, root.sessionId, ...[...this.#localRecords.values()].map(record =>
       [record.id, record.kind, record.rootId, record.name, record.sessionId, record.status, record.reloadUntil, record.remoteHost])]);
     const last = this.#rootCollisionPass;
-    if (last && last.token === token && last.files === files && last.local === local &&
+    if (last && last.files === files && last.local === local &&
       samePeerLeases(last.leases, leases, this.options.hostId) && now >= last.at &&
-      checkedAt >= last.checkedAt && checkedAt - last.checkedAt < this.#leaseMs) return undefined;
-    return { token, files, leases, local, at: now, checkedAt };
+      checkedAt >= last.checkedAt && checkedAt - last.checkedAt < this.#leaseMs &&
+      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES)) return undefined;
+    return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, at: now, checkedAt };
   }
 
   /**
@@ -2818,14 +2853,37 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const leases = readHostLeases(this.mesh.root);
     const checkedAt = Date.now();
     const memo = this.#legacyRenewals;
-    if (memo && memo.token === token && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
+    if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
       checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
-      (memo.required ? now <= memo.until : now >= memo.at)) return memo.required;
+      (memo.required ? now <= memo.until : now >= memo.at) &&
+      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) return memo.required;
     // Read-only: hostFromEntry/participantFromEntry/isLiveLegacyRootEntry only inspect the entries, and
     // #liveHosts and mergeParticipantEntries build new containers, so the shared entries need no copy.
     const result = this.#legacyRenewalsScan(now, leases, (prefix) => this.mesh.listAllShared(prefix, read), files);
-    this.#legacyRenewals = { token, files, leases, at: now, checkedAt, ...result };
+    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases,
+      at: now, checkedAt, ...result };
     return result.required;
+  }
+
+  /** The shared entries of `prefixes` in the snapshot `token`, uncopied (read-only). */
+  #peerEntries(token: object, prefixes: readonly string[]): readonly (readonly Readonly<MeshStateEntry>[])[] {
+    return prefixes.map((prefix) => this.mesh.listAllShared(prefix, { snapshot: token }));
+  }
+
+  /**
+   * Whether the snapshot `token` holds the same participant-relevant entries as `signals` (Astra P2 on
+   * fd31b1c1): the state token moves on ANY committed change (a fleet commits unrelated keys every
+   * second), so it is only the fast path; a moved token re-selects these prefixes and compares the
+   * entries by identity. Unchanged, the signals move to the newer token, so the next call is the fast
+   * path again and the older snapshot is released.
+   */
+  #samePeerState(signals: PeerSignals, token: object, prefixes: readonly string[]): boolean {
+    if (signals.token === token) return true;
+    const entries = this.#peerEntries(token, prefixes);
+    if (!sameEntrySelections(signals.entries, entries)) return false;
+    signals.token = token;
+    signals.entries = entries;
+    return true;
   }
 
   /** The scan behind #legacyRenewalsRequired; `until` is when the old reader that answered true lapses. */

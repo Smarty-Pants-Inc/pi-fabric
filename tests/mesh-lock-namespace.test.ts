@@ -497,15 +497,22 @@ describe("fabric-mesh-backend lock-recover (smarty-dev#9569 D2): safe form, labe
       const result = await recoverMeshLock(root, { lock: "mesh", holder: record.split("\n")[0]!, ...extra }).catch((error: unknown) => error);
       return { root, audit, result, held: fs.existsSync(path.join(root, ".lock", "owner")) };
     };
+    if (process.platform === "win32") {
+      // Windows takes the create-only branch: any existing audit file refuses, before the rename. The mode, symlink,
+      // FIFO and rotate-at-cap cases do not apply there; the Windows audit DACL is cut to smarty-dev#9842.
+      const existing = await recover(audit => fs.writeFileSync(audit, ""));
+      expect(existing.result).toBeInstanceOf(MeshLockRecoverRefusedError);
+      expect((existing.result as Error).message).toMatch(/already exists; on Windows it is only created/);
+      expect(existing.held).toBe(true); // nothing renamed
+      return;
+    }
     const linked = await recover(audit => fs.symlinkSync("/dev/null", audit));
     expect(linked.result).toBeInstanceOf(MeshLockRecoverRefusedError);
     expect(linked.held).toBe(true); // refused BEFORE the rename
     // Round 3: a FIFO planted at the audit path never blocks the open (O_NONBLOCK), and is refused.
-    if (process.platform !== "win32") {
-      const fifo = await recover(audit => { childProcess.execFileSync("mkfifo", ["-m", "600", audit]); });
-      expect(fifo.result).toBeInstanceOf(MeshLockRecoverRefusedError);
-      expect(fifo.held).toBe(true);
-    }
+    const fifo = await recover(audit => { childProcess.execFileSync("mkfifo", ["-m", "600", audit]); });
+    expect(fifo.result).toBeInstanceOf(MeshLockRecoverRefusedError);
+    expect(fifo.held).toBe(true);
     const open = await recover(audit => { fs.writeFileSync(audit, ""); fs.chmodSync(audit, 0o666); });
     expect((open.result as Error).message).toMatch(/not a private regular file \(mode 666/);
     expect(open.held).toBe(true);

@@ -19,6 +19,7 @@ interface ResidentHostLaunchContext {
 import { lockFile, FileLockBusy } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { readResidentOperatorEvidence, assertResidentOperatorConfirmed } from "./operator-safety.js";
+import { fencedOperatorCheck } from "../actors/remove-offline.js";
 import { closeWithActors } from "../actors/close-order.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -1730,7 +1731,11 @@ export class ResidentHost {
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check());
+            : await this.#removeResidentActor(actor.id, requestId, () => check(),
+              // smarty-dev#8090: the same check again under the Main publication fence, before the tree delete, inside the
+              // state transaction and the root participant's key lock (as the offline removal runs it).
+              () => fencedOperatorCheck(this.mesh, { id: this.identity.id, name: this.identity.name, kind: "agent" }, this.config.rootId, get =>
+                assertResidentOperatorConfirmed(readResidentOperatorEvidence(this.config, { get }), command.confirmDeadRoot)));
         }
       } else if (command.operation === "actors") {
         response = {
@@ -1800,14 +1805,15 @@ export class ResidentHost {
     return response;
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void): Promise<ResidentCommandResponse> {
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void,
+    finalCheck?: () => Promise<void>): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     if (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable")) {
       throw new Error(`Resident host does not own ${id}`);
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false });
+    const removed = await this.actors.remove(id, { wait: false, ...(finalCheck ? { check: finalCheck } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {

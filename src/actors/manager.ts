@@ -70,6 +70,7 @@ import { ActorBindingStore } from "./binding-store.js";
 import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
+import { deleteRootActorTree } from "../topology/main-publication-fence.js";
 import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/atomic-write.js";
 import { mainExecutionCeilingAbortReason, settleWithin } from "../async-settlement.js";
 import { MAX_ACTOR_BASH_TIMEOUT_S } from "../guards/actor-bash-timeout.js";
@@ -627,6 +628,9 @@ export class ActorManager {
   readonly #revoked = new Set<string>();
   readonly #removeCalls = new Map<string, Promise<RemovalResult>>();
   readonly #finishCalls = new Map<string, Promise<RemovalResult>>();
+  /** A removal's own final check (the resident operator's dead-root check), run under the Main publication fence
+   * right before the tree delete (smarty-dev#8090). In memory: a restarted owner finishes with the registry check. */
+  readonly #removalChecks = new Map<string, () => void | Promise<void>>();
   readonly #actorRoot: string;
   readonly #actorScope: import("./types.js").FabricActorStorageScope;
   readonly #registry: ActorRegistryStore;
@@ -2518,10 +2522,11 @@ export class ActorManager {
    */
   async remove(
     id: string,
-    { wait = true }: { wait?: boolean } = {},
+    { wait = true, check }: { wait?: boolean; check?: () => void | Promise<void> } = {},
   ): Promise<RemovalResult> {
     // Resolve aliases only against registered actors; cleanup retries require the exact full id.
     const actorId = this.cleanupObligation(id) || this.#removeCalls.has(id) ? id : this.#requireOwnedActor(id).id;
+    if (check) this.#removalChecks.set(actorId, check);
     // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
     const call = this.#removeCalls.get(actorId) ?? this.#remove(actorId);
     this.#removeCalls.set(actorId, call);
@@ -2759,7 +2764,7 @@ export class ActorManager {
     try {
       await this.#joinStoppedRun(cleanup.id);
       await this.#bindings.delete(cleanup.id);
-      fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+      await this.#deleteActorTree(cleanup);
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
         if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
@@ -2771,11 +2776,30 @@ export class ActorManager {
       if (this.#persistent && this.meshConfig.enabled) fs.rmSync(this.#cleanupPath(cleanup.id), { force: true });
       this.#removalCleanup.delete(cleanup.id);
       this.#revoked.delete(cleanup.id);
+      this.#removalChecks.delete(cleanup.id);
       this.#emitChange();
     } catch (error) {
       cleanup.pending = `removal cleanup failed: ${error instanceof Error ? error.message : String(error)} (a later remove or host start finishes it)`;
     }
     return this.#cleanupState(cleanup.id);
+  }
+
+  /**
+   * The actor-tree delete of a live removal (smarty-dev#8090): through deleteRootActorTree, the one fenced helper the
+   * offline removal uses too. Under the root's Main publication fence it checks again that the revocation is committed
+   * and runs the removal's own check, then deletes. A root Main that restarts after the operator's check either
+   * published first (the check sees it and the tree is kept) or is refused until the delete is done.
+   */
+  async #deleteActorTree(cleanup: RemovalCleanup): Promise<void> {
+    const check = async () => {
+      if (!this.#registryRevoked(cleanup.id)) throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
+      await this.#removalChecks.get(cleanup.id)?.();
+    };
+    const remove = () => fs.rmSync(cleanup.sessionDir, { recursive: true, force: true });
+    // ponytail: an in-memory manager has no mesh root to fence; Windows has no flock (smarty-dev#7858), so there the
+    // final check still runs but the delete is not fenced.
+    if (!this.#persistent || !this.meshConfig.enabled || process.platform === "win32") { await check(); remove(); return; }
+    await deleteRootActorTree(this.mesh.root, cleanup.owner?.rootId ?? this.#rootId, remove, check);
   }
 
   async #finishRemove(actor: ManagedActor): Promise<RemovalResult> {

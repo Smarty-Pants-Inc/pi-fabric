@@ -88,6 +88,13 @@ export const processHarness = () => {
     },
     /** The real `fabric-actors` CLI in its own process, paused at `pauseAt` (see the child fixture). */
     remover: (pauseAt: "fence-temp" | "fence-link" | "beforeTreeMove" | "none", cli: string[]) => start(["remover", pauseAt, ...cli]),
+    /** A real resident host (the live remover, smarty-dev#8090) on `residencyRoot`, paused at `pauseAt` in its
+     * fenced tree delete (see the child fixture); resolves once it serves requests. */
+    host: async (residencyRoot: string, pauseAt: "fence-temp" | "fence-link" | "afterBindings" | "beforeDelete" | "none") => {
+      const child = start(["host", residencyRoot, pauseAt]);
+      await child.next("ready", 60_000);
+      return child;
+    },
     close: async () => {
       for (const child of children) child.stdin?.destroy();
       await stopAllOwned(log.owned(), 2_000, 5_000);

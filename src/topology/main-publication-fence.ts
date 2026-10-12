@@ -115,16 +115,24 @@ export const acquireMainPublicationFence = async (meshRoot: string, rootId: stri
   };
 };
 
+/** Test seam only (tests/fixtures/process-harness-child.mjs): a resumable pause inside the fenced region. */
+export const treeDeleteHooks: {
+  /** Under the fence, after the final check, right before the delete. */
+  beforeDelete?: () => void | Promise<void>;
+} = {};
+
 /**
- * THE path that removes (moves to its archive) a root's actor tree in an offline removal (smarty-dev#7817): hold the root's
- * Main publication fence, run the final check under it, delete, release in finally. A Main cannot publish
- * its root participant between the check and the delete. The live host path is smarty-dev#8090.
+ * THE path that removes (deletes, or moves to its archive) a root's actor tree, offline (smarty-dev#7817) and live
+ * (ActorManager#finishCleanup, smarty-dev#8090): hold the root's Main publication fence, run the final check under it,
+ * delete, release in finally. A Main cannot publish its root participant between the check and the delete, and the
+ * kernel drops the fence when its holder dies.
  */
 export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void | Promise<void>,
   check?: () => void | Promise<void>): Promise<void> => {
   const release = await acquireMainPublicationFence(meshRoot, rootId);
   try {
     await check?.();
+    await treeDeleteHooks.beforeDelete?.();
     await remove();
   } finally { release(); }
 };

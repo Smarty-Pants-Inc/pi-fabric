@@ -8,6 +8,10 @@
 //     fence-link       the fence file is linked, its flock is not taken yet (sync)
 //     beforeTreeMove   inside the fenced check-plus-delete, after the final check (stdin "continue" resumes)
 //     none             no pause
+//   host <residencyRoot> <pauseAt>   a real ResidentHost on <residencyRoot>/config.json, the live remover
+//     (smarty-dev#8090); pauseAt is fence-temp, fence-link, none, or:
+//     afterBindings    the live cleanup deleted the bindings, before the tree delete and its fence (stdin "continue")
+//     beforeDelete     under the fence, after the final check (stdin "continue" resumes)
 // A synchronous pause blocks the thread (Atomics.wait), so only a signal ends it.
 import fs from "node:fs";
 import os from "node:os";
@@ -23,6 +27,19 @@ let waiter;
 lines.on("line", line => { if (waiter) { const resolve = waiter; waiter = undefined; resolve(line); } else queue.push(line); });
 const nextLine = () => queue.length ? Promise.resolve(queue.shift()) : new Promise(resolve => { waiter = resolve; });
 const blockForever = () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); };
+/** fence-temp / fence-link: block the thread in fs.linkSync of the Main publication fence file (any remover). */
+const pauseFence = pauseAt => {
+  if (pauseAt !== "fence-temp" && pauseAt !== "fence-link") return false;
+  const link = fs.linkSync;
+  fs.linkSync = (from, to) => {
+    const fence = String(to).includes("/main-publication-fences/") && !String(to).endsWith(".tmp");
+    if (fence && pauseAt === "fence-temp") { emit({ event: "paused", at: pauseAt, temp: String(from), fence: String(to) }); blockForever(); }
+    const result = link(from, to);
+    if (fence && pauseAt === "fence-link") { emit({ event: "paused", at: pauseAt, fence: String(to) }); blockForever(); }
+    return result;
+  };
+  return true;
+};
 
 const [role, ...args] = process.argv.slice(2);
 if (role === "main") {
@@ -42,20 +59,36 @@ if (role === "main") {
       process.exit(0);
     }
   }
+} else if (role === "host") {
+  const [residencyRoot, pauseAt] = args;
+  const { treeDeleteHooks } = await jiti.import("./src/topology/main-publication-fence.ts");
+  const { ResidentHost } = await jiti.import("./src/residency/host.ts");
+  if (!pauseFence(pauseAt)) {
+    if (pauseAt === "afterBindings") {
+      // The step right before the tree delete in ActorManager#finishCleanup, on every release (no hook needed).
+      const { ActorBindingStore } = await jiti.import("./src/actors/binding-store.ts");
+      const remove = ActorBindingStore.prototype.delete;
+      ActorBindingStore.prototype.delete = async function (...values) {
+        const result = await remove.apply(this, values);
+        emit({ event: "paused", at: pauseAt }); await nextLine();
+        return result;
+      };
+    } else if (pauseAt === "beforeDelete") {
+      treeDeleteHooks.beforeDelete = async () => { emit({ event: "paused", at: pauseAt }); await nextLine(); };
+    } else if (pauseAt !== "none") throw new Error(`Unknown pause point: ${pauseAt}`);
+  }
+  const host = new ResidentHost(JSON.parse(fs.readFileSync(`${residencyRoot}/config.json`, "utf8")), () => {});
+  await host.start();
+  emit({ event: "ready" });
+  for (;;) {
+    const command = await nextLine();
+    if (command === "close" || command === undefined) { await host.close(); emit({ event: "closed" }); process.exit(0); }
+  }
 } else if (role === "remover") {
   const [pauseAt, ...cli] = args;
   const { offlineRemovalHooks } = await jiti.import("./src/actors/remove-offline.ts");
   const { main } = await jiti.import("./src/actors-cli.ts");
-  if (pauseAt === "fence-temp" || pauseAt === "fence-link") {
-    const link = fs.linkSync;
-    fs.linkSync = (from, to) => {
-      const fence = String(to).includes("/main-publication-fences/") && !String(to).endsWith(".tmp");
-      if (fence && pauseAt === "fence-temp") { emit({ event: "paused", at: pauseAt, temp: String(from), fence: String(to) }); blockForever(); }
-      const result = link(from, to);
-      if (fence && pauseAt === "fence-link") { emit({ event: "paused", at: pauseAt, fence: String(to) }); blockForever(); }
-      return result;
-    };
-  } else if (pauseAt === "beforeTreeMove") {
+  if (pauseFence(pauseAt)) { /* paused in fs.linkSync */ } else if (pauseAt === "beforeTreeMove") {
     offlineRemovalHooks.beforeTreeMove = async () => { emit({ event: "paused", at: pauseAt }); await nextLine(); };
   } else if (pauseAt !== "none") throw new Error(`Unknown pause point: ${pauseAt}`);
   let out = "", err = "";

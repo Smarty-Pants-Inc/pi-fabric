@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyNatsMessage, assertNatsTransportSecure, closeNatsStateBackend, MeshStateNatsBusyError, MeshStateNatsInsecureError, MeshStateNatsOutcomeUnknownError,
   MAX_MESSAGE_BYTES, MeshStateNatsLimitError, MeshStateNatsRefusedError, MeshStateNatsSnapshotIntegrityError, MeshStateNatsUnavailableError,
-  guardNatsPort, NatsStateBackend, natsStreamName, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
+  guardNatsPort, NatsStateBackend, natsStreamName, NatsWrongLastSequenceError, openNatsStateBackend, preparedNatsStateBackend, redactNatsUrl, redactNatsUrls, type JetStreamPort,
 } from "../src/mesh/state-backend-nats.js";
 import { createStateBackend, MeshStateBackendNotBuiltError } from "../src/mesh/state-backend.js";
 import { MeshBatchConflictError } from "../src/mesh/state-file.js";
@@ -984,5 +984,122 @@ describe("JetStream backend: round 1 (pi-fabric#937)", () => {
       server.version = version;
       await expect(open(server), version).resolves.toBeInstanceOf(NatsStateBackend);
     }
+  });
+});
+
+describe("JetStream backend: round 2 (pi-fabric#937)", () => {
+  const base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const seed = `SU${base32.repeat(2).slice(0, 56)}`;
+  const userKey = `UA${base32.repeat(2).slice(3, 57)}`;
+  const jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5In0.eyJzdWIiOiJVQUJDIn0.c2lnbmF0dXJlLXNlY3JldA";
+  const creds = "-----BEGIN NATS USER JWT-----\nCREDSJWTBODY\n------END NATS USER JWT------\n\n" +
+    "************************* IMPORTANT *************************\n-----BEGIN USER NKEY SEED-----\nCREDSSEEDBODY\n------END USER NKEY SEED------\n";
+  const bare = [`token=tok111`, `auth_token: tok222`, `pass=pw333`, `password=pw444`, `nkey=nk555`, `jwt=jw666`, `seed=sd777`,
+    `credentials=cr888`, `"token":"tok999"`, `user seed ${seed}`, `key ${userKey}`, `bearer ${jwt}`, creds].join(" ");
+  const secrets = ["tok111", "tok222", "pw333", "pw444", "nk555", "jw666", "sd777", "cr888", "tok999", seed, userKey, jwt,
+    "CREDSJWTBODY", "CREDSSEEDBODY", "alice", "s3cret"];
+  const expectNoSecret = (label: string, values: unknown[]) => {
+    for (const value of values) for (const secret of secrets) expect(String(value), `${label}: ${secret}`).not.toContain(secret);
+  };
+  const credentialed = "nats://alice:s3cret@10.0.0.5:4222";
+
+  it("P1-1: a TLS hostname is remote whatever a later lookup says (DNS rebinding); plaintext stays pinned to its one lookup", async () => {
+    // The client's own resolution (at connect) sees off-host; every later answer is loopback.
+    let calls = 0;
+    const rebinding = async (_host: string) => calls++ === 0 ? [{ address: "10.9.9.9", family: 4 }] : [{ address: "127.0.0.1", family: 4 }];
+    await rebinding("nats.rebind.example"); // what the client got when it connected
+    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["tls://nats.rebind.example:4222"], lookup: rebinding }))
+      .rejects.toThrow(/does not require authentication/);
+    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["tls://localhost:4222"], lookup: rebinding }))
+      .rejects.toThrow(/does not require authentication/);
+    // Still local: a loopback IP literal, and a plaintext name pinned (by its one lookup) to a loopback address.
+    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["tls://127.0.0.1:4222"], lookup: rebinding }))
+      .resolves.toBeInstanceOf(NatsStateBackend);
+    await expect(openNatsStateBackend({ root: root(), port: fakeJetStream().port(), servers: ["nats://localhost:4222"], lookup: resolver }))
+      .resolves.toBeInstanceOf(NatsStateBackend);
+  });
+
+  it("P1-2: bare tokens, passwords, nkeys, JWTs and .creds blocks never reach a message, a stack or diagnostics", async () => {
+    expectNoSecret("redactNatsUrls", [redactNatsUrls(bare)]);
+    const server = fakeJetStream();
+    const backend = await openNatsStateBackend({ root: root(), port: guardNatsPort(server.port()) });
+    await backend.put({ key: "x/a", value: 1, identity });
+    server.breakDelivery(new Error(`consumer failed: ${bare}`));
+    const read = (() => { try { backend.get("x/a"); return undefined; } catch (caught) { return caught as Error; } })();
+    expect(read).toBeInstanceOf(Error);
+    expect(read!.message).toContain("consumer failed");
+    expectNoSecret("read", [String(read), read!.message, read!.stack]);
+    expectNoSecret("diagnostics", [backend.diagnostics().nats?.failure]);
+  });
+
+  it("P1-3: AggregateError members, non-Error throws and apiError() leave the port redacted; prototype and flags kept", async () => {
+    const thrown = async (value: unknown): Promise<Error & Record<string, unknown>> => {
+      const port = fakeJetStream().port();
+      port.purge = async () => { throw value; };
+      return await guardNatsPort(port).purge("S", 1).then(() => { throw new Error("no throw"); }, caught => caught as Error & Record<string, unknown>);
+    };
+    const all = (error: Error & Record<string, unknown>) => [String(error), error.stack, JSON.stringify(error.cause), JSON.stringify(error.errors),
+      JSON.stringify((error.errors as unknown[] | undefined)?.map(inner => [String(inner), (inner as Error).stack])),
+      JSON.stringify(Object.entries(error)), typeof error.apiError === "function" ? JSON.stringify((error.apiError as () => unknown)()) : ""];
+
+    const inner = Object.assign(new Error(`inner at ${credentialed} ${bare}`), { url: credentialed });
+    const aggregate = await thrown(new AggregateError([inner, `string member token=tok111`], `all servers failed ${bare}`));
+    expect(aggregate).toBeInstanceOf(AggregateError);
+    expect((aggregate.errors as unknown[]).length).toBe(2);
+    expectNoSecret("aggregate", all(aggregate));
+
+    const fromString = await thrown(`connect ${credentialed} ${bare}`);
+    expect(fromString).toBeInstanceOf(Error);
+    expectNoSecret("string", all(fromString));
+
+    const fromObject = await thrown({ url: credentialed, token: "tok111", nested: { password: "pw444" } });
+    expect(fromObject).toBeInstanceOf(Error);
+    expectNoSecret("object", all(fromObject));
+
+    const api = Object.assign(new Error(`api error ${bare}`), { code: "500", apiError: () => ({ code: 500, err_code: 10059, description: `stream at ${credentialed} ${bare}` }) });
+    const fromApi = await thrown(api);
+    expect((fromApi.apiError as () => { err_code: number }).call(fromApi).err_code).toBe(10059);
+    expect(fromApi.code).toBe("500");
+    expectNoSecret("apiError", all(fromApi));
+
+    // Kept: the class (the backend's CAS retry tests instanceof) and the number and boolean fields.
+    const wrong = await thrown(Object.assign(new NatsWrongLastSequenceError(7, `at ${credentialed}`), { transient: true }));
+    expect(wrong).toBeInstanceOf(NatsWrongLastSequenceError);
+    expect([wrong.expected, wrong.transient, wrong.code]).toEqual([7, true, "FABRIC_MESH_NATS_WRONG_LAST_SEQUENCE"]);
+    expectNoSecret("wrong", all(wrong));
+  });
+
+  it("the sanitizer is total: a throwing toString, getter or proxy gives [unprintable error], never an exception", async () => {
+    const hostile = { toString() { throw new Error(`toString ${credentialed}`); }, toJSON() { throw new Error("toJSON"); } };
+    const port = fakeJetStream().port();
+    const rejection = (pending: Promise<void>) =>
+      pending.then(() => { throw new Error("no throw"); }, (caught: unknown) => caught as Error & { code?: unknown });
+    port.purge = async () => { throw hostile; };
+    const fromObject = await rejection(guardNatsPort(port).purge("S", 1));
+    expect(fromObject).toBeInstanceOf(Error);
+    expect(fromObject.message).toBe("[unprintable error]");
+
+    const field = Object.assign(new Error("x"), { code: hostile });
+    Object.defineProperty(field, "message", { get() { throw new Error(`getter ${credentialed}`); } });
+    Object.defineProperty(field, "name", { value: hostile });
+    port.purge = async () => { throw field; };
+    const fromFields = await rejection(guardNatsPort(port).purge("S", 1));
+    expect(fromFields).toBeInstanceOf(Error);
+    expect([fromFields.name, fromFields.code]).toEqual(["[unprintable error]", "[unprintable error]"]);
+    expectNoSecret("fields", [String(fromFields), fromFields.stack]);
+
+    const trap = new Proxy(new Error("proxied"), { get() { throw new Error(`trap ${credentialed}`); }, ownKeys() { throw new Error("ownKeys"); } });
+    port.purge = async () => { throw trap; };
+    const fromProxy = await rejection(guardNatsPort(port).purge("S", 1));
+    expect(fromProxy).toBeInstanceOf(Error);
+    expectNoSecret("proxy", [String(fromProxy), fromProxy.stack]);
+
+    // A non-Error value handed to onError (the consumer path) is sanitized the same way.
+    const seen: unknown[] = [];
+    const consuming = fakeJetStream().port();
+    consuming.consume = async (_stream, _after, _onMessage, onError) => { onError?.(hostile); onError?.(`string ${credentialed} token=tok111`); return { stop: async () => undefined }; };
+    await guardNatsPort(consuming).consume("S", 0, () => undefined, error => seen.push(error));
+    expect(seen.map(error => (error as Error).message)).toEqual(["[unprintable error]", expect.stringContaining("string nats://")]);
+    expectNoSecret("onError", seen.map(error => String(error)));
   });
 });

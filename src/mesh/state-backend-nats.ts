@@ -672,7 +672,7 @@ export class NatsStateBackend implements StateBackend {
   /** The projector stopped (a protocol violation, a broken delivery): every later read and write fails closed. */
   #fail(error: unknown): void {
     if (this.#failure !== undefined || this.#closed) return;
-    this.#failure = error instanceof Error ? error : new Error(redactNatsUrls(String(error)));
+    this.#failure = redactNatsError(error);
     for (const waiter of this.#waiters.splice(0)) waiter.reject(this.#failure);
   }
 
@@ -1005,47 +1005,93 @@ export const redactNatsUrl = (url: string): string => {
   }
 };
 
-/** Every URL inside a message (a client or fetch error), redacted as redactNatsUrl does. */
-export const redactNatsUrls = (text: string): string =>
-  text.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, url => redactNatsUrl(url)).replace(/\b[^\s/@:'"]+:[^\s/@'"]+@/g, "***@");
+/**
+ * Bare credential text (pi-fabric#937 round 2): a .creds block (`-----BEGIN NATS USER JWT-----` ... `-----END ...`,
+ * or to the end when cut off), a `key=value` / `key: value` / `"key":"value"` for token, auth_token, pass(word),
+ * nkey, jwt, seed and credential(s), an nkey seed or public key (base32, `SU...`, `UA...`), and a JWT (`eyJ...`).
+ */
+export const redactSecrets = (text: string): string => text
+  .replace(/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, "-----*** (credentials block)-----")
+  .replace(/(["']?)\b(auth_token|token|password|pass|nkey|jwt|seed|credentials?)\1(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;"'}\]]+)/gi, "$1$2$1$3***")
+  .replace(/\bS[UANOCXP][A-Z2-7]{50,}|\b[UANOCXP][A-Z2-7]{50,}/g, "***")
+  .replace(/\beyJ[A-Za-z0-9_\-.=]{8,}/g, "***");
+
+/** Every URL inside a message (a client or fetch error), redacted as redactNatsUrl does, then redactSecrets. */
+export const redactNatsUrls = (text: string): string => redactSecrets(text
+  .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, url => redactNatsUrl(url)).replace(/\b[^\s/@:'"]+:[^\s/@'"]+@/g, "***@"));
 
 /**
- * An error fit to leave the NATS client (pi-fabric#937 round 1): every string field (message, stack, url, address,
- * ...) has its URLs redacted, and its cause is sanitized the same way (a non-Error cause is dropped). Done in place,
- * so the class, `code`, `transient` and `apiError()` stay.
+ * A NEW error fit to leave the NATS client (pi-fabric#937 round 2). It keeps the prototype (so `instanceof`, e.g.
+ * NatsWrongLastSequenceError, still works), a redacted name, message, stack and `code`, the number and boolean own
+ * fields (`transient`, `expected`, `afterLostAck`: no text), a sanitized `cause` and AggregateError `errors` (depth
+ * cap 4), and a sanitized `apiError()` result. Every other field is dropped. A non-Error throw becomes an Error with
+ * its redacted String(). Total: no coercion can throw out of it (a hostile toString, getter or proxy gives
+ * "[unprintable error]").
  */
 export const redactNatsError = (error: unknown, depth = 0): Error => {
-  if (!(error instanceof Error)) return new Error(redactNatsUrls(String(error)));
+  try { return sanitizeNatsError(error, depth); }
+  catch { return new Error("[unprintable error]"); }
+};
+
+/** Redacted text of any value, never throwing: JSON for a plain object, else String(), else "[unprintable error]". */
+const printable = (value: unknown): string => {
   try {
-    for (const key of new Set(["message", "stack", ...Object.keys(error)])) {
-      const value = (error as unknown as Record<string, unknown>)[key];
-      if (typeof value === "string") Object.defineProperty(error, key, { value: redactNatsUrls(value), writable: true, configurable: true });
+    if (typeof value === "object" && value !== null && !(value instanceof Error)) {
+      try { const json = JSON.stringify(value); if (json !== undefined) return redactNatsUrls(json); } catch { /* String() next */ }
     }
-    if ("cause" in error) {
-      const cause = depth < 4 && error.cause instanceof Error ? redactNatsError(error.cause, depth + 1) : undefined;
-      Object.defineProperty(error, "cause", { value: cause, writable: true, configurable: true });
-    }
-    return error;
-  } catch {
-    return Object.assign(new Error(redactNatsUrls(error.message)), { name: error.name });
+    return redactNatsUrls(String(value));
+  } catch { return "[unprintable error]"; }
+};
+
+const sanitizeNatsError = (error: unknown, depth: number): Error => {
+  if (!(error instanceof Error)) return new Error(printable(error));
+  const read = (key: string): unknown => { try { return (error as unknown as Record<string, unknown>)[key]; } catch { return undefined; } };
+  const safe = Object.create(Object.getPrototypeOf(error) as object) as Error & Record<string, unknown>;
+  const define = (key: string, value: unknown) => Object.defineProperty(safe, key, { value, writable: true, configurable: true, enumerable: false });
+  define("name", printable(read("name") ?? "Error"));
+  define("message", printable(read("message") ?? ""));
+  define("stack", printable(read("stack") ?? ""));
+  for (const key of Object.keys(error)) {
+    const value = read(key);
+    if (typeof value === "number" || typeof value === "boolean") safe[key] = value;
   }
+  const code = read("code");
+  if (code !== undefined) safe.code = typeof code === "number" ? code : printable(code);
+  if ("cause" in error && read("cause") !== undefined) define("cause", depth < 4 ? redactNatsError(read("cause"), depth + 1) : undefined);
+  const errors = read("errors");
+  if (Array.isArray(errors)) define("errors", depth < 4 ? errors.map(inner => redactNatsError(inner, depth + 1)) : []);
+  const apiError = read("apiError");
+  if (typeof apiError === "function") {
+    let kept: { code: number; err_code: number; description: string } | undefined;
+    try {
+      const api = (apiError as () => { code?: unknown; err_code?: unknown; description?: unknown } | undefined).call(error);
+      if (api !== undefined && api !== null) {
+        kept = { code: typeof api.code === "number" ? api.code : NaN, err_code: typeof api.err_code === "number" ? api.err_code : NaN,
+          description: printable(api.description ?? "") };
+      }
+    } catch { kept = undefined; }
+    define("apiError", () => kept);
+  }
+  return safe;
 };
 
 /**
- * The one choke point of the real client (pi-fabric#937 round 1): every port method's thrown error, every error it
- * hands to a callback (`onError`), and the `stop` it returns pass through redactNatsError.
+ * The one choke point of the real client (pi-fabric#937 round 1): every port method's thrown error, the errors
+ * `consume` hands to `onError`, and the `stop` it returns pass through redactNatsError.
  */
 export const guardNatsPort = (port: JetStreamPort): JetStreamPort => {
   const guard = <A extends unknown[], R>(method: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
-    const safe = args.map(arg => typeof arg !== "function" ? arg
-      : (...inner: unknown[]) => (arg as (...values: unknown[]) => unknown)(...inner.map(value => value instanceof Error ? redactNatsError(value) : value))) as A;
     let result: R;
-    try { result = await method(...safe); } catch (error) { throw redactNatsError(error); }
+    try { result = await method(...args); } catch (error) { throw redactNatsError(error); }
     const stop = (result as { stop?: unknown } | undefined)?.stop;
     return typeof stop === "function" ? { ...result, stop: guard(stop as () => Promise<unknown>) } as R : result;
   };
-  return Object.fromEntries(Object.entries(port).map(([key, method]) =>
+  const guarded = Object.fromEntries(Object.entries(port).map(([key, method]) =>
     [key, typeof method === "function" ? guard(method as (...args: unknown[]) => Promise<unknown>) : method])) as unknown as JetStreamPort;
+  const consume = guarded.consume;
+  guarded.consume = (stream, afterSeq, onMessage, onError) =>
+    consume(stream, afterSeq, onMessage, onError && (error => onError(redactNatsError(error))));
+  return guarded;
 };
 
 export type NatsLookup = (host: string) => Promise<{ address: string; family: number }[]>;
@@ -1087,6 +1133,12 @@ export const assertNatsTransportSecure = async (url: string, secureScheme: "tls:
   const pinned = addresses[0]!.address;
   parsed.hostname = net.isIPv6(pinned) ? `[${pinned}]` : pinned;
   return parsed.toString();
+};
+
+/** A URL whose host is a loopback IP literal (no lookup). */
+const loopbackUrl = (url: string): boolean => {
+  try { const host = new URL(withScheme(url)).hostname.replace(/^\[|\]$/g, ""); return net.isIP(host) !== 0 && loopbackAddress(host); }
+  catch { return false; }
 };
 
 /** The c03c829f stream name (before the hashed one): an existing stream under it is never replaced silently. */
@@ -1135,11 +1187,11 @@ export const openNatsStateBackend = async (options: OpenNatsStateBackendOptions)
     // auth_required). A non-loopback server that does not lets anyone on the network publish to or purge the stream:
     // refuse. Per-user publish/purge permissions are not visible to a client; docs/mesh-backends.md states the
     // required server configuration.
-    // assertNatsTransportSecure is async (smarty-dev#9663 item 1: resolved addresses): await it, with the same resolver.
-    let remote = false;
-    for (const url of servers) {
-      try { await assertNatsTransportSecure(url.replace(/^tls:/i, "nats:"), "tls:", lookup); } catch { remote = true; }
-    }
+    // Decided once, before the connection, never by a second lookup (pi-fabric#937 round 2: DNS rebinding). A
+    // plaintext URL is already pinned to the loopback address its one resolution gave; anything else whose host is not
+    // a loopback IP literal (a TLS hostname, even `localhost`) is remote. ponytail: local TLS without auth names
+    // tls://127.0.0.1, not a hostname.
+    const remote = servers.some(url => !loopbackUrl(url));
     if (remote && server.authRequired !== true) {
       throw new MeshStateNatsRefusedError("a non-loopback nats-server that does not require authentication: anyone who can reach it could write or purge the state stream (docs/mesh-backends.md)");
     }

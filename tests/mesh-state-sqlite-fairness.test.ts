@@ -141,7 +141,9 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
       const store = await SqliteStateStore.open(root, 65536, 1000);
       await store.writeBatch({ identity, ops: [], prepare: () => {
         fs.writeFileSync(path.join(root, "held"), "");
-        spin(2000);
+        // Held until the test says so (pi-fabric#936 CI): a fixed hold let a slow-starting queue drain before it formed.
+        const until = Date.now() + 150_000;
+        while (!fs.existsSync(path.join(root, "release")) && Date.now() < until) spin(5);
         fs.writeFileSync(path.join(root, "released"), String(Date.now()));
         return [{ kind: "put", key: "held", value: 1 }];
       } });
@@ -157,11 +159,13 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
       store.close();`;
     // The first waiter finds the queue empty, fails once and becomes the FIFO head.
     const head = run(single, [root, "head"]);
-    await waitFor(() => tickets(root).length === 1, "the head's ticket", 30_000);
+    // Setup budgets (children start and import under load) are separate from the asserted takeover bound.
+    await waitFor(() => tickets(root).length === 1, "the head's ticket", 120_000);
     const waiters = Array.from({ length: 15 }, (_, index) => run(single, [root, String(index)]));
-    await waitFor(() => tickets(root).length === 16, "15 queued behind the head", 60_000);
+    await waitFor(() => tickets(root).length === 16, "15 queued behind the head", 120_000);
     head.child.kill("SIGKILL");
     expect((await head.done).signal).toBe("SIGKILL");
+    fs.writeFileSync(path.join(root, "release"), ""); // the holder lets go only now: 15 queued, head dead
     const held = await holder.done;
     expect(held.code, held.stderr).toBe(0);
     const released = Number(fs.readFileSync(path.join(root, "released"), "utf8"));
@@ -178,5 +182,5 @@ describe.skipIf(process.platform === "win32")("SQLite mesh writer fairness (smar
     try { expect(check.listAll("w/").map((entry) => entry.key).sort()).toEqual(Array.from({ length: 15 }, (_, index) => `w/${index}`).sort()); }
     finally { check.close(); }
     expect(tickets(root)).toEqual([]);
-  }, 180_000);
+  }, 300_000);
 });

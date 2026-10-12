@@ -22,7 +22,7 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
@@ -719,6 +719,7 @@ export class ActorManager {
   #presenceTimer: NodeJS.Timeout | undefined;
   #orphanPresenceTimer: NodeJS.Timeout | undefined;
   #presenceRetryMs = PRESENCE_RETRY_MS;
+  #meshOutageAlarmMs: number | undefined;
   #removalRetryMs = REMOVAL_RETRY_MS;
   readonly #delivered = new Set<string>();
   // Independent of registry objects: ownership/reload may replace them during a drain.
@@ -807,6 +808,8 @@ export class ActorManager {
       presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
+      /** Outage-alarm bound of this manager's background paths (tests shorten it); default MESH_OUTAGE_ALARM_AFTER_MS. */
+      meshOutageAlarmMs?: number;
       /** Per-await preparation deadline; independent of model/run and permit wait timeouts. */
       preparationTimeoutMs?: number;
       preparationRetryMs?: number;
@@ -898,6 +901,7 @@ export class ActorManager {
     this.#retentionTimer = setInterval(() => this.#startRetentionSweep(), options.retentionSweepMs ?? RETENTION_SWEEP_INTERVAL_MS);
     this.#retentionTimer.unref();
     this.#meshMonitor = new ActorMeshMonitor(mesh, meshConfig, {
+      outageAlarm: meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })),
       cursorPath: options.meshCursorPath,
       canConsumeMesh: options.canConsumeMesh,
       maxReplayAgeMs: options.meshReplayAgeMs,
@@ -933,6 +937,7 @@ export class ActorManager {
     });
     this.#meshMonitor.start();
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
+    this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
     this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
@@ -2903,6 +2908,8 @@ export class ActorManager {
     this.#drainRearms.clear();
     if (this.#presenceTimer) clearTimeout(this.#presenceTimer);
     this.#presenceTimer = undefined;
+    if (this.#presenceAlarmTimer) clearTimeout(this.#presenceAlarmTimer);
+    this.#presenceAlarmTimer = undefined;
     if (this.#orphanPresenceTimer) clearTimeout(this.#orphanPresenceTimer);
     this.#orphanPresenceTimer = undefined;
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
@@ -5112,13 +5119,25 @@ export class ActorManager {
       catch (error) {
         // The failed acquisition wrote nothing. The host's next heartbeat carries
         // every pending id, with no per-actor timer, extra retry, or warning storm.
-        if (!isMeshLockTimeout(error)) console.warn(`[pi-fabric] host actor presence: ${error instanceof Error ? error.message : String(error)}`);
+        // The class or code only: a mesh error's message can carry WAL reader diagnostics (pi-fabric#893 round 4).
+        if (!isMeshLockTimeout(error)) {
+          const code = (error as { code?: unknown } | null)?.code;
+          console.warn(`[pi-fabric] host actor presence: ${typeof code === "string" ? code : error instanceof Error ? error.name : typeof error}`);
+        }
       }
       return;
     }
+    // pi-fabric#893 round 3: a settled id's retry is kept until its alarm and recovery were accepted; retry those now.
+    for (const [other, kept] of this.#presenceRetries) {
+      if (other === id || this.#pendingPresence.has(other)) continue;
+      if (kept.idle) this.#presenceRetries.delete(other);
+      else void kept.flushAlarms();
+    }
+    this.#schedulePresenceAlarms();
     let retry = this.#presenceRetries.get(id);
     if (!retry) {
-      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs);
+      retry = new MeshBackgroundRetry(`actor presence ${id}`, this.#presenceRetryMs)
+        .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })), this.#meshOutageAlarmMs);
       this.#presenceRetries.set(id, retry);
     }
     if (retry.waitMs > 0) {
@@ -5142,7 +5161,11 @@ export class ActorManager {
       }
       this.#pendingPresence.delete(id);
       this.#orphanPresence.delete(id);
-      this.#presenceRetries.delete(id);
+      // The write is this path's last: its outage (if any) ends now, alarm first, then recovery. The retry is dropped
+      // only once both were accepted; until then later presence passes retry them (above).
+      retry.success(true);
+      if (retry.idle) this.#presenceRetries.delete(id);
+      else this.#schedulePresenceAlarms();
     } catch (error) {
       if (fence !== undefined && error instanceof Error && error.message.includes("compare-and-swap failed")) {
         // Someone wrote this entry since it was found orphaned: it is not ours to delete.
@@ -5154,6 +5177,31 @@ export class ActorManager {
       this.#pendingPresence.add(id);
       this.#schedulePresenceRetry();
     }
+  }
+
+  // pi-fabric#893 round 4: a settled presence path whose alarm or recovery publish failed has no further writes to
+  // retry it. One owner timer retries the queued events while any are queued (none: no timer, no polling), backing
+  // off from presenceRetryMs to 60 s; unref'd, cancelled on close. A path is dropped once its events were accepted.
+  #presenceAlarmTimer: NodeJS.Timeout | undefined;
+  #presenceAlarmDelay = 0;
+  #schedulePresenceAlarms(): void {
+    if (this.#presenceAlarmTimer || this.#closing) return;
+    const queued = [...this.#presenceRetries].some(([id, kept]) => !this.#pendingPresence.has(id) && !kept.idle);
+    if (!queued) { this.#presenceAlarmDelay = 0; return; }
+    this.#presenceAlarmDelay = Math.min(60_000, Math.max(this.#presenceRetryMs, this.#presenceAlarmDelay * 2));
+    this.#presenceAlarmTimer = setTimeout(() => {
+      this.#presenceAlarmTimer = undefined;
+      void (async () => {
+        for (const [id, kept] of [...this.#presenceRetries]) {
+          if (this.#closing) return;
+          if (this.#pendingPresence.has(id)) continue;
+          await kept.flushAlarms();
+          if (kept.idle) this.#presenceRetries.delete(id);
+        }
+        this.#schedulePresenceAlarms();
+      })();
+    }, this.#presenceAlarmDelay);
+    this.#presenceAlarmTimer.unref();
   }
 
   #schedulePresenceRetry(): void {

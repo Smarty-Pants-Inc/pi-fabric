@@ -1,6 +1,22 @@
 import fs from "node:fs";
 import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } from "./types.js";
 import { ActorManager } from "./manager.js";
+import { SessionActorOrphans } from "./session-orphans.js";
+
+/**
+ * Run every halt step even when one throws, then report every failure at once: a scope
+ * that cannot save its cancellation must not leave later scopes running (smarty-dev#7706).
+ */
+export function haltEvery(steps: ReadonlyArray<() => number>): number {
+  let halted = 0;
+  const errors: unknown[] = [];
+  for (const step of steps) {
+    try { halted += step(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length) throw new AggregateError(errors, errors.map(error => error instanceof Error ? error.message : String(error)).join("; "));
+  return halted;
+}
 
 export interface ActorDirectoryRoots {
   project: string;
@@ -10,6 +26,7 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  readonly #sessionOrphans: SessionActorOrphans | undefined;
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
@@ -50,10 +67,15 @@ export class ActorDirectory extends ActorManager {
       actorScope: secondaryScope,
     });
     this.#defaultScope = defaultScope;
+    this.#sessionOrphans = persistent && base[3].enabled
+      // A resident host outlives Main and must also observe Main's own private
+      // session registry. A Main never repairs its current session's records.
+      ? new SessionActorOrphans(base[2], base[1], options.claimResidency === "durable" ? undefined : base[0], roots.project, options.lineageAlive) : undefined;
   }
 
   #isPrimary(id: string): boolean {
-    const actors = this.list();
+    // Foreign terminal records are observational only, never mutation/removal targets.
+    const actors = this.#localActors();
     const exact = actors.find((actor) => actor.id === id);
     if (exact) return exact.scope === this.#defaultScope;
     let matches = actors.filter((actor) => actor.id.startsWith(id) || actor.name === id);
@@ -79,7 +101,7 @@ export class ActorDirectory extends ActorManager {
     }
     const name = request.name.trim();
     // A predecessor whose removal is pending finishes behind its run, not in this create's way.
-    const sameName = this.list().filter((actor) => actor.name === name && !actor.removal);
+    const sameName = this.#localActors().filter((actor) => actor.name === name && !actor.removal && !actor.sessionOrphan);
     const existing = sameName.find((actor) => actor.status !== "stopped");
     if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
     const fencedOptions = {
@@ -97,12 +119,21 @@ export class ActorDirectory extends ActorManager {
       ? super.create(request, fencedOptions)
       : this.#secondary.create(request, fencedOptions);
   }
-  override list(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
-  override listOwned(): FabricActorInfo[] { return [...super.listOwned(), ...this.#secondary.listOwned()]; }
+  #localActors(): FabricActorInfo[] { return [...super.list(), ...this.#secondary.list()]; }
+  override reconcileSessionOrphans(): Promise<number> { return this.#sessionOrphans?.reconcile() ?? Promise.resolve(0); }
+  override list(): FabricActorInfo[] {
+    // Synchronous internal/UI reads schedule work; public provider reads await it.
+    void this.reconcileSessionOrphans().catch(() => undefined);
+    const actors = new Map(this.#localActors().map(actor => [actor.id, actor]));
+    for (const orphan of this.#sessionOrphans?.list() ?? []) actors.set(orphan.id, orphan);
+    return [...actors.values()];
+  }
+  override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);
-    return { ops: [...first.ops, ...second.ops], committed: () => { first.committed(); second.committed(); } };
+    return { ops: [...first.ops, ...second.ops], actorIds: [...first.actorIds, ...second.actorIds],
+      committed: () => { first.committed(); second.committed(); } };
   }
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
   override releaseForAdoption(...args: Parameters<ActorManager["releaseForAdoption"]>): ReturnType<ActorManager["releaseForAdoption"]> { return this.#isPrimary(args[0]) ? super.releaseForAdoption(...args) : this.#secondary.releaseForAdoption(...args); }
@@ -112,7 +143,16 @@ export class ActorDirectory extends ActorManager {
     return scope === this.#defaultScope ? super.acceptAdoption(id) : this.#secondary.acceptAdoption(id);
   }
   override reclaim(...args: Parameters<ActorManager["reclaim"]>): ReturnType<ActorManager["reclaim"]> { return this.#isPrimary(args[0]) ? super.reclaim(...args) : this.#secondary.reclaim(...args); }
-  override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }
+  override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> {
+    void this.reconcileSessionOrphans().catch(() => undefined);
+    try { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }
+    catch (error) {
+      if (!(error instanceof Error) || !/Unknown Fabric actor/.test(error.message)) throw error;
+      const orphan = this.#sessionOrphans?.resolve(args[0]);
+      if (orphan) return orphan;
+      throw error;
+    }
+  }
   override owns(...args: Parameters<ActorManager["owns"]>): ReturnType<ActorManager["owns"]> { try { return this.#isPrimary(args[0]) ? super.owns(...args) : this.#secondary.owns(...args); } catch { return false; } }
   override resolveBinding(...args: Parameters<ActorManager["resolveBinding"]>): ReturnType<ActorManager["resolveBinding"]> { return this.#isPrimary(args[0]) ? super.resolveBinding(...args) : this.#secondary.resolveBinding(...args); }
   override resolveActivationBinding(...args: Parameters<ActorManager["resolveActivationBinding"]>): ReturnType<ActorManager["resolveActivationBinding"]> { return this.#isPrimary(args[0]) ? super.resolveActivationBinding(...args) : this.#secondary.resolveActivationBinding(...args); }
@@ -153,7 +193,9 @@ export class ActorDirectory extends ActorManager {
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
-  override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
+  override haltAll(): { halted: number } {
+    return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };
+  }
   override pendingRemovals(): ReturnType<ActorManager["pendingRemovals"]> { return [...super.pendingRemovals(), ...this.#secondary.pendingRemovals()]; }
   override removalSettled(id: string): Promise<void> | undefined { return super.removalSettled(id) ?? this.#secondary.removalSettled(id); }
   override async finishPendingRemovals(): Promise<void> { await super.finishPendingRemovals(); await this.#secondary.finishPendingRemovals(); }
@@ -169,5 +211,8 @@ export class ActorDirectory extends ActorManager {
   override pauseForRelease(): void { super.pauseForRelease(); this.#secondary.pauseForRelease(); }
   override resumeAfterRelease(): void { super.resumeAfterRelease(); this.#secondary.resumeAfterRelease(); }
   override async checkpointForRelease(): Promise<void> { await super.checkpointForRelease(); await this.#secondary.checkpointForRelease(); }
-  override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
+  override async close(): Promise<void> {
+    await this.#sessionOrphans?.close();
+    await Promise.all([super.close(), this.#secondary.close()]);
+  }
 }

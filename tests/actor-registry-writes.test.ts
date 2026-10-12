@@ -156,7 +156,7 @@ describe("actor registry lazy/status writes (#3752, #4383)", () => {
     f.manager.tell(actor.id, "one activation, many status transitions");
     await settle();
     expect(running).toBeTypeOf("function");
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write"), lock = vi.spyOn(ActorRegistryStore.prototype, "withLock");
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare"), lock = vi.spyOn(ActorRegistryStore.prototype, "withLock");
     for (let second = 1; second <= 12; second++) {
       vi.setSystemTime(1_800_000_000_000 + second * 1_000);
       (second % 2 ? waiting : running)!();
@@ -187,7 +187,7 @@ describe("actor registry lazy/status writes (#3752, #4383)", () => {
     });
     const actor = await f.manager.create({ name: "timer", instructions: "Review." });
     f.manager.tell(actor.id, "activate"); await settle();
-    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const write = vi.spyOn(ActorRegistryStore.prototype, "prepare");
     waiting!(); await settle();
     expect(write).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(4_999); await settle();

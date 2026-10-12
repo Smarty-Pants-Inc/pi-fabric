@@ -1,49 +1,70 @@
-/** Tracks rendered fabric_exec cards so a display preference switch redraws the current transcript. */
+type Invalidators = { call?: () => void; result?: () => void };
+type CardReference = WeakRef<object>;
+
+/** Tracks live fabric_exec cards without owning the host's rendered transcript. */
 export class FabricToolDisplayController {
-  readonly #invalidators = new Map<string, {
-    call?: () => void;
-    result?: () => void;
-  }>();
-  #pendingRefresh: Array<() => void> = [];
+  // The host owns rendererState. A callback closes over ToolExecutionComponent,
+  // which in turn owns that state, so the callback must be an ephemeron value,
+  // not a strong value beside a WeakRef. The otherwise-unreachable cycle can
+  // then be collected after compaction, transcript rebuild or reader disposal.
+  readonly #cards = new Map<string, CardReference>();
+  #invalidators = new WeakMap<object, Invalidators>();
+  readonly #collected = new FinalizationRegistry<{ id: string; reference: CardReference }>(
+    ({ id, reference }) => {
+      // A rebuilt card may reuse its call id before the old finalizer runs.
+      if (this.#cards.get(id) === reference) this.#cards.delete(id);
+    },
+  );
+  #pendingRefresh: Array<{ id: string; reference: CardReference }> = [];
   #refreshDrainScheduled = false;
 
   observe(
     toolCallId: string,
     kind: "call" | "result",
     invalidate: () => void,
+    owner: object = invalidate,
   ): void {
-    const invalidators = this.#invalidators.get(toolCallId) ?? {};
+    const previous = this.#cards.get(toolCallId);
+    if (previous?.deref() !== owner) {
+      if (previous) this.#collected.unregister(previous);
+      const reference = new WeakRef(owner);
+      this.#cards.set(toolCallId, reference);
+      this.#collected.register(owner, { id: toolCallId, reference }, reference);
+    }
+    const invalidators = this.#invalidators.get(owner) ?? {};
     invalidators[kind] = invalidate;
-    this.#invalidators.set(toolCallId, invalidators);
+    this.#invalidators.set(owner, invalidators);
   }
 
   refresh(): void {
-    for (const { call, result } of this.#invalidators.values()) {
-      // A card's call and result invalidators resolve to the same host
-      // component: its invalidate() re-renders both renderers together, so one
-      // call covers the whole card and calling both would double the work.
-      const invalidate = result ?? call;
-      if (invalidate) this.#pendingRefresh.push(invalidate);
+    for (const [id, reference] of this.#cards) {
+      if (reference.deref()) this.#pendingRefresh.push({ id, reference });
+      else {
+        this.#cards.delete(id);
+        this.#collected.unregister(reference);
+      }
     }
     this.#scheduleRefreshDrain();
   }
 
-  // Drain a few cards per event-loop turn. invalidate() synchronously runs the
-  // card's full renderer pair (updateDisplay in pi's ToolExecutionComponent),
-  // so re-rendering a long transcript inside a single keypress froze the UI
-  // until every card had been redrawn.
+  // Queue only weak owners, never callbacks: a pending settings refresh must
+  // not extend a discarded card's lifetime. Resolve the newest invalidator at
+  // drain time, in small batches so a save cannot block the interactive path.
   #scheduleRefreshDrain(): void {
     if (this.#refreshDrainScheduled) return;
     this.#refreshDrainScheduled = true;
     setImmediate(() => {
       this.#refreshDrainScheduled = false;
       const batch = this.#pendingRefresh.splice(0, REFRESH_CARDS_PER_TICK);
-      for (const invalidate of batch) {
-        try {
-          invalidate();
-        } catch {
-          // A transcript component may already have been disposed.
-        }
+      for (const { id, reference } of batch) {
+        if (this.#cards.get(id) !== reference) continue;
+        const owner = reference.deref();
+        const invalidators = owner && this.#invalidators.get(owner);
+        // Call and result resolve to the same host component; one refresh
+        // covers the complete card, including a streaming call without result.
+        const invalidate = invalidators && (invalidators.result ?? invalidators.call);
+        try { invalidate?.(); }
+        catch { /* A transcript component may already have been disposed. */ }
       }
       if (this.#pendingRefresh.length > 0) this.#scheduleRefreshDrain();
     });
@@ -51,11 +72,10 @@ export class FabricToolDisplayController {
 
   clear(): void {
     this.#pendingRefresh = [];
-    this.#invalidators.clear();
+    for (const reference of this.#cards.values()) this.#collected.unregister(reference);
+    this.#cards.clear();
+    this.#invalidators = new WeakMap();
   }
 }
 
-// Cards re-rendered per event-loop turn during refresh(): small enough that
-// one drain tick stays well inside a frame, large enough that realistic
-// transcripts finish repainting within a handful of turns.
 const REFRESH_CARDS_PER_TICK = 3;

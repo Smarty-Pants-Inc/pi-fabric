@@ -22,6 +22,17 @@ try {
   host.actors.tell(actor.id, "queued-mailbox-one");
   host.actors.tell(actor.id, "queued-mailbox-two");
   await waitFor(() => host.actors.status(actor.id).queued === 2);
+  // Crash with the request unclaimed, not inside unrelated registry custody: tell()
+  // schedules an async registry save, and a SIGKILL inside it leaves a dead-owner
+  // registry lock. The current release reclaims that at once (pid + start time), but
+  // B70 only once the lock is 30 s old, so its rollback host could not save or close
+  // within the test's budget. From this check to SIGKILL everything is synchronous:
+  // no save can start, so the crash point no longer races the save.
+  const registryLock = path.join(config.actorRoot, "actors.json.lock");
+  for (let i = 0; fs.existsSync(registryLock); i++) {
+    if (i > 2_000) throw new Error("Actor registry lock was never released");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
   const client = new ResidentActorClient(config.meshRoot, config.rootId);
   const caller = { identity: { id: config.rootId, kind: "main", sessionId: config.sessionId, name: "Main" }, hostId: config.rootId };
   // These calls write synchronously before their first await. No event-loop turn

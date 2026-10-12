@@ -6,34 +6,43 @@ import { expect, it, vi } from "vitest";
 import { ActorContextAdmission, loadActorInputEstimator } from "../src/worker/context-admission.js";
 const fixture = (window = 272_000) => {
   const sent: Record<string, unknown>[] = [];
-  const ready = vi.fn(); const fail = vi.fn(); const compact = vi.fn();
+  const ready = vi.fn(); const fail = vi.fn(); const compact = vi.fn(); const reseed = vi.fn();
   const admission = new ActorContextAdmission("actor-run", "current event", "actor persona", value => Math.ceil(value.length / 4), {
-    send: frame => sent.push(frame), ready, fail, compact,
+    send: frame => sent.push(frame), ready, fail, compact, reseed,
   });
   const reply = (data: unknown, success = true) => {
     const frame = sent.at(-1)!;
     expect(admission.observe({ type: "response", id: frame.id, command: frame.type, success, data, error: success ? undefined : "compaction refused" })).toBe(true);
   };
   const start = () => { admission.start(); reply({ model: { contextWindow: window }, isStreaming: false, isCompacting: false }); };
-  return { admission, sent, ready, fail, compact, reply, start };
+  return { admission, sent, ready, fail, compact, reseed, reply, start };
 };
-it("280k > 272k compacts before admitting the activation, then measures the new context", () => {
-  const f = fixture(); f.start(); f.reply({ messages: [{ role: "user", content: "x".repeat(280_000 * 4) }] });
+it("300k > 272k compacts before admitting the activation, then measures the new context", () => {
+  const f = fixture(); f.start(); f.reply({ messages: [{ role: "user", content: "x".repeat(300_000 * 4) }] });
   expect(f.sent.map(frame => frame.type)).toEqual(["get_state", "get_messages", "compact"]);
   expect(f.ready).not.toHaveBeenCalled(); expect(f.fail).not.toHaveBeenCalled(); expect(f.compact).toHaveBeenCalledTimes(1);
   f.reply({ summary: "retained objectives" }); expect(f.sent.at(-1)?.type).toBe("get_messages");
   f.reply({ messages: [{ role: "user", content: "retained objectives" }] });
   expect(f.ready).toHaveBeenCalledTimes(1); expect(f.fail).not.toHaveBeenCalled();
 });
+it("admits below 85% and compacts above the safety margin, ignoring stale usage", () => {
+  const small = fixture(); small.start(); small.reply({ messages: [{ content: "x".repeat(220_000 * 4), usage: { totalTokens: 999_999 } }] });
+  expect(small.ready).toHaveBeenCalledOnce(); expect(small.compact).not.toHaveBeenCalled();
+  const large = fixture(); large.start(); large.reply({ messages: [{ content: "x".repeat(240_000 * 4), usage: { totalTokens: 1 } }] });
+  expect(large.ready).not.toHaveBeenCalled(); expect(large.compact).toHaveBeenCalledOnce();
+});
 it("small context dispatches without compaction", () => {
   const f = fixture(); f.start(); f.reply({ messages: [] });
   expect(f.ready).toHaveBeenCalledTimes(1); expect(f.compact).not.toHaveBeenCalled();
 });
-it.each(["still oversized", "compact error"])("%s refuses once, never retries oversized inference", mode => {
+it.each(["still oversized", "compact error"])("%s reseeds once, never dispatches oversized inference", mode => {
   const f = fixture(); f.start(); f.reply({ messages: [{ content: "x".repeat(280_000 * 4) }] });
   if (mode === "compact error") f.reply(undefined, false);
   else { f.reply({ summary: "summary" }); f.reply({ messages: [{ content: "x".repeat(280_000 * 4) }] }); }
-  expect(f.ready).not.toHaveBeenCalled(); expect(f.fail).toHaveBeenCalledTimes(1);
+  expect(f.ready).not.toHaveBeenCalled(); expect(f.fail).not.toHaveBeenCalled();
+  expect(f.reseed).toHaveBeenCalledOnce();
+  expect(f.reseed.mock.calls[0]![0]).toMatchObject({ contextWindow: 272_000, summaryTokens: 8192 });
+  expect(f.reseed.mock.calls[0]![0].summary.length).toBeLessThan(16_500);
   expect(f.sent.filter(frame => frame.type === "compact")).toHaveLength(1);
 });
 it.each(["reduced", "still oversized"])("oversized correlated history recovers once and settles (%s)", mode => {
@@ -48,8 +57,8 @@ it.each(["reduced", "still oversized"])("oversized correlated history recovers o
   else {
     const second = f.sent.at(-1)!;
     expect(f.admission.observeOversizedResponse(prefix.replace(String(history.id), String(second.id)), 4_824_809)).toBe(true);
-    expect(f.fail).toHaveBeenCalledTimes(1);
-    expect(f.fail).toHaveBeenCalledWith(expect.stringContaining("pre-dispatch compaction did not make this activation fit"));
+    expect(f.fail).not.toHaveBeenCalled();
+    expect(f.reseed).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining("pre-dispatch compaction did not make this activation fit") }));
   }
   expect(f.sent.filter(frame => frame.type === "compact")).toHaveLength(1);
 });

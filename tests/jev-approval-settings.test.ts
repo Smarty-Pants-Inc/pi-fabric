@@ -7,13 +7,14 @@ import { SettingsList } from "@earendil-works/pi-tui";
 import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
 import { isJevApprovalModel } from "../src/jev/model-key.js";
-import type { FabricState } from "../src/fabric-state.js";
+import type { FabricLifecycleLease, FabricState } from "../src/fabric-state.js";
 import { FabricModelSelector } from "../src/ui/fabric-model-selector.js";
 import { buildFabricSettingsItems, openFabricSettings } from "../src/ui/settings.js";
 import { ProbabilityInputSubmenu, SectionSubmenu } from "../src/ui/settings-submenus.js";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
 const thresholdId = "jev.autoApprovalThreshold";
+const liveLease: FabricLifecycleLease = { current: () => true };
 const fixture = (model?: string) => {
   const config = normalizeFabricConfig({ approvals: { model } });
   const apply = vi.fn((id: string, value: unknown) => {
@@ -112,7 +113,7 @@ describe("Jev approval probability settings", () => {
     try {
       const config = normalizeFabricConfig({});
       const state = {
-        config, ensure: vi.fn(async () => {}),
+        config, ensure: vi.fn(async () => liveLease),
         reloadConfig: vi.fn(() => Object.assign(config, loadFabricConfig({ cwd, agentDir, projectTrusted: true }))),
         agents: { claudeModels: vi.fn(async () => []) },
       } as unknown as FabricState;

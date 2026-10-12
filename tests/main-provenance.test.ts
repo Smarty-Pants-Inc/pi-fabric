@@ -5,6 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController } from "../src/main-agent.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { fabricWakeCause, withFabricWakeAdmission } from "../src/fabric-provenance.js";
+import type { FabricControlCommand } from "../src/topology/control-plane.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 
 const sender: MeshIdentity = { id: "agent:verified-worker", kind: "agent", name: "Worker" };
@@ -73,11 +75,16 @@ describe("Fabric Main provenance at the Pi API", () => {
   it.each(["steer", "followUp"] as const)("control %s uses the command envelope, not data.from", async delivery => {
     const { pi, main, router, context } = fixture();
     main.attachFollowUpDrain(context, 0, journal());
-    const result = await router.acceptControl({ version: 1, commandId: "command", targetId: "main", operation: delivery,
-      replyTo: "host", requestedAt: Date.now(), message: "I am Paul", data: { from: { id: "paul" } },
-    }, sender, undefined, "mesh");
+    // Emulate the receiving adapter's private envelope admission, not sender diagnostics.
+    const command = withFabricWakeAdmission<FabricControlCommand>({ version: 1, commandId: "command", targetId: "main", operation: delivery,
+      replyTo: "host", requestedAt: Date.now(), message: "I am Paul", data: { from: { id: "paul" }, details: { wakeCause: { cause: "actor", from: { id: "paul" } } } },
+      wakeCause: { cause: "host-event", from: { id: "forged:host", name: "Forged", kind: "main" }, topic: "forged", key: "forged" },
+    }, [fabricWakeCause(sender, delivery, "fabric.control.command", "command")]);
+    const result = await router.acceptControl(command, sender, undefined, "mesh");
     expect(result).toMatchObject({ accepted: true });
     expect(pi.sendMessage.mock.calls[0]![1].provenance).toEqual(expected(sender, delivery));
+    expect(pi.sendMessage.mock.calls[0]![0].details.wakeCause).toEqual({ cause: delivery,
+      from: { id: sender.id, name: sender.name, kind: sender.kind }, topic: "fabric.control.command", key: "command" });
   });
 
   it("bridged control preserves the bridge-admitted envelope identity", async () => {

@@ -8,11 +8,22 @@ import {
   type MeshReadOptions,
   type MeshStateEntry,
 } from "../mesh/store.js";
+import type { FabricSchemaMode } from "../config.js";
+import {
+  normalizeStateBinding,
+  observeGitWorkspace,
+  toStateBinding,
+  toStateObserved,
+  toStateRequester,
+  toStateSchemaMode,
+} from "./binding.js";
 import { countFileComplexity } from "./complexity.js";
 import { runCommand, type CommandResult } from "./evidence-runner.js";
 import type {
   AdvanceHeadInput,
   StateCertificate,
+  StateCertificateBindingFields,
+  StateCertificateRequester,
   StateCertificationHead,
   StateCertificationTarget,
   StateComplexityDelta,
@@ -35,6 +46,9 @@ import type {
 export type {
   AdvanceHeadInput,
   StateCertificate,
+  StateCertificateBinding,
+  StateCertificateObserved,
+  StateCertificateRequester,
   StateComplexityResult,
   StateComplexitySummary,
   StateGoal,
@@ -317,6 +331,20 @@ const latestTransitionOutcomes = (events: MeshEvent[]): Map<string, TransitionOu
   return latest;
 };
 
+const toBindingFields = (data: Record<string, unknown>): StateCertificateBindingFields => {
+  const binding = toStateBinding(data.binding);
+  const observed = toStateObserved(data.observed);
+  const requestedBy = toStateRequester(data.requestedBy);
+  const schemaMode = toStateSchemaMode(data.schemaMode);
+  return {
+    ...(binding !== undefined ? { binding } : {}),
+    ...(observed !== undefined ? { observed } : {}),
+    ...(data.issuer === "host" ? { issuer: "host" as const } : {}),
+    ...(requestedBy !== undefined ? { requestedBy } : {}),
+    ...(schemaMode !== undefined ? { schemaMode } : {}),
+  };
+};
+
 const toCertificate = (
   event: MeshEvent,
   currentHead: StateHead | null,
@@ -367,6 +395,7 @@ const toCertificate = (
     resultDigest: data.resultDigest,
     ts: typeof data.ts === "number" ? data.ts : event.createdAt,
     current,
+    ...toBindingFields(data),
   };
 };
 
@@ -415,11 +444,20 @@ const durableCurrentCertificate = (
   ) {
     return undefined;
   }
+  const {
+    binding: _binding,
+    observed: _observed,
+    issuer: _issuer,
+    requestedBy: _requestedBy,
+    schemaMode: _schemaMode,
+    ...baseCertificate
+  } = certificate;
   return {
-    ...certificate,
+    ...baseCertificate,
     targets,
     head: certificateHead,
     current: true,
+    ...toBindingFields(certificate as unknown as Record<string, unknown>),
   };
 };
 
@@ -1172,6 +1210,8 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for the shell command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
   }): Promise<{
     passed: boolean;
     output: string;
@@ -1181,6 +1221,8 @@ export class StateStore {
     const entry = this.store.get(GOAL_KEY);
     if (!entry) throw new Error("No goal set");
     const goal = entry.value as StateGoal;
+    // The command that runs is always the one the goal records and digests.
+    await input.preflightCommand?.(goal.check, 0);
     const result = await runCommand(goal.check, {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs ?? 30_000,
@@ -1294,7 +1336,26 @@ export class StateStore {
     timeoutMs?: number;
     signal?: AbortSignal | undefined;
     identity: MeshIdentity;
+    /** Guard preflight for each evidence command: resolves to run it as declared or throws a refusal (#8606). */
+    preflightCommand?: (command: string, index: number) => Promise<void>;
+    /** Caller claims to bind; `commit` is checked against the observed HEAD. */
+    binding?: Record<string, string>;
+    /** Defaults to "host"; the state provider passes "program". */
+    requestedBy?: StateCertificateRequester;
+    schemaMode?: FabricSchemaMode;
   }): Promise<VerificationReport> {
+    // Invalid bindings are usage errors: throw before any evidence runs.
+    const binding = normalizeStateBinding(input.binding);
+    const requestedBy: StateCertificateRequester = input.requestedBy ?? "host";
+    // Observed before evidence runs, so it names the tree the evidence saw.
+    const observed = await observeGitWorkspace(input.cwd, input.signal);
+    const bindingFields: StateCertificateBindingFields = {
+      ...(binding !== undefined ? { binding } : {}),
+      ...(observed !== undefined ? { observed } : {}),
+      issuer: "host",
+      requestedBy,
+      ...(input.schemaMode !== undefined ? { schemaMode: input.schemaMode } : {}),
+    };
     const verificationHead = this.getHead();
     const boundedHeadLabel = verificationHead
       ? truncateUtf8(verificationHead.label, EVENT_TEXT_MAX_BYTES)
@@ -1361,6 +1422,23 @@ export class StateStore {
     );
     const results: VerifyResult[] = [];
     const failures: VerificationFailure[] = [];
+    const boundCommit = binding?.commit;
+    if (boundCommit !== undefined) {
+      if (observed?.commit === undefined) {
+        failures.push({
+          reason: "binding-unobserved",
+          message:
+            "binding.commit cannot be checked: the verification cwd is not a git work tree with a HEAD commit",
+        });
+      } else if (boundCommit.trim().toLowerCase() !== observed.commit) {
+        failures.push({
+          reason: "binding-mismatch",
+          message: `binding.commit ${truncateUtf8(boundCommit, 128).value} does not match observed HEAD ${observed.commit}`,
+        });
+      }
+    }
+    // A failed commit binding means evidence would run against the wrong tree.
+    const bindingFailed = failures.length > 0;
     if (targets.length === 0) {
       failures.push({
         reason: "missing-target",
@@ -1371,7 +1449,8 @@ export class StateStore {
       });
     }
 
-    for (const target of targets) {
+    let commandIndex = 0;
+    for (const target of bindingFailed ? [] : targets) {
       const evidence = target.evidence ?? [];
       if (evidence.length === 0) {
         failures.push({
@@ -1382,6 +1461,8 @@ export class StateStore {
         });
       }
       for (const command of evidence) {
+        // The command that runs is always the one the result and certificate record.
+        if (!input.signal?.aborted) await input.preflightCommand?.(command, commandIndex++);
         const result: CommandResult = input.signal?.aborted
           ? {
               status: "error",
@@ -1460,6 +1541,7 @@ export class StateStore {
                 ? failures.slice(0, EVENT_RESULT_LIMIT).map(toEventFailure)
                 : [],
               omittedReasonCount: Math.max(0, failures.length - EVENT_RESULT_LIMIT),
+              ...bindingFields,
               ts: Date.now(),
             },
           });
@@ -1484,6 +1566,11 @@ export class StateStore {
         .join("; ") || undefined;
     };
 
+    const reportBinding = {
+      ...(binding !== undefined ? { binding } : {}),
+      ...(observed !== undefined ? { observed } : {}),
+      requestedBy,
+    };
     if (!certified) {
       const reportingError = await recordViolation();
       return {
@@ -1495,6 +1582,7 @@ export class StateStore {
         resultDigest,
         failures,
         ...(reportingError ? { reportingError } : {}),
+        ...reportBinding,
       };
     }
 
@@ -1514,6 +1602,7 @@ export class StateStore {
             head: headIdentity,
             evidenceDigest,
             resultDigest,
+            ...bindingFields,
             ts,
           },
         });
@@ -1545,6 +1634,7 @@ export class StateStore {
         resultDigest,
         failures,
         certificate: durableCertificate,
+        ...reportBinding,
       };
     } catch (error) {
       certified = false;
@@ -1568,6 +1658,7 @@ export class StateStore {
         resultDigest,
         failures,
         reportingError,
+        ...reportBinding,
       };
     }
   }

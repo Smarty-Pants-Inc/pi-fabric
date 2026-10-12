@@ -1,6 +1,7 @@
 import type { FabricActorInfo } from "../actors/types.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
+import { getAgentRunner } from "../agents/runner-registry.js";
 import type { FabricParticipantRecord } from "./types.js";
 
 /**
@@ -38,6 +39,8 @@ export const agentParticipantRecords = (
     const settledAt = run?.finishedAt ?? run?.updatedAt ?? observedAt;
     if (terminalAgentStatuses.has(record.status) && now - settledAt > SETTLED_AGENT_PUBLISH_MS) return;
     const active = record.status === "queued" || record.status === "running";
+    // Unregistered runners keep the historical surface; control fails closed later.
+    const runner = getAgentRunner(record.runner)?.capabilities;
     participants.push({
       format: 1,
       id: record.id,
@@ -52,7 +55,9 @@ export const agentParticipantRecords = (
       runner: record.runner,
       transport: record.transport,
       capabilities: [
-        ...(active ? (["steer", "followUp", "stop"] as const) : []),
+        ...(active && (runner?.steer ?? true) ? (["steer"] as const) : []),
+        ...(active && (runner?.followUp ?? true) ? (["followUp"] as const) : []),
+        ...(active ? (["stop"] as const) : []),
         ...(record.attachCommand ? (["attach"] as const) : []),
         ...(record.recursive ? (["fabric"] as const) : []),
       ],
@@ -63,6 +68,7 @@ export const agentParticipantRecords = (
       startedAt: run?.startedAt ?? observedAt,
       updatedAt: run?.updatedAt ?? observedAt,
       ...(run?.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
+      ...(run?.finalAnswerReceipt ? { finalAnswerReceiptId: run.finalAnswerReceipt.id } : {}),
       ...(run?.currentTool ? { currentTool: run.currentTool } : {}),
       ...(run ? { turns: run.turns, toolCalls: run.toolCalls, usage: { ...run.usage } } : {}),
       controlProtocol: "v1",
@@ -95,12 +101,15 @@ export const actorParticipantRecord = (
     ...(actor.status === "stopped"
       ? []
       : (["steer", "followUp", "stop", "ask", "actor-bindings"] as const)),
-    ...(actor.runner === "pi" && actor.extensions !== false ? (["fabric"] as const) : []),
+    ...(getAgentRunner(actor.runner)?.capabilities.recursiveFabric && actor.extensions !== false
+      ? (["fabric"] as const)
+      : []),
   ],
   ...(actor.model ? { model: actor.model } : {}),
   ...(actor.thinking ? { thinking: actor.thinking } : {}),
   startedAt: actor.createdAt,
   updatedAt: actor.updatedAt,
+  ...(actor.ownershipToken !== undefined ? { actorOwnershipToken: actor.ownershipToken } : {}),
   actorQueued: actor.queued,
   actorMessages: actor.messages,
   ...(actor.preparing ? { actorPreparing: { ...actor.preparing } } : {}),

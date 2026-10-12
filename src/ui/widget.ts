@@ -3,6 +3,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FabricUiWidgetMode } from "../config.js";
 import { spinnerFrame } from "./spinner.js";
+import { FabricWidgetRetention, isRecentWidgetCompletion } from "./retention.js";
 import { FABRIC_CONVERSATION_HINT } from "./conversation-shortcut.js";
 import type {
   FabricActivityRun,
@@ -75,7 +76,6 @@ const totalCost = (
 const agentLines = (
   theme: Theme,
   agent: FabricUiAgent,
-  now: number,
 ): string[] => {
   const status = colorStatus(theme, agent.status, statusGlyph(agent.status));
   const activity =
@@ -90,8 +90,8 @@ const agentLines = (
   const metrics = [
     agent.toolCalls !== undefined ? `${agent.toolCalls} calls` : undefined,
     agent.usage ? `${formatTokens(agent.usage.input + agent.usage.output)} tok` : undefined,
-    agent.startedAt
-      ? formatDuration((agent.finishedAt ?? now) - agent.startedAt)
+    agent.startedAt !== undefined && agent.finishedAt !== undefined
+      ? formatDuration(agent.finishedAt - agent.startedAt)
       : undefined,
   ].filter((value): value is string => Boolean(value));
   const indent = "  ".repeat(1 + Math.max(0, agent.nestingDepth ?? 0));
@@ -102,14 +102,21 @@ const agentLines = (
   ];
 };
 
+// Only the host reply needs a stable above-editor height. Children can outlive
+// that reply, but must not keep its reservation alive once Main has ended.
+export const isFabricWidgetStreaming = (snapshot: FabricDashboardSnapshot): boolean =>
+  snapshot.main.status === "running";
+
 export const shouldShowFabricWidget = (
   snapshot: FabricDashboardSnapshot,
   mode: FabricUiWidgetMode,
+  retention = new FabricWidgetRetention(),
 ): boolean => {
   if (mode === "hidden") return false;
   if (mode === "always") return true;
-  if (snapshot.shells?.some(job => job.finishedAt === undefined || snapshot.now - job.finishedAt < 30000)) return true;
-  if (ownAgents(snapshot).some((agent) => isActiveStatus(agent.status))) return true;
+  retention.sync(snapshot);
+  if (snapshot.shells?.some(job => job.finishedAt === undefined || isRecentWidgetCompletion(job.finishedAt, snapshot.now))) return true;
+  if (ownAgents(snapshot).some((agent) => retention.visible(agent, snapshot))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
   const run = snapshot.runs[0];
   if (!run) return false;
@@ -145,6 +152,10 @@ export class FabricWidget implements Component {
     // Live terminal height. pi re-renders the widget on resize, so reading the
     // pane per render bounds the box without a resize subscription.
     readonly terminalRows?: () => number | undefined,
+    // Controller-owned above-editor widgets reserve rows for streamed turns.
+    // Standalone renderers keep the historical compact behavior.
+    readonly stableWhileStreaming = false,
+    readonly retention = new FabricWidgetRetention(),
   ) {}
 
   #rowLimit(): number {
@@ -155,6 +166,10 @@ export class FabricWidget implements Component {
   #lastLimit: number | undefined;
   #lastSnapshot: FabricDashboardSnapshot | undefined;
   #lastLines: string[] | undefined;
+  // Above-editor components must not change height while a streamed turn is in
+  // flight: pi-tui may have to redraw the whole screen when their line count
+  // changes, and terminals such as Herdr can leave that redraw in scrollback.
+  #turnRowLimit: number | undefined;
   #pending:
     | { width: number; limit: number; snapshot: FabricDashboardSnapshot; lines: string[] }
     | undefined;
@@ -165,20 +180,28 @@ export class FabricWidget implements Component {
     // The pane can shrink between renders, so the row budget is part of the
     // cache key: a box measured against a taller terminal must not be reused.
     const limit = this.#rowLimit();
+    const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
+    if (streaming) this.#turnRowLimit ??= limit;
+    else this.#turnRowLimit = undefined;
+    // A stable turn budget must still fit the live pane after a resize.
+    // Keep the smaller reservation for the rest of this turn, avoiding growth
+    // when the pane is expanded again.
+    if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
+    const renderLimit = streaming ? this.#turnRowLimit! : limit;
     const lines =
       this.#pending?.width === width &&
-      this.#pending.limit === limit &&
+      this.#pending.limit === renderLimit &&
       this.#pending.snapshot === snapshot
         ? this.#pending.lines
         : this.#lastWidth === width &&
-            this.#lastLimit === limit &&
+            this.#lastLimit === renderLimit &&
             this.#lastSnapshot === snapshot &&
             this.#lastLines
           ? this.#lastLines
-          : this.#renderLines(snapshot, width, limit);
+          : this.#renderLines(snapshot, width, renderLimit, streaming);
     this.#pending = undefined;
     this.#lastWidth = width;
-    this.#lastLimit = limit;
+    this.#lastLimit = renderLimit;
     this.#lastSnapshot = snapshot;
     this.#lastLines = lines;
     return lines;
@@ -188,12 +211,25 @@ export class FabricWidget implements Component {
     if (this.#lastWidth === undefined || this.#lastLines === undefined) return true;
     const snapshot = this.snapshot();
     const limit = this.#rowLimit();
-    const lines = this.#renderLines(snapshot, this.#lastWidth, limit);
-    this.#pending = { width: this.#lastWidth, limit, snapshot, lines };
-    return (
-      lines.length !== this.#lastLines.length ||
-      lines.some((line, index) => line !== this.#lastLines?.[index])
-    );
+    const streaming = this.stableWhileStreaming && isFabricWidgetStreaming(snapshot);
+    if (streaming) this.#turnRowLimit ??= this.#lastLimit ?? limit;
+    else this.#turnRowLimit = undefined;
+    // A stable turn budget must still fit the live pane after a resize.
+    // Keep the smaller reservation for the rest of this turn, avoiding growth
+    // when the pane is expanded again.
+    if (streaming) this.#turnRowLimit = Math.min(this.#turnRowLimit!, limit);
+    const renderLimit = streaming ? this.#turnRowLimit! : limit;
+    const lines = this.#renderLines(snapshot, this.#lastWidth, renderLimit, streaming);
+    this.#pending = { width: this.#lastWidth, limit: renderLimit, snapshot, lines };
+    if (lines.length === this.#lastLines.length &&
+        lines.every((line, index) => line === this.#lastLines?.[index])) return false;
+    // Spinner-only differences are allowed to ride on the next Pi render.
+    // Calling requestRender for every animation tick defeats Pi's render
+    // coalescing and is especially noisy for above-editor widgets.
+    const normalizeSpinner = (line: string): string => line.replace(/[◐◓◑◒]/g, "◐");
+    if (!this.stableWhileStreaming) return true;
+    return lines.length !== this.#lastLines.length ||
+      lines.some((line, index) => normalizeSpinner(line) !== normalizeSpinner(this.#lastLines?.[index] ?? ""));
   }
 
   invalidate(): void {
@@ -204,8 +240,11 @@ export class FabricWidget implements Component {
     this.#lastLines = undefined;
   }
 
-  #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number): string[] {
-    return this.#boundContent(this.#buildContent(snapshot), width, limit);
+  #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number, streaming: boolean): string[] {
+    const lines = this.#boundContent(this.#buildContent(snapshot), width, limit);
+    if (!streaming) return lines;
+    while (lines.length < limit) lines.push("");
+    return lines;
   }
 
   #buildContent(snapshot: FabricDashboardSnapshot): string[] {
@@ -217,17 +256,19 @@ export class FabricWidget implements Component {
         candidateFinishedAt > (snapshot.widgetDismissedAt ?? 0))
         ? candidateRun
         : undefined;
+    this.retention.sync(snapshot);
     const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
     const activeAgents = orderedAgents.filter((agent) => isActiveStatus(agent.status));
     const activeAgentIds = new Set(activeAgents.map((agent) => agent.id));
-    const terminalAgents = run
-      ? orderedAgents.filter(
-          (agent) =>
-            agent.runId === run.id &&
-            !activeAgentIds.has(agent.id) &&
-            !isActiveStatus(agent.status),
-        )
-      : [];
+    // Keep settle-time rows stable, then retire each completion independently.
+    // Bound only current content: expiry must not leave a high-water blank row.
+    const terminalAgents = orderedAgents
+      .filter((agent) =>
+        !activeAgentIds.has(agent.id) &&
+        !isActiveStatus(agent.status) &&
+        this.retention.visible(agent, snapshot))
+      .sort((left, right) =>
+        this.retention.finishedAt(right, snapshot.now) - this.retention.finishedAt(left, snapshot.now));
     const visibleActors = snapshot.actors.filter((actor) => actor.status !== "stopped");
     const activeActorWorkers = visibleActors
       .filter((actor) => actor.worker && isActiveStatus(actor.worker.status))
@@ -240,7 +281,7 @@ export class FabricWidget implements Component {
     const title = run?.name ?? "Fabric session";
     const shells = snapshot.shells ?? [];
     const liveShells = shells.filter(job => job.finishedAt === undefined);
-    const recentShells = shells.filter(job => job.finishedAt !== undefined && snapshot.now - job.finishedAt < 30000);
+    const recentShells = shells.filter(job => job.finishedAt !== undefined && isRecentWidgetCompletion(job.finishedAt, snapshot.now));
     const headerStatus =
       run?.status ??
       (activeAgents.length > 0 || activeActorWorkers.length > 0 || liveShells.length > 0 ? "running" : "idle");
@@ -272,7 +313,9 @@ export class FabricWidget implements Component {
     if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
     const cost = totalCost(snapshot, run);
     if (cost > 0) parts.push(formatCost(cost));
-    const elapsed = run && formatDuration((run.finishedAt ?? snapshot.now) - run.startedAt);
+    // Live durations would imply a ticking clock. Only completed work gets a
+    // duration; progress and status redraw exclusively on observed events.
+    const elapsed = run?.finishedAt !== undefined && formatDuration(run.finishedAt - run.startedAt);
     if (elapsed) parts.push(elapsed);
 
     const glyph = colorStatus(this.theme, headerStatus, statusGlyph(headerStatus));
@@ -286,26 +329,26 @@ export class FabricWidget implements Component {
     const taskHeader = taskHint ? `${glyph} ${this.theme.fg("accent", "Fabric")}${taskHint}${parts.length ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}` : header;
     const lines = [hasActiveConversations ? `${taskHeader} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : taskHeader];
     for (const job of [...liveShells, ...recentShells].slice(0, 3)) {
-      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
+      const elapsed = job.finishedAt !== undefined ? formatDuration(job.finishedAt - job.startedAt) : "";
       const status = job.stopping ? "stopping" : job.status;
       const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
       const glyph = colorStatus(this.theme, status, statusGlyph(status));
       lines.push(
         `  ${glyph} ${this.theme.fg("muted", job.id.slice(0, 8))} ${this.theme.fg("muted", label)}` +
-        `${this.theme.fg("dim", ` · ${elapsed} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
+        `${this.theme.fg("dim", `${elapsed ? ` · ${elapsed}` : ""} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
       );
     }
     if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
 
     lines.push(
-      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent)),
       ...activeActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
       ...terminalActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
-      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent)),
     );
     return lines;
   }

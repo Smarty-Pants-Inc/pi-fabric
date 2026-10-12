@@ -56,7 +56,7 @@ describe("explicit managed host", () => {
     await builtins.memory({sessionManager: {getSessionFile: () => {throw new Error("native source discovery");}}} as unknown as ExtensionContext, host.config(), "test");
     expect(await registry.invoke("agents.run", {}, invocation())).toBe("broker");
     expect(await registry.describe("memory.run", ctx)).toBeDefined();
-    await builtins.mesh(host.config(), undefined as never, undefined as never, undefined as never);
+    await builtins.mesh(host.config(), undefined as never, undefined as never, undefined as never, undefined as never);
     expect(await registry.invoke("state.run", {}, invocation())).toBe("broker");
     expect(await registry.invoke("mesh.run", {}, invocation())).toBe("broker");
     await loader.reload("fabric.provider.agents");

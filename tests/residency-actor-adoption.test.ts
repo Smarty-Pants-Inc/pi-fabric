@@ -60,9 +60,8 @@ const startLiveMain = async (config: ResidentHostConfig) => {
     ownerHostId: identity.id, ownerIdentityId: identity.id, name: "Main", status: "idle", residency: "session",
     runner: "pi", transport: "host", capabilities: ["fabric"], sessionId: config.sessionId, cwd: config.cwd,
     startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1" }]);
+  // The directory claims the root lease itself, so its close() withdraws it as a real Main's does.
   await directory.start();
-  writeHostLease(config.meshRoot, { id: config.rootId, rootId: config.rootId, identityId: config.rootId,
-    updatedAt: Date.now(), expiresAt: Date.now() + 120_000 });
   const control = new FabricControlPlane(mesh, identity, { enabled: true, hostId: identity.id, pollMs: 20, acknowledgementTimeoutMs: 5000 });
   control.start(() => ({ accepted: false }));
   return { identity, directory, control, close: async () => { await control.close(); await directory.close(); } };
@@ -124,7 +123,8 @@ describe("fabric-actors adopt (smarty-dev#5919)", () => {
       await f.dead!.participants.refresh();
       expect(f.live.participants.get(actor.id, Date.now(), { fresh: true })?.ownerHostId).toBe(f.dead!.hostId);
 
-      const dry = await f.adopt(actor.name, ["--dry-run"]);
+      // A dry run runs every check, the confirmation included (smarty-dev#7817).
+      const dry = await f.adopt(actor.name, ["--dry-run", "--confirm-dead-root", f.deadConfig.rootId]);
       expect(dry).toMatchObject({ code: 0, err: "" });
       expect(JSON.parse(dry.out)).toMatchObject({ deadHost: "live", adoption: { actorId: actor.id, scope: "project" } });
       expect(f.rows(f.deadConfig.actorRoot).find(row => row.id === actor.id)?.rootId).toBe(f.deadConfig.rootId);
@@ -273,7 +273,7 @@ describe("fabric-actors adopt: the source project fails closed (smarty-dev#5919)
       expect(f.rows(f.deadConfig.actorRoot).find(row => row.id === actor.id)?.project).toBe(here);
       setRowProject(undefined);
       setConfigProject("/elsewhere/other-project");
-      for (const extra of [["--dry-run"], ["--confirm-dead-root", f.deadConfig.rootId]]) {
+      for (const extra of [["--dry-run", "--confirm-dead-root", f.deadConfig.rootId], ["--confirm-dead-root", f.deadConfig.rootId]]) {
         const foreign = await f.adopt(actor.id, extra);
         expect(foreign.code).toBe(1);
         expect(foreign.err).toContain("belongs to project /elsewhere/other-project");

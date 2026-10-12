@@ -4,6 +4,8 @@ export const COMPACTION_FAILED_ALARM = "fabric.session.compaction_failed";
 export interface CompactionRecoveryOptions {
   enabled: () => boolean;
   alarm: (data: Record<string, unknown>, context: ExtensionContext) => Promise<void>;
+  /** The retry compaction ended, either way, and Pi has left its compaction state (smarty-dev#9271). */
+  retryEnded?: () => void;
 }
 interface Incident {
   sessionId: string;
@@ -53,8 +55,8 @@ export const registerCompactionRecovery = (pi: ExtensionAPI, options: Compaction
       current.retrying = true;
       try {
         ctx.compact({ ...(current.customInstructions ? { customInstructions: current.customInstructions } : {}),
-          onComplete: () => { if (incident === current) reset(); },
-          onError: error => { void alarm(current, error.message); },
+          onComplete: () => { if (incident === current) reset(); options.retryEnded?.(); },
+          onError: error => { void alarm(current, error.message); options.retryEnded?.(); },
         });
       } catch (error) {
         void alarm(current, error instanceof Error ? error.message : String(error));

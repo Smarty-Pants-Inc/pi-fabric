@@ -1,0 +1,317 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadFabricConfig, normalizeFabricConfig } from "../src/config.js";
+import { normalizeAgentRouterConfig } from "../src/agents/router-config.js";
+import { routeAgentCreation, type SpawnRouterRequest } from "../src/agents/spawn-router.js";
+
+const roots: string[] = [];
+const root = (): string => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-router-")); roots.push(dir); return dir; };
+afterEach(() => { for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+const pick = { model: "provider/model-b", thinking: "high", reason: "normal.implementation", policyVersion: "1.0.0" };
+const defaults = { model: "provider/model-a", thinking: "medium" as const };
+const command = (dir: string, body = `process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`): string[] => [
+  process.execPath, "-e", `let input = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', c => input += c); process.stdin.on('end', () => {
+    require('node:fs').writeFileSync(process.argv[1], input); ${body}
+  });`, path.join(dir, "request.json"),
+];
+const options = (dir: string) => ({
+  config: { command: command(dir), mode: "enforce" as const }, meshRoot: dir,
+  kind: "spawn" as const, role: "task-agent", name: "implementation", cwd: dir, project: dir,
+  task: "private task 🦉", parentId: "actor:parent", complexity: "normal" as const, defaults,
+  explicit: false,
+  validateModel: (model: string) => { if (model !== pick.model) throw new Error("private validation detail"); return model; },
+});
+const decisions = (dir: string): Array<Record<string, any>> => fs.readFileSync(path.join(dir, "router", "decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+const request = (dir: string): SpawnRouterRequest => JSON.parse(fs.readFileSync(path.join(dir, "request.json"), "utf8"));
+
+describe("spawn router configuration", () => {
+  it("is optional and defaults to off/1500/no task disclosure", () => {
+    expect(normalizeFabricConfig({}).agents.router).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { router: { command: [process.execPath, "a b"] } } }).agents.router)
+      .toEqual({ command: [process.execPath, "a b"], mode: "off", timeoutMs: 1500, includeTask: false });
+  });
+  it.each([[0, 200], [199, 200], [5001, 5000], [NaN, 1500], [Infinity, 1500]])("bounds deadline %s to %s", (value, expected) => {
+    expect(normalizeAgentRouterConfig({ command: [process.execPath], timeoutMs: value })?.timeoutMs).toBe(expected);
+  });
+  it.each(["router | shell", [], [""], ["router"], ["./router"], ["../router"], [process.execPath, 1], [process.execPath, "\0"]].map(command => ({ command })))("rejects malformed argv $command without shell repair", ({ command }) => {
+    expect(normalizeAgentRouterConfig({ command, mode: "enforce" })?.command).toEqual([]);
+  });
+  it.each([true, false])("workspace cannot enable/override/disclose task (trusted=%s)", projectTrusted => {
+    const cwd = root(); const agentDir = root(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { router: { command: [process.execPath, "host-router"], mode: "shadow" } } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { router: { command: [process.execPath, "workspace-router"], mode: "enforce", includeTask: true } } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.router)
+      .toMatchObject({ command: [process.execPath, "host-router"], mode: "shadow", includeTask: false });
+    fs.unlinkSync(path.join(agentDir, "fabric.json"));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.router).toBeUndefined();
+  });
+});
+
+describe("external spawn router behavior", () => {
+  it("off starts no command and creates no ledger", async () => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, mode: "off" } })).toBeUndefined();
+    expect(fs.existsSync(path.join(dir, "request.json"))).toBe(false);
+    expect(fs.existsSync(path.join(dir, "router"))).toBe(false);
+  });
+  it.each(["node", "./router", "../router"])("runtime rejects non-absolute executable %s without PATH lookup", async executable => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: [executable, ...command(dir).slice(1)] } })).toBeUndefined();
+    expect(fs.existsSync(path.join(dir, "request.json"))).toBe(false);
+    expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: "invalid-command" });
+  });
+  it.each([...new Set([process.platform, "win32"])])("passes only the minimal explicit environment, never credentials or loader hooks (%s)", async platform => {
+    const dir = root(); const opts = options(dir);
+    for (const name of ["SMARTY_AUTH", "GITHUB_TOKEN", "MY_TOKEN", "API_KEY", "PI_CODING_AGENT_DIR", "NODE_OPTIONS", "LD_PRELOAD", "COMSPEC", "PATHEXT"]) {
+      vi.stubEnv(name, "must-not-reach-router");
+    }
+    vi.stubEnv("PATH", dir); vi.stubEnv("HOME", "/router-home"); vi.stubEnv("LANG", "C"); vi.stubEnv("TZ", "UTC");
+    const systemRoot = Object.entries(process.env).find(([key]) => key.toLowerCase() === "systemroot")?.[1] ?? "C:\\Windows";
+    const essentials = {
+      HOMEDRIVE: "C:", HOMEPATH: "\\router-home", LOGONSERVER: "\\\\router-host", SYSTEMDRIVE: "C:",
+      TEMP: dir, USERDOMAIN: "router-domain", USERNAME: "router-user", USERPROFILE: dir, WINDIR: systemRoot,
+    };
+    // Exercise case-insensitive Windows lookup without leaking these keys on POSIX.
+    for (const [name, value] of Object.entries({ ...essentials, SYSTEMROOT: systemRoot })) {
+      const keys = Object.keys(process.env).filter(key => key.toUpperCase() === name);
+      for (const key of keys.length ? keys : [name.toLowerCase()]) vi.stubEnv(key, value);
+    }
+    const body = `require('node:fs').writeFileSync(process.argv[1] + '.env', JSON.stringify(process.env)); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`;
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let routed: ReturnType<typeof routeAgentCreation>;
+    try {
+      // Inject only while the hook constructs env/spawn options; restore before
+      // asynchronous process retirement so a Linux child is retired on Linux.
+      Object.defineProperty(process, "platform", { ...descriptor, value: platform });
+      routed = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } });
+    } finally { Object.defineProperty(process, "platform", descriptor); }
+    expect(await routed).toEqual({ model: pick.model, thinking: pick.thinking });
+    const platformEnv = platform === "win32" ? {
+      ...essentials, SystemRoot: systemRoot,
+      PATH: `${path.win32.join(systemRoot, "System32")};${systemRoot}`,
+      COMSPEC: path.win32.join(systemRoot, "System32", "cmd.exe"),
+    } : { PATH: "/usr/bin:/bin" };
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "request.json.env"), "utf8"))).toEqual({ ...platformEnv, HOME: "/router-home", LANG: "C", TZ: "UTC" });
+  });
+  it("shadow preserves default and logs validated pick beside actual", async () => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, mode: "shadow" } })).toBeUndefined();
+    expect(decisions(dir)).toEqual([expect.objectContaining({ pick, actual: defaults, error: null, mode: "shadow", decision: "default" })]);
+  });
+  it("enforce selects validated model/thinking and emits one private decision", async () => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation(opts)).toEqual({ model: pick.model, thinking: pick.thinking });
+    const req = request(dir);
+    expect(req).toMatchObject({ kind: "spawn", role: "task-agent", name: "implementation", cwd: dir, project: dir,
+      parentId: "actor:parent", requestedComplexity: "normal", defaults,
+      taskDigest: createHash("sha256").update(opts.task).digest("hex"), taskLength: Buffer.byteLength(opts.task), host: os.hostname() });
+    expect(req).not.toHaveProperty("task");
+    const log = decisions(dir);
+    expect(log).toHaveLength(1);
+    expect(log[0]).toMatchObject({ actual: { model: pick.model, thinking: pick.thinking }, pick, error: null, decision: "enforce" });
+    expect(log[0]!.requestDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(log[0]!.ts).toMatch(/^\d{4}-/);
+    expect(log[0]!.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(log)).not.toContain(opts.task);
+  });
+  it.each(["simple", "normal", "complex", "delicate"] as const)("forwards %s complexity verbatim to router stdin", async complexity => {
+    const dir = root();
+    expect(await routeAgentCreation({ ...options(dir), complexity })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(request(dir).requestedComplexity).toBe(complexity);
+  });
+  it("full task reaches stdin only with includeTask true, never the ledger", async () => {
+    const dir = root(); const opts = options(dir);
+    await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true } });
+    expect(request(dir).task).toBe(opts.task);
+    expect(JSON.stringify(decisions(dir))).not.toContain(opts.task);
+  });
+  it.each(["policy:task/normal", "policy:task/tier-1", `policy:task/${"a".repeat(32)}`, "capacity-hold", "taskclass:implementation", "taskclass:code-1", `taskclass:${"a".repeat(32)}`, "default", "unavailable", "normal.implementation"])("preserves structured router reason %s", async reason => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, reason }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { ...pick, reason }, error: null });
+  });
+  it.each(["normal.policy", "normal.implementation:secret-token", "normal.implementation\n", "policy", "policy:task/", `policy:task/${"a".repeat(33)}`, "policy:task/UPPERCASE", "taskclass:", "taskclass:secret words with spaces", `taskclass:${"a".repeat(33)}`, "taskclass:private_task", "taskclass:normal\r\n", "capacity-hold\u2028", "default\u2029", "a".repeat(100), "private task 🦉", "UPPERCASE", ""])("maps unrecognized reason %s to other", async reason => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, reason }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: pick.policyVersion }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(JSON.stringify(reason));
+  });
+  it.each(["v1", "v1-2026.10.09", "v12-release.1", `v1-${"a".repeat(32)}`, `v${"1".repeat(40)}`, "1.2", "1.2.3", `${"1".repeat(37)}.1.0`, "abcdef0", "a".repeat(40)])("preserves structured router version %s", async policyVersion => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { ...pick, policyVersion }, error: null });
+  });
+  it.each(["v", "v1-", `v1-${"a".repeat(33)}`, "v1-secret words with spaces", "v1-2026.10.09\n", "v1-UPPERCASE", "2026-10-v1", "abcdef", "a".repeat(41), "ABCDEF0123456789", "private task 🦉", "1", "1.2.3.4", "1.2.3-secret", "1.2\n", "abcdef0\r\n", "1.2\u2028", "1.2\u2029", " 1.2", "1.2 ", ""])("maps invalid version %s to unknown without truncation", async policyVersion => {
+    const dir = root(); const opts = options(dir);
+    const body = `process.stdout.write(${JSON.stringify(JSON.stringify({ ...pick, policyVersion }))});`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: pick.reason, policyVersion: "unknown" }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(JSON.stringify(policyVersion));
+  });
+  it.each((["shadow", "enforce"] as const).flatMap(mode => ["secret-token", "taskclass:secret words with spaces", `taskclass:${"a".repeat(33)}`].map(fragment => ({ mode, fragment }))))("never records task-secret fragment $fragment echoed through either metadata field in $mode mode", async ({ mode, fragment }) => {
+    const dir = root(); const opts = { ...options(dir), task: `deploy ${fragment}` };
+    const logs = [vi.spyOn(console, "log"), vi.spyOn(console, "warn"), vi.spyOn(console, "error")].map(spy => spy.mockImplementation(() => {}));
+    const body = `const fragment = JSON.parse(input).task.slice('deploy '.length); process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: fragment, policyVersion: fragment }));`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, mode, includeTask: true, command: command(dir, body) } })).toEqual(mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : undefined);
+    expect(request(dir).task).toBe(opts.task);
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: "unknown" }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(fragment);
+    for (const log of logs) expect(JSON.stringify(log.mock.calls)).not.toContain(fragment);
+  });
+  it.each(["secret-task", "private task 🦉"])("redacts task text echoed through router metadata (%s)", async task => {
+    const dir = root(); const opts = { ...options(dir), task };
+    const body = `const task = JSON.parse(input).task; process.stdout.write(JSON.stringify({ model: '${pick.model}', thinking: '${pick.thinking}', reason: task, policyVersion: task }));`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, includeTask: true, command: command(dir, body) } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(decisions(dir)[0]).toMatchObject({ pick: { reason: "other", policyVersion: "unknown" }, error: null });
+    expect(fs.readFileSync(path.join(dir, "router/decisions.jsonl"), "utf8")).not.toContain(task);
+  });
+  it("explicit model/thinking starts no router but logs the actual binding", async () => {
+    const dir = root();
+    expect(await routeAgentCreation({ ...options(dir), explicit: true })).toBeUndefined();
+    expect(fs.existsSync(path.join(dir, "request.json"))).toBe(false);
+    expect(decisions(dir)).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual: defaults, error: null })]);
+  });
+  it.each([
+    ["process.stdout.write('not JSON');", "invalid-json"],
+    ["process.stdout.write('[]');", "invalid-output"],
+    ["process.stdout.write('{}');", "invalid-output"],
+    ["process.stdout.write(JSON.stringify({ model: 'unknown', thinking: 'high' }));", "unknown-or-denied-model"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'extreme' }));", "invalid-output"],
+    ["process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'high', reason: {} }));", "invalid-output"],
+    ["process.stderr.write('secret task text'); process.exit(17);", "nonzero-exit"],
+    ["process.stdout.write('x'.repeat(70000));", "output-too-large"],
+  ])("falls back and logs a sanitized error for %s", async (body, error) => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body) } })).toBeUndefined();
+    expect(decisions(dir)).toEqual([expect.objectContaining({ actual: defaults, pick: null, error })]);
+    expect(JSON.stringify(decisions(dir))).not.toContain("secret task text");
+    expect(JSON.stringify(decisions(dir))).not.toContain("private validation detail");
+  });
+  it.each([[], ["/definitely/missing/spawn-router"]].map(argv => ({ argv })))("fails open on unavailable command $argv", async ({ argv }) => {
+    const dir = root(); const opts = options(dir);
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: argv } })).toBeUndefined();
+    expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: argv.length ? "command-error" : "missing-command" });
+  });
+  it("times out, reaps the command and logs fallback before returning", async () => {
+    const dir = root(); const opts = options(dir);
+    const body = `require('node:fs').writeFileSync(process.argv[1] + '.pid', String(process.pid)); setInterval(() => {}, 1000);`;
+    const before = Date.now();
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body), timeoutMs: 200 } })).toBeUndefined();
+    expect(Date.now() - before).toBeLessThan(5000);
+    expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: "timeout" });
+    const pid = Number(fs.readFileSync(path.join(dir, "request.json.pid"), "utf8"));
+    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow());
+  });
+  it("timeout settles and retires a lingering grandchild with inherited pipes", async () => {
+    const dir = root(); const opts = options(dir);
+    const grandchild = `require('node:fs').writeFileSync(process.argv[1], 'started'); setTimeout(() => require('node:fs').writeFileSync(process.argv[1] + '.late', 'leaked'), 800);`;
+    const body = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}, process.argv[1] + '.grandchild'], { stdio: ['ignore', 'inherit', 'inherit'] }); setInterval(() => {}, 1000);`;
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body), timeoutMs: 400 } })).toBeUndefined();
+    expect(decisions(dir)[0]).toMatchObject({ error: "timeout", actual: defaults });
+    expect(fs.existsSync(path.join(dir, "request.json.grandchild"))).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 900));
+    expect(fs.existsSync(path.join(dir, "request.json.grandchild.late"))).toBe(false);
+  });
+  it("argv metacharacters are forwarded literally, never interpreted by a shell", async () => {
+    const dir = root(); const opts = options(dir); const literal = `space ; $(touch ${path.join(dir, "shell-leak")}) | &`;
+    const argv = [...command(dir, `require('node:fs').writeFileSync(process.argv[1] + '.arg', process.argv[2]); process.stdout.write(${JSON.stringify(JSON.stringify(pick))});`), literal];
+    expect(await routeAgentCreation({ ...opts, config: { ...opts.config, command: argv } })).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(fs.readFileSync(path.join(dir, "request.json.arg"), "utf8")).toBe(literal);
+    expect(fs.existsSync(path.join(dir, "shell-leak"))).toBe(false);
+  });
+
+  it("abort retires a running router and falls back", async () => {
+    const dir = root(); const opts = options(dir); const controller = new AbortController();
+    const body = `require('node:fs').writeFileSync(process.argv[1] + '.pid', String(process.pid)); setInterval(() => {}, 1000);`;
+    const pending = routeAgentCreation({ ...opts, config: { ...opts.config, command: command(dir, body), timeoutMs: 5000 }, signal: controller.signal });
+    await vi.waitFor(() => expect(fs.existsSync(path.join(dir, "request.json.pid"))).toBe(true), { timeout: 5000 });
+    const pid = Number(fs.readFileSync(path.join(dir, "request.json.pid"), "utf8"));
+    controller.abort(); await expect(pending).resolves.toBeUndefined();
+    expect(decisions(dir)[0]).toMatchObject({ actual: defaults, error: "aborted" });
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+  it("a logging failure cannot fail or change an enforce selection", async () => {
+    const dir = root(); fs.writeFileSync(path.join(dir, "router"), "not a directory");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await routeAgentCreation(options(dir))).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(warn).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
+  });
+  it.skipIf(process.platform === "win32")("creates a private directory and regular ledger with 0700/0600 modes", async () => {
+    const dir = root(); await routeAgentCreation({ ...options(dir), explicit: true });
+    const directory = fs.lstatSync(path.join(dir, "router"));
+    const ledger = fs.lstatSync(path.join(dir, "router/decisions.jsonl"));
+    expect(directory.isDirectory()).toBe(true); expect(directory.uid).toBe(process.getuid!());
+    expect(directory.mode & 0o777).toBe(0o700);
+    expect(ledger.isFile()).toBe(true); expect(ledger.mode & 0o777).toBe(0o600);
+  });
+  it.skipIf(!process.getuid)("refuses a directory owned by another uid without failing selection", async () => {
+    const dir = root(); fs.mkdirSync(path.join(dir, "router"), { mode: 0o700 });
+    const uid = process.getuid!(); vi.spyOn(process, "getuid").mockReturnValue(uid + 1);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await routeAgentCreation(options(dir))).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(fs.existsSync(path.join(dir, "router/decisions.jsonl"))).toBe(false);
+    expect(warn).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
+  });
+  it.skipIf(process.platform === "win32")("refuses a non-private existing router directory", async () => {
+    const dir = root(); fs.mkdirSync(path.join(dir, "router")); fs.chmodSync(path.join(dir, "router"), 0o755);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await routeAgentCreation(options(dir))).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(fs.existsSync(path.join(dir, "router/decisions.jsonl"))).toBe(false);
+    expect(warn).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
+  });
+  it.skipIf(process.platform === "win32").each(["directory", "ledger"])("refuses a %s symlink without changing the enforce selection", async target => {
+    const dir = root(); const victim = root();
+    const sentinel = path.join(victim, "decisions.jsonl"); fs.writeFileSync(sentinel, "untouched");
+    if (target === "directory") fs.symlinkSync(victim, path.join(dir, "router"), "dir");
+    else {
+      fs.mkdirSync(path.join(dir, "router"), { mode: 0o700 });
+      fs.symlinkSync(sentinel, path.join(dir, "router/decisions.jsonl"));
+    }
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await routeAgentCreation(options(dir))).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(fs.readFileSync(sentinel, "utf8")).toBe("untouched");
+    expect(warn).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
+    expect(fs.readdirSync(victim)).toEqual(["decisions.jsonl"]);
+  });
+  it("refuses a non-regular ledger without failing selection", async () => {
+    const dir = root(); fs.mkdirSync(path.join(dir, "router/decisions.jsonl"), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.join(dir, "router"), 0o700);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await routeAgentCreation(options(dir))).toEqual({ model: pick.model, thinking: pick.thinking });
+    expect(warn).toHaveBeenCalledWith("[pi-fabric] spawn router decision log unavailable");
+    expect(fs.lstatSync(path.join(dir, "router/decisions.jsonl")).isDirectory()).toBe(true);
+  });
+  it("rotates at 8 MiB, serializes concurrent appends, and keeps one archive", async () => {
+    const dir = root(); const router = path.join(dir, "router"); fs.mkdirSync(router, { mode: 0o700 });
+    const file = path.join(router, "decisions.jsonl"); const limit = 8 * 1024 * 1024;
+    const seed = "x".repeat(limit - 16);
+    fs.writeFileSync(file, seed, { mode: 0o600 }); fs.writeFileSync(file + ".1", "obsolete archive");
+    await Promise.all(Array.from({ length: 5 }, (_, n) => routeAgentCreation({ ...options(dir), task: `task-${n}`, explicit: true })));
+    expect(decisions(dir)).toHaveLength(5);
+    expect(fs.statSync(file).size).toBeLessThanOrEqual(limit);
+    expect(fs.readFileSync(file + ".1", "utf8") === seed).toBe(true);
+    fs.writeFileSync(file, "y".repeat(limit));
+    await routeAgentCreation({ ...options(dir), explicit: true });
+    expect(decisions(dir)).toHaveLength(1); expect(fs.statSync(file + ".1").size).toBe(limit);
+    expect(fs.readFileSync(file + ".1", "utf8").startsWith("y")).toBe(true);
+    expect(fs.readdirSync(router).sort()).toEqual(["decisions.jsonl", "decisions.jsonl.1"]);
+  });
+  it("concurrent spawns each append one complete JSONL record", async () => {
+    const dir = root();
+    await Promise.all(Array.from({ length: 5 }, (_, n) => routeAgentCreation({ ...options(dir), task: `task-${n}` })));
+    expect(decisions(dir)).toHaveLength(5);
+    expect(new Set(decisions(dir).map(d => d.requestDigest)).size).toBe(5);
+  });
+  it("owner-only actor instruction files expose only the supplied digest and unknown length", async () => {
+    const dir = root(); const { task: _task, ...opts } = options(dir); const taskDigest = "a".repeat(64);
+    await routeAgentCreation({ ...opts, kind: "actor", taskDigest, config: { ...opts.config, includeTask: true } });
+    expect(request(dir)).toMatchObject({ kind: "actor", taskDigest, taskLength: null });
+    expect(request(dir)).not.toHaveProperty("task");
+  });
+});

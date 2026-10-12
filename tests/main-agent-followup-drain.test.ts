@@ -518,7 +518,7 @@ describe("Main followUp drain (unit)", () => {
 
   it("flushes all due followUps as ONE steer in send order, each marked followUp; later ones wait", () => {
     const { main, sent, emit, ctx } = setup();
-    main.deliverAgent({ from: from("a"), message: "first", delivery: "followUp", data: { key: "k1" } });
+    main.deliverAgent({ from: from("a"), message: "first", delivery: "followUp", data: { key: "k1", topic: "fleet.work.k" } });
     vi.advanceTimersByTime(10_000);
     main.deliverAgent({ from: from("b"), message: "second", delivery: "followUp" });
     vi.advanceTimersByTime(120_000);
@@ -536,8 +536,9 @@ describe("Main followUp drain (unit)", () => {
     expect(message.details).toMatchObject({ delivery: "followUp", flushed: true });
     // The root inbox still sees the work key a batched followUp carried.
     const entry = { type: "custom_message", customType: "pi-fabric-agent-message", details: message.details };
-    expect(rootInboxSession([entry]).holdsSteer("agent-a", "k1")).toBe(true);
-    expect(rootInboxSession([entry]).holdsSteer("agent-c", "k1")).toBe(false);
+    expect(rootInboxSession([entry]).holdsSteer("agent-a", "k1", "fleet.work.k")).toBe(true);
+    expect(rootInboxSession([entry]).holdsSteer("agent-a", "k1", "fleet.work.other")).toBe(false);
+    expect(rootInboxSession([entry]).holdsSteer("agent-c", "k1", "fleet.work.k")).toBe(false);
     expect(main.queueDepth()).toEqual({ pendingFollowUps: 1, oldestAgeS: 0 });
   });
 

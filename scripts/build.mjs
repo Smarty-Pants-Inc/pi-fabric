@@ -2,7 +2,7 @@
 import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildLandlock } from "./build-landlock.mjs";
+import { buildLandlock, stripGroupOtherWrite } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
@@ -335,3 +335,6 @@ if (unstableLazyImports.length > 0) {
     `Package-local dynamic imports must use stable entry paths:\n${unstableLazyImports.join("\n")}`,
   );
 }
+
+// Last: nothing in dist/ may be writable by another user (smarty-dev#8145; assert-build-artifacts.mjs checks).
+stripGroupOtherWrite("dist");

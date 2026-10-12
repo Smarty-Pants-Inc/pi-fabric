@@ -14,7 +14,7 @@
  *   4. Keep state.json at `state.json.nats-cutover-<E+1>`, install the NATS moved marker over state.json, then
  *      publish `import-commit{E+1}`.
  * Rerun after a crash: without the marker, the same source (G0 equals the `import-begin` record) resumes: chunks
- * already stored must match byte for byte, the rest are published; a changed source refuses (delete the root's stream on the server first).
+ * already stored must match byte for byte, the rest are published; a changed source refuses (a leftover import may be deleted on the server; a stream with committed state never).
  * With the marker, the stream is verified against the kept copy and committed (or found committed).
  *
  * Rollback (nats -> file), under the fence: publish `retire{E+1}` with the expected last sequence (every later nats
@@ -43,6 +43,10 @@ const DEFAULT_LOCK_MS = 60_000;
 const CHUNK_BYTES = 512 * 1024;
 /** The backend's own tombstone bound (state-backend-nats.ts DEFAULT_TOMBSTONES): the projection forgets as it does. */
 const DEFAULT_MAX_TOMBSTONES = 2_048;
+/** The remedy for a partial import left in the root's stream (still `importing`, and no state.json NATS marker, so no
+ * Fabric store serves it): it may be deleted, after the operator checks that nothing serves the root from NATS. */
+const LEFTOVER = (stream: string): string => `the stream is a leftover of a failed import (still importing; state.json has no NATS marker). `
+  + `After checking that no Fabric process serves this root from NATS, delete stream ${stream} on the server and rerun (an import never purges)`;
 /** At most this many stream messages are replayed by one projection (a stream that long needs a snapshot first). */
 const DEFAULT_MAX_REPLAY = 1_000_000;
 
@@ -347,10 +351,15 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     } else {
       const begin = await port.getMessage(stream, 1);
       const recorded = begin ? JSON.parse(Buffer.from(begin.data).toString("utf8")) as { type?: string; digest?: string; generation?: string } : undefined;
-      if (projection.status !== "importing" || projection.epoch !== epoch || recorded?.type !== "import-begin"
+      // A committed, live or retired projection may be this root's live NATS mesh: never advise deleting it.
+      if (projection.status !== "importing") {
+        throw new MeshBackendRefusedError(`Fabric mesh: this root already has NATS state in stream ${stream} `
+          + `(${projection.status} at epoch ${projection.epoch}, ${head} messages); an import never overwrites it`);
+      }
+      if (projection.epoch !== epoch || recorded?.type !== "import-begin"
         || recorded.digest !== digest || recorded.generation !== generation || head > 1 + chunks.length) {
-        throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} is not empty and holds no unfinished import of this state.json `
-          + `(${projection.status} at epoch ${projection.epoch}, ${head} messages): delete stream ${stream} on the server first (an import never purges)`);
+        throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} holds an unfinished import of another state.json `
+          + `(epoch ${projection.epoch}, ${head} messages): ${LEFTOVER(stream)}`);
       }
     }
     for (const [index, chunk] of chunks.entries()) {
@@ -358,7 +367,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
       if (seq <= head) {
         const stored = await port.getMessage(stream, seq);
         if (!stored || Buffer.compare(Buffer.from(stored.data), Buffer.from(chunk)) !== 0) {
-          throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} message ${seq} is not chunk ${index} of this import: delete stream ${stream} on the server first (an import never purges)`);
+          throw new MeshBackendRefusedError(`Fabric mesh NATS stream ${stream} message ${seq} is not chunk ${index} of this import: ${LEFTOVER(stream)}`);
         }
         continue;
       }
@@ -373,7 +382,7 @@ export const importMeshStateToNats = (root: string, options: MeshNatsMigrationOp
     options.onStep?.("nats-import-verify");
     const again = readSource(statePath, options);
     if (meshSnapshotDigest(again) !== digest || (typeof again.readGeneration === "string" ? again.readGeneration : "") !== generation) {
-      throw new MeshBackendRefusedError("Fabric mesh state.json changed during the NATS import (a writer ignored .lock); delete this root's NATS stream on the server, then rerun");
+      throw new MeshBackendRefusedError(`Fabric mesh state.json changed during the NATS import (a writer ignored .lock): ${LEFTOVER(stream)}`);
     }
     // Keep the source (the rerun's and the operator's reference), then the marker, then the commit.
     keepCopy(root, path.join(root, `${STATE_JSON}.nats-cutover-${epoch}`), source, digest, options);

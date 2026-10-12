@@ -314,10 +314,25 @@ describe.each(["fake", "nats"] as const)("file <-> nats migration on the %s serv
     stores.push(file);
     await file.put({ key: "late/writer", value: 1, identity });
     await expect(importMeshStateToNats(root, options)).rejects.toBeInstanceOf(MeshBackendRefusedError);
-    await expect(importMeshStateToNats(root, options)).rejects.toThrow(/delete stream .* on the server first/);
+    // A partial leftover (still importing, no marker): it may be deleted, after checking nothing serves the root.
+    await expect(importMeshStateToNats(root, options)).rejects.toThrow(/leftover of a failed import .*After checking that no Fabric process serves this root from NATS, delete stream \S+ on the server and rerun/);
     expect(readMeshStateNatsMarker(root)).toBeUndefined();
     expect(file.get("late/writer")?.value).toBe(1);
   }, 60_000);
+});
+
+// pi-fabric#918: a stream that holds committed (here retired) state may be the root's live NATS mesh: the refusal never
+// advises deleting it.
+it("refuses to import over a stream with committed state, and never advises deleting it", async () => {
+  const server = fakeJetStream();
+  const root = tempRoot("committed");
+  await seedFileRoot(root);
+  const imported = await importMeshStateToNats(root, { port: server.port() });
+  await rollbackMeshStateFromNats(root, { port: server.port() });
+  expect(readMeshStateNatsMarker(root)).toBeUndefined();
+  const refusal = importMeshStateToNats(root, { port: server.port() });
+  await expect(refusal).rejects.toThrow(new RegExp(`this root already has NATS state in stream ${imported.stream} \\(retired at epoch 2, \\d+ messages\\); an import never overwrites it$`));
+  await expect(refusal).rejects.not.toThrow(/delete/);
 });
 
 it("refuses a nats-server older than the backend's minimum before any write: no marker, state.json unchanged", async () => {

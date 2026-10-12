@@ -170,8 +170,9 @@ then import. The details:
   order, at most 512 KiB of changes each, with fixed message ids.
 - The source is kept at `state.json.nats-cutover-<E+1>` before the marker goes in.
 - **Rerun without the marker:** the same source resumes. Stored chunks must match byte for byte.
-  A changed source refuses; delete the root's stream on the server first (an import never purges; the stream name
-  is derived from the root, pi-fabric#937).
+  A changed source refuses. An import never purges, and the stream name is derived from the root (pi-fabric#937).
+  A leftover of a failed import (still importing, no marker) may be deleted on the server, after checking that no
+  Fabric process serves the root from NATS. A stream with committed state refuses the import and is never deleted.
 - **Rerun with the marker:** the stream is checked against the kept copy, then committed.
 - **Rollback:** it retires the stream and exports the projection through the `state.json`
   encoder into `state.json.nats-rollback-<E+2>-<uuid>.tmp`. It reads the temp back, checks the digest

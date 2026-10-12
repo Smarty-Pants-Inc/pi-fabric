@@ -3,7 +3,8 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { fixture } from "./helpers/dead-root-fixture.js";
+import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { actorWithTree, pendingRemoval } from "./helpers/pending-removal.js";
 
 // pi-fabric#952 round 2 (smarty-dev#8090): where the Main publication fence is unavailable (Windows: no flock,
@@ -72,6 +73,27 @@ describe("live actor remove without the Main publication fence", () => {
       } finally { await restarted?.close(); await f.close(); }
     }, 60_000);
   }
+
+  // pi-fabric#952 round 5: a readable marker naming another owner root than the registry-loaded actor. The fence would
+  // have been the marker's root, so the actor's real Main could publish after the final check: refuse, keep the tree.
+  it("a registry actor whose removal marker names another root keeps its tree while its real Main lives", async () => {
+    const f = await fixture();
+    const main = mainDirectory(f.config.meshRoot, f.config.rootId);
+    try {
+      const actor = await actorWithTree(f, "other-root-marker");
+      // A readable marker for this actor naming another owner root (explicit false: nothing else holds it back).
+      fs.writeFileSync(path.join(f.config.actorRoot, `removal-${actor.id}.json`), JSON.stringify({ id: actor.id, sessionDir: actor.dir,
+        presenceKey: `actors/${f.config.sessionId}/${actor.id}`, operatorCheck: false,
+        owner: { name: "other-root-marker", rootId: "session:another-root", residency: "durable", requestedAt: Date.now() } }));
+      await main.refresh(); // the actor's real root Main is live
+      const failure = await f.host.actors.remove(actor.id).then(() => undefined, (error: unknown) => String(error));
+      expect(fs.existsSync(actor.dir), "the actor's tree").toBe(true);
+      expect(fs.readFileSync(path.join(actor.dir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(failure).toMatch(/names owner session:another-root/);
+      expect(f.registered(actor.id)).toBe(true); // not revoked: the removal stays pending, with the reason
+      expect(f.host.actors.status(actor.id).lastError).toMatch(/names owner session:another-root/);
+    } finally { await main.close(); await f.close(); }
+  }, 60_000);
 
   it("a removal marker with a malformed operator flag keeps the tree (fail closed)", async () => {
     const f = await fixture();

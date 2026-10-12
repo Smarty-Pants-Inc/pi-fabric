@@ -2765,8 +2765,8 @@ export class ActorManager {
       : { removed: true };
   }
 
-  /** `sessionActor`: the TRUSTED record (the registry-loaded actor, never the marker) says this is a session actor. */
-  async #finishCleanup(cleanup: RemovalCleanup, sessionActor = false): Promise<RemovalResult> {
+  /** `trusted`: the registry-loaded actor's root and residency (never the marker's); absent for a marker-only cleanup. */
+  async #finishCleanup(cleanup: RemovalCleanup, trusted?: { rootId: string; session: boolean }): Promise<RemovalResult> {
     // A prepared marker (or a transient hole in the actor map) is not a revocation receipt.
     if (!this.#revoked.has(cleanup.id) || !this.#registryRevoked(cleanup.id)) {
       throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
@@ -2774,7 +2774,7 @@ export class ActorManager {
     try {
       await this.#joinStoppedRun(cleanup.id);
       await this.#bindings.delete(cleanup.id);
-      await this.#deleteActorTree(cleanup, sessionActor);
+      await this.#deleteActorTree(cleanup, trusted);
       if (cleanup.presenceKey === this.#presenceKey(cleanup.id)) {
         await this.#writePresence(cleanup.id);
         if (this.#pendingPresence.has(cleanup.id)) throw new Error("presence deletion pending");
@@ -2800,7 +2800,7 @@ export class ActorManager {
    * and runs the removal's own check, then deletes. A root Main that restarts after the operator's check either
    * published first (the check sees it and the tree is kept) or is refused until the delete is done.
    */
-  async #deleteActorTree(cleanup: RemovalCleanup, sessionActor: boolean): Promise<void> {
+  async #deleteActorTree(cleanup: RemovalCleanup, trusted?: { rootId: string; session: boolean }): Promise<void> {
     const check = async () => {
       if (!this.#registryRevoked(cleanup.id)) throw new Error(`Fabric actor ${cleanup.id}: registry revocation did not commit`);
       await this.#removalChecks.get(cleanup.id)?.();
@@ -2812,7 +2812,7 @@ export class ActorManager {
     // durable actor (host.ts), so a session actor's removal never carries one. "Session" comes from the trusted record
     // only (pi-fabric#952 round 4): the registry-loaded actor, and the marker must not say otherwise; a marker alone
     // (no trusted record), or a mismatch, needs the check.
-    const session = sessionActor && (cleanup.owner?.residency ?? "session") === "session";
+    const session = trusted?.session === true && (cleanup.owner?.residency ?? "session") === "session";
     if (cleanup.operatorCheck !== false && !session && !this.#removalChecks.has(cleanup.id)) {
       throw new Error("the operator's dead-root check was lost with a host restart; the tree is kept until " +
         "`fabric-actors remove --confirm-dead-root` runs it again");
@@ -2822,7 +2822,15 @@ export class ActorManager {
     // No fence where there is no flock (Windows): no delete, the same refusal as the offline removal; the tree waits
     // for smarty-dev#7858 and the cleanup stays pending (the registry row is already revoked).
     if (process.platform === "win32") throw new Error("actor removal is not supported where file ownership cannot be proven (smarty-dev#7858)");
-    await deleteRootActorTree(this.mesh.root, cleanup.owner?.rootId ?? this.#rootId, remove, check);
+    // pi-fabric#952 round 5: the fence root is never the marker's. With a registry-loaded actor it is that actor's
+    // root (#commitRemove refuses a marker that names another owner); a marker-only cleanup has only this manager's
+    // own root to trust, so a marker naming any other root (or none) refuses and the tree is kept.
+    const fenceRoot = trusted?.rootId ?? (cleanup.owner?.rootId === this.#rootId ? this.#rootId : undefined);
+    if (fenceRoot === undefined) {
+      throw new Error(`its removal marker names root ${cleanup.owner?.rootId ?? "(none)"}, not this manager's ${this.#rootId}, ` +
+        "and no registry record vouches for it; the tree is kept");
+    }
+    await deleteRootActorTree(this.mesh.root, fenceRoot, remove, check);
   }
 
   async #finishRemove(actor: ManagedActor): Promise<RemovalResult> {
@@ -2840,6 +2848,13 @@ export class ActorManager {
     // An unreadable or malformed marker may carry an operator check: never replace it with a fresh one.
     if (!saved && fs.existsSync(this.#cleanupPath(actor.id))) {
       throw new Error(`Fabric actor ${actor.id}: its removal marker is unreadable or malformed; the tree is kept`);
+    }
+    // pi-fabric#952 round 5: the owner used for the fence and the live check comes from the registry-loaded actor. A
+    // marker naming another owner refuses: the tree is kept and the removal stays pending, with the reason recorded.
+    if (saved?.owner && (saved.owner.rootId !== actor.rootId || saved.owner.residency !== actor.residency)) {
+      actor.lastError = `removal cleanup failed: its removal marker names owner ${saved.owner.rootId} (${saved.owner.residency}), ` +
+        `the registry ${actor.rootId} (${actor.residency}); the tree is kept`;
+      throw new Error(`Fabric actor ${actor.id}: ${actor.lastError.slice("removal cleanup failed: ".length)}`);
     }
     const cleanup: RemovalCleanup = saved ?? {
       id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
@@ -2872,7 +2887,7 @@ export class ActorManager {
       this.#clearSettledWindows(actor.id);
       this.#emitChange();
     }
-    return this.#finishCleanup(cleanup, actor.residency === "session");
+    return this.#finishCleanup(cleanup, { rootId: actor.rootId, session: actor.residency === "session" });
   }
 
   /** Reversible activation gate. It never aborts a worker or consumes mesh input. */

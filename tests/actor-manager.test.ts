@@ -6499,6 +6499,27 @@ describe("#169 round 1 removal safety", () => {
       expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
     });
 
+  // pi-fabric#952 round 5: the fence root is never the marker's. A marker-only cleanup (row revoked) whose marker names
+  // another root has no trusted root: it is refused and the tree is kept (it used to fence the marker's root).
+  it("a marker-only cleanup whose marker names another root keeps its tree", async () => {
+    const { actors, root, mesh, identity, agents, meshConfig } = setup(true);
+    const actor = await actors.create({ name: "other-root", instructions: "Work." });
+    await actors.stop(actor.id);
+    await actors.close();
+    const actorRoot = path.join(root, "actors");
+    const dir = path.join(actorRoot, actor.id);
+    fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+    const registryPath = path.join(actorRoot, "actors.json");
+    fs.writeFileSync(registryPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(registryPath, "utf8")), actors: [] }));
+    fs.writeFileSync(path.join(actorRoot, `removal-${actor.id}.json`), JSON.stringify({ id: actor.id, sessionDir: dir, operatorCheck: false,
+      presenceKey: `actors/test/${actor.id}`, owner: { name: "other-root", rootId: "session:another-root", residency: "session", requestedAt: Date.now() } }));
+    const restarted = new ActorManager("different", identity, mesh, meshConfig, agents, () => {}, { actorRoot, persistent: true });
+    actorManagers.push(restarted);
+    await restarted.finishPendingRemovals();
+    expect(fs.existsSync(dir), "the actor's tree").toBe(true);
+    expect(restarted.cleanupObligation(actor.id)?.removal?.state).toMatch(/names root session:another-root/);
+  });
+
   it.each(["null", "invalid JSON", "symlink"])("recovers a valid cleanup independently of a preceding %s marker", async (bad) => {
     const { actors, root, identity, mesh, meshConfig, agents } = setup(true);
     const actor = await actors.create({ name: "healthy", instructions: "Work." });

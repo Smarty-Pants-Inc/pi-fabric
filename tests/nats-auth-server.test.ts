@@ -182,6 +182,23 @@ describe.skipIf(!available)(`NATS auth on a loopback node${available ? "" : " (s
   }, 30_000);
 });
 
+// The embedded node runs in its own process group: stop() also ends a server started through a wrapper (the case that
+// left servers behind in a review run).
+describe.skipIf(!available)(`the embedded node stops its whole process group${available ? "" : " (skipped: needs NATS_BIN)"}`, () => {
+  it("a wrapper that runs nats-server as its child leaves nothing behind after stop()", async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-nats-wrapper-"));
+    try {
+      const wrapper = path.join(work, "nats-wrapper.sh");
+      fs.writeFileSync(wrapper, `#!/bin/sh\n${JSON.stringify(binary)} "$@"\n`, { mode: 0o700 });
+      const port = await freeLoopbackPort(), httpPort = await freeLoopbackPort();
+      const made = initLocalNats({ dir: path.join(work, "nats"), port, httpPort, env: {} });
+      const node = await startLocalNatsServer({ binary: wrapper, configFile: made.configFile, url: `nats://127.0.0.1:${port}`, httpUrl: `http://127.0.0.1:${httpPort}` });
+      await node.stop();
+      await expect(fetch(new URL("/varz", `http://127.0.0.1:${httpPort}`), { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
+    } finally { fs.rmSync(work, { recursive: true, force: true }); }
+  }, 30_000);
+});
+
 // The self-hosting path through the real bin (dist): init --local, serve --local (the embedded node, 127.0.0.1), mint to a
 // pipe, and a nats-mode store over those creds. Stopped (SIGTERM) before the test ends.
 const built = fs.existsSync(path.resolve("dist/cli/index.js"));

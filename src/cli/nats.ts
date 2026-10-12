@@ -121,8 +121,10 @@ export async function runNatsCli(argv: string[], io: NatsCliIo = {}): Promise<nu
     if (command === "revoke") {
       if (!parsed.bools.has("--local")) throw new UsageError("revoke needs --local (the fleet revokes on Ryzen 1)");
       if (parsed.rest.length === 0) throw new UsageError("revoke needs at least one user key (U...)");
-      const jwt = auth.revokeLocalNatsUsers(parsed.rest, { ...(dir ? { dir } : {}), env });
-      const pushed = await auth.pushNatsAccountJwt([need(parsed, "--server")], auth.localSystemCreds(dir), jwt);
+      const server = need(parsed, "--server"); // review F4: before any state changes
+      const store = path.resolve(dir ?? auth.defaultLocalNatsDir());
+      const pushed = await auth.withLocalNatsRevokeLock(store, async () =>
+        auth.pushNatsAccountJwt([server], auth.localSystemCreds(store), auth.revokeLocalNatsUsers(parsed.rest, { dir: store, env })));
       write(`${JSON.stringify({ command: "revoke", revoked: parsed.rest, ...pushed })}\n`);
       return pushed.ok ? 0 : 1;
     }
@@ -130,7 +132,10 @@ export async function runNatsCli(argv: string[], io: NatsCliIo = {}): Promise<nu
       const preload: Record<string, string> = {};
       for (const file of parsed.flags.get("--preload") ?? []) {
         const jwt = fs.readFileSync(file, "utf8").trim();
-        preload[auth.decodeNatsJwt(jwt).sub] = jwt;
+        const claims = auth.decodeNatsJwt(jwt);
+        // Review F1: only an account JWT, keyed by its account public key (natsServerConfig checks the key again).
+        if (claims.nats.type !== "account" || !/^A[A-Z2-7]{55}$/.test(claims.sub)) throw new Error(`${file} is not an account JWT`);
+        preload[claims.sub] = jwt;
       }
       const certFile = one(parsed, "--tls-cert"), keyFile = one(parsed, "--tls-key"), caFile = one(parsed, "--tls-ca");
       const routes = parsed.flags.get("--route") ?? [];

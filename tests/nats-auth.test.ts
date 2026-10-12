@@ -80,12 +80,18 @@ describe("NATS JWT encoding (D4: own encoder, nsc as the oracle)", () => {
     expect(natsCredsIdentity(minted.creds).userKey).toBe(minted.publicKey);
     expect(() => natsCredsIdentity(minted.creds, { now: Date.now() + 61 * 60_000 })).toThrow(/FABRIC_MESH_STATE_NATS_CREDS_EXPIRED/);
     expect(() => natsCredsIdentity("nothing")).toThrow(/FABRIC_MESH_STATE_NATS_NO_CREDS/);
+    // Review F2: a user JWT without exp is refused for the mesh, never treated as unbounded.
+    const user = createUser();
+    const noExp = encodeNatsJwt({ iat: 1, iss: keys.scopes.agent.getPublicKey(), name: "n", sub: user.getPublicKey(),
+      nats: { issuer_account: keys.identity.getPublicKey(), type: "user", version: 2 } }, keys.scopes.agent);
+    expect(() => natsCredsIdentity(formatNatsCreds(noExp, new TextDecoder().decode(user.getSeed())))).toThrow(/has no expiry/);
   });
 });
 
 describe("the server config (operator mode, full resolver, route mTLS)", () => {
   it("one node and a cluster node have the same shape; routes must be tls:// and are checked against known URLs", () => {
-    const base = { serverName: "ryzen2", operatorJwt: "OPJWT", systemAccount: "ASYS", resolverDir: "/r", preload: { ASYS: "SYSJWT" }, jetstreamDir: "/j" };
+    const sysKey = createAccount().getPublicKey();
+    const base = { serverName: "ryzen2", operatorJwt: "OPJWT", systemAccount: sysKey, resolverDir: "/r", preload: { [sysKey]: "h.p.s" }, jetstreamDir: "/j" };
     const single = natsServerConfig(base);
     expect(single).toContain("resolver: {\n  type: full");
     expect(single).toContain("allow_delete: false");
@@ -100,6 +106,14 @@ describe("the server config (operator mode, full resolver, route mTLS)", () => {
     expect(node.startsWith(single.split("listen:")[0]!)).toBe(true);
     expect(() => natsServerConfig({ ...base, cluster: { name: "f", listen: "x", routes: ["nats://a:6222"], tls: { certFile: "", keyFile: "", caFile: "" } } }))
       .toThrow(/tls:\/\//);
+  });
+
+  it("review F1: a preload key that is not an account key, or a value that is not a compact JWT, never reaches the config", () => {
+    const key = createAccount().getPublicKey();
+    const base = { serverName: "n", operatorJwt: "O", systemAccount: key, resolverDir: "/r", jetstreamDir: "/j" };
+    expect(natsServerConfig({ ...base, preload: { [key]: "a.b.c" } })).toContain(`  ${key}: "a.b.c"`);
+    expect(() => natsServerConfig({ ...base, preload: { [`${key}\ninjected: true`]: "a.b.c" } })).toThrow(/account public key/);
+    expect(() => natsServerConfig({ ...base, preload: { [key]: "a.b.c\"\ninjected" } })).toThrow(/compact JWT/);
   });
 });
 
@@ -118,6 +132,29 @@ describe("the self-hosted store (init --local, S1)", () => {
     expect(decodeNatsJwt(minted.jwt).nats).toMatchObject({ issuer_account: made.account });
     const revoked = decodeNatsJwt(revokeLocalNatsUsers([minted.publicKey], { dir, env: {} }));
     expect((revoked.nats.revocations as Record<string, number>)[minted.publicKey]).toBeGreaterThan(0);
+  });
+
+  it("review F3/F4: concurrent revokes keep both keys; revoke without --server changes nothing", async () => {
+    const { withLocalNatsRevokeLock } = await import("../src/mesh/nats-auth.js");
+    const dir = path.join(tempDir(), "nats");
+    initLocalNats({ dir, env: {} });
+    const [a, b] = [createUser().getPublicKey(), createUser().getPublicKey()];
+    const pushed: string[] = [];
+    const revoke = (key: string) => withLocalNatsRevokeLock(dir, async () => {
+      const jwt = revokeLocalNatsUsers([key], { dir, env: {} });
+      await new Promise(resolve => setTimeout(resolve, 30)); // a slow push inside the lock
+      pushed.push(jwt);
+    });
+    await Promise.all([revoke(a), revoke(b)]);
+    const last = decodeNatsJwt(pushed.at(-1)!).nats.revocations as Record<string, number>;
+    expect(Object.keys(last).sort()).toEqual([a, b].sort()); // the last push holds both
+    expect(fs.existsSync(path.join(dir, "revoke.lock"))).toBe(false);
+    const other = path.join(tempDir(), "nats");
+    initLocalNats({ dir: other, env: {} });
+    let err = "";
+    expect(await runNatsCli(["revoke", "--local", "--dir", other, a], { stdout: () => undefined, stderr: (text) => { err += text; }, env: {} })).toBe(2);
+    expect(err).toContain("--server is required");
+    expect(fs.readdirSync(other).filter(name => name.startsWith("revocations-"))).toEqual([]);
   });
 
   it("the CLI never writes creds to a terminal", async () => {

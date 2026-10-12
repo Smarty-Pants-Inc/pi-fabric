@@ -228,6 +228,8 @@ export interface NatsServerConfigInput {
 }
 
 const quote = (value: string): string => JSON.stringify(value);
+const ACCOUNT_KEY = /^A[A-Z2-7]{55}$/;
+const JWT_TEXT = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 /** The nats-server configuration text for one node (single node or one of a cluster): the same shape either way. */
 export const natsServerConfig = (input: NatsServerConfigInput): string => {
@@ -245,7 +247,13 @@ export const natsServerConfig = (input: NatsServerConfigInput): string => {
     "  timeout: \"5s\"",
     "}",
     "resolver_preload: {",
-    ...Object.entries(input.preload).map(([account, jwt]) => `  ${account}: ${quote(jwt)}`),
+    // Review F1: a preload key is an account public key and its value a compact JWT, nothing else, so no name or
+    // payload can inject configuration.
+    ...Object.entries(input.preload).map(([account, jwt]) => {
+      if (!ACCOUNT_KEY.test(account)) throw new Error(`a preload key must be an account public key (got ${JSON.stringify(account.slice(0, 64))})`);
+      if (!JWT_TEXT.test(jwt)) throw new Error(`the preload for ${account} is not a compact JWT`);
+      return `  ${account}: ${quote(jwt)}`;
+    }),
     "}",
     "jetstream {",
     `  store_dir: ${quote(input.jetstreamDir)}`,
@@ -377,6 +385,26 @@ export const revokeLocalNatsUsers = (userKeys: string[], input: { dir?: string; 
   return jwt;
 };
 
+/**
+ * Review F3: the local revoke, serialized. One lock file (O_EXCL) per store covers the read-modify-write of the
+ * revocation map AND the push, so two revokes can neither drop each other's keys from the map nor push an older map
+ * last. A lock older than 2 min (a crashed revoke) is taken over.
+ */
+export const withLocalNatsRevokeLock = async <T>(dir: string, run: () => Promise<T>, timeoutMs = 30_000): Promise<T> => {
+  const lock = path.join(path.resolve(dir), "revoke.lock");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { writePrivate(lock, `${process.pid}\n`); break; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const age = Date.now() - (fs.statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now());
+      if (age > 120_000) { fs.rmSync(lock, { force: true }); continue; }
+      if (Date.now() > deadline) throw new Error(`another revoke holds ${lock}`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  try { return await run(); } finally { fs.rmSync(lock, { force: true }); }
+};
+
 // ------------------------------------------------------------------ revocation push and the creds cutoff
 
 /**
@@ -398,12 +426,16 @@ export const pushNatsAccountJwt = async (servers: string[], systemCreds: string,
 export const NATS_CREDS_CUTOFF_SECONDS = 3_600;
 
 /** The user key and the expiry of a creds text; refuses creds past Fabric's cutoff (exp - margin) or without a user JWT. */
-export const natsCredsIdentity = (creds: string, input: { now?: number; cutoffSeconds?: number } = {}): { userKey: string; exp: number | undefined } => {
+export const natsCredsIdentity = (creds: string, input: { now?: number; cutoffSeconds?: number } = {}): { userKey: string; exp: number } => {
   const jwt = natsCredsJwt(creds);
   if (!jwt) throw new Error("FABRIC_MESH_STATE_NATS_NO_CREDS: the NATS creds hold no user JWT");
   const claims = decodeNatsJwt(jwt);
   if (!/^U[A-Z2-7]{55}$/.test(claims.sub)) throw new Error("FABRIC_MESH_STATE_NATS_NO_CREDS: the NATS creds are not a user's");
-  if (claims.exp !== undefined && nowSeconds(input.now) >= claims.exp - (input.cutoffSeconds ?? NATS_CREDS_CUTOFF_SECONDS)) {
+  // Review F2: mesh creds always expire (a minted user does); a user without `exp` is refused, never unbounded.
+  if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+    throw new Error(`FABRIC_MESH_STATE_NATS_NO_CREDS: the NATS user ${claims.sub} has no expiry; mesh creds must be minted with one`);
+  }
+  if (nowSeconds(input.now) >= claims.exp - (input.cutoffSeconds ?? NATS_CREDS_CUTOFF_SECONDS)) {
     throw new Error(`FABRIC_MESH_STATE_NATS_CREDS_EXPIRED: the NATS user ${claims.sub} is past Fabric's cutoff (exp ${claims.exp}); relaunch through the issuer`);
   }
   return { userKey: claims.sub, exp: claims.exp };
@@ -430,11 +462,20 @@ export const freeLoopbackPort = (): Promise<number> => new Promise((resolve, rej
 export const startLocalNatsServer = async (input: { binary: string; configFile: string; url: string; httpUrl: string; timeoutMs?: number;
   /** "server": up and answering, before JetStream has a cluster quorum (a cluster node starting alone). Default: healthy. */
   ready?: "healthy" | "server" }): Promise<LocalNatsServer> => {
-  const child = spawn(input.binary, ["-c", input.configFile], { stdio: ["ignore", "ignore", "pipe"] });
+  // Its own process group: stop() ends the whole group, so a wrapper around the binary cannot leave the server behind.
+  const child = spawn(input.binary, ["-c", input.configFile], { stdio: ["ignore", "ignore", "pipe"], detached: true });
   let stderr = "";
   child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString("utf8")).slice(-4_000); });
   const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
-  const stop = async (): Promise<void> => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); await exited; };
+  const signalGroup = (signal: NodeJS.Signals): void => {
+    try { process.kill(-child.pid!, signal); } catch { /* the group is gone */ }
+  };
+  const stop = async (): Promise<void> => {
+    signalGroup("SIGTERM");
+    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 5_000))]);
+    signalGroup("SIGKILL"); // anything of the group still alive after 5 s
+    await exited;
+  };
   const deadline = Date.now() + (input.timeoutMs ?? 10_000);
   for (;;) {
     if (child.exitCode !== null) throw new Error(`nats-server exited ${child.exitCode}: ${stderr}`);

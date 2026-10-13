@@ -777,6 +777,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       : Promise.resolve(undefined);
     this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
+    // A permanent non-lock refresh failure (EACCES, a refused confirmation) must not retrigger at every
+    // canConsumeMesh gate or change wake: back off up to half a heartbeat so a recovered lease stays fresh.
+    const half = Math.floor(this.#heartbeatMs / 2);
+    this.#backgroundRefresh.backoffFailures(Math.min(1_000, half), half);
   }
 
   /** A retired owner lifecycle skips background work; a throwing token is retired too. */
@@ -1801,7 +1805,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // A typed lock timeout already has a single host recovery lane. Idle consumers
     // call this gate as often as every 100 ms; they must not multiply attempts.
     if (!confirmed && !isMeshLockTimeout(this.#refreshError) && !this.#closed && !this.#quiescing && this.#timer) {
-      void this.#backgroundRefresh.run(() => this.refresh(), false);
+      this.#runBackground(() => this.refresh());
     }
     return confirmed;
   }

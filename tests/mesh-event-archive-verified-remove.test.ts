@@ -868,6 +868,34 @@ it.runIf(process.platform === "linux")("r5: a successor's entry must be durable 
   expect(removals.filter(target => target.startsWith(`${seeded.file}.claim`))).toEqual([]);
 });
 
+// r5 re-review (Luna H-1): a winner that vanishes after the barrier never lets the keyed publish run unfenced.
+it.runIf(process.platform === "linux")("r5: a crash-left claim whose winner vanishes after the barrier still fences the key", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  const claim = `${seeded.file}.claim`;
+  real.renameSync(seeded.file, claim); // the crash-left claim (the original), its name absent
+  installArchivedSuccessor(seeded.file, seeded.archiveDir); // then an off-lock successor took the name
+  const linkSync = fs.linkSync;
+  const lstatSync = fs.lstatSync;
+  const state = { armed: false, removed: false };
+  vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+    try { return linkSync(source, target); }
+    catch (error) { if (String(source) === claim && (error as { code?: string }).code === "EEXIST") state.armed = true; throw error; }
+  }) as never);
+  // The barrier ran; before the name is rechecked the off-lock writer removes its successor (emulated by a rename).
+  vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    if (state.armed && String(target) === seeded.file) { state.armed = false; state.removed = true; probe.moveAway?.(seeded.file); }
+    return (lstatSync as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as never);
+  const outcome = await restoreOutcome(seeded);
+  vi.mocked(fs.linkSync).mockRestore(); vi.mocked(fs.lstatSync).mockRestore();
+  expect(state.removed).toBe(true);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0); // no fresh id was published
+  expect(fs.existsSync(receiptPath(seeded.root, "k"))).toBe(false);
+  expect(real.lstatSync(claim).ino).toBe(deadIno); // the exact claim still fences the key
+});
+
 // r5 review (Luna F-2): a crash-left claim reserves its key's capacity slot until a hold links it back.
 it.runIf(process.platform === "linux")("r5: a claim-only key still counts against the dedupe capacity", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-1036-"));

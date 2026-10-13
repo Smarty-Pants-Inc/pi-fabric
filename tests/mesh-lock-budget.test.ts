@@ -6,11 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
-import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { MeshLock, MeshLockIdentityNotReadyError } from "../src/mesh/mesh-lock.js";
+import { meshLockQueueDirectory, MeshLockTicket } from "../src/mesh/lock-queue.js";
+import { MeshLock, MeshLockIdentityNotReadyError, MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 
-// A mesh lock's relative wait budget starts at its first admission/acquisition attempt, after setup; a contention
-// timeout is reported only after at least one acquisition attempt; a cold identity refusal is a distinct pre-lock error.
+// Relative waits start after setup. Only eligible tickets attempt acquisition; FIFO expiry and cold identity
+// are distinct pre-lock refusals, never contention timeouts with fabricated attempts.
 const roots: string[] = [];
 const scratch = (): string => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-lock-budget-"));
@@ -44,6 +44,13 @@ const predecessor = (root: string): string => {
   fs.writeFileSync(file, "");
   return file;
 };
+const advanceWithHeartbeat = async (head: string, ms: number): Promise<void> => {
+  for (let elapsed = 0; elapsed < ms; elapsed += 50) {
+    const now = Date.now() / 1000;
+    fs.utimesSync(head, now, now);
+    await vi.advanceTimersByTimeAsync(Math.min(50, ms - elapsed));
+  }
+};
 const ready = async (protocol: 1 | 2 | 3, root: string, options: { lockTimeoutMs?: number } = {}): Promise<MeshLock> => {
   const lock = new MeshLock(root, { lockProtocol: protocol, ...options }, () => undefined);
   await lock.ownIncarnation;
@@ -64,28 +71,28 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   });
 
-  it.each([1, 2, 3] as const)("protocol %s: a queued waiter whose setup consumed its budget still waits it, then reports attempts > 0", async (protocol) => {
+  it.each([1, 2, 3] as const)("protocol %s: setup leaves the full FIFO wait budget, then reports queue expiry without acquisition", async (protocol) => {
     const root = scratch();
     const lock = await ready(protocol, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     holdLock(root);
-    predecessor(root);
+    const head = predecessor(root);
     slowSetup(root, 5_000);
     const operation = vi.fn();
     let settled = false;
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error).finally(() => { settled = true; });
     // Before the fix the deadline had already passed at the first loop: an instant 0-attempt timeout.
-    await vi.advanceTimersByTimeAsync(1_000);
+    await advanceWithHeartbeat(head, 1_000);
     expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(1_500);
+    await advanceWithHeartbeat(head, 1_500);
     const error = await pending;
-    expect(error).toBeInstanceOf(MeshLockTimeoutError);
-    expect(error).not.toBeInstanceOf(MeshLockIdentityNotReadyError);
-    expect((error as MeshLockTimeoutError).attempts).toBeGreaterThan(0);
+    expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      attempts: 0, waitersAhead: 1, waitedMs: 2_000 });
     expect(operation).not.toHaveBeenCalled();
   });
 
-  it("a waiter queued behind a live, heartbeating head never probes .lock early, and tries exactly once at expiry", async () => {
+  it("a waiter behind a live, heartbeating head never probes .lock, including at expiry", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -94,24 +101,23 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     const mkdir = vi.spyOn(fs, "mkdirSync");
     const lockAttempts = (): number => mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock")).length;
     const pending = lock.withLock(() => "never", 2_000).catch((error: unknown) => error);
-    for (let elapsed = 0; elapsed < 1_900; elapsed += 50) {
-      const now = Date.now() / 1000;
-      fs.utimesSync(head, now, now); // the head keeps proving progress: FIFO holds this waiter back
-      await vi.advanceTimersByTimeAsync(50);
-    }
-    expect(lockAttempts()).toBe(0); // normal FIFO fairness is unchanged within the budget
-    for (let elapsed = 0; elapsed < 300; elapsed += 50) {
-      const now = Date.now() / 1000;
-      fs.utimesSync(head, now, now);
-      await vi.advanceTimersByTimeAsync(50);
-    }
+    await advanceWithHeartbeat(head, 1_900);
+    expect(lockAttempts()).toBe(0);
+    await advanceWithHeartbeat(head, 300);
     const error = await pending;
-    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 1 });
-    expect(lockAttempts()).toBe(1);
+    expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      attempts: 0, waitersAhead: 1, waitedMs: 2_000, kind: "pre-lock", retryable: true });
+    expect((error as Error).message).toContain("expired in the FIFO queue before its turn, 1 waiters ahead, waited 2000 ms");
+    expect((error as Error).message.startsWith("FABRIC_MESH_LOCK_QUEUE_EXPIRED (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
+    expect((error as Error).message).not.toMatch(/Timed out|0 attempts/);
+    expect(atomic.isMeshLockTimeout(error)).toBe(true);
+    expect(atomic.isMeshWriteDeferred(error)).toBe(true);
+    expect(lockAttempts()).toBe(0);
     expect(fs.existsSync(head)).toBe(true);
   });
 
-  it("fresh-budget waiters keep FIFO order: no final-attempt barging while their budgets last", async () => {
+  it("fresh-budget waiters keep FIFO order", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -121,31 +127,47 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     const second = lock.withLock(() => order.push("second"), 10_000);
     await vi.advanceTimersByTimeAsync(3_000);
     expect(order).toEqual([]);
-    fs.rmSync(path.join(root, ".lock"), { recursive: true });
+    fs.renameSync(path.join(root, ".lock"), path.join(root, "fixture-held-lock"));
     await vi.advanceTimersByTimeAsync(200);
     await Promise.all([first, second]);
     expect(order).toEqual(["first", "second"]);
     expect(fs.readdirSync(meshLockQueueDirectory(root))).toEqual([]);
   });
 
-  it("the expiring queued waiter's one attempt takes a lock that is free by then", async () => {
+  it("a free lock does not let an ineligible expired waiter jump a live head", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const head = predecessor(root);
-    const pending = lock.withLock(() => "acquired", 2_000);
-    for (let elapsed = 0; elapsed < 2_200; elapsed += 50) {
-      const now = Date.now() / 1000;
-      fs.utimesSync(head, now, now);
-      await vi.advanceTimersByTimeAsync(50);
-    }
-    await expect(pending).resolves.toBe("acquired");
+    const operation = vi.fn();
+    const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
+    await advanceWithHeartbeat(head, 2_200);
+    expect(await pending).toMatchObject({ preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", attempts: 0, waitersAhead: 1 });
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   });
 
-  // Fairness envelope of the expiry attempt, against a live FIFO head H that is already contending (fake clock, no
-  // sleeps). H's budget is 10 s, so it is head and probes .lock every 10 ms; bargers B are gated (>= 2000 ms) and
-  // queued behind H, so they only reach .lock through the one expiry attempt. B budgets of 2005/2007 ms make their
-  // expiry attempts fall strictly between H's 10 ms probes (H at 2000 and 2010): a real supported interleaving.
+  it.each([1, 2, 3] as const)("protocol %s: an eligible head still gets a real acquisition attempt at expiry", async (protocol) => {
+    const root = scratch();
+    const lock = await ready(protocol, root);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const mayContend = MeshLockTicket.prototype.mayContend;
+    vi.spyOn(MeshLockTicket.prototype, "mayContend").mockImplementation(function (this: MeshLockTicket) {
+      const eligible = mayContend.call(this);
+      vi.setSystemTime(Date.now() + 2_000); // admission/setup used the budget, but this ticket really is eligible
+      return eligible;
+    });
+    await expect(lock.withLock(() => "head acquired", 2_000)).resolves.toBe("head acquired");
+    holdLock(root);
+    const error = await lock.withLock(() => "never", 2_000).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MeshLockTimeoutError);
+    expect(error).not.toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(error).toMatchObject({ attempts: 1 });
+    expect((error as Error).message).toContain("Timed out waiting");
+  });
+
+  // The reported interleaving: younger budgets expire between the live head's 10 ms probes. Expiry must
+  // refuse admission instead of turning a free canonical lock into permission to barge.
   const lockMkdirs = (root: string, onAttempt?: () => void) => {
     const mkdir = fs.mkdirSync;
     const at: number[] = [];
@@ -156,49 +178,40 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     return at;
   };
 
-  it.each([1, 2])("%s expired barger(s) take at most one attempt each and never push a live head past its own budget", async (bargers) => {
+  it.each([1, 2])("%s ineligible expiry refusal(s) leave the live head ahead of every younger acquisition", async (waiters) => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     holdLock(root);
     const t0 = Date.now();
-    // The holder releases at the first probe on or after t0 + 2005: the earliest barger's expiry attempt, not H's.
     let released = false;
     const attempts = lockMkdirs(root, () => {
-      if (!released && Date.now() >= t0 + 2_005) { released = true; fs.rmSync(path.join(root, ".lock"), { recursive: true }); }
+      if (!released && Date.now() >= t0 + 2_005) {
+        released = true;
+        fs.renameSync(path.join(root, ".lock"), path.join(root, "fixture-held-lock"));
+      }
     });
     const order: string[] = [];
-    let headAt = -1;
-    const head = lock.withLock(() => { order.push("head"); headAt = Date.now(); }, 10_000);
-    const budgets = [2_005, 2_007].slice(0, bargers);
-    const acquiredAt: number[] = [];
-    const barged = budgets.map((budget, index) =>
-      lock.withLock(() => { order.push(`barger${index}`); acquiredAt[index] = Date.now(); }, budget));
-    await vi.advanceTimersByTimeAsync(1_990);
-    // FIFO within the budgets: only H has probed .lock so far, the bargers are held back.
-    expect(order).toEqual([]);
-    const headProbes = attempts.length;
-    expect(headProbes).toBeGreaterThan(0);
-    await vi.advanceTimersByTimeAsync(100);
-    await Promise.all([head, ...barged]);
-    // The barge is real: the first barger acquires with its expiry attempt, exactly at its own deadline. A later
-    // barger's one attempt may land before or after H (H is also woken by the real release watcher), never more.
-    expect(order[0]).toBe("barger0");
-    expect(order.slice().sort()).toEqual([...budgets.map((_, index) => `barger${index}`), "head"]);
-    expect(acquiredAt[0]).toBe(t0 + 2_005);
-    // A second barger acquires no later than its own expiry attempt; if H was woken by the release first, it may
-    // instead have become the FIFO head behind H and acquired as such (ordinary admission, not a barge).
-    if (bargers === 2) expect(acquiredAt[1]).toBeGreaterThanOrEqual(t0 + 2_005);
-    if (bargers === 2) expect(acquiredAt[1]).toBeLessThanOrEqual(t0 + 2_007);
-    if (bargers === 2 && order.indexOf("barger1") < order.indexOf("head")) expect(acquiredAt[1]).toBe(t0 + 2_007);
-    // H is delayed at most until its own next probe after the barge (2010), far inside its own 10 s budget: the
-    // barge reset nothing and cost H only the bargers' synchronous critical sections.
-    expect(headAt).toBeGreaterThanOrEqual(t0 + 2_005);
-    expect(headAt).toBeLessThanOrEqual(t0 + 2_010);
+    const head = lock.withLock(() => order.push("head"), 10_000);
+    const younger = lock.withLock(() => order.push("younger"), 6_000);
+    const budgets = [2_005, 2_007].slice(0, waiters);
+    const expired = budgets.map((budget, index) =>
+      lock.withLock(() => order.push(`expired${index}`), budget).catch((error: unknown) => error));
+    await vi.advanceTimersByTimeAsync(2_100);
+    await Promise.all([head, younger]);
+    const refusals = await Promise.all(expired);
+    expect(order).toEqual(["head", "younger"]);
+    for (const [index, error] of refusals.entries()) {
+      expect(error).toBeInstanceOf(MeshLockQueueExpiredError);
+      expect(error).toMatchObject({ preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", attempts: 0,
+        waitersAhead: 2, waitedMs: budgets[index] });
+      expect((error as Error).message.startsWith("FABRIC_MESH_LOCK_QUEUE_EXPIRED (code FABRIC_MESH_LOCK_TIMEOUT): ")).toBe(true);
+      expect(attempts.filter(time => time === t0 + budgets[index]!)).toEqual([]);
+    }
     expect(fs.readdirSync(meshLockQueueDirectory(root))).toEqual([]);
   });
 
-  it("an expired barger that loses changes nothing for the head: it still settles at its own deadline with real attempts", async () => {
+  it("an ineligible queue expiry does not extend the live head's contention deadline", async () => {
     const root = scratch();
     const lock = await ready(1, root);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -208,18 +221,20 @@ describe("mesh lock wait budget starts after pre-lock setup", () => {
     let headSettledAt = -1;
     const head = lock.withLock(() => "never", 3_000).catch((error: unknown) => error)
       .finally(() => { headSettledAt = Date.now(); });
-    let bargerSettledAt = -1;
-    const barger = lock.withLock(() => "never", 2_005).catch((error: unknown) => error)
-      .finally(() => { bargerSettledAt = Date.now(); });
+    let waiterSettledAt = -1;
+    const waiter = lock.withLock(() => "never", 2_005).catch((error: unknown) => error)
+      .finally(() => { waiterSettledAt = Date.now(); });
     await vi.advanceTimersByTimeAsync(3_100);
-    const [headError, bargerError] = await Promise.all([head, barger]);
-    expect(bargerError).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 1 });
-    expect(bargerSettledAt).toBe(t0 + 2_005);
-    expect(attempts.filter(time => time === t0 + 2_005)).toHaveLength(1); // the barger's one attempt, nothing more
+    const [headError, queueError] = await Promise.all([head, waiter]);
+    expect(queueError).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(queueError).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0, waitersAhead: 1, waitedMs: 2_005 });
+    expect(waiterSettledAt).toBe(t0 + 2_005);
+    expect(attempts.filter(time => time === t0 + 2_005)).toEqual([]);
     expect(headError).toBeInstanceOf(MeshLockTimeoutError);
-    expect((headError as MeshLockTimeoutError).attempts).toBe(attempts.length - 1);
+    expect(headError).not.toBeInstanceOf(MeshLockQueueExpiredError);
+    expect((headError as MeshLockTimeoutError).attempts).toBe(attempts.length);
     expect((headError as MeshLockTimeoutError).attempts).toBeGreaterThan(100);
-    // H's deadline was never reset or extended by the barge: it settles at exactly t0 + 3000.
+    // H's deadline is fixed: queue expiry neither probes nor delays its settlement at t0 + 3000.
     expect(headSettledAt).toBe(t0 + 3_000);
     expect(Math.max(...attempts)).toBeLessThanOrEqual(t0 + 3_000);
   });

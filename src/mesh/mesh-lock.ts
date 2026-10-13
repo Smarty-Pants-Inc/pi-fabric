@@ -1,5 +1,5 @@
 import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
-import { MeshLockTicket } from "./lock-queue.js";
+import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
@@ -79,6 +79,29 @@ export class MeshLockSnapshotNotReadyError extends MeshLockTimeoutError {
       "not lock contention, retry the write";
   }
 }
+
+/** A wait budget exhausted before FIFO admission, not a failed acquisition of the canonical lock. */
+export class MeshLockQueueExpiredError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly lockPath: string, readonly waitersAhead: number | undefined, readonly waitedMs: number) {
+    super("", 0, 0);
+    this.name = "MeshLockQueueExpiredError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} expired in the FIFO queue before its turn, ` +
+      `${waitersAhead === undefined ? "waiter count unavailable" : `${waitersAhead} waiters ahead`}, waited ${waitedMs} ms`;
+  }
+}
+
+// Diagnostic snapshot only: admission remains MeshLockTicket's decision. Count matching receipts before our exact
+// token; a concurrent removal or an unreadable directory makes the count unavailable, never an invented number.
+const queueWaitersAhead = (root: string, token: string): number | undefined => {
+  try {
+    const receipts = fs.readdirSync(meshLockQueueDirectory(root)).filter(name => /^\d{24}-\d+-[a-f0-9-]+$/.test(name)).sort();
+    const index = receipts.findIndex(name => name.endsWith(`-${process.pid}-${token}`));
+    return index < 0 ? undefined : index;
+  } catch { return undefined; }
+};
 
 // Keep the normal global timer seam (including diagnostic/test clocks). An
 // aborted lifetime clears its referenced retry timer instead of awaiting the lock.
@@ -308,7 +331,8 @@ export class MeshLock {
     const ticket = new MeshLockTicket(this.root, token, waitMs);
     // The relative wait budget starts at the first admission/acquisition attempt, after setup (root mkdir, the
     // admission receipt and its queue scans): slow setup must not spend the budget before anything was tried.
-    const deadline = Date.now() + waitMs;
+    const waitStartedAt = Date.now();
+    const deadline = waitStartedAt + waitMs;
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -324,9 +348,10 @@ export class MeshLock {
             await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
             continue;
           }
-          if (attempts > 0) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          // Expired while still queued, never having tried: make exactly one acquisition attempt (it has exhausted its
-          // budget, so FIFO order within the budget is unchanged) and only then report contention, with attempts > 0.
+          // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
+          // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          throw new MeshLockQueueExpiredError(this.#lockPath, queueWaitersAhead(this.root, token),
+            Math.max(0, Date.now() - waitStartedAt));
         }
         const attemptAt = Date.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);

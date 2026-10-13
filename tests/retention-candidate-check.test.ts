@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -289,7 +290,8 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
   // Astra "read-generation race": an earlier registry, already stat'ed by this check, is really rewritten (unrelated
   // content, new size) while a later registry is being read. Its stamp changed inside the check: keep this candidate;
   // the next check adopts the rewrite and the next safe candidate is planned.
-  it("keeps the current candidate when an earlier registry is rewritten during a later registry's read, and plans the next", async () => {
+  // smarty-dev#976 A: one overlapping rewrite of a valid registry is retried (bounded); the stable recheck plans old.
+  it("plans the current candidate after an earlier registry is rewritten once during a later registry's read (stable recheck), and plans the next", async () => {
     const m = mesh();
     const a = path.join(m.registry, "actors.json");
     const b = path.join(m.actors, "01b0-busy-session", "actors.json");
@@ -315,7 +317,7 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
     const plan = await sweep(m.root);
     expect(fake.statusRead()).toBe(true);
     expect(trace.slice(0, 4)).toEqual(["trigger", "a-stat", "b-read", "rewrite-a"]);
-    expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.latest);
     expect(plan.removedRuns).toContain(m.orphan);
     expect(snapshot(m.root)).toEqual({
@@ -397,7 +399,8 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
   // orphan is safe). POSIX accepts the safe generation and still plans the orphan. smarty-dev#7858
   const atomicSavePlan = (m: ReturnType<typeof mesh>) => process.platform === "win32" ? [] : [m.orphan];
 
-  it("keeps old when a normal store save overlaps its final check, then plans the stable orphan", async () => {
+  // smarty-dev#976 A: an unrelated POSIX save overlapping old's check is retried; the stable recheck plans old too.
+  it("plans old after a normal store save overlaps its final check and a stable recheck, then plans the orphan", async () => {
     const m = mesh();
     const project = path.join(m.actors, "actors.json"), own = path.join(m.registry, "actors.json");
     const store = await projectStore(m);
@@ -415,8 +418,7 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     expect(fake.statusRead()).toBe(true);
     expect(committed).toBe(true);
     expect(ino(project)).not.toBe(inoBefore);
-    expect(plan.removedRuns).not.toContain(m.old);
-    expect(plan.removedRuns).toEqual(atomicSavePlan(m));
+    expect(plan.removedRuns.slice().sort()).toEqual(process.platform === "win32" ? [] : [m.old, m.orphan].sort());
     expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
   });
 
@@ -465,4 +467,352 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     expect(fs.existsSync(path.join(m.orphan, "reply.json"))).toBe(true);
   });
   }
+});
+
+// smarty-dev#976 E1 (.local/976-e1-red-tests.md): the live Ryzen 1 dry run planned none of 8906 expired unreferenced
+// runs: each was vetoed at its final check, and the sweep was sticky-stopped by "an actors entry changed type or
+// identity". RED-first tests on the current source, dry runs only. The only real writes are this test's own fixture
+// writes: REAL ActorRegistryStore prepare()/commit() saves and withLock() lock generations on its private temp mesh.
+// Every fs.rmSync/rmdirSync/unlinkSync is intercepted and recorded (never executed, #4664); the one removal the native
+// writer performs here, withLock's release `fs.rmSync(<actors>/actors.json.lock, { recursive: true })`, is modelled
+// by RENAMING that exact private fixture lock directory to another owned private temp path (namespace vacancy only).
+// No child process may start. prepared.dispose() is never called.
+const rcFrames = (): string[] => {
+  const limit = Error.stackTraceLimit; Error.stackTraceLimit = 80;
+  const stack = new Error().stack ?? ""; Error.stackTraceLimit = limit;
+  return stack.split("\n").filter(line => line.includes("retention-cli")).map(line => /^\s*at (?:async )?([^\s(]+)/.exec(line)?.[1] ?? "?");
+};
+/** checkedFresh's own-registry stamp (ownerBefore, or the stable post-read compare): one per bracket start/stable end. */
+const isOwnerStamp = (): boolean => { const frames = rcFrames(); return frames[0] === "stampOf" && frames[1] === "checkedFresh"; };
+
+// Linux-only: these native Ryzen 1 private-POSIX-lock, no-spawn fixtures do not model the Windows helper's legitimate
+// spawn (smarty-dev#7858). The original cross-platform contract tests above are unchanged.
+describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry rewrite and lock generation (dry run)", () => {
+  type Removal = { call: string; path: string; action: "moved" | "blocked" | "absent"; to?: string };
+  /** Records every removal call and never executes one; `lockPaths` (private fixture lock dirs) are moved aside.
+   * "absent": the target did not exist (writeFileAtomic's post-rename `rmSync(temp, { force: true })` no-op). */
+  const guardRemovals = (lockPaths: string[] = []) => {
+    const realRename = fs.renameSync.bind(fs);
+    const removals: Removal[] = [], spawned: string[] = [];
+    for (const call of ["rmSync", "rmdirSync", "unlinkSync"] as const) {
+      vi.spyOn(fs, call).mockImplementation(((target: fs.PathLike) => {
+        const file = String(target);
+        if (call === "rmSync" && lockPaths.includes(file) && fs.existsSync(file)) {
+          const to = path.join(tmp("fabric-976-e1-lockgen-"), "released.lock");
+          realRename(file, to); removals.push({ call, path: file, action: "moved", to }); return;
+        }
+        removals.push({ call, path: file, action: fs.existsSync(file) ? "blocked" : "absent" });
+      }) as never);
+    }
+    for (const call of ["spawn", "spawnSync", "execFile", "execFileSync", "exec", "execSync", "fork"] as const) {
+      vi.spyOn(childProcess, call).mockImplementation(((command: unknown) => { spawned.push(String(command)); throw new Error("E1 test: no child processes"); }) as never);
+    }
+    // What a test asserts empty: every removal that would have touched an existing path, and every spawn.
+    const effective = () => ({ removals: removals.filter(removal => removal.action !== "absent"), spawned });
+    return { removals, spawned, effective };
+  };
+  const liveRows = (lastRunId: string, extra: Record<string, unknown>[] = []) => [{ id: "busy", status: "idle", lastRunId }, ...extra];
+  /** A live session's registry actors/01b0-live-session/actors.json, written by the REAL store (fixture only). */
+  const liveStore = async (m: ReturnType<typeof mesh>) => {
+    const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
+    const directory = path.join(m.actors, "01b0-live-session");
+    fs.mkdirSync(directory, { recursive: true });
+    const store = new ActorRegistryStore(directory);
+    store.prepare(liveRows("busy-run")).commit();
+    return { store, file: path.join(directory, "actors.json") };
+  };
+  /** Trace: first status.json read of old/orphan, and every checkedFresh owner stamp of the dead Main's registry. */
+  const tracer = (m: ReturnType<typeof mesh>, onStamp: () => void) => {
+    const own = path.join(m.registry, "actors.json"), trace: string[] = [];
+    let writing = false;
+    const fixtureWrite = (label: string, write: () => void) => { writing = true; try { write(); trace.push(label); } finally { writing = false; } };
+    fakeFs({ candidate: m.old,
+      onReadFile: (file, real) => {
+        for (const [name, directory] of [["old", m.old], ["orphan", m.orphan]] as const)
+          if (!writing && file === path.join(directory, "status.json") && !trace.includes(`status:${name}`)) trace.push(`status:${name}`);
+        return real();
+      },
+      onLstat: (file, real) => {
+        if (!writing && file === own && trace.includes("status:old") && isOwnerStamp()) { trace.push("stamp"); onStamp(); }
+        return real();
+      } });
+    return { trace, fixtureWrite };
+  };
+  const between = (trace: string[], from: string, to: string) =>
+    trace.slice(trace.indexOf(from) + 1, trace.includes(to) ? trace.indexOf(to) : undefined).filter(event => event === "stamp").length;
+  const runsPresent = (m: ReturnType<typeof mesh>) => [m.old, m.latest, m.orphan].every(run => fs.existsSync(path.join(run, "reply.json")));
+
+  // RED (E1 progress): an unrelated live actor's lastRunId moves on in ONE real store save that overlaps old's first
+  // bracket; the registry is stable afterwards. The current candidate must be rechecked (bounded) and planned, not only
+  // the later orphan. Current source: old is vetoed once and never rechecked.
+  it("RED: plans the current candidate after one overlapping unrelated save and a stable recheck", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      if (saves++ === 0) fixtureWrite("save:unrelated", () => live.store.prepare(liveRows("busy-run-2")).commit());
+    });
+    const plan = await sweep(m.root);
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:unrelated"]); // fixture: the save is inside old's first bracket
+    expect(fs.readFileSync(live.file, "utf8")).toContain("busy-run-2");
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).not.toContain(m.latest);
+    expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
+    // A second, stable bracket for old (before + after stamps) before the orphan is considered.
+    expect(between(trace, "save:unrelated", "status:orphan")).toBeGreaterThanOrEqual(2);
+  });
+
+  // Positive control: the overlapping real save ADDS a cross-root reference to old. Any recheck must see it: old kept.
+  it("control: keeps old when the overlapping save adds a cross-root reference, and plans the orphan", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      if (saves++ === 0) fixtureWrite("save:cross-root-ref", () => live.store.prepare(liveRows("busy-run-2", [{ id: "adopter", status: "idle", lastRunId: "old" }])).commit());
+    });
+    const plan = await sweep(m.root);
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:cross-root-ref"]);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).toEqual([m.orphan]);
+  });
+
+  // Counterexample: the registry changes inside EVERY bracket. Rechecks must be bounded, then the candidate is kept.
+  it("counterexample: a continually rewritten registry gets bounded rechecks, then old (and orphan) are kept", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      saves++; fixtureWrite(`save:${saves}`, () => live.store.prepare(liveRows(`busy-run-${saves + 1}`)).commit());
+    });
+    const plan = await sweep(m.root);
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:1"]);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).toEqual([]);
+    // Exactly 3 complete attempts for old: before + after owner stamp each (6), then old is kept.
+    expect(between(trace, "status:old", "status:orphan")).toBe(6);
+    // At most 3 attempts each for old and orphan: one save per stamp.
+    expect(saves).toBeLessThanOrEqual(12);
+  });
+
+  // Counterexample: the first bracket is disturbed by an unrelated save; the NEXT bracket (a recheck of old, or the
+  // orphan's on the current source) publishes a cross-root reference to old. old must be kept either way.
+  it("counterexample: a cross-root reference added on the later check keeps old", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      saves++;
+      if (saves === 1) fixtureWrite("save:unrelated", () => live.store.prepare(liveRows("busy-run-2")).commit());
+      if (saves === 2) fixtureWrite("save:cross-root-ref", () => live.store.prepare(liveRows("busy-run-2", [{ id: "adopter", status: "idle", lastRunId: "old" }])).commit());
+    });
+    const plan = await sweep(m.root);
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:unrelated"]);
+    expect(trace).toContain("save:cross-root-ref");
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).not.toContain(m.latest);
+  });
+
+  // Counterexample: with the unrelated save, the candidate's OWN registry goes missing (moved to a private path) and
+  // stays missing: unsafe, so every recheck keeps old; the orphan (same owner) is kept too.
+  it("counterexample: its own registry missing after an overlapping save still keeps old", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const own = path.join(m.registry, "actors.json"), aside = path.join(tmp("fabric-976-e1-own-"), "actors.json");
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      if (saves++ === 0) fixtureWrite("save:unrelated+own-missing", () => { live.store.prepare(liveRows("busy-run-2")).commit(); fs.renameSync(own, aside); });
+    });
+    const outcome = await sweep(m.root).catch((error: unknown) => ({ removedRuns: [] as string[], error }));
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:unrelated+own-missing"]);
+    expect(fs.existsSync(own)).toBe(false);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(outcome.removedRuns).toEqual([]);
+  });
+
+  // RED (sticky stop): the normal project store's withLock() (the native writer) mkdirs actors/actors.json.lock (0700)
+  // and writes its `owner`, runs the operation, then releases with fs.rmSync of that directory; the next writer's
+  // withLock mkdirs the same name as a NEW directory inode. The sweep lists generation 1 (held at start); it is
+  // released while the sweep awaits (a residency entry without host.lock: claimFence refuses before any flock/spawn);
+  // generation 2 is taken at old's status read. A lock generation is not a registry replacement: no sticky stop.
+  it.skipIf(process.platform !== "linux")("RED: a project-store withLock lock-dir generation during the sweep does not sticky-stop planning", async () => {
+    const m = mesh();
+    const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
+    const project = new ActorRegistryStore(m.actors);
+    project.prepare([{ id: "project-actor", status: "idle", lastRunId: "its-own-run" }]).commit();
+    const lock = path.join(m.actors, "actors.json.lock");
+    const noHost = path.join(m.root, "residency", "no-host");
+    fs.mkdirSync(noHost, { recursive: true });
+    const guard = guardRemovals([lock]);
+    const trace: string[] = [];
+    let releaseA!: () => void, releaseB!: () => void;
+    const heldA = new Promise<void>(resolve => { releaseA = resolve; });
+    const heldB = new Promise<void>(resolve => { releaseB = resolve; });
+    const lockA = project.withLock(() => heldA); // generation 1, held when the sweep starts
+    const ino1 = fs.lstatSync(lock).ino;
+    trace.push("gen1:held");
+    let lockB: Promise<void> | undefined, ino2: number | undefined;
+    fakeFs({ candidate: m.old,
+      onStatusRead: () => {
+        lockB = project.withLock(() => heldB); // generation 2: same name, new inode
+        ino2 = fs.lstatSync(lock).ino; trace.push("status:old", "gen2:held");
+      },
+      onLstat: (file, real) => {
+        if (file === lock && trace.at(-1) === "gen1:held") trace.push("sweep-listed-gen1");
+        if (file === path.join(noHost, "host.lock") && !trace.includes("gen1:release")) { trace.push("gen1:release"); releaseA(); }
+        return real();
+      } });
+    const plan = await sweep(m.root);
+    releaseB(); await lockA; await lockB;
+    expect(trace).toEqual(["gen1:held", "sweep-listed-gen1", "gen1:release", "status:old", "gen2:held"]);
+    expect(ino2).toBeDefined();
+    expect(ino2).not.toBe(ino1);
+    // Both releases were the native rmSync of the private fixture lock, moved aside; nothing else was removed.
+    expect(guard.effective().removals.map(({ call, path: file, action }) => ({ call, file, action }))).toEqual([
+      { call: "rmSync", file: lock, action: "moved" }, { call: "rmSync", file: lock, action: "moved" }]);
+    expect(guard.spawned).toEqual([]);
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.skipped.map(entry => entry.reason).filter(reason => reason.includes("changed type or identity"))).toEqual([]);
+    expect(plan.removedRuns.slice().sort()).toEqual([m.old, m.orphan].sort());
+  });
+
+  // A concrete reference observed on a REJECTED (overlapping) attempt is kept for the invocation even when it is
+  // removed again before the stable third attempt.
+  it("keeps old when a cross-root reference seen on a rejected overlap is removed before the stable third attempt", async () => {
+    const m = mesh();
+    const live = await liveStore(m);
+    const guard = guardRemovals();
+    let saves = 0;
+    const { trace, fixtureWrite } = tracer(m, () => {
+      saves++;
+      if (saves === 1) fixtureWrite("save:add-ref", () => live.store.prepare(liveRows("busy-run-2", [{ id: "adopter", status: "idle", lastRunId: "old" }])).commit());
+      if (saves === 3) fixtureWrite("save:drop-ref", () => live.store.prepare(liveRows("busy-run-3")).commit());
+    });
+    const plan = await sweep(m.root);
+    expect(trace.slice(0, 3)).toEqual(["status:old", "stamp", "save:add-ref"]);
+    expect(trace).toContain("save:drop-ref");
+    expect(fs.readFileSync(live.file, "utf8")).not.toContain("\"old\"");
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).not.toContain(m.latest);
+  });
+
+  // B1: an empty/torn lock owner (private 0700 dir, private empty `owner`) appearing after the first listing is
+  // transient UNKNOWN: old is kept, nothing is seeded or poisoned, and once the name is vacant the orphan is planned.
+  it.each(["", "torn", "x".repeat(257)].flatMap(content => [false, true].map(recognised => ({ content, recognised }))))(
+    "keeps old on an incomplete-owner lock generation (recognised=$recognised), records no identity, and plans the later orphan", async ({ content, recognised }) => {
+    const m = mesh();
+    const lock = path.join(m.actors, "actors.json.lock");
+    if (recognised) {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      fs.writeFileSync(path.join(lock, "owner"), `00000000-0000-4000-8000-000000000000\n${process.pid}\n${NOW}\n`, { mode: 0o600 });
+    }
+    const guard = guardRemovals();
+    const trace: string[] = [];
+    fakeFs({ candidate: m.old,
+      onStatusRead: () => { if (!recognised) fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(path.join(lock, "owner"), content, { mode: 0o600 }); trace.push("torn:held"); },
+      onReadFile: (file, real) => {
+        if (file === path.join(m.orphan, "status.json") && !trace.includes("torn:valid")) {
+          fs.writeFileSync(path.join(lock, "owner"), `00000000-0000-4000-8000-000000000000\n${process.pid}\n${NOW}\n`, { mode: 0o600 }); trace.push("torn:valid");
+        }
+        return real();
+      } });
+    const plan = await sweep(m.root);
+    expect(trace).toEqual(["torn:held", "torn:valid"]);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.skipped.map(entry => entry.reason).filter(reason => reason.includes("changed type or identity"))).toEqual([]);
+    expect(plan.removedRuns).toEqual([m.orphan]);
+  });
+
+  // Physically unsafe shapes of a RECOGNISED lock generation are a permanent stop, even when restored afterwards.
+  // Mutated after the sweep listed the valid (withLock-held) generation, restored when the orphan is considered.
+  type Unsafe = { name: string; mutate: (lock: string) => () => void; fakeUid?: boolean };
+  const unsafe: Unsafe[] = [
+    { name: "group/other permission", mutate: lock => { fs.chmodSync(lock, 0o755); return () => fs.chmodSync(lock, 0o700); } },
+    { name: "extra actors.json child", mutate: lock => { const extra = path.join(lock, "actors.json"), aside = path.join(tmp("fabric-976-e1-extra-"), "a");
+      fs.writeFileSync(extra, "{}", { mode: 0o600 }); return () => fs.renameSync(extra, aside); } },
+    { name: "hard-linked owner", mutate: lock => { const owner = path.join(lock, "owner"), link = path.join(tmp("fabric-976-e1-link-"), "owner");
+      const bytes = fs.readFileSync(owner); fs.linkSync(owner, link);
+      return () => { const fresh = path.join(tmp("fabric-976-e1-link-"), "fresh"); fs.writeFileSync(fresh, bytes, { mode: 0o600 }); fs.renameSync(fresh, owner); }; } },
+    { name: "foreign uid", fakeUid: true, mutate: () => () => undefined },
+    { name: "type (directory -> file)", mutate: lock => { const aside = path.join(tmp("fabric-976-e1-type-"), "lock");
+      fs.renameSync(lock, aside); fs.writeFileSync(lock, "", { mode: 0o600 });
+      return () => { fs.renameSync(lock, path.join(tmp("fabric-976-e1-type-"), "file")); fs.renameSync(aside, lock); }; } },
+  ];
+  it.each(unsafe)("permanently stops on a recognised lock turned physically unsafe ($name), naming offender and identities", async ({ mutate, fakeUid }) => {
+    const m = mesh();
+    const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
+    const project = new ActorRegistryStore(m.actors);
+    project.prepare([{ id: "project-actor", status: "idle", lastRunId: "its-own-run" }]).commit();
+    const lock = path.join(m.actors, "actors.json.lock");
+    let release!: () => void;
+    const held = project.withLock(() => new Promise<void>(resolve => { release = resolve; }));
+    expect(fs.lstatSync(lock).isDirectory()).toBe(true);
+    const guard = guardRemovals([lock]);
+    let restore: (() => void) | undefined, mutated = false, restored = false;
+    fakeFs({ candidate: m.old,
+      onStatusRead: () => { restore = mutate(lock); mutated = true; },
+      onReadFile: (file, real) => {
+        if (file === path.join(m.orphan, "status.json") && restore && !restored) { restore(); restored = true; }
+        return real();
+      },
+      onLstat: (file, real) => {
+        const stat = real();
+        if (fakeUid && mutated && !restored && file === lock && stat instanceof fs.Stats)
+          return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: stat.uid + 1 });
+        return stat;
+      } });
+    const plan = await sweep(m.root);
+    if (restore && !restored) { restore(); restored = true; }
+    release(); await held;
+    expect(mutated).toBe(true);
+    expect(guard.spawned).toEqual([]);
+    expect(guard.effective().removals.filter(removal => removal.action !== "moved")).toEqual([]);
+    expect(runsPresent(m)).toBe(true);
+    expect(plan.removedRuns).toEqual([]);
+    const stops = plan.skipped.map(entry => entry.reason).filter(reason => reason.includes("changed type or identity"));
+    expect(stops.length).toBeGreaterThan(0);
+    expect(stops[0]).toMatch(/actors\.json\.lock .+ -> .+/);
+  });
+
+  it("refuses a first listing with an incomplete private lock owner without planning", async () => {
+    const m = mesh(), lock = path.join(m.actors, "actors.json.lock");
+    fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(path.join(lock, "owner"), "", { mode: 0o600 });
+    const guard = guardRemovals();
+    await expect(sweep(m.root)).rejects.toThrow("Actor references are uncertain");
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+  });
+
+  it("keeps a candidate when the lock's raw directory generation changes during classification", async () => {
+    const m = mesh(), lock = path.join(m.actors, "actors.json.lock");
+    fs.mkdirSync(lock, { mode: 0o700 });
+    fs.writeFileSync(path.join(lock, "owner"), `00000000-0000-4000-8000-000000000000\n${process.pid}\n${NOW}\n`, { mode: 0o600 });
+    const guard = guardRemovals(); let armed = false, raced = false;
+    fakeFs({ candidate: m.old, onStatusRead: () => { armed = true; }, onLstat: (file, real) => {
+      const stat = real();
+      if (armed && !raced && file === lock && (new Error().stack ?? "").includes("lockIdentity")) {
+        raced = true;
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: (stat as fs.Stats).ino + 1 });
+      }
+      return stat;
+    } });
+    const plan = await sweep(m.root);
+    expect(raced).toBe(true); expect(plan.removedRuns).toEqual([m.orphan]);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(plan.skipped.some(item => item.reason.includes("changed type or identity"))).toBe(false);
+    expect(runsPresent(m)).toBe(true);
+  });
 });

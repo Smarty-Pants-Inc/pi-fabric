@@ -236,7 +236,49 @@ const sweep = async (meshRoot: string, options: {
   // generation per the registry's own contract, and the stamp in every final check still vetoes an overlapping save. Any
   // other kind, owner or link count (or no getuid) keeps the exact inode identity, so that flip is a sticky replacement.
   // Windows: no uid/mode, so any registry change stops planning (fail closed); smarty-dev#7858
-  const entryIdentity = (name: string, stat: fs.Stats): string =>
+  // smarty-dev#976 B1: the project store's withLock dir actors/actors.json.lock is a new inode per generation. Only an
+  // owned private actual directory, empty or holding only an owned private single-link regular `owner` with a valid
+  // token/pid/time(/start) record read through O_NOFOLLOW, earns the kind+dev+uid role. Safe shape with missing, torn or
+  // malformed content: undefined (unknown, no identity recorded). Any physically unsafe shape: the exact raw identity.
+  const lockIdentity = (stat: fs.Stats): string | undefined | false => {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const lockDir = path.join(actorsRoot, "actors.json.lock");
+    if (process.platform === "win32" || uid === undefined || !stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) return false;
+    const names = fs.readdirSync(lockDir);
+    if (names.some(name => name !== "owner")) return false;
+    let record = "";
+    if (names.length === 1) {
+      const owner = fs.lstatSync(path.join(lockDir, "owner"), { throwIfNoEntry: false });
+      if (owner !== undefined) {
+        if (!owner.isFile() || owner.nlink !== 1 || owner.uid !== uid || (owner.mode & 0o077) !== 0) return false;
+        let fd: number;
+        try { fd = fs.openSync(path.join(lockDir, "owner"), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+        try {
+          const held = fs.fstatSync(fd);
+          if (!held.isFile() || held.nlink !== 1 || held.uid !== uid || (held.mode & 0o077) !== 0) return false;
+          if (held.dev !== owner.dev || held.ino !== owner.ino) return undefined;
+          if (held.size > 256) return undefined;
+          const buffer = Buffer.alloc(257); record = buffer.subarray(0, fs.readSync(fd, buffer, 0, 257, 0)).toString("utf8");
+          const canonical = fs.lstatSync(path.join(lockDir, "owner"), { throwIfNoEntry: false });
+          if (canonical && (!canonical.isFile() || canonical.nlink !== 1 || canonical.uid !== uid || (canonical.mode & 0o077) !== 0)) return false;
+          if (!canonical || canonical.dev !== held.dev || canonical.ino !== held.ino || canonical.size !== held.size ||
+              canonical.mtimeMs !== held.mtimeMs || canonical.ctimeMs !== held.ctimeMs || canonical.mode !== held.mode ||
+              canonical.uid !== held.uid || canonical.nlink !== held.nlink) return undefined;
+        } finally { fs.closeSync(fd); }
+      }
+    }
+    const after = fs.lstatSync(lockDir, { throwIfNoEntry: false });
+    if (after && (!after.isDirectory() || after.uid !== uid || (after.mode & 0o077) !== 0)) return false;
+    if (!after || after.dev !== stat.dev || after.ino !== stat.ino || after.mode !== stat.mode || after.uid !== stat.uid ||
+        after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || after.nlink !== stat.nlink) return undefined;
+    return /^[0-9a-f-]{36}\n[1-9]\d*\n\d+\n(\d+\n)?$/.test(record) ? `directory\0${stat.dev}\0uid:${uid}\0project-registry-lock` : undefined;
+  };
+  const entryIdentity = (name: string, stat: fs.Stats): string | undefined => {
+    if (name === "actors.json.lock") { const role = lockIdentity(stat); if (role !== false) return role; }
+    return entryIdentityRaw(name, stat);
+  };
+  const entryIdentityRaw = (name: string, stat: fs.Stats): string =>
     name === "actors.json" && stat.isFile() && stat.nlink === 1 && (stat.mode & 0o022) === 0 &&
       typeof process.getuid === "function" && stat.uid === process.getuid()
       ? `file\0${stat.dev}\0uid:${stat.uid}\0project-registry`
@@ -246,6 +288,7 @@ const sweep = async (meshRoot: string, options: {
   // a replacement (sticky `stop`, then undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
   // against the sweep's first-ever identities. Any other error, or a third listing with a vanished entry, is unknown.
   let stop: string | undefined; // sticky: set only by a replacement
+  const readable = (identity: string): string => identity.split("\0").join("/");
   const entries = (): Map<string, string> | undefined => {
     const seen = new Map<string, string>();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -261,7 +304,8 @@ const sweep = async (meshRoot: string, options: {
             vanished = true; continue;
           }
           const identity = entryIdentity(name, stat);
-          if (seen.has(name) && seen.get(name) !== identity) { stop ??= "an actors entry changed type or identity"; return undefined; }
+          if (identity === undefined) return undefined; // a lock generation in progress: unknown, nothing recorded
+          if (seen.has(name) && seen.get(name) !== identity) { stop ??= `an actors entry changed type or identity: ${name} ${readable(seen.get(name)!)} -> ${readable(identity)}`; return undefined; }
           seen.set(name, identity); current.set(name, identity);
         }
         if (!vanished) return current;
@@ -290,8 +334,10 @@ const sweep = async (meshRoot: string, options: {
   // First identity ever seen per name, never dropped: a same-named entry that differs (even after a removal the
   // re-walk accepted) stops the sweep. Only new names may be absorbed by a re-walk.
   const identities = new Map(listing);
-  const replaced = (current: Map<string, string>): boolean =>
-    [...current].some(([name, identity]) => identities.has(name) && identities.get(name) !== identity);
+  const replaced = (current: Map<string, string>): string | undefined => {
+    const found = [...current].find(([name, identity]) => identities.has(name) && identities.get(name) !== identity);
+    return found && `an actors entry changed type or identity: ${found[0]} ${readable(identities.get(found[0])!)} -> ${readable(found[1])}`;
+  };
   const stampOf = (file: string): string | undefined => {
     const stat = fs.lstatSync(file, { throwIfNoEntry: false });
     return stat && `${entryKind(stat)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.nlink}:${stat.uid}`;
@@ -302,14 +348,18 @@ const sweep = async (meshRoot: string, options: {
     if (root !== undefined && firstRoot !== "absent" && root !== firstRoot) return stop ??= "the actors directory was replaced or moved";
     const current = entries();
     if (root === undefined || !current) return "the actors listing is unknown";
-    if (replaced(current)) return stop ??= "an actors entry changed type or identity";
+    const change = replaced(current);
+    if (change !== undefined) return stop ??= change;
     if (firstRoot === "absent" && root !== "absent") firstRoot = root;
     try {
       const sorted = [...current].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
       const probes = [actorsRoot, ...sorted.filter(([, identity]) => identity.startsWith("directory\0")).map(([name]) => path.join(actorsRoot, name))]
         .map(directory => [directory, stampOf(path.join(directory, "actors.json"))] as const);
       const key = [root, ...sorted.map(entry => entry.join("\0")), ...probes.map(([directory, stamp]) => `${directory}\0${stamp !== undefined}`)].join("\n");
-      return { key, full: `${key}\n${probes.map(([, stamp]) => stamp ?? "").join("\n")}`, current };
+      // The raw lock-dir and owner generation (B1): the role key never hides a physical replacement within a bracket.
+      const lock = path.join(actorsRoot, "actors.json.lock");
+      const raw = current.has("actors.json.lock") ? `\n${stampOf(lock) ?? ""}\n${stampOf(path.join(lock, "owner")) ?? ""}` : "";
+      return { key, full: `${key}\n${probes.map(([, stamp]) => stamp ?? "").join("\n")}${raw}`, current };
     } catch (error) { return `an actors.json probe failed: ${(error as Error).message}`; }
   };
   const first = observe();
@@ -334,7 +384,16 @@ const sweep = async (meshRoot: string, options: {
   const unknown = (reason: string): Set<string> => stop !== undefined
     ? veto(`actor registry roots changed during the sweep (${stop}); no further run is deleted`)
     : veto(`actor registry roots are uncertain (${reason}); that candidate is kept`);
+  // smarty-dev#976 A: an own registry that is our regular, single-link, private file.
+  const ownerSafe = (file: string): boolean => {
+    const stat = ownedStat(file);
+    return stat?.isFile() === true && stat.nlink === 1 && (stat.mode & 0o022) === 0;
+  };
+  // smarty-dev#976 A: at most 3 complete observations; only an otherwise-safe raw overlap (post.full !== pre.full) retries.
+  // Every concrete id read on any attempt is kept (a reference removed before a stable attempt still keeps).
   const checkedFresh = (owner?: string): Set<string> => {
+    const union = new Set<string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
     if (stop !== undefined) return unknown(stop);
     const pre = observe();
     if (typeof pre === "string") return unknown(pre);
@@ -351,15 +410,21 @@ const sweep = async (meshRoot: string, options: {
         for (const [name, identity] of pre.current) if (!identities.has(name)) identities.set(name, identity);
         adopted = pre.key;
       }
-      const ownerBefore = owner === undefined ? undefined : stampOf(path.join(owner, "actors.json"));
+      const ownFile = owner === undefined ? undefined : path.join(owner, "actors.json");
+      const ownMissing = "a candidate's own actor registry is missing or changed; that candidate is kept";
+      const ownerBefore = ownFile === undefined ? undefined : stampOf(ownFile);
+      if (ownFile !== undefined && (!registries.includes(owner!) || ownerBefore === undefined || !ownerSafe(ownFile))) return veto(ownMissing);
       const ids = refs.fresh();
+      if (ids.has("*")) return ids;
+      for (const id of ids) union.add(id);
       const post = observe();
       if (typeof post === "string") return unknown(post);
-      if (post.full !== pre.full) return veto("actor registries changed during a final check; that candidate is kept");
-      if (owner !== undefined && (!registries.includes(owner) || ownerBefore === undefined || ownerBefore !== stampOf(path.join(owner, "actors.json"))))
-        return veto("a candidate's own actor registry is missing or changed; that candidate is kept");
-      return ids;
+      const ownerAfter = ownFile === undefined ? undefined : stampOf(ownFile);
+      if (ownFile !== undefined && (!registries.includes(owner!) || ownerAfter === undefined || !ownerSafe(ownFile))) return veto(ownMissing);
+      if (post.full === pre.full) return ownerAfter !== ownerBefore ? veto(ownMissing) : union;
     } catch (error) { return veto(`actor registry check failed (${(error as Error).message}); that candidate is kept`); }
+    }
+    return veto("actor registries changed during a final check; that candidate is kept");
   };
   // The dead host's flock fence on one residency root: claimed, re-proven and released around
   // that root's own work only (smarty-dev#7766). Holding every idle root's host.lock for the

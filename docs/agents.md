@@ -928,7 +928,7 @@ Confinement is inherited and only narrows. A confined agent's own children inher
 The result of every Pi child carries `writeReceipt: { paths, commands, truncated? }`, empty (`{ paths: [], commands: [] }`) when it changed nothing. Fabric records it from the child's own tool events, not from the child's report:
 
 - `paths`: every absolute path a `write` or `edit` call completed on, in first-touch order. A blocked or failed call is not listed.
-- `commands`: the text of every `bash` or `powershell` call the child made, whether it ran or the guard refused it. Not every event says which, so the receipt over-reports rather than miss one that ran.
+- `commands`: the text of every `bash` or `powershell` call the child made, whether it ran or the guard refused it. Some end events do not say which (a nested `pi.bash`, a durable run), so the receipt can also list a refused command; it never misses one that ran.
 
 The content a `write` or `edit` call carries is never recorded. A shell command's text is recorded as given, so data written inline in a command (a heredoc, for example) is kept in the receipt. The receipt holds at most 256 paths and 64 commands of at most 4,096 characters, 64 KiB in all, and `truncated: true` marks one that dropped or cut anything.
 

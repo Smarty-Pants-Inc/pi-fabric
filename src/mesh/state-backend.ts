@@ -927,6 +927,10 @@ export class SqliteStateBackend implements StateBackend {
       // brings forward with this commit's change rows instead of a full export (smarty-dev#6477).
       return result;
     } catch (error) {
+      // Caller-compatible timeout subclasses can refuse before lock acquisition. Preserve their typed refusal and
+      // exact split key: wrapping them as SQLite busy would recreate a false zero-attempt contention timeout.
+      const refusal = error as { kind?: unknown; preLockCode?: unknown } | null;
+      if (error instanceof Error && (refusal?.kind === "pre-lock" || typeof refusal?.preLockCode === "string")) throw error;
       if (error instanceof MeshLockTimeoutError && !(error instanceof MeshStateBusyError)) {
         this.#busyTimeouts += 1;
         throw new MeshStateBusyError(store?.file ?? this.database, performance.now() - started, error);

@@ -1,4 +1,4 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
 import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -101,6 +101,23 @@ const queueWaitersAhead = (root: string, token: string): number | undefined => {
     const index = receipts.findIndex(name => name.endsWith(`-${process.pid}-${token}`));
     return index < 0 ? undefined : index;
   } catch { return undefined; }
+};
+
+/** Both canonical mesh and SQLite writers start relative waits after ticket setup. Expiry before any acquisition
+ * stays a FIFO refusal: close admission before emitting its separate event, never a contention counter/event. */
+export const createMeshLockAdmission = (root: string, token: string, budgetMs: number,
+  options: { passStalledHead?: boolean } = {}, now: () => number = Date.now) => {
+  const ticket = new MeshLockTicket(root, token, budgetMs, options);
+  const startedAt = now();
+  return {
+    ticket, startedAt, deadline: startedAt + Math.max(0, budgetMs),
+    expire(lockPath: string, eventRoot: string, store: LockEventStore, lockClass: MeshLockClass): MeshLockQueueExpiredError {
+      const refusal = new MeshLockQueueExpiredError(lockPath, queueWaitersAhead(root, token), Math.max(0, now() - startedAt));
+      ticket.close();
+      lockEvents?.queueExpired(eventRoot, store, lockClass, refusal.waitedMs, refusal.waitersAhead);
+      return refusal;
+    },
+  };
 };
 
 // Keep the normal global timer seam (including diagnostic/test clocks). An
@@ -281,7 +298,6 @@ export class MeshLock {
     let lockHeldAt = -1;
     let holdMs = -1;
     let failedWaitMs = -1;
-    let queueExpired: MeshLockQueueExpiredError | undefined;
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
@@ -329,11 +345,9 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, waitMs);
-    // The relative wait budget starts at the first admission/acquisition attempt, after setup (root mkdir, the
-    // admission receipt and its queue scans): slow setup must not spend the budget before anything was tried.
-    const waitStartedAt = Date.now();
-    const deadline = waitStartedAt + waitMs;
+    const admission = createMeshLockAdmission(this.root, token, waitMs);
+    const { ticket, deadline } = admission;
+    // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -351,8 +365,7 @@ export class MeshLock {
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
           // retry code, but report this zero-acquisition refusal separately from real lock contention.
-          throw new MeshLockQueueExpiredError(this.#lockPath, queueWaitersAhead(this.root, token),
-            Math.max(0, Date.now() - waitStartedAt));
+          throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
@@ -457,9 +470,8 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) {
-        if (error instanceof MeshLockQueueExpiredError) queueExpired = error;
-        else failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
+        failedWaitMs = performance.now() - lockWaitStart;
       }
       throw error;
     } finally {
@@ -468,9 +480,6 @@ export class MeshLock {
       if (holdMs >= 0) {
         lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);
-      } else if (queueExpired) {
-        // No canonical acquisition attempt: neither a real-contention timeout nor a failed bounded lock try.
-        lockEvents?.queueExpired(this.root, "mesh-lock", lockClass, queueExpired.waitedMs, queueExpired.waitersAhead);
       } else if (failedWaitMs >= 0) {
         const tried = Boolean(scope?.active) || bounded;
         lockStats?.failed(this.root, lockClass, failedWaitMs, tried);

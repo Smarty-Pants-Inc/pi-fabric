@@ -439,7 +439,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
 // themselves, to `<root>/lock-stats/events.jsonl`: the holder when it releases after holding
 // longer than a threshold (`held`), the waiter when it gives up with the typed lock timeout
 // (`wait-timeout`, FABRIC_MESH_STATE_BUSY at the bridge), naming the holder it could identify.
-// A FIFO refusal before canonical acquisition is a separate `pre-lock` event (`queue-expired`), never a
+// A FIFO refusal before canonical acquisition is a separate `pre-lock` event (FABRIC_MESH_LOCK_QUEUE_EXPIRED), never a
 // real-contention timeout in these events or the minute counters. It has no identified lock holder.
 // It is a local append, never a mesh publish: publishing would need the very lock that is
 // contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
@@ -477,7 +477,7 @@ export interface LockEvent {
   /** `wait-timeout` or `pre-lock`. */
   waitedMs?: number;
   /** `pre-lock` only: a refusal before canonical lock acquisition, never contention. */
-  preLockCode?: "queue-expired";
+  preLockCode?: "FABRIC_MESH_LOCK_QUEUE_EXPIRED";
   /** `pre-lock` only: observed FIFO receipts ahead, if available. */
   waitersAhead?: number;
   holder: LockEventHolder;
@@ -577,7 +577,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     sleep?: (ms: number) => void;
   } = {}): LockEvents | undefined => {
   const existing = eventsGlobals[eventsKey];
-  if (existing && (!existing.events || typeof existing.events.queueExpired === "function")) return existing.events;
+  if (existing && (!existing.events || (existing.version >= 3 && typeof existing.events.queueExpired === "function"))) return existing.events;
   if (!existing && lockStatsDisabled(setting)) {
     eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
     return undefined;
@@ -717,18 +717,18 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
         holder: { pid, process: name, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
     },
     queueExpired(root, store, lockClass, waitedMs, waitersAhead) {
-      append(root, { v: 1, at: Date.now(), kind: "pre-lock", preLockCode: "queue-expired", store, class: lockClass,
+      append(root, { v: 1, at: Date.now(), kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store, class: lockClass,
         waitedMs: Math.round(waitedMs), ...(waitersAhead === undefined ? {} : { waitersAhead }),
         holder: { pid: null, process: null, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
     },
     get errors() { return errors; },
   };
-  // Additive handover from a captured v1 appender: retain its methods/sink/error count. Only the new event uses
-  // this generation's appender, so reload never calls a missing method or mislabels the refusal as wait-timeout.
+  // Additive handover from captured v1/v2 appenders: retain existing methods/sink/error count. The queue event
+  // uses this generation's full code, so reload cannot retain the older abbreviated field or a missing method.
   const legacy = existing?.events;
   const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: legacy.waitTimeout,
     queueExpired: events.queueExpired, get errors() { return legacy.errors + events.errors; } } : events;
-  eventsGlobals[eventsKey] = { version: 2, events: shared, dispose: existing?.dispose ?? (() => {}) };
+  eventsGlobals[eventsKey] = { version: 3, events: shared, dispose: existing?.dispose ?? (() => {}) };
   return shared;
 };
 

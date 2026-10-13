@@ -8,7 +8,7 @@ import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
-import { verifiedRemove } from "../storage/verified-remove.js";
+import { verifiedRemove, type VerifiedRemoveResult } from "../storage/verified-remove.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -370,9 +370,17 @@ export class EventLog {
     // File-only, as main's non-recursive rmSync: a directory (or link) at an intent name is never removed here.
     if (judged && !judged.isFile()) return false;
     const removed = judged === undefined ? (fs.rmSync(file, { force: true }), true)
-      : verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed;
+      : this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }));
     if (removed) syncPathNamespace(path.dirname(file));
     return removed;
+  }
+
+  /** A refusal is not absence (smarty-dev#8907 F-01): it counts as gone only when nothing was moved into a
+   * graveyard and the intent name is confirmed absent now (the judged intent was already gone before verification). */
+  #intentGone(file: string, result: VerifiedRemoveResult): boolean {
+    if (result.removed) return true;
+    if (result.graveyard !== undefined || result.reason.includes("graveyard")) return false;
+    return !fs.lstatSync(file, { throwIfNoEntry: false });
   }
 
   /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
@@ -485,10 +493,12 @@ export class EventLog {
       // unlink is ordered under the lock (a same-key writer may replace the intent next), its
       // namespace barrier runs after release. A crash before it may bring the intent back,
       // which settles to nothing again: no line can ever match its unique event id.
-      const removed = verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }).removed;
+      // A refused (replaced or refreshed) intent stays as the fence: fail closed before any sequence, intent or append.
+      if (!this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }))) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
+      }
       after.receipt = undefined;
-      // A refused (replaced or refreshed) intent stays: it is settled again by its next lookup.
-      after.finish = removed ? () => syncPathNamespace(path.dirname(file)) : undefined;
+      after.finish = () => syncPathNamespace(path.dirname(file));
       return undefined;
     }
     if (event && !prior) {
@@ -504,7 +514,10 @@ export class EventLog {
     // synchronous .lock hold (writeFileAtomic: pid+uuid temp, rename); no pre-judgment stat names that
     // inode and a stat taken now would be a refreshed one, so main's by-path removal stays there
     // (residual: a legacy off-lock writer renaming over it inside this hold, reported in smarty-dev#8907).
-    this.#removeDedupeIntent(file, judged);
+    // With no event, a kept (refused) intent must not be overwritten by a new append or invalidated by compaction.
+    if (!this.#removeDedupeIntent(file, judged) && !event) {
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
+    }
     return event;
   }
 

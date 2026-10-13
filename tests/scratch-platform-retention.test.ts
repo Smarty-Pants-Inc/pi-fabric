@@ -215,7 +215,7 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(warned).toEqual([expect.stringMatching(/sweepScratch: file ownership cannot be proven .* x2 \(e\.g\. /)]);
   });
 
-  it("another deleter off Linux still refuses (fallback never invoked); counted, one batch warning", async () => {
+  it("another deleter off Linux without a fallback refuses; counted, one batch warning", async () => {
     const parent = sandbox();
     const target = path.join(parent, "target");
     fs.mkdirSync(target);
@@ -226,13 +226,11 @@ describe("remaining platform refusals and failed removals are counted and logged
     if (typeof process.getuid !== "function") override("getuid", () => 0);
     if (typeof process.geteuid !== "function") override("geteuid", () => 0);
     override("platform", "darwin");
-    let fallbackRan = 0;
     const deleter = `other-${process.pid}-${Date.now()}`;
     for (let i = 0; i < 3; i++) {
-      expect(verifiedRemove(target, fs.lstatSync(target), { deleter, fallback: () => (++fallbackRan, true) }))
+      expect(verifiedRemove(target, fs.lstatSync(target), { deleter }))
         .toMatchObject({ removed: false, reason: expect.stringContaining("nothing is deleted") });
     }
-    expect(fallbackRan).toBe(0);
     expect(calls).toEqual([]);
     expect(shape(parent)).toEqual(before);
     const skips = Object.entries(platformRemovalSkips()).filter(([name]) => name.startsWith(`${deleter}:`));

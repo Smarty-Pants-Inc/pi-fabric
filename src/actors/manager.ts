@@ -1559,7 +1559,9 @@ export class ActorManager {
 
   /**
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
-   * queued work from the next item on. Per-filter telemetry resets; legacy lifetime count is kept.
+   * ordinary queue and overflow immediately, without touching an in-flight run. Interval-managed
+   * agent_settled deliveries recheck at arrival, their trailing boundary and dequeue. Per-filter
+   * telemetry resets; legacy lifetime count is kept.
    */
   async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
@@ -1577,6 +1579,8 @@ export class ActorManager {
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
+    this.#filterQueued(actor);
+    this.#replayDeadLetters(actor);
     await this.#publishPresence(actor, true);
     return this.#publicInfo(actor);
   }
@@ -3540,15 +3544,6 @@ export class ActorManager {
           await this.#publishDrainPresence(actor);
           continue;
         }
-        // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
-        // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
-        // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
-        // another scope can share); otherwise the activation runs as it was.
-        // The policy is read live here (review round 3): a reload that removed it hydrates nothing.
-        const wakeText = hydrateWakeText(item.source.startsWith("mesh:") ? this.wakeTextPolicy() : undefined, item.source, item.payload,
-          { id: actor.id, topics: actor.topics });
-        if (wakeText) item.wakeText = wakeText;
-        else delete item.wakeText;
         const filteredBy = this.#filteredBy(actor, item);
         if (filteredBy) {
           // smarty-dev#1579: a skip rule matched. No model run; the skip is logged and counted.
@@ -4555,9 +4550,45 @@ export class ActorManager {
     }
   }
 
+  // A new filter must free accepted slots now, not wait behind the actor's active run (#10630).
+  // Use the head-skip verdict and receipt path; retain every non-match in FIFO order.
+  #filterQueued(actor: ManagedActor): void {
+    if (!actor.activationFilter) return;
+    let skipped = 0;
+    const keep = (item: ActorQueueItem): boolean => {
+      // Interval-managed settles have their own arrival/trailing rechecks. Leave admitted
+      // deliveries for the head skip; counting them here also counts a held window's history.
+      if (item.source === "host:agent_settled" && (actor.activation?.minIntervalMs ?? 0) > 0) return true;
+      const ruleId = this.#filteredBy(actor, item);
+      if (!ruleId) return true;
+      this.#recordFiltered(actor, item, ruleId);
+      skipped++;
+      return false;
+    };
+    actor.queue = actor.queue.filter(keep);
+    const overflow = this.#overflow.get(actor.id)?.filter(keep);
+    if (overflow?.length) this.#overflow.set(actor.id, overflow);
+    else this.#overflow.delete(actor.id);
+    if (!skipped) return;
+    this.#refill(actor);
+    if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+    this.#persistQueue(actor.id);
+    queueMicrotask(() => this.#resumeSettledWindows(actor.id));
+    this.#meshMonitor.schedule();
+  }
+
   // Only callerless mesh and host events are filtered: a caller always hears its own run.
   #filteredBy(actor: ManagedActor, item: ActorQueueItem): string | undefined {
     this.#expireActivationFilter(actor);
+    // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
+    // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
+    // actor's host-only allowlist, keyed by this actor's exact ID (never its name, which a namesake in
+    // another scope can share); otherwise the activation runs as it was.
+    // Read policy live for both queued passes and head skips: removal revokes hydration at once.
+    const wakeText = hydrateWakeText(item.source.startsWith("mesh:") ? this.wakeTextPolicy() : undefined, item.source, item.payload,
+      { id: actor.id, topics: actor.topics });
+    if (wakeText) item.wakeText = wakeText;
+    else delete item.wakeText;
     if (!actor.activationFilter || item.resolve || item.reject) return undefined;
     if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return undefined;
     // Hydrated wake text is visible to filter paths as wakeText.* (author, authorAssociation, body).

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { windowsSecurityPowerShell } from "../storage/windows-powershell.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,7 +40,7 @@ export function windowsPowerShellPath(): string {
   return windowsSystemExecutable("WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
-// No double quotes: Windows argv quoting of " is unreliable for powershell.exe -Command.
+// Constant scripts; paths travel only through environment variables.
 // SIDs come from GetAccessRules(..., SecurityIdentifier), so output is locale independent.
 // One report of $acl; `emit` wraps each line expression (console write or buffered add).
 const aclReportStatements = (emit: (expression: string) => string): string[] => [
@@ -246,8 +247,9 @@ export function windowsRequestFileViolations(evidence: WindowsRequestFileEvidenc
 /** Runs the constant batch script once with fixed argv; `encodedPaths` is the FABRIC_ACL_PATHS value. */
 export type WindowsFileAclBatchRunner = (encodedPaths: string) => Promise<string>;
 const runWindowsFileAclBatch: WindowsFileAclBatchRunner = async encodedPaths => {
-  const { stdout } = await execFileAsync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", aclBatchReportScript], {
-    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, FABRIC_ACL_PATHS: encodedPaths },
+  const command = windowsSecurityPowerShell(aclBatchReportScript);
+  const { stdout } = await execFileAsync(command.file, command.args, {
+    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...command.env, FABRIC_ACL_PATHS: encodedPaths },
   });
   return stdout;
 };
@@ -284,8 +286,9 @@ export async function readWindowsFileAcls(files: string[], run: WindowsFileAclBa
 
 export async function readWindowsDirectoryAcl(directory: string): Promise<WindowsDirectoryAcl> {
   if (/[\r\n]/.test(directory)) throw new Error("path contains a line break");
-  const { stdout } = await execFileAsync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", aclReportScript], {
-    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...process.env, FABRIC_ACL_PATH: directory },
+  const command = windowsSecurityPowerShell(aclReportScript);
+  const { stdout } = await execFileAsync(command.file, command.args, {
+    encoding: "utf8", windowsHide: true, timeout: 30_000, env: { ...command.env, FABRIC_ACL_PATH: directory },
   });
   return parseWindowsAclReport(stdout);
 }

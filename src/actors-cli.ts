@@ -3,10 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
-import { assertWindowsResidentMetadataPrivate, readResidentMetadataFile, windowsPowerShellPath, windowsRequestsAclAdapters,
+import { assertWindowsResidentMetadataPrivate, readResidentMetadataFile, windowsRequestsAclAdapters,
   type WindowsDirectoryAcl, type WindowsRequestFileReport } from "./residency/windows-acl.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
+import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 
 const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
 const help = `${usage}
@@ -65,7 +66,7 @@ export interface ResidentChannelOwnerProbe {
 const windowsSidScript = [
   "$ErrorActionPreference = 'Stop'",
   "$sid = [System.Security.Principal.SecurityIdentifier]",
-  // No double quotes: Windows argv quoting of " is unreliable for powershell.exe -Command.
+  // Paths are data, never interpolated into the script.
   "$paths = $env:FABRIC_ACTORS_OWNER_PATHS -split [char]10",
   "foreach ($p in $paths) { [Console]::Out.WriteLine((Get-Acl -LiteralPath $p).GetOwner($sid).Value) }",
   "[Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)",
@@ -74,9 +75,10 @@ const windowsSidScript = [
 /** Query owner SIDs with a fixed argv; the paths travel in the environment, never the command line. */
 export function windowsOwnerSids(files: string[]): { owners: string[]; user: string } {
   if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
-  const output = execFileSync(windowsPowerShellPath(), ["-NoProfile", "-NonInteractive", "-Command", windowsSidScript], {
+  const command = windowsSecurityPowerShell(windowsSidScript);
+  const output = execFileSync(command.file, command.args, {
     encoding: "utf8", windowsHide: true, timeout: 30_000, stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, FABRIC_ACTORS_OWNER_PATHS: files.join("\n") },
+    env: { ...command.env, FABRIC_ACTORS_OWNER_PATHS: files.join("\n") },
   });
   const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (lines.length !== files.length + 1) throw new Error("unexpected owner query output");

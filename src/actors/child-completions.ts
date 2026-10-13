@@ -25,6 +25,9 @@ const WATCH_REARM_MAX_MS = 5 * 60_000;
 const WATCH_FAILURE_LIMIT = 6;
 // A closed native handle normally reports `close`; an errored one may never do so.
 const WATCH_CLOSE_GRACE_MS = 1_000;
+// Envelopes/control records are small metadata, not the retained full result or session.
+const MAX_SPOOL_JSON_BYTES = 1024 * 1024;
+class UnsafeCompletionEntry extends Error {}
 
 /**
  * Edge-only wake for completion writers in other processes. It carries no authority:
@@ -160,9 +163,50 @@ export class ActorChildCompletionStore {
   readonly #consumed = new Set<string>();
   readonly #publicationId = randomUUID();
   readonly #uncertainReceipts = new Set<string>();
+  readonly #warnedEntries = new Set<string>();
   #claimDepth = 0;
   constructor(readonly sessionFile: string) {
     this.directory = path.join(path.dirname(sessionFile), "child-completions");
+  }
+
+  /** A task can write spool names. Never follow them or read an unbounded stream,
+   * including if a regular pathname is replaced between lstat and open. */
+  #readSpoolJson(file: string) {
+    let fd: number | undefined;
+    try {
+      const expected = fs.lstatSync(file);
+      const regular = (stat: fs.Stats): boolean => stat.isFile() && stat.nlink === 1 &&
+        (!process.getuid || stat.uid === process.getuid()) && stat.size <= MAX_SPOOL_JSON_BYTES;
+      if (!regular(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const stat = fs.fstatSync(fd);
+      if (!regular(stat) || stat.dev !== expected.dev || stat.ino !== expected.ino) {
+        throw new UnsafeCompletionEntry("file changed before read");
+      }
+      // The sentinel catches growth, without allocating/reading beyond the bound.
+      const bytes = Buffer.alloc(stat.size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const read = fs.readSync(fd, bytes, length, bytes.length - length, null);
+        if (read === 0) break;
+        length += read;
+      }
+      const after = fs.fstatSync(fd);
+      if (length !== stat.size || !regular(after) || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
+        throw new UnsafeCompletionEntry("file changed during read");
+      }
+      this.#warnedEntries.delete(file);
+      return JSON.parse(bytes.subarray(0, length).toString("utf8"));
+    } catch (error) {
+      if (error instanceof UnsafeCompletionEntry || (error as NodeJS.ErrnoException).code === "ELOOP") {
+        if (!this.#warnedEntries.has(file)) {
+          this.#warnedEntries.add(file);
+          console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
+        }
+        throw error instanceof UnsafeCompletionEntry ? error : new UnsafeCompletionEntry("no-follow open refused");
+      }
+      throw error;
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
   }
 
   enqueue(result: AgentRunResult, spawner: AgentSpawner, notify = true): void {
@@ -172,7 +216,7 @@ export class ActorChildCompletionStore {
       // the source's archive obligation, not let its prepared receipt discharge it.
       this.#rollbackAbandoned(result.id);
       const received = this.received(result.id);
-      const publication = received ? JSON.parse(fs.readFileSync(this.#receipt(result.id), "utf8")).publication : undefined;
+      const publication = received ? this.#readSpoolJson(this.#receipt(result.id)).publication : undefined;
       if (this.#consumed.has(result.id) || (received && !publication)) {
         // A finalized observation/claim still prevents replay. Fence a receipt
         // whose rename was visible but whose durability barrier previously failed.
@@ -212,7 +256,7 @@ export class ActorChildCompletionStore {
     this.#withClaim(() => {
       const received = this.received(id);
       if (received && options.mailbox && !this.mailboxClaimed(id)) throw new ChildCompletionClaimLostError([id]);
-      const publication = received ? JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")).publication : undefined;
+      const publication = received ? this.#readSpoolJson(this.#receipt(id)).publication : undefined;
       if (!received || this.#uncertainReceipts.has(id) || (!options.publication && publication === this.#publicationId)) {
         this.#uncertainReceipts.add(id);
         writeJsonAtomic(this.#receipt(id), { id, kind: options.mailbox ? "mailbox" : "foreground", acknowledgedAt: Date.now(),
@@ -236,9 +280,9 @@ export class ActorChildCompletionStore {
   #rollbackAbandoned(id: string): void {
     const file = path.join(this.directory, `${id}.abandon`);
     if (!fs.existsSync(file)) return;
-    const abandoned = JSON.parse(fs.readFileSync(file, "utf8"));
+    const abandoned = this.#readSpoolJson(file);
     let receipt;
-    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); }
+    try { receipt = this.#readSpoolJson(this.#receipt(id)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (abandoned.id === id && typeof abandoned.publication === "string" && receipt?.publication === abandoned.publication) {
       writeJsonAtomic(this.#receipt(id), { id, unread: true }, { durable: true });
@@ -286,7 +330,7 @@ export class ActorChildCompletionStore {
   mailboxClaimed(id: string): boolean {
     return this.#withClaim(() => {
       if (!this.received(id)) return false;
-      const receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8"));
+      const receipt = this.#readSpoolJson(this.#receipt(id));
       // Legacy standalone receipts also gated persisted mailbox records.
       return receipt.kind === "mailbox" || (!receipt.kind && !receipt.batchId && !receipt.publication);
     });
@@ -315,7 +359,7 @@ export class ActorChildCompletionStore {
 
   handoffConsumed(id: string): boolean {
     if (!ID.test(id)) return false;
-    try { return JSON.parse(fs.readFileSync(path.join(this.directory, `${id}.consumed`), "utf8")).id === id; }
+    try { return this.#readSpoolJson(path.join(this.directory, `${id}.consumed`)).id === id; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
@@ -360,7 +404,7 @@ export class ActorChildCompletionStore {
     try { files = fs.readdirSync(this.directory); } catch { return; }
     for (const name of files.filter(file => file.endsWith(".source") && ID.test(file.slice(0, -7))).slice(0, 100)) {
       try {
-        const source = JSON.parse(fs.readFileSync(path.join(this.directory, name), "utf8"));
+        const source = this.#readSpoolJson(path.join(this.directory, name));
         if (source.id !== name.slice(0, -7) || typeof source.directory !== "string" || path.basename(source.directory) !== source.id || !ownedStat(source.directory)?.isDirectory()) continue;
         const pending = path.join(source.directory, ARCHIVE_PENDING_FILE);
         if (!fs.existsSync(pending)) { fs.rmSync(path.join(this.directory, name), { force: true }); continue; }
@@ -407,16 +451,17 @@ export class ActorChildCompletionStore {
       return (error as NodeJS.ErrnoException).code !== "ENOENT";
     }
     return files.some(file => {
-      if (file.endsWith(".abandon")) return ID.test(file.slice(0, -".abandon".length));
-      if (file.endsWith(".source")) return ID.test(file.slice(0, -".source".length));
-      if (!file.endsWith(".json") || !ID.test(file.slice(0, -5))) return false;
-      if (!options.actorId && !options.inFlightRunId) return true;
+      if (!WAKE_FILE.test(file)) return false;
       try {
-        const value = JSON.parse(fs.readFileSync(path.join(this.directory, file), "utf8")) as ActorChildCompletion;
+        const value = this.#readSpoolJson(path.join(this.directory, file)) as ActorChildCompletion;
+        if (!file.endsWith(".json") || (!options.actorId && !options.inFlightRunId)) return true;
         return value.format === 1 && value.spawner?.kind === "actor" &&
           (!options.actorId || value.spawner.id === options.actorId) &&
           (!options.inFlightRunId || value.spawner.runId !== options.inFlightRunId);
-      } catch { return true; }
+      } catch (error) {
+        // Unsafe entries remain on disk/custody-visible, but never enter the claim/read path.
+        return !(error instanceof UnsafeCompletionEntry);
+      }
     });
   }
 
@@ -441,12 +486,12 @@ export class ActorChildCompletionStore {
         this.#rollbackAbandoned(id);
         if (this.received(id)) {
           // An unpublished foreground fence can still be abandoned. Retain its envelope.
-          if (JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")).publication) continue;
+          if (this.#readSpoolJson(this.#receipt(id)).publication) continue;
           fs.rmSync(this.#file(id), { force: true });
           this.#checked.delete(id);
           continue;
         }
-        const value = JSON.parse(fs.readFileSync(this.#file(id), "utf8")) as ActorChildCompletion;
+        const value = this.#readSpoolJson(this.#file(id)) as ActorChildCompletion;
         if (value.format !== 1 || value.result?.id !== id || value.spawner?.kind !== "actor") continue;
         if (options.actorId && value.spawner.id !== options.actorId) continue;
         // Crucially this precedes the session read, not merely mailbox enqueue.
@@ -529,7 +574,7 @@ export class ActorChildCompletionStore {
 
   #received(id: string): boolean {
     let receipt: { batchId?: string; unread?: boolean };
-    try { receipt = JSON.parse(fs.readFileSync(this.#receipt(id), "utf8")); } catch (error) {
+    try { receipt = this.#readSpoolJson(this.#receipt(id)); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error; // Unreadable consumption evidence is not evidence of non-consumption.
     }

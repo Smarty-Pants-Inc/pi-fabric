@@ -62,8 +62,9 @@ export class WriteReceiptRecorder {
       if (resolved.length > WRITE_RECEIPT_MAX_COMMAND_CHARS) return this.#drop();
       call = { path: resolved };
     } else if (SHELL_TOOLS.has(event.toolName) && typeof args.command === "string") {
+      // A copy, not a slice: V8 may keep a slice's whole (child-sized) source string alive (round-2 review P2).
       call = args.command.length > WRITE_RECEIPT_MAX_COMMAND_CHARS
-        ? { command: args.command.slice(0, WRITE_RECEIPT_MAX_COMMAND_CHARS), cut: true }
+        ? { command: args.command.slice(0, WRITE_RECEIPT_MAX_COMMAND_CHARS).split("").join(""), cut: true }
         : { command: args.command };
     }
     if (!call) return;

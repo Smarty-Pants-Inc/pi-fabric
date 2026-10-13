@@ -11,7 +11,7 @@ import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js"
 import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
+import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
@@ -125,6 +125,8 @@ class LeaseResolutionRequired extends Error {
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   #legacyDeliveryCount = 0;
+  /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
+  readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
@@ -692,24 +694,75 @@ export class AgentMessageRouter {
         : this.actorManager.steerRemote(participant.id, message, kind, data);
     }
     if (!this.control) throw new Error("Fabric control plane is unavailable");
-    return this.control.request(
-      participant.ownerHostId,
-      participant.id,
-      kind,
-      {
-        principal: options.principal,
-        ownerIncarnation,
-        message,
-        data,
-        ...(typeof options.triggerTurn === "boolean"
-          ? { triggerTurn: options.triggerTurn }
-          : {}),
-        ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
-        ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
-      },
-      participant.ownerIdentityId,
-      { idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
-    );
+    const control = this.control;
+    // The same idempotency key (one commandId) covers the one dormant-wake resend.
+    return this.sendAfterDormantWake(participant, owner => {
+      if (!owner.capabilities.includes(kind)) throw unsupported(owner, kind);
+      if (needsBinding && !owner.capabilities.includes("actor-bindings")) {
+        throw new Error(`Fabric actor owner ${owner.ownerHostId} does not support session bindings`);
+      }
+      return control.request(
+        owner.ownerHostId,
+        owner.id,
+        kind,
+        {
+          principal: options.principal,
+          ownerIncarnation: controlOwnerIncarnation(owner),
+          message,
+          data,
+          ...(typeof options.triggerTurn === "boolean"
+            ? { triggerTurn: options.triggerTurn }
+            : {}),
+          ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
+          ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+        },
+        owner.ownerIdentityId,
+        {
+          idempotencyKey: options.idempotencyKey, routedRemoteHost: owner.remoteHost ?? null,
+          // Retained dormant authority has no live-owner ACK window yet. Its committed
+          // command must include bounded cold startup, formerly waited out in preflight.
+          ...(owner.stale ? { timeoutMs: 90_000 } : {}),
+          ...(context?.signal ? { signal: context.signal } : {}),
+        },
+      );
+    });
+  }
+
+  /**
+   * Dormant wake re-resolve (#774 with the #709 fence). A message to a dormant actor addresses its
+   * retained wake route, which names the epoch of the activation that went dormant. Its committed
+   * command wakes the actor; the woken successor runs under its own fresh epoch, publishes it
+   * (participant record, then its rewritten wake route) and refuses the predecessor epoch with
+   * FABRIC_CONTROL_STALE_INCARNATION before any claim or handler. The refusal attests no run.
+   *
+   * ponytail: one re-read and one resend, never a loop. Only a target this router resolved from a
+   * retained dormant route qualifies. Re-read its participant once; only when the same owner and
+   * actor lineage now advertise a different epoch, resend once under the same idempotency key. The
+   * key keeps the commandId, so the owner's claim answers any duplicate with the one outcome. A
+   * second refusal, a refusal from a live (non-dormant) target and every other error reach the
+   * caller unchanged: re-resolving and deciding to send again stays the caller's decision (#709).
+   */
+  async sendAfterDormantWake<T>(
+    addressed: FabricParticipantInfo,
+    send: (owner: FabricParticipantInfo) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send(addressed);
+    } catch (error) {
+      if (!(error instanceof FabricControlStaleIncarnationError) || !this.#dormantRoutes.has(addressed)) throw error;
+      let current: FabricParticipantInfo | undefined;
+      let fresh: string | undefined;
+      try {
+        current = (await this.resolveActorMessageTarget(addressed.id)).participant;
+        fresh = current ? controlOwnerIncarnation(current) : undefined;
+      } catch { throw error; }
+      if (!current || fresh === undefined || fresh === controlOwnerIncarnation(addressed) ||
+          current.id !== addressed.id || current.kind !== "actor" || current.rootId !== addressed.rootId ||
+          current.ownerHostId !== addressed.ownerHostId || current.ownerIdentityId !== addressed.ownerIdentityId ||
+          current.actorOwnershipToken !== addressed.actorOwnershipToken ||
+          (current.remoteHost ?? null) !== (addressed.remoteHost ?? null)) throw error;
+      return send(current);
+    }
   }
 
   async acceptControl(
@@ -865,6 +918,21 @@ export class AgentMessageRouter {
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
+    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
+    const definition = this.resolveActorTarget(id, false);
+    if (meshRoot && definition.actor?.residency === "durable" &&
+        ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
+        !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {
+      const { dormantActorRoute } = await import("../residency/wake.js");
+      const retained = dormantActorRoute(meshRoot, definition.actor);
+      // No wake effect here. The ordinary caller checks capability/binding/control;
+      // control then admits and commits a command. ONLY its post-commit hook wakes.
+      if (retained) {
+        if (!this.control) throw new Error(`Fabric actor owner ${retained.ownerHostId} has no acknowledged control channel`);
+        this.#dormantRoutes.add(retained); // see sendAfterDormantWake
+        return { actor: definition.actor, participant: retained };
+      }
+    }
     const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&

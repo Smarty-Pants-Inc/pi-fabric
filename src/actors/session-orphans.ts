@@ -328,7 +328,7 @@ export class SessionActorOrphans {
     const legacy = this.mesh.get(`actors/${sessionId}/${id}`, { fresh: true });
     const value = record(legacy?.value);
     if (legacy && (!value || value.id !== id || value.rootId !== `session:${sessionId}` || !time(legacy.updatedAt) ||
-        typeof value.status !== "string" || !["idle", "stopped", "running", "queued", "preparing", "waiting", "failed", "failing-preparation"].includes(value.status))) return false;
+        typeof value.status !== "string" || !["dormant", "idle", "stopped", "running", "queued", "preparing", "waiting", "failed", "failing-preparation"].includes(value.status))) return false;
     // An idle/stopped advertisement of the positively dead Main is not live
     // execution presence. Recent active advertisements retain the restart grace.
     if (legacy && value?.status !== "idle" && value?.status !== "stopped" &&

@@ -62,8 +62,8 @@ const fixture = (cooldownMs = COOLDOWN_MS) => {
   closers.push(async () => {
     for (const marker of ["TRANSIENT_FAILS", "AUTH_FAILS"]) fs.rmSync(path.join(os.tmpdir(), `fake-pi-rpc-${marker}-${token}`), { force: true });
   });
-  const start = async () => {
-    const host = new ResidentHost(config);
+  const start = async (onIdle?: ConstructorParameters<typeof ResidentHost>[1]) => {
+    const host = new ResidentHost(config, onIdle);
     closers.push(() => host.close());
     await host.start();
     return host;
@@ -73,7 +73,8 @@ const fixture = (cooldownMs = COOLDOWN_MS) => {
     // Factory review routing: skip an actor whose published record is blocked or not live.
     routable: (id: string): boolean => {
       const value = router.get(`actors/${config.sessionId}/${id}`)?.value as Presence;
-      return value !== undefined && value.activationBlocked === undefined && ["idle", "running", "queued"].includes(String(value.status));
+      // A dormant actor still accepts deliveries: delivery wakes it, so it is routable.
+      return value !== undefined && value.activationBlocked === undefined && ["idle", "running", "queued", "dormant"].includes(String(value.status));
     },
     route: (text: string) => router.publish({ topic: TOPIC, from, text }),
   };
@@ -87,7 +88,48 @@ const settled = (host: ResidentHost, id: string) => {
   return !status.inFlightRun && !status.preparing && status.queued === 0;
 };
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe("transient activation block on a resident host, end to end (smarty-dev#6509)", () => {
+  // Pi-fabric#774: a resident host sleeps its idle durable actors and exits 30 s (IDLE_EXIT_MS) after
+  // the last activity. A transient block whose cooldown outlasts that must keep the actor warm and
+  // the host up until retryAt, or nothing is left to publish the expired record routers wait for.
+  it("a transient cooldown longer than the 30 s idle exit keeps the blocked actor awake and the host up until retryAt", async () => {
+    const cooldownMs = 34_000;
+    const s = fixture(cooldownMs);
+    const exits: Array<{ reason: string | undefined; at: number }> = [];
+    const host = await s.start((reason) => { exits.push({ reason, at: Date.now() }); });
+    const actor = await createReviewer(host);
+    await waitFor(() => s.routable(actor.id), "the reviewer to be routable");
+
+    await s.route(`review 1 TRANSIENT_FAILS=1#${s.token}`);
+    await waitFor(() => host.actors.status(actor.id).activationBlocked !== undefined && settled(host, actor.id), "the block");
+    const blocked = host.actors.status(actor.id).activationBlocked!;
+    expect(blocked).toMatchObject({ class: "transient", backoffMs: cooldownMs, retryAt: blocked.blockedAt! + cooldownMs });
+
+    // Past the 30 s idle exit and up to retryAt: never dormant, the host never exits, the router keeps skipping it.
+    const statuses = new Set<string>();
+    while (Date.now() < blocked.retryAt! - 200) {
+      statuses.add(String(host.actors.status(actor.id).status));
+      expect(exits).toEqual([]);
+      expect(s.routable(actor.id)).toBe(false);
+      await sleep(100);
+    }
+    expect(statuses.has("dormant")).toBe(false);
+    expect(exits).toEqual([]);
+
+    // At retryAt the live host publishes the expired record, and only then may the actor sleep.
+    await waitFor(() => s.presence(actor.id)?.activationBlockExpired !== undefined, "the expired record to be published", 10_000);
+    expect(Date.now()).toBeGreaterThanOrEqual(blocked.retryAt!);
+    expect(Date.now()).toBeLessThan(blocked.retryAt! + 5_000);
+    expect(s.presence(actor.id)!.activationBlockExpired).toMatchObject({ code: "provider-transient", class: "transient",
+      backoffMs: cooldownMs, expiredAt: blocked.retryAt });
+    expect(s.presence(actor.id)).not.toHaveProperty("activationBlocked");
+    expect(exits).toEqual([]);
+    await waitFor(() => host.actors.status(actor.id).status === "dormant", "the expired actor to go dormant", 10_000);
+    expect(s.routable(actor.id)).toBe(true);
+  }, 120_000);
+
   it("a transient provider error blocks; after the configured cooldown the router re-admits it and the probe clears it", async () => {
     const s = fixture();
     const host = await s.start();

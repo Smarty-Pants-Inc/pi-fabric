@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -22,6 +23,14 @@ export class ActorRegistryUpdateVetoedError extends Error {
     this.name = "ActorRegistryUpdateVetoedError";
   }
 }
+
+/** Zero-wait entry refused; no queue mutation ran and async recovery is unchanged. */
+export class ActorRegistryBusyError extends Error {
+  readonly code = "FABRIC_ACTOR_REGISTRY_BUSY";
+  readonly retryable = true;
+  constructor() { super("Fabric actor registry fence is busy"); this.name = "ActorRegistryBusyError"; }
+}
+const registryCustody = new AsyncLocalStorage<ReadonlyMap<string, { token: string; active: boolean }>>();
 
 /** The fence wait expired before custody was acquired. */
 class ActorRegistryLockTimeoutError extends Error {
@@ -445,6 +454,36 @@ export class ActorRegistryStore {
     return acquire(0);
   }
 
+  /** One synchronous zero-wait entry to the SAME adoption/publication fence. No
+   * dead-holder recovery or wait under hot-path custody; withLock still owns recovery.
+   * Nested queue work within the current async fence reuses its verified receipt. */
+  withTryLockSync<T>(operation: () => T): T {
+    const lockPath = `${this.#registryPath}.lock`;
+    const ownerPath = path.join(lockPath, "owner");
+    const inherited = registryCustody.getStore();
+    const held = inherited?.get(this.#registryPath);
+    if (held?.active) {
+      if (!fs.readFileSync(ownerPath, "utf8").startsWith(`${held.token}\n`)) throw new ActorRegistryBusyError();
+      return operation();
+    }
+    const token = randomUUID();
+    const receipt = `${token}\n${process.pid}\n${Date.now()}\n${this.#ownProcessStart ? `${this.#ownProcessStart}\n` : ""}`;
+    fs.mkdirSync(this.#actorRoot, { recursive: true, mode: 0o700 });
+    try { fs.mkdirSync(lockPath, { mode: 0o700 }); }
+    catch (error) { if (errorCode(error) === "EEXIST") throw new ActorRegistryBusyError(); throw error; }
+    const scope = { token, active: true };
+    try {
+      fs.writeFileSync(ownerPath, receipt, { mode: 0o600 });
+      return registryCustody.run(new Map([...(inherited ?? []), [this.#registryPath, scope]]), operation);
+    } finally {
+      scope.active = false;
+      // A live owner is never reclaimed by withLock; retain its exact receipt check.
+      try {
+        if (fs.readFileSync(ownerPath, "utf8") === receipt) fs.rmSync(lockPath, { recursive: true, force: true });
+      } catch { /* Preserve the operation's error; async recovery still owns torn receipts. */ }
+    }
+  }
+
   /** Global order: actor registries (sorted path), then mesh; never the reverse.
    * Retains registry custody while adoption/publication acquires the mesh fence. */
   async withLock<T>(operation: () => T | Promise<T>, timeoutMs = ACTOR_REGISTRY_LOCK_TIMEOUT_MS): Promise<T> {
@@ -501,9 +540,12 @@ export class ActorRegistryStore {
         await delay(10);
       }
     }
+    const scope = { token, active: true };
+    const inherited = registryCustody.getStore();
     try {
-      return await operation();
+      return await registryCustody.run(new Map([...(inherited ?? []), [this.#registryPath, scope]]), operation);
     } finally {
+      scope.active = false;
       try {
         const owner = fs.readFileSync(ownerPath, "utf8");
         if (owner.startsWith(`${token}\n`)) {

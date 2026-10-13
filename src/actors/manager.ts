@@ -9,7 +9,7 @@ import { readPiSessionHeader } from "../core/pi-session-header.js";
 import { ActorMeshMonitor } from "./mesh-monitor.js";
 import { ActorSessionResetCancelledError } from "./session-reset-error.js";
 import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from "../core/atomic-write.js";
-import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
+import { prepareParticipantFileLock, readParticipantFile, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { isMeshLockTimeout } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
@@ -70,7 +70,7 @@ import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
 import { evaluateActorValidWhile, validateActorValidWhile } from "./predicate.js";
 import { ActorRecords, normalizeActorRecords, type FabricActorRecordsOptions } from "./records.js";
 import { ActorBindingStore } from "./binding-store.js";
-import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
+import { ActorRegistryBusyError, ActorRegistryStore, ActorRegistryUpdateVetoedError } from "./registry-store.js";
 import { observeActorOwnership, ownershipPointReads } from "../topology/publication-generation.js";
 import { withStateFence } from "../mesh/commit-outbox.js";
 import { writeJsonAtomic, syncPathNamespace, syncDirectoryChain } from "../core/atomic-write.js";
@@ -450,6 +450,16 @@ export class ActorRegistryOwnershipError extends Error {
   }
 }
 
+/** A changed owner/revision receipt cannot authorize a stale writer; acquisition must decide afresh. */
+export class ActorQueueCustodyLostError extends Error {
+  readonly code = "FABRIC_ACTOR_QUEUE_CUSTODY_LOST";
+  readonly retryable = false;
+  constructor(readonly actorId: string) {
+    super(`Actor ${actorId} queue custody changed; persistence refused`);
+    this.name = "ActorQueueCustodyLostError";
+  }
+}
+
 /** A routed event did not reach the receiver's persisted queue; the cursor must keep it (#816). */
 export class ActorQueueCheckpointError extends Error {
   constructor(actor: { id: string; name: string }) {
@@ -651,6 +661,9 @@ export class ActorManager {
   readonly #ownQueueRead = new Set<string>();
   // One refusal notice per actor instance, without retaining removed actor ids forever.
   readonly #queuePersistenceRefused = new WeakSet<ManagedActor>();
+  readonly #queueRevisions = new Map<string, string>();
+  readonly #queueOwnerGenerations = new Map<string, string>();
+  readonly #queueReadReceipts = new WeakMap<ManagedActor, string>();
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
@@ -721,7 +734,7 @@ export class ActorManager {
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #childCompletionWatches = new Map<string, ActorChildCompletionWatch>();
   readonly #childCompletionWatchCloses = new Map<string, Promise<void>>();
-  readonly #childCompletionRetries = new Map<string, { failures: number; timer?: NodeJS.Timeout | undefined }>();
+  readonly #childCompletionRetries = new Map<string, { failures: number; persist?: boolean; timer?: NodeJS.Timeout | undefined }>();
   readonly #acquireCapabilityView:
     | ((
         requirements: readonly FabricCapabilityRequirement[],
@@ -912,6 +925,8 @@ export class ActorManager {
     this.#actorScope = options.actorScope ?? meshConfig.actorScope;
     this.#persistent = options.persistent ?? false;
     this.#releasePaused = options.releasePaused ?? false;
+    // Initial queue acquisition can already owe a pending-work retry.
+    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#closeGraceMs = Math.max(0, options.closeGraceMs ?? 30_000);
     this.#maxSessionBytes = Math.max(0, options.maxSessionBytes ?? DEFAULT_FABRIC_CONFIG.actors.maxSessionBytes);
     this.#transientBlockCooldownMs = finitePositive(options.transientBlockCooldownMs)
@@ -999,7 +1014,6 @@ export class ActorManager {
     this.#presenceRetryMs = options.presenceRetryMs ?? PRESENCE_RETRY_MS;
     this.#meshOutageAlarmMs = options.meshOutageAlarmMs;
     this.#preparationTimeoutMs = Math.max(1, options.preparationTimeoutMs ?? ACTOR_PREPARATION_TIMEOUT_MS);
-    this.#preparationRetryMs = Math.max(1, options.preparationRetryMs ?? 5_000);
     this.#removalRetryMs = options.removalRetryMs ?? REMOVAL_RETRY_MS;
     // Presence entries this runtime wrote for actors it no longer knows (a remove whose
     // delete never landed) are orphans: reap them once at start.
@@ -1213,6 +1227,7 @@ export class ActorManager {
     this.#actors.set(id, actor);
     this.#locallyCreated.add(id);
     this.#ownQueueRead.add(id);                                 // a new actor has no queue file
+    this.#queueRevisions.set(this.#ownQueueFile(actor), "absent");
     this.#ownership.set(id, true);
     await this.#publishPresence(actor);
     await this.#publishNotification({
@@ -3004,6 +3019,13 @@ export class ActorManager {
         await this.#saveActors(new Set([actor.id]), { removedLineages: new Map([[actor.id, this.#lineage(actor)]]) });
         if (!this.#registryRevoked(actor.id)) throw new Error(`Fabric actor ${actor.id}: registry revocation did not commit`);
         this.#records.delete(actor.id);
+        const retry = this.#childCompletionRetries.get(actor.id);
+        if (retry?.timer) clearTimeout(retry.timer);
+        this.#childCompletionRetries.delete(actor.id);
+        this.#queueOwnerGenerations.delete(actor.id);
+        for (const file of this.#queueRevisions.keys()) {
+          if (path.dirname(file) === path.dirname(actor.sessionFile)) this.#queueRevisions.delete(file);
+        }
       } catch (error) {
         // Not revoked: retain the actor and any accepted-removal marker for a later attempt.
         if (!this.#actors.has(actor.id)) this.#actors.set(actor.id, actor);
@@ -3197,8 +3219,10 @@ export class ActorManager {
     const store = this.#childCompletionStores.get(actor.sessionFile);
     this.#childCompletionStores.delete(actor.sessionFile);
     const retry = this.#childCompletionRetries.get(actor.id);
-    if (retry?.timer) clearTimeout(retry.timer);
-    this.#childCompletionRetries.delete(actor.id);
+    if (!retry?.persist) {
+      if (retry?.timer) clearTimeout(retry.timer);
+      this.#childCompletionRetries.delete(actor.id);
+    }
     const directory = store?.directory ?? path.join(path.dirname(actor.sessionFile), "child-completions");
     const closing = this.#childCompletionWatchCloses.get(directory);
     if (closing) return closing;
@@ -3297,14 +3321,32 @@ export class ActorManager {
 
   /** Failed pending work owes one bounded retry, not an idle poll. Every retry re-enters
    * the monitor's ownership/admission gates before its fresh claim and durable queue write. */
-  #retryChildCompletions(actorId: string): void {
-    if (this.#closing) return;
-    const retry = this.#childCompletionRetries.get(actorId) ?? { failures: 0 };
+  #retryChildCompletions(actorId: string, persist = false): void {
+    if (this.#closing || (this.#actors.get(actorId) && this.#queuePersistenceRefused.has(this.#actors.get(actorId)!))) return;
+    const retry = this.#childCompletionRetries.get(actorId) ?? { failures: 0, persist: false };
+    retry.persist ||= persist;
     if (retry.timer) return;
     retry.failures++;
     retry.timer = setTimeout(() => {
       retry.timer = undefined;
-      if (!this.#closing) this.#meshMonitor.schedule();
+      if (!this.#closing) {
+        const actor = this.#actors.get(actorId);
+        if (actor && !this.#ownQueueRead.has(actorId)) {
+          const file = this.#ownQueueFile(actor);
+          const saved = this.#readQueue(file, actor);
+          if (this.#queueReadReceipts.get(actor) === file) {
+            this.#ownQueueRead.add(actorId);
+            this.#restoreQueue(actor, saved, false);
+            this.#seedDeadLetterDeliveries(actor);
+            this.#takeOverPredecessors(actor);
+            this.#scheduleRestoreParked();
+          }
+        }
+        if (retry.persist && this.#persistQueue(actorId, true) && !retry.timer) {
+          this.#childCompletionRetries.delete(actorId);
+        }
+        this.#meshMonitor.schedule();
+      }
     }, Math.min(300_000, this.#preparationRetryMs * 2 ** Math.min(retry.failures - 1, 10)));
     retry.timer.unref();
     this.#childCompletionRetries.set(actorId, retry);
@@ -6392,8 +6434,11 @@ export class ActorManager {
       if (actor.status === "stopped" || actor.removal) this.#clearSettledWindows(actor.id);
       // Once per process: later a live process's memory, not the file, holds its work.
       if (!this.#ownQueueRead.has(actor.id)) {
+        const file = this.#ownQueueFile(actor);
+        const saved = this.#readQueue(file, actor);
+        if (this.#queueReadReceipts.get(actor) !== file) continue; // busy/unknown: retry acquisition on the next wake
         this.#ownQueueRead.add(actor.id);
-        this.#restoreQueue(actor, this.#readQueue(this.#ownQueueFile(actor)), false);
+        this.#restoreQueue(actor, saved, false);
         this.#seedDeadLetterDeliveries(actor);
         firstLoads.push(actor);
       }
@@ -6456,12 +6501,12 @@ export class ActorManager {
   // - Writer: each lineage (a root and the residency it claims) has its own file per actor, and
   //   only that lineage writes it. An adopter deletes a predecessor's file only after it has
   //   written the merged work to its own. So no host loses or overwrites another's work (F1, F5).
-  // - Content: the lineage's pending items without a caller (mesh and host events) plus the
-  //   running one, rewritten on every change, whatever the ownership: a drop, cancel or finish
-  //   while unowned is recorded too. Ownership only decides what runs, through the parked path.
-  // - Reads: its own file once per process, when the actor first loads; the predecessor files that
-  //   its registry claim names, on adoption and again at that load. A regain reads nothing: memory
-  //   already holds the work, without what was cancelled or finished (F4). An item can run twice
+  // - Content: pending callerless items plus the running one. Every mutation shares the
+  //   registry transfer fence and validates fresh ownership + the last descriptor revision;
+  //   an unowned manager keeps its memory but may not mutate a successor's file (#11234).
+  // - Reads: its own file at first load and fresh ownership acquisition; predecessor files
+  //   named by its registry claim on adoption and load. Acquisition merges accepted successor
+  //   bytes with parked memory under the same fence. An item can run twice
   //   when its process died mid-run; three interrupted launched runs exhaust its budget.
   //   Mere failed host starts do not spend the versioned launch-evidence budget.
   #lineageKey(parts: readonly string[]): string {
@@ -6498,7 +6543,32 @@ export class ActorManager {
   }, cancellationFallback = false): boolean {
     if (!this.#persistent || this.#closing || !this.#ownQueueRead.has(actorId)) return false;
     const actor = this.#actors.get(actorId);
-    if (!actor) return false;
+    if (!actor || this.#queuePersistenceRefused.has(actor)) return false;
+    try {
+      return this.#registry.withTryLockSync(() => this.#persistQueueFenced(actorId, durable, release, transfer, cancellationFallback));
+    } catch (error) {
+      if (error instanceof ActorRegistryBusyError || isMeshLockTimeout(error)) {
+        this.#retryChildCompletions(actorId, true); // existing bounded pending-persistence backoff
+        return false;
+      }
+      if (error instanceof ActorQueueCustodyLostError) {
+        actor.lastError = error.message;
+        if (!this.#queuePersistenceRefused.has(actor)) {
+          this.#queuePersistenceRefused.add(actor);
+          console.warn(`[pi-fabric] actor ${actorId}: queue persistence refused; ${error.message}`);
+        }
+        return false;
+      }
+      if (release) throw error;
+      actor.lastError = errorText(error);
+      return false;
+    }
+  }
+
+  #persistQueueFenced(actorId: string, durable: boolean, release: boolean, transfer: {
+    sourceId: string; window: SettledWindow; pending: NonNullable<SettledWindow["pending"]>; item: ActorQueueItem;
+  } | undefined, cancellationFallback: boolean): boolean {
+    const actor = this.#actors.get(actorId)!;
     // Ordinary pending saves remain soft. Cancellation and predecessor deletion,
     // unlike ordinary admission, require a fresh durable destination receipt.
     durable ||= this.#queueCancellationDirty.has(actorId) || !!this.#takenOver.get(actorId)?.size;
@@ -6527,14 +6597,14 @@ export class ActorManager {
       this.#directoryOwnership = undefined;
       let owned = false;
       try { owned = this.#ownershipDecision(actorId); }
-      catch { /* Unknown ownership cannot authorize a queue mutation. */ }
+      catch (error) { if (isMeshLockTimeout(error)) throw error; /* Unknown authority refuses. */ }
       finally { this.#directoryOwnership = cached; }
-      if (owned) { this.#queuePersistenceRefused.delete(actor); return true; }
-      if (!this.#queuePersistenceRefused.has(actor)) {
-        this.#queuePersistenceRefused.add(actor);
-        console.warn(`[pi-fabric] actor ${actorId}: queue persistence refused; fresh ownership is not confirmed for this manager`);
-      }
-      return false;
+      const generation = this.#queueOwnershipGeneration(actor);
+      const expected = this.#queueOwnerGenerations.get(actorId);
+      if (!owned || (expected !== undefined && expected !== generation) ||
+          this.#queueRevision(file) !== this.#queueRevisions.get(file)) throw new ActorQueueCustodyLostError(actorId);
+      this.#queueOwnerGenerations.set(actorId, generation);
+      return true;
     };
     const cleanHandover = release || this.#releasePaused;
     const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
@@ -6549,6 +6619,7 @@ export class ActorManager {
     // Parsing, a soft save, and a failed post-rename barrier are not durable receipts.
     for (const { window } of savedPendingWindows) window.pendingCheckpointed = false;
     let snapshot: Record<string, unknown> | undefined;
+    let canonicalWrite = false;
     try {
       if (transfer && (!items.includes(transfer.item) ||
           this.#settledWindows.get(actorId)?.get(transfer.sourceId) !== transfer.window ||
@@ -6600,9 +6671,17 @@ export class ActorManager {
         fs.rmSync(file, { force: true });
       } else {
         if (!mayPersistQueue()) return false;
+        canonicalWrite = true;
         writeJsonAtomic(file, snapshot, { durable });
       }
     } catch (error) {
+      if (error instanceof ActorQueueCustodyLostError || error instanceof ActorRegistryBusyError || isMeshLockTimeout(error)) throw error;
+      // A post-rename durability failure wrote OUR exact projection while this
+      // fence excluded every successor. Retain its revision, not a durability ACK,
+      // so the existing fallback/retry can finish its barriers under the same fence.
+      if (canonicalWrite && snapshot && JSON.stringify(this.#readQueue(file)) === JSON.stringify(snapshot)) {
+        this.#rememberQueueRevision(file);
+      }
       if (durable || pendingWindows.length || transfer) actor.lastError = errorText(error);
       if (release) throw error;
       if (cancellationFallback && snapshot) {
@@ -6611,13 +6690,16 @@ export class ActorManager {
           // This marker describes only this snapshot, not a permanent actor disable.
           const cancelled = settledWindows.length === 0 && items.every(item => item.deferredHandoff);
           this.#persistCancellationFence(file, { ...snapshot, ...(cancelled ? { cancelled: true } : {}) });
+          this.#rememberQueueRevision(file);
           return true; // Receipt permits halt acknowledgment; canonical rewrite is STILL dirty.
         } catch (fallbackError) {
+          if (fallbackError instanceof ActorQueueCustodyLostError) throw fallbackError;
           actor.lastError = `${errorText(error)}; cancellation fence failed: ${errorText(fallbackError)}`;
         }
       }
       return false;
     }
+    this.#rememberQueueRevision(file);
     if (durable) {
       for (const { sourceId, window, pending } of savedPendingWindows) {
         if (this.#settledWindows.get(actorId)?.get(sourceId) === window && window.pending === pending) window.pendingCheckpointed = true;
@@ -6628,10 +6710,12 @@ export class ActorManager {
       for (const source of sources ?? []) {
         if (source === file) continue;
         if (!mayPersistQueue()) return false;
+        if (this.#queueRevision(source) !== this.#queueRevisions.get(source)) throw new ActorQueueCustodyLostError(actorId);
         try {
           fs.rmSync(source, { force: true });
           syncDirectoryChain(path.dirname(source));
           sources!.delete(source);
+          this.#queueRevisions.delete(source);
         } catch (error) { actor.lastError = errorText(error); }
       }
       if (!sources?.size) this.#takenOver.delete(actorId);
@@ -6655,12 +6739,14 @@ export class ActorManager {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
     }
+    let writing = false;
     try {
       const receipt = fs.fstatSync(fd);
       const endpoint = fs.lstatSync(file);
       if (!receipt.isFile() || !endpoint.isFile() || endpoint.isSymbolicLink() ||
           receipt.dev !== endpoint.dev || receipt.ino !== endpoint.ino) throw new Error("Cancellation queue receipt is not a bound regular file");
       let offset = 0;
+      writing = true;
       while (offset < bytes.length) {
         const written = fs.writeSync(fd, bytes, offset, bytes.length - offset, offset);
         if (written <= 0) throw new Error("Cancellation queue rewrite made no progress");
@@ -6669,7 +6755,18 @@ export class ActorManager {
       fs.ftruncateSync(fd, bytes.length);
       fs.fsyncSync(fd);
       syncPathNamespace(file, receipt);
-    } finally { fs.closeSync(fd); }
+    } finally {
+      // Even a partial OUR write is a new receipt, not an external replacement.
+      // Never rebase a path that stopped naming this held descriptor.
+      try {
+        if (writing) {
+          const held = fs.fstatSync(fd, { bigint: true });
+          const revision = this.#queueRevision(file);
+          const digest = held.ino === 0n ? `:${createHash("sha256").update(fs.readFileSync(fd)).digest("hex")}` : "";
+          if (revision === `${held.dev}:${held.ino}:${held.size}:${held.mtimeNs}:${held.ctimeNs}${digest}`) this.#queueRevisions.set(file, revision);
+        }
+      } finally { fs.closeSync(fd); }
+    }
   }
 
   #confirmDeliveryOutcomes(): void {
@@ -6781,12 +6878,79 @@ export class ActorManager {
     });
   }
 
-  #readQueue(file: string): unknown {
+  /** Descriptor-bound identity, including in-place changes; absent is a receipt,
+   * unknown/non-regular is not. Queue mutation and acquisition share registry custody. */
+  #queueRevision(file: string): string | undefined {
+    let fd: number | undefined;
+    const revision = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
     try {
-      return JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch {
-      return undefined;                                      // absent, or unreadable for now
-    }
+      const endpoint = fs.lstatSync(file, { bigint: true });
+      if (!endpoint.isFile() || endpoint.isSymbolicLink()) return undefined;
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const held = fs.fstatSync(fd, { bigint: true });
+      const current = fs.lstatSync(file, { bigint: true });
+      if (!held.isFile() || revision(endpoint) !== revision(held) || revision(held) !== revision(current)) return undefined;
+      // Some Windows volumes report inode 0 and coarse timestamps. Equal metadata
+      // there is not a revision receipt; include the exact descriptor bytes.
+      const bytes = held.ino === 0n ? fs.readFileSync(fd) : undefined;
+      if (revision(held) !== revision(fs.fstatSync(fd, { bigint: true })) || revision(held) !== revision(fs.lstatSync(file, { bigint: true }))) return undefined;
+      return revision(held) + (bytes ? `:${createHash("sha256").update(bytes).digest("hex")}` : "");
+    } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+
+  #rememberQueueRevision(file: string): void {
+    const revision = this.#queueRevision(file);
+    if (revision === undefined) throw new Error("Queue mutation has no bound revision receipt");
+    this.#queueRevisions.set(file, revision);
+  }
+
+  #queueOwnershipGeneration(actor: ManagedActor): string {
+    const key = `topology/participants/${createHash("sha256").update(actor.id).digest("hex")}`;
+    const file = readParticipantFile(this.mesh.root, key), shared = this.mesh.get(key, { fresh: true });
+    const remote = shared?.value as { remoteHost?: unknown } | undefined;
+    const chosen = !file ? shared : !shared || remote?.remoteHost !== undefined || file.updatedAt >= shared.updatedAt ? file : shared;
+    const record = chosen?.value as Record<string, unknown> | undefined;
+    const host = typeof record?.ownerHostId === "string" ? this.mesh.get(`topology/hosts/${createHash("sha256").update(record.ownerHostId).digest("hex")}`, { fresh: true })?.value as Record<string, unknown> | undefined : undefined;
+    const row = this.#registry.snapshot().actors.find(row => row.id === actor.id);
+    return JSON.stringify([row?.rootId ?? actor.rootId, row?.residency ?? actor.residency, row?.adoptedAt ?? actor.adoptedAt ?? null,
+      row?.adoptedFrom ?? actor.adoptedFrom ?? [], record?.rootId, record?.ownerHostId, record?.ownerIdentityId,
+      record?.actorOwnershipToken, record?.remoteHost, record?.residency,
+      host?.rootId, (host?.identity as { id?: unknown; kind?: unknown } | undefined)?.id,
+      (host?.identity as { kind?: unknown } | undefined)?.kind, host?.startedAt, host?.incarnationToken, host?.remoteHost]);
+  }
+
+  #readQueue(file: string, actor?: ManagedActor): unknown {
+    if (actor) this.#queueReadReceipts.delete(actor);
+    const read = (): unknown => {
+      if (!actor) {
+        try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; }
+      }
+      let fd: number | undefined, before: string | undefined, parsed: unknown;
+      const stamp = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      try {
+        if (fs.lstatSync(file).isSymbolicLink()) return undefined;
+        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+        const held = fs.fstatSync(fd, { bigint: true });
+        if (!held.isFile()) return undefined;
+        const bytes = fs.readFileSync(fd, "utf8"); // bytes and receipt name the SAME descriptor
+        before = stamp(held) + (held.ino === 0n ? `:${createHash("sha256").update(bytes).digest("hex")}` : "");
+        parsed = JSON.parse(bytes);
+        if (stamp(held) !== stamp(fs.fstatSync(fd, { bigint: true }))) return undefined;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") before = "absent";
+      } finally { if (fd !== undefined) fs.closeSync(fd); }
+      if (before !== undefined && before === this.#queueRevision(file) &&
+          (before === "absent" || (parsed !== null && typeof parsed === "object" && (parsed as { format?: unknown }).format === 1))) {
+        this.#queueRevisions.set(file, before);
+        this.#queueReadReceipts.set(actor, file);
+        this.#queueOwnerGenerations.set(actor.id, this.#queueOwnershipGeneration(actor));
+        this.#queuePersistenceRefused.delete(actor);
+      }
+      return parsed;
+    };
+    try { return actor ? this.#registry.withTryLockSync(read) : read(); }
+    catch (error) { if (error instanceof ActorRegistryBusyError) this.#retryChildCompletions(actor!.id); return undefined; }
   }
 
   // Adoption handoff (review/astra F5 on #79). The registry claim names the predecessor roots
@@ -6803,7 +6967,7 @@ export class ActorManager {
       const file = this.#queueFile(actor.id, rootId, actor.residency);
       if (file === own) continue;
       if (this.#cancelledPredecessors.get(actor.id)?.has(path.basename(file))) continue;
-      const saved = this.#readQueue(file);
+      const saved = this.#readQueue(file, actor);
       if (saved === undefined) continue;
       this.#takenOver.set(actor.id, new Set([...(this.#takenOver.get(actor.id) ?? []), file]));
       this.#restoreQueue(actor, saved, true);
@@ -7465,6 +7629,13 @@ export class ActorManager {
           `Fabric actor ${actor.name} (${actor.id}) ownership moved to another host`);
         if (actor.status !== "stopped") actor.status = "idle";
       } else if (!previous && next) {
+        // Acquisition reads/merges successor bytes under the same fence as its
+        // first write; a stale manager may never simply rebase its write receipt.
+        const file = this.#ownQueueFile(actor);
+        const saved = this.#readQueue(file, actor);
+        if (this.#queueReadReceipts.get(actor) !== file) { this.#ownership.set(actor.id, false); continue; }
+        this.#ownQueueRead.add(actor.id);
+        this.#restoreQueue(actor, saved, false);
         acquired = true;
       }
       if (!next) this.#maybeAdoptOrphan(actor);

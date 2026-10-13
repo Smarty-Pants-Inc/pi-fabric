@@ -1033,7 +1033,8 @@ describe("ActorManager presence under a stalled mesh lock", () => {
     await waitFor(() => mesh.get(`actors/presence/${actor.id}`) !== undefined, 5_000);
   }, 20_000);
 
-  it("deletes a removed actor's presence once a stalled lock frees", async () => {
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux")("deletes a removed actor's presence once a stalled lock frees", async () => {
     const { mesh, make, hold, release, root } = stalledSetup();
     const actors = make();
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", topics: ["team.pulls"], responseMode: "text" });

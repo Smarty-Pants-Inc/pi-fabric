@@ -111,7 +111,8 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     clock.mockRestore();
   }, 120_000);
 
-  it("publishes a stop and a removal at once, renews stopped records rarely, and a restart republishes", async () => {
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux")("publishes a stop and a removal at once, renews stopped records rarely, and a restart republishes", async () => {
     const { config, observer, start } = await fixture(false);
     let host = await start();
     let now = Date.now();

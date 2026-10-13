@@ -956,10 +956,11 @@ export class FabricRuntimeState {
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
       if (meshConfig.enabled && mainAgent.local && predecessor && predecessor.id !== mainAgentId &&
         predecessor.meshRoot === meshRoot && predecessor.cwd === mainAgent.cwd) {
-        await recordMainSuccessor(mesh, predecessor.id, predecessor.sessionId, mainAgentId);
+        // F-01: custody acquisition awaits; recheck liveness inside the critical section before writes.
+        await recordMainSuccessor(mesh, predecessor.id, predecessor.sessionId, mainAgentId, live.current);
       }
       const recordedRotation = meshConfig.enabled && mainAgent.local
-        ? await confirmMainSuccessor(mesh, mainAgentId, sessionFile) : false;
+        ? await confirmMainSuccessor(mesh, mainAgentId, sessionFile, live.current) : false;
       // An in-flight retry may outlive its ctx. Attach only to the latest live binding,
       // never reopen a retired activation during close/reload.
       const activationContext = live.read(ctx => ctx);

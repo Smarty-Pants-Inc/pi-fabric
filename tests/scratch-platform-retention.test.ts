@@ -184,7 +184,9 @@ describe("remaining platform refusals and failed removals are counted and warned
       `if (r.removed) process.exitCode = 3;`,
     ].join("\n")], { encoding: "utf8", timeout: 20_000 });
     expect(child.status).toBe(0);
-    expect(child.stderr).toContain("probe: directory-relative removal needs Linux /proc/self/fd; nothing is deleted x1 (e.g. /nonexistent/scratch-probe)");
+    // Native Windows has no getuid, so the ownership refusal fires before the platform one; the reason is not
+    // what this case proves, only that the first counted warning is written before a natural exit.
+    expect(child.stderr).toMatch(/probe: [^\n]+; nothing is deleted x1 \(e\.g\. \/nonexistent\/scratch-probe\)/);
   });
 
   it("Linux without getuid: scratch is not removed by any path; the skips are counted, one warning (first count)", async () => {

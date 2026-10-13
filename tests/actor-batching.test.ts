@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +22,8 @@ import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topo
 import type { ResidencyClient } from "../src/residency/client.js";
 import { residentHostId, RESIDENT_COMMANDS } from "../src/residency/protocol.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
+import * as wakeText from "../src/actors/wake-text.js";
 
 // #11199: recorded-call proof only. No worker, removal, retention or recursive fixture deletion.
 // Fixtures stay inside the runner's private TMPDIR. Hosted CI owns real-delete regressions.
@@ -414,9 +417,13 @@ describe("round 2 batch failure and recovery interleavings", () => {
     fakeClock();
     const events = [0, 1, 2].map(n => f.send({ ref: `boundary-${n}` }));
     const pending = f.snapshot(actor.id).items;
-    const cost = (item: typeof pending[number]) => Buffer.byteLength(JSON.stringify([{ source: "mesh:fleet.work.batch", payload: item.payload, id: item.id }], null, 2), "utf8") +
-      2 + Buffer.byteLength(JSON.stringify(item.id), "utf8") + 16;
-    const cap = cost(pending[0]!) + cost(pending[1]!);
+    const pair = pending.slice(0, 2);
+    const cap = Buffer.byteLength([
+      ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: pair[0]!.id, batchIds: pair.map(item => item.id) }),
+      "Fabric actor message from mesh:fleet.work.batch:",
+      "Pending events in FIFO order. Process every input once; each retains its own event identity:",
+      JSON.stringify(pair.map(item => ({ source: "mesh:fleet.work.batch", payload: item.payload, id: item.id })), null, 2),
+    ].join("\n\n"), "utf8");
     f.actors.pauseForRelease();
     await f.actors.setBatching(actor.id, { batchMaxBytes: cap });
     await f.close();
@@ -424,10 +431,40 @@ describe("round 2 batch failure and recovery interleavings", () => {
     expect(second.actors.status(actor.id)).toMatchObject({ batchMaxBytes: cap });
     for (let turn = 0; turn < 100 && (!second.runs.length || second.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
     expect(inputs(second.runs[0]!).map(input => input.payload.id)).toEqual(events.slice(0, 2).map(event => event.id));
+    expect(Buffer.byteLength(second.runs[0]!.task, "utf8")).toBe(cap);
     expect(second.actors.status(actor.id).queued).toBe(1);
     await vi.advanceTimersByTimeAsync(W);
     await settled(second.actors, actor.id);
     expect(inputs(second.runs[1]!).map(input => input.payload.id)).toEqual([events[2]!.id]);
+  });
+
+  it("counts the exact activation header and every wake-text label at a near-cap boundary", async () => {
+    const hydrated = (sequence: number): wakeText.ActorWakeText => ({ source: "ingress-receipt", event: "issue_comment", repository: "acme/demo",
+      sequence, body: "😀".repeat(200), truncated: false });
+    vi.spyOn(wakeText, "hydrateWakeText").mockImplementation((_policy, _source, payload) => hydrated((payload as MeshEvent).sequence));
+    const f = await fixture();
+    const actor = await create(f.actors, { activationFilter: [{ id: "unused", kind: ["skip"] }] });
+    fakeClock();
+    const events = [0, 1, 2].map(n => f.send({ ref: `wake-${n}` }));
+    const pair = f.snapshot(actor.id).items.slice(0, 2);
+    const cap = Buffer.byteLength([
+      ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: pair[0]!.id, batchIds: pair.map(item => item.id) }),
+      "Fabric actor message from mesh:fleet.work.batch:",
+      "Pending events in FIFO order. Process every input once; each retains its own event identity:",
+      JSON.stringify(pair.map(item => ({ source: "mesh:fleet.work.batch", payload: item.payload, id: item.id })), null, 2),
+      ...pair.flatMap(item => [`Event ${item.id}:`, wakeText.renderWakeTextBlock(hydrated(item.payload.sequence))]),
+    ].join("\n\n"), "utf8");
+    await f.actors.setBatching(actor.id, { batchMaxBytes: cap });
+    for (let turn = 0; turn < 100 && (!f.runs.length || f.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!).map(input => input.payload.id)).toEqual(events.slice(0, 2).map(event => event.id));
+    expect(Buffer.byteLength(f.runs[0]!.task, "utf8")).toBe(cap);
+    expect(f.runs[0]!.task).toContain(`Event ${pair[0]!.id}:`);
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(inputs(f.runs[1]!).map(input => input.payload.id)).toEqual([events[2]!.id]);
+    expect(Buffer.byteLength(f.runs[1]!.task, "utf8")).toBeLessThan(cap);
   });
 
   it("counts image bytes and runs one oversized event alone, preserving both adjacent events", async () => {
@@ -493,6 +530,134 @@ describe("round 2 batch failure and recovery interleavings", () => {
     const receipts = fs.readdirSync(dir).flatMap(file => fs.readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
     expect(receipts.map(receipt => receipt.eventId)).toEqual(events.map(event => event.id));
     expect(receipts.map(receipt => receipt.outcome)).toEqual(["failed", "delivered"]);
+  });
+
+  it.each([1, 2])("crash after durable FAILED and before in-flight cleanup never delivers the same send (members=%s)", async count => {
+    const first = await fixture();
+    const actor = await create(first.actors, { batchWindowMs: count === 1 ? 0 : W, batchMax: count });
+    first.runStub.mockRejectedValueOnce(new Error("recorded terminal refusal"));
+    let interrupted = "";
+    let queueFile = "";
+    const append = deliveryOutcomes.appendDeliveryOutcome;
+    const receipt = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation((...args) => {
+      append(...args); // FAILED is durably appended, but finishInFlight has not cleared the original yet.
+      if (args[2] === "failed") {
+        queueFile = first.snapshotFile(actor.id);
+        interrupted = fs.readFileSync(queueFile, "utf8");
+      }
+    });
+    fakeClock();
+    const events = Array.from({ length: count }, (_, n) => ({ ...first.event({ ref: `terminal-${n}` }), to: actor.id }));
+    for (const event of events) expect(first.monitor.callbacks.onEvent(event)).toBe(true);
+    await settled(first.actors, actor.id);
+    expect(interrupted).not.toBe("");
+    const saved = JSON.parse(interrupted);
+    expect(saved.items).toHaveLength(count);
+    expect(saved.items.every((item: { terminalFailed?: boolean }) => item.terminalFailed === true)).toBe(true);
+    expect(saved.items.some((item: { outcomeSend?: unknown }) => item.outcomeSend)).toBe(true);
+    await first.close();
+    receipt.mockRestore();
+    fs.writeFileSync(queueFile, interrupted); // Recorded exact crash point; no process or fixture deletion.
+    const second = await fixture(first.root);
+    expect(second.actors.status(actor.id).queued).toBe(0);
+    expect(second.runs).toHaveLength(0);
+    for (const event of events) expect(second.monitor.callbacks.onEvent(event)).toBe("ignored"); // Same cursor receipt, not a new original.
+    expect(second.actors.status(actor.id).queued).toBe(0);
+    await vi.advanceTimersByTimeAsync(W);
+    expect(second.runs).toHaveLength(0);
+    // A different original remains runnable and flushes the retained failure receipt normally.
+    const fresh = { ...second.event({ ref: "new-original" }, "steer"), to: actor.id };
+    expect(second.monitor.callbacks.onEvent(fresh)).toBe(true);
+    await settled(second.actors, actor.id);
+    expect(second.runs).toHaveLength(1);
+    const dir = path.join(second.mesh.root, "delivery-outcomes");
+    const receipts = fs.readdirSync(dir).flatMap(file => fs.readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    for (const event of events) expect(receipts.filter(record => record.eventId === event.id).map(record => record.outcome)).toEqual(["failed"]);
+    expect(receipts.filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
+  });
+
+  it("an undeletable adopted predecessor cannot resurrect an unmarked FAILED send across restarts", async () => {
+    const first = await fixture();
+    const actor = await create(first.actors, { batchWindowMs: 0 });
+    let older = "";
+    first.runStub.mockImplementationOnce(async () => {
+      older = fs.readFileSync(first.snapshotFile(actor.id), "utf8");
+      throw new Error("recorded terminal refusal");
+    });
+    const failed = { ...first.event({ ref: "predecessor-original" }), to: actor.id };
+    expect(first.monitor.callbacks.onEvent(failed)).toBe(true);
+    await settled(first.actors, actor.id);
+    const unmarked = JSON.parse(older);
+    expect(unmarked.items[0].terminalFailed).toBeUndefined();
+    const send = unmarked.items[0].outcomeSend;
+    expect(deliveryOutcomes.hasDeliveryOutcome(first.mesh.root, send, "failed")).toBe(true);
+    expect(deliveryOutcomes.hasDeliveryOutcome(first.mesh.root, { ...send, from: "another-sender" }, "failed")).toBe(false);
+    expect(deliveryOutcomes.hasDeliveryOutcome(first.mesh.root, send, "delivered")).toBe(false);
+    await first.close();
+    const oldRoot = "session:retired";
+    const key = createHash("sha256").update([oldRoot, actor.residency].join("\0")).digest("hex").slice(0, 16);
+    const predecessor = path.join(first.root, "actors", actor.id, `queue-${key}.json`);
+    fs.writeFileSync(predecessor, older);
+    const registryFile = path.join(first.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
+    registry.actors.find((record: { id: string }) => record.id === actor.id).adoptedFrom = [oldRoot];
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    const remove = fs.rmSync;
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (String(file) === predecessor) throw Object.assign(new Error("recorded undeletable predecessor"), { code: "EACCES" });
+      return remove(file, options);
+    }); // No real predecessor deletion; normal private lease release is unchanged.
+    const second = await fixture(first.root);
+    expect(second.actors.status(actor.id).queued).toBe(0);
+    expect(second.runs).toHaveLength(0);
+    expect(second.monitor.callbacks.onEvent(failed)).toBe("ignored");
+    await second.close();
+    expect(fs.existsSync(predecessor)).toBe(true);
+    const third = await fixture(first.root);
+    expect(third.actors.status(actor.id).queued).toBe(0);
+    expect(third.runs).toHaveLength(0);
+    const fresh = { ...third.event({ ref: "unrelated-new-original" }, "steer"), to: actor.id };
+    expect(third.monitor.callbacks.onEvent(fresh)).toBe(true);
+    await settled(third.actors, actor.id);
+    expect(third.runs).toHaveLength(1);
+    const dir = path.join(third.mesh.root, "delivery-outcomes");
+    const receipts = fs.readdirSync(dir).flatMap(file => fs.readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.filter(record => record.eventId === failed.id).map(record => record.outcome)).toEqual(["failed"]);
+    expect(receipts.filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
+  });
+
+  it("never appends FAILED when its terminal fence cannot checkpoint, then flushes it after durable removal", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchWindowMs: 0 });
+    f.runStub.mockRejectedValueOnce(new Error("recorded terminal refusal"));
+    const rename = fs.renameSync;
+    let refusals = 0;
+    const fence = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(destination).includes("queue-") && fs.readFileSync(source, "utf8").includes('"terminalFailed"')) {
+        refusals++;
+        throw Object.assign(new Error("recorded terminal-fence refusal"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    const failed = { ...f.event({ ref: "fence-refused" }), to: actor.id };
+    expect(f.monitor.callbacks.onEvent(failed)).toBe(true);
+    await settled(f.actors, actor.id);
+    fence.mockRestore();
+    expect(refusals).toBeGreaterThan(0);
+    const receiptDir = path.join(f.mesh.root, "delivery-outcomes");
+    expect(fs.existsSync(receiptDir)).toBe(false);
+    const saved = JSON.parse(fs.readFileSync(f.snapshotFile(actor.id), "utf8"));
+    expect(saved.items).toHaveLength(0);
+    expect(saved.pendingDeliveryOutcomes).toMatchObject([{ eventId: failed.id, outcome: "failed" }]);
+    await f.close();
+    const second = await fixture(f.root);
+    expect(second.runs).toHaveLength(0);
+    const fresh = { ...second.event({ ref: "following" }, "steer"), to: actor.id };
+    expect(second.monitor.callbacks.onEvent(fresh)).toBe(true);
+    await settled(second.actors, actor.id);
+    const receipts = fs.readdirSync(receiptDir).flatMap(file => fs.readFileSync(path.join(receiptDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.filter(record => record.eventId === failed.id).map(record => record.outcome)).toEqual(["failed"]);
+    expect(receipts.filter(record => record.eventId === fresh.id).map(record => record.outcome)).toEqual(["delivered"]);
   });
 
   it("a durable close keeps interrupted originals pending instead of recording terminal FAILED", async () => {

@@ -229,8 +229,8 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
  * retention, whose manager is gone. The same facts as #912: the exact ENODEV marker, this run's own process status
  * record, its worker proven gone (pid-reuse safe). Then it settles the run LOST, once, and delivers nothing: a
  * record its manager already made terminal keeps its outcome and gains settledLost; a running one becomes completed
- * with its saved answer (settlement.json receipt for exactly this run) kept in its own status record, or failed
- * with none. The marker goes last, so retention can collect the run. Nothing is deleted here. Undefined keeps the
+ * when its worker saved an answer (a settlement.json receipt for exactly this run), or failed with none. Recovery never
+ * writes answer text into status.json: a saved answer stays only in settlement.json. The marker goes last, so retention can collect the run. Nothing is deleted here. Undefined keeps the
  * veto. Delivery was removed in pi-fabric#1027 review round 1 (principal-data P1): a same-uid worker can rewrite the
  * run's recipient manifest and its exit proof, so no answer recovered here may cross to another session.
  */
@@ -243,12 +243,12 @@ export const recoverEnodevTaskRun = (directory: string): "lost" | undefined => {
   const record = readJson(statusFile);
   if (!record || record.id !== id || record.transport !== "process" || record.actorId !== undefined) return undefined;
   if (!enodevWorkerGone(record)) return undefined;
-  const text = savedEnodevAnswer(directory);
-  const run: EnodevRun = { id, statusFile, record, activationId: "", ...(text === undefined ? {} : { text }) };
+  const saved = savedEnodevAnswer(directory) !== undefined;
   const terminal = record.status !== "running" && record.status !== "queued";
-  settle(directory, run, terminal ? { settledLost: true } : text === undefined
+  // settle() writes the record plus these fields only: no answer text is added (or removed).
+  settle(directory, { id, statusFile, record, activationId: "" }, terminal ? { settledLost: true } : !saved
     ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
-    : { status: "completed", settledLost: true, text });
+    : { status: "completed", settledLost: true });
   return "lost";
 };
 

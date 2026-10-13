@@ -87,7 +87,10 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     const directory = runDir(tempRoot(), meshRoot, "a".repeat(32), { recipient: other });
     expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
-    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true, text: "the saved answer" });
+    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true });
+    // Recovery never writes answer text into status.json: the saved answer stays only in settlement.json.
+    expect("text" in status(directory)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "settlement.json"), "utf8")).text).toBe("the saved answer");
     expect(status(directory).enodevDelivered).toBeUndefined();
     expect(journal(meshRoot)).toEqual([]);
     expect(pendingCompletions(meshRoot, meshRoot)).toHaveLength(0);
@@ -105,6 +108,7 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
     expect(status(directory)).toMatchObject({ status: "failed", settledLost: true });
+    expect("text" in status(directory)).toBe(false);
     expect(journal(meshRoot)).toEqual([]);
   });
 
@@ -139,9 +143,11 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     const stopped = runDir(tempRoot(), meshRoot, "5".repeat(32), { status: "stopped", settlement: null });
     expect(recoverEnodevTaskRun(stopped)).toBe("lost");
     expect(status(stopped)).toMatchObject({ status: "stopped", settledLost: true });
+    expect("text" in status(stopped)).toBe(false);
     expect(vetoed(stopped)).toBe(false);
     const completed = runDir(tempRoot(), meshRoot, "6".repeat(32), { status: "completed", text: "the manager's text" });
     expect(recoverEnodevTaskRun(completed)).toBe("lost");
+    // A record that already has text keeps it unchanged (not replaced by the saved answer).
     expect(status(completed)).toMatchObject({ status: "completed", text: "the manager's text", settledLost: true });
     expect(journal(meshRoot)).toEqual([]);
   });
@@ -206,7 +212,8 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     // Recovery alone first (what the sweep runs before its safety walk): settled lost, once.
     expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
-    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true, text: "SCRATCH ANSWER" });
+    expect(status(directory)).toMatchObject({ status: "completed", settledLost: true });
+    expect("text" in status(directory)).toBe(false);
     expect(recoverEnodevTaskRun(directory)).toBeUndefined();
     // The spawner's Main drains its journal: nothing arrives.
     const mesh = new MeshStore(meshRoot, 65536, 1000);

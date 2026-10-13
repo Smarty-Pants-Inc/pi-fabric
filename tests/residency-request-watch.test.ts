@@ -4,6 +4,8 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { ActorDirectory } from "../src/actors/directory.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 import { ResidentHost } from "../src/residency/host.js";
@@ -66,8 +68,16 @@ const fixture = (agents: Partial<ResidentHostConfig["agents"]> = {}) => {
 };
 
 const intervals = () => {
+  const real = globalThis.setInterval;
   const spy = vi.spyOn(globalThis, "setInterval");
-  return { spy, periods: () => spy.mock.calls.map(call => call[1]) };
+  const host: unknown[] = [];
+  spy.mockImplementation(((handler: () => void, ms?: number) => {
+    // Intervals created directly by src/residency/host.ts (the first non-test frame).
+    const frames = (new Error().stack ?? "").split("\n").slice(2);
+    if (frames[0]?.includes(`residency${path.sep}host.ts`) || frames[0]?.includes("residency/host.ts")) host.push(ms);
+    return (real as (handler: () => void, ms?: number) => NodeJS.Timeout)(handler, ms);
+  }) as unknown as typeof setInterval);
+  return { spy, periods: () => spy.mock.calls.map(call => call[1]), hostPeriods: () => [...host] };
 };
 
 describe("resident request watch (smarty-dev#11107)", () => {
@@ -78,13 +88,37 @@ describe("resident request watch (smarty-dev#11107)", () => {
     const started = performance.now();
     request("watch-one");
     expect(await waitUntil(() => responded(["watch-one"]))).toBe(true);
-    expect(performance.now() - started).toBeLessThan(2_000); // far below the 5 s safety tick
-    // Host-owned intervals: the 5 s safety tick and the stuck-preparing check. Other components'
-    // own cadences are not this host's; none of them is the removed 50/100 ms request/maintenance tick.
-    expect(timers.periods()).toContain(5_000);
-    expect(timers.periods()).toContain(10_000);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    // smarty-dev#11107 (#11172): the host owns no standing interval at all: no 5 s safety tick,
+    // no 10 s stuck check, no 50/100 ms request/maintenance tick. Other components' own cadences
+    // are not this host's.
+    // (The participant directory's own 5 s lease heartbeat is not a host sample.)
+    expect(timers.hostPeriods()).toEqual([]);
+    expect(timers.periods()).not.toContain(10_000);
     expect(timers.periods()).not.toContain(50);
     expect(timers.periods()).not.toContain(100);
+  });
+
+  it("drains on the client request-nudge file alone when the requests/ watch misses the write", async () => {
+    const { host, request, responded, config } = fixture();
+    // The requests/ watch is healthy but silent (a lost native event); every other watch is real.
+    const watch = fs.watch;
+    vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target) === path.join(config.residencyRoot, "requests")) {
+        const silent = new EventEmitter() as fs.FSWatcher;
+        silent.close = () => { silent.emit("close"); };
+        return silent;
+      }
+      return (watch as (...args: unknown[]) => fs.FSWatcher)(target, ...rest);
+    }) as typeof fs.watch);
+    await host.start();
+    await sleep(100); // startup drain done
+    request("nudge-only");
+    await sleep(300);
+    expect(responded(["nudge-only"])).toBe(false); // no poll stands in for the lost event
+    // The nudge the client writes after its atomic request write drains it.
+    fs.writeFileSync(path.join(config.residencyRoot, "request-nudge"), "nudge-only");
+    expect(await waitUntil(() => responded(["nudge-only"]))).toBe(true);
   });
 
   it("drains the startup backlog explicitly and a burst larger than one 32-entry batch", async () => {
@@ -181,7 +215,7 @@ describe("resident request watch (smarty-dev#11107)", () => {
     expect(await waitUntil(() => pending() === 0, 4_000)).toBe(true);
   });
 
-  it("falls back to the 50 ms poll, with one warning, when fs.watch throws for requests/", async () => {
+  it("re-arms a throwing requests/ watch by bounded one-shot backoff, with one warning and no 50 ms poll", async () => {
     const watch = fs.watch;
     vi.spyOn(fs, "watch").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
       if (String(target).endsWith(`${path.sep}requests`)) throw Object.assign(new Error("watch unavailable"), { code: "ENOSPC" });
@@ -191,22 +225,23 @@ describe("resident request watch (smarty-dev#11107)", () => {
     const timers = intervals();
     const { host, request, responded } = fixture();
     await host.start();
-    expect(timers.periods()).toContain(50);
+    expect(timers.periods()).not.toContain(50);
     request("fallback");
     expect(await waitUntil(() => responded(["fallback"]))).toBe(true);
-    expect(warn.mock.calls.filter(([line]) => String(line).includes("resident request watch unavailable"))).toHaveLength(1);
-    // The 20 Hz fallback nudges requests only: no delivery-outbox flush rides on it.
-    // An outbox item written behind the host's back (no enqueue/write event) stays until the safety tick.
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("resident request watch failed"))).toHaveLength(1);
+    // The re-arm rescans requests only: no delivery-outbox flush rides on it, and no standing
+    // tick flushes an outbox item written behind the host's back (no enqueue/write event).
+    const deadlines = safety.deadlines().length;
     const outbox = path.join(host.config.residencyRoot, "delivery-outbox");
     fs.mkdirSync(outbox, { recursive: true });
     const id = "00000000-0000-4000-8000-000000000001";
     fs.writeFileSync(path.join(outbox, `${id}.json`), JSON.stringify({ format: RESIDENT_HOST_FORMAT, id,
       rootId: host.config.rootId, from: { id: "agent-x", name: "x", kind: "agent" }, delivery: "followUp", triggerTurn: false,
       message: "m", createdAt: Date.now() }));
-    await sleep(300); // ~6 fallback ticks
+    await sleep(300);
     expect(fs.existsSync(path.join(outbox, `${id}.json`))).toBe(true);
-    await safety.tick();
-    expect(await waitUntil(() => !fs.existsSync(path.join(outbox, `${id}.json`)))).toBe(true);
+    // Backoff re-arms are doubling one-shots, not a period: few in 300 ms.
+    expect(safety.deadlines().length - deadlines).toBeLessThanOrEqual(3);
   });
 
   it("falls back once on a watcher error event and close joins the native watcher close", async () => {
@@ -225,7 +260,7 @@ describe("resident request watch (smarty-dev#11107)", () => {
     watcher!.emit("error", new Error("watcher died again"));
     request("after-error");
     expect(await waitUntil(() => responded(["after-error"]))).toBe(true);
-    expect(warn.mock.calls.filter(([line]) => String(line).includes("resident request watch unavailable"))).toHaveLength(1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("resident request watch failed"))).toHaveLength(1);
     await host.close(); // must not hang on an already-closed handle
   });
 
@@ -314,41 +349,67 @@ describe("resident request watch (smarty-dev#11107)", () => {
     expect(closed).toBe(true);
   });
 
-  it.each([true, false])("an idle safety tick that is not due does no reference scan, config stat or actor listing (retention v2: %s)", async (retentionV2) => {
+  it.each([true, false])("a maintenance deadline that is not due does no reference scan, config stat or actor listing (retention v2: %s)", async (retentionV2) => {
     platform.retentionV2 = retentionV2;
     const { host, config } = fixture();
     await host.start();
     await safety.tick();
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    // The jumped clock outruns this host's real-time participant lease renewal; consumption itself is
+    // not under test here.
+    vi.spyOn(host.participants, "canConsumeMesh").mockReturnValue(true);
     const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
     const sweep = vi.spyOn(ResidentRequestRetention.prototype, "sweep");
     const references = vi.spyOn(host.agents, "retentionReferences");
     const listOwned = vi.spyOn(host.actors, "listOwned");
     const stat = vi.spyOn(fs, "statSync");
     const configStats = () => stat.mock.calls.filter(([target]) => String(target) === path.join(config.residencyRoot, "config.json")).length;
-    // Retention-changing events (agent settlement, actor removal) wake maintenance; not due, it is a no-op.
-    for (let index = 0; index < 5; index++) await safety.tick();
+    // Five real retention due datetimes (one sample interval apart) that find nothing due: no-ops.
+    for (let index = 0; index < 5; index++) { now += 61_000; await safety.tick(); }
     expect(due).toHaveBeenCalled();
     expect(references).not.toHaveBeenCalled();
     expect(sweep).not.toHaveBeenCalled();
     // Maintenance lists owned actors without arguments; presence publication's listOwned(true) is not retention.
     expect(listOwned.mock.calls.filter(call => call.length === 0 || call[0] === undefined)).toHaveLength(0);
-    // The slow tick refreshes the accepted overlay (one cached stat each), never the maintenance path.
+    // Each due datetime refreshes the accepted overlay (one cached stat each), never the maintenance path.
     expect(configStats()).toBeLessThanOrEqual(5);
     due.mockReturnValue(true);
+    now += 61_000;
     await safety.tick();
     expect(references).toHaveBeenCalled();
     expect(sweep).toHaveBeenCalled();
   });
 
-  it("reports stuck preparation on its own threshold timer, not the retention tick", async () => {
+  it("reports stuck preparation at the manager's real episode deadline, with no interval", async () => {
     const timers = intervals();
     const { host } = fixture({ stuckPreparingMs: 300 });
     const due = vi.spyOn(ResidentRequestRetention.prototype, "due").mockReturnValue(false);
+    let episodeAt: number | undefined;
+    const next = vi.spyOn(ActorManager.prototype, "nextStuckPreparingAt").mockImplementation(() => episodeAt);
+    // The host's actors are an ActorDirectory (primary + secondary manager); spy its entry point.
+    const report = vi.spyOn(ActorDirectory.prototype, "reportStuckPreparing").mockImplementation(() => { episodeAt = undefined; return 0; });
+    const actorListeners: Array<() => void> = [];
+    const subscribe = ActorManager.prototype.subscribe;
+    vi.spyOn(ActorManager.prototype, "subscribe").mockImplementation(function (this: ActorManager, listener) {
+      actorListeners.push(listener); return subscribe.call(this, listener);
+    });
     await host.start();
-    const report = vi.spyOn(host.actors, "reportStuckPreparing");
-    expect(timers.periods()).toContain(300);
-    expect(await waitUntil(() => report.mock.calls.length >= 2, 2_000)).toBe(true);
+    expect(timers.periods()).not.toContain(300);
+    expect(timers.periods()).not.toContain(10_000);
+    await sleep(400);
+    expect(report).not.toHaveBeenCalled(); // nothing preparing: no report and no timer
+    expect(next).toHaveBeenCalledWith(300, expect.any(Number));
+    // An actor event (a preparation began) re-arms ONE one-shot at the manager's episode deadline.
+    episodeAt = Date.now() + 200;
+    for (const listener of actorListeners) listener();
+    await sleep(50);
+    expect(report).not.toHaveBeenCalled(); // never early
+    expect(await waitUntil(() => report.mock.calls.length >= 1, 2_000)).toBe(true);
     expect(report.mock.calls[0]![0]).toBe(300);
+    await sleep(400);
+    expect(report).toHaveBeenCalledTimes(1); // the reported episode left the deadline set: no repeat
+    expect(host.actors).toBeInstanceOf(ActorDirectory);
     due.mockRestore();
   });
 });

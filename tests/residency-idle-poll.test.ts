@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
+import { ActorManager } from "../src/actors/manager.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { captureSafetyTick, type SafetyTickCapture } from "./helpers/resident-safety-tick.js";
@@ -99,9 +100,11 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       for (let second = 1; second <= 2; second++) {
         now += 1_000;
         await tick(host);
-        expect(checks.mock.calls.length).toBe(first + second);
+        // smarty-dev#11107: samples are event/deadline driven now; the old once-per-second
+        // rebuild is an upper bound, never once per tick.
+        expect(checks.mock.calls.length).toBeLessThanOrEqual(first + second);
         for (let index = 0; index < 10; index++) await tick(host);
-        expect(checks.mock.calls.length).toBe(first + second);
+        expect(checks.mock.calls.length).toBeLessThanOrEqual(first + second);
       }
       // Ownership stamps may now reuse the listing too; the old once-per-sample cadence
       // is an upper bound, not a requirement to rebuild unchanged ownership.
@@ -187,6 +190,12 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     // Freeze before construction/startup: fence and recovery latency are not idle time.
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     const { root, host } = fixture(() => { idled++; });
+    // smarty-dev#11107: actor ownership changes reach the host as ActorManager events (no tick).
+    const actorListeners: Array<() => void> = [];
+    const subscribe = ActorManager.prototype.subscribe;
+    vi.spyOn(ActorManager.prototype, "subscribe").mockImplementation(function (this: ActorManager, listener) {
+      actorListeners.push(listener); return subscribe.call(this, listener);
+    });
     try {
       await host.start();
       let active = false;
@@ -206,6 +215,7 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       // Truly idle for the whole window again: the host exits.
       active = false;
       now += 1_000;
+      for (const listener of actorListeners) listener(); // the actor left: its event
       await sleep(200); await tick(host); // First confirmed zero-actor sample starts the new window.
       now += 30_100;
       await sleep(200); await tick(host);

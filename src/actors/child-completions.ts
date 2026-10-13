@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
+import fs, { type FSWatcher } from "node:fs";
 import path from "node:path";
 import { syncDirectoryChain, withExclusiveFileLock, writeJsonAtomic } from "../core/atomic-write.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
@@ -17,6 +17,88 @@ export interface ActorChildCompletion {
 }
 const ID = /^[a-f0-9]{32}$/;
 const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-receipt|\.consumed|\.abandon)$/;
+
+// Writer-visible pending work: an envelope, cancellation intent or archive source.
+const WAKE_FILE = /^[a-f0-9]{32}\.(?:json|abandon|source)$/;
+const WATCH_REARM_MS = 500;
+const WATCH_REARM_MAX_MS = 30_000;
+// A closed native handle normally reports `close`; an errored one may never do so.
+const WATCH_CLOSE_GRACE_MS = 1_000;
+
+/**
+ * Edge-only wake for completion writers in other processes. It carries no authority:
+ * the callback only schedules the owner's existing fresh ownership/claim reconcile.
+ * Arm it BEFORE the first empty preflight so a later write cannot fall between them.
+ * A failed watch triggers exactly one rescan and one re-arm on a single one-shot timer
+ * (500 ms doubling, capped at 30 s). There is no standing poll and no attempt cap: a
+ * delivered event proves the watch healthy and resets the backoff, so failures never
+ * accumulate over the owner's lifetime into permanent loss of the wake.
+ */
+export class ActorChildCompletionWatch {
+  #watcher: FSWatcher | undefined;
+  #timer: NodeJS.Timeout | undefined;
+  #failures = 0;
+  #closed = false;
+  // Watchers closed after an error whose native close may still be in flight.
+  readonly #closing = new Set<Promise<void>>();
+  constructor(readonly directory: string, readonly wake: () => void) { this.#arm(); }
+
+  #arm(): void {
+    this.#timer = undefined;
+    if (this.#closed || this.#watcher) return;
+    try {
+      // Create the empty spool once (never recursively: a removed actor stays removed).
+      try { fs.mkdirSync(this.directory, { mode: 0o700 }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const watcher = fs.watch(this.directory, { persistent: false }, (_event, filename) => {
+        if (this.#closed || this.#watcher !== watcher) return;
+        this.#failures = 0; // A delivering watch is healthy: the backoff never exhausts over a lifetime.
+        const name = filename == null ? undefined : path.basename(filename.toString());
+        // A nameless event is a wake, not evidence that nothing changed.
+        if (name === undefined || WAKE_FILE.test(name)) this.wake();
+      });
+      watcher.on("error", () => this.#failed(watcher));
+      this.#watcher = watcher;
+      // Edges may have been missed while unarmed: rescan once after a successful re-arm.
+      if (this.#failures) this.wake();
+    } catch { this.#failed(undefined); }
+  }
+
+  #failed(watcher: FSWatcher | undefined): void {
+    if (this.#closed || (watcher && this.#watcher !== watcher)) return;
+    if (watcher) {
+      this.#watcher = undefined;
+      this.#closing.add(this.#closeHandle(watcher));
+    }
+    this.wake(); // Exactly one rescan per failure.
+    if (this.#timer) return; // One one-shot re-arm at a time.
+    this.#timer = setTimeout(() => this.#arm(), Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_MS * 2 ** Math.min(this.#failures++, 16)));
+    this.#timer.unref();
+  }
+
+  /** Joins the native close; an errored handle that never reports it is released after a bounded grace. */
+  #closeHandle(watcher: FSWatcher): Promise<void> {
+    let settle!: () => void;
+    const closed = new Promise<void>(resolve => { settle = resolve; });
+    const grace = setTimeout(() => settle(), WATCH_CLOSE_GRACE_MS);
+    grace.unref();
+    watcher.once("close", () => { clearTimeout(grace); settle(); });
+    try { watcher.close(); } catch { clearTimeout(grace); settle(); }
+    const done: Promise<void> = closed.then(() => { this.#closing.delete(done); });
+    return done;
+  }
+
+  /** Resolves once every owned native handle has closed (or its bounded grace expired), so custody is not released early. */
+  close(): Promise<void> {
+    this.#closed = true;
+    if (this.#timer) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    const watcher = this.#watcher;
+    this.#watcher = undefined;
+    if (watcher) this.#closing.add(this.#closeHandle(watcher));
+    return Promise.all([...this.#closing]).then(() => undefined);
+  }
+}
 
 /** Offline recovery retries exact actor-addressed archives before a dead root is collected. */
 export const recoverActorRunArchives = (directory: string, expired: () => boolean = () => false, depth = 0): void => {
@@ -296,8 +378,8 @@ export class ActorChildCompletionStore {
   pending(options: { actorId?: string; inFlightRunId?: string } = {}): ActorChildCompletion[] {
     // Most resident polls find an empty spool. Readdir is the observation; do not take the
     // claim lock until an envelope, cancellation intent, or recoverable archive source exists.
-    // A child completion writer still wakes the existing actor settlement/mesh path, so this
-    // fast path never trades prompt delivery for a slow retry cadence.
+    // The owner arms ActorChildCompletionWatch before this preflight; a later writer wakes
+    // the existing actor settlement/mesh path, so an empty scan never waits on a slow cadence.
     if (!this.#hasPendingWork(options)) return [];
     this.recoverArchives(options);
     if (!this.#hasPendingWork(options)) return [];

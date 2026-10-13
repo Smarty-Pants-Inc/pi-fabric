@@ -642,6 +642,9 @@ export interface ParticipantDirectoryOptions {
   reapDeadHosts?: false | { deadAfterMs?: number; sweepMs?: number };
   /** Stall checks share the committed heartbeat; secondary/resident hosts can participate. */
   presencePass?: () => Promise<void>;
+  /** Void, non-throwing notification on a real committed-refresh false -> true
+   * canConsumeMesh edge (not every heartbeat). Never affects the commit receipt. */
+  onCommittedReady?: () => void;
   presencePassMs?: number;
   /** Told once when close() could not withdraw this host's entries (default: console.warn). */
   onWithdrawalFailure?: (message: string) => void;
@@ -1142,8 +1145,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   async #finishRefresh(operation: Promise<number | false>, full: boolean): Promise<void> {
     let lockTimedOut = false;
+    // Pure readiness predicate (no canConsumeMesh side effects); captures the pre-commit state.
+    const consumable = (now: number) => !this.#closed && !this.#quiescing && !this.#superseded && this.#leaseConfirmed &&
+      this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2;
     try {
       const committed = await operation;
+      const wasReady = consumable(Date.now());
       if (!committed || this.#closed) return;
       this.#assertLeaseActive();
       // Fence delayed post-commit/confirmation continuations against a successor.
@@ -1164,6 +1171,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#cancelPublicationRetry();
       this.#publicationRetryDelay = 750;
       this.#routingError = undefined;
+      if (this.options.enabled && this.options.onCommittedReady && !wasReady && consumable(Date.now())) {
+        try { this.options.onCommittedReady(); } catch { /* wake is advisory; never falsify the receipt */ }
+      }
       if (full) {
         this.#sweepDeadHosts();
         if (this.options.enabled && !this.#closed && !this.#quiescing && this.options.presencePass &&

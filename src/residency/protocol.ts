@@ -318,6 +318,13 @@ export const residentActorRoots = (config: ResidentHostConfig): { project: strin
 
 export const isResidentHostId = (id: string): boolean => /^resident:[0-9a-f]{24}$/.test(id);
 
+/** smarty-dev#11107: a second, independent wake path for the resident request drain. After the
+ * atomic request write a client touches this file in the residency root; the host watches that
+ * root and rescans requests/ on it. It carries no authority: admission still reads requests/. */
+export const RESIDENT_REQUEST_NUDGE_FILE = "request-nudge";
+export const residentRequestNudgePath = (residencyRoot: string): string =>
+  path.join(residencyRoot, RESIDENT_REQUEST_NUDGE_FILE);
+
 export const residentRoot = (meshRoot: string, rootId: string): string =>
   path.join(meshRoot, "residency", digest(rootId));
 

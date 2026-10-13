@@ -32,7 +32,7 @@ import type { AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/
 import type { ModelRouteDecision } from "../agents/model-route.js";
 
 import { readJsonlPage } from "../log-tail.js";
-import { ActorChildCompletionStore, ChildCompletionClaimLostError } from "./child-completions.js";
+import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -693,6 +693,8 @@ export class ActorManager {
   readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
   readonly #snapshotActorOwnership: ((fresh?: boolean, actorIds?: readonly string[]) => ReadonlyMap<string, boolean>) | undefined;
   #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
+  /** A poll map's exact requested ids; an id outside them has no opinion there, not "no owner" (fv2-11107 F1). */
+  #directoryOwnershipScope: ReadonlySet<string> | undefined;
   #directoryLineages: Map<string, boolean> | undefined;
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
   // Set while one mesh event is delivered synchronously after a single ownership refresh.
@@ -715,6 +717,7 @@ export class ActorManager {
   // the immediately previous activation; cleanup follows confirmed archival.
   readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
+  readonly #childCompletionWatches = new Map<string, ActorChildCompletionWatch>();
   readonly #acquireCapabilityView:
     | ((
         requirements: readonly FabricCapabilityRequirement[],
@@ -3009,6 +3012,8 @@ export class ActorManager {
 
   /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
   pauseForRelease(): void { this.#releasePaused = true; }
+  /** Neutral wake: re-run the mesh monitor pass only. Changes no custody/gate state. */
+  scheduleMeshWake(): void { this.#meshMonitor.schedule(); }
   resumeAfterRelease(): void {
     this.#releasePaused = false;
     this.#settledRestoreReady = true;
@@ -3068,6 +3073,10 @@ export class ActorManager {
 
   async #close(): Promise<void> {
     this.#meshMonitor.close();
+    // Join native watch closes before any owned file can be released.
+    const watches = [...this.#childCompletionWatches.values()];
+    this.#childCompletionWatches.clear();
+    await Promise.all(watches.map(watch => watch.close()));
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;
     await this.#registrySavePending;
@@ -3207,6 +3216,10 @@ export class ActorManager {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
       this.#flushHandoffConsumption(actor);
       const store = this.#childCompletionStore(actor);
+      // Arm before the preflight; a cross-process write then reuses the monitor's gated poll.
+      if (!this.#childCompletionWatches.has(store.directory)) {
+        this.#childCompletionWatches.set(store.directory, new ActorChildCompletionWatch(store.directory, () => this.#meshMonitor.schedule()));
+      }
       for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
         try {
           const id = result.id;
@@ -4322,6 +4335,34 @@ export class ActorManager {
     // Safety net: an episode whose activation is no longer preparing is closed.
     for (const id of this.#stuckPreparing.keys()) if (!this.#draining.get(id)?.preparing) this.#stuckPreparing.delete(id);
     return sent;
+  }
+
+  /**
+   * smarty-dev#6337: the earliest time at which reportStuckPreparing(thresholdMs) would notice
+   * an episode, from the same eligibility and the same accrued active clock (pre-wait time
+   * kept, admission-permit waits excluded). Returns `now` for an episode already due,
+   * undefined when none can become due without an actor event first: no actor preparing, only
+   * permit waits, every episode already noticed, a paused clock, or not managed here. Every
+   * transition that can change the answer (activation start, waiting, permit admission,
+   * launch, settlement) emits a subscribe() change, so a caller re-arms its one-shot there.
+   * Read-only: it never notifies, closes an episode or advances a clock.
+   */
+  nextStuckPreparingAt(thresholdMs: number, now = Date.now()): number | undefined {
+    if (this.#halted || this.#closing || !(thresholdMs > 0)) return undefined;
+    let earliest: number | undefined;
+    for (const actor of this.#draining.values()) {
+      const preparing = actor.preparing;
+      const episode = this.#stuckPreparing.get(actor.id);
+      // The same eligibility as reportStuckPreparing, so a returned deadline is actionable.
+      if (!preparing || !episode || preparing.phase === "waiting" || actor.status === "stopped" || actor.removal) continue;
+      if (episode.notified || episode.itemId !== this.#inFlight.get(actor.id)?.id || !this.#canManageCached(actor.id)) continue;
+      const remaining = thresholdMs - this.#preparationActiveMs(episode, now);
+      // A paused clock below the threshold cannot become due until it resumes (an event).
+      if (remaining > 0 && episode.activeSince === undefined) continue;
+      const at = remaining > 0 ? now + remaining : now;
+      if (earliest === undefined || at < earliest) earliest = at;
+    }
+    return earliest;
   }
 
   /** smarty-dev#6337 review P2: one activation's preparation clock; a permit wait pauses it. */
@@ -7154,11 +7195,13 @@ export class ActorManager {
   #withOwnershipRead<T>(operation: () => T, fresh = true): T {
     if (this.#directoryOwnership || !this.#snapshotActorOwnership) return operation();
     // fresh=true never names ids, so authority never reaches a host's poll reuse.
-    this.#directoryOwnership = fresh ? this.#snapshotActorOwnership(true)
-      : this.#snapshotActorOwnership(false, [...this.#actors.keys()]);
+    // A nested read keeps the outer map and its scope flag (returned above).
+    const scope = fresh ? undefined : new Set(this.#actors.keys());
+    this.#directoryOwnership = scope ? this.#snapshotActorOwnership(false, [...scope]) : this.#snapshotActorOwnership(true);
+    this.#directoryOwnershipScope = scope;
     this.#directoryLineages = new Map();
     try { return operation(); }
-    finally { this.#directoryOwnership = undefined; this.#directoryLineages = undefined; }
+    finally { this.#directoryOwnership = undefined; this.#directoryOwnershipScope = undefined; this.#directoryLineages = undefined; }
   }
 
   #ownershipDecision(id: string, fresh = true): boolean {
@@ -7169,6 +7212,14 @@ export class ActorManager {
     // It can never authorize the cached predecessor after registry custody moved.
     if (this.#displacedLineages.has(id) ||
       (actor && lineage !== undefined && lineage !== this.#lineage(actor))) return false;
+    // A poll map is scoped to the ids managed when it was installed (fv2-11107 F1): an id outside that
+    // scope (e.g. restored by a nested reload) has no opinion there, not "no owner". Only an exact
+    // fresh read can claim it; unknown or a failed read refuses, never the root/residency fallback.
+    // A requested id the map omits, or a full fresh map's miss, keeps the fallback (legitimate local
+    // creation before its participant record is published).
+    if (this.#directoryOwnership && this.#directoryOwnershipScope && !this.#directoryOwnershipScope.has(id)) {
+      try { return this.#canManageActor?.(id, true) === true; } catch { return false; }
+    }
     const decision = this.#directoryOwnership ? this.#directoryOwnership.get(id)
       : fresh ? this.#canManageActor?.(id) : this.#canManageActor?.(id, false);
 

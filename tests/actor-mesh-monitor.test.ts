@@ -72,7 +72,7 @@ describe("ActorMeshMonitor", () => {
       expect(Date.now() - startedAt).toBeLessThan(100);
       await vi.advanceTimersByTimeAsync(10); // no quiet window between events
     }
-    expect(vi.getTimerCount()).toBe(1); // only the named safety net
+    expect(vi.getTimerCount()).toBe(0); // #11172: no safety-net interval, no trailing timer
     const count = s.mesh.tail.mock.calls.length;
     notify("change", "events.jsonl"); await flush();
     expect(s.mesh.tail).toHaveBeenCalledTimes(count); // duplicate edge, unchanged stamp
@@ -81,17 +81,15 @@ describe("ActorMeshMonitor", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("uses only a >=5 s safety net, with no idle log rereads over 60 s", async () => {
+  it("owns no interval and no timer when idle, with no idle log rereads or sweeps over 60 s", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [], nextOffset: 10 });
     const interval = vi.spyOn(globalThis, "setInterval");
     s.monitor.start(); await flush();
-    expect(interval).toHaveBeenCalledTimes(1);
-    expect(interval.mock.calls[0]![1]).toBe(5_000);
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(s.beforePoll).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(55_001);
-    expect(s.beforePoll).toHaveBeenCalledTimes(13); // startup + 12 recovery sweeps
+    expect(interval).not.toHaveBeenCalled(); // #11172: the 5 s safety net is removed
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.beforePoll).toHaveBeenCalledOnce(); // startup only; no recovery sweeps
     expect(s.mesh.tail).toHaveBeenCalledOnce();
     expect(s.mesh.latestOffset).toHaveBeenCalledOnce(); // no log-derived stamp
   });
@@ -147,7 +145,7 @@ describe("ActorMeshMonitor", () => {
       notify("rename", "registry.json"); await flush();
       expect(s.mesh.tail).toHaveBeenCalledTimes(5);
       expect(fs.watch).toHaveBeenCalledOnce(); // replacing files never detaches a directory watch
-      expect(vi.getTimerCount()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(s.mesh.tail).toHaveBeenCalledTimes(5); // no healthy-watch idle polling
       s.monitor.schedule(); await flush();
@@ -187,23 +185,31 @@ describe("ActorMeshMonitor", () => {
 
   it("does not treat unreadable metadata as an unchanged mesh", async () => {
     const s = setup(); s.monitor.start(); await flush();
+    const notify = vi.mocked(fs.watch).mock.calls[0]!.at(-1) as fs.WatchListener<string>;
     const stat = vi.spyOn(fs, "statSync").mockImplementation(() => { throw new Error("metadata unavailable"); });
     try {
-      await vi.advanceTimersByTimeAsync(10_000);
+      // Each notification rereads: an unreadable stamp is never "unchanged" (no interval needed).
+      notify("change", "events.jsonl"); await flush();
+      notify("change", "events.jsonl"); await flush();
       expect(s.mesh.tail).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(s.mesh.tail).toHaveBeenCalledTimes(3); // and no standing poll
     } finally { stat.mockRestore(); }
   });
 
-  it("retains unread work for safety-net recovery even when the log stamp is unchanged", async () => {
+  it("retains unread work for owner capacity-wake recovery even when the log stamp is unchanged", async () => {
     const s = setup();
     s.mesh.tail.mockReturnValue({ events: [{ topic: "fleet.wait" } as MeshEvent], nextOffset: 20 });
     s.onEvent.mockReturnValue(false);
     s.monitor.start(); await flush();
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
     s.onEvent.mockReturnValue(true);
-    await vi.advanceTimersByTimeAsync(4_999);
+    // #11172: no 5 s safety net; the rejected work stays retained, not lost or rewritten.
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(s.onEvent).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(1);
+    expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(10);
+    // The owner's freed-capacity wake (#refill/queue pop -> schedule()) recovers it at once.
+    s.monitor.schedule(); await flush();
     expect(s.onEvent).toHaveBeenCalledTimes(2);
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8")).cursor).toBe(20);
   });
@@ -285,31 +291,39 @@ describe("ActorMeshMonitor", () => {
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
 
-  it("restores bounded polling only after watcher errors and closes timers and queued work", async () => {
+  it("rescans and re-arms after watcher errors, backs off on one one-shot deadline, and closes timers and queued work", async () => {
     const s = setup();
     s.monitor.start();
     await flush();
+    const count = s.mesh.tail.mock.calls.length;
     s.watcher.emit("error", new Error("watch failed"));
     await flush();
     expect(s.watcher.close).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(1); // replaces, never adds to, the safety timer
-    const count = s.mesh.tail.mock.calls.length;
-    // With a broken watch, even an unchanged stamp must retain the old poll contract.
-    await vi.advanceTimersByTimeAsync(49);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count);
-    await vi.advanceTimersByTimeAsync(1);
+    // First error: immediate re-arm and exactly one rescan, no timer, no interval.
+    expect(fs.watch).toHaveBeenCalledTimes(2);
     expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1);
-    fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(50);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 1); // no fallback polling
+    // A consecutive error with no delivered notification waits one bounded deadline (100 ms).
+    s.watcher.emit("error", new Error("again"));
+    await flush();
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2); // one rescan
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(fs.watch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fs.watch).toHaveBeenCalledTimes(3);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 3); // rescan after re-arm
+    expect(vi.getTimerCount()).toBe(0);
     s.monitor.schedule();
     s.monitor.close();
     s.monitor.close();
     s.watcher.emit("error", new Error("late error"));
     await vi.advanceTimersByTimeAsync(5000);
-    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 2);
+    expect(s.mesh.tail).toHaveBeenCalledTimes(count + 3);
     expect(vi.getTimerCount()).toBe(0);
-    expect(s.watcher.close).toHaveBeenCalledOnce();
+    expect(s.watcher.close).toHaveBeenCalledTimes(3); // two errored handles + the closed one
   });
 
   it("resumes from a saved cursor but skips events older than the replay window", async () => {
@@ -424,22 +438,27 @@ describe("ActorMeshMonitor", () => {
     expect(reads).toBe(1);
   });
 
-  it.each(["unsupported", "ENOENT"])("uses bounded polling when watch creation fails (%s) and ignores malformed cursors", async reason => {
+  it.each(["unsupported", "ENOENT"])("retries the watch on a bounded one-shot deadline when creation fails (%s) and ignores malformed cursors", async reason => {
     const s = setup('{"format":2,"cursor":3}');
+    const interval = vi.spyOn(globalThis, "setInterval");
     vi.mocked(fs.watch).mockImplementation(() => { throw new Error(reason); });
     s.monitor.start();
     s.monitor.start();
     await flush();
     expect(fs.watch).toHaveBeenCalledOnce();
     expect(s.mesh.tail).toHaveBeenCalledExactlyOnceWith(10, 7);
+    // Each re-arm attempt rescans once: deadlines 50, 100, 200 ms (one timer, no interval).
     await vi.advanceTimersByTimeAsync(49);
     expect(s.mesh.tail).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
+    expect(fs.watch).toHaveBeenCalledTimes(2);
     expect(s.mesh.tail).toHaveBeenCalledTimes(2);
     fs.appendFileSync(path.join(s.root, "events.jsonl"), "changed\n");
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fs.watch).toHaveBeenCalledTimes(3);
     expect(s.mesh.tail).toHaveBeenCalledTimes(3);
     expect(vi.getTimerCount()).toBe(1);
+    expect(interval).not.toHaveBeenCalled();
   });
 
   it("idle checkpoints seed once and never rewrite an unchanged cursor", async () => {
@@ -765,7 +784,7 @@ describe("ActorManager idle checkpoints", () => {
       s.reads.mockClear();
       await vi.advanceTimersByTimeAsync(60_000);
       expect(s.reads).not.toHaveBeenCalled();
-      expect(maintenance).toHaveBeenCalledTimes(12);
+      expect(maintenance).not.toHaveBeenCalled(); // #11172: no 5 s maintenance sweep while idle
       expect(s.run).not.toHaveBeenCalled();
       await s.mesh.publish({ topic: "fleet.work.wanted", to: s.actor.id, from: s.from });
       const startedAt = Date.now();

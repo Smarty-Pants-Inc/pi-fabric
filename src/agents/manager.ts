@@ -1414,6 +1414,12 @@ export class AgentManager {
     checkDenyCommands(request.denyCommands);
     const denyCommands = resolveChildDenyCommands(request.denyCommands, readDenyCommands());
     if (denyCommands.length && hostedAdapter) throw new Error(`denyCommands needs a worker runner; ${runnerAdapter.label} is hosted`);
+    // pi-fabric#1034 security P1: the bash guard that enforces the list is a Pi extension. A child without extensions
+    // (extensions: false, so --no-extensions) or on another runner would carry the list but never enforce it: refuse.
+    if (denyCommands.length && (runner !== "pi" || !(request.recursive === true || (request.extensions ?? this.config.extensions)))) {
+      throw new Error(`denyCommands (${denyCommands.join(", ")}) needs a Pi child with extensions enabled: the bash guard that ` +
+        `enforces it is a Pi extension, so ${runner !== "pi" ? `the ${runner} runner` : "extensions: false"} would leave the list unenforced`);
+    }
     const worktreeSetup = request.worktree ? request.worktreeSetup ?? this.config.worktree?.setup : undefined;
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
       throw new Error("worktreeSetup must be a shell command of at most 8192 characters");

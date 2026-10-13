@@ -42,6 +42,14 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(fs.readFileSync(path.join(root, "b.txt"), "utf8")).toBe("B");
   }, 30_000);
 
+  // pi-fabric#1034 Astra P2: every Pi process child's result carries a receipt, empty when nothing was tracked.
+  it("a child that writes nothing and runs no shell gets an empty receipt, not a missing one", async () => {
+    const { manager } = managerIn("child-contract");
+    const result = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false });
+    expect(result.status).toBe("completed");
+    expect(result.writeReceipt).toEqual({ paths: [], commands: [] });
+  }, 30_000);
+
   it("bounds the receipt: a capped number of paths, cut command text, and truncated marked; no contents", async () => {
     // Imported here, so the other cases still run (and fail) on a tree without the module.
     const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_COMMAND_CHARS, WRITE_RECEIPT_MAX_PATHS } = await import("../src/agents/write-receipt.js");
@@ -61,27 +69,53 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
   });
 });
 
+// A child that loads extensions (the bash guard is one): the shape every denyCommands launch must have.
+const EXT = { task: "report", runner: "pi", transport: "process", extensions: true } as const;
+
 describe("denyCommands carried to the child (smarty-dev#8758 item 3)", () => {
   const report = (text: string) => JSON.parse(text) as { denyCommands: string | null };
   it("a child spawned with denyCommands sees PI_FABRIC_DENY_COMMANDS; one spawned without it sees none", async () => {
     const { manager } = managerIn("child-contract");
-    const denied = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, denyCommands: ["sed -i", "git"] });
+    const denied = await manager.run({ ...EXT, denyCommands: ["sed -i", "git"] });
     expect(denied.status).toBe("completed");
     expect(JSON.parse(report(denied.text).denyCommands!)).toEqual(["git", "sed -i"]);
-    const plain = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false });
+    const plain = await manager.run({ ...EXT });
     expect(report(plain.text).denyCommands).toBeNull();
+  }, 30_000);
+
+  // pi-fabric#1034 security P1: the bash guard that enforces the list is a Pi extension; without extensions the list
+  // would be carried but never enforced, so the launch is refused (fail closed), asked or inherited.
+  it("refuses a deny list with extensions: false before launch, asked or inherited", async () => {
+    const { root, manager } = managerIn("child-contract");
+    await expect(manager.run({ ...EXT, extensions: false, denyCommands: ["git"] }))
+      .rejects.toThrow("denyCommands (git) needs a Pi child with extensions enabled");
+    process.env.PI_FABRIC_DENY_COMMANDS = JSON.stringify(["git"]);
+    await expect(manager.run({ ...EXT, extensions: false })).rejects.toThrow("would leave the list unenforced");
+    // Nothing was launched: no run directory exists.
+    expect(fs.existsSync(path.join(root, "runs")) ? fs.readdirSync(path.join(root, "runs")).filter(name => /^[a-f0-9]{32}$/.test(name)) : []).toEqual([]);
+    // Without a list, extensions: false still launches.
+    delete process.env.PI_FABRIC_DENY_COMMANDS;
+    expect((await manager.run({ ...EXT, extensions: false })).status).toBe("completed");
+  }, 30_000);
+
+  // pi-fabric#1034 (both reviews): only an unset variable means no list; a present empty one is malformed.
+  it("a present but empty PI_FABRIC_DENY_COMMANDS is refused, not read as no list", async () => {
+    process.env.PI_FABRIC_DENY_COMMANDS = "";
+    const { manager } = managerIn("child-contract");
+    await expect(manager.run({ ...EXT })).rejects.toThrow("PI_FABRIC_DENY_COMMANDS is present but empty");
+    await expect(manager.run({ ...EXT, denyCommands: ["git"] })).rejects.toThrow("present but empty");
   }, 30_000);
 
   it("a confined caller cannot drop or shorten its list; omitting it inherits, and adding to it is allowed", async () => {
     process.env.PI_FABRIC_DENY_COMMANDS = JSON.stringify(["git"]);
     const { manager } = managerIn("child-contract");
-    await expect(manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, denyCommands: [] }))
+    await expect(manager.run({ ...EXT, denyCommands: [] }))
       .rejects.toThrow("cannot launch a child without its denied commands: git");
-    await expect(manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, denyCommands: ["rm"] }))
+    await expect(manager.run({ ...EXT, denyCommands: ["rm"] }))
       .rejects.toThrow("cannot launch a child without its denied commands: git");
-    const inherited = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false });
+    const inherited = await manager.run({ ...EXT });
     expect(JSON.parse(report(inherited.text).denyCommands!)).toEqual(["git"]);
-    const widened = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, denyCommands: ["git", "rm"] });
+    const widened = await manager.run({ ...EXT, denyCommands: ["git", "rm"] });
     expect(JSON.parse(report(widened.text).denyCommands!)).toEqual(["git", "rm"]);
   }, 30_000);
 

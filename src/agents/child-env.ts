@@ -51,9 +51,13 @@ export const checkDenyCommands = (value: unknown): void => {
   }
 };
 
-/** This process's inherited list; unreadable text fails closed to an error, never to "no denies". */
+/**
+ * This process's inherited list; unreadable text fails closed to an error, never to "no denies". Only an unset
+ * variable means no list: the worker never sets it empty, so a present empty value is malformed (pi-fabric#1034).
+ */
 export const readDenyCommands = (raw = process.env[DENY_COMMANDS_ENV]): string[] => {
-  if (raw === undefined || raw === "") return [];
+  if (raw === undefined) return [];
+  if (raw === "") throw new Error(`${DENY_COMMANDS_ENV} is present but empty`);
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error(`${DENY_COMMANDS_ENV} is not valid JSON`); }
   checkDenyCommands(value);

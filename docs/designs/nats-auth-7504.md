@@ -77,7 +77,7 @@ finding. Section 10 has the detail. Docs only: nothing is implemented, tested or
 Basis: Astra round 2, https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6154244752 (five P1s), and
 the lead's decisions on it. Section 11 has the detail. Docs only: nothing is implemented, tested or measured.
 
-- **Partition revocation (P1) ADOPT.** Every user JWT has `exp` at most 1 h after `iat`; the node itself closes a
+- **Partition revocation (P1) ADOPT.** Every user JWT has `exp` at most 1 h after it is signed; the node itself closes a
   connection at `exp` and refuses an expired JWT at connect (nats-server source cited in 11.1), so the bound needs
   no route and no issuer: **1 h**. Live clients renew through a 15 min issuer job; no renewal means fail closed.
   T17 observes a revoked user lose access on a partitioned, client-reachable node. Sections 1.4, 2.4, 11.1.
@@ -214,7 +214,7 @@ with its own allow and deny lists (10.1). So the normal-role deny and the break-
   explicit deny above; their allow entries are open item O-2.
 - **Expiry.** Agent `exp` = 7 days; Fabric's own cutoff at `exp − 1 h` (C6). Maintainer: 2 h migration, 1 h
   compaction. Principal: 90 days. Break-glass: 1 h (10.1). *Amended (11.1, slice 2+):* every user JWT has `exp` at
-  most 1 h after `iat` (agent, principal, maintainer, custodian; break-glass and the SYS-only user stay 1 h, not
+  most 1 h after it is signed (agent, principal, maintainer, custodian; break-glass and the SYS-only user stay 1 h, not
   renewed). Live users renew; Fabric fails closed at `exp − 5 min` without a renewal. This replaces the 7-day,
   90-day and `exp − 1 h` values above. `iat` 60 s in the past; no `nbf`. `SYS` serves only the resolver and the tools, through the SYS-only user
   (10.5): 1 h.
@@ -346,7 +346,8 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 - **G-10** (10.3, 10.4) Every configured node start runs the resolver start check (T16); `revoke` writes resolver
   dirs durably; signing-key rotation follows 10.4 (T15). *Amended (11.4):* the check verifies the signed claim
   record.
-- **G-11** (11.1) Every user JWT has `exp` at most 1 h after `iat`, the issuance ledger and the renewal job run,
+- **G-11** (11.1) Every user JWT has `exp` at most 1 h after it is signed, the issuance ledger, the per-org issuer
+  lock and the renewal job run,
   and clients renew and fail closed (T17, T19). The break-glass approval checks (11.3, T18) pass before any
   break-glass user is minted for a fleet account.
 
@@ -391,12 +392,12 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 | T11 `nats-auth-launch-graph` | cases a-l of 2.2: each gets its stated user or refuses with `FABRIC_MESH_STATE_NATS_NO_CREDS` |
 | T12 `nats-auth-root-lifecycle` | new root (provision, then agent open), migrated root, migration rerun; agent open of a missing stream refuses |
 | T13 `nats-auth-compaction` | agent compaction publishes without purge; the job purges below the snapshot |
-| T14 `nats-auth-custody-leader` | values of 11.2. `STREAM.INFO.KV_FABRIC_CUSTODY`: `allow_direct: false`, no `max_age`, no per-message TTL, configured replicas; `STREAM.INFO.KV_FABRIC_LEASES`: `allow_direct: false`, configured replicas; both stream names are what `@nats-io/kv` creates for the buckets; ownership reads use `$JS.API.STREAM.MSG.GET.KV_FABRIC_CUSTODY`; a custodian CAS write to `$KV.FABRIC_CUSTODY.owner.<agent key>` on a stale revision fails; a lapsed `$KV.FABRIC_LEASES.<host key>` leaves `owner.<agent key>` unchanged; a stream whose subjects overlap `$KV.FABRIC_CUSTODY.>` or a `FABRIC_MESH_<hex>` subject is refused at create; maintainer `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); a `<CUS>` whose replicas, `allow_direct` or expiry differ from the configuration fails to open, no ownership read decides and no owner write is sent, and nothing is lowered; normal maintainer `STREAM.UPDATE` (and `CREATE`) on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); after a `<CUS>` change made while an engine is disconnected, its reconnect recheck refuses (10.1) |
+| T14 `nats-auth-custody-leader` | values of 11.2. `STREAM.INFO.KV_FABRIC_CUSTODY`: `allow_direct: false`, no `max_age`, no per-message TTL, configured replicas; `STREAM.INFO.KV_FABRIC_LEASES`: every field of the 11.2 table (file, configured replicas, history 1, `max_age` and `subject_delete_marker_ttl` = the maximum lease, `allow_msg_ttl: true`, `allow_direct: false`, no mirror or source), and a bucket that differs in any of them fails to open; both stream names are what `@nats-io/kv` creates for the buckets; ownership reads use `$JS.API.STREAM.MSG.GET.KV_FABRIC_CUSTODY`; a custodian CAS write to `$KV.FABRIC_CUSTODY.owner.<agent key>` on a stale revision fails; a lapsed `$KV.FABRIC_LEASES.<host key>` leaves `owner.<agent key>` unchanged; a stream whose subjects overlap `$KV.FABRIC_CUSTODY.>` or a `FABRIC_MESH_<hex>` subject is refused at create; maintainer `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); a `<CUS>` whose replicas, `allow_direct` or expiry differ from the configuration fails to open, no ownership read decides and no owner write is sent, and nothing is lowered; normal maintainer `STREAM.UPDATE` (and `CREATE`) on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); after a `<CUS>` change made while an engine is disconnected, its reconnect recheck refuses (10.1) |
 | T15 `nats-auth-key-rotation` | for each scoped key (agent, principal, maintainer, break-glass): add a new key and mint with it; a user signed by the retiring key still connects until its own `exp` (at most 1 h after slice 2+, 11.1; slice 1's longer defaults run with a short test `exp`); the key is removed only after that, or after its users were reissued and revoked; after removal a user signed by the old key is refused and new-key users are unaffected (10.4) |
-| T16 `nats-auth-revoke-restart` | one node (`{nodes: 1}`): stop, `revoke` a user, start: the node accepts no client until its resolver account JWT hash matches the latest, and the revoked user's connect is refused before any mesh request; a stale or missing resolver JWT keeps the node from accepting clients; fleet configuration: the same check on each of the 3 node starts (10.3). *Amended (11.4)*, in both profiles (`{nodes: 1}` with the local record file; `{nodes: 3}` with the per-node SSH pull from Ryzen 1): a valid record starts the node; a record with a bad signature, another operator or account, `exp` in the past, or a `seq` below the node's highest seen is refused; the issuer unreachable or the record missing: no client listener; `--claim-override --reason` starts only with the newest verified record and its matching resolver file and logs who, when, why and the record's `seq` and age; a record that changes between the two fetches is checked again, three changes fail closed |
-| T17 `nats-auth-partition-expiry` | `{nodes: 3, replicas: 3}`, test lifetime 120 s, renewal every 30 s (the same code with short values). Users U and W connect to node C, X to node A. Cut C's routes (6222) while its client port stays reachable. `revoke U`: `partial`, naming C. Through U's real client on C: before `exp` U still works (the window); at U's `exp` plus clock error, C closes U's connection with `User Authentication Expired`, U's publish to `<B>.state` and its `$JS.API.STREAM.MSG.GET.<B>` fail, a reconnect to C with that JWT is refused, and no renewal for U arrives. Control: W on C also fails closed at its `exp` with `FABRIC_MESH_STATE_NATS_CREDS_EXPIRED` (no renewal crosses the partition); X on A keeps access over 3 renewals; after the routes heal W renews and U stays refused on every node (11.1) |
-| T18 `nats-auth-breakglass-approval` | each case exits 2, mints nothing and consumes no item: no `--approval`; unknown item; item not answered or answered `ignore`; answered by a person other than Paul; answered over 24 h ago; item already consumed; org, stream or config SHA-256 differs (one byte changed in `--config`); `--person` is the approver; no `--audit`; the audit comment is on another issue, by another author, or lacks the item id or the SHA-256. Positive: everything matches: one 1 h user, the item consumed, the mint log has the comment URL; the same item again is refused (11.3) |
-| T19 `nats-auth-renewal` | a renewed JWT has the same `sub`, name, tags and permissions and a later `exp`; a JWT for another key, from a key outside the account, or with other permissions is ignored; the client reconnects once in the last 20 min and continues; with the job stopped, Fabric fails closed at `exp − 5 min` and the node closes at `exp`; a revoked user gets no renewal; a principal's 1Password `jwt` field is updated and its seed field is not touched (11.1) |
+| T16 `nats-auth-revoke-restart` | one node (`{nodes: 1}`): stop, `revoke` a user, start: the node accepts no client until its resolver account JWT hash matches the latest, and the revoked user's connect is refused before any mesh request; a stale or missing resolver JWT keeps the node from accepting clients; fleet configuration: the same check on each of the 3 node starts (10.3). *Amended (11.4)*, in both profiles (`{nodes: 1}` with the local record file; `{nodes: 3}` with the per-node SSH pull from Ryzen 1): a valid record starts the node; a record with a bad signature, another operator or account, `exp` in the past, or a `seq` below the node's highest seen is refused; the issuer unreachable or the record missing: no client listener; `--claim-override --reason` starts only with the newest verified record and its matching resolver file and logs who, when, why and the record's `seq` and age; a record that changes between the two fetches is checked again, three changes fail closed; `--claim-override` without an approval, with an unanswered or mismatched approval (other node, account or seq), or with an already reserved approval is refused and the node starts no listener |
+| T17 `nats-auth-partition-expiry` | `{nodes: 3, replicas: 3}`, test lifetime 120 s, renewal every 30 s (the same code with short values). An R3 stream has no quorum on a minority node (2.4), so the access observed is what the node itself serves: a test-only R1 stream `FABRIC_MESH_<test hex>` placed on node C (bound to U and W by their `mesh:` tag), and `$SYS.REQ.USER.INFO`, which C answers locally. Users U and W connect to node C, X to node A. Cut C's routes (6222) while its client port stays reachable. `revoke U`: `partial`, naming C. Through U's real client on C: before `exp`, U's `USER.INFO`, its publish to that stream's `.state` and its `$JS.API.STREAM.MSG.GET` on it succeed (the window); at U's `exp` plus at most 30 s, C closes U's connection with `User Authentication Expired`, those three calls fail, a reconnect to C with that JWT is refused, and no renewal for U arrives. Control: W on C also fails closed at its `exp` with `FABRIC_MESH_STATE_NATS_CREDS_EXPIRED` (no renewal crosses the partition); X on A keeps access over 3 renewals; after the routes heal W renews and U stays refused on every node (11.1) |
+| T18 `nats-auth-breakglass-approval` | each case exits 2 and mints nothing: no `--approval`; unknown item; item not answered or answered `ignore`; answered by a person other than Paul; answered over 24 h ago; item already reserved; org, stream or config SHA-256 differs (one byte changed in `--config`); mint run from a session whose principal is Paul (a command-line name is ignored); no `--audit`; the audit comment is on another issue, by another author, created before Paul's answer, or lacks the item id or the SHA-256. Two concurrent mints with one item: exactly one mints. A crash injected after the reservation and before the signature: the item stays reserved, no credential exists, a retry is refused. Positive: everything matches: one 1 h user; the mint record holds the comment snapshot (id, author, `created_at`, body SHA-256); after an edit or deletion of that comment the runbook's audit check reports the mismatch (11.3) |
+| T19 `nats-auth-renewal` | a renewed JWT has the same `sub`, name, tags and permissions, a later `iat` and `exp`, and `exp − iat` at most 3660 s; a JWT for another key, from a key outside the account, with other permissions, an older `iat` (a replay of an earlier valid JWT), `exp − iat` over 3660 s (slice 1's 7-day form included), or `exp` over 1 h 90 s ahead is ignored; a `revoke` that runs while the renewal job is signing: no JWT for the revoked key is signed after R, and every JWT signed for it is refused by an up node after the push; the client reconnects once in the last 20 min and continues; with the job stopped, Fabric fails closed at `exp − 5 min` and the node closes at `exp`; a revoked user gets no renewal; a principal's 1Password `jwt` field is updated and its seed field is not touched (11.1) |
 
 ## 7. The reader-proof gap (smarty-dev#9834)
 
@@ -755,9 +756,12 @@ slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switc
 
 ### 11.1 Revocation bound on every node: a 1 h user JWT (Astra P1, partition; C7)
 
-- **Mechanism (NATS built-in).** Every user JWT the issuer signs has `exp` at most 1 h after `iat`: agent,
-  principal, maintainer and custodian (11.2). Break-glass and the SYS-only user were already 1 h and are not renewed.
-  **Bound: 1 h**, plus the node's clock error.
+- **Mechanism (NATS built-in).** Every user JWT the issuer signs has `exp` at most 1 h after the moment it is
+  signed: agent, principal, maintainer and custodian (11.2). Break-glass and the SYS-only user were already 1 h and
+  are not renewed. `iat` is the signing time minus 60 s (1.4; slice 1 `src/mesh/nats-auth.ts:200-201`), so
+  `exp − iat` is at most 3660 s; every bound below counts from the signing time. **Bound: 1 h**, plus the node's
+  clock error. Fleet nodes and the issuer keep clock error at most 30 s (NTP; T5 checks a +30 s skew), so the
+  worst case is 1 h 30 s.
 - **The node enforces it alone.** Read 10-13 20:30Z from nats-server v2.14.7 and nats-io/jwt v2.8.2 (the version in
   that server's `go.mod`):
   - At connect, an expired JWT is refused. `server/auth.go` L885-896 decodes the user JWT and refuses it when
@@ -769,11 +773,15 @@ slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switc
   - Both run on the node. They need no route, no resolver push and no issuer, so a partitioned node applies them.
 - **Revocation and renewal.** An account revocation covers the user JWTs of that key whose `iat` is at or before the
   revocation time (`server/accounts.go` L4008-4019: `seconds >= issuedAt`). A JWT signed later for the same key is
-  not covered. So the issuer never renews a revoked key: `revoke` first removes the user from the issuance ledger,
-  and the renewal job re-signs only ledger users that are not in the account's `revocations`.
+  not covered. So the issuer never signs a JWT for a revoked key, fenced by one lock: every signature of a user JWT
+  (mint, renewal) and every `revoke` run under the issuer's per-org lock (a `flock` on the issuer's ledger file on
+  Ryzen 1). Under that lock, renewal re-reads the ledger and the account's `revocations` immediately before it signs
+  each JWT; `revoke` removes the user, writes a durable tombstone (U key, R) and records the revocation time R
+  before it releases the lock. So every JWT for that key was signed before R (its `iat` is then before R, covered by
+  the revocation) or is never signed. T19 runs the revoke-during-renewal race.
 - **Stated bound.** A user revoked at time R holds at most a JWT signed before R, so its `exp` is at most R + 1 h.
   On every node (up, stopped, or partitioned and still client-reachable), that user's connections close and its
-  connects fail by R + 1 h plus the node's clock error. An up node closes them on the account push, target 5 s (2.4);
+  connects fail by R + 1 h plus the node's clock error (at most 30 s). An up node closes them on the account push, target 5 s (2.4);
   1 h is the worst case.
 - **Refresh path (slice 2+).**
   - The issuer keeps a ledger of live users: public key, role, claims, host, session. Mint adds to it; `revoke` and
@@ -785,7 +793,10 @@ slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switc
   - Each renewing user subscribes only to its own `fabric.auth.renew.{{subject()}}` (1.4). The JWT is not a secret:
     without the seed's signature over the server nonce it authenticates nothing.
   - Fabric keeps a received JWT only if it has its own `sub`, an `iss` among its account's scoped keys, the same
-    name, tags and permissions, and a later `exp`; it drops anything else. The client reads the JWT through a
+    name, tags and permissions, an `iat` later than the JWT it holds, `exp − iat` at most 3660 s, and `exp` at most
+    1 h 90 s after the client's own clock; it drops anything else. An older JWT replayed on the renewal subject, or
+    a long one (slice 1's 7-day and 90-day forms included), is refused. If a reconnect with the new JWT fails
+    authentication, Fabric keeps the previous JWT until its own `exp`. The client reads the JWT through a
     function: nats.js 3.4.0 `jwtAuthenticator(ajwt: string | (() => string), seed)` calls it on every connect and
     reconnect (`@nats-io/nats-core/lib/authenticator.js` L91-97, read in this tree's `node_modules`).
   - The server keeps the old JWT's timer on an open connection. When the connection's JWT has less than 20 min left
@@ -830,7 +841,7 @@ Fleet values (required configuration, 10.6; the code still sets no default):
 | stream | `KV_FABRIC_CUSTODY` | `KV_FABRIC_LEASES` |
 | stream subjects | `$KV.FABRIC_CUSTODY.>` | `$KV.FABRIC_LEASES.>` |
 | data subject | `$KV.FABRIC_CUSTODY.owner.<agent key>`, `<agent key>` = SHA-256 hex of the agent id | `$KV.FABRIC_LEASES.<host key>`, `<host key>` = SHA-256 hex of the host id |
-| configuration | file, replicas from `bus`, no `max_age`, no per-message TTL, `allow_direct: false` (9.2) | file, replicas from `bus`, `allow_msg_ttl: true`, `max_age` = the maximum lease, `allow_direct: false` (prototype) |
+| configuration | file, replicas from `bus`, no `max_age`, no per-message TTL, `allow_direct: false`, no mirror or source (9.2) | as the prototype requires: file, replicas from `bus`, history 1, `max_age` = the maximum lease, `allow_msg_ttl: true`, `subject_delete_marker_ttl` = the maximum lease, `allow_direct: false`, no mirror or source (`docs/nats-kv-leases.md`) |
 
 Per org account. `unverified:` that `@nats-io/kv` 3.4.0 names a bucket's stream `KV_<bucket>`; T14 reads the names.
 
@@ -877,23 +888,33 @@ principals, maintainers and break-glass users write no custody or liveness key (
   whose title starts `PAUL: break-glass <org> <stream> <config sha256>`. It names the exact target: org, stream
   (`KV_FABRIC_CUSTODY` or `KV_FABRIC_LEASES`) and the SHA-256 of the requested stream configuration file. Paul
   answers `accept`. The item id is the approval reference.
-- **Separation of duties.** The minter is the person in `--person` (user name `break-glass/<org>/<person>/<run-id>`,
-  1.1). Mint refuses when the minter is the approver: Paul approves and never mints. The agent or person who opened
-  the item may mint; the approval is Paul's answer.
+- **Separation of duties.** The minter is the Fabric principal of the session that runs mint, read from that
+  session's participant record (owner principal and `session:<id>`), never from a command-line name; the user name
+  `break-glass/<org>/<principal>/<run-id>` (1.1) and the mint record carry it. Mint refuses when that principal is
+  the approver (Paul), so Paul approves and an agent session mints. Residual: on one UID a same-UID process can
+  impersonate another session; that is the accepted same-UID trust domain of 10.2 (smarty-dev#11465), and the
+  approval itself stays Paul's own inbox answer.
 - **Durable audit record.** Before the mint, a comment on the tracking issue the item names (default
   smarty-dev#7504), posted by the fleet write App, with the item id, org, stream, config SHA-256, minter and planned
-  window. Mint takes `--approval <item id> --audit <comment URL> --config <file>` and writes the comment URL into
-  its mint log line (10.1). After runbook step 4 (recheck) the operator posts the `STREAM.INFO` result as a reply
-  on the same issue.
+  window. Mint takes `--approval <item id> --audit <comment URL> --config <file>`. Its append-only mint record (one
+  JSON line per mint, fsynced, in the issuer's state dir) keeps a snapshot of the audit comment: repository, issue,
+  comment id, author, `created_at`, and the SHA-256 of the comment body as read at mint, with the item id, target,
+  config SHA-256, minter and mint time. A later edit or deletion of the comment no longer matches that snapshot,
+  so the audit check of the runbook detects it. After runbook step 4 (recheck) the operator posts the
+  `STREAM.INFO` result as a reply on the same issue.
 - **Mint refuses** (exit 2, nothing signed) unless all of these hold:
   1. The item exists, its recipient is `paul`, it is answered `accept` by Paul (`unverified:` that the inbox
-     records who answered; T18 checks), the answer is under 24 h old, and no earlier mint consumed it (the mint log
-     keeps consumed ids).
+     records who answered; T18 checks), and the answer is under 24 h old.
   2. The item's org, stream and config SHA-256 equal `--org`, the target stream and the SHA-256 of `--config`.
   3. `--person` is not the approver.
   4. `--audit` resolves, through a GitHub REST read with the fleet App, to a comment on the named issue, by the
-     fleet write App, that carries the same item id and SHA-256.
-  Then it mints, marks the item consumed and logs.
+     fleet write App, created after Paul's answer and before this mint, that carries the same item id and SHA-256.
+  5. The approval is reserved atomically before anything is signed: mint creates `consumed/<item id>` in the
+     issuer's state dir with an exclusive create (`O_EXCL`), fsyncs it and its directory, and refuses when it
+     exists. Two concurrent mints cannot both pass. A crash after the reservation leaves the item consumed and no
+     credential (the creds live only in that process's memory, 2.3), so it fails closed and a new approval is
+     needed.
+  Then it signs, writes the mint record and gives the creds to the operator's process.
 - The break-glass permissions (10.1) and the stop, recheck and restart runbook stay; the approval is runbook step 1.
 - These checks are slice 2+. Until they land, no break-glass user is minted for a fleet account (G-11). Test T18.
 
@@ -919,16 +940,21 @@ principals, maintainers and break-glass users write no custody or liveness key (
   the node's last. Such a replay can admit only a user revoked within the last hour, whose JWT 11.1 already
   expires within 1 h.
 - **Issuer unavailable at start: fail closed.** The node starts no client listener. Explicit operator override, for
-  one start: `fabric nats node start --claim-override --reason "<text>"`, run by a person on that node. It starts
-  only with the node's newest verified record (expired allowed) and the resolver file that matches it. It logs who,
-  when, the reason, the record's seq and age to the node journal, and the runbook posts the same on smarty-dev#7504.
+  one start: `fabric nats node start --claim-override --approval <item id> --reason "<text>"`. It needs Paul's
+  approval, checked as in 11.3 (an inbox item `PAUL: claim-override <node> <account> <seq>`, answered `accept` by
+  Paul within 24 h, reserved once with an exclusive create in the node's `claims-seen/` dir). It starts only with the
+  node's newest verified record (expired allowed) and the resolver file that matches it. Before it starts the server
+  it logs the approval, the session principal that ran it, the reason, and the record's seq and age to the node
+  journal; the runbook posts the same on smarty-dev#7504.
   Exposure: users revoked while their current JWT is still valid, at most 1 h (11.1).
 - **Changes during startup.** The wrapper fetches and verifies the record (seq N) and checks the resolver file, then
   fetches again just before it executes `nats-server`. If the seq moved, it repeats the whole check against the new
   record (`revoke` writes the new resolver file into this node's dir first, 10.3). Three moves in a row fail closed.
   A change after `nats-server` starts is the up-node case (2.4): the `$SYS.REQ.CLAIMS.UPDATE` push reaches it, and
   `revoke` waits for its acknowledgement.
-- Slice 2+ (slice 1's embedded single node starts without it; G-10). Test T16, both profiles.
+- Slice 2+, for every start in both profiles (G-10). Slice 1's embedded single node serves only slice 1's test
+  users and is not a T16 profile; from slice 2+, `init --local` and each fleet node start through this check, and
+  T16 tests exactly those starts.
 
 ### 11.5 Open items after Amendment C
 

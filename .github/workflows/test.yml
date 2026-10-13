@@ -280,3 +280,51 @@ jobs:
           path: mesh-lock.json
           if-no-files-found: warn
           retention-days: 14
+
+  idle-wakes:
+    # The idle wake gate (smarty-dev#7978, R-no-polling; docs/idle-wake-gate.md): an idle activated Pi Main and an
+    # idle Fabric resident host, 300 s each in parallel after a 30 s warm-up. Breach: > 1.0 timer wakes/s in total,
+    # or one callsite firing more than once a minute. Report-only while IDLE_WAKE_ENFORCE is 0: set it to 1 to block.
+    # Not a required check. Wall time ~8 min: install + build ~2 min, self-test ~70 s, both modes ~6 min.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IDLE_WAKE_ENFORCE: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Fetch the pinned native toolchain
+        run: node scripts/native-toolchain.mjs fetch
+      - name: Build
+        env:
+          FABRIC_NATIVE_CC_PINNED: "1"
+        run: bun run build
+      - name: Gate self-test
+        run: bunx vitest run tests/idle-wake-gate.test.ts
+      - name: Idle wakes, Main and resident host (300 s each, in parallel)
+        shell: bash
+        run: |
+          # The 24G cap where a user systemd works (a hosted runner has systemd-run but often no user bus).
+          cap=(systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 --)
+          command -v systemd-run > /dev/null && "${cap[@]}" true 2> /dev/null || cap=()
+          status=0
+          for mode in main resident; do
+            "${cap[@]}" node scripts/benchmark-idle-cpu.mjs --mode "$mode" --out "idle-wakes-$mode.json" > "idle-wakes-$mode.log" 2>&1 &
+          done
+          for job in $(jobs -p); do wait "$job" || status=$(( $? > status ? $? : status )); done
+          cat idle-wakes-*.log
+          # 1 is a breach; anything else is a broken gate and always fails.
+          [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && [ "$IDLE_WAKE_ENFORCE" != 1 ]; }
+      - name: Upload idle wake report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: idle-wakes-${{ github.sha }}
+          path: idle-wakes-*
+          if-no-files-found: warn
+          retention-days: 14

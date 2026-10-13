@@ -1,10 +1,11 @@
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { FabricControlPlane, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
+import { CONTROL_CLAIMS_POLICY_KEY, FabricControlPlane, type FabricControlPlaneOptions } from "../src/topology/control-plane.js";
 
 // fv2-7978: the control plane drains on real mesh notifications and its own publishes. Idle has
 // no timer; one-shot timers exist only for retained work, real deadlines and a watcher re-arm.
@@ -47,6 +48,42 @@ describe("control plane idle wakes", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(tail).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
+    await owner.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retained shared claims keep the real sweep deadline without another event (recorded deletes)", async () => {
+    const root = meshRoot();
+    const store = new MeshStore(root, 64 * 1024, 1_000);
+    const start = Date.now();
+    const minute = 60_000;
+    const from = identity("host:other");
+    for (const [commandId, expiresAt] of [["expired", start], ["grace", start + 14 * minute]] as const) {
+      await store.publish({ topic: "fabric.control.command", from, to: "host:other", data: { commandId } });
+      await store.put({ key: `topology/control-seen/${commandId}`, identity: from, value: {
+        format: 1, hostId: "host:other", commandId, targetId: "agent:other", expiresAt, explicitDeadline: true,
+      } });
+    }
+    await store.put({ key: CONTROL_CLAIMS_POLICY_KEY, value: { version: 1, sharedClaims: "expiry" }, identity: from });
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    const owner = plane(root, "host:owner");
+    // Never execute the sweep locally: record its fenced deletion batch.
+    const deletion = vi.spyOn(owner.mesh, "writeBatch").mockResolvedValue([]);
+    const tail = vi.spyOn(owner.mesh, "tail");
+    owner.start(() => ({ accepted: true }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(deletion).not.toHaveBeenCalled();
+    const startupReads = tail.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(15 * minute - 1);
+    expect(tail).toHaveBeenCalledTimes(startupReads);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(deletion).toHaveBeenCalledExactlyOnceWith({ identity: identity("host:owner"), ops: [
+      { kind: "delete", key: "topology/control-seen/expired", ifVersion: 1, onConflict: "skip" },
+    ] }); // the other retained claim is still inside its grace
     await owner.close();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -155,10 +192,19 @@ describe("control plane idle wakes", () => {
     expect(seen).toEqual(["agent:first", "agent:second"]);
   });
 
-  it("settles a request to a dead owner at its real deadline without any event, then keeps no timer", async () => {
+  it("settles a request to a dead owner at its real deadline, retires its withdrawal at the sweep deadline, then keeps no timer", async () => {
     const sender = plane(meshRoot(), "host:sender", { pollMs: 20, acknowledgementTimeoutMs: 100 });
+    await sender.mesh.put({ key: CONTROL_CLAIMS_POLICY_KEY, value: { version: 1, sharedClaims: "expiry" }, identity: sender.identity });
     sender.start(() => ({ accepted: false }));
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    // Recorded retirement only: emulate its state-view result without deleting a source.
+    const retired = new Set<string>();
+    const list = sender.mesh.listAll.bind(sender.mesh);
+    vi.spyOn(sender.mesh, "listAll").mockImplementation((...args) => list(...args).filter((entry) => !retired.has(entry.key)));
+    const deletion = vi.spyOn(sender.mesh, "writeBatch").mockImplementation(async (input) => {
+      for (const op of input.ops) if (op.kind === "delete") retired.add(op.key);
+      return [];
+    });
     const outcome = sender.request("host:dead", "agent:target", "steer", { message: "hi", ownerIncarnation: "fixture:dead" }, "host:dead")
       .then(() => undefined, (error: Error) => error);
     await vi.advanceTimersByTimeAsync(0);
@@ -166,7 +212,11 @@ describe("control plane idle wakes", () => {
     expect(vi.getTimerCount()).toBe(1); // the per-command ACK deadline, nothing else
     await vi.advanceTimersByTimeAsync(400);
     expect((await outcome)?.message).toContain("now withdrawn");
-    await vi.advanceTimersByTimeAsync(0);
+    // Withdrawal leaves a retained shared record: its real cleanup duty remains,
+    // unlike the removed hot poll. Advance Date and timers through that deadline.
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    expect(deletion).toHaveBeenCalledOnce();
+    expect(retired.size).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
   });
 

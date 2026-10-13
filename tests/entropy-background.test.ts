@@ -207,6 +207,10 @@ describe("entropy background scheduler", () => {
     expect(warn).not.toHaveBeenCalled();
     fs.rmSync(lock, { recursive: true });
     await vi.waitFor(async () => expect((await poolStore.loadObservationPoolAsync(harness.agentDir)).file).toBeDefined(), { timeout: 3_000 });
+    // The pool file can be visible before updateObservationPoolAsync returns.
+    // Shutdown between that write and compile aborts the retry (notably Windows).
+    // Observe the retry's compiler before asking shutdown to cancel in-flight work.
+    await vi.waitFor(() => expect(compile).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     await harness.shutdown();
     expect(compile).toHaveBeenCalledTimes(2);
     expect(warn).not.toHaveBeenCalled();

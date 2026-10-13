@@ -99,6 +99,9 @@ const ADOPTED_OWNER_DEADLINE_MS = 60_000;
 // Failed delivery: one bounded one-shot backoff (1 s floor, 60 s cap), no interval.
 const DELIVERY_RETRY_MIN_MS = 1_000;
 const DELIVERY_RETRY_MAX_MS = 60_000;
+// fs.watch may report one atomic journal rename more than once (notably on Windows).
+// One short, non-recurring burst deadline coalesces those hints before reading state.
+const DELIVERY_EVENT_COALESCE_MS = 25;
 // Watcher failure: one rescan, then a bounded number of one-shot re-arms.
 const WATCH_REARM_BASE_MS = 1_000;
 const WATCH_REARM_MAX_MS = 60_000;
@@ -197,6 +200,8 @@ export class ResidencyClient {
   #deliveryDirty = false;
   #deliveryRetry: NodeJS.Timeout | undefined;
   #deliveryFailures = 0;
+  #deliveryEventTimer: NodeJS.Timeout | undefined;
+  #stopStateChanges: (() => void) | undefined;
   readonly #watchers = new Map<string, fs.FSWatcher>();
   // Nearest existing ancestor of a not-yet-created residencyRoot (own key: it may equal meshRoot).
   #rootAncestor: string | undefined;
@@ -269,6 +274,7 @@ export class ResidencyClient {
     // Event-driven: journal/mesh/owner notifications wake delivery and recovery.
     // Arm before the startup catch-up so a write racing it is never lost.
     this.#armWatches();
+    this.#stopStateChanges = this.options.mesh.subscribeStateChanges(() => this.#wakeDelivery());
     // Startup catch-up: one delivery pass and one recovery pass now.
     this.#wakeDelivery();
     this.#wakeWatchdog();
@@ -289,6 +295,10 @@ export class ResidencyClient {
       } catch (error) { this.#deferRelease(error); }
     }
     this.#releaseAbort.abort();
+    this.#stopStateChanges?.();
+    this.#stopStateChanges = undefined;
+    if (this.#deliveryEventTimer) clearTimeout(this.#deliveryEventTimer);
+    this.#deliveryEventTimer = undefined;
     if (this.#deliveryRetry) clearTimeout(this.#deliveryRetry);
     this.#deliveryRetry = undefined;
     if (this.#watchdogTimer) clearTimeout(this.#watchdogTimer);
@@ -1192,6 +1202,16 @@ export class ResidencyClient {
     this.#watchdogDeadline = owner ? this.#ownerDeadline(owner) : this.#nextWatchdogAt;
   }
 
+  /** Coalesce a filesystem notification burst, not recurring delivery work. */
+  #notifyDelivery(): void {
+    if (this.#closed || this.#deliveryEventTimer) return;
+    this.#deliveryEventTimer = setTimeout(() => {
+      this.#deliveryEventTimer = undefined;
+      this.#wakeDelivery();
+    }, DELIVERY_EVENT_COALESCE_MS);
+    this.#deliveryEventTimer.unref();
+  }
+
   /** Delivery wake: coalesced; a wake during an in-flight drain reruns it once. */
   #wakeDelivery(): void {
     if (this.#closed || !this.#started || !this.options.mainAgent.local) return;
@@ -1285,13 +1305,13 @@ export class ResidencyClient {
     const bindings: Array<[string, (name: string | null) => void]> = [
       [meshRoot, (name) => {
         if (name === "agent-completions") this.#armWatches();
-        if (name === null || name === "agent-completions" || MESH_STATE_FILES.has(name)) this.#wakeDelivery();
+        if (name === null || name === "agent-completions" || MESH_STATE_FILES.has(name)) this.#notifyDelivery();
       }],
       [completions, (name) => {
         if (name === "attempts") this.#armWatches();
-        if (name === null || name === "attempts" || name.endsWith(".json")) this.#wakeDelivery();
+        if (name === null || name === "attempts" || name.endsWith(".json")) this.#notifyDelivery();
       }],
-      [path.join(completions, "attempts"), (name) => { if (name === null || name.endsWith(".json")) this.#wakeDelivery(); }],
+      [path.join(completions, "attempts"), (name) => { if (name === null || name.endsWith(".json")) this.#notifyDelivery(); }],
       [residency, (name) => {
         if (name === "delivery-outbox") this.#armWatches();
         if (name === null || OWNER_FILES.has(name)) this.#wakeWatchdog();

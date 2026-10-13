@@ -18,7 +18,13 @@ const setup = () => {
   sender.start(() => ({ accepted: false }));
   const seenRoot = path.join(mesh.root, "control-seen", createHash("sha256").update("owner").digest("hex").slice(0, 32));
   const seen = new MeshStore(seenRoot, 65536, 1000);
-  return { root, owner, sender, mesh, seen, seenRoot, lease: (value: boolean) => { healthy = value; }, close: async () => { await owner.close(); await sender.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); } };
+  return { root, owner, sender, mesh, seen, seenRoot, lease: (value: boolean) => {
+    healthy = value;
+    // A real participant lease renewal publishes state; changing a test boolean
+    // alone cannot wake an event-driven receiver. Keep all fencing assertions.
+    if (value) return mesh.put({ key: "topology/hosts/owner", value: { healthy }, identity });
+    return Promise.resolve();
+  }, close: async () => { await owner.close(); await sender.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); } };
 };
 
 describe("Astra F2 resident control lease fences", () => {

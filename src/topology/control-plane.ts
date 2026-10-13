@@ -488,6 +488,7 @@ export class FabricControlPlane {
   #handler: FabricControlHandler | undefined;
   #seenCleanupAt = 0;
   #legacySeenCleanupAt = Date.now();
+  #legacySeenPending = false;
   /**
    * This host's dedupe records with their outcomes. Only this host reads them, so they live in
    * its own store under the mesh root rather than the shared state that every runtime parses
@@ -1207,7 +1208,7 @@ export class FabricControlPlane {
       }
       // A consumption gate held a wake back: it stays #dirty with no timer. The gate reopens
       // through a presence/lease notification (the watcher wakes a dirty plane) or resume().
-      if (!this.#dirty) this.#scheduleClaimExpiry();
+      if (!this.#dirty) this.#scheduleSeenCleanup();
     } finally {
       this.#draining = false;
     }
@@ -1230,11 +1231,14 @@ export class FabricControlPlane {
     this.#retryTimer.unref();
   }
 
-  /** A retained shared claim's real expiry is the only deadline an idle drained plane keeps;
-   * the drain at that expiry purges it, and with nothing pending no timer remains. */
-  #scheduleClaimExpiry(): void {
-    if (this.#closed || this.#paused || this.#retryTimer || !this.#sharedClaims.size) return;
-    const expiresAt = Math.min(...this.#sharedClaims.values());
+  /** Retained claims keep their expiry and shared-state cleanup duties, not a hot idle poll.
+   * Empty state has no deadline; shared records are swept at the existing 15-minute cadence. */
+  #scheduleSeenCleanup(): void {
+    if (this.#closed || this.#paused || this.#retryTimer) return;
+    const legacyDeadline = this.#legacySeenPending
+      ? this.#legacySeenCleanupAt + LEGACY_SEEN_CLEANUP_MS : Infinity;
+    const expiresAt = Math.min(legacyDeadline, ...this.#sharedClaims.values());
+    if (!Number.isFinite(expiresAt)) return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = undefined;
       this.#wake();
@@ -1686,6 +1690,9 @@ export class FabricControlPlane {
   }
 
   async #cleanupSeen(now: number): Promise<void> {
+    // Read inside the owned drain so a state outage uses its bounded retry, not
+    // an unhandled scheduling error. No shared records means no cleanup timer.
+    this.#legacySeenPending = this.mesh.listAll(CONTROL_SEEN_PREFIX).length > 0;
     if (now - this.#seenCleanupAt < this.#ackTimeoutMs) return;
     this.#seenCleanupAt = now;
     // A restarting owner replays the retained log from its start, so a record stays while its
@@ -1706,6 +1713,7 @@ export class FabricControlPlane {
     if (now - this.#legacySeenCleanupAt >= LEGACY_SEEN_CLEANUP_MS) {
       this.#legacySeenCleanupAt = now;
       await this.#cleanupLegacySeen(now);
+      this.#legacySeenPending = this.mesh.listAll(CONTROL_SEEN_PREFIX).length > 0;
     }
   }
 

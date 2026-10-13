@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -7,7 +8,9 @@ import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
 import { CompletionJournal } from "../src/agents/completion-journal.js";
 import { ResidencyClient } from "../src/residency/client.js";
-import { RESIDENT_HOST_FORMAT, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { closeNatsStateBackend, NatsStateBackend, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
+import { fakeJetStream } from "./helpers/nats-jetstream-fake.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 
@@ -69,6 +72,106 @@ describe("resident client event-driven delivery", () => {
       await realSleep(200);
       expect(drains()).toBe(2);
     } finally { await client.close(); cleanup(); }
+  });
+
+  it("Windows rename/change notification burst drains once and leaves no timer", async () => {
+    const { client, config, drains, cleanup } = fixture();
+    const journal = vi.spyOn(CompletionJournal.prototype, "drain");
+    let notify!: (event: string, name: string) => void;
+    const watch = vi.spyOn(fs, "watch").mockImplementation(((directory: string, callback: typeof notify) => {
+      if (directory === path.join(config.meshRoot, "agent-completions")) notify = callback;
+      return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
+    }) as unknown as typeof fs.watch);
+    vi.useFakeTimers();
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(0);
+      // Join startup's real filesystem IO before advancing a fake burst clock.
+      await journal.mock.results[0]!.value;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drains()).toBe(1);
+      notify("rename", "external.json");
+      await vi.advanceTimersByTimeAsync(10);
+      notify("change", "external.json");
+      await vi.advanceTimersByTimeAsync(15);
+      expect(drains()).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(drains()).toBe(2);
+      notify("rename", "late.json");
+      expect(vi.getTimerCount()).toBe(1);
+      await client.close();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(drains()).toBe(2);
+    } finally { await client.close(); vi.useRealTimers(); journal.mockRestore(); watch.mockRestore(); cleanup(); }
+  });
+
+  it.each([true, false])("delayed NATS projector wakes authenticated delivery only with the hook (%s), and close unsubscribes", async (withHook) => {
+    const { config, cleanup } = fixture();
+    // No directory notification can carry this wake: the receiver sees only projection callbacks.
+    const watch = vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    const server = fakeJetStream();
+    const receiverPort = server.port();
+    await openNatsStateBackend({ root: config.meshRoot, port: receiverPort, lockTimeoutMs: 2_000 });
+    const mesh = new MeshStore(config.meshRoot, 64 * 1024, 100, { stateBackend: "nats" });
+    const remote = await NatsStateBackend.open({ port: server.port(), stream: "S", subject: "S.state", snapshotSubject: "S.snapshot",
+      maxEventBytes: 1 << 20, lockTimeoutMs: 2_000 });
+    const deliverAgent = vi.fn();
+    const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
+      mainAgent: { local: true, deliverAgent } as unknown as FabricMainAgentTarget });
+    const stop = vi.fn();
+    const subscribe = mesh.subscribeStateChanges.bind(mesh);
+    const subscription = vi.spyOn(mesh, "subscribeStateChanges").mockImplementation((listener) => {
+      const unsubscribe = withHook ? subscribe(listener) : () => {};
+      return () => { stop(); unsubscribe(); };
+    });
+    // Record deletion intent only: this local probe must not run source-retirement deletion.
+    const deletion = vi.spyOn(mesh, "delete").mockResolvedValue({ deleted: true });
+    const reads = vi.spyOn(mesh, "listAll");
+    const key = residentDeliveryPrefix(config.rootId) + "remote";
+    const envelope = { format: RESIDENT_HOST_FORMAT, id: "remote", rootId: config.rootId,
+      from: { id: "actor:remote", name: "remote", kind: "actor" }, source: "actor-output",
+      message: "remote followUp", delivery: "followUp", triggerTurn: true };
+    try {
+      client.start();
+      client.start();
+      expect(subscription).toHaveBeenCalledOnce();
+      await until(() => reads.mock.calls.length > 0);
+      await realSleep(50);
+      // A remote commit is a wake hint, not recipient/producer authority.
+      await remote.put({ key: key + "-foreign", value: { ...envelope, id: "foreign" },
+        identity: { id: "foreign-resident", name: "foreign", kind: "actor" } });
+      await until(() => mesh.get(key + "-foreign") !== undefined);
+      await realSleep(50);
+      expect(deliverAgent).not.toHaveBeenCalled();
+      expect(deletion).not.toHaveBeenCalled();
+      receiverPort.pause();
+      await remote.put({ key, value: envelope, identity: { id: client.hostId, name: "resident", kind: "actor" } });
+      await realSleep(50);
+      expect(mesh.get(key)).toBeUndefined();
+      expect(deliverAgent).not.toHaveBeenCalled();
+      receiverPort.resume();
+      await until(() => mesh.get(key) !== undefined);
+      if (withHook) await until(() => deliverAgent.mock.calls.length === 1);
+      await realSleep(100);
+      expect(deliverAgent).toHaveBeenCalledTimes(withHook ? 1 : 0);
+      if (withHook) {
+        expect(deliverAgent).toHaveBeenCalledWith(expect.objectContaining({
+          message: "remote followUp", delivery: "followUp", triggerTurn: true,
+          deliveryId: `resident:${config.rootId}:remote`, verification: "mesh",
+        }));
+        expect(deletion).toHaveBeenCalledExactlyOnceWith({ key, ifVersion: mesh.get(key)!.version });
+      } else expect(deletion).not.toHaveBeenCalled();
+      await client.close();
+      expect(stop).toHaveBeenCalledOnce();
+      const closedReads = reads.mock.calls.length;
+      await remote.put({ key: "unrelated/after-close", value: 1, identity: { id: "peer", name: "peer", kind: "agent" } });
+      await until(() => mesh.get("unrelated/after-close") !== undefined);
+      await realSleep(50);
+      expect(reads).toHaveBeenCalledTimes(closedReads);
+    } finally { await client.close(); remote.close(); closeNatsStateBackend(config.meshRoot); watch.mockRestore(); cleanup(); }
   });
 
   it("a peer mesh write wakes delivery and the wake converges", async () => {

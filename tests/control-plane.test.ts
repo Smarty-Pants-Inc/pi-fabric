@@ -1411,6 +1411,9 @@ describe("FabricControlPlane", () => {
       const batches = vi.spyOn(MeshStore.prototype, "writeBatch");
       const now = Date.now;
       vi.spyOn(Date, "now").mockImplementation(() => now() - start + later);
+      // A wall-clock jump does not fire already-armed real timers. Trigger the
+      // event-driven maintenance drain; the product also keeps its real sweep deadline.
+      await store.publish({ topic: "test.maintenance", from: identity("host:owner") });
       await vi.waitFor(() => expect(store.get(seenKey("host:other", "command:flagged"))).toBeUndefined(),
         { timeout: 3_000, interval: 20 });
       expect(store.get(seenKey("host:other", "command:grace"))).toBeDefined();

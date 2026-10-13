@@ -390,6 +390,8 @@ const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | 
     !kind ||
     (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
     !remoteHostValid(value.remoteHost) ||
+    !remoteHostValid(value.bridgeVia) ||
+    (value.bridgeVia !== undefined && (value.remoteHost === undefined || value.bridgeVia === value.remoteHost)) ||
     // Optional fields that consumers read as strings (peer cards, labels, leader selection):
     // a malformed one drops this record alone, never the listing (smarty-dev#2045).
     !optionalStrings(value, ["sessionId", "herdrPane", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "actorOwnershipToken", "finalAnswerReceiptId"]) ||
@@ -431,6 +433,8 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
     typeof value.id !== "string" ||
     entry.key !== keyFor(HOST_PREFIX, value.id) ||
     !remoteHostValid(value.remoteHost) ||
+    !remoteHostValid(value.bridgeVia) ||
+    (value.bridgeVia !== undefined && (value.remoteHost === undefined || value.bridgeVia === value.remoteHost)) ||
     typeof value.rootId !== "string" ||
     !isObject(value.identity) ||
     typeof value.identity.id !== "string" ||
@@ -500,7 +504,8 @@ const ownerMatches = (
   localHostId: string,
 ): boolean =>
   !owner ||
-  (owner.remoteHost === participant.remoteHost && !(owner.remoteHost !== undefined && owner.id === localHostId));
+  (owner.remoteHost === participant.remoteHost && owner.bridgeVia === participant.bridgeVia &&
+    !(owner.remoteHost !== undefined && owner.id === localHostId));
 
 const isLocal = (participant: FabricParticipantRecord, localHostId: string): boolean =>
   participant.remoteHost === undefined && participant.ownerHostId === localHostId;

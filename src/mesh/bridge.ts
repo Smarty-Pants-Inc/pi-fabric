@@ -24,8 +24,10 @@ import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
  *
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
- * its recipient is native to the hub, or is the hub factory's role address `factory` on a work
- * event or owner wake (smarty-dev#9352). Mirrored records never replace a native record. The one
+ * its recipient is native to the hub, a canonical root held on another link (control/ACK only),
+ * or the hub factory's role address `factory` on a work event or owner wake (smarty-dev#9352).
+ * The trusted hub re-exports other links' roots and carries their controls one final hop.
+ * Mirrored records never replace a native record. The one
  * exception to "no hub record uses its id" is a hub-written handoff (smarty-dev#9074, below).
  */
 
@@ -199,16 +201,19 @@ const UNADDRESSED_LOG_MS = 60_000;
 /** The count line names at most this many distinct topics. */
 const UNADDRESSED_TOPICS = 10;
 
-/** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
-export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
+/** Origin and cursor-recovery event id; a trusted hub may add one final `via` hop. */
+export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string; via?: string } | undefined => {
   const stamp = isObject(event.data) ? event.data.bridge : undefined;
   return isObject(stamp) && typeof stamp.from === "string" && typeof stamp.id === "string"
-    ? { from: stamp.from, id: stamp.id }
+    ? { from: stamp.from, id: stamp.id, ...(typeof stamp.via === "string" ? { via: stamp.via } : {}) }
     : undefined;
 };
 
 const hasBridgeField = (event: Pick<MeshEvent, "data">): boolean =>
   isObject(event.data) && Object.hasOwn(event.data, "bridge");
+
+const hasHubHop = (event: Pick<MeshEvent, "data">): boolean =>
+  isObject(event.data) && isObject(event.data.bridge) && Object.hasOwn(event.data.bridge, "via");
 
 export interface BridgeHost {
   record: FabricHostRecord;
@@ -249,7 +254,7 @@ export interface BridgePublish {
   from: MeshIdentity;
   to: string;
   text?: string;
-  data: Record<string, unknown> & { bridge: { from: string; id: string } };
+  data: Record<string, unknown> & { bridge: { from: string; id: string; via?: string } };
 }
 
 /** One side of the bridge: the local mesh directly, or the remote one through the agent. */
@@ -266,6 +271,10 @@ export interface BridgeSide {
   latestCursor?(): Promise<BridgeHead>;
   tail?(after: number, offset?: number): Promise<BridgeRead>;
   presence(): Promise<BridgePresence>;
+  /** Hub-local only: live direct mirrors owned by other links, never re-exported mirrors. */
+  relayPresence?(): Promise<Pick<BridgePresence, "hosts" | "participants">>;
+  /** Direct origin of a held root on another link, for captured control destinations. */
+  relayOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
   publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
   /** Optional capability: returns a durably committed, ordered prefix (1..256 events). */
@@ -295,6 +304,11 @@ const BRIDGED_IDS_PAGE = 50_000;
 
 const remoteHostOf = (value: unknown): string | undefined =>
   isObject(value) && typeof value.remoteHost === "string" ? value.remoteHost : undefined;
+
+/** A re-export belongs to its immediate hub link, but routes and ACKs retain its origin. */
+const mirrorLinkOf = (value: unknown): string | undefined =>
+  remoteHostOf(value) !== undefined && isObject(value) && typeof value.bridgeVia === "string"
+    ? value.bridgeVia : remoteHostOf(value);
 
 const hostOf = (key: string, value: unknown): FabricHostRecord | undefined => {
   if (!isObject(value) || value.format !== 1 || typeof value.id !== "string") return undefined;
@@ -543,7 +557,8 @@ export class StoreBridgeSide implements BridgeSide {
     let offset = offsets?.start;
     let complete = true;
     for (const [index, event] of page.entries()) {
-      if (event.sequence > after && isBridgedTopic(event) && !hasBridgeField(event)) {
+      if (event.sequence > after && isBridgedTopic(event) && (!hasBridgeField(event) ||
+          (event.verification === "bridge" && bridgeStampOf(event)?.from !== this.peer && !hasHubHop(event)))) {
         const size = Buffer.byteLength(JSON.stringify(event), "utf8");
         if (size > pageBytes) {
           skipped.push({ id: event.id, sequence: event.sequence, topic: event.topic, bytes: size });
@@ -564,6 +579,39 @@ export class StoreBridgeSide implements BridgeSide {
     return this.#presenceSnapshot();
   }
 
+  relayOrigin(id: string): string | undefined {
+    const entry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
+    const host = entry && hostOf(entry.key, entry.value);
+    return host && host.remoteHost !== undefined && host.remoteHost !== this.peer && host.bridgeVia === undefined &&
+      CANONICAL_ID.test(id) && host.rootId === id && host.identity.id === id &&
+      !participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id)) &&
+      entry!.updatedBy.id === host.identity.id && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now()
+      ? host.remoteHost : undefined;
+  }
+
+  async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
+    const hosts: BridgeHost[] = [];
+    const leases = readHostLeases(this.store.root);
+    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+      const host = hostOf(entry.key, entry.value);
+      if (!host || host.remoteHost === undefined || host.remoteHost === this.peer || host.bridgeVia !== undefined ||
+          !CANONICAL_ID.test(host.id) || host.rootId !== host.id || host.identity.id !== host.id ||
+          participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, host.id)) ||
+          entry.updatedBy.id !== host.identity.id) continue;
+      const liveness = hostLiveness(leases, host);
+      if (liveness.expiresAt > this.now()) hosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt });
+    }
+    const owners = new Map(hosts.map(host => [host.record.id, host.record]));
+    const participants = this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }).flatMap(entry => {
+      const participant = participantOf(entry.key, entry.value);
+      const owner = participant && owners.get(participant.ownerHostId);
+      return participant && owner && participant.kind === "root" && participant.remoteHost === owner.remoteHost &&
+        participant.bridgeVia === undefined && participant.id === owner.id && participant.rootId === owner.rootId &&
+        participant.ownerIdentityId === owner.identity.id && entry.updatedBy.id === owner.identity.id ? [participant] : [];
+    });
+    return { hosts, participants };
+  }
+
   #presenceSnapshot(): BridgePresence {
     return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries(),
       this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
@@ -581,7 +629,7 @@ export class StoreBridgeSide implements BridgeSide {
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
       const mirrored = [...this.store.listAll(HOST_PREFIX, { fresh: true }), ...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })]
-        .filter(entry => remoteHostOf(entry.value) === this.peer)
+        .filter(entry => mirrorLinkOf(entry.value) === this.peer)
         .map(entry => {
           const host = hostOf(entry.key, entry.value);
           const lease = host && leases.get(host.id);
@@ -590,8 +638,13 @@ export class StoreBridgeSide implements BridgeSide {
             ...(host ? { lease: lease ? { id: lease.id, rootId: lease.rootId, identityId: lease.identityId, startedAt: lease.startedAt } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
       const native = this.#presenceSnapshot();
+      // Other links' mirror additions/removals must wake the hub's exporting links.
+      const relays = [...this.store.listAll(HOST_PREFIX, { fresh: true }), ...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })]
+        .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
+        .map(entry => ({ key: entry.key, value: entry.key.startsWith(HOST_PREFIX) && isObject(entry.value)
+          ? settled(entry.value) : entry.value, updatedBy: entry.updatedBy }));
       const topology = { ...native, hosts: native.hosts.map(host => settled(host.record as unknown as Record<string, unknown>)) };
-      return { native, digest: contentDigest({ native, mirrored }), topology: contentDigest({ topology, mirrored }) };
+      return { native, digest: contentDigest({ native, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
     };
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
@@ -664,7 +717,7 @@ export class StoreBridgeSide implements BridgeSide {
     // mirrors (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
-      if (mark === this.peer) continue;
+      if (mirrorLinkOf(entry.value) === this.peer) continue;
       const host = hostOf(entry.key, entry.value);
       if (!host) {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
@@ -682,7 +735,7 @@ export class StoreBridgeSide implements BridgeSide {
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
-      if (mark === this.peer) continue;
+      if (mirrorLinkOf(entry.value) === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
@@ -713,13 +766,13 @@ export class StoreBridgeSide implements BridgeSide {
     return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
   }
 
-  async publish(event: BridgePublish, held: string[] = []): Promise<{ sequence: number }> {
-    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held)));
+  async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
+    const published = await this.#fenceRetry(() => this.store.publish(this.#publication(event, held, fromHub)));
     return { sequence: published.sequence };
   }
 
-  async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<Array<{ sequence: number }>> {
-    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? []))));
+  async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
+    const published = await this.#fenceRetry(() => this.store.publishBatch(events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub))));
     return published.map(({ sequence }) => ({ sequence }));
   }
 
@@ -741,9 +794,11 @@ export class StoreBridgeSide implements BridgeSide {
     }
   }
 
-  #publication(event: BridgePublish, held: string[]): Parameters<MeshStore["publish"]>[0] {
+  #publication(event: BridgePublish, held: string[], fromHub: boolean): Parameters<MeshStore["publish"]>[0] {
     const checked = checkBridgePublish(event);
-    const data = { ...checked.data, bridge: { from: this.peer, id: checked.data.bridge.id } };
+    const stamp = checked.data.bridge;
+    const data = { ...checked.data, bridge: fromHub && stamp.via === this.peer
+      ? stamp : { from: this.peer, id: stamp.id } };
     return {
       ...checked,
       // The cursor advances only after the destination confirms its append durably.
@@ -872,8 +927,8 @@ export class StoreBridgeSide implements BridgeSide {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
-    if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return 0;
-    if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return 0;
+    if (!hostEntry || mirrorLinkOf(hostEntry.value) !== this.peer) return 0;
+    if (participantEntry && mirrorLinkOf(participantEntry.value) !== this.peer) return 0;
     // A native's own file, readable or not (fail closed, security pass S3 on #142).
     if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return 0;
     const host = hostOf(hostEntry.key, hostEntry.value);
@@ -889,7 +944,7 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   mirrored(id: string): boolean {
-    return remoteHostOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
+    return mirrorLinkOf(this.store.get(keyFor(HOST_PREFIX, id), { fresh: true })?.value) === this.peer;
   }
 
   // Every id this side holds that is not this link's mirror, read now, under the same handoffs.
@@ -901,7 +956,7 @@ export class StoreBridgeSide implements BridgeSide {
     const reserved = new Set<string>(handoffs.reserved);
     for (const entries of [hostEntries, participantEntries]) {
       for (const entry of entries) {
-        if (remoteHostOf(entry.value) === this.peer || !isObject(entry.value)) continue;
+        if (mirrorLinkOf(entry.value) === this.peer || !isObject(entry.value)) continue;
         const value = entry.value;
         const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
         if (isIdentity(value.identity)) ids.push(value.identity.id);
@@ -920,9 +975,10 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number): Promise<void> {
+  mirror(presence: Pick<BridgePresence, "hosts" | "participants">, observedAt?: number, fromHub = false): Promise<void> {
     if (this.#fenced) return Promise.resolve();
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt));
+    // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub));
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -938,7 +994,7 @@ export class StoreBridgeSide implements BridgeSide {
     const leases = readHostLeases(this.store.root);
     const hosts: BridgeHost[] = [];
     for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== this.peer) continue;
+      if (mirrorLinkOf(entry.value) !== this.peer) continue;
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;
       const expiresAt = hostLeaseExpiry(leases, host);
@@ -947,7 +1003,7 @@ export class StoreBridgeSide implements BridgeSide {
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants: FabricParticipantRecord[] = [];
     for (const entry of this.store.listAll(PARTICIPANT_PREFIX, { fresh: true })) {
-      if (remoteHostOf(entry.value) !== this.peer) continue;
+      if (mirrorLinkOf(entry.value) !== this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       const owner = participant && live.get(participant.ownerHostId);
       if (
@@ -958,7 +1014,7 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number): Promise<void> {
+  async #mirror(presence: Pick<BridgePresence, "hosts" | "participants">, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
     const halted = (): boolean => this.#fenced && !final;
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
@@ -987,8 +1043,8 @@ export class StoreBridgeSide implements BridgeSide {
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
         const hosts = new Map<string, FabricHostRecord>();
         for (const { record, expiresAt } of presence.hosts) {
-          // Only a peer's natives are mirrored; a record another link mirrored is never relayed.
-          if (remoteHostOf(record) !== undefined) continue;
+          const relayed = remoteHostOf(record) !== undefined;
+          if (relayed && (!fromHub || record.bridgeVia !== this.peer || record.remoteHost === this.peer)) continue;
           if (own.has(record.id) || own.has(record.identity.id) || own.has(record.rootId)) continue;
           // A mirror never outlives its origin (smarty-dev#6477): it keeps the origin's absolute
           // expiry, capped at one BRIDGE_LEASE_MS from this sync so a dead bridge still lapses it.
@@ -1005,7 +1061,7 @@ export class StoreBridgeSide implements BridgeSide {
           const renewedAt = Math.min(record.updatedAt, now);
           hosts.set(record.id, record);
           wanted.set(keyFor(HOST_PREFIX, record.id), {
-            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: this.peer },
+            value: { ...record, updatedAt: now, expiresAt: until, remoteHost: relayed ? record.remoteHost : this.peer },
             identity: record.identity,
           });
           // The lease carries the origin's incarnation, so a later removal can tell it from a replacement's.
@@ -1014,10 +1070,12 @@ export class StoreBridgeSide implements BridgeSide {
         }
         for (const participant of presence.participants) {
           const owner = hosts.get(participant.ownerHostId);
-          if (!owner || participant.kind !== "root" || own.has(participant.id) || remoteHostOf(participant) !== undefined) continue;
+          if (!owner || participant.kind !== "root" || own.has(participant.id)) continue;
+          if (remoteHostOf(participant) !== undefined && (!fromHub || participant.bridgeVia !== this.peer ||
+              participant.remoteHost !== owner.remoteHost)) continue;
           if (owner.identity.id !== participant.ownerIdentityId || owner.rootId !== participant.rootId) continue;
           wanted.set(keyFor(PARTICIPANT_PREFIX, participant.id), {
-            value: { ...participant, remoteHost: this.peer },
+            value: { ...participant, remoteHost: participant.remoteHost ?? this.peer },
             identity: owner.identity,
           });
         }
@@ -1027,7 +1085,7 @@ export class StoreBridgeSide implements BridgeSide {
           const existing = mirrored.get(key);
           // Never replace a native record, or another bridge's mirror (anti-spoofing); a native may be
           // only in its own file (smarty-dev#2004).
-          if (existing && remoteHostOf(existing.value) !== this.peer) continue;
+          if (existing && mirrorLinkOf(existing.value) !== this.peer) continue;
           if (participantFiles.present(key)) continue;
           if (
             existing && isObject(existing.value) && settled(existing.value) === settled(value) &&
@@ -1041,7 +1099,7 @@ export class StoreBridgeSide implements BridgeSide {
         }
         for (const [key, { value, version }] of mirrored) {
           if (halted()) return undefined;
-          if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
+          if (wanted.has(key) || mirrorLinkOf(value) !== this.peer) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
             removed.push(gone
@@ -1115,7 +1173,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   #applyLease(lease: BridgeLease, view: MeshBatchView, replay: boolean): void {
     const entry = view.get(keyFor(HOST_PREFIX, lease.id));
-    const held = entry && remoteHostOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+    const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
     if (!held || held.identity.id !== lease.identityId || held.rootId !== lease.rootId) return;
     // Only the incarnation the lease was planned for: an overlapping writer may have installed a
     // replacement mirror (same id, root and identity, new startedAt) since this batch committed,
@@ -1145,7 +1203,7 @@ export class StoreBridgeSide implements BridgeSide {
       const page = this.store.read({ after: cursor, limit: this.store.maxReadEvents });
       for (const event of page) {
         const stamp = bridgeStampOf(event);
-        if (stamp?.from === this.peer) ids.push(stamp.id);
+        if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
       }
       if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
       cursor = page.at(-1)!.sequence;
@@ -1281,18 +1339,19 @@ const numberArg = (args: unknown, name: string): number => {
   return value;
 };
 
-const presenceArg = (args: unknown): Pick<BridgePresence, "hosts" | "participants"> => {
+const presenceArg = (args: unknown, hub: string): Pick<BridgePresence, "hosts" | "participants"> => {
   if (!isObject(args) || !Array.isArray(args.hosts) || !Array.isArray(args.participants)) {
     throw new Error("Bridge presence is invalid");
   }
   const hosts = args.hosts.flatMap((host): BridgeHost[] => {
     if (!isObject(host) || typeof host.expiresAt !== "number" || !isObject(host.record)) return [];
     const record = hostOf(keyFor(HOST_PREFIX, String(host.record.id)), host.record);
-    return record && remoteHostOf(record) === undefined ? [{ record, expiresAt: host.expiresAt }] : [];
+    return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub))
+      ? [{ record, expiresAt: host.expiresAt }] : [];
   });
   const participants = args.participants.flatMap((value): FabricParticipantRecord[] => {
     const record = isObject(value) ? participantOf(keyFor(PARTICIPANT_PREFIX, String(value.id)), value) : undefined;
-    return record && remoteHostOf(record) === undefined ? [record] : [];
+    return record && (remoteHostOf(record) === undefined || (record.bridgeVia === hub && record.remoteHost !== hub)) ? [record] : [];
   });
   return { hosts, participants };
 };
@@ -1312,13 +1371,13 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest): Promise<unk
       isObject(request.args) && request.args.offset !== undefined ? numberArg(request.args, "offset") : undefined);
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
-    case "publish": return side.publish(checkBridgePublish(request.args));
+    case "publish": return side.publish(checkBridgePublish(request.args), [], true);
     case "publishBatch": {
       if (!Array.isArray(request.args) || !request.args.length || request.args.length > 256) throw new Error("Invalid bridge publish batch");
       // Remote wire never accepts held IDs: those are hub-local ownership fences.
-      return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })));
+      return side.publishBatch(request.args.map(event => ({ event: checkBridgePublish(event) })), true);
     }
-    case "mirror": return side.mirror(presenceArg(request.args));
+    case "mirror": return side.mirror(presenceArg(request.args, side.peer), undefined, true);
     case "bridgedIds": return side.bridgedIds(numberArg(request.args, "after"));
     default: throw new Error(`Unknown bridge operation: ${String(request.op)}`);
   }
@@ -1568,12 +1627,12 @@ export const admitPresence = (
   // v1 bridges Main roots only, whose host id, identity id and root id are one id (security
   // review round 4, F2): a host that splits them is refused, so one id names one owner.
   const hosts = claimed.hosts.filter(({ record }) =>
-    record.identity.id === record.id && record.rootId === record.id &&
+    record.identity.id === record.id && record.rootId === record.id && record.bridgeVia === undefined &&
     CANONICAL_ID.test(record.id) && !reserved.has(record.id));
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants = claimed.participants.filter((participant) => {
     const owner = admitted.get(participant.ownerHostId);
-    return participant.kind === "root" && owner !== undefined && participant.id === owner.id &&
+    return participant.kind === "root" && participant.bridgeVia === undefined && owner !== undefined && participant.id === owner.id &&
       owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId &&
       ![participant.id, participant.rootId, participant.ownerIdentityId, participant.sessionId]
         .some((id) => typeof id === "string" && reserved.has(id));
@@ -1638,6 +1697,8 @@ interface BridgeRules {
   /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
   identities?: Map<string, MeshIdentity>;
   reserved?: Set<string>;
+  /** Direct other-link origins, never supplied by an untrusted remote. */
+  relayOrigins?: Map<string, string>;
 }
 
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
@@ -1777,7 +1838,9 @@ export class MeshBridge {
       // fields, never the command's result payload (pi-fabric#928 SEC P1).
       data: { ...(direction === "toLocal" && event.topic === "fabric.control.ack" && !rules.recipients.has(event.to!)
         ? Object.fromEntries(Object.entries(data).filter(([field]) => RELAYED_ACK_FIELDS.has(field))) : data),
-      bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+      bridge: direction === "toRemote" && bridgeStampOf(event)
+        ? { ...bridgeStampOf(event)!, id: event.id, via: this.options.localName }
+        : { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
     } as BridgePublish;
   }
 
@@ -1900,7 +1963,11 @@ export class MeshBridge {
     const [local, claimed] = await Promise.all([this.options.local.presence(), this.options.remote.presence()]);
     const remote = admitPresence(claimed, new Set(local.reserved));
     if (this.#stopped) return;
-    const outbound = boundPresence(local);
+    const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
+    const outbound = boundPresence({
+      hosts: [...local.hosts, ...relays.hosts.map(host => ({ ...host, record: { ...host.record, bridgeVia: this.options.localName } }))],
+      participants: [...local.participants, ...relays.participants.map(record => ({ ...record, bridgeVia: this.options.localName }))],
+    });
     if (outbound.dropped) this.#log(`presence: ${outbound.dropped} hosts pass the frame budget and are not mirrored`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outbound.presence), this.options.local.mirror(remote, syncedAt)]);
@@ -1917,7 +1984,7 @@ export class MeshBridge {
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
     // Source expiry itself is reconciled once. No hosts means no deadline at all.
-    const expiries = [...local.hosts, ...claimed.hosts]
+    const expiries = [...local.hosts, ...claimed.hosts, ...relays.hosts]
       .map(host => host.expiresAt).filter(expiry => Number.isFinite(expiry) && expiry > syncedAt);
     this.#expiryAt = Math.min(Infinity, ...expiries,
       ...(expiries.some(expiry => expiry > syncedAt + BRIDGE_LEASE_MS) ? [syncedAt + BRIDGE_LEASE_MS - 1_000] : []));
@@ -1961,12 +2028,16 @@ export class MeshBridge {
     return direction === "toRemote"
       ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
         const { remote } = await this.#authority(refreshIfStale);
-        return { recipients: remoteAddresses(remote) };
+        const relays = await this.options.local.relayPresence?.();
+        return { recipients: remoteAddresses(remote), relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       })
       : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
         const { local, remote } = await this.#authority(refreshIfStale);
         // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
-        return { recipients: addresses(local), senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved) };
+        const relays = await this.options.local.relayPresence?.();
+        return { recipients: new Set([...addresses(local), ...remoteAddresses(relays ?? { hosts: [], participants: [] })]),
+          senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved),
+          relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
       });
   }
 
@@ -2248,13 +2319,22 @@ export class MeshBridge {
     const destination = event.data.destinationRemoteHost;
     if (destination === null) return "command destination is native and must not cross a bridge";
     if (typeof destination !== "string") return "command destinationRemoteHost is not a string or null";
-    const intended = direction === "toRemote" ? this.options.remoteName : this.options.localName;
+    const intended = direction === "toRemote" ? this.options.remoteName
+      : (typeof event.to === "string" ? this.options.local.relayOrigin?.(event.to) : undefined) ?? this.options.localName;
     if (destination !== intended) return `command destination is not bound to bridge link ${intended}`;
     return undefined;
   }
 
   #refusal(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): string | undefined {
-    if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
+    if (!isBridgedTopic(event)) return "not allowed";
+    if (hasBridgeField(event)) {
+      const stamp = bridgeStampOf(event);
+      if (direction !== "toRemote" || event.verification !== "bridge" || !stamp || hasHubHop(event) ||
+          (event.topic !== "fabric.control.command" && event.topic !== "fabric.control.ack") ||
+          stamp.from === this.options.remoteName || rules.relayOrigins?.get(event.from.id) !== stamp.from) return "not allowed";
+    }
+    if (direction === "toLocal" && typeof event.to === "string" && rules.relayOrigins?.has(event.to) &&
+        event.topic !== "fabric.control.command" && event.topic !== "fabric.control.ack") return "not allowed";
     // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
     // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
     // (smarty-dev#9352), within the link's factory rate. Never hub to remote.

@@ -8,7 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { normalizeActorRecords } from "./records.js";
 import type {
@@ -264,6 +264,9 @@ export class GlobalActorRegistry {
         : existing.dedupeKey !== undefined
           ? { dedupeKey: existing.dedupeKey }
           : {}),
+      ...(patch.deadLetterReplayMaxAgeMs !== undefined
+        ? { deadLetterReplayMaxAgeMs: patch.deadLetterReplayMaxAgeMs }
+        : existing.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: existing.deadLetterReplayMaxAgeMs } : {}),
       ...(patch.activationFilter === null
         ? {}
         : patch.activationFilter !== undefined
@@ -345,6 +348,7 @@ export class GlobalActorRegistry {
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
       ...(def.activation ? { activation: clone(def.activation) } : {}),
+      ...(def.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: def.deadLetterReplayMaxAgeMs } : {}),
       ...(def.activationFilter !== undefined && !def.activationFilterError && !this.#invalidFilters.has(def.id)
         ? { activationFilter: clone(def.activationFilter) }
         : {}),
@@ -409,6 +413,7 @@ export class GlobalActorRegistry {
     validateActorCoalesceKey(def.coalesceKey);
     validateActorDedupeKey(def.dedupeKey);
     const activation = normalizeActorActivation(def.activation);
+    const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(def.deadLetterReplayMaxAgeMs);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
     const records = normalizeActorRecords(def.records);
     const requires = normalizeRequirements(def.requires);
@@ -447,6 +452,7 @@ export class GlobalActorRegistry {
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
       ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
+      ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       ...(validWhile ? { validWhile } : {}),
       ...(records ? { records } : {}),
     };
@@ -601,6 +607,8 @@ export class GlobalActorRegistry {
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
         ...(record.dedupeKey !== undefined ? { dedupeKey: record.dedupeKey } : {}),
         ...(activation ? { activation } : {}),
+        ...(typeof record.deadLetterReplayMaxAgeMs === "number" && Number.isSafeInteger(record.deadLetterReplayMaxAgeMs) && record.deadLetterReplayMaxAgeMs >= 0
+          ? { deadLetterReplayMaxAgeMs: record.deadLetterReplayMaxAgeMs } : {}),
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),

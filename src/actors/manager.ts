@@ -40,7 +40,7 @@ import { fileURLToPath } from "node:url";
 import { processIsAlive, scriptSpawnArgs } from "../agents/transports/process-utils.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { ActorLogStore, ACTOR_MESSAGE_ENVELOPE_BYTES, ACTOR_MESSAGE_HISTORY_LIMIT as MESSAGE_HISTORY_LIMIT } from "./log-store.js";
-import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext, type FabricActorInferenceContext } from "./types.js";
 import { activationFilterSkip, normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { hydrateWakeText, normalizeWakeTextConfig, renderWakeTextBlock, type ActorWakeText, type FabricWakeTextConfig } from "./wake-text.js";
 import { appendDeadRootSkip, DeadRootCache, deadRootExempt } from "./dead-root-filter.js";
@@ -186,6 +186,7 @@ interface ManagedActor {
   dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
+  deadLetterReplayMaxAgeMs?: number;
   activationFilterExpiresAt?: number;
   filterSkipped?: FabricActorInfo["filterSkipped"];
   /** A stored filter that cannot be read: kept as stored and written back, never applied. */
@@ -1105,6 +1106,7 @@ export class ActorManager {
     validateActorCoalesceKey(request.coalesceKey);
     validateActorDedupeKey(request.dedupeKey);
     const activation = normalizeActorActivation(request.activation);
+    const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(request.deadLetterReplayMaxAgeMs);
     const activationFilter = request.activationFilter === undefined
       ? undefined
       : normalizeActorActivationFilter(request.activationFilter);
@@ -1155,6 +1157,7 @@ export class ActorManager {
       ...(request.dedupeKey ? { dedupeKey: request.dedupeKey } : {}),
       ...(activation ? { activation } : {}),
       ...(activationFilter?.length ? { activationFilter } : {}),
+      ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       residency,
       runner,
       ...(kernel ? { kernel } : {}),
@@ -1626,14 +1629,17 @@ export class ActorManager {
    * agent_settled deliveries recheck at arrival, their trailing boundary and dequeue. Per-filter
    * telemetry resets; legacy lifetime count is kept.
    */
-  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number): Promise<FabricActorInfo> {
+  async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number, deadLetterReplayMaxAgeMs?: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
+    normalizeDeadLetterReplayMaxAgeMs(deadLetterReplayMaxAgeMs);
     if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
     this.#assertPresenceValue(this.#presencePreview(actor, { activationFilter: filter.length ? filter : undefined,
       invalidActivationFilter: undefined, activationFilterExpiresAt: filter.length ? expiresAt : undefined,
+      ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } }));
     beforeCommit?.(actor.id);
+    if (deadLetterReplayMaxAgeMs !== undefined) actor.deadLetterReplayMaxAgeMs = deadLetterReplayMaxAgeMs;
     if (filter.length > 0) actor.activationFilter = filter;
     else delete actor.activationFilter;
     delete actor.invalidActivationFilter;
@@ -2121,6 +2127,7 @@ export class ActorManager {
       ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
+      ...(actor.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: actor.deadLetterReplayMaxAgeMs } : {}),
       ...(actor.requirements.length > 0
         ? { requires: actor.requirements.map((requirement) => ({ ...requirement })) }
         : {}),
@@ -4642,7 +4649,7 @@ export class ActorManager {
   }
 
   // Only callerless mesh and host events are filtered: a caller always hears its own run.
-  #filteredBy(actor: ManagedActor, item: ActorQueueItem): string | undefined {
+  #filteredBy(actor: ManagedActor, item: Pick<ActorQueueItem, "source" | "payload" | "resolve" | "reject" | "wakeText">): string | undefined {
     this.#expireActivationFilter(actor);
     // smarty-dev#6144: read-only, bounded and fail-closed: only a trusted ingress sender's event on a
     // topic this actor subscribes to, bound to the receipt's delivery, for a full owner/repository on this
@@ -5003,17 +5010,15 @@ export class ActorManager {
 
   #writeDeadLetters(actorId: string, entries: readonly ActorDeadLetter[]): void {
     const file = this.#deadLetterFile(actorId);
-    if (entries.length === 0) fs.rmSync(file, { force: true });
-    else {
-      const temporary = `${file}.${process.pid}.tmp`;
-      // Synced before the rename: a spill must be durable before the queue file forgets it.
-      const fd = fs.openSync(temporary, "w", 0o600);
-      try {
-        fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
-        fs.fsyncSync(fd);
-      } finally { fs.closeSync(fd); }
-      fs.renameSync(temporary, file);
-    }
+    const temporary = `${file}.${process.pid}.tmp`;
+    // Empty files also use the atomic rewrite; accepted entries are never removed by deletion.
+    const fd = fs.openSync(temporary, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, file);
+    syncPathNamespace(file);
     this.#deadLetters.set(actorId, entries.length);
   }
 
@@ -5081,16 +5086,39 @@ export class ActorManager {
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
-    const entries = this.#readDeadLetters(actor.id);
+    const maxAgeMs = actor.deadLetterReplayMaxAgeMs ?? DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS;
+    const cutoff = Date.now() - maxAgeMs;
+    const stale: ActorDeadLetter[] = [];
+    const entries = this.#readDeadLetters(actor.id).filter((entry) => {
+      // Unknown recorded times stay replayable; never infer age from the event itself.
+      if (maxAgeMs > 0 && Number.isFinite(entry.at) && entry.at < cutoff) { stale.push(entry); return false; }
+      return true;
+    });
+    const archive = path.join(path.dirname(this.#deadLetterFile(actor.id)), "dead-letter.archive.jsonl");
+    if (stale.length) {
+      try {
+        const fd = fs.openSync(archive, "a", 0o600);
+        try {
+          fs.writeFileSync(fd, stale.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+          fs.fsyncSync(fd);
+        } finally { fs.closeSync(fd); }
+        syncPathNamespace(archive);
+      } catch { return; } // Never rewrite until the archive is durable. A crash may duplicate, not lose.
+    }
     const inFlight = this.#inFlight.get(actor.id);
     const held = new Set([...(inFlight ? [inFlight] : []), ...actor.queue]
       .map((item) => (item.payload as { id?: unknown } | undefined)?.id));
     let taken = 0;
     let added = 0;
+    let filterSkipped = 0;
     try {
       while (taken < entries.length && actor.queue.length < limit) {
         const entry = entries[taken]!;
-        if (!held.has(entry.event.id)) {
+        const ruleId = this.#filteredBy(actor, { source: entry.source, payload: entry.event });
+        if (ruleId) {
+          this.#recordFiltered(actor, { id: entry.event.id, source: entry.source, payload: entry.event }, ruleId);
+          filterSkipped++;
+        } else if (!held.has(entry.event.id)) {
           held.add(entry.event.id);
           if (this.#hasProcessedKey(actor, entry.source, entry.event)) {
             if (!this.#persistQueue(actor.id, true)) throw new ActorQueueCheckpointError(actor);
@@ -5102,10 +5130,17 @@ export class ActorManager {
         taken++;
       }
     } catch { /* a queue checkpoint failure keeps this entry and the rest for the next drain */ }
-    if (taken === 0) return;
-    // A single rewrite per batch (the O(N^2) worst case over a 50 MB file is a noted follow-up).
+    if (taken === 0 && stale.length === 0) return;
+    // A single rewrite per batch, under the same actor ownership fence as queue replay.
     if (added === 0 || this.#persistQueue(actor.id, true)) {
-      try { this.#writeDeadLetters(actor.id, entries.slice(taken)); } catch { this.#deadLetters.delete(actor.id); }
+      try {
+        this.#writeDeadLetters(actor.id, entries.slice(taken));
+        this.#recordMessage(actor, {
+          id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in",
+          source: "actor:dead-letter-replay", createdAt: Date.now(),
+          data: { replayed: added, archivedStale: stale.length, filterSkipped, remaining: entries.length - taken },
+        });
+      } catch { this.#deadLetters.delete(actor.id); }
     }
     this.#ensureDrain(actor);
   }
@@ -5751,6 +5786,7 @@ export class ActorManager {
         : actor.invalidActivationFilter
           ? { activationFilter: actor.invalidActivationFilter.value }
           : {}),
+      ...(actor.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: actor.deadLetterReplayMaxAgeMs } : {}),
       // Untouched actors need no new registry field; older rollback hosts omit it too.
       ...(actor.filterSkipped ? { filterSkipped: { ...actor.filterSkipped } } : {}),
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
@@ -6251,6 +6287,8 @@ export class ActorManager {
           ? { dedupeKey: record.dedupeKey }
           : {}),
         ...(activation ? { activation } : {}),
+        ...(typeof record.deadLetterReplayMaxAgeMs === "number" && Number.isSafeInteger(record.deadLetterReplayMaxAgeMs) && record.deadLetterReplayMaxAgeMs >= 0
+          ? { deadLetterReplayMaxAgeMs: record.deadLetterReplayMaxAgeMs } : {}),
         // An unreadable filter is dropped, never guessed: unsure means deliver.
         ...loadedActivationFilter((record as { activationFilter?: unknown }).activationFilter, { id: record.id, name: record.name }),
         ...(typeof record.filteredCount === "number" && Number.isSafeInteger(record.filteredCount) && record.filteredCount > 0
@@ -7096,6 +7134,7 @@ export class ActorManager {
       ...(actor.dedupeKey ? { dedupeKey: actor.dedupeKey } : {}),
       ...(actor.activation ? { activation: { ...actor.activation } } : {}),
       ...(actor.activationFilter ? { activationFilter: structuredClone(actor.activationFilter) } : {}),
+      deadLetterReplayMaxAgeMs: actor.deadLetterReplayMaxAgeMs ?? DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS,
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null, ...actor.filterSkipped },
       ...(actor.activationFilterExpiresAt !== undefined ? { activationFilterExpiresAt: actor.activationFilterExpiresAt } : {}),
       ...(actor.filteredCount ? { filteredCount: actor.filteredCount } : {}),

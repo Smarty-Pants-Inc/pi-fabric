@@ -1,0 +1,206 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentManager } from "../src/agents/manager.js";
+import { ActorManager } from "../src/actors/manager.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorRequest } from "../src/actors/types.js";
+import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
+
+const closers: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  for (const close of closers.splice(0).reverse()) await close();
+  vi.restoreAllMocks();
+});
+const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
+const waitFor = async (predicate: () => boolean) => {
+  const deadline = Date.now() + 10_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("replay did not reach its checkpoint");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+};
+const readLines = <T>(file: string): T[] => fs.existsSync(file)
+  ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as T) : [];
+type Entry = { at: number; source: string; event: MeshEvent };
+
+// Real registry, restart, mesh envelopes and queue checkpoint. Worker launches are held at the
+// run boundary, so assertions inspect accepted durable work without calling a model. No cleanup
+// deletes: the enclosing local probe records/retains product delete targets (#11199).
+async function backlog(patch: Partial<FabricActorRequest> = {}, queueLimit = 16) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-replay-"));
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  closers.push(() => agents.close());
+  vi.spyOn(agents, "run").mockImplementation(async (_request, signal) => {
+    await new Promise<void>(resolve => {
+      if (signal?.aborted) resolve();
+      else signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+    throw new Error("held test run aborted");
+  });
+  const open = () => {
+    const manager = new ActorManager("test", identity, mesh,
+      { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 0, meshRetentionSweepPath: false });
+    closers.push(() => manager.close());
+    return manager;
+  };
+  const first = open();
+  const actor = await first.create({ name: "backlog", instructions: "Supervise.", topics: ["team.work"], coalesce: false, ...patch });
+  await first.close();
+  const now = Date.now();
+  const entries: Entry[] = [];
+  for (let i = 0; i < 10; i++) {
+    const event = await mesh.publish({ topic: "team.work", from: identity, kind: i === 7 ? "noise" : "work", text: `event-${i}` });
+    // Event timestamps deliberately disagree with recorded age: use entry.at, not event.createdAt.
+    event.createdAt = i < 6 ? now : now - 48 * 60 * 60 * 1000;
+    entries.push({ at: i < 6 ? now - DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS - 60_000 : now, source: "mesh:team.work", event });
+  }
+  const directory = path.join(root, "actors", actor.id);
+  const file = path.join(directory, "dead-letter.jsonl");
+  const archive = path.join(directory, "dead-letter.archive.jsonl");
+  fs.writeFileSync(file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+  const queued = () => {
+    const name = fs.readdirSync(directory).find(file => file.startsWith("queue-") && file.endsWith(".json"));
+    if (!name) return [];
+    return (JSON.parse(fs.readFileSync(path.join(directory, name), "utf8")) as { items: Array<{ payload: MeshEvent }> }).items.map(item => item.payload.id);
+  };
+  return { root, actor, entries, file, archive, queued, open };
+}
+const receipts = (manager: ActorManager, id: string) => manager.messages(id, 100)
+  .filter(message => message.source === "actor:dead-letter-replay").map(message => message.data);
+
+describe("dead-letter replay age and current activation filter (#10630)", () => {
+  it("replays four of ten in order, archives exactly six by recorded time, and reports the counts", async () => {
+    const w = await backlog();
+    const manager = w.open();
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual(w.entries.slice(6).map(entry => entry.event.id));
+    expect(readLines<Entry>(w.archive)).toEqual(w.entries.slice(0, 6));
+    expect(readLines(w.file)).toEqual([]);
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 4, archivedStale: 6, filterSkipped: 0, remaining: 0 }]);
+    expect(manager.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS);
+  });
+
+  it("archives stale entries behind a full replay batch without overtaking remaining fresh work", async () => {
+    const w = await backlog({}, 2);
+    const freshIds = new Set([0, 3, 6, 9]);
+    for (const [index, entry] of w.entries.entries()) {
+      entry.at = Date.now() - (freshIds.has(index) ? 0 : DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS + 60_000);
+    }
+    fs.writeFileSync(w.file, w.entries.map(entry => JSON.stringify(entry) + "\n").join(""));
+    const manager = w.open();
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    const fresh = w.entries.filter((_entry, index) => freshIds.has(index));
+    expect(w.queued()).toEqual(fresh.slice(0, 2).map(entry => entry.event.id));
+    expect(readLines<Entry>(w.file)).toEqual(fresh.slice(2));
+    expect(readLines<Entry>(w.archive)).toEqual(w.entries.filter((_entry, index) => !freshIds.has(index)));
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 2, archivedStale: 6, filterSkipped: 0, remaining: 2 }]);
+  });
+
+  it("0 restores unlimited replay across restart, including all six old entries", async () => {
+    const w = await backlog({ deadLetterReplayMaxAgeMs: 0 });
+    const manager = w.open();
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual(w.entries.map(entry => entry.event.id));
+    expect(fs.existsSync(w.archive)).toBe(false);
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 10, archivedStale: 0, filterSkipped: 0, remaining: 0 }]);
+    expect(manager.definition(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+    await manager.setActivationFilter(w.actor.id, null);
+    expect(manager.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+  });
+
+  it("sets the replay age through live filter configuration and preserves it on reload", async () => {
+    const w = await backlog();
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, null, undefined, undefined, 0);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual(w.entries.map(entry => entry.event.id));
+    expect(fs.existsSync(w.archive)).toBe(false);
+    await expect(manager.setActivationFilter(w.actor.id, null, undefined, undefined, -1)).rejects.toThrow(/deadLetterReplayMaxAgeMs/);
+    expect(manager.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+    await manager.close();
+    const reloaded = w.open();
+    expect(reloaded.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
+  });
+
+  it("uses the current head-skip filter before replay and keeps unmatched events in order", async () => {
+    const w = await backlog();
+    // Configure synchronously before the restart's queued replay microtask.
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual(w.entries.slice(6).filter(entry => entry.event.kind !== "noise").map(entry => entry.event.id));
+    expect(manager.status(w.actor.id).filterSkipped.count).toBe(1);
+    expect(manager.messages(w.actor.id)).toContainEqual(expect.objectContaining({ reason: "filtered: noise", data: { filteredItemId: w.entries[7]!.event.id } }));
+    expect(receipts(manager, w.actor.id)).toEqual([{ replayed: 3, archivedStale: 6, filterSkipped: 1, remaining: 0 }]);
+  });
+
+  it("an expired current filter does not skip a fresh dead letter", async () => {
+    const w = await backlog();
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }], undefined, Date.now() - 1);
+    await waitFor(() => receipts(manager, w.actor.id).length === 1);
+    expect(w.queued()).toEqual(w.entries.slice(6).map(entry => entry.event.id));
+    expect(manager.status(w.actor.id).filterSkipped.count).toBe(0);
+  });
+
+  it("retains every entry if rewriting crashes after the archive append; retry may duplicate the archive", async () => {
+    const w = await backlog();
+    let failRewrite = true;
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === w.file && failRewrite) throw new Error("injected crash after archive append");
+      return rename(from, to);
+    });
+    const manager = w.open();
+    await waitFor(() => readLines(w.archive).length >= 6 && w.queued().length === 4);
+    expect(readLines<Entry>(w.file)).toEqual(w.entries); // archive append never truncates the backlog
+    expect(readLines<Entry>(w.archive).slice(0, 6)).toEqual(w.entries.slice(0, 6));
+    expect(receipts(manager, w.actor.id)).toEqual([]); // no false successful-rewrite receipt
+    failRewrite = false;
+    await manager.setActivationFilter(w.actor.id, null);
+    await waitFor(() => readLines(w.file).length === 0);
+    expect(w.queued()).toEqual(w.entries.slice(6).map(entry => entry.event.id));
+    const archivedIds = readLines<Entry>(w.archive).map(entry => entry.event.id);
+    expect(archivedIds.length).toBeGreaterThanOrEqual(12);
+    expect(new Set([...archivedIds, ...w.queued()])).toEqual(new Set(w.entries.map(entry => entry.event.id)));
+  });
+
+  it("fails closed on an archive append error, leaving the complete backlog replayable", async () => {
+    const w = await backlog();
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (String(file) === w.archive) throw new Error("archive unavailable");
+      return open(file, flags, mode);
+    });
+    const manager = w.open();
+    await manager.setActivationFilter(w.actor.id, null);
+    expect(readLines<Entry>(w.file)).toEqual(w.entries);
+    expect(w.queued()).toEqual([]);
+    expect(receipts(manager, w.actor.id)).toEqual([]);
+  });
+
+  it("validates the option and preserves it through global create, update, reload and import", () => {
+    for (const bad of [-1, 0.5, Infinity, NaN, "0", Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => normalizeDeadLetterReplayMaxAgeMs(bad)).toThrow(/deadLetterReplayMaxAgeMs/);
+    }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-template-"));
+    const registry = new GlobalActorRegistry(root, 64 * 1024);
+    const template = registry.create({ name: "backlog", instructions: "Supervise.", deadLetterReplayMaxAgeMs: 0 });
+    registry.update(template.id, { activationFilter: ["hold"] });
+    const reloaded = new GlobalActorRegistry(root, 64 * 1024);
+    expect(reloaded.toRequest(reloaded.resolve(template.id)!).deadLetterReplayMaxAgeMs).toBe(0);
+    registry.update(template.id, { deadLetterReplayMaxAgeMs: 12_345 });
+    expect(reloaded.toRequest(reloaded.resolve(template.id)!).deadLetterReplayMaxAgeMs).toBe(12_345);
+    expect(() => registry.update(template.id, { deadLetterReplayMaxAgeMs: -1 })).toThrow(/deadLetterReplayMaxAgeMs/);
+    for (const action of ["create", "setActivationFilter"]) {
+      const descriptor = AGENTS_ACTION_DESCRIPTORS.find(item => item.name === action)!;
+      expect(descriptor.inputSchema.properties).toHaveProperty("deadLetterReplayMaxAgeMs");
+    }
+  });
+});

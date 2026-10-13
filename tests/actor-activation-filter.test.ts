@@ -349,7 +349,7 @@ describe("setting activation filters on accepted queues", () => {
     const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
     expect(changed).toMatchObject({ queued: 1, filterSkipped: { count: 18 } });
     expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
-    expect(fs.existsSync(deadLetter)).toBe(false);
+    expect(fs.readFileSync(deadLetter, "utf8")).toBe("");
     await actors.setActivationFilter(actor.id, WAIT_FILTER); // no second replay on re-apply
     expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
     release();

@@ -5541,12 +5541,19 @@ describe("AgentsProvider steering", () => {
   it("creates an actor with an activationFilter and sets, clears and validates it", async () => {
     const { provider } = setup();
     const actor = (await provider.invoke("create", {
-      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
+      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    expect(actor).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     const expiresAt = Date.now() + 60_000;
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
-      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 0, activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
+    for (const deadLetterReplayMaxAgeMs of [-1, 0.5, Infinity, "0"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+      await expect(provider.invoke("create", { name: "bad-age", instructions: "x", deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+    }
     for (const invalid of [NaN, Infinity, "tomorrow"]) {
       await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
     }
@@ -5557,12 +5564,14 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setActivationFilter", { id: actor.id }, context)).rejects.toThrow("activationFilter is required");
     await expect(provider.invoke("create", { name: "bad", instructions: "x", activationFilter: [{ id: "all" }] }, context)).rejects.toThrow("name a source, topic, kind or where");
     const template = (await provider.invoke("create", {
-      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
+      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    expect(template).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
-    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
-      .resolves.toMatchObject({ activationFilter: ["hold"] });
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global", deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 });
+    await expect(provider.invoke("import", { id: template.id, as: "imported-backlog" }, context)).resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
       .resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["x"], scope: "global" }, context)).rejects.toThrow("Unknown activationFilter preset");
@@ -6417,11 +6426,11 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
-  it("forwards resident expiry to the execution owner", async () => {
+  it("forwards resident expiry and dead-letter replay age to the execution owner", async () => {
     const state = await remoteState();
     const expiresAt = Date.now() + 60000;
-    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
-    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 });
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {

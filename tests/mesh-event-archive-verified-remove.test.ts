@@ -212,6 +212,59 @@ it.runIf(process.platform === "linux")("compaction stops before rewriting the lo
   expect(receiptRemovals(file)).toEqual([]);
 });
 
+// F-02: a batch whose keyed suffix is refused after a committed prefix. The 50 ms batch budget reads a frozen clock so the
+// prefix/suffix split never depends on host speed (the cap itself is unchanged).
+const seedOversizedBatch = () => {
+  vi.spyOn(performance, "now").mockReturnValue(1);
+  const seeded = seedIntent({ maxEventLogBytes: 8192, retainedEventLogBytes: 6000 });
+  const line = (sequence: number) => JSON.stringify({ id: `fill-${sequence}`, sequence, topic: "mesh.8907", kind: "message", from, text: "x".repeat(600), createdAt: 1 });
+  const log = Array.from({ length: 15 }, (_, index) => `${line(index + 1)}\n`).join("");
+  fs.writeFileSync(path.join(seeded.root, "events.jsonl"), log, { mode: 0o600 });
+  return { ...seeded, log };
+};
+
+it.runIf(process.platform === "linux")("a batch refusal after a committed prefix finishes the prefix and never re-judges the successor", async () => {
+  const { root, file, ino, store, log } = seedOversizedBatch();
+  const swap = afterIntentRead(file, () => installSuccessor(file));
+  const outcome = await store.publishBatch([
+    { topic: "mesh.8907", from, dedupeKey: "p" },
+    { topic: "mesh.8907", from, dedupeKey: "k" },
+  ]).then(() => undefined, (error: unknown) => error);
+  expect(swap.fired).toBe(true);
+  const successor = fs.lstatSync(file).ino;
+  expect(successor).not.toBe(ino);
+  // Only the original inode was judged (and refused); compaction never authorized the successor.
+  expect(probe.calls.filter(call => call.target === file)).toEqual([{ target: file, ino, deleter: "meshDedupeIntent", removed: false }]);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(JSON.parse(fs.readFileSync(file, "utf8") as string)).toMatchObject({ eventId: "successor-id", reservedSequence: 7 });
+  expect(fs.existsSync(path.join(root, "generation"))).toBe(false); // no compaction rewrite
+  const text = fs.readFileSync(path.join(root, "events.jsonl"), "utf8") as string;
+  expect(text.startsWith(log)).toBe(true);
+  const appended = text.slice(log.length).trim().split("\n").map(entry => JSON.parse(entry) as { dedupeKey?: string; id: string });
+  expect(appended.map(event => event.dedupeKey)).toEqual(["p"]); // the refused key appended nothing
+  // The committed prefix still finished through the outer handler: its receipt is durable and its own intent was
+  // settled once, by the after-release receipt CAS (dry run, so the name stays), not by a same-hold compaction.
+  expect(JSON.parse(fs.readFileSync(receiptPath(root, "p"), "utf8") as string)).toMatchObject({ id: appended[0]!.id, dedupeKey: "p" });
+  const prefixIntent = receiptPath(root, "p").replace(/\.json$/, ".pending.json");
+  expect(probe.calls.filter(call => call.target === prefixIntent)).toMatchObject([{ deleter: "meshDedupeIntent", removed: true }]);
+  expect(fs.existsSync(receiptPath(root, "k"))).toBe(false);
+  expect(receiptRemovals(file)).toEqual([]);
+});
+
+it.runIf(process.platform === "linux")("an ordinary batch tail failure still returns the committed prefix and compacts", async () => {
+  const { root, file, ino, store } = seedOversizedBatch();
+  const events = await store.publishBatch([
+    { topic: "mesh.8907", from, dedupeKey: "p" },
+    { topic: "mesh.8907", from, text: "y".repeat(2048) }, // exceeds maxEventBytes before any append
+  ]);
+  expect(events.map(event => event.dedupeKey)).toEqual(["p"]);
+  expect(JSON.parse(fs.readFileSync(receiptPath(root, "p"), "utf8") as string)).toMatchObject({ id: events[0]!.id });
+  // Normal cleanup: compaction settled the unchanged stale intent by its judged inode (dry run) and rewrote the log.
+  expect(probe.calls.filter(call => call.target === file)).toEqual([{ target: file, ino, deleter: "meshDedupeIntent", removed: true }]);
+  expect(fs.existsSync(path.join(root, "generation"))).toBe(true);
+  expect(receiptRemovals(file)).toEqual([]);
+});
+
 it("off Linux runs main's removal as the fallback and propagates its failure", async () => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
   Object.defineProperty(process, "platform", { ...platform, value: "darwin" });

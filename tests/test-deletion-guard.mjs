@@ -22,7 +22,6 @@ const guardHref = selfUrl.href;
 const guardPath = fileURLToPath(guardHref);
 
 const realpath = fs.realpathSync.native;
-const fold = (path) => (windows ? path.toLowerCase() : path);
 
 /** Physical path of p, climbing to the nearest existing ancestor; missing components are joined lexically. */
 function physical(p) {
@@ -42,15 +41,11 @@ function physical(p) {
 
 const isShared = (root) => {
   const shared = new Set([parse(root).root, "/tmp", "/var/tmp", "/private/tmp", "/dev/shm"].map((p) => {
-    try { return fold(realpath(p)); } catch { return fold(p); }
+    try { return realpath(p); } catch { return p; }
   }));
-  if (shared.has(fold(root))) return true;
+  if (shared.has(root)) return true;
   // The root must not contain the home directory (or be it).
-  try {
-    const home = fold(realpath(homedir()));
-    const r = fold(root);
-    return home === r || home.startsWith(r.endsWith(sep) ? r : r + sep);
-  } catch { return false; }
+  try { return within(root, realpath(homedir())); } catch { return false; }
 };
 
 function pinRoot() {
@@ -65,10 +60,12 @@ function pinRoot() {
   } catch { return undefined; }
 }
 
+const segments = windows ? /[\\/]+/ : /\/+/;
 const within = (root, target) => {
-  const r = fold(root);
-  const t = fold(target);
-  return t === r || t.startsWith(r.endsWith(sep) ? r : r + sep);
+  // Realpath canonicalizes ancestors; compare whole segments, without Unicode case folding.
+  const r = root.split(segments);
+  const t = target.split(segments);
+  return r.length <= t.length && r.every((part, index) => part === t[index]);
 };
 
 /** The raw path as a string, or undefined when Node itself must reject the argument. */
@@ -92,7 +89,8 @@ function resolveTarget(raw) {
   if (windows && /^[a-z]:(?![\\/])/i.test(raw)) throw new Error("drive-relative path");
   const absolute = isAbsolute(raw) ? raw : `${process.cwd()}${sep}${raw}`;
   let trimmed = absolute;
-  while (trimmed.length > parse(trimmed).root.length && /[\\/]$/.test(trimmed)) trimmed = trimmed.slice(0, -1);
+  const trailingSeparator = windows ? /[\\/]$/ : /\/$/;
+  while (trimmed.length > parse(trimmed).root.length && trailingSeparator.test(trimmed)) trimmed = trimmed.slice(0, -1);
   const name = basename(trimmed);
   // A trailing separator, "." or ".." makes the kernel follow the final component: resolve it whole.
   if (trimmed !== absolute || name === "" || name === "." || name === "..") return physical(trimmed);

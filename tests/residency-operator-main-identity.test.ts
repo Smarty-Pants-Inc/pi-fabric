@@ -83,7 +83,6 @@ const staleHostRow = async (f: DeadRootFixture) => {
     row = await mesh.put({ key: hostKey(f.config.rootId), identity: { id: f.config.rootId, name: "main", kind: "main" },
       value: { id: f.config.rootId, rootId: f.config.rootId, identity: { id: f.config.rootId }, expiresAt: old } });
   } finally { clock.mockRestore(); }
-  mesh.close?.();
   expect(row.updatedAt).toBe(old);
 };
 const freshLeaseFile = (f: DeadRootFixture, id: string, expiresAt = Date.now() + 120_000) =>

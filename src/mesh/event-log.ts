@@ -3,12 +3,12 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace, syncDirectoryChain, trackTemporary } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { jsonClone } from "./state-file.js";
-import { verifiedRemove, type VerifiedRemoveResult } from "../storage/verified-remove.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 
 // Mesh events (smarty-dev#6477 L0): publish, publishBatch, dedupe receipts, the live log, its
 // compaction, archive coupling and recovery, and cursor reads.
@@ -275,16 +275,13 @@ export class EventLog {
    * evicted it, or a new publication may now own this same key. Never resurrect a receipt. */
   #finishLiveReceipt(after: AfterUnlock, event: MeshEvent, intentPath: string, receiptPath: string): void {
     const finalizeReceipt = (): void => {
-      // The judged intent's identity, captured before its bytes are read (smarty-dev#8907).
-      const judged = fs.lstatSync(intentPath, { throwIfNoEntry: false });
-      if (!judged) return;
       let intent: MeshDedupeIntent;
       try { intent = JSON.parse(fs.readFileSync(intentPath, "utf8")) as MeshDedupeIntent; }
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
       if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
           intent.reservedSequence !== event.sequence) return;
       writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-      this.#removeDedupeIntent(intentPath, judged);
+      this.#removeDedupeIntent(intentPath);
     };
     const receipt = (): Promise<void> => this.#lock.withLock(finalizeReceipt, undefined, "publish");
     after.receipt = receipt;
@@ -344,7 +341,7 @@ export class EventLog {
             fs.readFileSync(intentPath, "utf8") !== intentText) return;
         const namedIntent = fs.lstatSync(intentPath);
         if (!sameInode(intentIdentity, namedIntent)) return;
-        this.#removeDedupeIntent(intentPath, intentIdentity);
+        this.#removeDedupeIntent(intentPath);
       } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
     }, undefined, "publish");
   }
@@ -363,153 +360,9 @@ export class EventLog {
     return event;
   }
 
-  /** Removes the intent `judged` describes (smarty-dev#8907): a replacement or a refreshed intent
-   * is refused and left as the recovery fence (an intent beside its receipt settles again later). */
-  #removeDedupeIntent(file: string, judged: fs.Stats): boolean {
-    // File-only, as main's non-recursive rmSync: a directory (or link) at an intent name is never removed here.
-    if (!judged.isFile()) return false;
-    // Verified-only on every platform (smarty-dev#7858, pi-fabric#1036 r3 P1): no pathname fallback. Off Linux the
-    // verifier refuses and the intent is retained; a retained intent holds its key's slot, so admission stays bounded
-    // (MeshDedupeStoreFullError) and a receipt beside it stays authoritative for its key.
-    const removed = this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent" }));
-    if (removed) syncPathNamespace(path.dirname(file));
-    return removed;
-  }
-
-  /** Removes the intent this same .lock hold wrote as `written` (pi-fabric#1036 r3 P1). writeFileAtomic returns no
-   * identity, and a stat taken after its rename may already name a legacy off-lock successor, so a stat alone proves
-   * nothing. Only the exact written bytes (unique eventId) bind it: lstat, read, the same inode after the read, bytes
-   * equal. Unproved (other bytes, another inode, not a file) is kept and reported false; absent counts as gone. A
-   * refused removal of the proved intent (off Linux: no verifier) is true only while the name still holds that inode:
-   * the retained intent is our own, not a successor a same-hold compaction could re-judge. */
-  #removeWrittenIntent(file: string, written: string): boolean {
-    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (!stat) return true;
-    if (!stat.isFile()) return false;
-    let text: string;
-    try { text = fs.readFileSync(file, "utf8"); }
-    catch (error) { if (errorCode(error) === "ENOENT") return !fs.lstatSync(file, { throwIfNoEntry: false }); throw error; }
-    const named = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (text !== written || !named || named.dev !== stat.dev || named.ino !== stat.ino) return false;
-    if (this.#removeDedupeIntent(file, stat)) return true;
-    const kept = fs.lstatSync(file, { throwIfNoEntry: false });
-    return kept !== undefined && kept.dev === stat.dev && kept.ino === stat.ino && kept.size === stat.size && kept.mtimeMs === stat.mtimeMs;
-  }
-
-  /** A refusal is not absence (smarty-dev#8907 F-01): it counts as gone only when nothing was moved into a
-   * graveyard and the intent name is confirmed absent now (the judged intent was already gone before verification). */
-  #intentGone(file: string, result: VerifiedRemoveResult): boolean {
-    if (result.removed) return true;
-    if (result.graveyard !== undefined || result.reason.includes("graveyard")) return false;
-    return !fs.lstatSync(file, { throwIfNoEntry: false });
-  }
-
-  /** pi-fabric#1036 r5: replace the ORIGINAL judged intent (pre-read inode `judged`, raw bytes `original`) with
-   * `restored`, never a successor, even one a legacy or off-lock writer renames in after the last check. Not a plain
-   * rename after a check (r4 left that window): claim-aside plus a no-replace link. (1) Stage and fsync. (2) Refuse a
-   * changed name by its stat before any read, then by raw bytes. (3) Rename the name to the in-flight claim
-   * `<file>.claim`. (4) The claim must be the judged inode with the original raw bytes; otherwise it is linked back
-   * (no-replace) and refused. (5) link(staged, file) never replaces: EEXIST is a successor that arrived after the claim,
-   * and it is kept. Every refusal is a retryable MeshDedupeRecoveryError; no step ever replaces the intent name.
-   * ponytail: there is no native compare-and-swap rename to use instead. Node exposes neither renameat2's
-   * RENAME_NOREPLACE/RENAME_EXCHANGE nor a Windows equivalent, so rename-to-claim (take the name and learn what it
-   * held) plus link(2) (install only if absent, the Maildir delivery primitive) is the portable form. NTFS supports
-   * hard links (EEXIST included). Link support is probed on the private staged file before the intent moves (a probe
-   * against the intent name itself proves nothing: linkat reports EEXIST before EPERM/EXDEV), so a volume without hard
-   * links refuses with the intent untouched; a later failed link refuses and links the claim back, never a replacing
-   * rename. The name is absent between (3) and (5): a crash there leaves only `<file>.claim`, which
-   * #reinstateIntentClaim links back under the next hold before this key is judged. The claim goes only after the
-   * restored name's directory barrier succeeded (Windows has no directory fsync: like writeFileAtomic's durable mode,
-   * this relies on NTFS journaling metadata operations in order). */
-  #replaceJudgedIntent(file: string, judged: fs.Stats, original: Buffer, restored: string, key: string): void {
-    const changed = () => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent was replaced or refreshed and is kept`);
-    const unreadable = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent is unreadable or changed and is kept`, { cause });
-    // The judged regular-file inode, then its raw bytes, then the same inode again. size/mtime(/ctime) catch an in-place
-    // write; a rename changes ctime, so the claimed name skips it (its raw bytes are still compared).
-    const isOriginal = (target: string, ctime: boolean): boolean => {
-      const same = (stat: fs.Stats | undefined) => !!stat?.isFile() && stat.dev === judged.dev && stat.ino === judged.ino &&
-        stat.size === judged.size && stat.mtimeMs === judged.mtimeMs && (!ctime || stat.ctimeMs === judged.ctimeMs);
-      try {
-        if (!same(fs.lstatSync(target, { throwIfNoEntry: false }))) return false; // never read a changed name
-        return fs.readFileSync(target).equals(original) && same(fs.lstatSync(target, { throwIfNoEntry: false }));
-      } catch (error) { throw unreadable(error); }
-    };
-    const claim = `${file}.claim`;
-    const staged = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    const release = trackTemporary(staged);
-    let claimed = false;
-    let linked = false;
-    let installed = false;
-    try {
-      const fd = fs.openSync(staged, "wx", 0o600);
-      try { fs.writeFileSync(fd, restored, { encoding: "utf8" }); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      const probe = `${staged}.link`;
-      try { fs.linkSync(staged, probe); }
-      catch (error) {
-        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: this volume cannot hard-link the restored intent; the intent is kept`, { cause: error });
-      }
-      // ponytail: plain unlink of this process's private probe name (the staged inode keeps its own name).
-      try { fs.unlinkSync(probe); } catch { /* a stray probe name matches no intent, receipt or claim scan */ }
-      if (!isOriginal(file, true)) throw changed();
-      // Only this hold uses the in-flight name. #reinstateIntentClaim already linked any crash leftover back before the
-      // judgment, so a claim still here only duplicates a name (its unlink failed): the same path retires it, never over.
-      this.#reinstateIntentClaim(file);
-      if (fs.lstatSync(claim, { throwIfNoEntry: false })) throw changed();
-      try { fs.renameSync(file, claim); }
-      catch (error) { throw errorCode(error) === "ENOENT" ? changed() : unreadable(error); }
-      claimed = true;
-      if (!isOriginal(claim, false)) throw changed();
-      try { fs.linkSync(staged, file); }
-      catch (error) { throw errorCode(error) === "EEXIST" ? changed() : unreadable(error); }
-      linked = true;
-      syncDirectoryChain(path.dirname(file)); // the restored name is durable before the claim goes
-      installed = true;
-    } finally {
-      try {
-        if (installed) {
-          // ponytail: plain unlink of private names. The claim is the original, proven above and superseded by this
-          // hold's restore; the staged name is this process's temporary (the same inode is now named by `file`).
-          try { fs.unlinkSync(claim); } catch { this.#keepIntentClaim(claim); }
-        } else if (linked) {
-          // The restored name is not proven durable: the claim stays the fence; the next hold moves it to evidence.
-        } else if (claimed) {
-          try { this.#reinstateIntentClaim(file); } catch { /* the claim stays for the next hold; this refusal stands */ }
-        }
-      } finally {
-        try { fs.rmSync(staged, { force: true }); } catch { /* a tracked temporary: removed at exit */ } finally { release(); }
-      }
-    }
-  }
-
-  /** An in-flight claim (#replaceJudgedIntent) the name no longer needs: moved to a unique evidence name, never removed
-   * and never reinstated later (only the exact `<file>.claim` name is). */
-  #keepIntentClaim(claim: string): void {
-    try { fs.renameSync(claim, `${claim}-${randomUUID()}`); } catch { /* the next hold retries */ }
-  }
-
-  /** Under the lock, before an intent name is judged: a `<file>.claim` left by a refused or interrupted restore. With the
-   * name absent, link it back (no-replace) and drop the claim name. EEXIST means a newer intent holds the name: that
-   * one is kept, and only once its entry is durable (an off-lock writer may not have run its own barrier yet) does the
-   * claim move to evidence. Any other failure keeps the exact claim and refuses, so the key stays fenced (never treated
-   * as unreserved). */
-  #reinstateIntentClaim(file: string): void {
-    const claim = `${file}.claim`;
-    if (!fs.lstatSync(claim, { throwIfNoEntry: false })) return;
-    const kept = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent claim ${path.basename(claim)}: it cannot be reinstated and is kept`, { cause });
-    try { fs.linkSync(claim, file); }
-    catch (error) {
-      if (errorCode(error) !== "EEXIST") throw kept(error);
-      try { syncDirectoryChain(path.dirname(file)); } // the competing name is durable before the claim stops fencing
-      catch (barrier) { throw kept(barrier); }
-      // The winner vanished after the barrier (an off-lock removal or rename): the exact claim stays the fence and the
-      // keyed caller must not continue as if no intent existed; the next hold links the claim back.
-      if (!fs.lstatSync(file, { throwIfNoEntry: false })) throw kept(error);
-      this.#keepIntentClaim(claim);
-      return;
-    }
-    syncDirectoryChain(path.dirname(file)); // the reinstated name is durable before the claim name goes
-    // ponytail: plain unlink of a private name whose inode `file` now also names.
-    try { fs.unlinkSync(claim); } catch { this.#keepIntentClaim(claim); }
+  #removeDedupeIntent(file: string): void {
+    fs.rmSync(file, { force: true });
+    syncPathNamespace(path.dirname(file));
   }
 
   /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
@@ -535,16 +388,10 @@ export class EventLog {
   }
 
   #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
-    // The judged intent's identity, before its bytes are read.
-    const judged = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (!judged) return undefined;
-    // The exact bytes of an archive restore's rewrite below, once this hold replaces the judged intent.
-    let restored: string | undefined;
-    // The ORIGINAL raw bytes (pi-fabric#1036 r4): a decoded string can hide a changed invalid-UTF-8 byte.
-    let originalBytes: Buffer;
-    try { originalBytes = fs.readFileSync(file); }
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
-    const intent = JSON.parse(originalBytes.toString("utf8")) as MeshDedupeIntent;
+    const intent = JSON.parse(text) as MeshDedupeIntent;
     if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
         (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
         !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
@@ -566,11 +413,6 @@ export class EventLog {
         await this.#cleanupReceiptIntent(prior, file);
       };
       return prior;
-    }
-    // A receipt settles only its own intent (pi-fabric#1036 r3): a kept successor beside the original's receipt is not
-    // stale by that receipt. Fail closed before any removal, prune or rewrite (the retry's after-release CAS keeps it too).
-    if (prior && (intent.eventId !== prior.id || intent.reservedSequence !== prior.sequence)) {
-      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: it does not match the receipt for its key and is kept`);
     }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
@@ -601,8 +443,7 @@ export class EventLog {
           let liveOffset = 0;
           try { liveOffset = fs.statSync(this.#eventsPath).size; }
           catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-          restored = JSON.stringify({ ...intent, liveOffset });
-          this.#replaceJudgedIntent(file, judged, originalBytes, restored, intent.dedupeKey);
+          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
         }
@@ -630,11 +471,7 @@ export class EventLog {
       // unlink is ordered under the lock (a same-key writer may replace the intent next), its
       // namespace barrier runs after release. A crash before it may bring the intent back,
       // which settles to nothing again: no line can ever match its unique event id.
-      // A refused (replaced or refreshed) intent stays as the fence: fail closed before any sequence, intent or append.
-      // Verified-only, no pathname fallback on any platform (smarty-dev#7858): off Linux this refuses and fails closed.
-      if (!this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent" }))) {
-        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
-      }
+      fs.rmSync(file, { force: true });
       after.receipt = undefined;
       after.finish = () => syncPathNamespace(path.dirname(file));
       return undefined;
@@ -648,14 +485,7 @@ export class EventLog {
       }
       writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
     }
-    // After an archive restore the judged inode is gone: only the restored bytes can prove the name is still ours.
-    // A kept (refused) intent with no event must not be overwritten by a new append or invalidated by compaction; a
-    // kept successor of a restore fails closed too (its receipt is durable: a retry returns it), so no compaction in
-    // this hold re-judges that successor (pi-fabric#1036 r3 P1).
-    const removed = restored === undefined ? this.#removeDedupeIntent(file, judged) : this.#removeWrittenIntent(file, restored);
-    if (!removed && (!event || restored !== undefined)) {
-      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
-    }
+    this.#removeDedupeIntent(file);
     return event;
   }
 
@@ -665,13 +495,7 @@ export class EventLog {
     let names: string[];
     try { names = fs.readdirSync(directory); }
     catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-    const intents = new Set(names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry)));
-    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json\.claim$/.test(entry))) {
-      const intent = name.slice(0, -".claim".length);
-      this.#reinstateIntentClaim(path.join(directory, intent));
-      intents.add(intent);
-    }
-    for (const name of intents) {
+    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
       this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
     }
   }
@@ -752,21 +576,17 @@ export class EventLog {
         const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-          // A single publish confirms the visible receipt and unlinks after release, through the intent/receipt CAS.
-          // Every keyed caller passes `after` (publish, publishBatch; appendLocked rejects a dedupe key): there is no
-          // locked by-name cleanup of an intent judged stale by its receipt alone (pi-fabric#1036 r3).
+          // A single publish confirms the visible receipt and unlinks after release.
           if (after) {
             after.receipt = undefined;
             after.finish = async () => {
               this.#confirmEventFile(receiptPath!);
               await this.#cleanupReceiptIntent(prior, intentPath!);
             };
-          }
+          } else if (fs.existsSync(intentPath!)) this.#removeDedupeIntent(intentPath!);
           return prior;
         }
       }
-      // The exact bytes of the intent this hold writes below (the crash fence), for its archive-coupled cleanup.
-      let writtenIntent: string | undefined;
       let archive: MeshArchive | undefined;
       try { archive = MeshArchive.fromRoot(this.root); }
       catch (error) {
@@ -784,8 +604,6 @@ export class EventLog {
       // In the same boot, defer ordinary pending cutback until the exact retry has settled.
       // New keys still take only the normal recovery path, with no event-history lookup.
       if (input.dedupeKey) {
-        // pi-fabric#1036 r5: a restore interrupted between its claim and its link leaves only `<intent>.claim`.
-        this.#reinstateIntentClaim(intentPath!);
         if (archive && fs.existsSync(intentPath!)) {
           try { this.#recoverArchive(archive, true, prepared, liveCatchUp); }
           catch (error) {
@@ -853,11 +671,10 @@ export class EventLog {
           // with the synced archive line address, before any live append.
           archive?.reserveLookup(sequence);
           // This is the crash fence: the intent is durable before the live append begins.
-          writtenIntent = JSON.stringify({
+          writeFileAtomic(intentPath, JSON.stringify({
             dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
             ...(archive ? { archiveDir: archive.dir } : {}),
-          } satisfies MeshDedupeIntent);
-          writeFileAtomic(intentPath, writtenIntent, { durable: true });
+          } satisfies MeshDedupeIntent), { durable: true });
         }
         const pending = archive?.begin({ event, line });
         // Test-only process-death fence: unlike an append exception, no rollback can run.
@@ -886,11 +703,7 @@ export class EventLog {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-        // The intent this hold wrote above, proved by its exact bytes. A kept successor fails closed after the
-        // durable receipt (a retry returns it), before this hold's compaction could re-judge it (pi-fabric#1036 r3 P1).
-        if (intentPath && writtenIntent !== undefined && !this.#removeWrittenIntent(intentPath, writtenIntent)) {
-          throw new MeshDedupeRecoveryError(`Dedupe intent ${input.dedupeKey} was replaced after publication and is kept; its receipt is durable`);
-        }
+        if (intentPath) this.#removeDedupeIntent(intentPath);
       }
       if (batch) batch.bytes = bytes + 1;
       else {
@@ -972,9 +785,7 @@ export class EventLog {
               // After append begins, success may be unknown. Stop rather than replay a
               // possibly complete event; a restarted bridge reconciles its committed IDs.
               if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });
-              // A refused intent stays the fence (smarty-dev#8907 F-02): never compact (re-judge it) in this hold;
-              // the outer handler finishes the committed prefix's receipts and propagates the refusal.
-              if (!events.length || error instanceof MeshDedupeRecoveryError) throw error;
+              if (!events.length) throw error;
               break;
             }
           }
@@ -1513,9 +1324,8 @@ export class EventLog {
     let names: string[];
     try { names = fs.readdirSync(directory); }
     catch (error) { if (errorCode(error) === "ENOENT") return 0; throw error; }
-    // An in-flight restore claim (pi-fabric#1036 r5) still reserves its key until a hold links it back.
-    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json(\.claim)?$/.test(name))
-      .map(name => name.slice(0, name.indexOf(".pending.json"))));
+    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
+      .map(name => name.slice(0, -".pending.json".length)));
     const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
     let count = new Set([...pending, ...receipts.map(name => name.slice(0, -".json".length))]).size;
     const initialCount = count;

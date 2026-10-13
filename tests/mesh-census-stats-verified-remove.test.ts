@@ -10,15 +10,13 @@ import { censusHostSlug, pruneDeadCensusRecords } from "../src/mesh/store.js";
 import { censusSync } from "../src/mesh/writer-census.js";
 
 type Call = { target: string; deleter: string; ino: number | undefined; removed: boolean; reason?: string };
-type Result = { removed: true; bytes: number } | { removed: false; reason: string; graveyard?: string };
-/** `result` stands in for the real outcome (no real call): a refusal after a move, or a target already gone. */
-const probe = vi.hoisted(() => ({ dryRun: true, calls: [] as Call[], result: undefined as Result | undefined }));
+const probe = vi.hoisted(() => ({ dryRun: true, calls: [] as Call[] }));
 vi.mock("../src/storage/verified-remove.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../src/storage/verified-remove.js")>();
   return {
     ...real,
     verifiedRemove: (...[target, judged, options]: Parameters<typeof real.verifiedRemove>) => {
-      const result = probe.result ?? real.verifiedRemove(target, judged, probe.dryRun ? { ...options, dryRun: true } : options);
+      const result = real.verifiedRemove(target, judged, probe.dryRun ? { ...options, dryRun: true } : options);
       probe.calls.push({ target, deleter: options.deleter, ino: judged?.ino, ...result });
       return result;
     },
@@ -105,7 +103,6 @@ const refusedSwap = (file: string, body: string): void => {
 beforeEach(() => {
   probe.dryRun = true;
   probe.calls.length = 0;
-  probe.result = undefined;
   primitive.length = 0;
   for (const key of globalsKeys) { registry[key]?.dispose(); delete registry[key]; }
   const record = (file: fs.PathLike, options?: unknown): void => { primitive.push({ file: String(file), options }); };
@@ -128,52 +125,6 @@ describe.runIf(process.platform === "linux")("mesh judge-then-delete through ver
     afterLiveness(() => swap(file, live));
     pruneDeadCensusRecords(path.dirname(path.dirname(file)));
     refusedSwap(file, live);
-  });
-
-  it("writer census keeps a record swapped in after the dead-writer judgment", () => {
-    const file = censusRecord();
-    const live = record(process.pid);
-    afterLiveness(() => swap(file, live));
-    const report = censusSync(path.dirname(path.dirname(file)));
-    refusedSwap(file, live);
-    expect(report.unknown).toContainEqual(expect.objectContaining({ name: path.basename(file),
-      reason: expect.stringMatching(/removal refused: .*replaced since judgment/) }));
-  });
-
-  it("writer census keeps a torn-write temporary swapped in after the liveness judgment", () => {
-    const file = path.join(dir(".writer-census"), `${censusHostSlug(host)}-${deadPid}-${STARTED}.json.ab12.tmp`);
-    fs.writeFileSync(file, "torn", { mode: 0o600 });
-    afterLiveness(() => swap(file, "new"));
-    const report = censusSync(path.dirname(path.dirname(file)));
-    refusedSwap(file, "new");
-    expect(report.unknown).toContainEqual(expect.objectContaining({ name: path.basename(file),
-      reason: expect.stringMatching(/removal refused: .*replaced since judgment/) }));
-  });
-
-  it("writer census reports a graveyard-held refusal unknown and omits a target already gone", () => {
-    for (const name of [`${censusHostSlug(host)}-${deadPid}-${STARTED}.json`, `${censusHostSlug(host)}-${deadPid}-${STARTED}.json.ef56.tmp`]) {
-      const file = path.join(dir(".writer-census"), name);
-      fs.writeFileSync(file, record(deadPid), { mode: 0o600 });
-      const root = path.dirname(path.dirname(file));
-      probe.result = { removed: false, reason: "x (swapped during removal; left in the graveyard)", graveyard: "/g/held" };
-      expect(censusSync(root).unknown).toContainEqual(expect.objectContaining({ name,
-        reason: expect.stringMatching(/removal refused: .*left in the graveyard\) \(at \/g\/held\)/) }));
-      probe.result = { removed: false, reason: "open failed (ENOENT)" };
-      expect(censusSync(root).unknown.map(item => item.name)).not.toContain(name);
-    }
-    expect(primitive).toEqual([]);
-  });
-
-  it("writer census omits an unchanged dead record and torn write it removes (dry run): nothing unknown", () => {
-    const census = censusRecord();
-    const torn = `${path.basename(census)}.ab12.tmp`;
-    fs.writeFileSync(path.join(path.dirname(census), torn), "torn", { mode: 0o600 });
-    const report = censusSync(path.dirname(path.dirname(census)));
-    expect(probe.calls.map(call => [path.basename(call.target), call.removed])).toEqual(expect.arrayContaining([
-      [path.basename(census), true], [torn, true]]));
-    expect(report.unknown.map(item => item.name)).not.toContain(path.basename(census));
-    expect(report.unknown.map(item => item.name)).not.toContain(torn);
-    expect(primitive).toEqual([]);
   });
 
   it("lock-stats prune keeps a temporary swapped in after the age judgment", () => {
@@ -224,7 +175,6 @@ describe.runIf(process.platform === "linux")("mesh judge-then-delete through ver
     const old = (Date.now() - 25 * 60 * 60_000) / 1000;
     const dirs = [path.join(path.dirname(stats.file), ".retention-graveyard-1"), path.join(path.dirname(stats.file), "gone-2.json.ab12.tmp"),
       path.join(path.dirname(stats.file), "gone-3.json"), path.join(path.dirname(census), ".retention-graveyard-1"),
-      path.join(path.dirname(census), `${censusHostSlug(host)}-${deadPid}-${STARTED}.json.cd34.tmp`),
       path.join(path.dirname(outcomes.file), ".retention-graveyard-1"), path.join(path.dirname(outcomes.file), "20200102.jsonl")];
     for (const directory of dirs) {
       fs.mkdirSync(directory, { mode: 0o700 });

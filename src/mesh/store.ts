@@ -16,6 +16,7 @@ import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { processSender } from "../scope.js";
 export { MeshLockTimeoutError } from "../core/atomic-write.js";
+export { MeshLockIdentityNotReadyError, MeshLockSnapshotNotReadyError } from "./mesh-lock.js";
 export type { MeshIdentity, MeshEvent, MeshPublishInput, MeshTailResult } from "./event-log.js";
 export { meshCursorGeneration, meshCursorAtStart, MeshDedupeRecoveryError, MeshDedupeStoreFullError } from "./event-log.js";
 export type { MeshStateEntry, MeshReadOptions, MeshBatchOperation, MeshBatchView, MeshBatchResult } from "./state-file.js";

@@ -41,6 +41,45 @@ export const lockOwnerPid = (ownerPath: string): number | undefined => {
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 30_000;
 
+/**
+ * A bounded protocol-2/3 acquisition refused BEFORE any `.lock` attempt because this process's lock identity (start
+ * time, PID namespace) is still being prepared. Not contention: nobody held the lock and no budget was spent waiting.
+ * Still a MeshLockTimeoutError with the same `code` so every safe caller keeps its release-fences-and-retry handling;
+ * `preLockCode`/`kind` tell the two apart, and the message never claims a timeout.
+ */
+export class MeshLockIdentityNotReadyError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_LOCK_IDENTITY_NOT_READY";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly lockPath: string, readonly lockProtocol: MeshLockProtocol) {
+    super("", 0, 0);
+    this.name = "MeshLockIdentityNotReadyError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh lock ${lockPath} not attempted: this process's protocol-${lockProtocol} lock ` +
+      "identity is still being prepared (a bounded try fails closed); retry outside the bounded try";
+  }
+}
+
+/**
+ * An optimistic state write whose snapshot never became committable within its total deadline (or within a bounded
+ * try): the state file kept changing between off-lock preparation and the identity check. Not lock contention.
+ * `attempts` counts only real `.lock` admissions this write obtained (each one found the snapshot stale), never a
+ * fabricated count; 0 means `.lock` was not tried. Same retryable `code` as a lock timeout, for safe callers.
+ */
+export class MeshLockSnapshotNotReadyError extends MeshLockTimeoutError {
+  readonly preLockCode = "FABRIC_MESH_STATE_SNAPSHOT_NOT_READY";
+  readonly kind = "pre-lock";
+  readonly retryable = true;
+  constructor(readonly statePath: string, readonly preparations: number, lockAdmissions: number, readonly bounded: boolean,
+    options?: { cause?: unknown }) {
+    super("", lockAdmissions, 0);
+    if (options && "cause" in options) (this as { cause?: unknown }).cause = options.cause;
+    this.name = "MeshLockSnapshotNotReadyError";
+    this.message = `${this.preLockCode} (code ${this.code}): Fabric mesh state ${statePath} changed under every optimistic write snapshot ` +
+      `(${preparations} preparations, ${lockAdmissions} .lock admissions) ${bounded ? "within the bounded try" : "before the write deadline"}; ` +
+      "not lock contention, retry the write";
+  }
+}
+
 // Keep the normal global timer seam (including diagnostic/test clocks). An
 // aborted lifetime clears its referenced retry timer instead of awaiting the lock.
 export const delay = (milliseconds: number, signal?: AbortSignal): Promise<void> =>
@@ -231,12 +270,12 @@ export class MeshLock {
       // Fails closed before the common accounting below: count it once here. It never tried .lock,
       // so it is no wait-timeout event (and reads no owner record for one): nobody made it wait.
       lockStats?.failed(this.root, lockClass, performance.now() - lockWaitStart, Boolean(scope?.active) || bounded);
-      throw new MeshLockTimeoutError(describeLockHolder(ownerPath), 0, 0);
+      throw new MeshLockIdentityNotReadyError(this.#lockPath, this.#lockProtocol);
     }
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
-    const deadline = Date.now() + Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
@@ -266,7 +305,10 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    const ticket = new MeshLockTicket(this.root, token, deadline - Date.now());
+    const ticket = new MeshLockTicket(this.root, token, waitMs);
+    // The relative wait budget starts at the first admission/acquisition attempt, after setup (root mkdir, the
+    // admission receipt and its queue scans): slow setup must not spend the budget before anything was tried.
+    const deadline = Date.now() + waitMs;
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
       // (no CPU); many attempts with small gaps mean it kept losing the race (smarty-dev#816).
@@ -277,10 +319,14 @@ export class MeshLock {
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
         if (!ticket.mayContend()) {
-          if (Date.now() >= deadline) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
-          // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-          await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
-          continue;
+          if (Date.now() < deadline) {
+            // Woken when the predecessor's receipt goes; the short poll is only a safety net.
+            await ticket.wait(Math.min(20, Math.max(0, deadline - Date.now())), this.#writeAbortSignal);
+            continue;
+          }
+          if (attempts > 0) throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+          // Expired while still queued, never having tried: make exactly one acquisition attempt (it has exhausted its
+          // budget, so FIFO order within the budget is unchanged) and only then report contention, with attempts > 0.
         }
         const attemptAt = Date.now();
         if (attempts > 0) maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);

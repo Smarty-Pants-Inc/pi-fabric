@@ -294,9 +294,34 @@ export class ActorChildCompletionStore {
   }
 
   pending(options: { actorId?: string; inFlightRunId?: string } = {}): ActorChildCompletion[] {
+    // Most resident polls find an empty spool. Readdir is the observation; do not take the
+    // claim lock until an envelope, cancellation intent, or recoverable archive source exists.
+    // A child completion writer still wakes the existing actor settlement/mesh path, so this
+    // fast path never trades prompt delivery for a slow retry cadence.
+    if (!this.#hasPendingWork(options)) return [];
     this.recoverArchives(options);
+    if (!this.#hasPendingWork(options)) return [];
     try { return this.#withClaim(() => this.#pending(options)); }
     catch { return []; } // Busy/unreadable claims retry on the next owner poll.
+  }
+
+  #hasPendingWork(options: { actorId?: string; inFlightRunId?: string }): boolean {
+    let files: string[];
+    try { files = fs.readdirSync(this.directory); } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    return files.some(file => {
+      if (file.endsWith(".abandon")) return ID.test(file.slice(0, -".abandon".length));
+      if (file.endsWith(".source")) return ID.test(file.slice(0, -".source".length));
+      if (!file.endsWith(".json") || !ID.test(file.slice(0, -5))) return false;
+      if (!options.actorId && !options.inFlightRunId) return true;
+      try {
+        const value = JSON.parse(fs.readFileSync(path.join(this.directory, file), "utf8")) as ActorChildCompletion;
+        return value.format === 1 && value.spawner?.kind === "actor" &&
+          (!options.actorId || value.spawner.id === options.actorId) &&
+          (!options.inFlightRunId || value.spawner.runId !== options.inFlightRunId);
+      } catch { return true; }
+    });
   }
 
   #pending(options: { actorId?: string; inFlightRunId?: string }): ActorChildCompletion[] {

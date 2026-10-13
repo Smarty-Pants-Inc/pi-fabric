@@ -11,10 +11,19 @@ import { MeshStore } from "../src/mesh/store.js";
 const roots: string[] = [];
 const stores: MeshStore[] = [];
 const children: ChildProcess[] = [];
-afterEach(() => {
-  for (const child of children.splice(0)) child.kill("SIGKILL");
+// Windows (pi-fabric#956): a killed child still holds state.db until it has exited, so rmSync gave EPERM. Wait for each
+// child's exit (bounded), then remove with the repo's usual Windows-safe retries.
+const exited = (child: ChildProcess): Promise<void> => new Promise<void>((resolve) => {
+  if (child.exitCode !== null || child.signalCode !== null) return resolve();
+  const timer = setTimeout(resolve, 5_000);
+  child.once("exit", () => { clearTimeout(timer); resolve(); });
+});
+afterEach(async () => {
+  const killed = children.splice(0);
+  for (const child of killed) child.kill("SIGKILL");
+  await Promise.all(killed.map(exited));
   for (const store of stores.splice(0)) store.closeState();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 const identity = { id: "session:stalled", name: "stalled", kind: "main" as const };
 const sqliteStore = async (lockTimeoutMs: number) => {

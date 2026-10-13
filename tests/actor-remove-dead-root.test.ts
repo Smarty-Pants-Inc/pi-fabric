@@ -20,7 +20,6 @@ import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile, writeParticipantFile } from "../src/topology/participant-files.js";
-import { windowsRequestsAclAdapters, type WindowsRequestFileReport } from "../src/residency/windows-acl.js";
 import { deleteRootActorTree, mainPublicationFencePath, mainPublicationFenced, takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
 import { EVIDENCE, fixture, mainDirectory, rootParticipantKey } from "./helpers/dead-root-fixture.js";
 
@@ -366,104 +365,12 @@ describe.skipIf(process.platform !== "linux")("fabric-actors remove on a dead ro
       (process as { getuid?: unknown }).getuid = undefined;
       let result: Awaited<ReturnType<typeof f.cli>>;
       try { result = await f.cli(actor.id); } finally { (process as { getuid?: unknown }).getuid = getuid; }
-      // Off Windows the CLI's channel owner check (smarty-dev#6001) refuses first; on Windows owner SIDs pass it
-      // and the offline removal's own ownership gate refuses.
+      // The CLI's channel owner check (smarty-dev#6001) refuses before offline removal without getuid.
       expect(result.code).toBe(1);
-      expect(result.err).toMatch(process.platform === "win32" ? /file ownership cannot be proven \(smarty-dev#7858\)/
-        : /Cannot verify that the resident channel is owned by this OS user \(no uid available\); refusing stop\/remove/);
+      expect(result.err).toContain("Cannot verify that the resident channel is owned by this OS user (no uid available); refusing stop/remove");
       expect(f.registered(actor.id)).toBe(true); expect(f.archives()).toEqual([]);
       expect(fs.readFileSync(path.join(actorDir, "session.jsonl"), "utf8")).toBe("history\n");
     } finally { (process as { getuid?: unknown }).getuid = getuid; await f.close(); }
-  }, 40_000);
-
-  it("offline: simulated win32 refuses before any change when owner.json grants another SID write; private metadata passes (smarty-dev#6001)", async () => {
-    const f = await fixture();
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    const userSid = "S-1-5-21-1-2-3-1001", otherSid = "S-1-5-21-1-2-3-1002";
-    const report = (foreign: boolean): WindowsRequestFileReport => ({ attributes: 0x20, acl: { user: userSid, owner: userSid, dacl: "present",
-      aces: [userSid, "S-1-5-18", "S-1-5-32-544", ...(foreign ? [otherSid] : [])].map(sid => ({ type: "Allow" as const, sid, rights: sid === otherSid ? 278 : 2032127 })) } });
-    const calls: string[][] = [];
-    // win32 only for the metadata check: the rest of the offline removal needs Linux flock fences.
-    const answer = (foreignIndex?: number) => async (files: string[]) => {
-      calls.push(files); Object.defineProperty(process, "platform", platform);
-      return files.map((_, index) => report(index === foreignIndex));
-    };
-    const spy = vi.spyOn(windowsRequestsAclAdapters, "readFileAcls");
-    const directoryAcl = vi.spyOn(windowsRequestsAclAdapters, "readAcl").mockImplementation(async () => {
-      const directory = report(false);
-      if ("error" in directory) throw new Error(directory.error);
-      return directory.acl;
-    });
-    try {
-      const actor = await f.create("win32-metadata");
-      await f.killResident();
-      const metadata = [path.join(f.config.residencyRoot, "config.json"), path.join(f.config.residencyRoot, "owner.json")];
-      const options = { confirmDeadRoot: f.config.rootId, mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) };
-      spy.mockImplementation(answer(1));
-      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, options)).rejects.toThrow(
-        `Resident metadata is not private to this OS user: ${metadata[1]} (owned or writable by other accounts (${otherSid})); refusing offline removal`);
-      expectUnchanged(f, actor.id);
-      spy.mockImplementation(answer());
-      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, { ...options, dryRun: true }))
-        .resolves.toMatchObject({ offline: true, dryRun: true, actor: { id: actor.id } });
-      expect(calls).toEqual([metadata, metadata]);
-      expect(directoryAcl.mock.calls).toEqual([[f.config.residencyRoot], [f.config.residencyRoot]]);
-      expectUnchanged(f, actor.id);
-    } finally { Object.defineProperty(process, "platform", platform); spy.mockRestore(); directoryAcl.mockRestore(); await f.close(); }
-  }, 40_000);
-
-  it("offline: simulated win32 refuses before any change when the metadata stays owned by the caller but another SID may write the resident directory, or config.json no longer matches the config given (smarty-dev#6001)", async () => {
-    const f = await fixture();
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    const userSid = "S-1-5-21-1-2-3-1001", otherSid = "S-1-5-21-1-2-3-1002";
-    const acl = (foreign: boolean) => ({ user: userSid, owner: userSid, dacl: "present" as const,
-      aces: [userSid, "S-1-5-18", "S-1-5-32-544", ...(foreign ? [otherSid] : [])].map(sid => ({ type: "Allow" as const, sid, rights: sid === otherSid ? 197055 : 2032127 })) });
-    let wideDirectory = true;
-    const restore = () => Object.defineProperty(process, "platform", platform);
-    // win32 only for the metadata check: the rest of the offline removal needs Linux flock fences.
-    const directoryAcl = vi.spyOn(windowsRequestsAclAdapters, "readAcl").mockImplementation(async () => { if (wideDirectory) restore(); return acl(wideDirectory); });
-    const fileAcls = vi.spyOn(windowsRequestsAclAdapters, "readFileAcls").mockImplementation(async files => { restore(); return files.map(() => ({ attributes: 0x20, acl: acl(false) })); });
-    try {
-      const actor = await f.create("win32-directory");
-      await f.killResident();
-      const options = { confirmDeadRoot: f.config.rootId, mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) };
-      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, options)).rejects.toThrow(
-        `Resident directory is not private to this OS user: ${f.config.residencyRoot} (owned or writable by other accounts (${otherSid})); refusing offline removal`);
-      expect(fileAcls).not.toHaveBeenCalled();
-      expectUnchanged(f, actor.id);
-      // A private directory and private files, but config.json now selects other actor registries than the config handed in.
-      wideDirectory = false;
-      const configPath = path.join(f.config.residencyRoot, "config.json");
-      fs.writeFileSync(configPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(configPath, "utf8")), actorRoot: path.join(f.root, "elsewhere") }));
-      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id, options)).rejects.toThrow(
-        "Resident config.json no longer matches the config this removal was given; refusing offline removal");
-      expectUnchanged(f, actor.id);
-    } finally { restore(); directoryAcl.mockRestore(); fileAcls.mockRestore(); await f.close(); }
-  }, 40_000);
-
-  it("offline: config.json selecting other actor registries under the fence refuses before any change (residentActorRoots, smarty-dev#6001)", async () => {
-    const f = await fixture();
-    try {
-      const actor = await f.create("moved-registry");
-      await f.killResident();
-      const configPath = path.join(f.config.residencyRoot, "config.json");
-      const elsewhere = path.join(f.root, "elsewhere");
-      for (const changed of [{ actorRoot: elsewhere }, { sessionActorRoot: elsewhere }]) {
-        fs.writeFileSync(configPath, JSON.stringify({ ...f.config, ...changed }));
-        await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id,
-          { confirmDeadRoot: f.config.rootId, mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) }))
-          .rejects.toThrow("Resident root identity changed under the fence");
-        expectUnchanged(f, actor.id);
-      }
-      fs.writeFileSync(configPath, JSON.stringify(f.config));
-      await expect(removeActorOffline(f.config.residencyRoot, f.config, actor.id,
-        { dryRun: true, confirmDeadRoot: f.config.rootId, mainStoppedAudit: mainStoppedAudit(f.config.rootId, EVIDENCE) }))
-        .resolves.toMatchObject({ offline: true, dryRun: true, actor: { id: actor.id } });
-    } finally { await f.close(); }
   }, 40_000);
 
   it("offline: a nested dir swapped for a symlink before the rename leaves the outside target untouched", async () => {

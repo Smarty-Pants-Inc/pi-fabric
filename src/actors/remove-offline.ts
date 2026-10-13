@@ -21,7 +21,6 @@ import { acquireMainPublicationFence, deleteRootActorTree } from "../topology/ma
 import { withParticipantFileTryLock } from "../topology/participant-files.js";
 import { assertResidentOperatorConfirmed, readResidentOperatorEvidence, type MainToolEvidence } from "../residency/operator-safety.js";
 import { residentActorRoots, residentHostId, residentRoot, type ResidentHostConfig } from "../residency/protocol.js";
-import { assertWindowsResidentMetadataPrivate, readResidentMetadataFile } from "../residency/windows-acl.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
 import { ActorBindingStore } from "./binding-store.js";
@@ -321,28 +320,9 @@ const readOfflineMarker = (actorRoot: string, id: string, rootId: string): Offli
   return marker;
 };
 
-/** The actor registries a config selects (residentActorRoots), or "" when it cannot say. */
-const actorScopeOf = (value: unknown): string => {
-  try {
-    const roots = residentActorRoots(value as ResidentHostConfig);
-    return typeof roots.project === "string" && typeof roots.session === "string" ? JSON.stringify([roots.project, roots.session]) : "";
-  } catch { return ""; }
-};
-const sameResidentScope = (value: Record<string, unknown>, config: ResidentHostConfig): boolean =>
-  value.format === 1 && value.rootId === config.rootId && value.meshRoot === config.meshRoot &&
-  typeof value.residencyRoot === "string" && value.residencyRoot === config.residencyRoot &&
-  actorScopeOf(value) !== "" && actorScopeOf(value) === actorScopeOf(config);
-
 export const removeActorOffline = async (directory: string, config: ResidentHostConfig, selector: string,
   options: { dryRun?: boolean; confirmDeadRoot?: string; mainStoppedAudit?: MainStoppedAudit } = {}): Promise<OfflineRemoveResult> => {
   const dryRun = options.dryRun === true;
-  // Windows: config.json and owner.json are trusted below only when no other account may write them or replace
-  // them through the directory (smarty-dev#6001), and the config handed in must be the verified file's content:
-  // it picks the actor registries (residentActorRoots) and the archive root.
-  const pins = await assertWindowsResidentMetadataPrivate([path.join(directory, "config.json"), path.join(directory, "owner.json")], "offline removal");
-  if (pins && !sameResidentScope(JSON.parse(readResidentMetadataFile(path.join(directory, "config.json"), pins, "offline removal")), config)) {
-    throw new Error("Resident config.json no longer matches the config this removal was given; refusing offline removal");
-  }
   assertOwnershipProvable(); // before the fence, any record or any mutation
   // The root's existing resident startup claim, held for the whole removal, in the host's own order
   // (startup claim, then host.lock): no resident host can start on this root meanwhile; it gets
@@ -363,8 +343,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
     };
     const config2 = readOwned(path.join(directory, "config.json"));
     if (config2.format !== 1 || config2.rootId !== config.rootId || typeof config2.residencyRoot !== "string" ||
-        path.resolve(config2.residencyRoot) !== path.resolve(directory) || config2.meshRoot !== config.meshRoot ||
-        actorScopeOf(config2) !== actorScopeOf(config)) {
+        path.resolve(config2.residencyRoot) !== path.resolve(directory) || config2.meshRoot !== config.meshRoot) {
       throw new Error("Resident root identity changed under the fence");
     }
     mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents,

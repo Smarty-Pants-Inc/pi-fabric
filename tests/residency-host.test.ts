@@ -22,7 +22,6 @@ import { ResidentHost, sweepResidentRuns } from "../src/residency/host.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
-import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -791,7 +790,6 @@ describe("resident tracked result preservation", () => {
     let fault: ReturnType<typeof vi.spyOn> | undefined;
     try {
       if (platformCase === "win32-injected") {
-        installSimulatedWindowsRequestsAcl();
         Object.defineProperty(process, "platform", { ...platform, value: "win32" });
         Object.defineProperty(process, "getuid", { configurable: true, writable: true, value: undefined });
         // Exercise the product Windows exclusive-create claim, not the POSIX adapter.

@@ -84,7 +84,6 @@ import { completionRecipientFromRun, saveCompletion } from "../agents/completion
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { ResidentRequestRetention } from "./retention.js";
-import { prepareResidentRequestsDirectory, WindowsRequestsGuard } from "./windows-acl.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -251,7 +250,6 @@ export class ResidentHost {
   readonly #lockPath: string;
   readonly #errorPath: string;
   readonly #requestsPath: string;
-  readonly #requestsGuard: WindowsRequestsGuard;
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
@@ -315,7 +313,6 @@ export class ResidentHost {
     this.#lockPath = path.join(config.residencyRoot, "host.lock");
     this.#errorPath = path.join(config.residencyRoot, "error.json");
     this.#requestsPath = path.join(config.residencyRoot, "requests");
-    this.#requestsGuard = new WindowsRequestsGuard(this.#requestsPath);
     this.#processingPath = path.join(config.residencyRoot, "processing");
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
@@ -698,11 +695,8 @@ export class ResidentHost {
       // The streaming request collector replays pending full archives before
       // terminal retention after readiness. Failed sinks retain their sources.
       this.#initialize();
-      // Requests are unauthenticated files: on Windows, refuse to serve unless only
-      // this user, SYSTEM and Administrators own or can write the directory, the
-      // residency directory and its parent (which could otherwise replace it).
-      await this.#requestsGuard.prepare();
-      await prepareResidentRequestsDirectory(this.#processingPath);
+      fs.mkdirSync(this.#requestsPath, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
       this.#recoverInterruptedRequests();
@@ -1195,26 +1189,14 @@ export class ResidentHost {
     if (this.#staged || this.#handover) { await this.#advanceRelease(); return; }
     this.#pollingRequests = true;
     try {
-      if (this.#requestsGuard.refusal) return;
       let entries: string[];
       try {
         entries = fs.readdirSync(this.#requestsPath).filter((entry) => entry.endsWith(".json"));
       } catch {
         return;
       }
-      if (entries.length === 0) return;
-      this.#idleSince = undefined;
-      try {
-        // Windows: the directory must still be the verified one, with a private DACL.
-        await this.#requestsGuard.assertBeforeConsume();
-      } catch (error) {
-        // Latched: one clear error, then no request is consumed until a restart re-verifies.
-        console.error(`[pi-fabric] ${error instanceof Error ? error.message : String(error)}`);
-        return;
-      }
-      // Windows: a file planted before the DACL was tightened keeps its own owner and
-      // DACL. Each file is validated first; a violating one is quarantined, never consumed.
-      for (const entry of await this.#requestsGuard.screenPending(entries.slice(0, 32))) {
+      if (entries.length) this.#idleSince = undefined;
+      for (const entry of entries.slice(0, 32)) {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
@@ -1341,9 +1323,8 @@ export class ResidentHost {
   }
 
   #hasPendingRequest(): boolean {
-    // A refused requests directory is not served, so its files must not keep the host alive.
     return !!(this.#pollingRequests || this.#admissions || this.#boundaryRequests.size) ||
-      [...(this.#requestsGuard.refusal ? [] : [this.#requestsPath]), this.#processingPath].some(directory => {
+      [this.#requestsPath, this.#processingPath].some(directory => {
         try { return fs.readdirSync(directory).some(entry => entry.endsWith(".json")); }
         catch { return true; } // Unreadable queues cannot certify emptiness.
       });

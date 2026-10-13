@@ -19,7 +19,6 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { projectOf } from "../src/topology/project-identity.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricUiController } from "../src/ui/controller.js";
-import { installSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -91,7 +90,7 @@ const deferred = () => {
 const onPlatform = async (platform: "native" | "win32", operation: () => Promise<void>): Promise<void> => {
   const original = Object.getOwnPropertyDescriptor(process, "platform")!;
   try {
-    if (platform !== "native") { installSimulatedWindowsRequestsAcl(); Object.defineProperty(process, "platform", { ...original, value: platform }); }
+    if (platform !== "native") Object.defineProperty(process, "platform", { ...original, value: platform });
     await operation();
   } finally { Object.defineProperty(process, "platform", original); }
 };

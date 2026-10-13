@@ -241,9 +241,30 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
   return { minIntervalMs };
 }
 
+/** Window batching retains each observation; 0 keeps single-event activation. */
+export interface FabricActorBatching {
+  batchWindowMs?: number;
+  batchMax?: number;
+}
+
+export function normalizeActorBatching(value: unknown): FabricActorBatching {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid actor batching policy");
+  const input = value as Record<string, unknown>;
+  const result: FabricActorBatching = {};
+  for (const key of ["batchWindowMs", "batchMax"] as const) {
+    const number = input[key];
+    if (number === undefined) continue;
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < (key === "batchMax" ? 1 : 0)) {
+      throw new Error(`${key} must be a ${key === "batchMax" ? "positive" : "non-negative"} safe integer`);
+    }
+    result[key] = number;
+  }
+  return result;
+}
+
 /** Public creation input; file instructions are resolved only by the actor owner. */
 export type FabricActorCreateRequest = Omit<FabricActorRequest, "instructions"> & import("./instructions-file.js").FabricActorInstructionsSource;
-export interface FabricActorRequest {
+export interface FabricActorRequest extends FabricActorBatching {
   /** Resident-host create deduplication key; reuse on retry (host-local, bounded retention). */
   idempotencyKey?: string;
   /** Storage and visibility boundary. Defaults to mesh.actorScope for compatibility. */
@@ -334,7 +355,7 @@ export interface FabricActorSessionOrphan {
   alarmPublishedAt?: number;
 }
 
-export interface FabricActorInfo {
+export interface FabricActorInfo extends FabricActorBatching {
   id: string;
   scope: FabricActorStorageScope;
   name: string;

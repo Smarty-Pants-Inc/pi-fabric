@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
@@ -16,17 +17,66 @@ if (process.platform !== "win32") process.umask(0o022);
 const ci = process.env.CI === "true";
 
 // smarty-dev#4664/#11145: suites whose source references a product-deletion entrypoint are excluded before collection
-// outside hosted CI. A broad, conservative text heuristic (comments and quoted strings count), not a proof.
-// Substrings: actor removal (actors-cli, ActorManager.remove, remove-offline), storage removers (verifiedRemove,
-// retention/retention-cli --apply, scratch), mesh store cleanup (MeshStore, StoreBridgeSide), native Windows helper.
-export const productDeletionMarkers: readonly string[] = ["actors-cli", "fabric-actors", "actors/manager", "ActorManager",
-  "actors/remove-offline", "removeActorOffline", ".actors.remove(", "manager.remove(", "verifiedRemove",
-  "storage/verified-remove", "storage/retention", "storage/scratch", "removeEmptyRunRoot", "sweepTempRunRoots",
+// outside hosted CI. Syntactic (TypeScript AST; comments and plain string mentions do not count), not a proof.
+// A suite qualifies by importing/requiring a deletion entry module, calling a deletion function, calling .remove with
+// an actor-manager import (or on a .actors/manager receiver), calling .publishBatch/.prune/.compact with a mesh
+// store/bridge import, or spawning/executing fabric-win-remove or a retention CLI with --apply.
+export const productDeletionMarkers: readonly string[] = ["actors-cli", "actors/remove-offline",
+  "storage/verified-remove", "storage/retention", "storage/scratch", "mesh/event-log"];
+const deletionCalls = new Set(["verifiedRemove", "removeActorOffline", "removeEmptyRunRoot", "sweepTempRunRoots",
   "removeUnreferencedRun", "compactTerminalRunEvents", "pruneActorRunArchives", "pruneActorSessionBackups",
-  "sweepScratch", "closeScratch", "deleteRootActorTree", "MeshStore", "StoreBridgeSide", "pruneDeadCensusRecords",
-  "mesh/store", "mesh/bridge", "mesh/event-log", "fabric-win-remove"];
+  "sweepScratch", "closeScratch", "deleteRootActorTree", "pruneDeadCensusRecords"]);
+const meshCalls = new Set(["publishBatch", "prune", "compact"]);
+const execCalls = new Set(["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork", "execa"]);
 
-/** Sorted `tests/<relative>` paths of `.test.ts` files under testRoot that mention a marker; [] on GitHub Actions. */
+function literals(node: ts.Node, out: string[] = []): string[] {
+  if (ts.isStringLiteralLike(node)) out.push(node.text);
+  ts.forEachChild(node, (child) => { literals(child, out); });
+  return out;
+}
+
+/** True when the parsed suite syntactically reaches a product-deletion entrypoint. */
+function reachesProductDeletion(path: string, source: string): boolean {
+  const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const modules: string[] = [];
+  const calls: { name: string; receiver: string | undefined; args: string[] }[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause, bindings = clause?.namedBindings;
+      const typeOnly = clause?.isTypeOnly || (!clause?.name && bindings && ts.isNamedImports(bindings)
+        && bindings.elements.length > 0 && bindings.elements.every((entry) => entry.isTypeOnly));
+      if (!typeOnly && ts.isStringLiteralLike(node.moduleSpecifier)) modules.push(node.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier
+      && ts.isStringLiteralLike(node.moduleSpecifier)) modules.push(node.moduleSpecifier.text);
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const first = node.arguments[0];
+      if ((callee.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(callee) && callee.text === "require"))
+        && first && ts.isStringLiteralLike(first)) modules.push(first.text);
+      const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : "";
+      const target = ts.isPropertyAccessExpression(callee) ? callee.expression : undefined;
+      const receiver = target && ts.isPropertyAccessExpression(target) ? target.name.text
+        : target && ts.isIdentifier(target) ? target.text : undefined;
+      if (name) calls.push({ name, receiver, args: node.arguments.flatMap((arg) => literals(arg)) });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  const imports = (...needles: string[]) => modules.some((m) => {
+    const module = m.replace(/\.[cm]?[jt]s$/, "");
+    return needles.some((needle) => module === needle || module.endsWith("/" + needle));
+  });
+  if (imports(...productDeletionMarkers)) return true;
+  const managerImport = imports("actors/manager", "fabric-actors");
+  const meshImport = imports("mesh/store", "mesh/bridge");
+  return calls.some(({ name, receiver, args }) => deletionCalls.has(name)
+    || (name === "remove" && (managerImport || receiver === "actors" || receiver === "manager"))
+    || (meshImport && meshCalls.has(name))
+    || (execCalls.has(name) && (args.some((arg) => arg.includes("fabric-win-remove"))
+      || (args.includes("--apply") && args.some((arg) => arg.includes("retention"))))));
+}
+
+/** Sorted `tests/<relative>` paths of `.test.ts` files under testRoot reaching product deletion; [] on GitHub Actions. */
 export function productDeletionSuites(testRoot = fileURLToPath(new URL("./tests", import.meta.url))): string[] {
   if (process.env.GITHUB_ACTIONS === "true") return [];
   const found: string[] = [];
@@ -39,8 +89,7 @@ export function productDeletionSuites(testRoot = fileURLToPath(new URL("./tests"
       if (entry.isDirectory()) walk(path);
       else if (entry.name.endsWith(".test.ts") && (entry.isFile() || entry.isSymbolicLink())) {
         const source = readFileSync(path, "utf8"); // Unreadable sources stop config evaluation, not bypass the scan.
-        if (productDeletionMarkers.some((marker) => source.includes(marker))
-          || (source.includes("retention") && source.includes("--apply"))) {
+        if (reachesProductDeletion(path, source)) {
           found.push(`tests/${relative(testRoot, path).split(sep).join("/")}`);
         }
       }

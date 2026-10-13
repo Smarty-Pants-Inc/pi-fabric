@@ -290,7 +290,7 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
 
 // smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. The config derives them by
 // scanning test sources for its exported markers; this file keeps the original six plus every actor-remove suite
-// as an independent floor. No marker text appears in this source, so the scanner cannot select this file.
+// as an independent floor. Comment/string-only mentions and a non-deleting import remain eligible locally.
 const originalSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
   "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
   "tests/scratch-platform-retention.test.ts"];
@@ -325,8 +325,14 @@ if (out.exported) {
   out.markerFound = typeof text === "string" && text.length > 0;
   if (out.markerFound) {
     fs.mkdirSync(fixtureRoot + "/nested", { recursive: true });
-    fs.writeFileSync(fixtureRoot + "/nested/marker.test.ts", "/* fixture */\\n" + text + "\\n");
-    fs.writeFileSync(fixtureRoot + "/nested/helper.ts", "/* fixture */\\n" + text + "\\n");
+    const entry = "import { main } from " + JSON.stringify("../src/" + text + ".js") + ";\\n";
+    fs.writeFileSync(fixtureRoot + "/nested/marker.test.ts", entry);
+    fs.writeFileSync(fixtureRoot + "/nested/helper.ts", entry);
+    fs.writeFileSync(fixtureRoot + "/comment.test.ts", "/* " + text + " */\\n");
+    fs.writeFileSync(fixtureRoot + "/string.test.ts", "const marker = " + JSON.stringify(text) + ";\\n");
+    fs.writeFileSync(fixtureRoot + "/mesh-import.test.ts", 'import { MeshStore } from "../src/mesh/store.js";\\n');
+    fs.writeFileSync(fixtureRoot + "/type-import.test.ts", "import type { Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
+    fs.writeFileSync(fixtureRoot + "/type-specifier.test.ts", "import { type Options } from " + JSON.stringify("../src/" + text + ".js") + ";\\n");
     fs.writeFileSync(fixtureRoot + "/neutral.test.ts", "export const neutral = 1;\\n");
     out.fixture = mod.productDeletionSuites(fixtureRoot);
   }
@@ -362,6 +368,7 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
       const suites = output.suites!;
       expect(suites).toEqual(expect.arrayContaining(required));
       expect(suites).not.toContain(ownSuite);
+      expect(suites).not.toContain("tests/test-fleet-isolation.test.ts");
       for (const suite of suites) expect(suite).toMatch(/^tests\/(?:[^/\\]+\/)*[^/\\]+\.test\.ts$/);
       expect(suites.filter((suite) => !output.exclude.includes(suite))).toEqual([]);
       expect(output.fixture).toEqual(["tests/nested/marker.test.ts"]);

@@ -582,7 +582,7 @@ describe("final pre-delete check fences", () => {
     expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
   });
 
-  it("keeps the overlapped candidate and plans the next after an unrelated actors.json appears after the probe (race 2)", async () => {
+  it("plans the old run after a stable recheck of an unrelated actors.json appearing after the probe (race 2)", async () => {
     const mesh = deadRootMesh();
     const session = path.join(mesh.root, "actors", "01a118ab-new-session");
     fs.mkdirSync(session, { recursive: true }); // listed, watched, no registry yet
@@ -592,7 +592,7 @@ describe("final pre-delete check fences", () => {
     const injected = onStatusRead(mesh.old, () => { armed = true; });
     const lstat = fs.lstatSync;
     vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
-      // The probe has just reported no registry; the registry appears right after it.
+      // The probe reports no registry, then an unrelated registry appears: the stable recheck may plan the old run.
       const after = !armed || done || String(file) !== probe ? undefined : () => { done = true; create(); };
       try {
         const result = (lstat as (...args: unknown[]) => unknown)(file, ...rest);
@@ -605,7 +605,7 @@ describe("final pre-delete check fences", () => {
     }) as typeof fs.lstatSync);
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect([injected(), done]).toEqual([true, true]);
-    expect(plan.removedRuns).not.toContain(mesh.old);
+    expect(plan.removedRuns).toContain(mesh.old);
     expect(plan.removedRuns).toContain(mesh.orphan);
     expect(plan.removedRuns).not.toContain(mesh.latest);
     expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');

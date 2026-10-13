@@ -34,16 +34,25 @@ export const readAgentLineage = (
 };
 
 export interface AgentWritePolicyRequest {
+  /** Explicitly opt out of the task default; never escapes an inherited policy. */
+  writePolicy?: "unrestricted";
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";
 }
 
 export const requestsWritePolicy = (request: AgentWritePolicyRequest): boolean =>
-  request.readOnly !== undefined || request.writableRoots !== undefined || request.shell !== undefined;
+  request.writePolicy !== undefined || request.readOnly !== undefined || request.writableRoots !== undefined || request.shell !== undefined;
 
 /** Shape checks that must pass before admission or worktree side effects. */
 export const checkWritePolicyRequest = (request: AgentWritePolicyRequest): void => {
+  if (request.writePolicy !== undefined && request.writePolicy !== "unrestricted") {
+    throw new Error('writePolicy must be "unrestricted" or omitted');
+  }
+  if (request.writePolicy === "unrestricted" &&
+    (request.readOnly !== undefined || request.writableRoots !== undefined || request.shell !== undefined)) {
+    throw new Error('writePolicy: "unrestricted" cannot be combined with readOnly, writableRoots, or shell');
+  }
   if (request.readOnly !== undefined && typeof request.readOnly !== "boolean") {
     throw new Error("readOnly must be a boolean");
   }
@@ -84,6 +93,10 @@ export const resolveChildWritePolicy = (
   parent: FabricWritePolicy | undefined,
   cwd: string,
 ): FabricWritePolicy | undefined => {
+  if (request.writePolicy === "unrestricted") {
+    if (parent) throw new Error("A write-confined agent cannot launch an unrestricted child");
+    return undefined;
+  }
   if (!requestsWritePolicy(request)) return parent;
   const readOnly = request.readOnly ?? parent?.readOnly ?? false;
   if (parent?.readOnly && (!readOnly || request.writableRoots?.length)) {

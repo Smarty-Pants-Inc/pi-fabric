@@ -195,16 +195,16 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
-  it("never auto-selects a v1 worker without the receipt/attributed-refusal boundary", async () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe(2);
+  it.each([1, 2])("never auto-selects a v%s worker without the current terminal/task-scratch boundaries", async version => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(3);
     const f = fixture();
-    const legacy = f.release("legacy-terminal-protocol", 1);
+    const legacy = f.release("legacy-terminal-protocol", version);
     f.select(legacy);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await probe(f, f.parent);
     expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 1");
-    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 2");
+    expect(warn.mock.calls[0]?.[0]).toContain(`worker protocol ${version}`);
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 3");
   });
 
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {

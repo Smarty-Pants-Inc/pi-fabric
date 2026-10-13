@@ -1,0 +1,108 @@
+Running as unit: run-u1042794.scope; invocation ID: 8ad2356f57774580bd932c74e7efb7f2
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)
+[pi-fabric] Unfenced legacy control delivery count=1 operation=steer target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records timeout unknown without falsely treating admission as delivered
+[pi-fabric] Unfenced legacy control delivery count=1 operation=steer target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records timeout unknown without falsely treating admission as delivered
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=steer target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit
+[pi-fabric] resident completion/actor delivery: background operation failed: Fabric control plane closed
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability authority and host-only configuration > defaults empty; workspace cannot advertise capabilities or relax host remote policy
+[pi-fabric] /tmp/sM8vfHr/pi-fabric-vitest-3h8u7r/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+ ✓ |default| tests/remote-capability-tasks.test.ts (27 tests) 9827ms
+     ✓ a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox  915ms
+     ✓ status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit  1890ms
+     ✓ persists the caller proxy across restart, deduplicates unchanged keys, and retains terminal results after owner restart  966ms
+     ✓ retains owner-side deduplication beyond control claims, and refuses interrupted admission after restart  940ms
+     ✓ retains an unknown completion ACK and rekeys delivery to the same caller's restarted activation  637ms
+     ✓ allows host-authorized write and shell settings to narrow, and defaults an omitted cwd to execution-host TMPDIR  1299ms
+     ✓ refuses unknown and stale owners without publishing, and keeps local-capable/reserved-local tasks on A  969ms
+ ✓ |default| tests/agent-service.test.ts (25 tests) 1889ms
+     ✓ ends only the wait at its bound: the child keeps running, and a later join returns its result  1013ms
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > on the shared claim, the command is claimed on the next poll and runs once
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 11 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > between the shared and the own claim, the retry keeps its shared claim and runs once
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 96 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > while recording the outcome, the sender still gets it
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 87 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > of a detached ask, the bounded notification queue retries its outcome without re-execution
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 87 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > on the acknowledgement, the next poll publishes the real outcome, even past the deadline
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 72 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > does not retry an expiry acknowledgement without notRun, as an older owner sends
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+ ✓ |default| tests/control-plane.test.ts (111 tests) 45033ms
+     ✓ followUp advisory A6 validates incoming ACKs without changing success or retrying  397ms
+     ✓ retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing  10224ms
+     ✓ retains the remote owner's independent ASK deadline after Main stops observing  519ms
+       ✓ stamps the command's deadline at commit, and waits for a slow owner from there  3273ms
+       ✓ does not time out before its publish commits, however long the lock wait  3534ms
+       ✓ of a detached ask, the bounded notification queue retries its outcome without re-execution  335ms
+       ✓ on the acknowledgement, the next poll publishes the real outcome, even past the deadline  1399ms
+       ✓ do not run a command whose claim returned after its deadline  635ms
+       ✓ do not run a command whose claim waited for the owner's store lock past its deadline  725ms
+       ✓ keep the shared claim for a paused older runtime through the sweep and tombstone eviction  2373ms
+       ✓ are deleted only once expired and their command has left the log  4126ms
+     ✓ retains a completed ask outcome through its request deadline  331ms
+     ✓ waits past the deadline for the acknowledgement of a command the owner admitted in time  535ms
+     ✓ still times out, after the deadline plus a bounded grace, when no owner answers, and withdraws the unclaimed message  384ms
+     ✓ keeps the outcome unknown when the owner claimed the message before the sender timed out  309ms
+       ✓ answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry  1353ms
+       ✓ reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry  1364ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome  1338ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet  1332ms
+       ✓ retries a message once with a new command, and the owner delivers it once  1490ms
+       ✓ does not retry a command that is not a message  1358ms
+stderr | tests/agents-provider.test.ts > configured task model precedence (#2890, #6062) > global model/effort wins for main caller via run
+[pi-fabric] /tmp/sM8vfHr/pi-fabric-vitest-3h8u7r/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+stderr | tests/agents-provider.test.ts > terminal result observation receipts > keeps exactly one completion when terminal wait publication crosses the ceiling
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+

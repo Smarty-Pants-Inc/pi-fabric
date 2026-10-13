@@ -1,0 +1,568 @@
+Running as unit: run-u1042769.scope; invocation ID: d9293554978d403e9993a24812e4a122
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ❯ |default| tests/agents-provider.test.ts (530 tests | 1 failed | 529 skipped) 23ms
+     ↓ create retains and normalizes records through the provider
+     ↓ createActor retains and normalizes records through the provider
+     ↓ retains records in a global template and its live import
+     ↓ run refuses missing, blank and non-string reasons before any side effect
+     ↓ spawn refuses missing, blank and non-string reasons before any side effect
+     ↓ create refuses missing, blank and non-string reasons before any side effect
+     ↓ createActor refuses missing, blank and non-string reasons before any side effect
+     ↓ run covers all Astra provider prefixes and the reason length boundary
+     ↓ spawn covers all Astra provider prefixes and the reason length boundary
+     ↓ create covers all Astra provider prefixes and the reason length boundary
+     ↓ createActor covers all Astra provider prefixes and the reason length boundary
+     ↓ setModel refuses without a fresh reason and records an accepted session exception
+     ↓ setModel refuses without a fresh reason and records an accepted project exception
+     ↓ setModel refuses without a fresh reason and records an accepted global exception
+     ↓ keeps existing actors and template imports running without a retroactive reason requirement
+     ↓ honors an empty rollback list and a provider-qualified override
+     ↓ run accepts a reason and records it verbatim on the run
+     ↓ spawn accepts a reason and records it verbatim on the run
+     ↓ records a supplied reason for an unaffected model selection (undefined)
+     ↓ records a supplied reason for an unaffected model selection (cliproxyapi/gpt-6.1-sol)
+     ↓ create retains the reason in persistent definitions and activation run records
+     ↓ createActor retains the reason in persistent definitions and activation run records
+     ↓ run leaves omitted, inherited, other and alias model selections unaffected
+     ↓ spawn leaves omitted, inherited, other and alias model selections unaffected
+     ↓ create leaves omitted, inherited, other and alias model selections unaffected
+     ↓ createActor leaves omitted, inherited, other and alias model selections unaffected
+     ↓ public guest run receives the exact refusal
+     ↓ public guest spawn receives the exact refusal
+     ↓ public guest create receives the exact refusal
+     ↓ public guest createActor receives the exact refusal
+     ↓ round 5 F5 refuses veda backend-shortcut (explicit) before session submission
+     ↓ round 5 F5 refuses veda veda/gpt-6-astra (configured) before session submission
+     ↓ round 5 F5 refuses veda cliproxyapi/not-registered (explicit) before session submission
+     ↓ round 5 F5 refuses claude default (explicit) before session submission
+     ↓ round 5 F5 refuses claude anthropic/default (configured) before session submission
+     ↓ round 5 F5 refuses claude unknown-runtime-alias (explicit) before session submission
+     ↓ round 5 F5 refuses veda backend-shortcut (explicit) before durable submission
+     ↓ round 5 F5 refuses veda veda/gpt-6-astra (configured) before durable submission
+     ↓ round 5 F5 refuses veda cliproxyapi/not-registered (explicit) before durable submission
+     ↓ round 5 F5 refuses claude default (explicit) before durable submission
+     ↓ round 5 F5 refuses claude anthropic/default (configured) before durable submission
+     ↓ round 5 F5 refuses claude unknown-runtime-alias (explicit) before durable submission
+     ↓ round 5 F5 forwards allowed canonical alternate targets for session admission
+     ↓ round 5 F5 forwards allowed canonical alternate targets for durable admission
+     ↓ round 5 F5 preserves no-policy veda aliases for durable submission
+     ↓ round 5 F5 preserves no-policy claude aliases for durable submission
+     ↓ round 3 F3 refuses an unknown Veda backend default before session admission
+     ↓ round 3 F3 refuses an unknown Veda backend default before durable admission
+     ↓ round 3 F4 public cancellation during refresh leaves create uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves create uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves create uncommitted (revocation)
+     ↓ round 3 F4 public cancellation during refresh leaves global-create uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves global-create uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves global-create uncommitted (revocation)
+     ↓ round 3 F4 public cancellation during refresh leaves import uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves import uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves import uncommitted (revocation)
+     ↓ round 3 F4 public cancellation during refresh leaves session-set uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves session-set uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves session-set uncommitted (revocation)
+     ↓ round 3 F4 public cancellation during refresh leaves project-set uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves project-set uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves project-set uncommitted (revocation)
+     ↓ round 3 F4 public cancellation during refresh leaves global-set uncommitted (Escape)
+     ↓ round 3 F4 public cancellation during refresh leaves global-set uncommitted (deadline)
+     ↓ round 3 F4 public cancellation during refresh leaves global-set uncommitted (revocation)
+     ↓ F6 #3115 standalone Main creation needs no participants.self API
+     ↓ F6 #3115 missing child creation host fails closed before local commitment
+     ↓ F6 #3115 missing child creation host preserves a stopped predecessor
+     ↓ F6 #3115 main parent public create retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 main parent public create retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 main parent public create retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 main parent public create retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 main parent public create retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 main parent public create retains committed actor identity during presence publication (revocation)
+     ↓ F6 #3115 main parent public import retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 main parent public import retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 main parent public import retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 main parent public import retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 main parent public import retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 main parent public import retains committed actor identity during presence publication (revocation)
+     ↓ F6 #3115 task parent public create retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 task parent public create retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 task parent public create retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 task parent public create retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 task parent public create retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 task parent public create retains committed actor identity during presence publication (revocation)
+     ↓ F6 #3115 task parent public import retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 task parent public import retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 task parent public import retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 task parent public import retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 task parent public import retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 task parent public import retains committed actor identity during presence publication (revocation)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 actor parent public create retains committed actor identity during presence publication (revocation)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during registry publication (Escape)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during registry publication (deadline)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during registry publication (revocation)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during presence publication (Escape)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during presence publication (deadline)
+     ↓ F6 #3115 actor parent public import retains committed actor identity during presence publication (revocation)
+     ↓ round 3 F4 public cancellation under the binding lock cannot change a local overlay
+     ↓ review round F1 refuses explicit and default Veda backend selectors before session submission
+     ↓ review round F1 refuses explicit and default Veda backend selectors before durable submission
+     ↓ review round A3 exposes policy code to the public TypeScript guest for spawn
+     ↓ review round A3 exposes policy code to the public TypeScript guest for create
+     ↓ inherits the actor spawning run's admitted model and thinking
+     ↓ inherits the agent spawning run's admitted model and thinking
+     ↓ spawn refuses explicit, alias, inherited and default denied models before creation
+     ↓ create refuses explicit, alias, inherited and default denied models before creation
+     ↓ refuses denied unavailable keys before registry refresh, fuzzy fallback or durable admission
+     ↓ spawn admits an allowed explicit override of a denied default
+     ↓ create admits an allowed explicit override of a denied default
+     ↓ refuses denied actor setters, global setters and Main switches
+     ↓ global model/effort wins for main caller via run
+     ↓ global model/effort wins for main caller via spawn
+     ↓ global model/effort wins for actor caller via run
+     ↓ global model/effort wins for actor caller via spawn
+     ↓ global model/effort wins for agent caller via run
+     ↓ global model/effort wins for agent caller via spawn
+     ↓ project model/effort wins for main caller via run
+     ↓ project model/effort wins for main caller via spawn
+     ↓ project model/effort wins for actor caller via run
+     ↓ project model/effort wins for actor caller via spawn
+     ↓ project model/effort wins for agent caller via run
+     ↓ project model/effort wins for agent caller via spawn
+     ↓ unconfigured model inherits main caller via run, not the remote Main
+     ↓ unconfigured model inherits main caller via spawn, not the remote Main
+     ↓ unconfigured model inherits actor caller via run, not the remote Main
+     ↓ unconfigured model inherits actor caller via spawn, not the remote Main
+     ↓ unconfigured model inherits agent caller via run, not the remote Main
+     ↓ unconfigured model inherits agent caller via spawn, not the remote Main
+     ↓ explicit model/effort beats configured defaults for main caller via run
+     ↓ explicit model/effort beats configured defaults for main caller via spawn
+     ↓ explicit model/effort beats configured defaults for actor caller via run
+     ↓ explicit model/effort beats configured defaults for actor caller via spawn
+     ↓ explicit model/effort beats configured defaults for agent caller via run
+     ↓ explicit model/effort beats configured defaults for agent caller via spawn
+     ↓ configured thinking undefined has precedence over an alias, not built-in medium
+     ↓ configured thinking high has precedence over an alias, not built-in medium
+     ↓ routes a session actor child's spawner followUp to the actor, not root Main
+     ↓ routes a durable actor child's spawner followUp to the actor, not root Main
+     ↓ uses Main only for a Main spawner and refuses an absent binding without root fallback
+     ↓ R2 refuses unavailable or invalid exact role pin: provider/modle-a
+     ↓ R2 refuses unavailable or invalid exact role pin: modle-a
+     ↓ R2 refuses unavailable or invalid exact role pin: 
+     ↓ R2 refuses unavailable or invalid exact role pin: auto
+     ↓ R3 refuses known unsupported pin effort before Jev or spawn: {"reasoning":false,"effort":"high"}
+     ↓ R3 refuses known unsupported pin effort before Jev or spawn: {"reasoning":true,"effort":"max"}
+     ↓ R3 refuses known unsupported pin effort before Jev or spawn: {"reasoning":true,"thinkingLevelMap":{"high":null},"effort":"high"}
+     ↓ enforces the host deny policy on exact and aliased route pins: provider/model-a
+     ↓ enforces the host deny policy on exact and aliased route pins: role
+     ↓ records shadow choice yet launches the pin and appends actual outcome
+     ↓ routes explicit opt-in task:merge-additive on spawn and run, never from task text
+     ↓ routes explicit opt-in task:ci-test-fixture on spawn and run, never from task text
+     ↓ routes explicit opt-in task:exact-checks on spawn and run, never from task text
+     ↓ removes the quality reporting action without disabling opted-in LIVE
+     ↓ excludes protected/unknown before Jev at the public API: true
+     ↓ excludes protected/unknown before Jev at the public API: undefined
+     ↓ R2 refuses invalid explicit pins rather than substituting role config: null
+     ↓ R2 refuses invalid explicit pins rather than substituting role config: undefined
+     ↓ R2 refuses invalid explicit pins rather than substituting role config: 
+     ↓ R2 resolves explicit role aliases only to their exact targets
+     ↓ R2 refreshes a pin miss but remains exact after refresh
+     ↓ accepts explicit role-config pins, not inherited/default model or medium effort
+     ↓ rejects unsupported/missing inputs without dispatch: {}
+     ↓ rejects unsupported/missing inputs without dispatch: {}
+     ↓ rejects unsupported/missing inputs without dispatch: {"runner":"claude"}
+     ↓ rejects unsupported/missing inputs without dispatch: {"transport":"tmux"}
+     ↓ rejects unsupported/missing inputs without dispatch: {"residency":"durable"}
+     ↓ rejects unsupported/missing inputs without dispatch: {"routeClass":"bad/header"}
+     ↓ never resolves auto as a fuzzy model outside spawn: run
+     ↓ never resolves auto as a fuzzy model outside spawn: handoff
+     ↓ never resolves auto as a fuzzy model outside spawn: create
+     ↓ records a plain spawn as a derived task class without Jev
+     ↓ records a plain run as a derived task class without Jev
+     ↓ preserves an explicit history class on non-auto spawn without routing
+     ↓ preserves an explicit history class on non-auto run without routing
+     ↓ leaves explicit model calls unchanged and never asks Jev
+     ↓ spawn takes the Pi principal, ignoring model-authored provenance
+     ↓ run keeps an immutable UNKNOWN snapshot across async model preparation
+     ↓ spawn keeps an immutable UNKNOWN snapshot across async model preparation
+     ↓ ask keeps an immutable UNKNOWN snapshot across async model preparation
+     ↓ registry snapshots before awaited descriptor/argument preparation
+     ↓ steer carries the requester separately from payload
+     ↓ followUp carries the requester separately from payload
+     ↓ tell carries the requester separately from payload
+     ↓ returns five handles from one program with two running and three queued, then completes all five
+     ↓ preserves queued spawns after the calling program's short deadline
+     ↓ cancels a queued agent without ever creating its process and updates queue positions
+     ↓ session shutdown cancels returned queued handles without launching them
+     ↓ counts queued receipts against the per-execution budget and resets accounting for the next program
+     ↓ does not refund a cancelled queued receipt's execution budget
+     ↓ admits queued workers in FIFO order while preserving concurrency and nice
+     ↓ discovers a resident cleanup-only marker without restart and routes its exact id using retained ownership
+     ↓ reports and retries a cleanup-only project id through the provider, preserving its successor
+     ↓ reports and retries a cleanup-only session id through the provider, preserving its successor
+     ↓ preserves accepted native owner work at the Main ceiling (queued=false)
+     ↓ preserves accepted native owner work at the Main ceiling (queued=true)
+     ↓ preserves accepted mesh owner work at the Main ceiling (queued=false)
+     ↓ preserves accepted mesh owner work at the Main ceiling (queued=true)
+     ↓ keeps exactly one completion when terminal wait publication crosses the ceiling
+     ↓ keeps exactly one completion when terminal join publication crosses the ceiling
+     ↓ keeps exactly one completion when terminal status publication crosses the ceiling
+     ↓ keeps exactly one completion when terminal wait progress crosses the ceiling
+     ↓ keeps exactly one completion when terminal join progress crosses the ceiling
+     ↓ keeps exactly one completion when terminal wait serialization crosses the ceiling
+     ↓ keeps exactly one completion when terminal join serialization crosses the ceiling
+     ↓ keeps exactly one completion when terminal status serialization crosses the ceiling
+       ↓ keeps exactly one completion for terminal agents.wait after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after confirmed delivery until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after confirmed delivery until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after confirmed delivery until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.wait after confirmed delivery until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.join after confirmed delivery until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after write failure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after transport closure until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after ceiling cancellation until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after written then expired until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after written then closed until confirmed delivery
+       ↓ keeps exactly one completion for terminal agents.status after confirmed delivery until confirmed delivery
+     ↓ retains exactly one completion after cpython write success before guest admission and deadline
+     ↓ retains exactly one completion after cpython write success before guest admission and transport close
+     ↓ retains exactly one completion after node-process write success before guest admission and deadline
+     ↓ retains exactly one completion after node-process write success before guest admission and transport close
+     ↓ terminal agents.wait after Monty return before admission: expiry
+     ↓ terminal agents.wait after Monty return before admission: closure
+     ↓ terminal agents.wait after Monty return before admission: normal ack
+     ↓ terminal agents.wait after Monty return before admission: ack then expiry
+     ↓ terminal agents.join after Monty return before admission: expiry
+     ↓ terminal agents.join after Monty return before admission: closure
+     ↓ terminal agents.join after Monty return before admission: normal ack
+     ↓ terminal agents.join after Monty return before admission: ack then expiry
+     ↓ terminal agents.status after Monty return before admission: expiry
+     ↓ terminal agents.status after Monty return before admission: closure
+     ↓ terminal agents.status after Monty return before admission: normal ack
+     ↓ terminal agents.status after Monty return before admission: ack then expiry
+     ↓ keeps an unread completion after quickjs rejects result encoding, but not after delivered guest continuation
+     ↓ keeps an unread completion after node-process rejects result encoding, but not after delivered guest continuation
+     ↓ keeps an unread completion after monty rejects result encoding, but not after delivered guest continuation
+     ↓ keeps an unread completion after cpython rejects result encoding, but not after delivered guest continuation
+     ↓ answers agents.compact on an actor id with a pointer to resetSession, and routes resetSession
+     ↓ does not close shared runtime services when it is not the owner
+     ↓ closes agents even if actor shutdown fails, after stopping lifecycle delivery
+   ↓ throws for tell and followUp to a Main whose held queue is stalled
+     ↓ delivers exactly one local completion notification to main during a directory outage
+     ↓ delivers exactly one local completion notification to session:test during a directory outage
+     ↓ coalesces a burst of followUp lifecycle events into one wake delivery
+     ↓ delivers steer lifecycle events immediately without coalescing
+     ↓ keeps separate targets on separate wake deliveries
+     ↓ keeps single-event deliveries in the original message format
+     × exposes model-programmable residency on spawn and create 21ms
+     ↓ exposes actor activation overrides and scoped binding setters
+     ↓ exposes the Veda runner and per-run persona on run and spawn
+     ↓ rejects unavailable durable actor residency before creating an actor
+     ↓ routes durable creates and imports when the local registry is already owned
+     ↓ never hides resident uncertainty in local activation compensation or reclaim
+     ↓ lists live peer sessions separately from Main
+     ↓ keeps session: stop targets out of actor classification (#2386)
+     ↓ remote ask uses the unfenced legacy path for an epochless legacy peer
+     ↓ remote ask uses the unfenced legacy path for an epochless v1 peer
+     ↓ remote ask stamps the target's current directory epoch, not caller data
+     ↓ followUp refreshes an exact-id negative lookup using the same peers directory
+     ↓ steer refreshes an exact-id negative lookup using the same peers directory
+     ↓ tell refreshes an exact-id negative lookup using the same peers directory
+     ↓ followUp names a peers-listed root whose mirror is not admissible
+     ↓ steer names a peers-listed root whose mirror is not admissible
+     ↓ tell names a peers-listed root whose mirror is not admissible
+     ↓ #201 preserves directory-unavailable error metadata through normal TypeScript Fabric execution
+     ↓ #201 preserves incarnation-required error metadata through normal TypeScript Fabric execution
+     ↓ #201 preserves not-yet-mirrored error metadata through normal TypeScript Fabric execution
+     ↓ #201 preserves non-interactive error metadata through normal TypeScript Fabric execution
+     ↓ #201 preserves ambiguous error metadata through normal TypeScript Fabric execution
+     ↓ #201 preserves unresolved error metadata through normal TypeScript Fabric execution
+     ↓ #201 never exposes a sensitive marker through projectAgent provider construction or invocation
+     ↓ projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch
+     ↓ returns this session's project agent
+     ↓ never returns a mirrored root as the project agent, even newer than the native one
+     ↓ lists current and peer roots as symmetric session agents
+     ↓ creates, lists, and removes source-qualified lifecycle subscriptions
+     ↓ delivers lifecycle envelopes to Main with source identity and passive policy
+     ↓ rejects remote Main delivery after its capabilities are withdrawn
+     ↓ tells a sender that a quiesced Main is shutting down (smarty-dev#1113)
+     ↓ projects remote agents through members, scoped list, and status
+     ↓ omits actor activation runs from agents.list; the actor is listed by agents.actors
+     ↓ reports a mesh write stall from user-facing listings but not from local ones
+     ↓ defers handoff until the finalized outer Fabric result and records its class: undefined, interrupted=false
+     ↓ defers handoff until the finalized outer Fabric result and records its class: handoff-review, interrupted=false
+     ↓ defers handoff until the finalized outer Fabric result and records its class: undefined, interrupted=true
+     ↓ requires an explicit target model for handoff
+     ↓ exposes cwd on one-shot schemas but not handoff or actor definitions
+     ↓ rejects invalid durable recursive cwd before the provider can transfer ownership
+     ↓ joins successful Windows run -> public cleanup (worktree=false)
+     ↓ joins successful Windows run -> public cleanup (worktree=true)
+     ↓ joins successful Windows spawn -> public cleanup (worktree=false)
+     ↓ joins successful Windows spawn -> public cleanup (worktree=true)
+     ↓ shows the effective cwd in run and spawn launch activity
+     ↓ bounds and escapes control characters in cwd launch activity
+     ↓ returns the live status at the bound in an interactive Main; a task agent's wait still throws
+     ↓ bounds Main agents.run at 60 s without stopping its child (request undefined)
+     ↓ bounds Main agents.run at 60 s without stopping its child (request 86400000)
+     ↓ returns Main agents.run before a 60 s program ceiling and continues the guest
+     ↓ budgets successive Main wait observations against the same absolute ceiling
+     ↓ budgets successive Main join observations against the same absolute ceiling
+     ↓ budgets a durable Main wait observation without consuming its running result
+     ↓ budgets a durable Main join observation without consuming its running result
+     ↓ returns a live Main run and guest tail before a small ceiling through quickjs
+     ↓ returns a live Main run and guest tail before a small ceiling through node-process
+     ↓ returns a live Main run and guest tail before a small ceiling through monty
+     ↓ returns a live Main run and guest tail before a small ceiling through cpython
+     ↓ detaches a Main child with no progress when its program hits the ceiling: return agents.run({ task: "HANG", transport: "process" });
+     ↓ detaches a Main child with no progress when its program hits the ceiling: const child = await agents.spawn({ task: "HANG", transport: "process" }); while (true) await agents.wait({ id: child.id });
+     ↓ detaches only a zero-progress local actor ASK observation at the Main ceiling (tui, fullCodeMode=true, backend=quickjs)
+     ↓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=quickjs)
+     ↓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=node-process)
+     ↓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=monty)
+     ↓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=cpython)
+     ↓ still stops a zero-progress local actor ASK on Escape
+     ↓ still stops a zero-progress local actor ASK on ordinary deadline
+     ↓ still stops a zero-progress local actor ASK on explicit stop
+     ↓ still stops a zero-progress local actor ASK on non-Main abort
+     ↓ keeps explicit stop effective after Main's ceiling detaches a local ASK
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (quickjs, queued=false)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (quickjs, queued=true)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (node-process, queued=false)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (node-process, queued=true)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (monty, queued=false)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (monty, queued=true)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (cpython, queued=false)
+     ↓ rearms an early runtime Main deadline without cancelling accepted ASK work (cpython, queued=true)
+     ↓ does not trust guest exception text as a Main ceiling (quickjs)
+     ↓ does not trust guest exception text as a Main ceiling (node-process)
+     ↓ detaches accepted Main work when the first launch publication hits its ceiling
+     ↓ keeps ordinary Escape cancellation for zero-progress agents.run (rpc)
+     ↓ keeps ordinary Escape cancellation for zero-progress agents.run (tui)
+     ↓ keeps ordinary Escape cancellation for zero-progress agents.run (print)
+     ↓ preserves a queued local ASK and its late delivery at Main's ceiling
+     ↓ ends only the durable wait at the Main program ceiling, without stopping or acknowledging its run
+     ↓ exposes the compact option on handoff only and validates it before deferring
+     ↓ compacts the handed-off trajectory when the caller requests it
+     ↓ attaches a structured child-tool preview to blocking agent runs
+     ↓ refreshes bounded agent previews when only the transcript changes
+     ↓ acknowledges model-facing terminal status but not running status or UI polling
+     ↓ attaches previews and reports friendly names through wait for spawned agents
+     ↓ attaches previews and reports friendly names through join for spawned agents
+     ↓ attaches the final preview for actors that settle before the first poll
+     ↓ ignores actor timeout overrides below the configured default
+     ↓ enumerates Claude models and preserves runner on actors
+     ↓ #3307 actorStatus preserves preparing diagnostics without resident RPC and clears old receipts
+     ↓ #3307 actorStatus preserves waiting diagnostics without resident RPC and clears old receipts
+     ↓ #3307 actors preserves preparing diagnostics without resident RPC and clears old receipts
+     ↓ #3307 actors preserves waiting diagnostics without resident RPC and clears old receipts
+     ↓ actorStatus reads fresh running owner counts, then clears the settled run on idle
+     ↓ actors reads fresh running owner counts, then clears the settled run on idle
+     ↓ actorStatus reports unknown, not false idle/counts/run, for stale, missing, or wrong-kind owners
+     ↓ actors reports unknown, not false idle/counts/run, for stale, missing, or wrong-kind owners
+     ↓ actorStatus omits counters missing from a fresh old-version owner rather than falling back to registry counts
+     ↓ actors omits counters missing from a fresh old-version owner rather than falling back to registry counts
+     ↓ actorStatus preserves a stopped owner's active run and pending removal, but not an unavailable owner's state
+     ↓ actors preserves a stopped owner's active run and pending removal, but not an unavailable owner's state
+     ↓ leaves owned local actors and global templates unchanged without reading a remote owner
+     ↓ does not mkdir an embedded drive path when preparing a Windows absolute selection
+     ↓ rejects an explicitly empty run ID instead of falling back to the last run
+     ↓ rejects traversal to another actor's retained run through the public provider
+     ↓ rejects an absolute caller-selected run path through the public provider
+     ↓ rejects Windows drive absolute backslash caller run IDs before an unsafe join or filesystem read
+     ↓ rejects Windows drive absolute slash caller run IDs before an unsafe join or filesystem read
+     ↓ rejects Windows drive relative caller run IDs before an unsafe join or filesystem read
+     ↓ rejects UNC caller run IDs before an unsafe join or filesystem read
+     ↓ rejects rooted backslash caller run IDs before an unsafe join or filesystem read
+     ↓ rejects mixed separators caller run IDs before an unsafe join or filesystem read
+     ↓ rejects colon / alternate data stream caller run IDs before an unsafe join or filesystem read
+     ↓ rejects POSIX absolute caller run IDs before an unsafe join or filesystem read
+     ↓ rejects POSIX traversal caller run IDs before an unsafe join or filesystem read
+     ↓ rejects Windows traversal caller run IDs before an unsafe join or filesystem read
+     ↓ rejects uppercase hexadecimal caller run IDs before an unsafe join or filesystem read
+     ↓ rejects wrong length caller run IDs before an unsafe join or filesystem read
+     ↓ rejects a valid-shaped foreign actor run ID absent from the selected archive
+     ↓ rejects a foreign actor status copied into the selected actor archive
+     ↓ rejects an archive whose status identifies a different run
+     ↓ rejects a symlinked retained run outside the selected actor archive
+     ↓ rejects symlinked event content outside an otherwise owned retained run
+     ↓ preserves legacy retained status without actor attribution only for a matching run ID
+     ↓ preserves the default current retained run after registry bootstrap
+     ↓ preserves default session reads and generation-bound older retained run paging
+     ↓ round 2 members keeps a legacy binding unknown under a diverging overlay with project defaults=false (#7682, #8487)
+     ↓ round 2 members keeps a legacy binding unknown under a diverging overlay with project defaults=true (#7682, #8487)
+     ↓ members reports the resolved run binding, not the project default or owner overlay (#7682)
+     ↓ refuses an unbound public log cursor instead of silently reusing bytes
+     ↓ exposes the shared definition, mailbox, and logs while keeping mutation owner-gated
+     ↓ routes passive-session ask and tell with the caller's pinned binding (retained=false)
+     ↓ routes passive-session ask and tell with the caller's pinned binding (retained=true)
+     ↓ routes steer and followUp to a remote agent through its owner
+     ↓ routes ask and tell for a remote actor absent from the local registry
+     ↓ executes one shared actor with each caller's session binding
+     ↓ creates a global template and lists it separately from project actors
+     ↓ imports a global template as a fresh live actor without history
+     ↓ exports a project actor to a global template without its history
+     ↓ export collides without overwrite and replaces with it
+     ↓ migrates a persistent actor model and thinking without replacing its session
+     ↓ exposes inference context create/update/readback and history-free export/import
+     ↓ updates tool allowlists for project actors and global templates
+     ↓ accepts the complete host-event catalog through create and setEvents
+     ↓ validates and updates delivery policies for project actors and global templates
+     ↓ edits instructions for project and global scopes
+     ↓ guards setInstructions against a >80% shrink in project and global scopes
+     ↓ removes a global template via scoped remove
+     ↓ points an unscoped remove of a global template to the global scope
+     ↓ discovers and addresses the root Main agent through its stable alias
+     ↓ steer routes to a local running agent and queues a steer command
+     ↓ accepts an owner-addressed control command for a local agent
+     ↓ steer routes to a local actor as a mailbox message
+     ↓ says why status and stop cannot resolve an id
+     ↓ stops a finished durable agent with its terminal record, not Unknown participant
+     ↓ says why status cannot resolve a remote Main, by alias and by id, after a write stall check
+     ↓ rejects an unknown remote id instead of broadcasting an unverified steer
+     ↓ creates an actor with a coalesceKey and sets, clears and validates it
+     ↓ creates and imports an actor with an explicit dedupeKey independently of coalesceKey
+     ↓ creates an actor with an activationFilter and sets, clears and validates it
+     ↓ setSteeringMode routes to a local agent
+     ↓ setSteeringMode throws for a non-local id (no mesh fallback)
+     ↓ setSteeringMode rejects an invalid mode
+     ↓ compact enqueues a compact entry for a running pi child
+     ↓ compact descriptor is agent-risk with required id
+     ↓ compact rejects an unknown id
+     ↓ maps a nested run tree onto recursive preview nodes
+     ↓ marks nodes whose descendants exceed the depth budget
+     ↓ caps the total node count across the breadth of the tree
+     ↓ labels actor-runs with the actor owner kind
+     ↓ describes the action with a required model selector
+     ↓ switches an exact provider/id and reports the previous model
+     ↓ resolves aliases configured in models.aliases with fallback chains
+     ↓ keeps the current model when the selector is already active
+     ↓ resolves inexact selectors to the closest match and reports the pick
+     ↓ resolves visible exact, fuzzy, and alias run models before spawning
+     ↓ preserves a case-insensitive alias thinking default in agents.run
+     ↓ preserves a case-insensitive alias thinking default in agents.spawn
+     ↓ keeps explicit thinking above an alias and the agent default below it
+     ↓ rejects unavailable exact models for agents.run
+     ↓ rejects unavailable exact models for agents.spawn
+     ↓ refuses closest-match models for agents.spawn and agents.create but keeps exact ids and aliases (smarty-dev#3326)
+     ↓ refuses ranked closest activation overrides for agents.ask without activity
+     ↓ refuses ranked closest activation overrides for agents.tell without activity
+     ↓ keeps exact ids and configured aliases for agents.ask activation overrides without activity
+     ↓ keeps exact ids and configured aliases for agents.tell activation overrides without activity
+     ↓ allows exact marker-name alias closest in public spawn/create
+     ↓ allows exact marker-name alias recent in public spawn/create
+     ↓ allows exact marker-name alias latest in public spawn/create
+     ↓ returns chosen model and via for run, setModel and import without activity
+     ↓ preserves effective model under a different session overlay with closest provenance
+     ↓ preserves observed run model when it differs from closest launch selection
+     ↓ refuses inexact handoff before the outer boundary but keeps exact ids and aliases
+     ↓ refuses inexact handoff at the executor boundary before launching
+     ↓ launches near-miss models canonically while isolating unrelated batch failures
+     ↓ rejects exhausted Pi model aliases instead of forwarding them
+     ↓ rejects unavailable Pi models for handoff and actor creation
+     ↓ rejects unavailable actor setModel and activation overrides
+     ↓ passes Claude and Veda model strings through unchanged
+     ↓ rejects unknown selectors and exhausted alias chains
+     ↓ surfaces host switch failures as errors
+     ↓ rejects when Main is not a local host with model control
+     ↓ requires a non-empty model selector
+     ↓ routes resident setters without promoting session model/thinking to project
+     ↓ resident setModel requires a named exception before submission and forwards its metering reason
+     ↓ returns model and via from resident model setters without activity
+     ↓ captures the turn principal for every Main-routed setter, never action args or inherited authority
+     ↓ rejects resident setters from inherited Main with a typed error before routing
+     ↓ rejects resident setters from actor with local flag with a typed error before routing
+     ↓ rejects resident setters from task with local flag with a typed error before routing
+     ↓ rejects resident setters from different root identity with a typed error before routing
+     ↓ refuses tools beyond the caller ceiling even for native and global setters
+     ↓ forwards resident expiry to the execution owner
+     ↓ returns host effective status/list rather than a stale Main overlay
+     ↓ keeps remote agents.ask model overrides raw for execution-owner resolution without activity
+     ↓ keeps remote agents.tell model overrides raw for execution-owner resolution without activity
+     ↓ sends only raw own-root ask/tell overrides; steer defaults are not auto-resolved into pins
+     ↓ keeps foreign caller session bindings local and refuses foreign project mutations/removal
+     ↓ keeps a plain session actor local when no root resident owner exists
+     ↓ keeps all setter global template mutations global and supports clearing model/thinking
+     ↓ off selects the expected actual worker model/thinking
+     ↓ shadow selects the expected actual worker model/thinking
+     ↓ enforce selects the expected actual worker model/thinking
+     ↓ advertises all four caller complexity classes in the spawn schema
+     ↓ accepts delicate and forwards it verbatim in shadow mode
+     ↓ accepts delicate and forwards it verbatim in enforce mode
+     ↓ caller override {"model":"provider/project","thinking":"low"} bypasses router and is logged explicit
+     ↓ caller override {"thinking":"xhigh"} bypasses router and is logged explicit
+     ↓ router error process.stdout.write('garbage'); keeps worker defaults and records invalid-json
+     ↓ router error process.stdout.write(JSON.stringify({ model: 'provider/unknown', thinking: 'high' })); keeps worker defaults and records unknown-or-denied-model
+     ↓ router error setInterval(() => {}, 1000); keeps worker defaults and records timeout
+     ↓ router error process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'invalid' })); keeps worker defaults and records invalid-output
+     ↓ does not fuzzy-match or bypass host deny policy for a router pick
+     ↓ uses inherited model/thinking as the static default but does not mistake inheritance for explicit
+     ↓ lets an enforce pick override the inherited static default
+     ↓ shadow: a configured agents.model wins over the inherited model as the router's static default
+     ↓ enforce: a configured agents.model wins over the inherited model as the router's static default
+     ↓ create shares the hook once and freezes the enforce binding
+     ↓ createActor shares the hook once and freezes the enforce binding
+     ↓ forwards the selected model and complex complexity to a durable spawn without a second router call
+     ↓ forwards the selected model and delicate complexity to a durable spawn without a second router call
+     ↓ global templates and ordinary agents.run do not invoke the spawn-only router
+     ↓ validates complexity before command or launch
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |default| tests/agents-provider.test.ts > AgentsProvider runner support > exposes model-programmable residency on spawn and create
+AssertionError: expected { type: 'string', minLength: 1, …(2) } to deeply equal { type: 'string', minLength: 1, …(2) }
+
+- Expected
++ Received
+
+  {
+-   "description": "Retry key. Remote capability spawns persist the same-key unchanged-input route/outcome across caller and owner restarts; interrupted owner claims return FABRIC_REMOTE_TASK_LOST, never replay. Local durable spawn keys remain host-local/bounded as described for actor creation.",
++   "description": "Optional durable create/spawn retry key. Same operation and key on the same resident host returns the first result (last 256 completed requests, up to 10 minutes). Different or omitted keys create independently; no deduplication across host restarts or for session/global creation.",
+    "maxLength": 256,
+    "minLength": 1,
+    "type": "string",
+  }
+
+ ❯ tests/agents-provider.test.ts:2190:45
+    2188|     expect(runProperties).not.toHaveProperty("residency");
+    2189|     expect(spawnProperties.idempotencyKey).toMatchObject({ type: "stri…
+    2190|     expect(createProperties.idempotencyKey).toEqual(spawnProperties.id…
+       |                                             ^
+    2191|     expect(runProperties).not.toHaveProperty("idempotencyKey");
+    2192|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 529 skipped (530)
+   Start at  21:35:16
+   Duration  4.61s (transform 3.51s, setup 78ms, import 4.39s, tests 23ms, environment 0ms)
+

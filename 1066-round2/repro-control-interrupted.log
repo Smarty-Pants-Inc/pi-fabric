@@ -1,0 +1,176 @@
+Running as unit: run-u1042771.scope; invocation ID: 1516e1cf17d34086ad89b23c8dd63f75
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ❯ |default| tests/control-plane.test.ts (111 tests | 1 failed | 110 skipped) 101ms
+     ↓ records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+     ↓ records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+     ↓ records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+     ↓ records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+     ↓ records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)
+     ↓ records timeout unknown without falsely treating admission as delivered
+     ↓ delivers ordinary control to older owners unfenced with one counted warning per request
+     ↓ counts one legacy warning even when a proven-notRun receipt causes a bounded resend
+     ↓ derives wake cause from the real event envelope, never a forged sender diagnostic
+     ↓ only sheds an optional warning, not delivery fields or an oversized core (oversized=false)
+     ↓ only sheds an optional warning, not delivery fields or an oversized core (oversized=true)
+     ↓ followUp advisory A6 validates incoming ACKs without changing success or retrying
+     ↓ retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing
+     ↓ still cancels the owner for Escape, never from guest ceiling text
+     ↓ still cancels the owner for ordinary timeout, never from guest ceiling text
+     ↓ still cancels the owner for forged ceiling, never from guest ceiling text
+     ↓ still cancels the owner for cloned ceiling, never from guest ceiling text
+     ↓ still cancels the owner for ceiling without policy, never from guest ceiling text
+     ↓ retains the remote owner's independent ASK deadline after Main stops observing
+     ↓ keeps the production local deadline at 5 s and does not run a command arriving just after it
+       ↓ observes a dynamic lapse after a live send, publishes once and cancels once
+       ↓ keeps waiting beyond the captured expiry when the lease is renewed, then accepts the valid bridge ACK
+       ↓ names a healthy bridge with a lost ACK without claiming link death or retry safety
+       ↓ does not trust wrong bridge, identity or target ACKs while watching a lease
+       ↓ settles lapse during publish completion without waiting, then cancels the committed command once
+       ↓ settles abort during publish completion without waiting, then cancels the committed command once
+       ↓ settles close during publish completion without waiting, then cancels the committed command once
+       ↓ lets a valid ACK win during publish and does not cancel on later lapse, abort or close
+       ↓ returns the lapse error without waiting for an in-flight cancellation
+       ↓ freezes cancellation destination forge while publication is blocked and ownership changes
+       ↓ freezes cancellation destination null while publication is blocked and ownership changes
+       ↓ refuses a known native routing snapshot when fresh admission finds a mirror
+       ↓ never retries a known native send into a newly mirrored owner
+       ↓ binds known native commands and ignores foreign stamped notRun after mirror takeover
+       ↓ does not start a watchdog or alter native ACKs when the read port returns no mirror
+       ↓ keeps no-port destinations unbound but refuses an unrevalidated explicit mirror
+       ↓ never adopts an unvalidated replacement link label
+       ↓ reports a proven expired mirrored steer as not delivered and safe to resend
+       ↓ reports a proven expired mirrored followUp as not delivered and safe to resend
+       ↓ reports a proven expired mirrored stop as not delivered and safe to resend
+       ↓ close owns a pending jittered steer resend
+       ↓ close owns a pending jittered followUp resend
+       ↓ uses configured bridge window 1, floored to 30000 ms
+       ↓ uses configured bridge window 60000, floored to 60000 ms
+       ↓ settles steer at admission + 45 s during a 46 s lock, even with failed reads
+       ↓ settles followUp at admission + 45 s during a 46 s lock, even with failed reads
+       ↓ allows the original ACK inside the bridge budget despite replacement, and clears the prearmed timer
+       ↓ does not let same-origin renewal extend the 45 s bridge budget
+       ↓ clears admission timer on abort while blocked, then cancels once after commit
+       ↓ clears admission timer on close while blocked, then cancels once after commit
+       ↓ clears admission timer on lapse while blocked, then cancels once after commit
+       ↓ preserves postcommit waits beyond 9 s for native
+       ↓ preserves postcommit waits beyond 9 s for legacy
+       ↓ preserves postcommit waits beyond 9 s for ask
+       ↓ preserves postcommit waits beyond 9 s for result-message
+       ↓ preserves postcommit waits beyond 9 s for stop
+       ↓ rejects replacement ACK origin ryzen2 with notRun without retry or native downgrade
+       ↓ rejects replacement ACK origin undefined with notRun without retry or native downgrade
+       ↓ rejects withdrawal ACK origin ryzen2 with notRun without retry or native downgrade
+       ↓ rejects withdrawal ACK origin undefined with notRun without retry or native downgrade
+       ↓ does not adopt a replacement on bounded retry with routing snapshot undefined
+       ↓ does not adopt a replacement on bounded retry with routing snapshot forge
+       ↓ keeps the original destination on a healthy mirrored notRun retry
+       ↓ accepts the original Forge ACK committed before withdrawal but consumed after it
+       ↓ does not revive a settled mirrored request when its original ACK arrives
+       ↓ stamps the command's deadline at commit, and waits for a slow owner from there
+       ↓ does not time out before its publish commits, however long the lock wait
+       ↓ on the shared claim, the command is claimed on the next poll and runs once
+       ↓ between the shared and the own claim, the retry keeps its shared claim and runs once
+       ↓ while recording the outcome, the sender still gets it
+       ↓ of a detached ask, the bounded notification queue retries its outcome without re-execution
+       ↓ on the acknowledgement, the next poll publishes the real outcome, even past the deadline
+       ↓ keep the outcome in the owner's own store; the shared state holds only the claim
+       ↓ left in the shared state by older runtimes still answer a replay, and stay there
+       ↓ run a command once when an older runtime of the same host checked it first and claims it later
+       ↓ run a command once when an older runtime of the same host claimed it first
+       ↓ do not run a command whose claim returned after its deadline
+       ↓ do not run a command whose claim waited for the owner's store lock past its deadline
+       ↓ in the shared state go once expired plus a grace when the fleet owner allows it and the command had its own deadline
+       ↓ keep the shared claim for a paused older runtime through the sweep and tombstone eviction
+       ↓ are deleted only once expired and their command has left the log
+     ↓ routes to one execution owner and returns its acknowledgement
+     ↓ round-trips boolean trigger receipts without inventing a legacy or malformed report
+     ↓ round-trips held wake reasons through control ACKs and validates malformed reports
+     ↓ passes the owner's followUp queue depth to the sender, and drops a malformed one
+     ↓ returns an authenticated result with the caller's actor binding
+     ↓ ignores an acknowledgement forged by a different mesh identity
+     ↓ recovers an unexpired current-incarnation command queued before polling starts
+     × rejects an interrupted durable claim as indeterminate after restart 100ms
+     ↓ does not re-execute a command republished after owner restart
+     ↓ rejects a replay outside the acknowledgement lifetime
+     ↓ does not answer a command whose sender stopped waiting long ago
+     ↓ answers a command a bridge delivered past its deadline with an expired ACK, never a silent skip
+     ↓ final-drains a command published immediately before close
+     ↓ does not re-execute a retained command after event-log compaction
+     ↓ keeps control traffic responsive while an ask is running and cancels the owner
+     ↓ fences an immediately cancelled command before mesh admission
+     ↓ retains a completed ask outcome through its request deadline
+     ↓ waits past the deadline for the acknowledgement of a command the owner admitted in time
+     ↓ still times out, after the deadline plus a bounded grace, when no owner answers, and withdraws the unclaimed message
+     ↓ keeps the outcome unknown when the owner claimed the message before the sender timed out
+     ↓ surfaces owner rejection instead of reporting an unverified queue
+       ↓ answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry
+       ↓ reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry
+       ↓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome
+       ↓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+       ↓ (f) loses the shared claim and does not report notRun when its cached read missed a later claim
+       ↓ does not retry an expiry acknowledgement without notRun, as an older owner sends
+       ↓ retries a message once with a new command, and the owner delivers it once
+       ↓ does not retry a command that is not a message
+       ↓ does not retry a message the owner rejected for another reason
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |default| tests/control-plane.test.ts > FabricControlPlane > rejects an interrupted durable claim as indeterminate after restart
+AssertionError: expected [ { …(10) } ] to deep equally contain ObjectContaining{…}
+
+- Expected:
+ObjectContaining {
+  "data": ObjectContaining {
+    "accepted": false,
+    "commandId": "command:interrupted",
+    "error": "Fabric control outcome is indeterminate after owner restart",
+  },
+}
+
++ Received:
+[
+  {
+    "createdAt": 1791927323458,
+    "data": {
+      "accepted": false,
+      "commandId": "command:interrupted",
+      "error": "Fabric control outcome is indeterminate after owner restart; do not replay accepted work",
+      "targetId": "agent:target",
+      "version": 1,
+    },
+    "from": {
+      "id": "host:receiver",
+      "kind": "main",
+      "name": "host:receiver",
+      "sessionId": "host:receiver",
+    },
+    "id": "44046302-9057-44d3-90d9-41cdcc4ae6e2",
+    "kind": "rejected",
+    "sender": {
+      "authority": "host",
+    },
+    "sequence": 2,
+    "to": "host:sender",
+    "topic": "fabric.control.ack",
+    "verification": "mesh",
+  },
+]
+
+ ❯ tests/control-plane.test.ts:1734:68
+    1732|
+    1733|     expect(receive).not.toHaveBeenCalled();
+    1734|     expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toC…
+       |                                                                    ^
+    1735|       expect.objectContaining({
+    1736|         data: expect.objectContaining({
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 110 skipped (111)
+   Start at  21:35:21
+   Duration  1.89s (transform 1.50s, setup 215ms, import 1.45s, tests 101ms, environment 0ms)
+

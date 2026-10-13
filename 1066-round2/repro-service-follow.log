@@ -1,0 +1,68 @@
+Running as unit: run-u1042768.scope; invocation ID: 6dd3d0e3954440cea1b9a01ef6fa1bfb
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ❯ |default| tests/agent-service.test.ts (25 tests | 1 failed | 24 skipped) 64ms
+     ↓ ends only the wait at its bound: the child keeps running, and a later join returns its result
+     ↓ bounds a wait without timeoutMs at the 5-minute default
+     ↓ clamps a larger timeoutMs to the 5-minute foreground limit
+     ↓ records hosted run history and protection without routing: undefined
+     ↓ records hosted run history and protection without routing: custom-review
+     ↓ shares native normalization/schema results, stable prepare identity, usage and private checkpoints
+     ↓ keeps hosted wait cancellation, admission, and result semantics identical
+     ↓ keeps hosted join cancellation, admission, and result semantics identical
+     ↓ consumes admitted failed starts, not denied asynchronous preparation
+     ↓ validates structured output using the native worker failure contract
+     ↓ admits exactly eight attempts atomically after nine concurrent preparations
+     ↓ uses per-parent concurrency without recursive semaphore deadlock and checks depth
+     ↓ rechecks authority after prepare and refuses stale admissions without charging
+     ↓ aborts only a waiter and leaves the admitted child running
+     ↓ stops descendants and waits for control acknowledgment before cleanup and waiter completion
+     ↓ restores paused children without ambient calls or automatic relaunch and resumes direct lineage
+     ↓ restores interrupted running records as paused, validates snapshots and rejects unsupported resume
+     ↓ reserves one continuation, denies concurrent resumes, and preserves a denied paused attempt
+     ↓ closes pending preparations and rejects unsupported requests even without discovery
+     ↓ preserves approval pauses on close, including an interrupted child's emitted checkpoint
+     ↓ continues completed and failed children and resets only trusted new-root admission epochs
+     ↓ acknowledges steer and compact only after the port finishes and drains in-flight controls
+     ↓ fences execution after asynchronous running publication and drains cleanup even when stop acknowledgment fails
+     ↓ drains background descendants admitted by live parents during natural completion
+     × follows up a running child and routes session/peer delivery through host topology 63ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |default| tests/agent-service.test.ts > hosted Fabric agent service > follows up a running child and routes session/peer delivery through host topology
+AssertionError: expected [ 'create', 'followUp', 'join', …(13) ] to deeply equal [ 'create', 'followUp', 'join', …(12) ]
+
+- Expected
++ Received
+
+@@ -4,10 +4,11 @@
+    "join",
+    "list",
+    "members",
+    "peers",
+    "remove",
++   "result",
+    "run",
+    "self",
+    "sessions",
+    "spawn",
+    "status",
+
+ ❯ tests/agent-service.test.ts:505:92
+    503|     const client = createAgentServiceClient(createAgentServiceHandler(…
+    504|     const provider = createAgentsProvider(client);
+    505|     expect((await provider.list({}, context)).map((descriptor) => desc…
+       |                                                                                            ^
+    506|       "create", "followUp", "join", "list", "members", "peers", "remov…
+    507|     ]);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 24 skipped (25)
+   Start at  21:35:15
+   Duration  871ms (transform 449ms, setup 35ms, import 593ms, tests 64ms, environment 0ms)
+

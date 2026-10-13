@@ -1,0 +1,63 @@
+Running as unit: run-u1040816.scope; invocation ID: fc0bc3e1c37e4761b8b684141439f7be
+$ bun run proof:artifact && node -e "require('node:fs').rmSync('dist',{recursive:true,force:true})" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && bun run assert:build-artifacts
+$ node scripts/verified-kernels.mjs --artifact
+Verified kernel artifact matches its proof sources and bridge.
+[pi-fabric] native helpers built UNPINNED with the host compiler: untrusted toolchain cache: /home/paul/.cache/pi-fabric/toolchains: ENOENT (smarty-dev#8121)
+
+  dist/fabric-runtime-state.js   919.4kb
+  dist/chunks/chunk-ED6LQUAP.js  593.5kb
+  dist/chunks/chunk-NFGNWWFY.js  361.2kb
+  dist/chunks/chunk-TUKXGFTL.js  331.8kb
+  dist/chunks/chunk-NWFFBJTB.js  251.5kb
+  dist/ui/dashboard.js           190.6kb
+  dist/chunks/chunk-GZRG6DR4.js  167.6kb
+  dist/chunks/chunk-2WHP53IP.js  145.7kb
+  dist/chunks/chunk-IUVKSX57.js  131.2kb
+  dist/ui/conversation.js        120.5kb
+  dist/mesh-bridge.js            117.0kb
+  dist/chunks/chunk-3AY6KKFN.js  114.3kb
+  dist/ui/settings.js            108.0kb
+  dist/records/service-main.js   104.6kb
+  dist/chunks/chunk-NMMJFS7O.js   98.4kb
+  dist/chunks/chunk-JDATQP4B.js   93.6kb
+  dist/chunks/chunk-3JGY6RT6.js   91.6kb
+  dist/chunks/chunk-NNTPJYQG.js   85.8kb
+  dist/chunks/chunk-HUHEHO23.js   84.3kb
+  dist/chunks/chunk-5SSOTPLX.js   78.8kb
+  ...and 550 more output files...
+
+⚡ Done in 217ms
+
+  dist/worker.js                     707.3kb
+  dist/mesh/mesh-backend-cli.js      674.5kb
+  dist/memory/file-worker.js         509.0kb
+  dist/storage/retention-cli.js      164.2kb
+  dist/storage/sweep-main.js          91.0kb
+  dist/worker.js.map                   1.9mb
+  dist/mesh/mesh-backend-cli.js.map    1.6mb
+  dist/memory/file-worker.js.map       1.3mb
+  dist/storage/retention-cli.js.map  881.1kb
+  dist/storage/sweep-main.js.map     407.9kb
+
+⚡ Done in 111ms
+
+  dist/guards/actor-bash-hook.js        4.5kb
+  dist/guards/sender-headers.js         3.1kb
+  dist/guards/model-route-hook.js       680b 
+  dist/guards/actor-bash-hook.js.map   15.3kb
+  dist/guards/sender-headers.js.map     7.6kb
+  dist/guards/model-route-hook.js.map   1.2kb
+
+⚡ Done in 17ms
+
+  dist/bash-idle-watchdog.js      4.0kb
+  dist/bash-idle-watchdog.js.map  8.3kb
+
+⚡ Done in 13ms
+
+  dist/records-service/service-main.mjs  303.9kb
+
+⚡ Done in 57ms
+$ node scripts/assert-build-artifacts.mjs
+[pi-fabric] native helpers are UNPINNED (gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)): a local build only (smarty-dev#8121)
+build artifacts and lazy startup graph verified (50 startup files, 1249150 startup bytes, 12418 bytes headroom, 73 stable lazy entries, 154 chunks)

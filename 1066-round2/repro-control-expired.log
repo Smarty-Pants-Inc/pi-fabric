@@ -1,0 +1,189 @@
+Running as unit: run-u1042772.scope; invocation ID: 2cdc51ac2ac448e2b3c021073440f5a4
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > does not retry an expiry acknowledgement without notRun, as an older owner sends
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+ ❯ |default| tests/control-plane.test.ts (111 tests | 3 failed | 102 skipped) 8662ms
+     ↓ records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+     ↓ records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+     ↓ records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+     ↓ records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+     ↓ records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)
+     ↓ records timeout unknown without falsely treating admission as delivered
+     ↓ delivers ordinary control to older owners unfenced with one counted warning per request
+     ↓ counts one legacy warning even when a proven-notRun receipt causes a bounded resend
+     ↓ derives wake cause from the real event envelope, never a forged sender diagnostic
+     ↓ only sheds an optional warning, not delivery fields or an oversized core (oversized=false)
+     ↓ only sheds an optional warning, not delivery fields or an oversized core (oversized=true)
+     ↓ followUp advisory A6 validates incoming ACKs without changing success or retrying
+     ↓ retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing
+     ↓ still cancels the owner for Escape, never from guest ceiling text
+     ↓ still cancels the owner for ordinary timeout, never from guest ceiling text
+     ↓ still cancels the owner for forged ceiling, never from guest ceiling text
+     ↓ still cancels the owner for cloned ceiling, never from guest ceiling text
+     ↓ still cancels the owner for ceiling without policy, never from guest ceiling text
+     ↓ retains the remote owner's independent ASK deadline after Main stops observing
+     ↓ keeps the production local deadline at 5 s and does not run a command arriving just after it
+       ↓ observes a dynamic lapse after a live send, publishes once and cancels once
+       ↓ keeps waiting beyond the captured expiry when the lease is renewed, then accepts the valid bridge ACK
+       ↓ names a healthy bridge with a lost ACK without claiming link death or retry safety
+       ↓ does not trust wrong bridge, identity or target ACKs while watching a lease
+       ↓ settles lapse during publish completion without waiting, then cancels the committed command once
+       ↓ settles abort during publish completion without waiting, then cancels the committed command once
+       ↓ settles close during publish completion without waiting, then cancels the committed command once
+       ↓ lets a valid ACK win during publish and does not cancel on later lapse, abort or close
+       ↓ returns the lapse error without waiting for an in-flight cancellation
+       ↓ freezes cancellation destination forge while publication is blocked and ownership changes
+       ↓ freezes cancellation destination null while publication is blocked and ownership changes
+       ↓ refuses a known native routing snapshot when fresh admission finds a mirror
+       ↓ never retries a known native send into a newly mirrored owner
+       ↓ binds known native commands and ignores foreign stamped notRun after mirror takeover
+       ↓ does not start a watchdog or alter native ACKs when the read port returns no mirror
+       ↓ keeps no-port destinations unbound but refuses an unrevalidated explicit mirror
+       ↓ never adopts an unvalidated replacement link label
+       ↓ reports a proven expired mirrored steer as not delivered and safe to resend
+       ↓ reports a proven expired mirrored followUp as not delivered and safe to resend
+       ↓ reports a proven expired mirrored stop as not delivered and safe to resend
+       ↓ close owns a pending jittered steer resend
+       ↓ close owns a pending jittered followUp resend
+       ↓ uses configured bridge window 1, floored to 30000 ms
+       ↓ uses configured bridge window 60000, floored to 60000 ms
+       ↓ settles steer at admission + 45 s during a 46 s lock, even with failed reads
+       ↓ settles followUp at admission + 45 s during a 46 s lock, even with failed reads
+       ↓ allows the original ACK inside the bridge budget despite replacement, and clears the prearmed timer
+       ↓ does not let same-origin renewal extend the 45 s bridge budget
+       ↓ clears admission timer on abort while blocked, then cancels once after commit
+       ↓ clears admission timer on close while blocked, then cancels once after commit
+       ↓ clears admission timer on lapse while blocked, then cancels once after commit
+       ↓ preserves postcommit waits beyond 9 s for native
+       ↓ preserves postcommit waits beyond 9 s for legacy
+       ↓ preserves postcommit waits beyond 9 s for ask
+       ↓ preserves postcommit waits beyond 9 s for result-message
+       ↓ preserves postcommit waits beyond 9 s for stop
+       ↓ rejects replacement ACK origin ryzen2 with notRun without retry or native downgrade
+       ↓ rejects replacement ACK origin undefined with notRun without retry or native downgrade
+       ↓ rejects withdrawal ACK origin ryzen2 with notRun without retry or native downgrade
+       ↓ rejects withdrawal ACK origin undefined with notRun without retry or native downgrade
+       ↓ does not adopt a replacement on bounded retry with routing snapshot undefined
+       ↓ does not adopt a replacement on bounded retry with routing snapshot forge
+       ↓ keeps the original destination on a healthy mirrored notRun retry
+       ↓ accepts the original Forge ACK committed before withdrawal but consumed after it
+       ↓ does not revive a settled mirrored request when its original ACK arrives
+       ↓ stamps the command's deadline at commit, and waits for a slow owner from there
+       ↓ does not time out before its publish commits, however long the lock wait
+       ↓ on the shared claim, the command is claimed on the next poll and runs once
+       ↓ between the shared and the own claim, the retry keeps its shared claim and runs once
+       ↓ while recording the outcome, the sender still gets it
+       ↓ of a detached ask, the bounded notification queue retries its outcome without re-execution
+       ↓ on the acknowledgement, the next poll publishes the real outcome, even past the deadline
+       ↓ keep the outcome in the owner's own store; the shared state holds only the claim
+       ↓ left in the shared state by older runtimes still answer a replay, and stay there
+       ↓ run a command once when an older runtime of the same host checked it first and claims it later
+       ↓ run a command once when an older runtime of the same host claimed it first
+       ↓ do not run a command whose claim returned after its deadline
+       ↓ do not run a command whose claim waited for the owner's store lock past its deadline
+       ↓ in the shared state go once expired plus a grace when the fleet owner allows it and the command had its own deadline
+       ↓ keep the shared claim for a paused older runtime through the sweep and tombstone eviction
+       ↓ are deleted only once expired and their command has left the log
+     ↓ routes to one execution owner and returns its acknowledgement
+     ↓ round-trips boolean trigger receipts without inventing a legacy or malformed report
+     ↓ round-trips held wake reasons through control ACKs and validates malformed reports
+     ↓ passes the owner's followUp queue depth to the sender, and drops a malformed one
+     ↓ returns an authenticated result with the caller's actor binding
+     ↓ ignores an acknowledgement forged by a different mesh identity
+     ↓ recovers an unexpired current-incarnation command queued before polling starts
+     ↓ rejects an interrupted durable claim as indeterminate after restart
+     ↓ does not re-execute a command republished after owner restart
+     ↓ rejects a replay outside the acknowledgement lifetime
+     ↓ does not answer a command whose sender stopped waiting long ago
+     ↓ answers a command a bridge delivered past its deadline with an expired ACK, never a silent skip
+     ↓ final-drains a command published immediately before close
+     ↓ does not re-execute a retained command after event-log compaction
+     ↓ keeps control traffic responsive while an ask is running and cancels the owner
+     ↓ fences an immediately cancelled command before mesh admission
+     ↓ retains a completed ask outcome through its request deadline
+     ↓ waits past the deadline for the acknowledgement of a command the owner admitted in time
+     ↓ still times out, after the deadline plus a bounded grace, when no owner answers, and withdraws the unclaimed message
+     ↓ keeps the outcome unknown when the owner claimed the message before the sender timed out
+     ↓ surfaces owner rejection instead of reporting an unverified queue
+       ✓ answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry  1371ms
+       × reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry 1383ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome  1330ms
+       × (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet 1349ms
+       × (f) loses the shared claim and does not report notRun when its cached read missed a later claim 184ms
+       ✓ does not retry an expiry acknowledgement without notRun, as an older owner sends 228ms
+       ✓ retries a message once with a new command, and the owner delivers it once  1435ms
+       ✓ does not retry a command that is not a message  1330ms
+       ✓ does not retry a message the owner rejected for another reason 50ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |default| tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry
+AssertionError: expected 'Fabric control outcome is indetermina…' to be 'Fabric control outcome is indetermina…' // Object.is equality
+
+Expected: "Fabric control outcome is indeterminate after owner restart"
+Received: "Fabric control outcome is indeterminate after owner restart; do not replay accepted work"
+
+ ❯ tests/control-plane.test.ts:2268:30
+    2266|     it("reports a claimed message without an outcome as indeterminate …
+    2267|       const { error, receive, commands, acks } = await restartPastDead…
+    2268|       expect(error?.message).toBe("Fabric control outcome is indetermi…
+       |                              ^
+    2269|       expect(commands).toHaveLength(1);
+    2270|       expect(acks).toHaveLength(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  |default| tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+AssertionError: expected 'Fabric control outcome is indetermina…' to be 'Fabric control outcome is indetermina…' // Object.is equality
+
+Expected: "Fabric control outcome is indeterminate after owner restart"
+Received: "Fabric control outcome is indeterminate after owner restart; do not replay accepted work"
+
+ ❯ tests/control-plane.test.ts:2309:35
+    2307|       const { value, error } = await outcome;
+    2308|       if (recorded) expect(value).toMatchObject({ acknowledged: true, …
+    2309|       else expect(error?.message).toBe("Fabric control outcome is inde…
+       |                                   ^
+    2310|       const acks = store.read({ topic: "fabric.control.ack", limit: 10…
+    2311|       expect(acks).toHaveLength(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  |default| tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (f) loses the shared claim and does not report notRun when its cached read missed a later claim
+AssertionError: expected { version: 1, …(4) } to match object { accepted: false, …(1) }
+(3 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+    "accepted": false,
+-   "error": "Fabric control outcome is indeterminate after owner restart",
++   "error": "Fabric control outcome is indeterminate after owner restart; do not replay accepted work",
+  }
+
+ ❯ tests/control-plane.test.ts:2341:19
+    2339|         { timeout: 3_000, interval: 20 });
+    2340|       const ack = store.read({ topic: "fabric.control.ack", limit: 10 …
+    2341|       expect(ack).toMatchObject({ accepted: false, error: "Fabric cont…
+       |                   ^
+    2342|       expect(ack).not.toHaveProperty("notRun");
+    2343|       expect(receive.mock.calls.length + olderDeliveries).toBe(1);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  3 failed | 6 passed | 102 skipped (111)
+   Start at  21:35:24
+   Duration  10.35s (transform 1.41s, setup 38ms, import 1.52s, tests 8.66s, environment 0ms)
+

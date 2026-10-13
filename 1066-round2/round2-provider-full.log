@@ -1,0 +1,256 @@
+Running as unit: run-u1042818.scope; invocation ID: 0eb54ea3043441d584806279f9c89b09
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/agents-provider.test.ts > configured task model precedence (#2890, #6062) > global model/effort wins for main caller via run
+[pi-fabric] /tmp/s7MEWK1/pi-fabric-vitest-I4Xdtj/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+stderr | tests/agents-provider.test.ts > terminal result observation receipts > keeps exactly one completion when terminal wait publication crosses the ceiling
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+ ✓ |default| tests/agents-provider.test.ts (530 tests) 179575ms
+     ✓ run covers all Astra provider prefixes and the reason length boundary  479ms
+     ✓ spawn covers all Astra provider prefixes and the reason length boundary  430ms
+     ✓ setModel refuses without a fresh reason and records an accepted session exception  452ms
+     ✓ setModel refuses without a fresh reason and records an accepted project exception  477ms
+     ✓ keeps existing actors and template imports running without a retroactive reason requirement  382ms
+     ✓ honors an empty rollback list and a provider-qualified override  743ms
+     ✓ run accepts a reason and records it verbatim on the run  406ms
+     ✓ spawn accepts a reason and records it verbatim on the run  409ms
+     ✓ records a supplied reason for an unaffected model selection (undefined)  347ms
+     ✓ records a supplied reason for an unaffected model selection (cliproxyapi/gpt-6.1-sol)  390ms
+     ✓ create retains the reason in persistent definitions and activation run records  476ms
+     ✓ createActor retains the reason in persistent definitions and activation run records  433ms
+     ✓ run leaves omitted, inherited, other and alias model selections unaffected  1481ms
+     ✓ spawn leaves omitted, inherited, other and alias model selections unaffected  1441ms
+     ✓ public guest run receives the exact refusal  894ms
+     ✓ round 5 F5 forwards allowed canonical alternate targets for session admission  779ms
+     ✓ round 3 F3 refuses an unknown Veda backend default before session admission  844ms
+     ✓ round 3 F4 public cancellation during refresh leaves create uncommitted (deadline)  1146ms
+     ✓ round 3 F4 public cancellation during refresh leaves global-create uncommitted (deadline)  1120ms
+     ✓ round 3 F4 public cancellation during refresh leaves import uncommitted (deadline)  1133ms
+     ✓ round 3 F4 public cancellation during refresh leaves session-set uncommitted (deadline)  1131ms
+     ✓ round 3 F4 public cancellation during refresh leaves project-set uncommitted (deadline)  1125ms
+     ✓ round 3 F4 public cancellation during refresh leaves global-set uncommitted (deadline)  1118ms
+     ✓ F6 #3115 main parent public create retains committed actor identity during registry publication (deadline)  1121ms
+     ✓ F6 #3115 main parent public create retains committed actor identity during presence publication (deadline)  1091ms
+     ✓ F6 #3115 main parent public import retains committed actor identity during registry publication (deadline)  1120ms
+     ✓ F6 #3115 main parent public import retains committed actor identity during presence publication (deadline)  1097ms
+     ✓ F6 #3115 task parent public create retains committed actor identity during registry publication (deadline)  1138ms
+     ✓ F6 #3115 task parent public create retains committed actor identity during presence publication (deadline)  1135ms
+     ✓ F6 #3115 task parent public import retains committed actor identity during registry publication (deadline)  1159ms
+     ✓ F6 #3115 task parent public import retains committed actor identity during presence publication (deadline)  1107ms
+     ✓ F6 #3115 actor parent public create retains committed actor identity during registry publication (deadline)  1126ms
+     ✓ F6 #3115 actor parent public create retains committed actor identity during presence publication (deadline)  1106ms
+     ✓ F6 #3115 actor parent public import retains committed actor identity during registry publication (deadline)  1106ms
+     ✓ F6 #3115 actor parent public import retains committed actor identity during presence publication (deadline)  1100ms
+     ✓ review round F1 refuses explicit and default Veda backend selectors before session submission  319ms
+     ✓ inherits the actor spawning run's admitted model and thinking  365ms
+     ✓ inherits the agent spawning run's admitted model and thinking  350ms
+     ✓ spawn admits an allowed explicit override of a denied default  335ms
+     ✓ global model/effort wins for main caller via run  339ms
+     ✓ global model/effort wins for main caller via spawn  410ms
+     ✓ global model/effort wins for actor caller via run  391ms
+     ✓ global model/effort wins for actor caller via spawn  457ms
+     ✓ global model/effort wins for agent caller via run  362ms
+     ✓ global model/effort wins for agent caller via spawn  386ms
+     ✓ project model/effort wins for main caller via run  383ms
+     ✓ project model/effort wins for main caller via spawn  407ms
+     ✓ project model/effort wins for actor caller via run  409ms
+     ✓ project model/effort wins for actor caller via spawn  437ms
+     ✓ project model/effort wins for agent caller via run  384ms
+     ✓ project model/effort wins for agent caller via spawn  387ms
+     ✓ unconfigured model inherits main caller via run, not the remote Main  345ms
+     ✓ unconfigured model inherits main caller via spawn, not the remote Main  404ms
+     ✓ unconfigured model inherits actor caller via run, not the remote Main  437ms
+     ✓ unconfigured model inherits actor caller via spawn, not the remote Main  383ms
+     ✓ unconfigured model inherits agent caller via run, not the remote Main  373ms
+     ✓ unconfigured model inherits agent caller via spawn, not the remote Main  386ms
+     ✓ explicit model/effort beats configured defaults for main caller via run  329ms
+     ✓ explicit model/effort beats configured defaults for main caller via spawn  384ms
+     ✓ explicit model/effort beats configured defaults for actor caller via run  342ms
+     ✓ explicit model/effort beats configured defaults for actor caller via spawn  359ms
+     ✓ explicit model/effort beats configured defaults for agent caller via run  396ms
+     ✓ explicit model/effort beats configured defaults for agent caller via spawn  337ms
+     ✓ configured thinking undefined has precedence over an alias, not built-in medium  347ms
+     ✓ configured thinking high has precedence over an alias, not built-in medium  328ms
+     ✓ records shadow choice yet launches the pin and appends actual outcome  394ms
+     ✓ routes explicit opt-in task:merge-additive on spawn and run, never from task text  1097ms
+     ✓ routes explicit opt-in task:ci-test-fixture on spawn and run, never from task text  1067ms
+     ✓ routes explicit opt-in task:exact-checks on spawn and run, never from task text  1097ms
+     ✓ removes the quality reporting action without disabling opted-in LIVE  395ms
+     ✓ excludes protected/unknown before Jev at the public API: true  352ms
+     ✓ excludes protected/unknown before Jev at the public API: undefined  325ms
+     ✓ R2 resolves explicit role aliases only to their exact targets  421ms
+     ✓ R2 refreshes a pin miss but remains exact after refresh  338ms
+     ✓ accepts explicit role-config pins, not inherited/default model or medium effort  403ms
+     ✓ records a plain spawn as a derived task class without Jev  354ms
+     ✓ records a plain run as a derived task class without Jev  362ms
+     ✓ preserves an explicit history class on non-auto spawn without routing  338ms
+     ✓ preserves an explicit history class on non-auto run without routing  376ms
+     ✓ leaves explicit model calls unchanged and never asks Jev  351ms
+     ✓ returns five handles from one program with two running and three queued, then completes all five  1728ms
+     ✓ preserves queued spawns after the calling program's short deadline  3083ms
+     ✓ cancels a queued agent without ever creating its process and updates queue positions  642ms
+     ✓ session shutdown cancels returned queued handles without launching them  413ms
+     ✓ counts queued receipts against the per-execution budget and resets accounting for the next program  953ms
+     ✓ does not refund a cancelled queued receipt's execution budget  374ms
+     ✓ admits queued workers in FIFO order while preserving concurrency and nice  1075ms
+     ✓ preserves accepted native owner work at the Main ceiling (queued=false)  1090ms
+     ✓ preserves accepted native owner work at the Main ceiling (queued=true)  1419ms
+     ✓ preserves accepted mesh owner work at the Main ceiling (queued=false)  1136ms
+     ✓ preserves accepted mesh owner work at the Main ceiling (queued=true)  1534ms
+     ✓ keeps exactly one completion when terminal wait publication crosses the ceiling  424ms
+     ✓ keeps exactly one completion when terminal join publication crosses the ceiling  370ms
+     ✓ keeps exactly one completion when terminal status publication crosses the ceiling  364ms
+     ✓ keeps exactly one completion when terminal wait progress crosses the ceiling  354ms
+     ✓ keeps exactly one completion when terminal wait serialization crosses the ceiling  377ms
+     ✓ keeps exactly one completion when terminal join serialization crosses the ceiling  330ms
+       ✓ keeps exactly one completion for terminal agents.wait after write failure until confirmed delivery  452ms
+       ✓ keeps exactly one completion for terminal agents.wait after transport closure until confirmed delivery  357ms
+       ✓ keeps exactly one completion for terminal agents.wait after ceiling cancellation until confirmed delivery  373ms
+       ✓ keeps exactly one completion for terminal agents.wait after written then expired until confirmed delivery  395ms
+       ✓ keeps exactly one completion for terminal agents.wait after written then closed until confirmed delivery  440ms
+       ✓ keeps exactly one completion for terminal agents.wait after confirmed delivery until confirmed delivery  340ms
+       ✓ keeps exactly one completion for terminal agents.join after write failure until confirmed delivery  307ms
+       ✓ keeps exactly one completion for terminal agents.join after transport closure until confirmed delivery  384ms
+       ✓ keeps exactly one completion for terminal agents.join after ceiling cancellation until confirmed delivery  368ms
+       ✓ keeps exactly one completion for terminal agents.join after written then expired until confirmed delivery  394ms
+       ✓ keeps exactly one completion for terminal agents.join after written then closed until confirmed delivery  330ms
+       ✓ keeps exactly one completion for terminal agents.status after write failure until confirmed delivery  344ms
+       ✓ keeps exactly one completion for terminal agents.status after transport closure until confirmed delivery  304ms
+       ✓ keeps exactly one completion for terminal agents.status after ceiling cancellation until confirmed delivery  349ms
+       ✓ keeps exactly one completion for terminal agents.status after written then expired until confirmed delivery  313ms
+       ✓ keeps exactly one completion for terminal agents.status after written then closed until confirmed delivery  340ms
+       ✓ keeps exactly one completion for terminal agents.status after confirmed delivery until confirmed delivery  375ms
+       ✓ keeps exactly one completion for terminal agents.wait after write failure until confirmed delivery  308ms
+       ✓ keeps exactly one completion for terminal agents.wait after transport closure until confirmed delivery  331ms
+       ✓ keeps exactly one completion for terminal agents.wait after ceiling cancellation until confirmed delivery  322ms
+       ✓ keeps exactly one completion for terminal agents.wait after written then closed until confirmed delivery  312ms
+       ✓ keeps exactly one completion for terminal agents.wait after confirmed delivery until confirmed delivery  314ms
+       ✓ keeps exactly one completion for terminal agents.join after write failure until confirmed delivery  321ms
+       ✓ keeps exactly one completion for terminal agents.join after transport closure until confirmed delivery  353ms
+       ✓ keeps exactly one completion for terminal agents.join after ceiling cancellation until confirmed delivery  395ms
+       ✓ keeps exactly one completion for terminal agents.join after written then closed until confirmed delivery  315ms
+       ✓ keeps exactly one completion for terminal agents.join after confirmed delivery until confirmed delivery  344ms
+       ✓ keeps exactly one completion for terminal agents.status after write failure until confirmed delivery  342ms
+       ✓ keeps exactly one completion for terminal agents.status after transport closure until confirmed delivery  341ms
+       ✓ keeps exactly one completion for terminal agents.status after ceiling cancellation until confirmed delivery  313ms
+       ✓ keeps exactly one completion for terminal agents.status after written then expired until confirmed delivery  313ms
+       ✓ keeps exactly one completion for terminal agents.status after written then closed until confirmed delivery  377ms
+       ✓ keeps exactly one completion for terminal agents.status after confirmed delivery until confirmed delivery  351ms
+     ✓ retains exactly one completion after cpython write success before guest admission and deadline  413ms
+     ✓ retains exactly one completion after cpython write success before guest admission and transport close  409ms
+     ✓ retains exactly one completion after node-process write success before guest admission and deadline  391ms
+     ✓ retains exactly one completion after node-process write success before guest admission and transport close  374ms
+     ✓ terminal agents.wait after Monty return before admission: expiry  456ms
+     ✓ terminal agents.wait after Monty return before admission: closure  349ms
+     ✓ terminal agents.wait after Monty return before admission: normal ack  340ms
+     ✓ terminal agents.wait after Monty return before admission: ack then expiry  380ms
+     ✓ terminal agents.join after Monty return before admission: expiry  387ms
+     ✓ terminal agents.join after Monty return before admission: closure  363ms
+     ✓ terminal agents.join after Monty return before admission: normal ack  374ms
+     ✓ terminal agents.join after Monty return before admission: ack then expiry  371ms
+     ✓ terminal agents.status after Monty return before admission: expiry  390ms
+     ✓ terminal agents.status after Monty return before admission: closure  325ms
+     ✓ terminal agents.status after Monty return before admission: normal ack  393ms
+     ✓ terminal agents.status after Monty return before admission: ack then expiry  426ms
+     ✓ keeps an unread completion after quickjs rejects result encoding, but not after delivered guest continuation  723ms
+     ✓ keeps an unread completion after node-process rejects result encoding, but not after delivered guest continuation  719ms
+     ✓ keeps an unread completion after monty rejects result encoding, but not after delivered guest continuation  810ms
+     ✓ keeps an unread completion after cpython rejects result encoding, but not after delivered guest continuation  907ms
+     ✓ omits actor activation runs from agents.list; the actor is listed by agents.actors  677ms
+     ✓ defers handoff until the finalized outer Fabric result and records its class: undefined, interrupted=false  329ms
+     ✓ defers handoff until the finalized outer Fabric result and records its class: undefined, interrupted=true  342ms
+     ✓ rejects invalid durable recursive cwd before the provider can transfer ownership  2763ms
+     ✓ shows the effective cwd in run and spawn launch activity  606ms
+     ✓ bounds and escapes control characters in cwd launch activity  661ms
+     ✓ returns the live status at the bound in an interactive Main; a task agent's wait still throws  6288ms
+     ✓ bounds Main agents.run at 60 s without stopping its child (request undefined)  385ms
+     ✓ bounds Main agents.run at 60 s without stopping its child (request 86400000)  382ms
+     ✓ returns Main agents.run before a 60 s program ceiling and continues the guest  429ms
+     ✓ budgets successive Main wait observations against the same absolute ceiling  484ms
+     ✓ budgets successive Main join observations against the same absolute ceiling  444ms
+     ✓ budgets a durable Main wait observation without consuming its running result  1222ms
+     ✓ budgets a durable Main join observation without consuming its running result  1220ms
+     ✓ returns a live Main run and guest tail before a small ceiling through quickjs  1836ms
+     ✓ returns a live Main run and guest tail before a small ceiling through node-process  1984ms
+     ✓ returns a live Main run and guest tail before a small ceiling through monty  1946ms
+     ✓ returns a live Main run and guest tail before a small ceiling through cpython  1933ms
+     ✓ detaches a Main child with no progress when its program hits the ceiling: return agents.run({ task: "HANG", transport: "process" });  591ms
+     ✓ detaches a Main child with no progress when its program hits the ceiling: const child = await agents.spawn({ task: "HANG", transport: "process" }); while (true) await agents.wait({ id: child.id });  586ms
+     ✓ detaches only a zero-progress local actor ASK observation at the Main ceiling (tui, fullCodeMode=true, backend=quickjs)  1877ms
+     ✓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=quickjs)  1913ms
+     ✓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=node-process)  1948ms
+     ✓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=monty)  1869ms
+     ✓ detaches only a zero-progress local actor ASK observation at the Main ceiling (rpc, fullCodeMode=false, backend=cpython)  1905ms
+     ✓ still stops a zero-progress local actor ASK on Escape  404ms
+     ✓ still stops a zero-progress local actor ASK on ordinary deadline  431ms
+     ✓ still stops a zero-progress local actor ASK on explicit stop  448ms
+     ✓ still stops a zero-progress local actor ASK on non-Main abort  471ms
+     ✓ keeps explicit stop effective after Main's ceiling detaches a local ASK  1175ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (quickjs, queued=false)  1073ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (quickjs, queued=true)  1330ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (node-process, queued=false)  1141ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (node-process, queued=true)  1402ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (monty, queued=false)  1119ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (monty, queued=true)  1392ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (cpython, queued=false)  1180ms
+     ✓ rearms an early runtime Main deadline without cancelling accepted ASK work (cpython, queued=true)  1458ms
+     ✓ does not trust guest exception text as a Main ceiling (quickjs)  771ms
+     ✓ does not trust guest exception text as a Main ceiling (node-process)  930ms
+     ✓ detaches accepted Main work when the first launch publication hits its ceiling  1904ms
+     ✓ keeps ordinary Escape cancellation for zero-progress agents.run (rpc)  419ms
+     ✓ keeps ordinary Escape cancellation for zero-progress agents.run (tui)  390ms
+     ✓ keeps ordinary Escape cancellation for zero-progress agents.run (print)  417ms
+     ✓ preserves a queued local ASK and its late delivery at Main's ceiling  2224ms
+     ✓ compacts the handed-off trajectory when the caller requests it  333ms
+     ✓ attaches a structured child-tool preview to blocking agent runs  370ms
+     ✓ refreshes bounded agent previews when only the transcript changes  3079ms
+     ✓ acknowledges model-facing terminal status but not running status or UI polling  368ms
+     ✓ attaches previews and reports friendly names through wait for spawned agents  371ms
+     ✓ attaches previews and reports friendly names through join for spawned agents  314ms
+     ✓ attaches the final preview for actors that settle before the first poll  394ms
+     ✓ members reports the resolved run binding, not the project default or owner overlay (#7682)  1000ms
+     ✓ executes one shared actor with each caller's session binding  788ms
+     ✓ exports a project actor to a global template without its history  356ms
+     ✓ steer routes to a local running agent and queues a steer command  450ms
+     ✓ accepts an owner-addressed control command for a local agent  458ms
+     ✓ setSteeringMode routes to a local agent  436ms
+     ✓ setSteeringMode rejects an invalid mode  417ms
+     ✓ compact enqueues a compact entry for a running pi child  541ms
+     ✓ resolves visible exact, fuzzy, and alias run models before spawning  1589ms
+     ✓ preserves a case-insensitive alias thinking default in agents.run  389ms
+     ✓ preserves a case-insensitive alias thinking default in agents.spawn  395ms
+     ✓ keeps explicit thinking above an alias and the agent default below it  758ms
+     ✓ refuses closest-match models for agents.spawn and agents.create but keeps exact ids and aliases (smarty-dev#3326)  1090ms
+     ✓ keeps exact ids and configured aliases for agents.ask activation overrides without activity  1301ms
+     ✓ allows exact marker-name alias closest in public spawn/create  396ms
+     ✓ allows exact marker-name alias recent in public spawn/create  423ms
+     ✓ allows exact marker-name alias latest in public spawn/create  480ms
+     ✓ returns chosen model and via for run, setModel and import without activity  795ms
+     ✓ launches near-miss models canonically while isolating unrelated batch failures  342ms
+     ✓ passes Claude and Veda model strings through unchanged  775ms
+     ✓ off selects the expected actual worker model/thinking  377ms
+     ✓ shadow selects the expected actual worker model/thinking  635ms
+     ✓ enforce selects the expected actual worker model/thinking  412ms
+     ✓ accepts delicate and forwards it verbatim in shadow mode  399ms
+     ✓ accepts delicate and forwards it verbatim in enforce mode  424ms
+     ✓ caller override {"model":"provider/project","thinking":"low"} bypasses router and is logged explicit  479ms
+     ✓ caller override {"thinking":"xhigh"} bypasses router and is logged explicit  432ms
+     ✓ router error process.stdout.write('garbage'); keeps worker defaults and records invalid-json  411ms
+     ✓ router error process.stdout.write(JSON.stringify({ model: 'provider/unknown', thinking: 'high' })); keeps worker defaults and records unknown-or-denied-model  377ms
+     ✓ router error setInterval(() => {}, 1000); keeps worker defaults and records timeout  795ms
+     ✓ router error process.stdout.write(JSON.stringify({ model: 'provider/model-b', thinking: 'invalid' })); keeps worker defaults and records invalid-output  401ms
+     ✓ does not fuzzy-match or bypass host deny policy for a router pick  808ms
+     ✓ uses inherited model/thinking as the static default but does not mistake inheritance for explicit  398ms
+     ✓ lets an enforce pick override the inherited static default  397ms
+     ✓ shadow: a configured agents.model wins over the inherited model as the router's static default  465ms
+     ✓ enforce: a configured agents.model wins over the inherited model as the router's static default  449ms
+     ✓ global templates and ordinary agents.run do not invoke the spawn-only router  426ms
+
+ Test Files  1 passed (1)
+      Tests  530 passed (530)
+   Start at  21:40:15
+   Duration  186.76s (transform 6.04s, setup 246ms, import 6.78s, tests 179.57s, environment 0ms)
+

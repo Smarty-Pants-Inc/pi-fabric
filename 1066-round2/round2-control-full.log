@@ -1,0 +1,88 @@
+Running as unit: run-u1042845.scope; invocation ID: f2bad7aac60949548c5a3c2af2363aae
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Unknown Fabric participant: missing) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection without notRun (Main's followUp queue is full) as unknown: its handler may have run
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Unknown Fabric participant: missing) as failed
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an owner rejection with notRun: true (Main's followUp queue is full) as failed
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=followUp target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records an unclaimed command withdrawn at its deadline as failed (smarty-dev#6729)
+[pi-fabric] Unfenced legacy control delivery count=1 operation=steer target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records timeout unknown without falsely treating admission as delivered
+[pi-fabric] Unfenced legacy control delivery count=1 operation=steer target="session:target"
+
+stderr | tests/control-plane.test.ts > sender final delivery outcomes > records timeout unknown without falsely treating admission as delivered
+[pi-fabric] Unfenced legacy sender delivery count=1 sender="host:sender" operation=steer target="session:target" mesh.controlIncarnationFence=warn
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > on the shared claim, the command is claimed on the next poll and runs once
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 46 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > between the shared and the own claim, the retry keeps its shared claim and runs once
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 59 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > while recording the outcome, the sender still gets it
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 68 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > of a detached ask, the bounded notification queue retries its outcome without re-execution
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 16 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > after a lock timeout > on the acknowledgement, the next poll publishes the real outcome, even past the deadline
+[pi-fabric] control claim/ack poll: mesh lock timeout; retrying in 36 ms: Timed out waiting for the Fabric mesh lock
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > does not retry an expiry acknowledgement without notRun, as an older owner sends
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+ ✓ |default| tests/control-plane.test.ts (111 tests) 44230ms
+     ✓ followUp advisory A6 validates incoming ACKs without changing success or retrying  382ms
+     ✓ retries cancellation beyond the production 10-second lock timeout with commit-time ACK timing  10227ms
+     ✓ retains the remote owner's independent ASK deadline after Main stops observing  511ms
+       ✓ stamps the command's deadline at commit, and waits for a slow owner from there  3290ms
+       ✓ does not time out before its publish commits, however long the lock wait  3526ms
+       ✓ on the acknowledgement, the next poll publishes the real outcome, even past the deadline  1354ms
+       ✓ do not run a command whose claim returned after its deadline  636ms
+       ✓ do not run a command whose claim waited for the owner's store lock past its deadline  725ms
+       ✓ keep the shared claim for a paused older runtime through the sweep and tombstone eviction  2247ms
+       ✓ are deleted only once expired and their command has left the log  4097ms
+     ✓ retains a completed ask outcome through its request deadline  332ms
+     ✓ waits past the deadline for the acknowledgement of a command the owner admitted in time  535ms
+     ✓ still times out, after the deadline plus a bounded grace, when no owner answers, and withdraws the unclaimed message  360ms
+     ✓ keeps the outcome unknown when the owner claimed the message before the sender timed out  336ms
+       ✓ answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry  1365ms
+       ✓ reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry  1363ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome  1329ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet  1346ms
+       ✓ retries a message once with a new command, and the owner delivers it once  1352ms
+       ✓ does not retry a command that is not a message  1327ms
+
+ Test Files  1 passed (1)
+      Tests  111 passed (111)
+   Start at  21:44:10
+   Duration  45.11s (transform 660ms, setup 29ms, import 762ms, tests 44.23s, environment 0ms)
+

@@ -1,0 +1,26 @@
+Running as unit: run-u1042789.scope; invocation ID: b174774d7b4849208e0dc8addfcd9652
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+stderr | tests/control-plane.test.ts > FabricControlPlane > when the owner rejects a command as expired > does not retry an expiry acknowledgement without notRun, as an older owner sends
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="agent:target"
+
+ ✓ |default| tests/control-plane.test.ts (111 tests | 101 skipped) 8711ms
+       ✓ answers a delivered message's recorded outcome after an owner restart past the deadline, without a retry  1357ms
+       ✓ reports a claimed message without an outcome as indeterminate after a restart past the deadline, without a retry  1356ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with its outcome  1335ms
+       ✓ (e) does not report notRun or retry a message an older runtime claimed and delivered, with no outcome yet  1334ms
+       ✓ retries a message once with a new command, and the owner delivers it once  1438ms
+       ✓ does not retry a command that is not a message  1331ms
+
+ Test Files  1 passed (1)
+      Tests  10 passed | 101 skipped (111)
+   Start at  21:37:04
+   Duration  10.18s (transform 1.20s, setup 38ms, import 1.31s, tests 8.71s, environment 0ms)
+

@@ -1,0 +1,46 @@
+{
+  "pass": true,
+  "rootA": "/tmp/silEHi7/pi-fabric-vitest-Sd6072/fabric-remote-capability-qiC1xj/work-host/mesh",
+  "rootB": "/tmp/silEHi7/pi-fabric-vitest-Sd6072/fabric-remote-capability-qiC1xj/capability-host/mesh",
+  "remoteAgent": "df4214831abd429193dba8dca506ca97",
+  "status": "completed",
+  "nativeValue": {
+    "cwd": "/tmp/silEHi7/pi-fabric-vitest-Sd6072/fabric-remote-capability-qiC1xj/capability-host",
+    "corpus": "answer-only-on-root-B",
+    "spawner": "session:work-lead",
+    "spawnerSession": "work-lead",
+    "returnAddress": {
+      "spawnerId": "session:work-lead",
+      "spawnerSessionId": "work-lead",
+      "ancestors": [
+        "session:work-lead"
+      ],
+      "escalationTargets": []
+    },
+    "spawnerArgument": "session:work-lead",
+    "writePolicy": {
+      "readOnly": true,
+      "writableRoots": [],
+      "shell": "deny"
+    },
+    "pid": 3600502
+  },
+  "inbox": {
+    "customType": "pi-fabric-agent-complete",
+    "content": "Unread background agent results (batched). Incorporate relevant results into the current task. These are run outcomes, not new user requests. Do not restart completed work or reply merely to acknowledge stale/superseded results. A completed run does not necessarily mean its assignment is complete.\n\nAgent {} (df4214831abd429193dba8dca506ca97) completed after 0s:\n{\"cwd\":\"/tmp/silEHi7/pi-fabric-vitest-Sd6072/fabric-remote-capability-qiC1xj/capability-host\",\"corpus\":\"answer-only-on-root-B\",\"spawner\":\"session:work-lead\",\"spawnerSession\":\"work-lead\",\"returnAddress\":{\"spawnerId\":\"session:work-lead\",\"spawnerSessionId\":\"work-lead\",\"ancestors\":[\"session:work-lead\"],\"escalationTargets\":[]},\"spawnerArgument\":\"session:work-lead\",\"writePolicy\":{\"readOnly\":true,\"writableRoots\":[],\"shell\":\"deny\"},\"pid\":3600502}",
+    "display": false,
+    "details": {
+      "ids": [
+        "df4214831abd429193dba8dca506ca97"
+      ],
+      "wakeCause": {
+        "cause": "inbox",
+        "from": {
+          "id": "df4214831abd429193dba8dca506ca97",
+          "name": "{}",
+          "kind": "agent"
+        }
+      }
+    }
+  }
+}

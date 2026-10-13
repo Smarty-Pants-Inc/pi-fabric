@@ -1,0 +1,3 @@
+Running as unit: run-u1040772.scope; invocation ID: f6c2cc4b0f0d42aeaf700335de853e0e
+$ node scripts/assert-lazy-graph-host-free.mjs
+lazy UI graph is host-package-free (48 files checked)

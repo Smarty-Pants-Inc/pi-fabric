@@ -1,0 +1,253 @@
+Running as unit: run-u1040730.scope; invocation ID: fbe6b27bbde9455c983a5b10b957b5ff
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/config.test.ts > host-only explicit model exceptions (#3134) > project cannot disable the host reason gate (trusted=true)
+[pi-fabric] /tmp/sabsuPa/pi-fabric-vitest-EUhZwB/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+ ✓ |default| tests/config.test.ts (84 tests) 191ms
+stderr | tests/agents-provider-services.test.ts > agents provider message routing service boundaries > delivers interactive Main direct and control messages despite failed initial presence (steer)
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/agents-provider-services.test.ts > agents provider message routing service boundaries > routes a listed legacy peer root without an owner incarnation
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:legacy"
+
+ ❯ |default| tests/agents-provider-services.test.ts (91 tests | 10 failed) 1027ms
+     ✓ preserves the public preview export identity 2ms
+     ✓ attaches final metrics and preview even before the first poll 3ms
+     ✓ clears the poll and preserves rejection when cancellation removes the run 1ms
+     ✓ rejects polling errors and stops polling even if the worker is still pending 1ms
+     ✓ uses the latest terminal actor worker and tolerates transcript cleanup 1ms
+     × joins detached child and grandchild sleep before stopped during a directory outage 412ms
+     × provider.invoke stops a canonical process task and native Main without probing the damaged directory 389ms
+     × provider.invoke keeps session:remote retryable unavailable with no publication 18ms
+     × provider.invoke keeps remote-task retryable unavailable with no publication 11ms
+     × provider.invoke keeps actor retryable unavailable with no publication 11ms
+     × provider.invoke keeps task-prefix retryable unavailable with no publication 12ms
+     × provider.invoke keeps task-name retryable unavailable with no publication 11ms
+     × normalizes a remote stop read failure after healthy preflight without publication 8ms
+     × retains the resident caller fence after healthy directory admission 8ms
+     × retains foreign durable actor authorization after healthy directory admission 8ms
+     ✓ an actor's steer to main still reaches its owning Main 1ms
+     ✓ an actor's steer to session:owner still reaches its owning Main 0ms
+     ✓ F4 never ensures a missing durable participant without a kernel fence 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for actor (dead holder) 2ms
+     ✓ F7 waits through the mesh stale window on ensure failure for actor (ownerless holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for actor (ownerless-submillisecond holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for actor (ownerless-submillisecond-past holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for spawner (dead holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for spawner (ownerless holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for spawner (ownerless-submillisecond holder) 1ms
+     ✓ F7 waits through the mesh stale window on ensure failure for spawner (ownerless-submillisecond-past holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for actor (dead holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for actor (ownerless holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for actor (ownerless-submillisecond holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for actor (ownerless-submillisecond-past holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for spawner (dead holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for spawner (ownerless holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for spawner (ownerless-submillisecond holder) 1ms
+     ✓ F7 waits through the mesh stale window on route failure for spawner (ownerless-submillisecond-past holder) 1ms
+     ✓ awaits durable recovery before routing steer with a missing or stale participant 1ms
+     ✓ awaits durable recovery before routing followUp with a missing or stale participant 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (live) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (missing) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (malformed) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (future) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (expired) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (wrong-root) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (ownerless-future) 1ms
+     ✓ F7 does not retry an unsafe or exhausted mesh holder (ownerless-expired) 1ms
+     ✓ steers a local child during a mesh write stall and names the stall for unknown targets 1ms
+     ✓ names a peers-listed but not yet mirrored target as retryable (steer) 1ms
+     ✓ names a peers-listed but not yet mirrored target as retryable (followUp) 0ms
+     ✓ replies to a peer root whose lease lapsed moments ago through its owner host 0ms
+     ✓ routes steer to a known Main regardless of lease age while its lineage is alive 0ms
+     ✓ routes followUp to a known Main regardless of lease age while its lineage is alive 0ms
+     ✓ keeps steer routable when a cached native root's lease expires under the same authority 0ms
+     ✓ keeps followUp routable when a cached native root's lease expires under the same authority 0ms
+     ✓ does not lose a Main renewed between lease-filtered get and lastKnown reads 0ms
+     ✓ rejects steer to a provably dead Main even with a recent last-known record 0ms
+     ✓ rejects followUp to a provably dead Main even with a recent last-known record 0ms
+     ✓ replies to a remote Main whose lease lapsed moments ago (main) 0ms
+     ✓ replies to a remote Main whose lease lapsed moments ago (session:main-root) 0ms
+     ✓ refuses a cached native root when fresh authority changes (absent) 0ms
+     ✓ refuses a cached native root when fresh authority changes (rootId) 0ms
+     ✓ refuses a cached native root when fresh authority changes (ownerHostId) 0ms
+     ✓ refuses a cached native root when fresh authority changes (ownerIdentityId) 0ms
+     ✓ refuses a cached native root when fresh authority changes (remoteHost) 0ms
+     ✓ refuses a remote Main alias when fresh authority changes (absent) 0ms
+     ✓ refuses a remote Main alias when fresh authority changes (rootId) 0ms
+     ✓ refuses a remote Main alias when fresh authority changes (ownerHostId) 0ms
+     ✓ refuses a remote Main alias when fresh authority changes (ownerIdentityId) 1ms
+     ✓ refuses a remote Main alias when fresh authority changes (remoteHost) 0ms
+     ✓ names why a remote Main cannot be resolved 1ms
+     ✓ reports a write-stalled mesh before trying a recently lapsed root 1ms
+     ✓ names why a target cannot be resolved 1ms
+     ✓ refuses direct and incoming control delivery to a local non-interactive Main (fresh-only=false) 1ms
+     ✓ refuses direct and incoming control delivery to a local non-interactive Main (fresh-only=true) 0ms
+     ✓ rejects direct and incoming control to print Main after failed initial presence (steer) 12ms
+     ✓ rejects direct and incoming control to print Main after failed initial presence (followUp) 9ms
+     ✓ rejects direct and incoming control to json Main after failed initial presence (steer) 7ms
+     ✓ rejects direct and incoming control to json Main after failed initial presence (followUp) 8ms
+     ✓ delivers interactive Main direct and control messages despite failed initial presence (steer) 28ms
+     ✓ delivers interactive Main direct and control messages despite failed initial presence (followUp) 17ms
+     ✓ preserves passive Main delivery and caller identity without actor validation 0ms
+     ✓ rechecks remote capability withdrawal on every delivery 1ms
+     ✓ routes listed busy peer roots through their current owner, without treating them as actors 1ms
+     ✓ passes a participant's remote host separately from passive message data and rechecks capabilities 0ms
+     ✓ routes a listed legacy peer root without an owner incarnation 0ms
+     ✓ does not hide local agent failures by falling through to actors 0ms
+     ✓ translates only unknown actor targets into unknown participant errors 1ms
+     ✓ ask carries principal alongside raw own-root and resolved foreign bindings 1ms
+     ✓ followUp carries principal alongside raw own-root and resolved foreign bindings 1ms
+     ✓ leaves cancel commands to the control plane and refreshes successful stops 0ms
+     ✓ answers a remote followUp to Main with Main's queue depth 4ms
+     ✓ passes a stalled Main queue to the sender, which throws 0ms
+     ✓ rejects a remote followUp to a full Main queue with the reason 0ms
+ ✓ |default| tests/guest-agents-surface.test.ts (60 tests) 686ms
+ ✓ |default| tests/orchestration.test.ts (12 tests) 4ms
+ ✓ |default| tests/control-plane-incarnation.test.ts (45 tests) 4399ms
+     ✓ counts real dispatches, rate-limits by envelope sender for one hour, and does not count duplicate outcomes  312ms
+     ✓ does not retarget queued steer to a different Main session ID  321ms
+     ✓ does not retarget queued followUp to a different Main session ID  307ms
+     ✓ never attests a legacy completed claim as a new activation's outcome  304ms
+
+⎯⎯⎯⎯⎯⎯ Failed Tests 10 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > joins detached child and grandchild sleep before stopped during a directory outage
+AssertionError: promise rejected "TypeError: Cannot read properties of unde…" instead of resolving
+ ❯ tests/agents-provider-services.test.ts:200:77
+    198|       const probe = vi.spyOn(f.directory, "refreshRoutingView");
+    199|       const started = Date.now();
+    200|       await expect(f.provider.invoke("stop", { id: task.id }, f.invoca…
+       |                                                                             ^
+    201|       expect(Date.now() - started).toBeLessThan(12_000);
+    202|       for (const pid of descendants) expect(() => process.kill(pid, 0)…
+
+Caused by: TypeError: Cannot read properties of undefined (reading 'root')
+ ❯ AgentsProvider.#remote src/providers/agents-provider.ts:494:78
+ ❯ AgentsProvider.#invoke src/providers/agents-provider.ts:1316:34
+ ❯ AgentsProvider.invoke src/providers/agents-provider.ts:851:25
+ ❯ tests/agents-provider-services.test.ts:200:31
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/10]⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke stops a canonical process task and native Main without probing the damaged directory
+AssertionError: promise rejected "TypeError: Cannot read properties of unde…" instead of resolving
+ ❯ tests/agents-provider-services.test.ts:221:77
+    219|       const probe = vi.spyOn(f.directory, "refreshRoutingView");
+    220|       const get = vi.spyOn(f.directory, "get");
+    221|       await expect(f.provider.invoke("stop", { id: task.id }, f.invoca…
+       |                                                                             ^
+    222|       expect(f.manager.status(task.id).status).toBe("stopped");
+    223|       for (const id of ["main", f.main.id]) {
+
+Caused by: TypeError: Cannot read properties of undefined (reading 'root')
+ ❯ AgentsProvider.#remote src/providers/agents-provider.ts:494:78
+ ❯ AgentsProvider.#invoke src/providers/agents-provider.ts:1316:34
+ ❯ AgentsProvider.invoke src/providers/agents-provider.ts:851:25
+ ❯ tests/agents-provider-services.test.ts:221:31
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/10]⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke keeps session:remote retryable unavailable with no publication
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke keeps remote-task retryable unavailable with no publication
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke keeps actor retryable unavailable with no publication
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke keeps task-prefix retryable unavailable with no publication
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > provider.invoke keeps task-name retryable unavailable with no publication
+AssertionError: expected TypeError: Cannot read properties of unde… to match object { …(3) }
+
+- Expected
++ Received
+
+- {
+-   "code": "FABRIC_DIRECTORY_UNAVAILABLE",
+-   "name": "FabricDirectoryUnavailableError",
+-   "retryable": true,
++ TypeError {
++   "message": "Cannot read properties of undefined (reading 'root')",
+  }
+
+ ❯ tests/agents-provider-services.test.ts:246:68
+    244|       const probe = vi.spyOn(f.directory, "refreshRoutingView");
+    245|       const stop = vi.spyOn(f.manager, "stop");
+    246|       await expect(f.provider.invoke("stop", { id }, f.invocation)).re…
+       |                                                                    ^
+    247|         name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTO…
+    248|       });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/10]⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > normalizes a remote stop read failure after healthy preflight without publication
+AssertionError: expected TypeError: Cannot read properties of unde… to match object { …(2) }
+
+- Expected
++ Received
+
+- {
+-   "code": "FABRIC_DIRECTORY_UNAVAILABLE",
+-   "retryable": true,
++ TypeError {
++   "message": "Cannot read properties of undefined (reading 'root')",
+  }
+
+ ❯ tests/agents-provider-services.test.ts:264:86
+    262|       vi.spyOn(f.directory, "get").mockImplementation(() => { throw ne…
+    263|       const probe = vi.spyOn(f.directory, "refreshRoutingView").mockRe…
+    264|       await expect(f.provider.invoke("stop", { id: "session:remote" },…
+       |                                                                                      ^
+    265|         code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true,
+    266|       });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/10]⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > retains the resident caller fence after healthy directory admission
+AssertionError: expected TypeError: Cannot read properties of unde… to match object { Object (name) }
+
+- Expected
++ Received
+
+- {
+-   "name": "ResidentActorAuthorizationError",
++ TypeError {
++   "message": "Cannot read properties of undefined (reading 'root')",
+  }
+
+ ❯ tests/agents-provider-services.test.ts:282:76
+    280|       const worker = new AgentsProvider(f.manager, { ...f.actors, iden…
+    281|         f.provider.globalActors, f.main, source, f.provider.control, {…
+    282|       await expect(worker.invoke("stop", { id: "resident" }, f.invocat…
+       |                                                                            ^
+    283|       expect(f.actors.stop).not.toHaveBeenCalled();
+    284|       expect(f.control.request).not.toHaveBeenCalled();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/10]⎯
+
+ FAIL  |default| tests/agents-provider-services.test.ts > agents.stop directory outage (#2386 F5) > retains foreign durable actor authorization after healthy directory admission
+AssertionError: expected TypeError: Cannot read properties of unde… to match object { Object (name) }
+
+- Expected
++ Received
+
+- {
+-   "name": "ResidentActorAuthorizationError",
++ TypeError {
++   "message": "Cannot read properties of undefined (reading 'root')",
+  }
+
+ ❯ tests/agents-provider-services.test.ts:293:79
+    291|     try {
+    292|       f.actors.status.mockReturnValue({ id: "foreign", rootId: "sessio…
+    293|       await expect(f.provider.invoke("stop", { id: "foreign" }, f.invo…
+       |                                                                               ^
+    294|       expect(f.actors.stop).not.toHaveBeenCalled();
+    295|       expect(f.control.request).not.toHaveBeenCalled();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/10]⎯
+
+
+ Test Files  1 failed | 4 passed (5)
+      Tests  10 failed | 282 passed (292)
+   Start at  18:56:39
+   Duration  5.37s (transform 1.84s, setup 62ms, import 3.73s, tests 6.31s, environment 0ms)
+

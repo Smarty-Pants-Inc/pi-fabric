@@ -1,0 +1,27 @@
+Running as unit: run-u1040810.scope; invocation ID: 3c6e17427d594182819caf106857ccb6
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit
+[pi-fabric] resident completion/actor delivery: background operation failed: Fabric control plane closed
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability authority and host-only configuration > defaults empty; workspace cannot advertise capabilities or relax host remote policy
+[pi-fabric] /tmp/silEHi7/pi-fabric-vitest-Sd6072/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+ ✓ |default| tests/remote-capability-tasks.test.ts (27 tests) 8679ms
+     ✓ a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox  770ms
+     ✓ status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit  1841ms
+     ✓ persists the caller proxy across restart, deduplicates unchanged keys, and retains terminal results after owner restart  694ms
+     ✓ retains owner-side deduplication beyond control claims, and refuses interrupted admission after restart  1013ms
+     ✓ retains an unknown completion ACK and rekeys delivery to the same caller's restarted activation  594ms
+     ✓ allows host-authorized write and shell settings to narrow, and defaults an omitted cwd to execution-host TMPDIR  1036ms
+     ✓ refuses unknown and stale owners without publishing, and keeps local-capable/reserved-local tasks on A  856ms
+
+ Test Files  1 passed (1)
+      Tests  27 passed (27)
+   Start at  19:13:08
+   Duration  12.85s (transform 2.75s, setup 45ms, import 3.94s, tests 8.68s, environment 0ms)
+

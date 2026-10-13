@@ -1,0 +1,31 @@
+Running as unit: run-u1040735.scope; invocation ID: 8c9e16d64b9b4d7dbc14afb017c687be
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/agents-provider-services.test.ts > agents provider message routing service boundaries > delivers interactive Main direct and control messages despite failed initial presence (steer)
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/agents-provider-services.test.ts > agents provider message routing service boundaries > routes a listed legacy peer root without an owner incarnation
+[pi-fabric] Unfenced legacy control delivery count=1 operation=followUp target="session:legacy"
+
+ ✓ |default| tests/agents-provider-services.test.ts (91 tests) 8002ms
+     ✓ joins detached child and grandchild sleep before stopped during a directory outage  7455ms
+stderr | tests/remote-capability-tasks.test.ts > remote capability authority and host-only configuration > defaults empty; workspace cannot advertise capabilities or relax host remote policy
+[pi-fabric] /tmp/sGAaZzW/pi-fabric-vitest-u0zlPR/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+ ✓ |default| tests/remote-capability-tasks.test.ts (25 tests) 7986ms
+     ✓ a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox  693ms
+     ✓ status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit  2021ms
+     ✓ persists the caller proxy across restart, deduplicates unchanged keys, and retains terminal results after owner restart  647ms
+     ✓ retains owner-side deduplication beyond control claims, and refuses interrupted admission after restart  831ms
+     ✓ allows host-authorized write and shell settings to narrow, and defaults an omitted cwd to execution-host TMPDIR  1121ms
+     ✓ refuses unknown and stale owners without publishing, and keeps local-capable/reserved-local tasks on A  730ms
+
+ Test Files  2 passed (2)
+      Tests  116 passed (116)
+   Start at  18:58:32
+   Duration  10.78s (transform 2.54s, setup 117ms, import 4.89s, tests 15.99s, environment 0ms)
+

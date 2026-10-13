@@ -1,0 +1,11 @@
+Running as unit: run-u1042786.scope; invocation ID: 18c66e868dca4e538c0b4cd499c91ffd
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ✓ |default| tests/agent-service.test.ts (25 tests | 23 skipped) 128ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed | 23 skipped (25)
+   Start at  21:36:57
+   Duration  1.33s (transform 531ms, setup 169ms, import 791ms, tests 128ms, environment 0ms)
+

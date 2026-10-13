@@ -1,0 +1,12 @@
+Running as unit: run-u1040768.scope; invocation ID: b538fe66b5ee45eb97d7afdbccc28954
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ✓ |default| tests/agent-service.test.ts (25 tests | 21 skipped) 1019ms
+     ✓ ends only the wait at its bound: the child keeps running, and a later join returns its result  1011ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed | 21 skipped (25)
+   Start at  19:06:04
+   Duration  2.08s (transform 715ms, setup 303ms, import 654ms, tests 1.02s, environment 0ms)
+

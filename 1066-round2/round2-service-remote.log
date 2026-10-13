@@ -1,0 +1,26 @@
+Running as unit: run-u1042815.scope; invocation ID: 83c5a01b38244ee7bfc5f22e84856f25
+
+ RUN  v4.1.10 /home/paul/lanes/fv2-11362
+
+ ✓ |default| tests/agent-service.test.ts (25 tests) 1892ms
+     ✓ ends only the wait at its bound: the child keeps running, and a later join returns its result  1013ms
+stderr | tests/remote-capability-tasks.test.ts > remote capability process tasks over two real mesh roots > a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox
+[pi-fabric] Pi does not advertise hostCapabilities.turnProvenance === 1; delivering without turn provenance (legacy behavior). Upgrade Pi to a host with turn provenance v1 support and configure global turnProvenance.fabricExtensions trust for this Fabric extension.
+
+stderr | tests/remote-capability-tasks.test.ts > remote capability authority and host-only configuration > defaults empty; workspace cannot advertise capabilities or relax host remote policy
+[pi-fabric] /tmp/sK4jMft/pi-fabric-vitest-4vvusn/host-policy-missing/fabric-policy.json is missing; agent-dir authority relaxations are disabled. Hosts must provision root-owned policy.
+
+ ✓ |default| tests/remote-capability-tasks.test.ts (27 tests) 11549ms
+     ✓ a work-host lead spawns needs corpus on B and receives its native answer in A's completion inbox  960ms
+     ✓ status/wait/result use the proxy; an observation timeout leaves the native task running and stop joins its exit  2351ms
+     ✓ persists the caller proxy across restart, deduplicates unchanged keys, and retains terminal results after owner restart  1293ms
+     ✓ retains owner-side deduplication beyond control claims, and refuses interrupted admission after restart  1375ms
+     ✓ retains an unknown completion ACK and rekeys delivery to the same caller's restarted activation  776ms
+     ✓ allows host-authorized write and shell settings to narrow, and defaults an omitted cwd to execution-host TMPDIR  1401ms
+     ✓ refuses unknown and stale owners without publishing, and keeps local-capable/reserved-local tasks on A  920ms
+
+ Test Files  2 passed (2)
+      Tests  52 passed (52)
+   Start at  21:39:55
+   Duration  18.86s (transform 6.90s, setup 104ms, import 8.71s, tests 13.44s, environment 0ms)
+

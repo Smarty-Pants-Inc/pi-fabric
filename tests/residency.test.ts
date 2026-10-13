@@ -14,7 +14,7 @@ import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
-import { runResidentHostFromConfigPath } from "../src/residency/host.js";
+import { runResidentHostFromConfigPath as runResidentHostFromConfigPathInProcess } from "../src/residency/host.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -218,15 +218,39 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
   };
 };
 
+// In-process hosts run by this file, by residency root: stopResident releases them through their own close path
+// (their abort signal), never by a signal to this process.
+const inProcessHosts = new Map<string, AbortController>();
+const runResidentHostFromConfigPath = (configPath: string, signal?: AbortSignal): Promise<void> => {
+  const stopper = new AbortController();
+  if (signal?.aborted) stopper.abort();
+  else signal?.addEventListener("abort", () => stopper.abort(), { once: true });
+  const residencyRoot = path.dirname(configPath);
+  inProcessHosts.set(residencyRoot, stopper);
+  return runResidentHostFromConfigPathInProcess(configPath, stopper.signal)
+    .finally(() => { if (inProcessHosts.get(residencyRoot) === stopper) inProcessHosts.delete(residencyRoot); });
+};
+
+const readOwner = (ownerPath: string): ResidentHostOwner | undefined => {
+  try {
+    return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
+  } catch {
+    return undefined;
+  }
+};
+
 const stopResident = async (config: ResidentHostConfig): Promise<void> => {
   const ownerPath = path.join(config.residencyRoot, "owner.json");
-  const owner = (() => {
-    try {
-      return JSON.parse(fs.readFileSync(ownerPath, "utf8")) as ResidentHostOwner;
-    } catch {
-      return undefined;
-    }
-  })();
+  const owner = readOwner(ownerPath);
+  if (owner?.pid && (owner.pid === process.pid || owner.pid === process.ppid)) {
+    // An in-process host (this vitest fork) or the pool: a SIGTERM here, then the SIGKILL below once the fork never
+    // looks dead, ends the fork with no output. Release an in-process host through its own close path instead.
+    inProcessHosts.get(config.residencyRoot)?.abort();
+    await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 20_000).catch(() => {
+      throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}) and no in-process stop released it; never signalling it`);
+    });
+    return;
+  }
   if (owner?.pid) {
     const alive = (): boolean => {
       try {
@@ -492,6 +516,9 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
         residentRequestPreserved: true, controlActorLifecycleGatesClosed: true, successorToken: owner.token, replayedAcceptedInputOnce: true }));
       expect(state.mesh.latestSequence()).toBeGreaterThan(event.sequence);
     } finally {
+      // Probe (hosted ubuntu fork death on pi-fabric#902): whose pid owner.json names when cleanup starts.
+      const probeOwner = readOwner(ownerPath);
+      console.log(JSON.stringify({ probe: "S4-finally", mode, ownerPid: probeOwner?.pid ?? null, vitestPid: process.pid, vitestPpid: process.ppid }));
       // Release any faulted host/helper first, then join exact fixture-owned births.
       fs.rmSync(fault, { force: true });
       fs.writeFileSync(`${helperPath}.release`, "checked fixture drain");

@@ -6,6 +6,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { CONTROL_STALE_INCARNATION, FabricControlPlane, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { controlProviderParticipant } from "../src/topology/provider-participants.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
 const roots: string[] = [];
@@ -424,4 +425,247 @@ it("actual bridge: a mirrored owner restart refuses the queued epoch and a fresh
   await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce()); await bridge.step();
   await expect(live).resolves.toMatchObject({ messageId: "fresh", acknowledged: true });
   await bridge.step(); await bridge.step(); expect(handler).toHaveBeenCalledOnce(); expect(commands(remote)).toHaveLength(2);
+});
+
+// Upstream 0.110.1 (a8d2714b) owner-incarnation cases, fitted to main's per-activation
+// epoch (#709): the participant directory owns the epoch and its control plane adopts it.
+describe("upstream owner incarnation cases", () => {
+  const upMesh = (): string => path.join(temp(), "mesh");
+  const upStore = (meshRoot: string): MeshStore => new MeshStore(meshRoot, 64 * 1024, 1_000);
+  const upPlane = (meshRoot: string, id: string, ownerIncarnation?: string): FabricControlPlane => {
+    const value = new FabricControlPlane(upStore(meshRoot), identity(id), {
+      enabled: true,
+      hostId: id,
+      pollMs: 20,
+      acknowledgementTimeoutMs: 1_000,
+      ...(ownerIncarnation ? { ownerIncarnation } : {}),
+    });
+    planes.push(value);
+    return value;
+  };
+  const upProviderRecord = (id: string, hostId: string): FabricParticipantRecord => ({
+    format: 1,
+    id,
+    kind: "provider",
+    rootId: hostId,
+    ownerHostId: hostId,
+    ownerIdentityId: hostId,
+    parentId: hostId,
+    name: "demo",
+    status: "running",
+    provider: "demo",
+    transport: "host",
+    capabilities: ["stop", "steer"],
+    startedAt: 1,
+    updatedAt: 1,
+    controlProtocol: "v1",
+  });
+  /** A directory that never heartbeats, so a test controls when records change. */
+  const upOwnerDirectory = (meshRoot: string, hostId: string, records: () => FabricParticipantRecord[]): ParticipantDirectory => {
+    const value = new ParticipantDirectory(upStore(meshRoot), { enabled: true, hostId, rootId: hostId, identity: identity(hostId) });
+    value.registerSource(records);
+    directories.push(value);
+    return value;
+  };
+  const upViewer = (meshRoot: string, hostId: string): ParticipantDirectory => {
+    const value = new ParticipantDirectory(upStore(meshRoot), { enabled: true, hostId, rootId: hostId, identity: identity(hostId) });
+    directories.push(value);
+    return value;
+  };
+
+  it("gives every plane instance a distinct incarnation", () => {
+    const meshRoot = upMesh();
+    const first = upPlane(meshRoot, "host:owner");
+    const second = upPlane(meshRoot, "host:owner");
+    expect(first.incarnation).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second.incarnation).not.toBe(first.incarnation);
+  });
+
+  it("executes a command addressed to the current incarnation", async () => {
+    const meshRoot = upMesh();
+    const sender = upPlane(meshRoot, "host:sender");
+    const owner = upPlane(meshRoot, "host:owner");
+    const handler = vi.fn((command: { commandId: string }) => ({ accepted: true, messageId: "local:" + command.commandId }));
+    sender.start(() => ({ accepted: false }));
+    owner.start(handler);
+    await expect(
+      sender.request("host:owner", "agent:target", "steer", { message: "focus", ownerIncarnation: owner.incarnation }),
+    ).resolves.toMatchObject({ acknowledged: true, messageId: expect.stringMatching(/^local:/) });
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerIncarnation: owner.incarnation }),
+      expect.anything(),
+      expect.anything(),
+      // Our control plane also passes the admitted verification (mesh or bridge).
+      expect.anything(),
+    );
+    expect(upStore(meshRoot).read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
+      expect.objectContaining({ data: expect.objectContaining({ accepted: true, ownerIncarnation: owner.incarnation }) }),
+    );
+  });
+
+  it("refuses a replayed command naming a previous incarnation without executing it", async () => {
+    const meshRoot = upMesh();
+    const mesh = upStore(meshRoot);
+    const previous = upPlane(meshRoot, "host:owner");
+    const previousIncarnation = previous.incarnation;
+    await previous.close();
+    // Published to the old process, never claimed; the new process replays from offset 0.
+    await mesh.publish({
+      topic: "fabric.control.command",
+      kind: "stop",
+      from: identity("host:sender"),
+      to: "host:owner",
+      data: {
+        version: 1,
+        commandId: "command:stale",
+        targetId: "actor:durable",
+        operation: "stop",
+        replyTo: "host:sender",
+        ownerIncarnation: previousIncarnation,
+        requestedAt: Date.now(),
+      },
+    });
+    const restarted = upPlane(meshRoot, "host:owner");
+    const handler = vi.fn(() => ({ accepted: true }));
+    restarted.start(handler);
+    await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1));
+    expect(handler).not.toHaveBeenCalled();
+    expect(mesh.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          commandId: "command:stale",
+          accepted: false,
+          error: STALE_INCARNATION_ERROR,
+          errorCode: CONTROL_STALE_INCARNATION,
+          ownerIncarnation: restarted.incarnation,
+          staleIncarnation: previousIncarnation,
+        }),
+      }),
+    );
+    expect(mesh.listAll("topology/control-seen/")).toEqual([]);
+  });
+
+  it("fails a live request to a restarted owner fast with the fencing error", async () => {
+    const meshRoot = upMesh();
+    const sender = upPlane(meshRoot, "host:sender");
+    const previous = upPlane(meshRoot, "host:owner");
+    const previousIncarnation = previous.incarnation;
+    await previous.close();
+    const restarted = upPlane(meshRoot, "host:owner");
+    const handler = vi.fn(() => ({ accepted: true }));
+    sender.start(() => ({ accepted: false }));
+    restarted.start(handler);
+    const startedAt = Date.now();
+    await expect(
+      sender.requestResult("host:owner", "actor:durable", "ask", { message: "late", ownerIncarnation: previousIncarnation }),
+    ).rejects.toThrow(STALE_INCARNATION_ERROR);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("still executes commands that name no incarnation after a restart (warn rollout)", async () => {
+    const meshRoot = upMesh();
+    const sender = upPlane(meshRoot, "host:sender");
+    await upPlane(meshRoot, "host:owner").close();
+    const restarted = upPlane(meshRoot, "host:owner");
+    const handler = vi.fn((_command: { ownerIncarnation?: string | undefined }) => ({ accepted: true, messageId: "legacy" }));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    sender.start(() => ({ accepted: false }));
+    restarted.start(handler);
+    await expect(
+      sender.request("host:owner", "agent:target", "followUp", { message: "older sender" }),
+    ).resolves.toMatchObject({ messageId: "legacy" });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0]![0]).not.toHaveProperty("ownerIncarnation");
+  });
+
+  it("ignores an acknowledgement from a different incarnation of the owner", async () => {
+    const meshRoot = upMesh();
+    const mesh = upStore(meshRoot);
+    const sender = upPlane(meshRoot, "host:sender");
+    const owner = upPlane(meshRoot, "host:owner");
+    sender.start(() => ({ accepted: false }));
+    owner.start(async (command) => {
+      // Same identity, other incarnation: neither a result nor a refusal of this target counts.
+      for (const extra of [
+        { accepted: true, messageId: "other-process" },
+        { accepted: false, error: "not ours", staleIncarnation: "incarnation:unrelated" },
+      ]) {
+        await mesh.publish({
+          topic: "fabric.control.ack",
+          kind: extra.accepted ? "accepted" : "rejected",
+          from: identity("host:owner"),
+          to: "host:sender",
+          data: { version: 1, commandId: command.commandId, targetId: command.targetId, ownerIncarnation: "incarnation:other", ...extra },
+        });
+      }
+      return { accepted: true, messageId: "current:" + command.commandId };
+    });
+    await expect(
+      sender.request("host:owner", "agent:target", "steer", { message: "focus", ownerIncarnation: owner.incarnation }),
+    ).resolves.toMatchObject({ messageId: expect.stringMatching(/^current:/) });
+  });
+
+  it("rejects a malformed incarnation before publishing", async () => {
+    const meshRoot = upMesh();
+    const sender = upPlane(meshRoot, "host:sender");
+    sender.start(() => ({ accepted: false }));
+    await expect(
+      sender.request("host:owner", "agent:target", "stop", { ownerIncarnation: "x".repeat(129) }),
+    ).rejects.toThrow("Invalid Fabric owner incarnation");
+    expect(upStore(meshRoot).read({ topic: "fabric.control.command", limit: 10 })).toEqual([]);
+  });
+
+  it("stamps, validates and re-resolves a provider participant's incarnation across an owner restart", async () => {
+    const meshRoot = upMesh();
+    const ref = "provider:demo:1";
+    const requester = upPlane(meshRoot, "host:requester");
+    requester.start(() => ({ accepted: false }));
+    const viewer = upViewer(meshRoot, "host:requester");
+    const previousDirectory = upOwnerDirectory(meshRoot, "host:owner", () => [upProviderRecord(ref, "host:owner")]);
+    const previous = upPlane(meshRoot, "host:owner", previousDirectory.ownerIncarnation);
+    await previousDirectory.refresh();
+    expect(viewer.get(ref)).toMatchObject({ ownerIncarnation: previous.incarnation });
+    // The owner crashes: its records outlive the process until the new one republishes.
+    await previous.close();
+
+    const restartedDirectory = upOwnerDirectory(meshRoot, "host:owner", () => [upProviderRecord(ref, "host:owner")]);
+    const restarted = upPlane(meshRoot, "host:owner", restartedDirectory.ownerIncarnation);
+    expect(restarted.incarnation).not.toBe(previous.incarnation);
+    const handler = vi.fn(() => ({ accepted: true, result: { stopped: true } }));
+    restarted.start(handler);
+    await expect(controlProviderParticipant(undefined, viewer, requester, ref, "stop")).rejects.toThrow(STALE_INCARNATION_ERROR);
+    expect(handler).not.toHaveBeenCalled();
+
+    await restartedDirectory.refresh();
+    expect(viewer.get(ref)).toMatchObject({ ownerIncarnation: restarted.incarnation });
+    await expect(controlProviderParticipant(undefined, viewer, requester, ref, "stop")).resolves.toMatchObject({ acknowledged: true });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps records without an incarnation valid and drops malformed ones", async () => {
+    const meshRoot = upMesh();
+    const mesh = upStore(meshRoot);
+    await upOwnerDirectory(meshRoot, "host:legacy", () => [upProviderRecord("provider:legacy:1", "host:legacy")]).refresh();
+    const entry = mesh.listAll("topology/participants/")
+      .find((candidate) => (candidate.value as { id?: string }).id === "provider:legacy:1")!;
+    // An older owner's record: no epoch at all.
+    const { ownerIncarnation: _epoch, ...legacyValue } = entry.value as Record<string, unknown>;
+    const legacyEntry = await mesh.put({ key: entry.key, value: legacyValue, identity: identity("host:legacy"), ifVersion: entry.version });
+    const viewer = upViewer(meshRoot, "host:viewer");
+    const legacy = viewer.get("provider:legacy:1");
+    expect(legacy).toBeDefined();
+    expect(legacy).not.toHaveProperty("ownerIncarnation");
+    await mesh.put({ key: entry.key, value: { ...legacyValue, ownerIncarnation: 42 }, identity: identity("host:legacy"), ifVersion: legacyEntry.version });
+    expect(viewer.get("provider:legacy:1")).toBeUndefined();
+  });
+
+  it("does not let a source record override the owner's incarnation", async () => {
+    const meshRoot = upMesh();
+    const owner = upOwnerDirectory(meshRoot, "host:owner", () => [
+      { ...upProviderRecord("provider:demo:2", "host:owner"), ownerIncarnation: "incarnation:forged" },
+    ]);
+    await owner.refresh();
+    expect(upViewer(meshRoot, "host:viewer").get("provider:demo:2")).toMatchObject({ ownerIncarnation: owner.ownerIncarnation });
+  });
 });

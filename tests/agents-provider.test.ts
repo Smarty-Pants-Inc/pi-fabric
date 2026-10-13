@@ -1686,20 +1686,23 @@ describe.skipIf(process.platform !== "linux")("native written-but-unadmitted obs
     let guest!: ReturnType<typeof childProcess.spawn>;
     let wrote!: () => void;
     const written = new Promise<void>(resolve => { wrote = resolve; });
+    // Only the response to the stopped agents.wait call counts; upstream's
+    // native-tools catalog call (fabric.$piAllTools) answers before it.
+    let stopped = false;
     const spawn = vi.mocked(childProcess.spawn).mockImplementationOnce((...args: Parameters<typeof childProcess.spawn>) => {
       guest = actual.spawn(...args);
       if (backend === "node-process") {
         const send = guest.send.bind(guest);
         guest.send = ((message: any, callback: (error: Error | null) => void) => send(message, (error) => {
           callback(error);
-          if (message.type === "response" && !error) wrote();
+          if (message.type === "response" && !error && stopped) wrote();
         })) as typeof guest.send;
       } else {
         const channel = guest.stdio[3] as Duplex;
         const write = channel.write.bind(channel);
         channel.write = ((frame: string, callback: (error?: Error | null) => void) => write(frame, (error) => {
           callback(error);
-          if (JSON.parse(frame).type === "response" && !error) wrote();
+          if (JSON.parse(frame).type === "response" && !error && stopped) wrote();
         })) as typeof channel.write;
       }
       return guest;
@@ -1710,6 +1713,7 @@ describe.skipIf(process.platform !== "linux")("native written-but-unadmitted obs
       deadlineAt = ctx.mainDeadlineAt!;
       process.kill(guest.pid!, "SIGSTOP");
       await waitFor(() => /\) T /.test(fs.readFileSync(`/proc/${guest.pid}/stat`, "utf8")), 5_000);
+      stopped = true;
       return invoke(ref, args, ctx);
     });
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
@@ -2211,11 +2215,16 @@ describe("AgentsProvider runner support", () => {
     const { provider } = setup();
     const run = await provider.describe("run", context);
     const spawn = await provider.describe("spawn", context);
-    type RunnerProperty = { enum?: string[]; type?: string; description?: string };
+    type RunnerProperty = { enum?: string[]; pattern?: string; type?: string; description?: string };
     const runProperties = (run?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
     const spawnProperties = (spawn?.inputSchema as { properties: Record<string, RunnerProperty> }).properties;
-    expect(runProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
-    expect(spawnProperties.runner?.enum).toEqual(["pi", "claude", "veda"]);
+    for (const properties of [runProperties, spawnProperties]) {
+      expect(properties.runner?.description).toContain("claude, veda");
+      // Fork default: pi; pi-durable is opt-in (PR #864 review).
+      expect(properties.runner?.description).toMatch(/^Execution harness: pi \(default\), pi-durable \(opt-in/);
+      expect(new RegExp(properties.runner!.pattern!).test("veda")).toBe(true);
+      expect(new RegExp(properties.runner!.pattern!).test("Bad Runner")).toBe(false);
+    }
     expect(runProperties.persona?.type).toBe("string");
     expect(runProperties.persona?.description).toContain("Veda persona");
     expect(spawnProperties.persona?.type).toBe("string");
@@ -2942,7 +2951,7 @@ describe("AgentsProvider runner support", () => {
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
     expect(fs.existsSync(path.join(root, "runs"))).toBe(false);
 
     const outerToolResult = {
@@ -3615,7 +3624,12 @@ return { first, second, tail: "continued" };`,
         await service.prewarm(mainContext);
         const run = vi.spyOn(agents, "run");
         const stop = vi.spyOn(agents, "stop");
-        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS").catch(error => error) : undefined;
+        // smarty-dev#10340: the live worker is held by the fake worker's release file, not by its 1.5 s timer. A slow
+        // guest start (CPython on Windows) once outlived the timer, so the queued ASK was answered before admission.
+        const releaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-early-ask-"));
+        const gate = { fakeWorkerReleasePath: path.join(releaseDir, "release") };
+        const releaseWorker = () => fs.writeFileSync(gate.fakeWorkerReleasePath, "");
+        const first = queued ? actors.ask(actor.id, "LIVE_WITHOUT_PROGRESS", gate).catch(error => error) : undefined;
         if (queued) await waitFor(() => Boolean(actors.status(actor.id).inFlightRun) && "turns" in agents.list()[0]!);
         const activation = actors.status(actor.id).inFlightRun;
         let mainDeadlineAt: number | undefined;
@@ -3626,9 +3640,11 @@ return { first, second, tail: "continued" };`,
         });
         const timer = captureRuntimeDeadline(backend);
         const message = queued ? "queued advice" : "LIVE_WITHOUT_PROGRESS";
+        // The in-flight case's own live ASK is held by the same release file.
+        const data = queued ? "" : JSON.stringify(gate);
         const execution = executeAfterAdmission(signal => service.execute({
-          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)})`
-            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)} });`,
+          code: python ? `return await agents.ask(id=${JSON.stringify(actor.id)}, message=${JSON.stringify(message)}${data ? `, data=${data}` : ""})`
+            : `return agents.ask({ id: ${JSON.stringify(actor.id)}, message: ${JSON.stringify(message)}${data ? `, data: ${data}` : ""} });`,
           context: mainContext, signal, parentToolCallId: "early-runtime-ask", onPartial() {},
         }), () => timer.ready() && (queued ? actors.status(actor.id).queued === 1
           : Boolean(actors.status(actor.id).inFlightRun) && Boolean(agents.list()[0] && "turns" in agents.list()[0]!)), async () => {
@@ -3647,6 +3663,7 @@ return { first, second, tail: "continued" };`,
           const result = await execution;
           expect(result.error).toMatch(/MainExecutionCeilingError/);
           expect(result.trace.outcome).toBe("timed_out");
+          releaseWorker(); // the guest's deadline outcome is in: the accepted ASK work may finish now
           if (first) expect(await first).toMatchObject({ text: "live attempt 1 complete" });
           await waitFor(() => actorDeliveries.length === (queued ? 2 : 1) && actors.status(actor.id).status === "idle", 3_000);
           expect(actorDeliveries.map(delivery => delivery.message.text)).toEqual(queued
@@ -3655,11 +3672,13 @@ return { first, second, tail: "continued" };`,
           expect(run).toHaveBeenCalledTimes(queued ? 2 : 1);
           expect(stop).not.toHaveBeenCalled();
         } finally {
+          releaseWorker();
           timer.restore();
           await execution;
           await registry.close();
           if (first) await first;
           vi.unstubAllEnvs();
+          fs.rmSync(releaseDir, { recursive: true, force: true });
         }
     },
   );
@@ -3914,7 +3933,7 @@ return { first, second, tail: "continued" };`,
       status: "deferred",
       boundary: "fabric_exec_end",
     });
-    expect(deferredRequest).toEqual({ ...args, extensions: true, kernel: "typescript", pythonRuntime: "monty" });
+    expect(deferredRequest).toEqual({ ...args, runner: "pi", extensions: true, kernel: "typescript", pythonRuntime: "monty" });
 
     const outerToolResult = {
       role: "toolResult" as const,
@@ -5847,6 +5866,75 @@ describe("AgentsProvider switchModel", () => {
         undefined,
       );
     }
+  });
+
+  it.each(["run", "spawn"] as const)(
+    "preserves a case-insensitive alias thinking default in agents.%s",
+    async (action) => {
+      const { provider, agents } = setup([], [], undefined, {
+        modelsConfig: {
+          aliases: {
+            fast: { targets: ["provider/model-a"], thinking: "high" },
+          },
+        },
+        agentsConfig: { thinking: "medium" },
+      });
+      const spawn = vi.spyOn(agents, "spawn");
+
+      const result = await provider.invoke(
+        action,
+        { task: `alias ${action}`, model: "FAST" },
+        context,
+      );
+
+      expect(spawn).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "provider/model-a", thinking: "high" }),
+        undefined,
+      );
+      if (action === "run") {
+        expect(result).toMatchObject({ thinking: "high" });
+      } else {
+        await expect(agents.wait((result as { id: string }).id)).resolves.toMatchObject({
+          thinking: "high",
+        });
+      }
+    },
+  );
+
+  it("keeps explicit thinking above an alias and the agent default below it", async () => {
+    const { provider, agents } = setup([], [], undefined, {
+      modelsConfig: {
+        aliases: {
+          fast: { targets: ["provider/model-a"], thinking: "high" },
+          steady: { targets: ["provider/model-b"] },
+        },
+      },
+      agentsConfig: { thinking: "medium" },
+    });
+    const spawn = vi.spyOn(agents, "spawn");
+
+    const explicit = (await provider.invoke(
+      "spawn",
+      { task: "explicit alias level", model: "fast", thinking: "low" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-a", thinking: "low" }),
+      undefined,
+    );
+    await expect(agents.wait(explicit.id)).resolves.toMatchObject({ thinking: "low" });
+
+    const fallback = (await provider.invoke(
+      "spawn",
+      { task: "global default level", model: "steady" },
+      context,
+    )) as { id: string };
+    expect(spawn).toHaveBeenLastCalledWith(
+      expect.objectContaining({ model: "provider/model-b" }),
+      undefined,
+    );
+    expect(spawn.mock.calls.at(-1)?.[0]).not.toHaveProperty("thinking");
+    await expect(agents.wait(fallback.id)).resolves.toMatchObject({ thinking: "medium" });
   });
 
   it.each(["run", "spawn"] as const)(

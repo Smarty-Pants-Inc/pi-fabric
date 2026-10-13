@@ -23,6 +23,7 @@ import { createDashboardSnapshot } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
 import { FabricWidget, isFabricWidgetStreaming, shouldShowFabricWidget } from "./widget.js";
+import { FabricWidgetRetention } from "./retention.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
@@ -99,6 +100,7 @@ export class FabricUiController {
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
   #refreshGeneration = 0;
+  readonly #widgetRetention = new FabricWidgetRetention();
 
   constructor(
     readonly state: FabricState,
@@ -164,6 +166,7 @@ export class FabricUiController {
     this.#events = [];
     this.#meshOffset = 0;
     this.#snapshot = emptySnapshot();
+    this.#widgetRetention.clear();
     this.#lastRefreshErrorAt = 0;
     this.#lastRefreshAt = 0;
     this.#dashboardOpen = false;
@@ -194,6 +197,8 @@ export class FabricUiController {
     if (this.ownsInput) return;
     const jobs = this.state.shellJobs;
     if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
+    // Input ownership is claimed synchronously; reattached tasks arrive as store events.
+    void jobs.durable?.resume();
     const candidates = query ? jobs.list().filter(job => job.id === query || job.id.startsWith(query)) : [];
     if (query && candidates.length !== 1) { context.ui.notify("Task ID is unknown or ambiguous", "warning"); return; }
     if (context.mode !== "tui") {
@@ -205,12 +210,12 @@ export class FabricUiController {
     this.#tasksOpen = true;
     const epoch = this.#epoch;
     try {
-      const { ShellTasksView } = await import("./shell-tasks.js");
+      const [{ ShellTasksView }, { imageSafeCustom }] = await Promise.all([import("./shell-tasks.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
-      await context.ui.custom<void>((tui, theme, _keys, done) => {
+      await imageSafeCustom<void>(context.ui, (tui, theme, keys, done) => {
         this.#closeTasks = () => done();
         const id = candidates[0]?.id;
-        this.#tasksView = new ShellTasksView({ jobs, theme, done: () => done(), requestRender: () => tui.requestRender(),
+        this.#tasksView = new ShellTasksView({ jobs, theme, keys, done: () => done(), requestRender: () => tui.requestRender(),
           rows: () => tui.terminal?.rows ?? 24, ...(id ? { id } : {}) });
         return this.#tasksView;
       }, { overlay: true, overlayOptions: { width: "94%", maxHeight: "90%", anchor: "center", margin: 1 } });
@@ -248,8 +253,8 @@ export class FabricUiController {
       const { initializeConversationHost } = await import("./conversation-host.js");
       if (epoch !== this.#epoch) return;
       initializeConversationHost(piConversationHost);
-      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }] =
-        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js")]);
+      const [{ FabricConversationView, FabricConversationState }, { conversationTargets, resolveConversationTarget }, { readConversationAppearance }, { NativeConversationReader }, { imageSafeCustom }] =
+        await Promise.all([import("./conversation.js"), import("./conversation-targets.js"), import("./conversation-chrome.js"), import("./conversation-native-reader.js"), import("./image-overlays.js")]);
       if (epoch !== this.#epoch) return;
       this.#refresh();
       const initialTarget = query?.trim()
@@ -340,7 +345,7 @@ export class FabricUiController {
           throw new Error(target?.readOnlyReason ?? `Participant ${id} cannot receive ${action}`);
         }
       };
-      await context.ui.custom<void>((tui, theme, keybindings, done) => {
+      await imageSafeCustom<void>(context.ui, (tui, theme, keybindings, done) => {
         if (epoch !== this.#epoch) {
           done(undefined);
           return { render: () => [], invalidate: () => {} };
@@ -437,8 +442,8 @@ export class FabricUiController {
     const epoch = this.#epoch;
     const current = (): boolean => epoch === this.#epoch;
     this.#refresh();
-    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }] =
-      await Promise.all([import("./dashboard.js"), import("./model-picker.js")]);
+    const [{ FabricDashboard }, { buildClaudeModelSource, buildModelSource }, { imageSafeCustom }] =
+      await Promise.all([import("./dashboard.js"), import("./model-picker.js"), import("./image-overlays.js")]);
     if (!current()) return;
     const modelSource = buildModelSource(context.modelRegistry, resolveAgentDir());
     let claudeModelSource: ModelSource | undefined;
@@ -597,7 +602,7 @@ export class FabricUiController {
     };
     let conversationTarget: string | undefined;
     try {
-      await context.ui.custom<void>(
+      await imageSafeCustom<void>(context.ui,
         (tui, theme, keybindings, done) => {
           if (!current()) { done(undefined); return { render: () => [], invalidate() {} }; }
           this.#dashboardTui = tui;
@@ -832,6 +837,9 @@ export class FabricUiController {
       if (this.#snapshot.main.status !== main.status) {
         this.#snapshot = { ...this.#snapshot, main: { ...this.#snapshot.main, status: main.status } };
       }
+      this.#widgetRetention.sync(this.#snapshot);
+      // Fork (46857f02, no widget clock): retained completion rows expire on the
+      // next event refresh after their deadline, never on a timer of their own.
       this.#renderWidget(context);
       // Read the native source even when manager metadata is unchanged: log
       // appends and pinned-window growth do not require a status revision.
@@ -859,7 +867,7 @@ export class FabricUiController {
     const config = this.state.config.ui;
     const shouldShow =
       context.mode === "tui" &&
-      shouldShowFabricWidget(this.#snapshot, config.widget);
+      shouldShowFabricWidget(this.#snapshot, config.widget, this.#widgetRetention);
     // Keep the above-editor component mounted for the entire streamed turn.
     // A transient status gap must not turn into a remove/add pair while Pi is
     // diff-rendering the conversation.
@@ -878,6 +886,7 @@ export class FabricUiController {
             config.maxRows,
             () => tui.terminal?.rows ?? process.stdout.rows,
             true,
+            this.#widgetRetention,
           );
           return this.#widget;
         },

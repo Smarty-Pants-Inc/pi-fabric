@@ -8,11 +8,17 @@ import type { CreateAgentSessionRuntimeFactory } from "@earendil-works/pi-coding
 import { applyTaskRetryDefaults } from "./retry-profile.js";
 import { installFabricResourcePin } from "./resource-pin.js";
 import { installTerminalAnswerBoundary } from "./terminal-boundary.js";
+import { registerHostExtensionRunner } from "./host-runner-registration.js";
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
 const load = (file: string) => import(pathToFileURL(path.join(sdkDirectory, file)).href);
 const sdk = await load("index.js") as typeof import("@earendil-works/pi-coding-agent");
+// Fabric's tool capture must observe this SDK's runner, the one that carries the
+// profile guards' tool_call hooks, not Fabric's own peer copy (smarty-dev#8606).
+// Registered once, before any extension or task code loads, as a non-writable,
+// non-configurable property: task code can neither delete nor replace it.
+registerHostExtensionRunner(sdk.ExtensionRunner);
 const { parseArgs } = await load("cli/args.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js");
 const { createSessionManager } = await load("main.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/main.js");
 const { resolveProjectTrusted } = await load("core/project-trust.js") as typeof import("../../node_modules/@earendil-works/pi-coding-agent/dist/core/project-trust.js");

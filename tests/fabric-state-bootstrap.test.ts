@@ -31,6 +31,7 @@ const runtimeHarness = () => {
   class FakeRuntime {
     initialized = false;
     widgetDismissedAt = 0;
+    setDecisionProfile = vi.fn();
     initialize = vi.fn(async () => {
       if (blocked) await new Promise<void>((resolve) => { release = resolve; });
       this.initialized = true;
@@ -121,6 +122,40 @@ describe("FabricState lazy bootstrap", () => {
       expect(harness.loader).toHaveBeenCalledTimes(1);
     } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
   });
+  it("updates only decision defaults and forwards live changes without reactivation", async () => {
+    const profiles = { version: 1, defaultProfile: "fast", profiles: {
+      fast: { provider: "typesafe" }, vision: { provider: "openai" },
+    } };
+    const cwd = project({ jev: { decisionProfiles: profiles }, mesh: { enabled: false }, approvals: { execute: "deny" } });
+    const context = contextAt(cwd);
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(context);
+      state.setDecisionProfile(null);
+      expect(harness.loader).not.toHaveBeenCalled();
+      expect(state.config.jev.decisionProfile).toBeNull();
+      await state.ensure(context);
+      const runtime = harness.instances[0]!;
+      state.setDecisionProfile("vision");
+      expect(state.config.jev.decisionProfile).toBe("vision");
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith("vision");
+      state.setDecisionProfile(null);
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith(null);
+      state.setDecisionProfile(undefined);
+      expect(state.config.jev.decisionProfile).toBeUndefined();
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith(undefined);
+      for (const invalid of ["missing", "", "__proto__", "constructor", "prototype"]) {
+        expect(() => state.setDecisionProfile(invalid)).toThrow("Decision profile");
+      }
+      expect(runtime.setDecisionProfile).toHaveBeenCalledTimes(3);
+      expect(runtime.initialize).toHaveBeenCalledTimes(1);
+      expect(runtime.shutdown).not.toHaveBeenCalled();
+      expect(state.config.approvals.execute).toBe("deny");
+      expect(state.config.jev.decisionProfiles).toEqual(profiles);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it("loads normalized turn policy without importing or constructing the runtime", async () => {
     const cwd = project({
       fullCodeMode: false,

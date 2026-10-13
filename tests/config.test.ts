@@ -147,6 +147,32 @@ describe("host-only control incarnation rollout fence (#7514)", () => {
     }
   });
 });
+describe("host-only stuckPreparingMs (smarty-dev#6337)", () => {
+  it("defaults to ten minutes and clamps to [1 s, 7 d]", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({}).agents.stuckPreparingMs).toBe(600_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 300_000 } }).agents.stuckPreparingMs).toBe(300_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: 5 } }).agents.stuckPreparingMs).toBe(1_000);
+    expect(normalizeFabricConfig({ agents: { stuckPreparingMs: "soon" } }).agents.stuckPreparingMs).toBe(600_000);
+  });
+  it.each([true, false])("ignores even trusted project overrides (trusted=%s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 7 * 24 * 60 * 60_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(600_000);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { stuckPreparingMs: 120_000 } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.stuckPreparingMs).toBe(120_000);
+  });
+});
+
+it("normalizes the dead-root resident idle-exit policy, with an explicit disabled rollback", () => {
+  expect(DEFAULT_FABRIC_CONFIG.mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({}).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 0 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1_234 } }).mesh.residentIdleExitMs).toBe(1_234);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: -1 } }).mesh.residentIdleExitMs).toBe(0);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: "bad" } }).mesh.residentIdleExitMs).toBe(600_000);
+  expect(normalizeFabricConfig({ mesh: { residentIdleExitMs: 1e12 } }).mesh.residentIdleExitMs).toBe(7 * 24 * 60 * 60_000);
+});
 
 it("normalizes the reader-only idle coalescing window", () => {
   expect(normalizeFabricConfig({}).mesh.idleReadCoalesceMs).toBe(5_000);
@@ -172,6 +198,31 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
     if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
     else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
   }
+});
+
+describe("executor.powershell opt-in (smarty-dev#9826)", () => {
+  it("defaults to refuse and accepts only the exact allow", () => {
+    expect(DEFAULT_FABRIC_CONFIG.executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({}).executor.powershell).toBe("refuse");
+    expect(normalizeFabricConfig({ executor: { powershell: "allow" } }).executor.powershell).toBe("allow");
+    for (const value of ["refuse", "Allow", "ALLOW", true, 1, "yes", null, {}]) {
+      expect(normalizeFabricConfig({ executor: { powershell: value } }).executor.powershell).toBe("refuse");
+    }
+  });
+  it("honors the host profile opt-in and ignores a project opt-in", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("refuse");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ executor: { powershell: "allow" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+    expect(loadGlobalFabricConfig(agentDir).executor.powershell).toBe("allow");
+    // A project layer cannot withdraw it either: the key is host-only.
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ executor: { powershell: "refuse" } }));
+    expect(loadFabricConfig(options).executor.powershell).toBe("allow");
+  });
 });
 
 describe("Fabric configuration", () => {
@@ -483,7 +534,7 @@ describe("Fabric configuration", () => {
       model: "claude/haiku",
     });
     const invalid = normalizeFabricConfig({
-      agents: { runner: "other", claude: { binary: " ", model: " " } },
+      agents: { runner: "Not A Runner", claude: { binary: " ", model: " " } },
     });
     expect(invalid.agents.runner).toBe("pi");
     expect(invalid.agents.claude).toEqual({ binary: "claude" });
@@ -518,7 +569,11 @@ describe("Fabric configuration", () => {
     expect(backendModel.agents.veda.model).toBe("opus");
     const blankBackend = normalizeFabricConfig({ agents: { veda: { backend: " " } } });
     expect(blankBackend.agents.veda.backend).toBe("agy");
-    const invalidRunner = normalizeFabricConfig({ agents: { runner: "other" } });
+    const invalidRunner = normalizeFabricConfig({ agents: { runner: 42 } });
+    expect(invalidRunner.agents.runner).toBe("pi");
+    // A well-formed id may name a runner registered later; launch fails closed if not.
+    const registered = normalizeFabricConfig({ agents: { runner: "acme-daemon" } });
+    expect(registered.agents.runner).toBe("acme-daemon");
     expect(invalidRunner.agents.runner).toBe("pi");
   });
 
@@ -1083,6 +1138,26 @@ describe("Fabric configuration", () => {
   });
 });
 
+describe("native MCP ownership configuration", () => {
+  it("rejects invalid settings before replacing the working configuration", () => {
+    const directory = temporaryDirectory();
+    const location = { cwd: directory, agentDir: directory, projectTrusted: false };
+    const saved = saveFabricConfig(location, { mcp: { nativeServers: ["docs"] } });
+    const before = fs.readFileSync(saved.path, "utf8");
+    expect(() => saveFabricConfig(location, { mcp: { nativeServers: ["bad.name"] } })).toThrow("mcp.nativeServers");
+    expect(fs.readFileSync(saved.path, "utf8")).toBe(before);
+    expect(loadFabricConfig(location).mcp.nativeServers).toEqual(["docs"]);
+  });
+
+  it("is opt-in, deduplicates exact names, and rejects malformed selections rather than falling back", () => {
+    expect(normalizeFabricConfig({}).mcp.nativeServers).toEqual([]);
+    expect(normalizeFabricConfig({ mcp: { nativeServers: [" docs-api ", "docs-api", "issues"] } }).mcp.nativeServers).toEqual(["docs-api", "issues"]);
+    for (const nativeServers of ["docs", ["bad.name"], [1], [""], ["*"]]) {
+      expect(() => normalizeFabricConfig({ mcp: { nativeServers } })).toThrow("mcp.nativeServers");
+    }
+  });
+});
+
 describe("MCP descriptor cache configuration", () => {
   it("defaults to an enabled cache with changed revalidation", () => {
     const config = normalizeFabricConfig({});
@@ -1141,5 +1216,14 @@ describe("MCP Jev semantic search configuration", () => {
     expect(config.mcp.jev.blockedServers).toEqual(["github"]);
     expect(config.mcp.jev.semanticCandidateLimit).toBe(127);
     expect(config.mcp.jev.semanticMinProbability).toBe(0.75);
+  });
+
+  it("normalizes the agent model admission policy", () => {
+    expect(DEFAULT_FABRIC_CONFIG.agents.modelAdmission).toBe("strict");
+    expect(normalizeFabricConfig({}).agents.modelAdmission).toBe("strict");
+    expect(normalizeFabricConfig({ agents: { modelAdmission: "permissive" } }).agents.modelAdmission)
+      .toBe("permissive");
+    expect(normalizeFabricConfig({ agents: { modelAdmission: "relaxed" } }).agents.modelAdmission)
+      .toBe("strict");
   });
 });

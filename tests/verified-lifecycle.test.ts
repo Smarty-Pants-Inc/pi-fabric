@@ -11,9 +11,9 @@ describe("compiled binding lifecycle", () => {
   it("encodes close reservation and independent blockers without mutating input", () => {
     const life: BindingLife = { $: "Life", phase: { $: "Retiring" }, owner: false, revoked: true, holds: 0n, calls: 0n };
     const before = structuredClone(life);
-    const closing = bindingStep(life, { $: "Close" });
+    const closing = bindingStep(life, { $: "Shut" });
     expect(closing).toEqual({ $: "Outcome", next: { ...life, phase: { $: "Closing" } }, command: { $: "StartClose" } });
-    expect(bindingStep(closing.next, { $: "Close" })).toEqual({ $: "Outcome", next: closing.next, command: { $: "Denied" } });
+    expect(bindingStep(closing.next, { $: "Shut" })).toEqual({ $: "Outcome", next: closing.next, command: { $: "Denied" } });
     expect(life).toEqual(before);
     const blocked: BindingLife[] = [
       { ...life, owner: true }, { ...life, holds: 4n }, { ...life, calls: 7n },
@@ -21,7 +21,7 @@ describe("compiled binding lifecycle", () => {
     ];
     for (const input of blocked) {
       const unchanged = structuredClone(input);
-      expect(bindingStep(input, { $: "Close" })).toEqual({ $: "Outcome", next: unchanged, command: { $: "Denied" } });
+      expect(bindingStep(input, { $: "Shut" })).toEqual({ $: "Outcome", next: unchanged, command: { $: "Denied" } });
       expect(input).toEqual(unchanged);
     }
   });
@@ -53,7 +53,7 @@ describe("compiled binding lifecycle", () => {
       { event: { $: "Retire" }, next: { ...life, phase: { $: "Retiring" } } },
       { event: { $: "DropOwner" }, next: { ...life, owner: false } },
       { event: { $: "Revoke" }, next: { ...life, phase: { $: "Retiring" }, owner: false, revoked: true } },
-      { event: { $: "Fail" }, next: { ...life, phase: { $: "Failed" }, owner: false, revoked: true } },
+      { event: { $: "Abort" }, next: { ...life, phase: { $: "Failed" }, owner: false, revoked: true } },
     ];
     for (const { event, next } of cases) expect(bindingStep(life, event)).toEqual({ $: "Outcome", next, command: { $: "Granted" } });
     const empty: BindingLife = { ...life, phase: { $: "Failed" }, holds: 0n, calls: 0n };

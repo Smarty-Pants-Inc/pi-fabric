@@ -299,6 +299,17 @@ setInterval(() => {}, 1000);`;
 });
 
 describe("agents provider message routing service boundaries", () => {
+  it.each(["main", "session:owner"])("an actor's steer to %s still reaches its owning Main", async (target) => {
+    const ports = routing();
+    const actor = { ...ports.actors, identity: { id: "actor", name: "Review", kind: "actor" as const } };
+    const main = { ...ports.main, id: "session:owner", matches: (id: string) => id === "main" || id === "session:owner" };
+    const router = new AgentMessageRouter(ports.agents, actor, main, ports.participants, ports.control, (binding) => binding);
+    await router.routeMessage(target, "Steer Main", undefined, "steer");
+    expect(main.deliverAgent).toHaveBeenCalledOnce();
+    expect(main.deliverAgent).toHaveBeenCalledWith(expect.objectContaining({ message: "Steer Main", delivery: "steer", from: actor.identity }));
+    expect(actor.tell).not.toHaveBeenCalled();
+  });
+
   it("F4 never ensures a missing durable participant without a kernel fence", async () => {
     const ports = routing();
     ports.actors.status.mockReturnValue({ id: "actor", residency: "durable", rootId: "main" } as ReturnType<Ports[1]["status"]>);
@@ -683,7 +694,8 @@ describe("agents provider message routing service boundaries", () => {
     const { router, main, actors } = routing();
     const from = { id: "source", name: "Source", kind: "main" as const };
     await router.routeMessage("main", "event", undefined, "followUp", undefined, { from, triggerTurn: false });
-    expect(main.deliverAgent).toHaveBeenCalledWith({ from, verification: "mesh", message: "event", delivery: "followUp", triggerTurn: false });
+    expect(main.deliverAgent).toHaveBeenCalledWith({ from, verification: "mesh", message: "event", delivery: "followUp", triggerTurn: false,
+      outcomeSend: { eventId: generatedIdempotencyKey, to: main.id, from: from.id, mode: "followUp" } });
     expect(actors.validateDirectMessage).not.toHaveBeenCalled();
   });
 
@@ -777,9 +789,11 @@ describe("agents provider message routing service boundaries", () => {
     const principal = { id: "paul", binding: "voice-call" as const };
     const signal = new AbortController().signal;
     const own = { ...command(operation), principal, binding: { model: "provider/pinned" }, bindingProvenance: { kind: "owner-defaults" as const, rootId: actors.identity.id } };
-    const check = (options: unknown) => {
-      if (operation === "ask") expect(actors.ask).toHaveBeenLastCalledWith("child", "hello", undefined, signal, options);
-      else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, options);
+    // Upstream sender stamps: an unstamped control carries sender: null.
+    const check = (options: Record<string, unknown>, from = actors.identity.id) => {
+      if (operation === "ask") expect(actors.ask).toHaveBeenLastCalledWith("child", "hello", undefined, signal, { ...options, sender: null });
+      else expect(actors.tell).toHaveBeenLastCalledWith("child", "hello", undefined, { ...options, sender: null,
+        outcomeSend: { eventId: "cmd", to: "child", from, mode: operation } });
     };
     await expect(router.acceptControl(own, actors.identity, signal, "mesh")).resolves.toMatchObject({ accepted: true });
     check({ overrides: own.binding, provenance: expect.objectContaining({ principal }) });
@@ -787,10 +801,10 @@ describe("agents provider message routing service boundaries", () => {
     await expect(router.acceptControl(own, foreign, signal, "mesh")).resolves.toMatchObject({ accepted: false, error: "Invalid actor owner-default binding provenance" });
     for (const binding of [undefined, {}, { thinking: "high" as const }]) {
       await expect(router.acceptControl({ ...command(operation), principal, ...(binding ? { binding } : {}) }, foreign, signal, "bridge")).resolves.toMatchObject({ accepted: true });
-      check({ binding: binding ?? {}, provenance: expect.objectContaining({ principal }) });
+      check({ binding: binding ?? {}, provenance: expect.objectContaining({ principal }) }, foreign.id);
     }
     await expect(router.acceptControl({ ...command(operation), principal }, foreign, signal)).resolves.toMatchObject({ accepted: true });
-    check({ binding: {}, provenance: undefined });
+    check({ binding: {}, provenance: undefined }, foreign.id);
   });
 
   it("leaves cancel commands to the control plane and refreshes successful stops", async () => {

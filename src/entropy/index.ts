@@ -13,3 +13,6 @@ export * from "./corpus.js";
 export * from "./sessions.js";
 export * from "./trial.js";
 export * from "./surface.js";
+// Entropy's store lock contention, for the extension's lazy compile path: importing it there
+// statically would add core/file-lock.ts to the eager extension graph.
+export { FileLockTimeoutError } from "../core/file-lock.js";

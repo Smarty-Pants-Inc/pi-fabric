@@ -118,6 +118,7 @@ const providerTransientIn = (text: string): { why: string; match: string } | und
  * Classify one failed activation. lastError is the reported terminal error line; error is the
  * full failure text; evidence is the run's worker warnings, when the run produced any.
  */
+const WINDOW_LOST = /^[ \t]*(?:Fabric activation window failed: )?(?:Error: )?(Activation window lost (?:current activation messages|its authorized compaction|its native history boundary|its native system records|its native system prompt|the Google config object))[ \t]*\r?$/m;
 export const classifyActivationFailure = (input: {
   lastError: string; error?: string | undefined; evidence?: readonly string[] | undefined; preparation?: boolean | undefined;
   /** The preparation error is a timeout by type (a preparation, launch or mesh lock deadline). */
@@ -144,9 +145,15 @@ export const classifyActivationFailure = (input: {
   const permanent = permanentAnywhere(input);
   if (permanent) return permanent;
   const line = withoutModelText(input.lastError);
-  if (/Activation window lost current activation messages/i.test(line)) {
+  // smarty-dev#9890: every terminal "Activation window lost …" (its messages, history boundary,
+  // system records or authorized compaction) is one transient class; the next run rebuilds the window.
+  // Only the worker's own refusal counts: a whole line that is exactly one of activation-window.ts's messages,
+  // optionally behind its "Fabric activation window failed: " and "Error: " prefixes. A mention inside another
+  // error stays fail-closed.
+  const windowLost = WINDOW_LOST.exec(line);
+  if (windowLost) {
     return { code: "activation-window-lost", transient: true,
-      classification: "transient: activation window lost its current messages" };
+      classification: `transient: activation window lost (matched ${quote(windowLost[0])})` };
   }
   if (/Child Pi exited before requested model admission completed/i.test(line)) {
     return { code: "child-exit-before-admission", transient: true,

@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
-import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE } from "../core/atomic-write.js";
+import { isMeshLockTimeout, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -10,9 +10,9 @@ import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 
 /**
@@ -23,7 +23,8 @@ import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
  *
  * Trust: the hub side is trusted; the remote side is not. An event from the remote crosses only
  * when its sender is a live participant native to the remote (and no hub record uses its id), and
- * its recipient is native to the hub. Mirrored records never replace a native record. The one
+ * its recipient is native to the hub, or is the hub factory's role address `factory` on a work
+ * event or owner wake (smarty-dev#9352). Mirrored records never replace a native record. The one
  * exception to "no hub record uses its id" is a hub-written handoff (smarty-dev#9074, below).
  */
 
@@ -39,6 +40,15 @@ const BRIDGE_FENCE_RETRY_MS = 5_000;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
+/** Commands whose ACK this link relays back to a non-participant hub sender (smarty-dev#9751). */
+const MAX_AWAITING_ACKS = 4_096;
+type Direction = "toRemote" | "toLocal";
+/** How long a carried command's ACK may still be relayed back (smarty-dev#9751). */
+const AWAITING_ACK_MS = 15 * 60_000;
+/** A relayed ACK goes back only to one session or factory host: never an org, topic or broadcast name. */
+const UNICAST_REPLY_TO = /^(?:session|factory-host):[A-Za-z0-9._-]{1,128}$/;
+/** The outcome fields a relayed ACK carries (no result payload). */
+const RELAYED_ACK_FIELDS = new Set(["version", "commandId", "targetId", "ownerIncarnation", "accepted", "messageId", "error", "errorCode", "notRun"]);
 /** A bridge call the remote has not answered by then closes the transport. */
 export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 /** stop() waits at most this long for the loop and for each remote step of the withdrawal. */
@@ -84,12 +94,109 @@ const isIdentity = (value: unknown): value is MeshIdentity =>
 
 export const validBridgeName = (name: string): boolean => NAME_PATTERN.test(name);
 
-/** v1 allow-list: control commands and acks, work events, and owner wakes. */
-export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind">): boolean =>
+/** A mesh topic is at most this long (the event log's topic pattern); the parsers read no further. */
+const MAX_TOPIC_LENGTH = 128;
+const WORK_TOPIC_PREFIX = "fleet.work.";
+const WORK_SEGMENT = /^[A-Za-z0-9_-]+$/;
+const WORK_REPO = /^[A-Za-z0-9._-]+$/;
+const WORK_NUMBER = /^[1-9][0-9]{0,15}$/;
+
+/**
+ * A well-formed work topic, `fleet.work.<name>` (pi-fabric#876 security pass, (a)): dot-separated,
+ * non-empty ASCII segments of [A-Za-z0-9_-], at most 128 characters in all. Every work topic the
+ * bridge allows, to any recipient, therefore also passes the mesh event log's and mesh_answers'
+ * topic pattern. The one empty segment allowed is a dot-led repo name such as `.github`
+ * (`fleet.work..github.7`), and only before two more segments. No `fleet.work.`, `fleet.work..1`,
+ * `fleet.work.a..b.1`, trailing dot, NUL, space, lookalike or other non-ASCII character. Linear: a
+ * length cap, one split and a character class per segment, never a backtracking pattern.
+ */
+export const isWorkTopic = (topic: unknown): topic is string => {
+  if (typeof topic !== "string" || topic.length > MAX_TOPIC_LENGTH || !topic.startsWith(WORK_TOPIC_PREFIX)) return false;
+  const segments = topic.slice(WORK_TOPIC_PREFIX.length).split(".");
+  for (let index = segments[0] === "" && segments.length > 2 ? 1 : 0; index < segments.length; index++) {
+    if (!WORK_SEGMENT.test(segments[index]!)) return false;
+  }
+  return true;
+};
+
+/** v1 allow-list: control commands and acks, well-formed work events (isWorkTopic), owner wakes, and a work host's
+ * mesh-outage alarm and its recovery, only when addressed to one `session:<uuid>` (pi-fabric#893 rounds 4-5). */
+export const isBridgedTopic = (event: Pick<MeshEvent, "topic" | "kind"> & { to?: unknown }): boolean =>
   event.topic === "fabric.control.command" ||
   event.topic === "fabric.control.ack" ||
-  event.topic.startsWith("fleet.work.") ||
-  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm"));
+  isWorkTopic(event.topic) ||
+  (event.topic === "ops.owner" && (event.kind === "pr.wake" || event.kind === "inbox.age.alarm")) ||
+  (event.topic === FABRIC_MESH_OUTAGE_ALARM_TOPIC && (event.kind === "mesh-outage" || event.kind === "mesh-recovered") &&
+    isMeshAlarmTarget(event.to));
+
+/**
+ * The hub factory's role address (smarty-dev#9352). The factory on the hub reads work events and
+ * owner wakes by topic, addressed to this literal name rather than to a participant id, so no hub
+ * record answers to it. Only from the remote to the hub, only this exact name, and only on a
+ * parsed `fleet.work.<repo>.<n>` topic (parseWorkTopic) or the allow-listed `ops.owner` kinds is it
+ * an address across; every other check (allow-list, sender identity, reserved ids, live sender at
+ * commit, frame budget) still holds, and the link's factory rate bound (factoryRate) applies.
+ */
+export const HUB_FACTORY_RECIPIENT = "factory";
+
+/**
+ * A work topic as work-host Mains name it, `fleet.work.<repo>.<n>` (pi-fabric#876 review, P1-1): a
+ * non-empty repo segment of [A-Za-z0-9._-] (never `.` or `..`, which name no repo) and a decimal
+ * issue or PR number without a sign or leading zero. The number is the segment after the last
+ * dot, so a dotted repo name still parses. It is a well-formed work topic first (isWorkTopic).
+ * Linear in the topic: an untrusted remote's string meets no backtracking pattern. Anything else
+ * (`fleet.work.`, `fleet.work.<repo>`, `fleet.work.inbox-receipts`, `fleet.work..1`,
+ * `fleet.work.<repo>.1.extra`, `fleet.work.a:b.1`, a lookalike or a NUL) is undefined.
+ */
+export const parseWorkTopic = (topic: unknown): { repo: string; number: number } | undefined => {
+  if (!isWorkTopic(topic)) return undefined;
+  const rest = topic.slice(WORK_TOPIC_PREFIX.length);
+  const dot = rest.lastIndexOf(".");
+  if (dot <= 0) return undefined;
+  const repo = rest.slice(0, dot);
+  const digits = rest.slice(dot + 1);
+  if (!WORK_REPO.test(repo) || repo === "." || repo === ".." || !WORK_NUMBER.test(digits)) return undefined;
+  const number = Number(digits);
+  return Number.isSafeInteger(number) ? { repo, number } : undefined;
+};
+
+/**
+ * Whether a remote event is addressed to the hub factory's role (see HUB_FACTORY_RECIPIENT): `to`
+ * is exactly `factory`, and the topic is a parsed `fleet.work.<repo>.<n>` or `ops.owner` with an
+ * allow-listed kind.
+ */
+export const isHubFactoryEvent = (event: Pick<MeshEvent, "topic" | "kind" | "to">): boolean =>
+  event.to === HUB_FACTORY_RECIPIENT &&
+  (parseWorkTopic(event.topic) !== undefined || (event.topic === "ops.owner" && isBridgedTopic(event)));
+
+/**
+ * Two per-link token buckets: `perMinute` events refill each minute, up to `burst` held, and
+ * `bytesPerMinute` bytes, up to `byteBurst` held (each defaults to DEFAULT_FACTORY_RATE's).
+ */
+export interface FactoryRate {
+  perMinute: number;
+  burst: number;
+  bytesPerMinute?: number;
+  byteBurst?: number;
+}
+
+/**
+ * The default per-link bound on the factory exception (pi-fabric#876 review, P1-2, and security
+ * pass, (c)): 30 events a minute, burst 60, and 512 KiB a minute, burst 1 MiB, of the events as
+ * published. Only events that cross because they are addressed to the factory's role spend from
+ * either bucket; events to a hub-native recipient do not.
+ */
+export const DEFAULT_FACTORY_RATE: Readonly<Required<FactoryRate>> = Object.freeze({
+  perMinute: 30, burst: 60, bytesPerMinute: 512 * 1024, byteBurst: 1024 * 1024,
+});
+
+/** At most one factory-rate deferral line per this interval. */
+const FACTORY_RATE_LOG_MS = 60_000;
+
+/** At most one "not addressed across" count line per this interval (smarty-dev#9352). */
+const UNADDRESSED_LOG_MS = 60_000;
+/** The count line names at most this many distinct topics. */
+const UNADDRESSED_TOPICS = 10;
 
 /** The stamp a bridged event carries; an event with one is never forwarded again (no loops). */
 export const bridgeStampOf = (event: Pick<MeshEvent, "data">): { from: string; id: string } | undefined => {
@@ -346,6 +453,7 @@ export class StoreBridgeSide implements BridgeSide {
     readonly now: () => number = Date.now,
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
+    assertBridgeStateBackend(store.root, store.stateBackend);
     this.#outbox = new CommitOutbox(store, `bridge/${peer}`, this.#identity(), {
       lease: (lease: BridgeLease, view, replay) => this.#applyLease(lease, view, replay),
       // A removal (live or replayed) unlinks only the removed mirror's own lease: a replacement
@@ -623,7 +731,11 @@ export class StoreBridgeSide implements BridgeSide {
         fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit),
         admit: () => {
           for (const id of held) {
-            if (!this.holds(id)) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+            // An inbound sender's name, kind and session id must be its mirrored record's, at commit
+            // (pi-fabric#876 security pass, (b)): a body identity never gets the bridge's mark.
+            if (!this.holds(id, id === checked.from.id ? checked.from : undefined)) {
+              throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+            }
           }
         },
       } : {}),
@@ -637,9 +749,11 @@ export class StoreBridgeSide implements BridgeSide {
    * 3 and 4, F2). Any record for the
    * id that is not this link's live mirror (a native, another link's, or a reserved id anywhere
    * on this side) is a denial, never a gap to fill from another mirror: `id` must be this
-   * link's host, with a live lease, and its root, if present, must be this link's too.
+   * link's host, with a live lease, and its root, if present, must be this link's too. With
+   * `identity` (an inbound sender's `from`), that must also be exactly the host record's identity:
+   * id, name, kind and session id (pi-fabric#876 security pass, (b)).
    */
-  holds(id: string): boolean {
+  holds(id: string, identity?: MeshIdentity): boolean {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
@@ -649,6 +763,7 @@ export class StoreBridgeSide implements BridgeSide {
     if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return false;
     const host = hostOf(hostEntry.key, hostEntry.value);
     if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return false;
+    if (identity && !sameIdentity(host.identity, identity)) return false;
     if (hostLeaseExpiry(readHostLeases(this.store.root), host) <= now) return false;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
@@ -895,7 +1010,7 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
   if (!isObject(input)) throw new Error("Bridge publish is not an object");
   const { topic, kind, from, to, text, data } = input;
   const principal = copyFabricPrincipal(input.principal);
-  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind })) {
+  if (typeof topic !== "string" || typeof kind !== "string" || !isBridgedTopic({ topic, kind, to })) {
     throw new Error(`Bridge topic is not allowed: ${String(topic)}`);
   }
   if (!isIdentity(from)) throw new Error("Bridge publish has no sender identity");
@@ -1239,6 +1354,16 @@ export interface MeshBridgeOptions {
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
   log?: (message: string) => void;
+  /** Debug lines (each event not addressed across); off when absent. */
+  debug?: (message: string) => void;
+  /**
+   * The per-link bound on remote events that cross only as addressed to the hub factory's role
+   * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
+   * before it, and resumes when its token is due: the event waits, it is never dropped.
+   */
+  factoryRate?: FactoryRate;
+  /** The clock of the once-a-minute log lines and the factory rate bound (Date.now by default; tests inject it). */
+  clock?: () => number;
 }
 
 export interface BridgeStepResult {
@@ -1334,6 +1459,34 @@ export const boundPresence = (
   return { presence: { hosts, participants }, dropped };
 };
 
+/**
+ * Each admitted sender id's identity, from this link's canonical record for it (pi-fabric#876
+ * security pass, (b)). admitPresence makes a host's id, identity id and root id one id, and a root
+ * participant's id that same id, so the host record's identity is the sender's. A bridged event's
+ * `from` is this, never the name, kind or session id its body claims.
+ */
+const senderIdentities = (presence: Pick<BridgePresence, "hosts" | "participants">): Map<string, MeshIdentity> => {
+  const identities = new Map<string, MeshIdentity>();
+  for (const { record } of presence.hosts) {
+    const { id, name, kind, sessionId } = record.identity;
+    if (id === record.id) identities.set(id, { id, name, kind, ...(typeof sessionId === "string" ? { sessionId } : {}) });
+  }
+  return identities;
+};
+
+const sameIdentity = (a: MeshIdentity, b: MeshIdentity): boolean =>
+  a.id === b.id && a.name === b.name && a.kind === b.kind &&
+  (typeof a.sessionId === "string" ? a.sessionId : undefined) === (typeof b.sessionId === "string" ? b.sessionId : undefined);
+
+/** What one direction's forwarding is checked against: the link's authority for that page. */
+interface BridgeRules {
+  recipients: Set<string>;
+  senders?: Set<string>;
+  /** Inbound only: each admitted sender's canonical identity (senderIdentities). */
+  identities?: Map<string, MeshIdentity>;
+  reserved?: Set<string>;
+}
+
 const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<string> => {
   const ids = new Set<string>();
   for (const { record } of presence.hosts) ids.add(record.identity.id);
@@ -1360,16 +1513,182 @@ export class MeshBridge {
   #expiryAt = Infinity;
   /** The loop's current pass, so stop() can fence it before the final withdrawal. */
   #running: Promise<void> = Promise.resolve();
+  /** run()'s two direction loops (smarty-dev#9751); stop() fences on them too. */
+  #directions: Promise<void> = Promise.resolve();
+  readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  readonly #directionWake: Partial<Record<Direction, () => void>> = {};
+  /** Events not addressed across since the last count line (smarty-dev#9352). */
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+  #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
+  readonly #factoryRate: Required<FactoryRate>;
+  #factoryTokens: number;
+  /** Bytes left in the byte bucket; below zero after an event bigger than its burst (a debt). */
+  #factoryBytes: number;
+  #factoryRefilledAt = Number.NEGATIVE_INFINITY;
+  /** A deferred factory event holds the inbound drain until this time (this bridge's clock). */
+  #factoryWaiting = false;
+  /** Command id to the hub sender's replyTo, for commands this link carried out (smarty-dev#9751). */
+  readonly #awaitingAck = new Map<string, { replyTo: string; target: string; targetId: string; expiresAt: number }>();
+  #factoryRetryAt = Number.NEGATIVE_INFINITY;
+  #factoryDeferrals = 0;
+  #factoryLoggedAt = Number.NEGATIVE_INFINITY;
 
   constructor(readonly options: MeshBridgeOptions) {
     for (const name of [options.localName, options.remoteName]) {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    const given = options.factoryRate ?? DEFAULT_FACTORY_RATE;
+    const rate: Required<FactoryRate> = {
+      perMinute: given.perMinute, burst: given.burst,
+      bytesPerMinute: given.bytesPerMinute ?? DEFAULT_FACTORY_RATE.bytesPerMinute,
+      byteBurst: given.byteBurst ?? DEFAULT_FACTORY_RATE.byteBurst,
+    };
+    if (!(Number.isFinite(rate.perMinute) && rate.perMinute > 0) || !(Number.isSafeInteger(rate.burst) && rate.burst > 0)) {
+      throw new Error("factoryRate needs a positive perMinute and a positive integer burst");
+    }
+    if (!(Number.isSafeInteger(rate.bytesPerMinute) && rate.bytesPerMinute > 0) || !(Number.isSafeInteger(rate.byteBurst) && rate.byteBurst > 0)) {
+      throw new Error("factoryRate needs a positive integer bytesPerMinute and byteBurst");
+    }
+    this.#factoryRate = rate;
+    this.#factoryTokens = rate.burst;
+    this.#factoryBytes = rate.byteBurst;
+  }
+
+  #now(): number {
+    return (this.options.clock ?? Date.now)();
+  }
+
+  /** The factory buckets' event tokens now, both buckets refilled for the time since the last look. */
+  #factoryTokensNow(): number {
+    const now = this.#now();
+    if (now > this.#factoryRefilledAt) {
+      const { perMinute, burst, bytesPerMinute, byteBurst } = this.#factoryRate;
+      const elapsed = now - this.#factoryRefilledAt;
+      this.#factoryTokens = Math.min(burst, this.#factoryTokens + elapsed * perMinute / 60_000);
+      this.#factoryBytes = Math.min(byteBurst, this.#factoryBytes + elapsed * bytesPerMinute / 60_000);
+      this.#factoryRefilledAt = now;
+    }
+    return this.#factoryTokens;
+  }
+
+  /**
+   * Whether one more factory event of `size` bytes fits, after `events` and `bytes` already
+   * spent in this batch. An event bigger than the byte burst needs a full bucket and leaves a debt,
+   * so it waits but is never stuck, and the bytes over any window stay bounded.
+   */
+  #factoryAffords(events: number, bytes: number, size: number): boolean {
+    return events + 1 <= this.#factoryTokensNow() && bytes + Math.min(size, this.#factoryRate.byteBurst) <= this.#factoryBytes;
+  }
+
+  /**
+   * The event a bridged event becomes on the far side. Its `from` is, inbound, the sender's
+   * identity from this link's presence record (pi-fabric#876 security pass, (b)): the name, kind
+   * and session id in the remote event's body never pass through, on any topic or recipient.
+   * Outbound it is the hub's own event's sender.
+   */
+  #outbound(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): BridgePublish {
+    const data = isObject(event.data) ? event.data : {};
+    // smarty-dev#9751: a hub sender that is no participant (a factory host) still gets the ACK of a command
+    // this link carried out for it. Only its own authenticated address: replyTo must be the carried command's
+    // sender, published natively on the hub (verification "mesh", never a bridged copy), so no command can
+    // point an ACK, and its result, at anyone else (pi-fabric#928 review P1). The record is bound to the
+    // command's target and expires; bounded, oldest first out.
+    if (direction === "toRemote" && event.topic === "fabric.control.command" && typeof data.commandId === "string" &&
+        data.replyTo === event.from.id && event.verification === "mesh" && UNICAST_REPLY_TO.test(data.replyTo) &&
+        typeof data.targetId === "string" && typeof event.to === "string") {
+      const now = this.#now();
+      this.#awaitingAck.delete(data.commandId);
+      this.#awaitingAck.set(data.commandId, { replyTo: event.from.id, target: event.to, targetId: data.targetId, expiresAt: now + AWAITING_ACK_MS });
+      for (const [id, awaited] of this.#awaitingAck) {
+        if (this.#awaitingAck.size <= MAX_AWAITING_ACKS && awaited.expiresAt > now) break;
+        this.#awaitingAck.delete(id);
+      }
+    }
+    let from = event.from;
+    if (direction === "toLocal" && rules.identities) {
+      const identity = rules.identities.get(event.from.id);
+      if (!identity) throw new BridgeOwnershipError(`${event.from.id} is no longer bound to bridge link ${this.options.remoteName}`);
+      if (!sameIdentity(identity, event.from)) {
+        this.options.debug?.(`toLocal: sender identity from its presence record, not the event: ${event.topic} ${event.id} from ${event.from.id}`);
+      }
+      from = identity;
+    }
+    return {
+      topic: event.topic, kind: event.kind, from, to: event.to!,
+      ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
+      ...(event.text !== undefined ? { text: event.text } : {}),
+      // An ACK that crosses only through the relay (its address is no hub recipient) carries just the outcome
+      // fields, never the command's result payload (pi-fabric#928 SEC P1).
+      data: { ...(direction === "toLocal" && event.topic === "fabric.control.ack" && !rules.recipients.has(event.to!)
+        ? Object.fromEntries(Object.entries(data).filter(([field]) => RELAYED_ACK_FIELDS.has(field))) : data),
+      bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
+    } as BridgePublish;
+  }
+
+  /** Whether a remote event crosses only through the factory exception, so it spends a token. */
+  #viaFactory(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): boolean {
+    return direction === "toLocal" && !(typeof event.to === "string" && rules.recipients.has(event.to)) && isHubFactoryEvent(event);
+  }
+
+  /**
+   * Over the factory rate: the inbound drain stops at this event, unforwarded, with the cursor
+   * before it, and retries when its token is due (run() arms one timer for that; no notification is
+   * needed and nothing polls). At most one line a minute reports the deferrals.
+   */
+  #deferFactory(event: MeshEvent, size: number): void {
+    const now = this.#now();
+    const { perMinute, burst, bytesPerMinute, byteBurst } = this.#factoryRate;
+    const waitMs = Math.max(1, Math.ceil((1 - this.#factoryTokens) * 60_000 / perMinute),
+      Math.ceil((Math.min(size, byteBurst) - this.#factoryBytes) * 60_000 / bytesPerMinute));
+    this.#factoryWaiting = true;
+    this.#factoryRetryAt = now + waitMs;
+    this.#factoryDeferrals += 1;
+    if (now - this.#factoryLoggedAt < FACTORY_RATE_LOG_MS) return;
+    this.#factoryLoggedAt = now;
+    this.#log(`toLocal: factory rate bound (${perMinute}/min, burst ${burst}; ${bytesPerMinute} bytes/min, burst ${byteBurst}): ${this.#factoryDeferrals} deferrals; ` +
+      `waiting at ${event.topic} ${event.id}, retry in ${waitMs} ms; nothing dropped`);
+    this.#factoryDeferrals = 0;
   }
 
   #log(message: string): void {
     this.options.log?.(message);
+  }
+
+  /**
+   * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
+   * for the INFO line (smarty-dev#9352: these drops were silent).
+   */
+  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent): void {
+    const unaddressed = this.#unaddressed;
+    unaddressed.count += 1;
+    unaddressed[direction] += 1;
+    // A remote event to the factory's role that did not cross (pi-fabric#876 post-install gate).
+    if (direction === "toLocal" && event.to === HUB_FACTORY_RECIPIENT) unaddressed.factory += 1;
+    if (!unaddressed.topics.has(event.topic)) {
+      if (unaddressed.topics.size < UNADDRESSED_TOPICS) unaddressed.topics.add(event.topic);
+      else unaddressed.more = true;
+    }
+    this.options.debug?.(`${direction}: not addressed across: ${event.topic} ${event.id} from ${
+      isObject(event.from) ? String(event.from.id) : "?"} to ${String(event.to ?? "(none)")}`);
+    this.#reportUnaddressed();
+  }
+
+  /**
+   * The INFO count line, at most once a minute. Event-driven: a drop or a forward after the
+   * minute emits it; an idle bridge arms no timer for it.
+   */
+  #reportUnaddressed(): void {
+    const unaddressed = this.#unaddressed;
+    if (unaddressed.count === 0) return;
+    const now = this.#now();
+    if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
+    this.#unaddressedLoggedAt = now;
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, topics: new Set<string>(), more: false };
+    this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}))`);
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
@@ -1480,28 +1799,93 @@ export class MeshBridge {
     if (!this.#cursor) await this.start();
     if (this.#presenceDue()) await this.syncPresence();
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
-    const toRemote = await this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
-      const { remote } = await this.#authority(refreshIfStale);
-      return { recipients: remoteAddresses(remote) };
-    });
-    const toLocal = await this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
-      const { local, remote } = await this.#authority(refreshIfStale);
-      // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
-      return { recipients: addresses(local), senders: senders(remote), reserved: new Set(local.reserved) };
-    });
+    const toRemote = await this.#direction("toRemote");
+    const toLocal = await this.#direction("toLocal");
     return { toRemote: toRemote.forwarded, toLocal: toLocal.forwarded, dropped: toRemote.dropped + toLocal.dropped };
+  }
+
+  #direction(direction: Direction): Promise<{ forwarded: number; dropped: number }> {
+    return direction === "toRemote"
+      ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
+        const { remote } = await this.#authority(refreshIfStale);
+        return { recipients: remoteAddresses(remote) };
+      })
+      : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
+        const { local, remote } = await this.#authority(refreshIfStale);
+        // The remote is untrusted: its sender (and an ack's target) must be bound to this link.
+        return { recipients: addresses(local), senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved) };
+      });
+  }
+
+  /**
+   * smarty-dev#9751: run()'s drain of one direction, independent of the other. Each loop is sequential (one page in
+   * flight; pages are bounded by BRIDGE_PAGE_BYTES and the source's read limit), with its own cursor that moves only
+   * after a publish succeeds, in order, so nothing in one direction (a slow page read, a stalled publish, a long
+   * catch-up) can hold the other back. A retryable busy backs this direction off alone; any other error ends run()
+   * as before (a closed transport fails both directions, and the supervisor restarts the bridge).
+   */
+  async #directionLoop(direction: Direction, running: () => boolean): Promise<void> {
+    let retryMs = LOCK_RETRY_MIN_MS;
+    let walCapDelay: number | undefined;
+    let reported = false; // one log line per busy streak, as run() logs its own
+    while (running()) {
+      this.#directionPending[direction] = false;
+      this.#directionBackoff[direction] = false;
+      let delay: number | undefined;
+      try {
+        await this.#direction(direction);
+        retryMs = LOCK_RETRY_MIN_MS;
+        walCapDelay = undefined;
+        reported = false;
+        // A factory-rate deferral retries when its token is due: one timer, no notification needed.
+        if (direction === "toLocal" && this.#factoryWaiting) delay = Math.max(0, this.#factoryRetryAt - this.#now());
+        if (this.#legacyPolling) delay = Math.min(delay ?? Infinity, this.options.pollMs ?? LEGACY_POLL_MS);
+      } catch (error) {
+        if (!running()) return;
+        if (!isMeshRetryableBusy(error)) {
+          this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
+          this.#wake?.();
+          return;
+        }
+        this.#directionBackoff[direction] = true;
+        if (isMeshStateWalCap(error)) delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        else delay = retryMs;
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        if (!reported) {
+          this.#log(`${isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout"} (${direction}); retrying in ${delay} ms: ${(error as Error).message}`);
+          reported = true;
+        }
+      }
+      if (!running()) return;
+      if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        this.#directionWake[direction] = () => {
+          if (timer !== undefined) clearTimeout(timer);
+          delete this.#directionWake[direction];
+          resolve();
+        };
+        if (delay !== undefined) timer = setTimeout(() => this.#directionWake[direction]?.(), Math.min(delay, 2_147_483_647));
+      });
+    }
   }
 
   async #forward(
     direction: "toRemote" | "toLocal",
     source: BridgeSide,
     target: BridgeSide,
-    authority: (refreshIfStale?: boolean) => Promise<{ recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }>,
+    authority: (refreshIfStale?: boolean) => Promise<BridgeRules>,
   ): Promise<{ forwarded: number; dropped: number }> {
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
     let forwarded = 0;
     let dropped = 0;
+    if (direction === "toLocal" && this.#factoryWaiting) {
+      // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
+      // until then a pass does not even reread the page.
+      if (this.#now() < this.#factoryRetryAt) return { forwarded, dropped };
+      this.#factoryWaiting = false;
+    }
     while (true) {
       const start = cursor.after;
       const startOffset = cursor.offset;
@@ -1511,7 +1895,7 @@ export class MeshBridge {
       if (this.#presenceDue()) await this.syncPresence();
       // Authority reads are deliberately canonical (copied-marker ABA), so idle pages
       // avoid them; every page with events retains the same fresh authority checks.
-      let rules = page.events.length ? await authority() : { recipients: new Set<string>() };
+      let rules: BridgeRules = page.events.length ? await authority() : { recipients: new Set<string>() };
       for (const skip of Array.isArray(page.skipped) ? page.skipped : []) {
         dropped += 1;
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
@@ -1529,24 +1913,33 @@ export class MeshBridge {
           }
           if (this.#stopped) return { forwarded, dropped };
           const candidates: Array<{ event: BridgePublish; held: string[] }> = [];
+          // Which candidates spend a factory token; the batch ends at the first one over the rate,
+          // and the single-event path below defers it.
+          // Each candidate's factory cost in bytes (0 when it spends nothing).
+          const spends: number[] = [];
+          let spending = 0;
+          let spendingBytes = 0;
           let bytes = 0;
           for (const candidate of page.events.slice(index, index + 256)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
             const item = {
-              event: {
-                topic: candidate.topic, kind: candidate.kind, from: candidate.from, to: candidate.to!,
-                ...(candidate.verification === "mesh" || candidate.verification === "bridge" ? { principal: candidate.principal } : {}),
-                ...(candidate.text !== undefined ? { text: candidate.text } : {}),
-                data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: candidate.id } },
-              },
+              event: this.#outbound(candidate, rules, direction),
               held: direction === "toLocal" ? [candidate.from.id,
                 ...(candidate.topic === "fabric.control.ack" && typeof data.targetId === "string" ? [data.targetId] : [])] : [],
             };
-            bytes += Buffer.byteLength(JSON.stringify(item.event), "utf8") + 1;
+            const size = Buffer.byteLength(JSON.stringify(item.event), "utf8");
+            const spend = this.#viaFactory(candidate, rules, direction);
+            if (spend && !this.#factoryAffords(spending, spendingBytes, size)) break;
+            bytes += size + 1;
             if (bytes > BRIDGE_PAGE_BYTES - 1024) break;
             candidates.push(item);
+            spends.push(spend ? size : 0);
+            if (spend) {
+              spending += 1;
+              spendingBytes += size;
+            }
           }
           if (candidates.length > 1) {
             let committed: Array<{ sequence: number }> | undefined;
@@ -1560,6 +1953,9 @@ export class MeshBridge {
                   committed.some(result => !Number.isSafeInteger(result?.sequence) || result.sequence <= 0)) {
                 throw new Error("Invalid bridge batch receipt");
               }
+              const spent = spends.slice(0, committed.length).filter((size) => size > 0);
+              this.#factoryTokens -= spent.length;
+              this.#factoryBytes -= spent.reduce((sum, size) => sum + size, 0);
               const ids = page.events.slice(index, index + committed.length).map(item => item.id);
               for (const id of ids) seen.add(id);
               cursor.mark = Math.max(cursor.mark, ...committed.map(result => result.sequence));
@@ -1567,6 +1963,7 @@ export class MeshBridge {
               forwarded += committed.length;
               this.#save(); // Advance only after the destination confirms the prefix durably.
               for (const id of ids) seen.delete(id);
+              this.#reportUnaddressed();
               index += committed.length - 1;
               continue;
             }
@@ -1595,7 +1992,7 @@ export class MeshBridge {
           if (reason !== "not addressed across") {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
-          }
+          } else this.#notAddressed(direction, event);
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
@@ -1603,7 +2000,19 @@ export class MeshBridge {
           // existing one-refresh commit refusal path, never an idle renewal timer.
           if (this.#presenceDue()) await this.syncPresence();
           if (this.#stopped) return { forwarded, dropped };
-          const data = isObject(event.data) ? event.data : {};
+          if (this.#viaFactory(event, rules, direction)) {
+            const size = Buffer.byteLength(JSON.stringify(this.#outbound(event, rules, direction)), "utf8");
+            if (!this.#factoryAffords(0, 0, size)) {
+              // Defer, never drop (pi-fabric#876 review, P1-2): this event and all after it stay
+              // unread. The cursor stays before it (offset at this page's start; a reread skips
+              // by sequence), so a restart or the next drain resumes exactly here.
+              this.#deferFactory(event, size);
+              if (cursor.after > start) this.#save();
+              return { forwarded, dropped };
+            }
+            this.#factoryTokens -= 1;
+            this.#factoryBytes -= size;
+          }
           try {
             // Revalidated for each event after the awaits before it: an inbound event commits only
             // while its sender (and an ack's target) is still this link's; an outbound one is sent
@@ -1618,12 +2027,8 @@ export class MeshBridge {
               // Recheck the captured destination at the last seam, including after a refresh.
               const destinationRefusal = this.#destinationRefusal(event, direction);
               if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
-              return target.publish({
-                topic: event.topic, kind: event.kind, from: event.from, to: event.to!,
-                ...(event.verification === "mesh" || event.verification === "bridge" ? { principal: event.principal } : {}),
-                ...(event.text !== undefined ? { text: event.text } : {}),
-                data: { ...data, bridge: { from: direction === "toRemote" ? this.options.localName : this.options.remoteName, id: event.id } },
-              }, held);
+              // Built from the current rules, so a sender identity refreshed below is the one sent.
+              return target.publish(this.#outbound(event, rules, direction), held);
             };
             let published: { sequence: number };
             try {
@@ -1646,6 +2051,7 @@ export class MeshBridge {
             this.#save();
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
             seen.delete(event.id);
+            this.#reportUnaddressed();
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;
@@ -1666,6 +2072,16 @@ export class MeshBridge {
     return { forwarded, dropped };
   }
 
+  /** An inbound ACK for a command this link carried out, addressed to that command's replyTo (smarty-dev#9751). */
+  #awaitedAck(event: MeshEvent): boolean {
+    const commandId = isObject(event.data) ? event.data.commandId : undefined;
+    if (event.topic !== "fabric.control.ack" || typeof commandId !== "string" || !isObject(event.data)) return false;
+    const awaited = this.#awaitingAck.get(commandId);
+    // Only from the owner the command was addressed to, about the same target, to the sender itself.
+    return awaited !== undefined && awaited.expiresAt > this.#now() && awaited.replyTo === event.to &&
+      awaited.target === event.from.id && awaited.targetId === event.data.targetId;
+  }
+
   #destinationRefusal(event: MeshEvent, direction: "toRemote" | "toLocal"): string | undefined {
     // This is control-plane routing metadata, not a business field on work events or ACKs.
     // Absence alone is legacy compatibility; an explicitly present undefined is malformed.
@@ -1679,15 +2095,21 @@ export class MeshBridge {
     return undefined;
   }
 
-  #refusal(event: MeshEvent, rules: { recipients: Set<string>; senders?: Set<string>; reserved?: Set<string> }, direction: "toRemote" | "toLocal"): string | undefined {
+  #refusal(event: MeshEvent, rules: BridgeRules, direction: "toRemote" | "toLocal"): string | undefined {
     if (!isBridgedTopic(event) || hasBridgeField(event)) return "not allowed";
-    if (!event.to || !rules.recipients.has(event.to)) return "not addressed across";
+    // The hub (local) side is the factory's: a remote work event (parsed fleet.work.<repo>.<n>) or
+    // owner wake addressed to its role crosses to the hub on the same topic, `to` unchanged
+    // (smarty-dev#9352), within the link's factory rate. Never hub to remote.
+    if (!event.to || !(rules.recipients.has(event.to) || (direction === "toLocal" && (isHubFactoryEvent(event) || this.#awaitedAck(event))))) {
+      return "not addressed across";
+    }
     if (event.data !== undefined && !isObject(event.data)) return "data is not an object";
     const destinationRefusal = this.#destinationRefusal(event, direction);
     if (destinationRefusal) return destinationRefusal;
     if (!isIdentity(event.from)) return "no sender identity";
     if (rules.reserved?.has(event.from.id)) return "sender claims a hub identity";
     if (rules.senders && !rules.senders.has(event.from.id)) return "sender is not a live participant of the remote";
+    if (rules.identities && !rules.identities.has(event.from.id)) return "sender is not a live participant of the remote";
     if (rules.senders && event.topic === "fabric.control.ack") {
       const target = isObject(event.data) ? event.data.targetId : undefined;
       if (typeof target !== "string" || !rules.senders.has(target)) return "ack target is not bound to this link";
@@ -1709,6 +2131,16 @@ export class MeshBridge {
     let walCapLoggedAt = Number.NEGATIVE_INFINITY;
     let walCapDelay: number | undefined;
     let backingOff = false;
+    // smarty-dev#9751: once start() has loaded the cursors, each direction runs in its own loop (#directionLoop),
+    // which also does that direction's catch-up: no sequential drain first.
+    let ended = false;
+    const running = (): boolean => !this.#stopped && !ended;
+    const wakeDirections = (): void => {
+      for (const direction of ["toRemote", "toLocal"] as const) {
+        this.#directionPending[direction] = true;
+        if (!this.#directionBackoff[direction]) this.#directionWake[direction]?.();
+      }
+    };
     this.#notificationMode = true;
     const changed = (kind: BridgeChange): void => {
       if (kind === "lease") {
@@ -1722,6 +2154,7 @@ export class MeshBridge {
       this.#changesPending = true;
       if (kind === "presence") this.#presenceVersion++;
       if (!backingOff) this.#wake?.();
+      wakeDirections();
     };
     const failed = (error: Error): void => {
       this.#notificationError ??= error;
@@ -1747,7 +2180,9 @@ export class MeshBridge {
             }
             unsubscribers.push(unsubscribe ?? (() => undefined));
           }
-          if (!this.#stopped) await (started ? this.step() : this.start());
+          if (this.#stopped) return;
+          if (!started) await this.start();
+          else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.
         this.#running = pass.then(() => undefined, () => undefined);
@@ -1758,7 +2193,11 @@ export class MeshBridge {
           reportedTimeout = false;
           walCapDelay = undefined;
           retryMs = LOCK_RETRY_MIN_MS;
-          if (!started) { started = true; continue; } // drain events arriving during startup
+          if (!started) {
+            started = true;
+            this.#directions = Promise.all([this.#directionLoop("toRemote", running), this.#directionLoop("toLocal", running)])
+              .then(() => undefined, () => undefined);
+          }
           const deadline = Math.min(this.#expiryAt,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
@@ -1774,7 +2213,7 @@ export class MeshBridge {
             delay = walCapDelay;
             const now = Date.now();
             if (now - walCapLoggedAt >= WAL_CAP_LOG_MS) {
-              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${(error as Error).message}`);
+              this.#log(`mesh state WAL cap; retrying in ${delay} ms: ${meshDeferredSummary(error)}`); // no reader pids
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
@@ -1796,6 +2235,8 @@ export class MeshBridge {
         });
       }
     } finally {
+      ended = true;
+      for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
       for (const unsubscribe of unsubscribers) unsubscribe();
       this.#notificationMode = false;
     }
@@ -1820,10 +2261,13 @@ export class MeshBridge {
     };
     this.#stopped = true;
     this.#wake?.();
+    for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
     await within(this.#running);
+    await within(this.#directions);
     await within(this.options.remote.mirror({ hosts: [], participants: [] }));
     this.options.remote.close?.(new Error("Bridge stopped"));
     await within(this.#running);
+    await within(this.#directions);
     const { local } = this.options;
     await (local.withdraw ? local.withdraw() : local.mirror({ hosts: [], participants: [] })).catch((error: unknown) => {
       this.#log(`local withdrawal failed: ${error instanceof Error ? error.message : String(error)}`);

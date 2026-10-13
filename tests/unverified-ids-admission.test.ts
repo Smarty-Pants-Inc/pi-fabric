@@ -207,7 +207,9 @@ describe("round-1 native root inbox read provenance", () => {
       const manager = session();
       const own: MeshIdentity = { ...identity, id: `session:${manager.getSessionId()}` };
       const store = new MeshStore(root, 64 * 1024, 100);
-      const provider = new MeshProvider(store, own, {} as ConstructorParameters<typeof MeshProvider>[2]);
+      // An immediate addressed publish needs a known target (smarty-dev#5518); the self-publish targets own.id.
+      const participants = { get: (id: string) => id === own.id ? { id } : undefined, list: () => [] };
+      const provider = new MeshProvider(store, own, participants as unknown as ConstructorParameters<typeof MeshProvider>[2]);
       const inbox = new RootInbox(store, own, () => [own.id], { steerGraceMs: 0 });
       inbox.start();
       expect(await provider.invoke("publish", { topic: "fleet.report", to: own.id, text }, invocation(manager)))

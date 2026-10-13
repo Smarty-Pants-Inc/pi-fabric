@@ -1,3 +1,4 @@
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { terminalRejectionFields } from "../agents/terminal-target.js";
@@ -102,6 +103,17 @@ export class FabricRouteAuthorityError extends Error {
   }
 }
 
+/** Known pre-publication routing refusals: nothing was published, so the attempt failed. */
+const PRE_PUBLICATION_REFUSALS = new Set([
+  "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_CONTROL_INCARNATION_REQUIRED",
+  "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FABRIC_PARTICIPANT_NON_INTERACTIVE",
+]);
+const prePublicationRefusal = (error: unknown, reason: string): string | undefined => {
+  const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+  if (code !== undefined && PRE_PUBLICATION_REFUSALS.has(code)) return `${code}: ${reason}`;
+  return reason.includes("this attempt was not published") ? reason : undefined;
+};
+
 /** Distinguishes a pre-publication lease wait from an uncertain published ACK. */
 class LeaseResolutionStale extends FabricParticipantStaleError {}
 
@@ -115,7 +127,7 @@ export class AgentMessageRouter {
   #legacyDeliveryCount = 0;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -360,6 +372,14 @@ export class AgentMessageRouter {
         : await this.#withDurableRecovery(id, recovering =>
           this.#withDirectory(() => this.#route(id, message, data, kind, context, options, false, !recovering), id, !recovering));
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
+      const refusal = prePublicationRefusal(error, reason) ??
+        (/^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason) ? reason : undefined);
+      if (root && !(error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED") && refusal !== undefined) {
+        appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal);
+      }
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
@@ -502,6 +522,7 @@ export class AgentMessageRouter {
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
+          outcomeSend: { eventId: options.idempotencyKey!, to: this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
           ...(options.priority ? { priority: options.priority } : {}),
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
@@ -621,7 +642,6 @@ export class AgentMessageRouter {
         { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
-
     // Persistent actors consume both delivery modes through their serial mailbox.
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
@@ -643,6 +663,7 @@ export class AgentMessageRouter {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
         provenance,
+        outcomeSend: { eventId: options.idempotencyKey!, to: actor.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
         ...(binding ? { overrides: binding } : {}),
       });
       return { queued: true, messageId: result.messageId, routed: "local" };
@@ -755,7 +776,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
+          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -779,6 +800,7 @@ export class AgentMessageRouter {
         delivery: command.operation,
         ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
+        outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),
@@ -825,7 +847,7 @@ export class AgentMessageRouter {
       // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
       // Validate without promoting the owner's current defaults into fixed per-call overrides.
       await this.actorManager.resolveActivationBinding(actor.id, options);
-      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
+      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {

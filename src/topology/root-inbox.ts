@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
   INBOX_HORIZON_MS, ROOT_ID_PREFIX, crossIdentityReceipts, deliveryIdentity, eventReceipt, eventReceipts, topicWorkReceipt, workKey,
-  type RootInboxBatch, type RootInboxReconcileOptions, type RootInboxSession,
+  type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
 export {
   INBOX_INJECT_EVENT_TEXT_BYTES, INBOX_INJECT_MAX_EVENTS, INBOX_INJECT_MAX_TEXT_BYTES, ROOT_ID_PREFIX, ROOT_INBOX_CUSTOM_TYPE,
   confirmedMainInboxIds, confirmedRootInboxSession, projectRootInboxReceipt, rootInboxBudget, rootInboxMessage, rootInboxSession,
   rootInboxSummary, sessionHoldsInboxBatch,
-  type RootInboxBatch, type RootInboxReconcileOptions, type RootInboxSession,
+  type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
 /**
@@ -25,7 +26,8 @@ export {
  * survives a stop between the save and the session's write: delivery is at least once. A work
  * event is skipped when the recipient has a confirmed native/inbox receipt for its sender and
  * work identity, persisted across reloads. Queued messages are not receipts. Addressed shadows
- * older than the configurable horizon are expired on first drain without buying model turns.
+ * older than the configurable horizon are expired on first drain without buying model turns,
+ * except answers, blockers, handoffs and completions: those remain actionable work.
  *
  * An event whose message entered a turn is acknowledged by id (smarty-dev#8962): it is never
  * injected again, whatever the session file confirms. A fully acknowledged batch moves the cursor
@@ -37,6 +39,8 @@ export const ROOT_INBOX_PREFIX = "topology/inbox/";
 export const WORK_TOPIC_PREFIX = "fleet.";
 /** A shadow record newer than this waits a reconcile, so its steer can arrive first and win. */
 const STEER_GRACE_MS = 60_000;
+const NEVER_EXPIRE_KINDS = new Set(["answer", "blocker", "handoff", "completion"]);
+const LATE_DELIVERY_HOUR_MS = 60 * 60_000;
 const inboxHorizonMs = (): number => {
   const text = process.env.PI_FABRIC_INBOX_HORIZON_MS;
   const value = Number(text);
@@ -142,6 +146,10 @@ export class RootInbox {
       const reread = this.#reread(state.after, held);
       const pending = reread.filter((event) => !this.#acked(event));
       if (holdsBatch) {
+        // smarty-dev#5518: only the session's own inbox carrier is native consumption; an ack-only commit is not.
+        if (session.holdsBatch(held.ids)) for (const event of pending) appendDeliveryOutcome(this.mesh.root, {
+          eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish",
+        }, "delivered", "consumed by Main inbox as itself", this.#now());
         this.#remember(pending.flatMap(eventReceipts));
       } else {
         // A missing retained event proves neither delivery nor expiry. Keep its id pending, until
@@ -159,7 +167,7 @@ export class RootInbox {
           if (!this.#steered(event, session)) return true;
           this.#remember(eventReceipts(event));
           return false;
-        });
+        }).map((event) => this.#late(event));
         if (events.length || missing.length) {
           held.ids = [...events.map((event) => event.id), ...missing];
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
@@ -207,13 +215,15 @@ export class RootInbox {
     if (cooling && !urgent) return undefined;
     const batch = await this.next(session);
     if (!idle()) return undefined;
-    // A stale-only drain reports once but must not buy a model turn.
+    // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
+    const waking = batch.events.filter((event) => !event.deliveredLate);
+    if (waking.length === 0) return batch;
     const reason = urgent ? "p0" : "idle";
     this.#wokeAt = this.#now();
     void this.#notifications.enqueue(() => this.mesh.publish({
       topic: ROOT_INBOX_WAKE_TOPIC, kind: "idle-wake", from: this.identity,
-      data: { count: batch.events.length, reason, ids: batch.events.map((event) => event.id) },
+      data: { count: waking.length, reason, ids: waking.map((event) => event.id) },
     }));
     return batch;
   }
@@ -239,6 +249,11 @@ export class RootInbox {
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
     const pending = state.pending;
+    // smarty-dev#5518: an ack is the inbox carrier entering a turn, so it is native consumption.
+    // Resolve the batch's newly acked events before the cursor moves past them; next() then never
+    // sees them, and the journal dedups an id it already holds (exactly once per event id).
+    const consumed = pending ? ids.filter((id) => pending.ids.includes(id) && !this.#acks.has(id)) : [];
+    const delivered = consumed.length ? this.#reread(state.after, { ...pending!, ids: consumed }) : [];
     for (const id of ids) {
       if (!this.#acks.has(id)) this.#acks.set(id, pending?.ids.includes(id) ? pending.through : state.after);
     }
@@ -247,6 +262,15 @@ export class RootInbox {
       delete state.pending;
     }
     this.#syncAcks();
+    for (const event of delivered) {
+      try {
+        appendDeliveryOutcome(this.mesh.root, { eventId: event.id, to: this.identity.id, from: event.from.id, mode: "publish" },
+          "delivered", "consumed by Main inbox as itself", this.#now());
+      } catch (error) {
+        // Observational evidence must never undo the ack that keeps the event from re-injection.
+        console.warn(`[pi-fabric] root inbox delivery outcome: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   /**
@@ -322,7 +346,7 @@ export class RootInbox {
       name.trim() && (name === this.identity.id || !name.startsWith(ROOT_ID_PREFIX))));
     const cutoff = now - (this.options.steerGraceMs ?? STEER_GRACE_MS);
     const pageSize = this.options.pageSize ?? 500;
-    const events: MeshEvent[] = [];
+    const events: RootInboxEvent[] = [];
     let through = after;
     let bytes = 0;
     let skippedStale = 0;
@@ -341,7 +365,7 @@ export class RootInbox {
             if (bounded && (events.length >= MAX_BATCH_EVENTS || (events.length > 0 && bytes + size > MAX_BATCH_TEXT_BYTES))) {
               return result();
             }
-            events.push(event);
+            events.push(this.#late(event));
             bytes += size;
             for (const id of eventReceipts(event)) seen.add(id);
           }
@@ -412,7 +436,18 @@ export class RootInbox {
 
   #horizon(): number { return this.options.horizonMs ?? inboxHorizonMs(); }
 
-  #stale(event: MeshEvent): boolean { return event.createdAt < this.#now() - this.#horizon(); }
+  #neverExpire(event: MeshEvent): boolean { return event.to !== undefined && NEVER_EXPIRE_KINDS.has(event.kind); }
+
+  #stale(event: MeshEvent): boolean {
+    return event.createdAt < this.#now() - this.#horizon() && !this.#neverExpire(event);
+  }
+
+  #late(event: MeshEvent): RootInboxEvent {
+    const age = this.#now() - event.createdAt;
+    if (age <= this.#horizon() || !this.#neverExpire(event)) return event;
+    const hours = Math.floor(age / LATE_DELIVERY_HOUR_MS);
+    return { ...event, deliveredLate: true, text: `(delivered late: created ${new Date(event.createdAt).toISOString()}, ${hours} h ago) ${event.text ?? ""}` };
+  }
 
   #reread(after: number, pending: NonNullable<RootInboxState["pending"]>): MeshEvent[] {
     const ids = new Set(pending.ids);
@@ -423,7 +458,7 @@ export class RootInbox {
       if (page.length === 0) break;
       for (const event of page) {
         if (event.sequence > pending.through) return found;
-        if (ids.has(event.id)) found.push(event);
+        if (ids.delete(event.id)) found.push(event);
         cursor = Math.max(cursor, event.sequence);
       }
       if (page.length < pageSize) break;

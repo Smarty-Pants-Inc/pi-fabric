@@ -6,12 +6,13 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { acquireMeshCustodyLock } from "../src/mesh/custody-lock.js";
 import { abortMeshRollback, assertFileStateWritable, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
-  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, readMeshStateMovedMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
+  MeshBackendRefusedError, MeshCutoverFailedError, meshSnapshotDigest, encodeMeshStateNatsMarker, readMeshStateMovedMarker, readMeshStateNatsMarker, readStateFileEpoch, resolveMeshStateSource, rollbackMeshState,
   type MeshBackendAlarm, type MeshCensusAdvisory, type MeshStateSnapshot } from "../src/mesh/backend-migration.js";
 import { main } from "../src/mesh/mesh-backend-cli.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { assertMeshStateReadable, decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
 import { legacyReadState } from "./fixtures/legacy-mesh-state-04930dfd.js";
+import { legacyReadState8d0af4b0 } from "./fixtures/legacy-mesh-state-8d0af4b0.js";
 import { MeshStateRetiredError, openNodeSqlite, SqliteStateStore } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshBatchOperation, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -433,9 +434,8 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
       census: async () => ({ writers: [fileWriter] }), builtinReaders: [], stdout: () => undefined, stderr: (text) => { err += text; },
     });
     expect(code).toBe(0);
-    expect(err).toBe("fabric-mesh-backend: accepted gap smarty-dev#8116: a lock-free holder whose /proc/<pid>/fd "
-      + "is unreadable and that opens state.db between the lease probe and the commit (under the fence) is not detected\n"
-      + "fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
+    // smarty-dev#8116: the gap warning is gone; the lease watch covers the fenced window.
+    expect(err).toBe("fabric-mesh-backend: advisory: 1 writer, 0 unknown\n");
     expect(rawMeta(other)).toMatchObject({ backend: "sqlite", epoch: 1 });
   });
 
@@ -469,6 +469,71 @@ describe("mesh backend cutover fence: .lock and custody.lock; census advisory", 
     expect(meshSnapshotDigest(decodeFile(after))).toBe(imported);
     const conflict = (failed as MeshCutoverFailedError).conflictFile!;
     expect((decodeMeshStateFile(conflict, 64 * 1024 * 1024, false) as MeshStateFile).entries["rogue/key"]?.value).toBe(1);
+  });
+});
+
+describe("the NATS moved marker and backend=nats (smarty-dev#7504, docs/mesh-backends.md §Migration)", () => {
+  it("over a file root: file and sqlite mode fail closed and name the stream; status reports it", async () => {
+    const root = tempRoot("nats-marker");
+    await seedFileRoot(root);
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker("FABRIC_MESH_X", 2));
+    const bytes = fs.readFileSync(path.join(root, "state.json"));
+    expect(readMeshStateNatsMarker(root)).toMatchObject({ format: "sqlite", movedTo: "state.db", backend: "sqlite", natsStream: "FABRIC_MESH_X", epoch: 2 });
+    expect(readMeshStateMovedMarker(root)).toBeUndefined(); // never taken for the SQLite marker (which opens state.db)
+    const store = fileStore(root);
+    expect(() => store.get("seed/solo")).toThrow(/moved to NATS stream FABRIC_MESH_X .*must run in nats mode/);
+    await expect(store.put({ key: "seed/solo", value: "late", identity })).rejects.toBeInstanceOf(MeshBackendFenceError);
+    expect(() => assertMeshStateReadable(root)).toThrow(MeshBackendFenceError);
+    expect(() => resolveMeshStateSource(root)).toThrow(/NATS stream FABRIC_MESH_X/);
+    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow();
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    expect(fs.readFileSync(path.join(root, "state.json"))).toEqual(bytes);
+    const status = await meshBackendStatus(root);
+    expect(status).toMatchObject({ backend: "none", fileEpoch: 2, fileMoved: true, natsStream: "FABRIC_MESH_X", fenceHolds: true });
+    expect(status.reader).toHaveProperty("error");
+  });
+
+  it("backend=nats in state.db fences sqlite readers and writers and file-mode writers", async () => {
+    const root = tempRoot("nats-flag");
+    await seedFileRoot(root);
+    await importMeshState(root);
+    const sqlite = await openSqlite(root);
+    expect(sqlite.get("seed/solo")?.value).toBe("plain");
+    setRawMeta(root, "backend", "nats");
+    setRawMeta(root, "epoch", 2);
+    expect(() => resolveMeshStateSource(root)).toThrow(/backend=nats at epoch 2/);
+    expect(() => assertFileStateWritable(root)).toThrow(MeshBackendFenceError);
+    await expect(sqlite.put({ key: "seed/solo", value: "late", identity })).rejects.toBeInstanceOf(MeshStateRetiredError);
+    expect(() => sqlite.get("seed/solo")).toThrow(MeshStateRetiredError);
+    // The marker then replaces the SQLite one at the same epoch: the fence still holds.
+    fs.writeFileSync(path.join(root, "state.json"), encodeMeshStateNatsMarker("FABRIC_MESH_X", 2));
+    expect(await meshBackendStatus(root)).toMatchObject({ backend: "nats", epoch: 2, natsStream: "FABRIC_MESH_X", fenceHolds: true });
+  });
+
+  it("an installed older release (8d0af4b0) refuses the NATS marker on its tolerant and strict reads, never an empty mesh (pi-fabric#917 security P1)", async () => {
+    const root = tempRoot("nats-legacy");
+    await seedFileRoot(root);
+    const statePath = path.join(root, "state.json");
+    fs.writeFileSync(statePath, encodeMeshStateNatsMarker("FABRIC_MESH_X", 1));
+    expect(() => legacyReadState8d0af4b0(statePath, 64 * 1024 * 1024, true)).toThrow(/moved to state.db/);
+    expect(() => legacyReadState8d0af4b0(statePath, 64 * 1024 * 1024, false)).toThrow(/moved to state.db/);
+    // In sqlite mode that release finds no state.db and refuses as well (this release's sqlite open has the same rule).
+    await expect(SqliteStateStore.open(root, 64 * 1024, 1_000)).rejects.toThrow();
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(false);
+    // The counterexample the fence prevents: a marker with another format is damage there, and its tolerant read is EMPTY.
+    fs.writeFileSync(statePath, JSON.stringify({ format: "nats", movedTo: "nats", backend: "nats", stream: "FABRIC_MESH_X", epoch: 1, at: "x" }));
+    expect(legacyReadState8d0af4b0(statePath, 64 * 1024 * 1024, true).entries).toEqual({});
+    // Releases before pi-fabric#627 (main c58cec72) know no marker at all: the named, accepted gap (the operator stops them first).
+    fs.writeFileSync(statePath, encodeMeshStateNatsMarker("FABRIC_MESH_X", 1));
+    expect(legacyReadState(statePath, 64 * 1024 * 1024, true).entries).toEqual({});
+    // This release never takes it for the SQLite marker (which would open state.db).
+    expect(readMeshStateMovedMarker(root)).toBeUndefined();
+    expect(readMeshStateNatsMarker(root)?.natsStream).toBe("FABRIC_MESH_X");
+  });
+
+  it("refuses a stream name NATS would not accept", () => {
+    expect(() => encodeMeshStateNatsMarker("a.b", 1)).toThrow(/Invalid NATS stream name/);
+    expect(() => encodeMeshStateNatsMarker("", 1)).toThrow(/Invalid NATS stream name/);
   });
 });
 

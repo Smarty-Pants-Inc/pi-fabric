@@ -29,8 +29,17 @@ export function installFabricEscapeHalt(
       let count: number;
       try {
         if (options.halted()) return;
-        count = options.halt();
       } catch {
+        return;
+      }
+      try {
+        count = options.halt();
+      } catch (error) {
+        // The halt could not be saved: tell the person who pressed Escape (smarty-dev#7706).
+        context.ui.notify(
+          `Fabric: halt not saved; work may resume on restart: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
         return;
       }
       if (count > 0) {

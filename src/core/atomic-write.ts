@@ -768,6 +768,20 @@ export const MESH_ALARM_MAX_AGE_MS = 30 * 60 * 1_000;
 /** Every stderr alarm line is `fabric.alarm.mesh-outage {json}`, the one shape smarty-dev#9729's factory reader pages
  * on: label (string), state ("outage" | "recovered"), sinceMs (epoch ms, int), optional durationMs (int) and reason
  * (string); extra fields are allowed. */
+/** One sink attempt's deadline (smarty-dev#9848): a publish that never settles counts as a failed attempt, so the
+ * attempt and age limits still run; its late settle is ignored. */
+export const MESH_ALARM_ATTEMPT_MS = 10_000;
+class MeshAlarmAttemptTimeout extends Error {}
+const withAttemptDeadline = (attempt: Promise<unknown> | void): Promise<unknown> => {
+  if (!attempt) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new MeshAlarmAttemptTimeout("mesh alarm publish did not settle")), MESH_ALARM_ATTEMPT_MS);
+    timer.unref?.();
+  });
+  Promise.resolve(attempt).catch(() => undefined); // a late rejection after the deadline is ignored, never unhandled
+  return Promise.race([attempt, deadline]).finally(() => clearTimeout(timer));
+};
 export const MESH_JOURNAL_ALARM_TAG = MESH_OUTAGE_ALARM_TAG;
 export const meshJournalAlarmLine = (alarm: { label: string; state: "outage" | "recovered"; sinceMs: number; durationMs?: number;
   reason?: string; [extra: string]: unknown }): string =>
@@ -797,6 +811,9 @@ export class MeshBackgroundRetry {
   // outage: a rejected or throwing publish keeps its event, and the next failure() or success() retries it.
   readonly #pendingAlarms: PendingAlarm[] = [];
   #flushing = false;
+  // pi-fabric#979 Astra P2: the one retry a timed-out attempt schedules (a hung sink may be the last trigger).
+  #retryFlush: ReturnType<typeof setTimeout> | undefined;
+  #closed = false;
   #droppedOverflow = 0;
   #droppedExhausted = 0;
   #undeliverableReported = false;
@@ -813,6 +830,12 @@ export class MeshBackgroundRetry {
   get idle(): boolean { return this.#outageSince === undefined && this.#pendingAlarms.length === 0 && !this.#flushing; }
   /** Retry the pending alarm events now (an owner whose path has no further writes). */
   flushAlarms(): Promise<void> { return this.#flushAlarms(); }
+  /** Clears a scheduled retry flush; no new one is scheduled after close. */
+  close(): void {
+    this.#closed = true;
+    if (this.#retryFlush) clearTimeout(this.#retryFlush);
+    this.#retryFlush = undefined;
+  }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
     console.warn(meshJournalAlarmLine({ ...alarm }));
@@ -843,12 +866,19 @@ export class MeshBackgroundRetry {
       while (this.#pendingAlarms.length && this.#alarm) {
         const head = this.#pendingAlarms[0]!;
         head.attempts++;
-        try { await this.#alarm(head.alarm); }
-        catch {
+        try { await withAttemptDeadline(this.#alarm(head.alarm)); }
+        catch (error) {
           // Kept for the next call, until its attempts or age run out: then dropped, and reported once.
           if (head.attempts >= MESH_ALARM_MAX_ATTEMPTS || performance.now() - head.firstAt >= MESH_ALARM_MAX_AGE_MS) {
             if (this.#removeHead(head)) { this.#droppedExhausted++; this.#reportUndeliverable(); } // else counted as overflow
             continue;
+          }
+          // A timed-out attempt may have swallowed the last trigger (calls made while it was in flight returned at
+          // the #flushing guard): it schedules one retry itself, so the attempt and age limits still run. A sink that
+          // rejects keeps the old contract (the next failure() or success() retries). One unref'd timer, no loop.
+          if (error instanceof MeshAlarmAttemptTimeout && !this.#closed && !this.#retryFlush) {
+            this.#retryFlush = setTimeout(() => { this.#retryFlush = undefined; void this.#flushAlarms(); }, 0);
+            this.#retryFlush.unref?.();
           }
           return;
         }
@@ -1016,6 +1046,7 @@ export class MeshBackgroundQueue {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#retry.close();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     await this.#draining;

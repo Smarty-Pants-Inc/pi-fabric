@@ -4627,7 +4627,7 @@ describe("AgentsProvider shared actor definitions", () => {
     });
   });
 
-  it("routes passive-session ask and tell with the caller's pinned binding", async () => {
+  it.each([false, true])("routes passive-session ask and tell with the caller's pinned binding (retained=%s)", async stale => {
     const members: FabricParticipantInfo[] = [];
     const response = {
       id: "remote-response",
@@ -4674,7 +4674,7 @@ describe("AgentsProvider shared actor definitions", () => {
       updatedAt: actor.updatedAt,
       controlProtocol: "v1",
       local: false,
-      stale: false,
+      stale,
     });
 
     await expect(provider.invoke("ask", {
@@ -4692,7 +4692,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/one-off", thinking: "xhigh" },
       }),
       "identity:owner",
-      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: 2 * 60 * 60 * 1_000 + 30_000 + (stale ? 90_000 : 0), idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await expect(
@@ -4714,7 +4714,7 @@ describe("AgentsProvider shared actor definitions", () => {
         binding: { model: "provider/session", thinking: "low" },
       }),
       "identity:owner",
-      { routedRemoteHost: null, idempotencyKey: expect.any(String) },
+      { routedRemoteHost: null, idempotencyKey: expect.any(String), ...(stale ? { timeoutMs: 90_000 } : {}) },
     );
   });
 
@@ -4791,7 +4791,7 @@ describe("AgentsProvider shared actor definitions", () => {
       "ask",
       { ownerIncarnation: "fixture:owner", message: "PING", bindingProvenance: { kind: "owner-defaults", rootId: "session:test" } },
       "identity:resident",
-      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, routedRemoteHost: null, detachOnMainCeiling: false },
+      { timeoutMs: DEFAULT_FABRIC_CONFIG.agents.timeoutMs + 30_000, idempotencyKey: expect.any(String), routedRemoteHost: null, detachOnMainCeiling: false },
     );
 
     await provider.invoke("tell", {

@@ -80,7 +80,7 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     recorder.end({ toolCallId: "long", isError: true, durationMs: 3 }); // ran, exited non-zero: still recorded
     const receipt = recorder.receipt;
     expect(receipt.paths).toHaveLength(WRITE_RECEIPT_MAX_PATHS);
-    expect(receipt.paths[0]).toBe("/work/f0.txt");
+    expect(receipt.paths[0]).toBe(path.resolve("/work", "f0.txt")); // D:\work\f0.txt on Windows
     expect(receipt.commands).toEqual(["x".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS)]);
     expect(receipt.truncated).toBe(true);
     expect(JSON.stringify(receipt)).not.toContain("secret contents");

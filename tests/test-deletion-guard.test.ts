@@ -305,6 +305,18 @@ if (spec.direction === "final-symlink") {
   dest = join(root, "final-link");
   fs.symlinkSync(victim, dest, "file");
 }
+// Dangling links point at absent outside names; record-only delegates must never create them.
+const absentOutside = join(outside, "new-file");
+const absentOutsideDir = join(outside, "missing-dir");
+if (spec.direction === "dangling-final") {
+  dest = join(root, "dangling-link");
+  fs.symlinkSync(absentOutside, dest, "file");
+}
+if (spec.direction === "dangling-ancestor") {
+  fs.symlinkSync(absentOutsideDir, join(root, "dangling-dir"), "dir");
+  dest = join(root, "dangling-dir", "leaf.txt");
+}
+if (spec.direction === "missing-plain") dest = join(root, "plain-missing", "leaf.txt");
 if (spec.direction === "nested" || spec.direction === "filtered") {
   src = join(root, "tree");
   dest = join(root, "copied");
@@ -399,7 +411,8 @@ try {
 console.log("OVERWRITE:" + JSON.stringify({ caseDir, root, victim: fs.readFileSync(victim, "utf8"),
   source: fs.existsSync(source) ? fs.readFileSync(source, "utf8") : null,
   renamed: fs.existsSync(fresh) ? fs.readFileSync(fresh, "utf8") : null,
-  kind, errorCode, errorMessage, calls, filterVisits }));
+  kind, errorCode, errorMessage, calls, filterVisits,
+  outsideCreated: fs.existsSync(absentOutside) || fs.existsSync(absentOutsideDir) }));
 `;
 
 const overwriteSurfaces = ["fs-sync", "named-sync", "module-sync", "fs-callback", "named-callback",
@@ -413,6 +426,8 @@ const overwriteCases: OverwriteCase[] = [
     ["outside-dest", "outside-source"].map((direction) => ({ op, surface, direction })))),
   ...["copyFile", "cp"].flatMap((op) => overwriteSurfaces.map((surface) =>
     ({ op, surface, direction: "final-symlink" }))),
+  ...["copyFile", "cp"].flatMap((op) => overwriteSurfaces.flatMap((surface) =>
+    ["dangling-final", "dangling-ancestor", "missing-plain"].map((direction) => ({ op, surface, direction })))),
   ...overwriteSurfaces.flatMap((surface) => ["nested", "filtered"].map((direction) =>
     ({ op: "cp", surface, direction }))),
   ...["Buffer", "URL"].flatMap((form) => ["outside-dest", "outside-source", "inside"].map((direction) =>
@@ -436,7 +451,8 @@ it.each(recordedCases)("overwrite guard recorded $label", (spec) => {
   expect(line, result.stdout + result.stderr).toBeDefined();
   const output = JSON.parse(line!.slice("OVERWRITE:".length)) as { caseDir: string; root: string;
     victim: string; source: string | null; renamed: string | null; kind: Outcome["kind"];
-    errorCode: string | null; errorMessage: string | null; calls: unknown[]; filterVisits: unknown[] };
+    errorCode: string | null; errorMessage: string | null; calls: unknown[]; filterVisits: unknown[];
+    outsideCreated: boolean };
   console.info("OVERWRITE_EVIDENCE:" + JSON.stringify({ label: spec.label, code: output.errorCode,
     delegates: output.calls.length, kind: output.kind, intact: output.victim === "outside victim\n",
     renamed: output.renamed, filterVisits: output.filterVisits.length,
@@ -444,6 +460,7 @@ it.each(recordedCases)("overwrite guard recorded $label", (spec) => {
   expect(inside(privateTemp, output.caseDir)).toBe(true);
   expect(inside(output.caseDir, output.root)).toBe(true);
   expect(output.victim).toBe("outside victim\n");
+  expect(output.outsideCreated).toBe(false);
   if (!(spec.op === "rename" && spec.direction === "inside")) expect(output.source).toBe("inside source\n");
   expect(output.kind).toBe(spec.surface.endsWith("sync") ? "sync" : "async");
   if (spec.report) {
@@ -453,7 +470,8 @@ it.each(recordedCases)("overwrite guard recorded $label", (spec) => {
     expect(reports).toHaveLength(1);
     expect(JSON.parse(reports[0]!.slice("TEST_DELETION_REPORT:".length))).toMatchObject({
       operation: "renameSync", caller: expect.stringContaining("overwrite-recorder-child") });
-  } else if (["outside-dest", "outside-source", "final-symlink", "nested", "thenable"].includes(spec.direction)
+  } else if (["outside-dest", "outside-source", "final-symlink", "nested", "thenable", "dangling-final",
+    "dangling-ancestor"].includes(spec.direction)
     && !(spec.direction === "outside-source" && spec.op !== "rename")) {
     expect(output.errorCode, output.errorMessage ?? JSON.stringify(output.calls)).toBe("ERR_TEST_DELETION_GUARD");
     expect(output.errorMessage).toMatch(refusal);

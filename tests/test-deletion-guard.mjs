@@ -23,8 +23,9 @@ const guardHref = selfUrl.href;
 const guardPath = fileURLToPath(guardHref);
 
 const realpath = fs.realpathSync.native;
+const lstat = fs.lstatSync;
 
-/** Physical path of p, climbing to the nearest existing ancestor; missing components are joined lexically. */
+/** Physical path of p, climbing to the nearest existing ancestor; missing non-symlink components are joined lexically. */
 function physical(p) {
   const tail = [];
   for (let current = p; ;) {
@@ -32,6 +33,12 @@ function physical(p) {
       return tail.length ? join(realpath(current), ...tail) : realpath(current);
     } catch (error) {
       if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      // A dangling symlink (leaf or ancestor) has an unresolved target: fail closed, never lexical.
+      let link = false;
+      try { link = lstat(current).isSymbolicLink(); } catch (statError) {
+        if (statError?.code !== "ENOENT" && statError?.code !== "ENOTDIR") throw statError;
+      }
+      if (link) throw error;
       const parent = dirname(current);
       if (parent === current) throw error;
       tail.unshift(basename(current));

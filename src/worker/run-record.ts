@@ -151,10 +151,13 @@ export const writeCrashRunRecord = (
   filePath: string,
   record: AgentRunRecord,
   error: unknown,
+  // pi-fabric#1034 round 7: the worker's live receipt, so a crash keeps pending calls marked truncated.
+  writeReceipt?: AgentRunRecord["writeReceipt"],
 ): void => {
   const reason = error instanceof Error ? error.message : String(error);
   const crashed: AgentRunRecord = {
     ...record,
+    ...(writeReceipt ? { writeReceipt } : {}),
     status: "failed",
     error: `Worker crashed before reporting a result: ${reason}`.slice(0, MAX_RUN_ERROR_CHARS),
     finishedAt: Date.now(),

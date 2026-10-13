@@ -6,13 +6,13 @@ import { expect, it } from "vitest";
 
 // A synchronous FIFO read cannot be interrupted by a Vitest timer. Isolate each real
 // native-watch reconciliation in an owned OS process, with an external kill deadline.
-const run = (script: string): Promise<string> => new Promise((resolve, reject) => {
-  execFile("bun", ["--eval", script], { timeout: 5_000, killSignal: "SIGKILL", maxBuffer: 32_768 },
+const run = (script: string, timeout = 5_000): Promise<string> => new Promise((resolve, reject) => {
+  execFile("bun", ["--eval", script], { timeout, killSignal: "SIGKILL", maxBuffer: 32_768 },
     (error, stdout) => error ? reject(error) : resolve(stdout));
 });
 const cases = process.platform === "win32"
   ? ["oversized", "read-growth"] as const
-  : ["fifo", "symlink-zero", "oversized", "open-race", "read-growth", "abandon-fifo", "source-fifo", "receipt-fifo"] as const;
+  : ["fifo", "symlink-zero", "windows-symlink", "oversized", "open-race", "read-growth", "abandon-fifo", "source-fifo", "receipt-fifo"] as const;
 
 it.each(cases)("refuses %s without blocking or consuming it; a normal completion still reconciles", async kind => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-spool-safety-"));
@@ -33,7 +33,20 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
       const result = id => ({ id, name: "child", status: "completed", text: "saved", startedAt: Date.now(), finishedAt: Date.now() });
       const envelope = id => ({ format: 1, spawner, result: result(id) });
       const fifo = file => execFileSync("mkfifo", [file], { timeout: 1_000 });
-      let warnings = 0, openFlags = [], readLengths = [], initialBytes = 0, resolved;
+      let warnings = 0, openFlags = [], readLengths = [], initialBytes = 0, unsafeOpens = 0, resolved;
+      let privateFile, privateBytes;
+      if (kind === "windows-symlink") {
+        Object.defineProperty(process, "platform", { value: "win32" });
+        const open = fs.openSync, unavailableFlags = (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+        // Simulate libuv's absent Windows flags, not POSIX protection under a fake label.
+        fs.openSync = (file, flags, ...args) => {
+          if (String(file) === unsafe) unsafeOpens++;
+          return open(file, typeof flags === "number" ? flags & ~unavailableFlags : flags, ...args);
+        };
+        privateFile = path.join(root, "private.json");
+        privateBytes = JSON.stringify(envelope(bad));
+        fs.writeFileSync(privateFile, privateBytes);
+      }
       console.warn = () => { warnings++; };
       const observed = new Promise(resolve => { resolved = resolve; });
       const watch = new ActorChildCompletionWatch(store.directory, () => {
@@ -43,6 +56,7 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
         if (pending.some(item => item.result.id === good)) resolved(pending.map(item => item.result.id));
       });
       if (kind === "symlink-zero") fs.symlinkSync("/dev/zero", unsafe);
+      else if (kind === "windows-symlink") fs.symlinkSync(privateFile, unsafe);
       else if (kind === "oversized") fs.writeFileSync(unsafe, JSON.stringify({ ...envelope(bad), result: { ...result(bad), text: "x".repeat(1024 * 1024) } }));
       else if (kind === "open-race") {
         fs.writeFileSync(unsafe, JSON.stringify(envelope(bad)));
@@ -88,7 +102,8 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
       await watch.close();
       console.log(JSON.stringify({ ids, unscoped, warnings, unsafeRetained: !!retained,
         resultRetained: fs.existsSync(store.resultFile(good)), openFlags, removals: removals.length,
-        mailbox, afterHandoff, custodyVisible, readLengths, initialBytes,
+        mailbox, afterHandoff, custodyVisible, readLengths, initialBytes, unsafeOpens, platform: process.platform,
+        privateUnchanged: !privateFile || fs.readFileSync(privateFile, "utf8") === privateBytes,
         noFollow: fs.constants.O_NOFOLLOW, nonblock: fs.constants.O_NONBLOCK }));
     `;
     const started = performance.now();
@@ -103,6 +118,11 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
     expect(output.mailbox).toBe(true);
     expect(output.afterHandoff).toEqual([]);
     expect(output.custodyVisible).toBe(true);
+    if (kind === "windows-symlink") {
+      expect(output.platform).toBe("win32");
+      expect(output.unsafeOpens).toBe(0); // refused BEFORE open, even with zero protection flags
+      expect(output.privateUnchanged).toBe(true);
+    }
     if (kind === "read-growth") {
       expect(output.readLengths.length).toBeGreaterThan(0);
       expect(output.readLengths.every((length: number) => length <= output.initialBytes + 1)).toBe(true);
@@ -117,3 +137,50 @@ it.each(cases)("refuses %s without blocking or consuming it; a normal completion
     fs.rmSync(root, { recursive: true, force: true });
   }
 }, 10_000);
+
+it("bounds warning deduplication across 10,000 serial unsafe entries and prunes removed paths on a scan", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-spool-warning-bound-"));
+  try {
+    const script = `
+      import fs from "node:fs";
+      import path from "node:path";
+      import { ActorChildCompletionStore } from ${JSON.stringify(path.resolve("src/actors/child-completions.ts"))};
+      const root = ${JSON.stringify(root)};
+      const session = path.join(root, "session.jsonl"); fs.writeFileSync(session, "");
+      const store = new ActorChildCompletionStore(session); fs.mkdirSync(store.directory);
+      let cache, maxSeen = 0, warnings = 0;
+      console.warn = () => { warnings++; };
+      // Observe the actual private dedup Set without adding a production test API.
+      const add = Set.prototype.add;
+      Set.prototype.add = function(value) {
+        const answer = add.call(this, value);
+        if (typeof value === "string" && value.startsWith(store.directory + path.sep) && value.endsWith(".json")) {
+          cache = this; maxSeen = Math.max(maxSeen, this.size);
+        }
+        return answer;
+      };
+      const name = index => path.join(store.directory, index.toString(16).padStart(32, "0") + ".json");
+      for (let index = 0; index < 10_000; index++) {
+        const file = name(index);
+        fs.mkdirSync(file); // unsafe type, no FIFO process or blocking read needed
+        store.pending({ actorId: "actor:owner" });
+        fs.rmdirSync(file); // this attack fixture's own removal, not product cleanup
+      }
+      store.pending();
+      const afterSerial = cache.size;
+      const present = Array.from({ length: 300 }, (_, index) => name(index + 10_000));
+      for (const file of present) fs.mkdirSync(file);
+      store.pending();
+      const atCapacity = cache.size;
+      for (const file of present) fs.rmdirSync(file);
+      store.pending();
+      console.log(JSON.stringify({ maxSeen, afterSerial, atCapacity, afterRemoval: cache.size, warnings }));
+    `;
+    const output = JSON.parse((await run(script, 30_000)).trim());
+    expect(output.warnings).toBeGreaterThanOrEqual(10_000);
+    expect(output.maxSeen).toBeLessThanOrEqual(256);
+    expect(output.atCapacity).toBe(256);
+    expect(output.afterSerial).toBe(0);
+    expect(output.afterRemoval).toBe(0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 40_000);

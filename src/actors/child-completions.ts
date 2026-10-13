@@ -27,6 +27,7 @@ const WATCH_FAILURE_LIMIT = 6;
 const WATCH_CLOSE_GRACE_MS = 1_000;
 // Envelopes/control records are small metadata, not the retained full result or session.
 const MAX_SPOOL_JSON_BYTES = 1024 * 1024;
+const MAX_WARNING_ENTRIES = 256;
 class UnsafeCompletionEntry extends Error {}
 
 /**
@@ -196,15 +197,33 @@ export class ActorChildCompletionStore {
     this.directory = path.join(path.dirname(sessionFile), "child-completions");
   }
 
-  /** A task can write spool names. Never follow them or read an unbounded stream,
-   * including if a regular pathname is replaced between lstat and open. */
+  #scanFiles(): string[] {
+    let files: string[];
+    try { files = fs.readdirSync(this.directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.#warnedEntries.clear();
+      throw error;
+    }
+    if (this.#warnedEntries.size) {
+      const present = new Set(files);
+      for (const file of this.#warnedEntries) if (!present.has(path.basename(file))) this.#warnedEntries.delete(file);
+    }
+    return files;
+  }
+
+  /** A task can write spool names. Refuse unsafe entries before open and bound every
+   * read; POSIX no-follow/nonblocking open also protects the final-component swap. */
   #readSpoolJson(file: string) {
     let fd: number | undefined;
     try {
       const expected = fs.lstatSync(file);
       const regular = (stat: fs.Stats): boolean => stat.isFile() && stat.nlink === 1 &&
         (!process.getuid || stat.uid === process.getuid()) && stat.size <= MAX_SPOOL_JSON_BYTES;
-      if (!regular(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
+      if (expected.isSymbolicLink() || !regular(expected)) throw new UnsafeCompletionEntry("not an owned bounded regular file");
+      // ponytail: Windows has no task confinement, so a same-user task can already
+      // end the host directly. Refuse Node-reported symlinks/junctions BEFORE open
+      // and retain fstat checks; the remaining Windows lstat/open swap is an accepted
+      // security gap, not a claim that these unavailable POSIX flags protect it.
       fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
       const stat = fs.fstatSync(fd);
       if (!regular(stat) || stat.dev !== expected.dev || stat.ino !== expected.ino) {
@@ -227,6 +246,10 @@ export class ActorChildCompletionStore {
     } catch (error) {
       if (error instanceof UnsafeCompletionEntry || (error as NodeJS.ErrnoException).code === "ELOOP") {
         if (!this.#warnedEntries.has(file)) {
+          if (this.#warnedEntries.size >= MAX_WARNING_ENTRIES) {
+            const oldest = this.#warnedEntries.values().next().value;
+            if (oldest !== undefined) this.#warnedEntries.delete(oldest);
+          }
           this.#warnedEntries.add(file);
           console.warn(`[pi-fabric] unsafe child completion entry retained, not read: ${file}`);
         }
@@ -428,7 +451,7 @@ export class ActorChildCompletionStore {
   /** An owner/restart retries sources even when the original activation has exited. */
   recoverArchives(options: { actorId?: string; inFlightRunId?: string } = {}): void {
     let files: string[];
-    try { files = fs.readdirSync(this.directory); } catch { return; }
+    try { files = this.#scanFiles(); } catch { return; }
     for (const name of files.filter(file => file.endsWith(".source") && ID.test(file.slice(0, -7))).slice(0, 100)) {
       try {
         const source = this.#readSpoolJson(path.join(this.directory, name));
@@ -451,7 +474,7 @@ export class ActorChildCompletionStore {
   /** Unsettled child custody is a pending reply, even before a result envelope exists. */
   hasPendingReply(): boolean {
     try {
-      return fs.readdirSync(this.directory).some(file => {
+      return this.#scanFiles().some(file => {
         if (file.endsWith(".source") || file.endsWith(".abandon")) return true;
         return /^[a-f0-9]{32}\.json$/.test(file) && !this.received(file.slice(0, -5));
       });
@@ -474,7 +497,7 @@ export class ActorChildCompletionStore {
 
   #hasPendingWork(options: { actorId?: string; inFlightRunId?: string }): boolean {
     let files: string[];
-    try { files = fs.readdirSync(this.directory); } catch (error) {
+    try { files = this.#scanFiles(); } catch (error) {
       return (error as NodeJS.ErrnoException).code !== "ENOENT";
     }
     return files.some(file => {
@@ -494,7 +517,7 @@ export class ActorChildCompletionStore {
 
   #pending(options: { actorId?: string; inFlightRunId?: string }): ActorChildCompletion[] {
     let files: string[];
-    try { files = fs.readdirSync(this.directory); } catch { return []; }
+    try { files = this.#scanFiles(); } catch { return []; }
     // Intent is independent of archival: neither an envelope nor even a result
     // file need exist when a foreground publication is cancelled. Reconcile these
     // under the claim lock on restart, including muted outcomes with no envelope.
@@ -546,7 +569,7 @@ export class ActorChildCompletionStore {
     // smarty-dev#7916: each file's owned stat is taken at judgment; only that inode is removed.
     const groups = new Map<string, { files: { file: string; stat: fs.Stats | undefined }[]; newest: number }>();
     try {
-      for (const name of fs.readdirSync(this.directory)) {
+      for (const name of this.#scanFiles()) {
         const id = STORED_FILE.exec(name)?.[1];
         if (!id || keepIds.has(id)) continue;
         const file = path.join(this.directory, name);

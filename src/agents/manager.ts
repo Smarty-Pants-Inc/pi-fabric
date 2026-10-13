@@ -107,6 +107,7 @@ import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
+  assertDefaultTaskWriteRoots,
   checkWritePolicyRequest,
   readAgentLineage,
   readWritePolicy,
@@ -1396,6 +1397,9 @@ export class AgentManager {
       !requestsWritePolicy(request) && this.#parentWritePolicy === undefined;
     // Runners without write-policy support keep their historical behavior; log the gap below.
     const applyTaskWriteDefault = defaultTaskWritePolicy && capabilities.writePolicy;
+    // Before admission/host records, reject a cwd grant over the host run root.
+    // Worktrees get their effective cwd below; explicit policies remain caller choices.
+    if (applyTaskWriteDefault && !request.worktree) assertDefaultTaskWriteRoots(this.#runRoot, [selectedCwd]);
     const confined = applyTaskWriteDefault ||
       (requestsWritePolicy(request) && request.writePolicy !== "unrestricted") || this.#parentWritePolicy !== undefined;
     if (confined && !capabilities.writePolicy) {
@@ -1570,9 +1574,10 @@ export class AgentManager {
         if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(applyTaskWriteDefault
-              ? { writableRoots: [agentCwd, runDirectory], shell: "unconfined" }
+              ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
               : request, this.#parentWritePolicy, agentCwd)
           : undefined;
+        if (applyTaskWriteDefault) assertDefaultTaskWriteRoots(this.#runRoot, writePolicy!.writableRoots);
         const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {
           fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id, runner,
             ...(policy ? { policy } : {}), ...(warning ? { warning } : {}),

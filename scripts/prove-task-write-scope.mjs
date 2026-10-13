@@ -32,18 +32,57 @@ assert(process.env.TMPDIR, "Private TMPDIR required");
 assert(!fs.existsSync(evidence), "Use a fresh evidence directory");
 fs.mkdirSync(evidence);
 assert.equal(fs.realpathSync(evidence), evidence, "Evidence directory must remain canonical");
+const evidenceComponents = [];
+for (let component = evidence; ; component = path.dirname(component)) {
+  const stat = fs.lstatSync(component);
+  assert(stat.isDirectory() && !stat.isSymbolicLink(), "Evidence path must not contain symlinked components");
+  evidenceComponents.push({ path: component, dev: stat.dev, ino: stat.ino });
+  if (path.dirname(component) === component) break;
+}
+// Linux directory-relative writes keep the created inode even if an ancestor
+// changes after the check. Other platforms recheck each component before writes.
+const evidenceFd = process.platform === "linux"
+  ? fs.openSync(evidence, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
+  : undefined;
+const verifyEvidence = () => {
+  for (const component of evidenceComponents) {
+    const stat = fs.lstatSync(component.path, { throwIfNoEntry: false });
+    assert(stat?.isDirectory() && !stat.isSymbolicLink() && stat.dev === component.dev && stat.ino === component.ino,
+      "Evidence path changed after creation");
+  }
+  assert.equal(fs.realpathSync(evidence), evidence, "Evidence directory must remain canonical");
+  if (evidenceFd !== undefined) {
+    const stat = fs.fstatSync(evidenceFd), expected = evidenceComponents[0];
+    assert(stat.dev === expected.dev && stat.ino === expected.ino, "Evidence directory handle changed");
+  }
+};
+const writeEvidence = (name, content, append = false) => {
+  verifyEvidence();
+  assert.equal(path.basename(name), name, "Evidence filename must be one component");
+  const file = path.join(evidenceFd === undefined ? evidence : `/proc/self/fd/${evidenceFd}`, name);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+    (append ? fs.constants.O_APPEND : fs.constants.O_TRUNC) | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  try { fs.writeFileSync(fd, content); } finally { fs.closeSync(fd); }
+};
+verifyEvidence();
 const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR, "task-write-native-"));
 const agent = path.join(scratch, "agent"), rootCwd = path.join(scratch, "root"), runs = path.join(scratch, "runs");
 for (const dir of [agent, rootCwd, runs, path.join(scratch, "home"), path.join(scratch, "tmp")]) fs.mkdirSync(dir);
-const json = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+const json = (file, value) => {
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  if (path.dirname(file) === evidence) writeEvidence(path.basename(file), content);
+  else fs.writeFileSync(file, content);
+};
 const forbidden = "/tmp/fv2-writescope-probe"; // Explicit assignment's refused real write target; never delete it.
 assert(!fs.existsSync(forbidden), "Refused target already exists; do not touch an existing fixture");
 const outside = path.join(scratch, "outside-task.txt");
 const shellOutside = path.join(scratch, "native-shell-outside-task.txt");
-const cwdFile = path.join(evidence, "worktree-write.txt");
-
+// Native model tools exercise cwd independently of generator-owned artifacts.
+const cwdFile = path.join(workspace, `${path.basename(scratch)}-worktree-write.txt`);
+assert(!fs.existsSync(cwdFile), "Use a fresh native worktree write target");
 const toolResults = [], childRequests = [], parentEvents = [];
-let child, server, parentExit, failure;
+let child, server, parentExit, failure, rejectSettlement;
+const protectedRecords = [];
 let tail = "", parentCalls = 0;
 const guard = 180_000;
 const bounded = (promise, label, ms = guard) => {
@@ -93,8 +132,15 @@ try {
         if (scenario === "default") {
           const runId = fs.readdirSync(runs).find(id => fs.existsSync(path.join(runs, id, "task.txt")) && fs.readFileSync(path.join(runs, id, "task.txt"), "utf8").includes("SCOPE_PROBE:default"));
           assert(runId, "Real worker run must exist before inference");
-          const tmp = path.join(runs, runId, "tmp");
+          const run = path.join(runs, runId), tmp = path.join(run, "tmp");
+          const hostWrites = ["completion-recipient.json", "status.json", "events.jsonl"].flatMap(name => {
+            const file = path.join(run, name), before = fs.readFileSync(file, "utf8");
+            protectedRecords.push({ name, file, before });
+            return [["write", { path: file, content: "HOST_RECORD_TAMPERED" }],
+              ["edit", { path: file, edits: [{ oldText: before, newText: "HOST_RECORD_TAMPERED" }] }]];
+          });
           stream.tools([
+            ...hostWrites,
             ["write", { path: forbidden, content: "MUST_BE_REFUSED" }],
             ["write", { path: cwdFile, content: "WORKTREE_ALLOWED" }],
             ["edit", { path: cwdFile, edits: [{ oldText: "WORKTREE_ALLOWED", newText: "WORKTREE_EDIT_ALLOWED" }] }],
@@ -103,7 +149,7 @@ try {
           ]);
         } else if (scenario === "readonly") stream.tools([["write", { path: path.join(evidence, "readonly-refused.txt"), content: "MUST_BE_REFUSED" }]]);
         else stream.tools([["write", { path: outside, content: "UNRESTRICTED_ALLOWED" }]]);
-      } catch (error) { failure ??= error; response.destroy(error); }
+      } catch (error) { failure ??= error; rejectSettlement?.(error); response.destroy(error); }
     });
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -116,19 +162,23 @@ try {
   child = spawn(process.execPath, [nativePi, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, stdio: ["pipe", "pipe", "pipe"] });
   parentExit = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));
   const settled = new Promise((resolve, reject) => {
+    rejectSettlement = reject;
     child.once("error", reject);
     child.stdout.on("data", chunk => {
-      fs.appendFileSync(path.join(evidence, "parent-events.jsonl"), chunk);
-      tail += chunk;
-      while (tail.includes("\n")) {
-        const index = tail.indexOf("\n"), line = tail.slice(0, index); tail = tail.slice(index + 1);
-        if (!line.trim()) continue;
-        try { const event = JSON.parse(line); parentEvents.push(event); if (event.type === "agent_settled") resolve(); }
-        catch (error) { reject(error); }
-      }
+      try {
+        writeEvidence("parent-events.jsonl", chunk, true);
+        tail += chunk;
+        while (tail.includes("\n")) {
+          const index = tail.indexOf("\n"), line = tail.slice(0, index); tail = tail.slice(index + 1);
+          if (!line.trim()) continue;
+          const event = JSON.parse(line); parentEvents.push(event); if (event.type === "agent_settled") resolve();
+        }
+      } catch (error) { reject(error); }
+    });
+    child.stderr.on("data", chunk => {
+      try { writeEvidence("parent-stderr.log", chunk, true); } catch (error) { reject(error); }
     });
   });
-  child.stderr.on("data", chunk => fs.appendFileSync(path.join(evidence, "parent-stderr.log"), chunk));
   child.stdin.write(`${JSON.stringify({ id: "proof", type: "prompt", message: "Run the exact keyless native task write-scope proof." })}\n`);
   await bounded(Promise.race([settled, parentExit.then(exit => { throw new Error(`Parent exited before settle: ${JSON.stringify(exit)}`); })]), "real root settled");
   if (failure) throw failure;
@@ -149,6 +199,14 @@ try {
   assert.equal(fs.readFileSync(path.join(tmp, "scratch-write.txt"), "utf8"), "SCRATCH_ALLOWED");
   const defaultTools = toolResults.find(item => item.scenario === "default").messages;
   assert(defaultTools.some(message => JSON.stringify(message).includes("outside writable roots")), "Native write must record its refusal, not merely skip the attempt");
+  for (const record of protectedRecords) {
+    const refusals = defaultTools.filter(message => JSON.stringify(message).includes(record.file) && JSON.stringify(message).includes("outside writable roots"));
+    assert.equal(refusals.length, 2, `Native write and edit must refuse ${record.name}`);
+    const current = fs.readFileSync(record.file, "utf8");
+    if (record.name === "completion-recipient.json") assert.equal(current, record.before);
+    else if (record.name === "events.jsonl") assert(current.startsWith(record.before), "Host event history must not be overwritten");
+    else assert.equal(JSON.parse(current).id, path.basename(path.dirname(record.file)), "Host status identity must survive");
+  }
   assert(defaultTools.some(message => JSON.stringify(message).includes(`CHILD_TMPDIR=${tmp}`)), "Native child must receive its own TMPDIR");
   assert(!fs.existsSync(path.join(evidence, "readonly-refused.txt")));
   assert(toolResults.find(item => item.scenario === "readonly").messages.some(message => JSON.stringify(message).includes("read-only")));
@@ -162,7 +220,7 @@ try {
   assert.deepEqual(await bounded(parentExit, "root native EXITED", 15000), { code: 0, signal: null });
   child = undefined;
   const summary = { passed: true, route: "real native Pi RPC root -> public Fabric agents.spawn/wait -> compiled process worker -> real native Pi write/edit/bash", workspace, fabricRoot, nativePi, scratch,
-    refused: forbidden, worktreeWriteAndEdit: "allowed", childScratchWrite: "allowed", explicitReadOnly: "refused", unrestrictedOutsideWrite: "allowed in proof-owned scratch", optOutLogCount: 1,
+    refused: forbidden, worktreeWriteAndEdit: "allowed", childScratchWrite: "allowed", hostRecordWriteAndEdit: "refused (completion-recipient.json, status.json, events.jsonl)", explicitReadOnly: "refused", unrestrictedOutsideWrite: "allowed in proof-owned scratch", optOutLogCount: 1,
     nativeBashGap: "allowed outside child roots, but inside proof-owned scratch; Landlock deliberately off", parentNativeExit: 0,
     artifacts: Object.fromEntries([extension, path.join(fabricRoot, "dist/worker.js")].map(file => [file, crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")])),
   };
@@ -170,7 +228,8 @@ try {
   console.log(JSON.stringify(summary, null, 2));
 } catch (error) {
   failure ??= error;
-  json(path.join(evidence, "failure.json"), { error: failure.stack, scratch, toolResults });
+  // Failure may mean the output directory is no longer trusted. Never write
+  // even a failure artifact through that path; stderr is the safe receipt.
   console.error(failure.stack);
   process.exitCode = 1;
 } finally {
@@ -180,5 +239,6 @@ try {
     catch { child.kill("SIGTERM"); await bounded(parentExit, "owned root TERM close", 15000); }
   }
   if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+  if (evidenceFd !== undefined) fs.closeSync(evidenceFd);
   // Retain proof-owned scratch. The allocating Main decides cleanup after reading evidence.
 }

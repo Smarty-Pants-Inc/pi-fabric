@@ -83,6 +83,24 @@ const nearestExisting = (target: string): string => {
   return path.join(fs.realpathSync(current), path.relative(current, target));
 };
 
+export class AgentWriteRootOverlapError extends Error {
+  readonly code = "FABRIC_AGENT_WRITE_ROOT_OVERLAP";
+  readonly launchOutcome = "unlaunched";
+  constructor(readonly runRoot: string, readonly writableRoot: string) {
+    super(`Default task write root ${writableRoot} contains host-owned run root ${runRoot}; move the run root outside the task cwd or choose an explicit writableRoots policy`);
+    this.name = "AgentWriteRootOverlapError";
+  }
+}
+
+/** A default cwd grant must not implicitly grant host-owned run records. */
+export const assertDefaultTaskWriteRoots = (runRoot: string, roots: readonly string[]): void => {
+  const canonicalRunRoot = nearestExisting(path.resolve(runRoot));
+  for (const root of roots) {
+    const canonicalRoot = nearestExisting(path.resolve(root));
+    if (isInside(canonicalRoot, canonicalRunRoot)) throw new AgentWriteRootOverlapError(canonicalRunRoot, canonicalRoot);
+  }
+};
+
 /**
  * Effective child policy: explicit request narrowed by the caller's own
  * PI_FABRIC_WRITE_POLICY. A confined caller cannot drop readOnly, enable an

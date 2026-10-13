@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { checkWritePolicyRequest, resolveChildWritePolicy } from "../src/agents/child-env.js";
+import { completionRecipientFromRun } from "../src/agents/completion-journal.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import type { AgentRunRequest } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
@@ -22,11 +23,14 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
 });
-const fixture = (placement = false) => {
+const fixture = (placement = false, overlap?: "option" | "environment" | "equal" | "alias") => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-task-write-")));
   const cwd = path.join(root, "work");
   fs.mkdirSync(cwd);
   const outside = path.join(root, "outside.txt");
+  const meshRoot = path.join(root, "mesh");
+  fs.mkdirSync(meshRoot);
+  const recipient = { rootId: "session:admitted-main", sessionId: "admitted-main", projectRoot: cwd, cwd, name: "Admitted Main", startedAt: Date.now() };
   const worker = path.join(root, "worker.mjs");
   // The launch fixture uses the production guard and records real allowed writes/refused attempts.
   fs.writeFileSync(worker, `import fs from 'node:fs'; import path from 'node:path';
@@ -56,13 +60,22 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
       commandTimeoutMs: 5_000, pollIntervalMs: 10,
     } } }).agents.placement;
   }
+  let runRoot = path.join(overlap ? cwd : root, FABRIC_RUN_ROOT_PREFIX + "write-scope");
+  if (overlap === "equal") runRoot = cwd;
+  if (overlap === "alias") {
+    fs.mkdirSync(runRoot);
+    const alias = path.join(root, "run-root-alias");
+    fs.symlinkSync(runRoot, alias, "junction");
+    runRoot = alias;
+  }
+  if (overlap === "environment") vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
   const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: true,
     ...(remote ? { placement: remote } : {}),
-  }, { workerPath: worker, runRoot: path.join(root, FABRIC_RUN_ROOT_PREFIX + "write-scope"), fullCodeMode: false });
+  }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient });
   managers.push(manager);
   const events = (id: string) => fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8")
     .trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
-  return { root, cwd, outside, manager, events };
+  return { root, cwd, outside, manager, events, meshRoot, recipient, runRoot };
 };
 const report = async (f: ReturnType<typeof fixture>, request: Partial<AgentRunRequest> = {}) => {
   const handle = await f.manager.spawn({ task: "probe", transport: "process", ...request });
@@ -76,10 +89,13 @@ describe("local process task write default", () => {
     const f = fixture();
     const { result, value } = await report(f);
     const run = f.manager.runDirectory(result.id)!;
-    expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, run].sort(), shell: "unconfined" });
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, value.tmpdir].sort(), shell: "unconfined" });
     expect(value.tmpdir).toBe(path.join(run, "tmp"));
-    for (const file of ["session.jsonl", "terminal-controls/control.json", "deliveries/message.json", "nested/child/task.txt"]) {
-      expect(writePolicyDenial(value.policy, "write", { path: path.join(run, file) }, f.cwd)).toBeUndefined();
+    for (const tool of ["write", "edit"]) {
+      expect(writePolicyDenial(value.policy, tool, { path: path.join(value.tmpdir, "x") }, f.cwd)).toBeUndefined();
+      for (const file of ["completion-recipient.json", "status.json", "events.jsonl", "session.jsonl", "terminal-controls/control.json", "deliveries/message.json", "nested/child/task.txt"]) {
+        expect(writePolicyDenial(value.policy, tool, { path: path.join(run, file) }, f.cwd)).toContain("outside writable roots");
+      }
     }
     for (const file of [path.join(path.dirname(run), "other-run/task.txt"), path.join(f.root, "shared-state/state.json")]) {
       expect(writePolicyDenial(value.policy, "write", { path: file }, f.cwd)).toContain("outside writable roots");
@@ -91,6 +107,24 @@ describe("local process task write default", () => {
     expect(fs.existsSync(f.outside)).toBe(false);
     expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
       .toEqual([expect.objectContaining({ type: "write_policy.default", policy: value.policy, warning: expect.stringContaining("Shell writes are unconfined") })]);
+  });
+
+  it.each(["option", "environment", "equal", "alias"] as const)("refuses a default launch when the %s host run root overlaps cwd before admission", async source => {
+    const f = fixture(false, source);
+    await expect(f.manager.spawn({ task: "must not launch", transport: "process" })).rejects.toMatchObject({
+      name: "AgentWriteRootOverlapError", code: "FABRIC_AGENT_WRITE_ROOT_OVERLAP", launchOutcome: "unlaunched",
+      writableRoot: f.cwd, runRoot: source === "equal" ? f.cwd : path.join(f.cwd, FABRIC_RUN_ROOT_PREFIX + "write-scope"),
+      message: expect.stringContaining("contains host-owned run root"),
+    });
+    expect(f.manager.listForUi()).toEqual([]);
+  });
+
+  it("honours an explicit caller writableRoots policy over the same custom host run-root layout", async () => {
+    const f = fixture(false, "option");
+    const { value } = await report(f, { writableRoots: [f.cwd], shell: "unconfined" });
+    expect(value.policy.writableRoots).toEqual([f.cwd]);
+    expect(value.tmpdir).toBeNull();
+    expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([true, false]);
   });
 
   it("collects the default's owned scratch with the completed run", async () => {
@@ -141,7 +175,8 @@ describe("local process task write default", () => {
 
   it("enforces the same default for nested pi.write and pi.edit while leaving bash allowed", async () => {
     const f = fixture();
-    const { value } = await report(f);
+    const { result, value } = await report(f);
+    const run = f.manager.runDirectory(result.id)!;
     vi.stubEnv("PI_FABRIC_WRITE_POLICY", JSON.stringify(value.policy));
     const provider = new PiToolsProvider(f.cwd, undefined, undefined, { allowUnhookedTools: true, powerShellToolDefinitionFactory: undefined });
     const context = { cwd: f.cwd, extensionContext: { cwd: f.cwd,
@@ -154,6 +189,17 @@ describe("local process task write default", () => {
       await expect(provider.invoke("write", { path: f.outside, content: "escape" }, context)).rejects.toThrow(/outside writable roots/);
       await expect(provider.invoke("edit", { path: f.outside, edits: [{ oldText: "one", newText: "escape" }] }, context)).rejects.toThrow(/outside writable roots/);
       expect(fs.existsSync(f.outside)).toBe(false);
+      for (const name of ["completion-recipient.json", "status.json", "events.jsonl"]) {
+        const file = path.join(run, name);
+        const before = fs.readFileSync(file, "utf8");
+        await expect(provider.invoke("write", { path: file, content: "redirected" }, context)).rejects.toThrow(/outside writable roots/);
+        await expect(provider.invoke("edit", { path: file, edits: [{ oldText: before, newText: "redirected" }] }, context)).rejects.toThrow(/outside writable roots/);
+        expect(fs.readFileSync(file, "utf8")).toBe(before);
+      }
+      expect(completionRecipientFromRun(f.meshRoot, run)).toEqual(f.recipient);
+      await provider.invoke("write", { path: path.join(value.tmpdir, "nested.txt"), content: "scratch-one" }, context);
+      await provider.invoke("edit", { path: path.join(value.tmpdir, "nested.txt"), edits: [{ oldText: "scratch-one", newText: "scratch-two" }] }, context);
+      expect(fs.readFileSync(path.join(value.tmpdir, "nested.txt"), "utf8")).toBe("scratch-two");
       const shell = await provider.invoke("bash", { command: "echo nested-shell-allowed", timeout: 5 }, context);
       expect(JSON.stringify(shell)).toContain("nested-shell-allowed");
     } finally { await provider.close(); }
@@ -263,6 +309,35 @@ describe("local process task write default", () => {
     expect(processResult.status).not.toBe(0);
     expect(processResult.stderr).toContain("Evidence path must not contain symlinked components");
     expect(fs.existsSync(evidence)).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("pins artifact writes across an ancestor swap and writes no failure artifact through the changed path", { timeout: 30_000 }, () => {
+    const f = fixture();
+    const parent = path.join(f.cwd, "artifacts"), parked = path.join(f.cwd, "artifacts-original"), outside = path.join(f.root, "escaped");
+    fs.mkdirSync(parent); fs.mkdirSync(outside);
+    const evidence = path.join(parent, "proof");
+    const preload = path.join(f.root, "swap-evidence.mjs");
+    fs.writeFileSync(preload, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const open = fs.openSync; let swapped = false;
+fs.openSync = function(file, ...args) {
+  if (!swapped && String(file).startsWith('/proc/self/fd/') && /parent-(events\\.jsonl|stderr\\.log)$/.test(String(file))) {
+    swapped = true; fs.renameSync(${JSON.stringify(parent)}, ${JSON.stringify(parked)});
+    fs.symlinkSync(${JSON.stringify(outside)}, ${JSON.stringify(parent)}, 'junction');
+  }
+  return open.call(this, file, ...args);
+}; syncBuiltinESMExports();`);
+    const native = path.join(f.root, "native.mjs");
+    fs.writeFileSync(native, `process.stdin.resume(); process.stdin.once('end', () => process.exit(0));
+process.stderr.write('first artifact\\n'); setTimeout(() => process.stderr.write('second artifact\\n'), 100);`);
+    const processResult = spawnSync(process.execPath, ["scripts/prove-task-write-scope.mjs", "--fabric-root", process.cwd(),
+      "--workspace", f.cwd, "--evidence-dir", evidence, "--pi-binary", native], {
+      encoding: "utf8", timeout: 25_000, env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` },
+    });
+    expect(processResult.status).toBe(1);
+    expect(processResult.stderr).toContain("Evidence path changed after creation");
+    expect(fs.readdirSync(outside)).toEqual([]);
+    expect(fs.readFileSync(path.join(parked, "proof", "parent-stderr.log"), "utf8")).toBe("first artifact\n");
+    expect(fs.existsSync(path.join(parked, "proof", "failure.json"))).toBe(false);
   });
 
   it("refuses a canonical proof evidence path outside its workspace before creating it", () => {

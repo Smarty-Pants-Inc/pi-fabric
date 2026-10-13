@@ -33,6 +33,7 @@ fs.writeFileSync(args.get("status-file"), JSON.stringify({
 const fixture = (fullCodeMode = true) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-spawn-release-")));
   roots.push(root);
+  const cwd = path.join(root, "cwd"); fs.mkdirSync(cwd);
   const profile = path.join(root, "profile");
   fs.mkdirSync(profile);
   vi.stubEnv("PI_CODING_AGENT_DIR", profile);
@@ -48,12 +49,12 @@ const fixture = (fullCodeMode = true) => {
   const parent = release("parent");
   const select = (directory: string) => fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [{ source: directory }] }));
   select(parent);
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
+  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], maxConcurrent: 1, timeoutMs: 4_000 }, {
     workerPath: path.join(parent, "dist/worker.js"), fabricExtensionPath: path.join(parent, "dist/index.js"),
     fullCodeMode, runRoot: path.join(root, "runs"),
   });
   managers.push(manager);
-  return { root, profile, parent, manager, release, select };
+  return { root, cwd, profile, parent, manager, release, select };
 };
 
 const probe = async (f: ReturnType<typeof fixture>, expected: string) => {
@@ -123,7 +124,7 @@ const args = new Map();`));
     const current = f.release("canonical-current");
     const alias = path.join(f.root, "parent-alias");
     fs.symlinkSync(f.parent, alias, "junction");
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: path.join(alias, "dist/worker.js"), fabricExtensionPath: path.join(alias, "dist/index.js"),
       fullCodeMode: true, runRoot: path.join(f.root, "alias-runs"),
     });
@@ -136,7 +137,7 @@ const args = new Map();`));
     const f = fixture();
     const custom = path.join(f.parent, "custom-worker.mjs");
     fs.writeFileSync(custom, worker);
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: custom, fabricExtensionPath: path.join(f.parent, "dist/index.js"),
       fullCodeMode: true, runRoot: path.join(f.root, "custom-runs"),
     });
@@ -154,7 +155,7 @@ const args = new Map();`));
     const hook = path.join(f.root, "custom-hook.mjs");
     fs.writeFileSync(hook, "export default function () {}\n");
     const current = f.release("custom-hook-current");
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
+    const manager = new AgentManager(f.cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 4_000 }, {
       workerPath: path.join(f.parent, "dist/worker.js"), fabricExtensionPath: hook,
       fullCodeMode: true, runRoot: path.join(f.root, "custom-hook-runs"),
     });
@@ -255,7 +256,8 @@ const workerStarted = async (root: string) => { await vi.waitFor(() => expect(fs
 describe.skipIf(process.platform !== "linux")("ProcessTransport processSlice (#4383)", () => {
   it("propagates the host slice from AgentManager through a real process worker", async () => {
     const f = fixture();
-    const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, processSlice: "batch.slice", budgetUsd: 0, sessionExport: false, timeoutMs: 5_000 }, {
+    const cwd = path.join(f.root, "cwd"); fs.mkdirSync(cwd);
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, processSlice: "batch.slice", budgetUsd: 0, sessionExport: false, timeoutMs: 5_000 }, {
       runRoot: path.join(f.root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     });
     try {

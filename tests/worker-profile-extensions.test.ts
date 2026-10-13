@@ -58,8 +58,9 @@ const installWorker = (f: ReturnType<typeof fixture>) => {
 };
 const managerFor = (f: ReturnType<typeof fixture>, binary: string) => {
   vi.stubEnv("PI_CODING_AGENT_DIR", f.profile); vi.stubEnv("PI_OFFLINE", "1");
+  const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-profile-run-root-")); roots.push(runRoot);
   const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, nice: 19, timeoutMs: 30_000, retainRuns: true, budgetUsd: 0, deniedModels: [] }, {
-    workerPath: path.join(path.dirname(f.pinned), "worker.js"), piBinary: binary, fabricExtensionPath: f.pinned, fullCodeMode: false, runRoot: path.join(f.root, "runs"),
+    workerPath: path.join(path.dirname(f.pinned), "worker.js"), piBinary: binary, fabricExtensionPath: f.pinned, fullCodeMode: false, runRoot,
   }); managers.push(manager); return manager;
 };
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;

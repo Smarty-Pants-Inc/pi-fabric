@@ -101,7 +101,7 @@ const runProperties = {
   writePolicy: {
     type: "string",
     enum: ["unrestricted"],
-    description: "Audited opt-out of the process task default (write/edit restricted to cwd and its own run directory, including private TMPDIR; shells allowed). Cannot be combined with readOnly/writableRoots/shell or escape inherited confinement.",
+    description: "Audited opt-out of the process task default (write/edit restricted to cwd and the run's dedicated tmp/; host-owned run records excluded; shells allowed). Cannot be combined with readOnly/writableRoots/shell or escape inherited confinement.",
   },
   readOnly: { type: "boolean", description: "Pi only: refuse write/edit (and shell unless shell: \"unconfined\") in the child" },
   writableRoots: {

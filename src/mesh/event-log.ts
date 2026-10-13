@@ -501,7 +501,10 @@ export class EventLog {
       if (errorCode(error) !== "EEXIST") throw kept(error);
       try { syncDirectoryChain(path.dirname(file)); } // the competing name is durable before the claim stops fencing
       catch (barrier) { throw kept(barrier); }
-      if (fs.lstatSync(file, { throwIfNoEntry: false })) this.#keepIntentClaim(claim);
+      // The winner vanished after the barrier (an off-lock removal or rename): the exact claim stays the fence and the
+      // keyed caller must not continue as if no intent existed; the next hold links the claim back.
+      if (!fs.lstatSync(file, { throwIfNoEntry: false })) throw kept(error);
+      this.#keepIntentClaim(claim);
       return;
     }
     syncDirectoryChain(path.dirname(file)); // the reinstated name is durable before the claim name goes

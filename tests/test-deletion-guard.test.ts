@@ -13,7 +13,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // smarty-dev#11145: tests/test-deletion-guard.mjs (imported by tests/fleet-isolation-setup.ts, inherited by
 // children through NODE_OPTIONS --import) refuses deletes outside the run's private TMPDIR locally and only
 // reports them under GITHUB_ACTIONS=true. External fixtures here are NEVER deleted by this file: a sibling
-// mkdtemp under the real /tmp (POSIX) or dirname(TMPDIR) (Windows), left for the owner to clean.
+// mkdtemp under dirname(TMPDIR), inside test-env's private parent but outside Vitest's guard root,
+// left for the owner to clean.
 
 const guardFile = "test-deletion-guard.mjs";
 const guardUrl = new URL(`./${guardFile}`, import.meta.url).href;
@@ -84,7 +85,7 @@ let fixtures = "";
 
 beforeAll(() => {
   requireGuard();
-  external = mkdtempSync(join(posix ? "/tmp" : dirname(privateTemp), "delguard-external-"));
+  external = mkdtempSync(join(dirname(privateTemp), "delguard-external-"));
   externalFile = join(external, "keep.txt");
   externalDir = join(external, "keep-dir");
   writeFileSync(externalFile, "keep");
@@ -272,6 +273,201 @@ const withoutGuard = (options = "") => {
   }
   return kept.join(" ");
 };
+
+// Every mutating delegate is a recorder installed before the guard. Only the explicitly known
+// inside -> NEW destination rename may reach native fs; even RED cannot overwrite an outside victim.
+const overwriteChild = String.raw`
+import fs from "node:fs";
+import * as fsModule from "node:fs";
+import * as promiseModule from "node:fs/promises";
+import { renameSync, rename, copyFileSync, copyFile, cpSync, cp, linkSync, link, symlinkSync, symlink } from "node:fs";
+import { rename as promiseRename, copyFile as promiseCopyFile, cp as promiseCp,
+  link as promiseLink, symlink as promiseSymlink } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+const [guard, parent, input] = process.argv.slice(2);
+const spec = JSON.parse(input);
+const caseDir = fs.mkdtempSync(join(parent, "overwrite-case-"));
+const root = join(caseDir, "guard-root");
+const outside = join(caseDir, "outside");
+fs.mkdirSync(root);
+fs.mkdirSync(outside);
+const victim = join(outside, "keep.txt");
+const source = join(root, "source.txt");
+const fresh = join(root, "new-target.txt");
+fs.writeFileSync(victim, "outside victim\n");
+fs.writeFileSync(source, "inside source\n");
+let src = spec.direction === "outside-source" ? victim : source;
+let dest = ["outside-dest", "thenable"].includes(spec.direction) ? victim : fresh;
+let nestedSrc, nestedDest;
+if (spec.direction === "final-symlink") {
+  dest = join(root, "final-link");
+  fs.symlinkSync(victim, dest, "file");
+}
+if (spec.direction === "nested" || spec.direction === "filtered") {
+  src = join(root, "tree");
+  dest = join(root, "copied");
+  fs.mkdirSync(join(src, "nested"), { recursive: true });
+  fs.mkdirSync(dest);
+  nestedSrc = join(src, "nested", "keep.txt");
+  nestedDest = join(dest, "nested", "keep.txt");
+  fs.writeFileSync(nestedSrc, "nested source\n");
+  fs.symlinkSync(outside, join(dest, "nested"), "dir");
+}
+Object.assign(process.env, { TMPDIR: root, TMP: root, TEMP: root });
+const text = (p) => p instanceof URL ? fileURLToPath(p) : String(p);
+const calls = [], filterVisits = [];
+const native = { sync: fs.renameSync, callback: fs.rename, promise: fs.promises.rename };
+const safeRename = (name, args) => name === "rename" && spec.direction === "inside"
+  && text(args[0]) === source && text(args[1]) === fresh && !fs.existsSync(fresh);
+const record = (name, args) => calls.push({ name, source: text(args[0]), dest: text(args[1]) });
+// Match Node's options-or-callback overload and filter every kept root/recursive pair.
+const cpOptions = (args) => typeof args[2] === "function" ? {} : args[2] ?? {};
+const cpPairs = (args) => [[args[0], args[1]], ...(nestedSrc ? [[nestedSrc, nestedDest]] : [])];
+const filterSync = (name, args) => {
+  const options = cpOptions(args);
+  if (name !== "cp" || typeof options.filter !== "function") return true;
+  for (const pair of cpPairs(args)) if (!options.filter(...pair)) return false;
+  return true;
+};
+const filterAsync = async (name, args) => {
+  const options = cpOptions(args);
+  if (name !== "cp" || typeof options.filter !== "function") return true;
+  for (const pair of cpPairs(args)) if (!await options.filter(...pair)) return false;
+  return true;
+};
+for (const name of ["rename", "copyFile", "cp", "link", "symlink"]) {
+  fs[name + "Sync"] = (...args) => {
+    if (!filterSync(name, args)) return;
+    record(name, args);
+    if (safeRename(name, args)) return native.sync(...args);
+  };
+  fs[name] = (...args) => {
+    const done = args.at(-1);
+    void (async () => {
+      if (!await filterAsync(name, args)) { done(null); return; }
+      record(name, args);
+      if (safeRename(name, args)) { native.callback(...args); return; }
+      done(null);
+    })().catch(done);
+  };
+  fs.promises[name] = async (...args) => {
+    if (!await filterAsync(name, args)) return;
+    record(name, args);
+    if (safeRename(name, args)) return native.promise(...args);
+  };
+}
+syncBuiltinESMExports();
+await import(guard);
+// Read the static named bindings after synchronization, alongside the live module namespaces.
+const namedSync = { rename: renameSync, copyFile: copyFileSync, cp: cpSync, link: linkSync, symlink: symlinkSync };
+const namedCallback = { rename, copyFile, cp, link, symlink };
+const namedPromises = { rename: promiseRename, copyFile: promiseCopyFile, cp: promiseCp,
+  link: promiseLink, symlink: promiseSymlink };
+const form = (p) => spec.form === "Buffer" ? Buffer.from(p) : spec.form === "URL" ? pathToFileURL(p) : p;
+const args = [form(src), form(dest)];
+if (spec.op === "cp" && !spec.bare) {
+  const options = { recursive: true };
+  // cpSync treats a non-Promise thenable as a truthy filter result; it must not bypass destination checks.
+  if (spec.direction === "thenable") options.filter = () => ({ then() { return true; } });
+  if (spec.direction === "filtered") options.filter = (s, d) => {
+    filterVisits.push([text(s), text(d)]);
+    return text(d) !== nestedDest;
+  };
+  args.push(options);
+}
+const api = spec.surface.startsWith("module") ? fsModule : fs;
+let kind = "sync", errorCode = null, errorMessage = null;
+try {
+  let value;
+  if (spec.surface.endsWith("sync")) {
+    const invoke = spec.surface === "named-sync" ? namedSync[spec.op] : api[spec.op + "Sync"];
+    value = invoke(...args);
+  } else if (spec.surface.endsWith("callback")) {
+    let done;
+    value = new Promise((ok, no) => { done = (error) => error ? no(error) : ok(); });
+    const invoke = spec.surface === "named-callback" ? namedCallback[spec.op] : api[spec.op];
+    invoke(...args, done);
+  } else {
+    const promises = spec.surface === "named-promise" ? namedPromises
+      : spec.surface === "module-promise" ? promiseModule : fs.promises;
+    value = promises[spec.op](...args);
+  }
+  if (value !== undefined) { kind = "async"; await value; }
+} catch (error) { errorCode = error.code ?? null; errorMessage = error.message; }
+console.log("OVERWRITE:" + JSON.stringify({ caseDir, root, victim: fs.readFileSync(victim, "utf8"),
+  source: fs.existsSync(source) ? fs.readFileSync(source, "utf8") : null,
+  renamed: fs.existsSync(fresh) ? fs.readFileSync(fresh, "utf8") : null,
+  kind, errorCode, errorMessage, calls, filterVisits }));
+`;
+
+const overwriteSurfaces = ["fs-sync", "named-sync", "module-sync", "fs-callback", "named-callback",
+  "module-callback", "fs-promise", "named-promise", "module-promise"] as const;
+type OverwriteCase = { op: string; surface: typeof overwriteSurfaces[number]; direction: string;
+  form?: string; report?: boolean; bare?: boolean };
+const overwriteCases: OverwriteCase[] = [
+  ...overwriteSurfaces.flatMap((surface) => ["outside-dest", "outside-source", "inside"]
+    .map((direction) => ({ op: "rename", surface, direction }))),
+  ...["copyFile", "cp", "link", "symlink"].flatMap((op) => overwriteSurfaces.flatMap((surface) =>
+    ["outside-dest", "outside-source"].map((direction) => ({ op, surface, direction })))),
+  ...["copyFile", "cp"].flatMap((op) => overwriteSurfaces.map((surface) =>
+    ({ op, surface, direction: "final-symlink" }))),
+  ...overwriteSurfaces.flatMap((surface) => ["nested", "filtered"].map((direction) =>
+    ({ op: "cp", surface, direction }))),
+  ...["Buffer", "URL"].flatMap((form) => ["outside-dest", "outside-source", "inside"].map((direction) =>
+    ({ op: "rename", surface: "fs-sync" as const, direction, form }))),
+  ...overwriteSurfaces.filter((surface) => surface.endsWith("callback")).flatMap((surface) =>
+    ["outside-dest", "outside-source"].map((direction) => ({ op: "cp", surface, direction, bare: true }))),
+  ...overwriteSurfaces.filter((surface) => surface.endsWith("sync")).map((surface) =>
+    ({ op: "cp", surface, direction: "thenable" })),
+  { op: "rename", surface: "fs-sync", direction: "outside-dest", report: true },
+];
+const recordedCases = overwriteCases.map((spec) => ({ ...spec,
+  label: `${spec.op} ${spec.surface} ${spec.direction} ${spec.form ?? "string"}${spec.bare ? " bare-options" : ""}${spec.report ? " hosted-report" : ""}` }));
+
+it.each(recordedCases)("overwrite guard recorded $label", (spec) => {
+  const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
+  expect(nodeOptions).not.toContain(guardFile);
+  const result = runChild("overwrite-recorder-child.mjs", overwriteChild,
+    [guardUrl, privateTemp, JSON.stringify(spec)],
+    { ...process.env, NODE_OPTIONS: nodeOptions, GITHUB_ACTIONS: spec.report ? "true" : "false" });
+  const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("OVERWRITE:"));
+  expect(line, result.stdout + result.stderr).toBeDefined();
+  const output = JSON.parse(line!.slice("OVERWRITE:".length)) as { caseDir: string; root: string;
+    victim: string; source: string | null; renamed: string | null; kind: Outcome["kind"];
+    errorCode: string | null; errorMessage: string | null; calls: unknown[]; filterVisits: unknown[] };
+  console.info("OVERWRITE_EVIDENCE:" + JSON.stringify({ label: spec.label, code: output.errorCode,
+    delegates: output.calls.length, kind: output.kind, intact: output.victim === "outside victim\n",
+    renamed: output.renamed, filterVisits: output.filterVisits.length,
+    reports: result.stderr.split(/\r?\n/).filter((entry) => entry.startsWith("TEST_DELETION_REPORT:")).length }));
+  expect(inside(privateTemp, output.caseDir)).toBe(true);
+  expect(inside(output.caseDir, output.root)).toBe(true);
+  expect(output.victim).toBe("outside victim\n");
+  if (!(spec.op === "rename" && spec.direction === "inside")) expect(output.source).toBe("inside source\n");
+  expect(output.kind).toBe(spec.surface.endsWith("sync") ? "sync" : "async");
+  if (spec.report) {
+    expect(output.errorCode).toBeNull();
+    expect(output.calls).toHaveLength(1);
+    const reports = result.stderr.split(/\r?\n/).filter((entry) => entry.startsWith("TEST_DELETION_REPORT:"));
+    expect(reports).toHaveLength(1);
+    expect(JSON.parse(reports[0]!.slice("TEST_DELETION_REPORT:".length))).toMatchObject({
+      operation: "renameSync", caller: expect.stringContaining("overwrite-recorder-child") });
+  } else if (["outside-dest", "outside-source", "final-symlink", "nested", "thenable"].includes(spec.direction)
+    && !(spec.direction === "outside-source" && spec.op !== "rename")) {
+    expect(output.errorCode, output.errorMessage ?? JSON.stringify(output.calls)).toBe("ERR_TEST_DELETION_GUARD");
+    expect(output.errorMessage).toMatch(refusal);
+    expect(output.calls).toEqual([]);
+  } else {
+    expect(output.errorCode, output.errorMessage ?? "unexpected refusal").toBeNull();
+    expect(output.calls).toHaveLength(spec.direction === "filtered" ? 0 : 1);
+    if (spec.direction === "filtered") expect(output.filterVisits).toHaveLength(2);
+    if (spec.op === "rename") {
+      expect(output.source).toBeNull();
+      expect(output.renamed).toBe("inside source\n");
+    }
+  }
+});
 
 it("keeps native Windows deletion hosted-only without invoking its test callbacks", () => {
   const source = fs.readFileSync(new URL("./verified-remove-windows.test.ts", import.meta.url), "utf8");
@@ -464,4 +660,91 @@ describe("deletion guard in child processes", () => {
     });
     expect(output.calls).toEqual([`${output.root}/x`, `${output.root}/`]);
   });
+});
+
+// Config imports test-temp before the deletion guard. Record every outside request before import:
+// even RED never creates/deletes a shared /tmp root. Exit hooks are invoked manually, not registered.
+const tempOwnershipChild = String.raw`
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+const [helperUrl, parent] = process.argv.slice(2);
+const native = { mkdtemp: fs.mkdtempSync, mkdir: fs.mkdirSync, write: fs.writeFileSync, rename: fs.renameSync };
+const once = process.once;
+let caller, hooks = [], early = [], guarded = [], outside = [], serial = 0;
+const inside = (p) => { const r = relative(caller, resolve(String(p))); return r === "" || (!isAbsolute(r) && r !== ".." && !r.startsWith(".." + sep)); };
+const record = (op, path) => { if (!inside(path)) outside.push({ op, path: String(path) }); };
+fs.mkdtempSync = (prefix) => { record("mkdtempSync", prefix); return inside(prefix) ? native.mkdtemp(prefix) : join(parent, "VIRTUAL-NOT-CREATED-" + ++serial); };
+for (const [op, invoke] of [["mkdirSync", native.mkdir], ["writeFileSync", native.write]]) {
+  fs[op] = (p, ...args) => { record(op, p); if (inside(p)) return invoke(p, ...args); };
+}
+for (const op of ["rmSync", "rmdirSync", "unlinkSync", "rm", "rmdir", "unlink"]) {
+  fs[op] = (p, ...args) => { record(op, p); early.push(String(p)); if (typeof args.at(-1) === "function") args.at(-1)(null); };
+}
+for (const op of ["rm", "rmdir", "unlink"]) fs.promises[op] = async p => { record(op, p); early.push(String(p)); };
+process.once = function(event, hook) { if (event === "exit") { hooks.push(hook); return this; } return once.call(this, event, hook); };
+syncBuiltinESMExports();
+const helper = await import(helperUrl);
+const results = [];
+for (const mode of ["long", "short"]) {
+  caller = native.mkdtemp(join(parent, mode === "long" ? "long-private-caller-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-" : "s-"));
+  process.chdir(caller);
+  // The short counterexample uses a one-character caller TMPDIR, still inside our real private root.
+  const envTemp = mode === "short" ? "." : caller;
+  Object.assign(process.env, { TMPDIR: envTemp, TMP: envTemp, TEMP: envTemp });
+  delete process.env.RUNNER_TEMP;
+  delete process[Symbol.for("pi-fabric.test-owned-fleet-roots")];
+  hooks = []; early = []; guarded = []; outside = [];
+  const temp = helper.isolatedTestTemp("owned-");
+  // Sibling roots let us replace each identity independently without moving the other fixture.
+  Object.assign(process.env, { TMPDIR: caller, TMP: caller, TEMP: caller });
+  const fleet = helper.isolateTestFleetEnvironment();
+  const roots = [resolve(temp.TMPDIR), resolve(fleet.PI_FABRIC_MESH_ROOT, "..")];
+  // No syncBuiltinESMExports here: the later guard must be looked up dynamically.
+  fs.rmSync = p => { record("current rmSync", p); guarded.push(resolve(String(p))); };
+  for (const hook of hooks) hook(0);
+  const cleanup = [...guarded];
+  let sentinels = false;
+  if (roots.every(p => inside(p) && fs.existsSync(p))) {
+    for (const [i, root] of roots.entries()) {
+      const unowned = join(caller, "unowned-" + i);
+      native.mkdir(unowned);
+      native.write(join(unowned, "sentinel"), "pre-existing");
+      native.rename(root, join(caller, "held-owned-" + i));
+      native.rename(unowned, root);
+    }
+    guarded = [];
+    for (const hook of hooks) hook(0);
+    sentinels = roots.every(p => fs.readFileSync(join(p, "sentinel"), "utf8") === "pre-existing");
+  }
+  results.push({ mode, caller, callerTempLength: envTemp.length, roots, outside, early, cleanup,
+    replacementCleanup: guarded, sentinels, hookCount: hooks.length });
+}
+console.log("TEMP_OWNERSHIP:" + JSON.stringify(results));
+`;
+
+it("test-temp keeps long and short callers private, uses the current exit guard and pins created roots", () => {
+  const nodeOptions = withoutGuard(process.env.NODE_OPTIONS);
+  expect(nodeOptions).not.toContain(guardFile);
+  const result = runChild("temp-ownership-child.mjs", tempOwnershipChild,
+    [new URL("../scripts/test-temp.ts", import.meta.url).href, fixtures],
+    { ...process.env, NODE_OPTIONS: `${nodeOptions} --experimental-transform-types` });
+  const line = result.stdout.split(/\r?\n/).find(entry => entry.startsWith("TEMP_OWNERSHIP:"));
+  expect(line, result.stdout + result.stderr).toBeDefined();
+  const output = JSON.parse(line!.slice("TEMP_OWNERSHIP:".length)) as Array<{ mode: string; caller: string;
+    callerTempLength: number; roots: string[]; outside: unknown[]; early: string[]; cleanup: string[];
+    replacementCleanup: string[]; sentinels: boolean; hookCount: number }>;
+  expect(output.map(entry => entry.mode)).toEqual(["long", "short"]);
+  for (const entry of output) {
+    console.info("TEMP_OWNERSHIP_EVIDENCE:" + JSON.stringify(entry));
+    expect(inside(privateTemp, entry.caller)).toBe(true);
+    expect(entry.callerTempLength > 40).toBe(entry.mode === "long");
+    expect(entry.roots.every(root => inside(entry.caller, root))).toBe(true);
+    expect(entry.outside).toEqual([]);
+    expect(entry.early).toEqual([]);
+    expect(entry.cleanup).toEqual(entry.roots);
+    expect(entry.replacementCleanup).toEqual([]);
+    expect(entry.sentinels).toBe(true);
+    expect(entry.hookCount).toBe(2);
+  }
 });

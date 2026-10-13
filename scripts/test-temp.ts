@@ -1,6 +1,26 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { lstatSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+// Only call immediately after mkdtemp: path ownership is not ownership of a replacement.
+const ownedRootCleanup = (directory: string): (() => void) => {
+  const pin = lstatSync(directory, { bigint: true });
+  const parent = dirname(directory);
+  const parentPin = lstatSync(parent, { bigint: true });
+  return () => {
+    try {
+      const current = lstatSync(directory, { bigint: true });
+      const currentParent = lstatSync(parent, { bigint: true });
+      if (!current.isDirectory() || current.isSymbolicLink()
+        || current.dev !== pin.dev || current.ino !== pin.ino
+        || currentParent.dev !== parentPin.dev || currentParent.ino !== parentPin.ino) return;
+      // Config imports precede the deletion guard: look up the CURRENT wrapped remover.
+      fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    } catch {
+      // Missing/replaced roots or a child's Windows handle must not mask test results.
+    }
+  };
+};
 
 // Git Bash (MSYS2) keeps its mount table, with /tmp resolved from the first shell's TEMP, in
 // per-user shared memory for as long as any MSYS process lives. A shell a test could not reap
@@ -8,36 +28,32 @@ import { join } from "node:path";
 // Git Bash in the next run starts with "bash.exe: warning: could not find /tmp, please create!"
 // on stderr. On a Windows CI runner, reuse one path per job and leave it for the runner
 // to clean: no test process owns this shared parent or the lifetime of a pinned /tmp.
-// ponytail: a runner runs one job at a time and RUNNER_TEMP is per runner, so the path is private.
+// RUNNER_TEMP selects job lifetime only; caller TMPDIR remains the allocation boundary.
 const stableRoot = (prefix: string): string | undefined => {
   const runnerTemp = process.env.RUNNER_TEMP;
   if (process.platform !== "win32" || !runnerTemp) return;
-  const directory = join(runnerTemp, `${prefix}job`);
+  const directory = join(resolve(tmpdir()), `${prefix}job`);
   mkdirSync(directory, { recursive: true });
+  if (!lstatSync(directory).isDirectory()) {
+    throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${directory}`);
+  }
   return directory;
 };
 
 /** Tests must never prune a real session's caches or leave their own behind. */
 export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEMP", string> {
+  if (!prefix || prefix === "." || prefix === ".." || /[/\\]/.test(prefix)) {
+    throw new Error("Test temp prefix must be a single name inside caller TMPDIR");
+  }
   const sharedDirectory = stableRoot(prefix);
   if (sharedDirectory) {
     // Config probes and workers share this path; their exit must not delete live siblings.
     return { TMPDIR: sharedDirectory, TMP: sharedDirectory, TEMP: sharedDirectory };
   }
-  // ponytail: smarty-dev#7554. Unix socket paths have a 108-byte limit; an agent host's long TMPDIR
-  // (/srv/scratch/<user>/smarty-pi-tmp/...) plus nested fixture dirs exceeded it (listen EINVAL, tmux
-  // "File name too long"). POSIX-only: Windows keeps its own TEMP and pipes, not path-bound sockets.
-  const base = tmpdir();
-  const directory = process.platform !== "win32" && base.length > 40
-    ? mkdtempSync(join("/tmp", prefix))
-    : mkdtempSync(join(base, prefix));
-  process.once("exit", () => {
-    try {
-      rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    } catch {
-      // A killed child may still hold a Windows handle; never mask test results.
-    }
-  });
+  // Long paths stay private. Socket fixtures that need shorter paths must use a shorter
+  // caller TMPDIR or refuse explicitly; never relocate into a shared /tmp fallback.
+  const directory = mkdtempSync(join(resolve(tmpdir()), prefix));
+  process.once("exit", ownedRootCleanup(directory));
   return { TMPDIR: directory, TMP: directory, TEMP: directory };
 }
 
@@ -74,21 +90,15 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.
-  const root = mkdtempSync(join(tmpdir(), "pi-fabric-test-fleet-"));
-  const owner = process as typeof process & { [fleetRootsKey]?: Set<string> };
+  const root = mkdtempSync(join(resolve(tmpdir()), "pi-fabric-test-fleet-"));
+  const owner = process as typeof process & { [fleetRootsKey]?: Set<() => void> };
   if (!owner[fleetRootsKey]) {
-    const roots = owner[fleetRootsKey] = new Set<string>();
+    const roots = owner[fleetRootsKey] = new Set<() => void>();
     process.once("exit", () => {
-      for (const directory of roots) {
-        try {
-          rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-        } catch {
-          // A killed child may still hold a Windows handle; never mask test results.
-        }
-      }
+      for (const cleanup of roots) cleanup();
     });
   }
-  owner[fleetRootsKey]!.add(root);
+  owner[fleetRootsKey]!.add(ownedRootCleanup(root));
   const environment = {
     PI_FABRIC_MESH_ROOT: join(root, "mesh"),
     // Writable project state is private; PI_FABRIC_PROJECT is attribution only.

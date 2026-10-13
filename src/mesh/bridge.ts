@@ -1060,6 +1060,9 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
+      // With a handoff row, #scan reads every lease file (bridgeHandoffScope): stamp their directory first.
+      const leaseStamp = early && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0
+        ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
       const plan = this.#outbox.plan();
       try {
@@ -1077,7 +1080,8 @@ export class StoreBridgeSide implements BridgeSide {
             if (!this.#recovered) plan.replay(view);
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
-            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES)) result = planned;
+            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
+              (leaseStamp === undefined || meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp)) result = planned;
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);

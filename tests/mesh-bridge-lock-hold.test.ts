@@ -252,6 +252,35 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
 
   });
 
+  // Review finding (Luna max, P1): with a handoff row the mirror plan reads every lease file, so a lease
+  // written between the plan and its transaction must re-plan; with no lease change the plan commits once.
+  it.each([false, true])("mirror plan with a handoff row, lease written before its transaction: %s", async (leaseChanges) => {
+    const hub = store(), far = store();
+    await native(hub, "session:plan-hub");
+    await native(far, "session:plan-spoke");
+    const side = new StoreBridgeSide(hub, "far");
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: side,
+      remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(scratch(), "cursor.json") });
+    await bridge.start(); // the recovery pass; later passes plan before their transaction
+    const identity: MeshIdentity = { id: "session:plan-other", name: "other", kind: "main" };
+    await hub.put({ key: `topology/handoffs/${createHash("sha256").update(identity.id).digest("hex")}`, value: { id: identity.id }, identity });
+    const writeBatch = hub.writeBatch.bind(hub);
+    let batches = 0;
+    hub.writeBatch = (input) => {
+      batches += 1;
+      if (batches === 1 && leaseChanges) {
+        const now = Date.now();
+        writeHostLease(hub.root, { id: identity.id, rootId: identity.id, identityId: identity.id, updatedAt: now, expiresAt: now + 60000, startedAt: now });
+      }
+      return writeBatch(input);
+    };
+    const presence = await new StoreBridgeSide(far, "hub").presence();
+    await side.mirror(presence);
+    expect(batches).toBe(leaseChanges ? 2 : 1);
+    expect(side.holds("session:plan-spoke")).toBe(true);
+    await bridge.stop();
+  });
+
   it("the change-feed proof: other keys pass, a host, participant or handoff row since the revision fails", async () => {
     const mesh = store();
     const other = new MeshStore(mesh.root, 65536, 1000, { stateBackend: "sqlite" });

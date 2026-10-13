@@ -5,11 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ACTOR_ACTIVATION_HEADER, ENODEV_UNRESOLVED_REASON, peekEnodevRun } from "../src/agents/enodev-recovery.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
-import { normalizeActorBatching } from "../src/actors/types.js";
+import { FabricActorBatchPolicyError, normalizeActorBatching } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
@@ -41,14 +42,15 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batching-")), limit = 32, resume = true) => {
+const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batching-")), limit = 32, resume = true,
+  options: ConstructorParameters<typeof ActorManager>[6] = {}) => {
   let monitor!: ActorMeshMonitor;
   vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
   const mesh = new MeshStore(path.join(root, "mesh"), 256 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
   const runs: AgentRunRequest[] = [];
   let hold: Promise<void> | undefined;
-  vi.spyOn(agents, "run").mockImplementation(async (request, _signal, onSpawned) => {
+  const runStub = vi.spyOn(agents, "run").mockImplementation(async (request, _signal, onSpawned) => {
     runs.push(request);
     const id = `recorded-${runs.length}`;
     onSpawned?.({ id, name: "recorded", status: "running", runner: "pi", transport: "process", cwd: process.cwd() });
@@ -64,7 +66,7 @@ const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batch
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorQueueLimit: limit }, agents, () => {}, {
     actorRoot: path.join(root, "actors"), persistent: true, releasePaused: true, reapDeadSessionPresence: false,
     // Disable unrelated retention admission; events still use the real synchronous receiver path.
-    canConsumeMesh: () => false,
+    canConsumeMesh: () => false, ...options,
   });
   const close = async () => { await actors.close(); await agents.close(); };
   closers.push(close);
@@ -89,7 +91,7 @@ const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batch
     const dir = path.join(root, "actors", id);
     const name = fs.readdirSync(dir).find(file => /^queue-.*\.json$/.test(file));
     return name ? JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as {
-      items: Array<{ id: string; payload: MeshEvent; executionStarted: boolean; resumed?: boolean; batchIds?: string[] }>;
+      items: Array<{ id: string; payload: MeshEvent; executionStarted: boolean; resumed?: boolean; activationId?: string; batchIds?: string[] }>;
       processedKeys?: string[];
     } : { items: [] };
   };
@@ -97,7 +99,7 @@ const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batch
     const dir = path.join(root, "actors", id);
     return path.join(dir, fs.readdirSync(dir).find(file => /^queue-.*\.json$/.test(file))!);
   };
-  return { root, mesh, agents, actors, runs, send, sendPublished, event, monitor, snapshot, snapshotFile, close, hold: (gate: Promise<void> | undefined) => { hold = gate; } };
+  return { root, mesh, agents, actors, runs, runStub, send, sendPublished, event, monitor, snapshot, snapshotFile, close, hold: (gate: Promise<void> | undefined) => { hold = gate; } };
 };
 const create = (actors: ActorManager, options = {}) => actors.create({
   name: "supervisor", instructions: "Observe all events.", topics: ["fleet.work.batch"], events: ["tool_error"],
@@ -390,25 +392,298 @@ describe("actor window batching on the durable receiver path", () => {
   });
 });
 
+describe("round 2 batch failure and recovery interleavings", () => {
+  it("default aggregate cap flushes before a third large event without dropping its neighbor", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    const events = [0, 1, 2].map(n => f.send({ ref: `large-${n}`, padding: "x".repeat(100 * 1024) }));
+    for (let turn = 0; turn < 100 && (!f.runs.length || f.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!).map(input => input.payload.id)).toEqual(events.slice(0, 2).map(event => event.id));
+    expect(Buffer.byteLength(f.runs[0]!.task, "utf8")).toBeLessThan(256 * 1024);
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(inputs(f.runs[1]!).map(input => input.payload.id)).toEqual([events[2]!.id]);
+  });
+
+  it("configured exact aggregate boundary is inclusive and survives live update/restart", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    const events = [0, 1, 2].map(n => f.send({ ref: `boundary-${n}` }));
+    const pending = f.snapshot(actor.id).items;
+    const cost = (item: typeof pending[number]) => Buffer.byteLength(JSON.stringify([{ source: "mesh:fleet.work.batch", payload: item.payload, id: item.id }], null, 2), "utf8") +
+      2 + Buffer.byteLength(JSON.stringify(item.id), "utf8") + 16;
+    const cap = cost(pending[0]!) + cost(pending[1]!);
+    f.actors.pauseForRelease();
+    await f.actors.setBatching(actor.id, { batchMaxBytes: cap });
+    await f.close();
+    const second = await fixture(f.root);
+    expect(second.actors.status(actor.id)).toMatchObject({ batchMaxBytes: cap });
+    for (let turn = 0; turn < 100 && (!second.runs.length || second.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(inputs(second.runs[0]!).map(input => input.payload.id)).toEqual(events.slice(0, 2).map(event => event.id));
+    expect(second.actors.status(actor.id).queued).toBe(1);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(second.actors, actor.id);
+    expect(inputs(second.runs[1]!).map(input => input.payload.id)).toEqual([events[2]!.id]);
+  });
+
+  it("counts image bytes and runs one oversized event alone, preserving both adjacent events", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchMaxBytes: 1024 });
+    fakeClock();
+    const image = { type: "image" as const, mimeType: "image/png", data: "A".repeat(3000) };
+    f.actors.dispatchHostEvent("tool_error", { marker: "before" });
+    f.actors.dispatchHostEvent("tool_error", { marker: "oversized" }, [image]);
+    f.actors.dispatchHostEvent("tool_error", { marker: "after" });
+    for (let turn = 0; turn < 100 && (f.runs.length < 2 || f.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[0]!)).toHaveLength(1);
+    expect(f.runs[0]!.task).toContain('"marker": "before"');
+    expect(inputs(f.runs[1]!)).toHaveLength(1);
+    expect(f.runs[1]!.images).toEqual([image]);
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs[2]!.task).toContain('"marker": "after"');
+    expect(f.runs[2]!.images).toBeUndefined();
+  });
+
+  it("keeps same-key originals pending when their earlier batch fails; success still suppresses repeats", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchMax: 3, residency: "durable", dedupeKey: "data.key" });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.runStub.mockImplementationOnce(async request => { f.runs.push(request); await gate; throw new Error("recorded unlaunched failure"); });
+    fakeClock();
+    const events = ["same", "different", "same"].map((key, n) => ({ ...f.event({ key, n }), to: actor.id }));
+    for (const event of events) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    for (let turn = 0; turn < 100 && !f.runs.length; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(inputs(f.runs[0]!).map(input => input.payload.id)).toEqual(events.slice(0, 2).map(event => event.id));
+    expect(f.snapshot(actor.id).items.map(item => item.payload.id)).toEqual(events.map(event => event.id));
+    expect(f.actors.status(actor.id).queued).toBe(1);
+    release();
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[1]!).map(input => input.payload.id)).toEqual([events[2]!.id]);
+    const dir = path.join(f.mesh.root, "delivery-outcomes");
+    const receipts = fs.readdirSync(dir).flatMap(file => fs.readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.map(receipt => receipt.eventId)).toEqual(events.map(event => event.id));
+    expect(receipts.map(receipt => receipt.outcome)).toEqual(["failed", "failed", "delivered"]);
+    f.send({ key: "same", n: 4 });
+    expect(f.actors.status(actor.id).queued).toBe(0);
+    expect(f.runs).toHaveLength(2);
+  });
+
+  it("W=0 also settles a terminal failed original without losing its following event", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchWindowMs: 0 });
+    f.runStub.mockRejectedValueOnce(new Error("recorded unlaunched failure"));
+    const events = [0, 1].map(n => ({ ...f.event({ ref: `single-${n}` }), to: actor.id }));
+    for (const event of events) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    await settled(f.actors, actor.id);
+    expect(f.runStub).toHaveBeenCalledTimes(2);
+    expect(f.runs).toHaveLength(1);
+    expect(f.runs[0]!.task).toContain('"ref": "single-1"');
+    expect(f.runs[0]!.task).not.toContain("Pending events in FIFO order");
+    const dir = path.join(f.mesh.root, "delivery-outcomes");
+    const receipts = fs.readdirSync(dir).flatMap(file => fs.readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.map(receipt => receipt.eventId)).toEqual(events.map(event => event.id));
+    expect(receipts.map(receipt => receipt.outcome)).toEqual(["failed", "delivered"]);
+  });
+
+  it("a durable close keeps interrupted originals pending instead of recording terminal FAILED", async () => {
+    const first = await fixture(undefined, 32, true, { closeGraceMs: 100 });
+    const actor = await create(first.actors, { batchMax: 2 });
+    first.runStub.mockImplementationOnce((request, signal) => {
+      first.runs.push(request);
+      return new Promise<AgentRunResult>((_resolve, reject) => signal!.addEventListener("abort", () => reject(new Error("recorded close before inference")), { once: true }));
+    });
+    const events = [0, 1].map(n => ({ ...first.event({ ref: `close-pending-${n}` }), to: actor.id }));
+    for (const event of events) expect(first.monitor.callbacks.onEvent(event)).toBe(true);
+    for (let turn = 0; turn < 100 && !first.runs.length; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    await first.close();
+    const receiptDir = path.join(first.mesh.root, "delivery-outcomes");
+    expect(fs.existsSync(receiptDir)).toBe(false);
+    const second = await fixture(first.root);
+    await settled(second.actors, actor.id);
+    expect(second.runs).toHaveLength(1);
+    expect(inputs(second.runs[0]!).map(input => input.payload.id)).toEqual(events.map(event => event.id));
+    const receipts = fs.readdirSync(receiptDir).flatMap(file => fs.readFileSync(path.join(receiptDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.map(receipt => receipt.eventId)).toEqual(events.map(event => event.id));
+    expect(receipts.every(receipt => receipt.outcome === "delivered")).toBe(true);
+  });
+
+  it("same-key pending originals are suppressed only after their earlier batch completes successfully", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchMax: 3, residency: "durable", dedupeKey: "data.key" });
+    let release!: () => void;
+    f.hold(new Promise<void>(resolve => { release = resolve; }));
+    fakeClock();
+    const events = ["same", "different", "same"].map((key, n) => f.send({ key, n }));
+    for (let turn = 0; turn < 100 && !f.runs.length; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    const active = f.snapshot(actor.id).items.map(item => item.payload.id);
+    release(); // Always release the recorded run before assertions can fail.
+    expect(active).toEqual(events.map(event => event.id));
+    expect(inputs(f.runs[0]!)).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(1);
+    expect(f.snapshot(actor.id).processedKeys).toHaveLength(2);
+  });
+
+  it.each([W, 0])("preparation failure preserves an older batch before a bypass, but legacy rotation remains (W=%s)", async window => {
+    let preparing!: () => void;
+    let fail!: (error: Error) => void;
+    const entered = new Promise<void>(resolve => { preparing = resolve; });
+    const gate = new Promise<never>((_resolve, reject) => { fail = reject; });
+    let calls = 0;
+    const f = await fixture(undefined, 32, true, { preparationRetryMs: 20, acquireCapabilityView: async () => {
+      if (++calls === 1) { preparing(); await gate; }
+      return { satisfied: true, missing: [], optionalMissing: [], view: { id: "test", digest: "test", semanticDigest: "test", bindings: {} }, release: async () => {} };
+    } });
+    const actor = await create(f.actors, { batchWindowMs: window, batchMax: 2, requires: ["demo.echo"] });
+    fakeClock();
+    f.send({ ref: "older-1" });
+    f.send({ ref: "older-2" });
+    await entered;
+    f.send({ ref: "urgent" }, "steer");
+    fail(new Error("recorded preparation failure"));
+    for (let turn = 0; turn < 100 && f.actors.inFlightCount(); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(0);
+    expect(f.snapshot(actor.id).items.map(item => (item.payload.data as { ref: string }).ref)).toEqual(window > 0
+      ? ["older-1", "older-2", "urgent"] : ["older-2", "urgent", "older-1"]);
+    await vi.advanceTimersByTimeAsync(20);
+    await settled(f.actors, actor.id);
+    if (window > 0) {
+      expect(inputs(f.runs[0]!).map(input => input.payload.data)).toEqual([{ ref: "older-1" }, { ref: "older-2" }]);
+      expect(f.runs[1]!.task).toContain('"ref": "urgent"');
+    } else {
+      expect(f.runs.map(run => run.task.match(/"ref": "([^"]+)"/)?.[1])).toEqual(["older-2", "urgent", "older-1"]);
+    }
+  });
+
+  it("a failed durable manifest checkpoint launches nothing and retries the same originals", async () => {
+    const f = await fixture(undefined, 32, true, { preparationRetryMs: 20 });
+    const actor = await create(f.actors, { batchMax: 2 });
+    fakeClock();
+    const rename = fs.renameSync;
+    let refused = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (!refused && String(destination).includes("queue-") && fs.readFileSync(source, "utf8").includes('"activationId"')) {
+        refused = true;
+        throw Object.assign(new Error("recorded manifest write refusal"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    const events = [0, 1].map(n => ({ ...f.event({ ref: `checkpoint-${n}` }), to: actor.id }));
+    for (const event of events) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    for (let turn = 0; turn < 100 && (!refused || f.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(refused).toBe(true);
+    expect(f.runs).toHaveLength(0);
+    expect(f.snapshot(actor.id).items.map(item => item.payload.id)).toEqual(events.map(event => event.id));
+    const receiptDir = path.join(f.mesh.root, "delivery-outcomes");
+    expect(fs.existsSync(receiptDir)).toBe(false); // Retained preparation work is not terminal FAILED.
+    await vi.advanceTimersByTimeAsync(20);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!).map(input => input.payload.id)).toEqual(events.map(event => event.id));
+    const receipts = fs.readdirSync(receiptDir).flatMap(file => fs.readFileSync(path.join(receiptDir, file), "utf8").trim().split("\n").map(line => JSON.parse(line)));
+    expect(receipts.map(receipt => receipt.eventId)).toEqual(events.map(event => event.id));
+    expect(receipts.every(receipt => receipt.outcome === "delivered")).toBe(true);
+  });
+
+  it("pre-launch membership is durable even when transport never calls onSpawned", async () => {
+    const first = await fixture();
+    const actor = await create(first.actors, { batchMax: 2 });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    first.runStub.mockImplementationOnce(async request => { first.runs.push(request); await gate; throw new Error("recorded host crash before launch callback"); });
+    fakeClock();
+    first.send({ ref: "planned-1" });
+    first.send({ ref: "planned-2" });
+    for (let turn = 0; turn < 100 && !first.runs.length; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    const file = first.snapshotFile(actor.id);
+    const interrupted = fs.readFileSync(file, "utf8");
+    const active = first.snapshot(actor.id).items;
+    const ids = active.map(item => item.id);
+    expect(active.every(item => item.activationId === ids[0] && JSON.stringify(item.batchIds) === JSON.stringify(ids) && !item.executionStarted)).toBe(true);
+    expect(first.runs[0]!.task.startsWith(ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: ids[0], batchIds: ids }))).toBe(true);
+    release();
+    await settled(first.actors, actor.id);
+    await first.close();
+    fs.writeFileSync(file, interrupted); // Recorded pre-callback crash, no destructive execution.
+    const second = await fixture(first.root, 32, false);
+    second.send({ ref: "new-after-crash" });
+    second.actors.resumeAfterRelease();
+    for (let turn = 0; turn < 100 && (!second.runs.length || second.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(inputs(second.runs[0]!).map(input => input.id)).toEqual(ids);
+    expect(second.runs[0]!.activationId).toBe(ids[0]);
+    expect(second.actors.status(actor.id).queued).toBe(1);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(second.actors, actor.id);
+    expect(inputs(second.runs[1]!).map(input => input.payload.data)).toEqual([{ ref: "new-after-crash" }]);
+  });
+
+  it.each([1, 3])("ENODEV saved-answer recovery recognizes an explicit %s-event activation without inference", async count => {
+    const f = await fixture();
+    const actor = await create(f.actors, { batchMax: count });
+    fakeClock();
+    for (let n = 0; n < count; n++) f.send({ ref: `recover-${n}` });
+    await settled(f.actors, actor.id);
+    const request = f.runs[0]!;
+    const runRoot = path.join(f.root, "saved-runs");
+    const id = "a".repeat(32);
+    const directory = path.join(runRoot, id);
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "task.txt"), request.task);
+    fs.writeFileSync(path.join(directory, "status.json"), JSON.stringify({ id, actorId: actor.id, status: "running", transport: "process", sessionId: String(process.ppid), processStartTime: "0" }));
+    fs.writeFileSync(path.join(directory, "unresolved-worker.json"), JSON.stringify({ reason: ENODEV_UNRESOLVED_REASON }));
+    fs.writeFileSync(path.join(directory, "settlement.json"), JSON.stringify({ version: 1, runId: id, outcome: "completed", text: "saved batch answer" }));
+    expect(peekEnodevRun(directory, actor.id, request.activationId!)).toMatchObject({ status: "completed", text: "saved batch answer" });
+    expect(peekEnodevRun(directory, actor.id, "another-activation")).toBeUndefined();
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot });
+    closers.push(() => manager.close());
+    const spawn = vi.spyOn(manager, "spawn").mockRejectedValue(new Error("must not infer again"));
+    expect(await manager.run(request)).toMatchObject({ id, status: "completed", enodevRecovered: true, text: "saved batch answer" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(directory, "unresolved-worker.json"))).toBe(true); // No local real-delete commit.
+    fs.writeFileSync(path.join(directory, "task.txt"), ACTOR_ACTIVATION_HEADER + JSON.stringify({ activationId: "bad", batchIds: [] }) + "\n" + request.task);
+    expect(peekEnodevRun(directory, actor.id, request.activationId!)).toBeUndefined();
+    // W=0 legacy object tasks still match their own top-level id, not nested payload data.
+    fs.writeFileSync(path.join(directory, "task.txt"), "Fabric actor message:\n" + JSON.stringify({ payload: { id: "nested" }, id: "legacy" }, null, 2));
+    expect(peekEnodevRun(directory, actor.id, "legacy")).toMatchObject({ text: "saved batch answer" });
+    expect(peekEnodevRun(directory, actor.id, "nested")).toBeUndefined();
+  });
+});
+
 describe("batching configuration surface", () => {
   it("validates create/set inputs and persists live/global export and import fields", async () => {
     const f = await fixture();
-    const actor = await create(f.actors, { batchMax: 12 });
-    expect(f.actors.definition(actor.id)).toMatchObject({ batchWindowMs: W, batchMax: 12 });
+    const actor = await create(f.actors, { batchMax: 12, batchMaxBytes: 4096 });
+    expect(f.actors.definition(actor.id)).toMatchObject({ batchWindowMs: W, batchMax: 12, batchMaxBytes: 4096 });
     expect(await f.actors.setBatching(actor.id, { batchMax: 7 })).toMatchObject({ batchWindowMs: W, batchMax: 7 });
     const global = new GlobalActorRegistry(path.join(f.root, "global.json"), 256 * 1024);
     const template = global.create(f.actors.definition(actor.id));
-    expect(global.toRequest(template)).toMatchObject({ batchWindowMs: W, batchMax: 7 });
+    expect(global.toRequest(template)).toMatchObject({ batchWindowMs: W, batchMax: 7, batchMaxBytes: 4096 });
     expect(global.update(template.id, { batchWindowMs: 0 })).toMatchObject({ batchWindowMs: 0, batchMax: 7 });
     const loaded = new GlobalActorRegistry(path.join(f.root, "global.json"), 256 * 1024);
-    expect(loaded.toRequest(loaded.resolve(template.id)!)).toMatchObject({ batchWindowMs: 0, batchMax: 7 });
+    expect(loaded.toRequest(loaded.resolve(template.id)!)).toMatchObject({ batchWindowMs: 0, batchMax: 7, batchMaxBytes: 4096 });
     for (const batchWindowMs of [-1, 1.5, NaN, Infinity, "300000"]) expect(() => normalizeActorBatching({ batchWindowMs })).toThrow("batchWindowMs");
-    for (const batchMax of [0, -1, 1.5, NaN, "50"]) expect(() => normalizeActorBatching({ batchMax })).toThrow("batchMax");
-    await expect(f.actors.setBatching(actor.id, {})).rejects.toThrow("required");
-    await expect(f.actors.create({ name: "bad", instructions: "x", batchMax: 0 })).rejects.toThrow("batchMax");
+    for (const batchMax of [0, -1, 1.5, NaN, "50", 1001]) expect(() => normalizeActorBatching({ batchMax })).toThrow("batchMax");
+    for (const batchMaxBytes of [0, -1, 1.5, NaN, Infinity, "4096"]) expect(() => normalizeActorBatching({ batchMaxBytes })).toThrow(FabricActorBatchPolicyError);
+    await expect(f.actors.setBatching(actor.id, {})).rejects.toMatchObject({ code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
+    await expect(f.actors.create({ name: "bad", instructions: "x", batchMax: 0 })).rejects.toMatchObject({ code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
+    expect(() => normalizeActorBatching(null)).toThrow(FabricActorBatchPolicyError);
+    await expect(f.actors.setBatching(actor.id, { batchMax: 0 })).rejects.toMatchObject({ name: "FabricActorBatchPolicyError", code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
+    expect(() => global.update(template.id, { batchMax: 0 })).toThrow(FabricActorBatchPolicyError);
     const createDescriptor = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "create")!;
     expect(createDescriptor.inputSchema.properties).toHaveProperty("batchWindowMs");
     expect(createDescriptor.inputSchema.properties).toHaveProperty("batchMax");
+    expect(createDescriptor.inputSchema.properties).toHaveProperty("batchMaxBytes");
     expect(AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "setBatching")).toMatchObject({ risk: "agent" });
   });
 
@@ -433,11 +708,13 @@ describe("batching configuration surface", () => {
     const provider = new AgentsProvider(f.agents, f.actors, global, main, participants, undefined, lifecycle, undefined, client);
     vi.spyOn(f.actors, "owns").mockReturnValue(false); // Passive definition; the existing native owner route handles it.
     const context = { cwd: process.cwd(), signal: undefined, parentToolCallId: "test", nestedToolCallId: "test", extensionContext: {}, update: () => {} } as unknown as FabricInvocationContext;
-    await provider.invoke("setBatching", { id: actor.id, batchWindowMs: W, batchMax: 50 }, context);
-    expect(setActor).toHaveBeenCalledWith({ operation: "setBatching", id: actor.id, batchWindowMs: W, batchMax: 50 }, undefined,
+    await provider.invoke("setBatching", { id: actor.id, batchWindowMs: W, batchMax: 50, batchMaxBytes: 4096 }, context);
+    expect(setActor).toHaveBeenCalledWith({ operation: "setBatching", id: actor.id, batchWindowMs: W, batchMax: 50, batchMaxBytes: 4096 }, undefined,
       expect.objectContaining({ identity, hostId: root.ownerHostId }));
     expect(RESIDENT_COMMANDS).toContain("setBatching");
     setActor.mockClear();
+    await expect(provider.invoke("setBatching", { id: actor.id, batchMaxBytes: 0 }, context)).rejects.toMatchObject({ code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
+    expect(setActor).not.toHaveBeenCalled();
     const child = new AgentsProvider(f.agents, f.actors, global, { ...main, local: false }, participants, undefined, lifecycle, undefined, client);
     await expect(child.invoke("setBatching", { id: actor.id, batchWindowMs: 0 }, context)).rejects.toMatchObject({ code: "RESIDENT_ACTOR_FORBIDDEN" });
     expect(setActor).not.toHaveBeenCalled();
@@ -456,6 +733,7 @@ describe("batching configuration surface", () => {
     expect(await provider.invoke("setBatching", { id: actor.id, batchWindowMs: 0 }, context)).toMatchObject({ batchWindowMs: 0, batchMax: 10 });
     const template = global.create({ name: "global-batch", instructions: "Observe." });
     expect(await provider.invoke("setBatching", { id: template.id, batchWindowMs: W, scope: "global" }, context)).toMatchObject({ batchWindowMs: W });
-    await expect(provider.invoke("setBatching", { id: actor.id, batchMax: 0 }, context)).rejects.toThrow("batchMax");
+    await expect(provider.invoke("setBatching", { id: actor.id, batchMax: 0 }, context)).rejects.toMatchObject({ code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
+    await expect(provider.invoke("setBatching", { id: template.id, batchMax: 0, scope: "global" }, context)).rejects.toMatchObject({ code: "FABRIC_ACTOR_BATCH_POLICY_INVALID" });
   });
 });

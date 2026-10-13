@@ -8,7 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { normalizeActorRecords } from "./records.js";
 import type {
@@ -226,6 +226,7 @@ export class GlobalActorRegistry {
       ...normalizeActorBatching({
         ...(existing.batchWindowMs !== undefined ? { batchWindowMs: existing.batchWindowMs } : {}),
         ...(existing.batchMax !== undefined ? { batchMax: existing.batchMax } : {}),
+        ...(existing.batchMaxBytes !== undefined ? { batchMaxBytes: existing.batchMaxBytes } : {}),
         ...normalizeActorBatching(patch),
       }),
       ...(patch.activation !== undefined
@@ -610,7 +611,8 @@ export class GlobalActorRegistry {
         ...(record.dedupeKey !== undefined ? { dedupeKey: record.dedupeKey } : {}),
         ...(activation ? { activation } : {}),
         ...(Number.isSafeInteger(record.batchWindowMs) && (record.batchWindowMs as number) >= 0 ? { batchWindowMs: record.batchWindowMs as number } : {}),
-        ...(Number.isSafeInteger(record.batchMax) && (record.batchMax as number) > 0 ? { batchMax: record.batchMax as number } : {}),
+        ...(Number.isSafeInteger(record.batchMax) && (record.batchMax as number) > 0 && (record.batchMax as number) <= MAX_ACTOR_BATCH_EVENTS ? { batchMax: record.batchMax as number } : {}),
+        ...(Number.isSafeInteger(record.batchMaxBytes) && (record.batchMaxBytes as number) > 0 ? { batchMaxBytes: record.batchMaxBytes as number } : {}),
         // Kept as stored, even when unreadable: #noteFilter disables it instead (smarty-dev#1579).
         ...(record.activationFilter !== undefined ? { activationFilter: record.activationFilter } : {}),
         ...(validWhile ? { validWhile } : {}),

@@ -1254,14 +1254,16 @@ Stop, removal, redefinition and a user halt cancel pending trailing work so it c
 #### Batch matched observations
 
 Set `batchWindowMs` on `agents.create`, or update a live actor with
-`agents.setBatching({ id, batchWindowMs: 300_000, batchMax: 50 })`. Both options
-also survive global template export/import. `batchWindowMs` defaults to `0`,
-which keeps single-event behavior; `batchMax` defaults to `50`. Values are safe
-integers: the window is non-negative and the maximum is positive.
+`agents.setBatching({ id, batchWindowMs: 300_000, batchMax: 50, batchMaxBytes: 262_144 })`.
+All three options survive global template export/import. `batchWindowMs` defaults
+to `0`, which keeps single-event behavior; `batchMax` defaults to `50` (maximum
+`1000`), and `batchMaxBytes` defaults to `256 KiB`. Values are safe integers: the
+window is non-negative and both limits are positive. Invalid settings throw
+`FabricActorBatchPolicyError` with code `FABRIC_ACTOR_BATCH_POLICY_INVALID`.
 
 With a positive window, the first queued matched observation anchors its
-expiry. Later arrivals do not extend it. At expiry or `batchMax` events, one
-activation receives an array of the existing `{ source, payload, id }` input
+expiry. Later arrivals do not extend it. At expiry, `batchMax` events or the
+aggregate byte boundary, one activation receives an array of the existing `{ source, payload, id }` input
 envelopes in FIFO order. Each payload retains its original ref, kind and data.
 Filtering still runs per event before admission and before execution. Positive
 batching suspends replacement-style `coalesce` and `coalesceKey`, so all matched
@@ -1270,16 +1272,27 @@ still performs its separate settlement admission before the queue.
 
 Direct asks/messages, mesh `steer` or `ask` kinds, Main-origin mesh messages,
 and host `input`/`user_bash` bypass the window. Pending observations run first
-(in groups bounded by `batchMax`); the urgent item then runs separately without
-a window. This keeps FIFO order and the caller's binding and attribution. Main
+(in groups bounded by `batchMax` and `batchMaxBytes`); the urgent item then runs
+separately without a window. An unlaunched preparation retry keeps its older
+batch ahead of an already pending bypass; ordinary retries retain queue rotation. This keeps FIFO order and the caller's binding and attribution. Main
 is the existing lead/person message identity; Fabric does not infer roles from
 message text or data. Normal actor serialization and admission still apply.
 
 The existing queue checkpoints every original event before any window opens.
 Queue limits, overflow, dead letters, completed-key history and delivery
 receipts count individual events, never batches. Restart restores the original
-IDs and deadline; overdue work runs immediately. A crash during a launched run
-retains the existing per-event, at-least-once recovery policy. A single unref'd
+IDs and deadline; overdue work runs immediately. Before transport launch, a
+durable manifest binds `activationId` to every original `batchIds` member,
+including one-event batches. The same manifest leads the run's task file, so
+ENODEV saved-answer recovery matches its explicit activation ID, not array
+indentation. Restart cannot append new events to that activation. Other
+interrupted runs retain the existing per-event, at-least-once recovery policy.
+
+The byte budget counts serialized envelopes, images, hydrated wake text and
+member IDs. Collection stops before adding an event that would cross it. A
+single oversized event runs alone, never with its neighbors. A completed-key
+repeat stays pending until its earlier occurrence completes successfully; a
+failed earlier batch cannot discard that repeat. A single unref'd
 timer per actor wakes the queue while a window is open; there is no timer per
 event. Setting the window to `0` releases pending work without replacing an
 active activation. Mixed-trust batches keep each input's trust marking and

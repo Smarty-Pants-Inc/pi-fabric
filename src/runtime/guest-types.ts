@@ -768,7 +768,10 @@ interface FabricActorActivationPolicy {
 /** Leading-edge batching of original event envelopes; 0 is the single-event default. */
 interface FabricActorBatching {
   batchWindowMs?: number;
+  /** Maximum 1000; default 50. */
   batchMax?: number;
+  /** Aggregate serialized event/image bytes; default 256 KiB. Single oversized events run alone. */
+  batchMaxBytes?: number;
 }
 /** Exactly one instruction source; file bytes are verified on the owning host. */
 type FabricActorInstructionsSource =

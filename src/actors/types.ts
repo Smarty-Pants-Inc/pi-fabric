@@ -245,17 +245,30 @@ export function normalizeActorActivation(value: unknown): FabricActorActivationP
 export interface FabricActorBatching {
   batchWindowMs?: number;
   batchMax?: number;
+  /** Aggregate serialized event/image budget; default 256 KiB. One oversized event runs alone. */
+  batchMaxBytes?: number;
+}
+
+export const MAX_ACTOR_BATCH_EVENTS = 1_000;
+
+export class FabricActorBatchPolicyError extends Error {
+  readonly code = "FABRIC_ACTOR_BATCH_POLICY_INVALID";
+  constructor(message: string) {
+    super(message);
+    this.name = "FabricActorBatchPolicyError";
+  }
 }
 
 export function normalizeActorBatching(value: unknown): FabricActorBatching {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid actor batching policy");
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new FabricActorBatchPolicyError("Invalid actor batching policy");
   const input = value as Record<string, unknown>;
   const result: FabricActorBatching = {};
-  for (const key of ["batchWindowMs", "batchMax"] as const) {
+  for (const key of ["batchWindowMs", "batchMax", "batchMaxBytes"] as const) {
     const number = input[key];
     if (number === undefined) continue;
-    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < (key === "batchMax" ? 1 : 0)) {
-      throw new Error(`${key} must be a ${key === "batchMax" ? "positive" : "non-negative"} safe integer`);
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < (key === "batchWindowMs" ? 0 : 1) ||
+        (key === "batchMax" && number > MAX_ACTOR_BATCH_EVENTS)) {
+      throw new FabricActorBatchPolicyError(`${key} must be a ${key === "batchWindowMs" ? "non-negative" : "positive"} safe integer${key === "batchMax" ? ` <= ${MAX_ACTOR_BATCH_EVENTS}` : ""}`);
     }
     result[key] = number;
   }

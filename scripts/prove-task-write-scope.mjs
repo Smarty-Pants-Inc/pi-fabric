@@ -15,13 +15,23 @@ const option = name => {
 };
 const fabricRoot = fs.realpathSync(option("--fabric-root"));
 const workspace = fs.realpathSync(option("--workspace"));
-const evidence = option("--evidence-dir");
+const requestedEvidence = option("--evidence-dir");
+const evidenceParent = path.dirname(requestedEvidence);
+for (let component = evidenceParent; ; component = path.dirname(component)) {
+  assert(!fs.lstatSync(component).isSymbolicLink(), "Evidence path must not contain symlinked components");
+  if (path.dirname(component) === component) break;
+}
+const evidence = path.join(fs.realpathSync(evidenceParent), path.basename(requestedEvidence));
+const evidenceRelative = path.relative(workspace, evidence);
+assert(evidenceRelative && evidenceRelative !== ".." && !evidenceRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(evidenceRelative),
+  "Evidence writes must be inside the assigned worktree");
 const nativePi = option("--pi-binary");
 const extension = path.join(fabricRoot, "dist/index.js");
 for (const file of [nativePi, extension, path.join(fabricRoot, "dist/worker.js")]) assert(fs.statSync(file).isFile(), `Missing ${file}`);
 assert(process.env.TMPDIR, "Private TMPDIR required");
 assert(!fs.existsSync(evidence), "Use a fresh evidence directory");
-fs.mkdirSync(evidence, { recursive: true });
+fs.mkdirSync(evidence);
+assert.equal(fs.realpathSync(evidence), evidence, "Evidence directory must remain canonical");
 const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR, "task-write-native-"));
 const agent = path.join(scratch, "agent"), rootCwd = path.join(scratch, "root"), runs = path.join(scratch, "runs");
 for (const dir of [agent, rootCwd, runs, path.join(scratch, "home"), path.join(scratch, "tmp")]) fs.mkdirSync(dir);
@@ -31,7 +41,7 @@ assert(!fs.existsSync(forbidden), "Refused target already exists; do not touch a
 const outside = path.join(scratch, "outside-task.txt");
 const shellOutside = path.join(scratch, "native-shell-outside-task.txt");
 const cwdFile = path.join(evidence, "worktree-write.txt");
-assert(cwdFile.startsWith(workspace + path.sep), "Evidence writes must be inside the assigned worktree");
+
 const toolResults = [], childRequests = [], parentEvents = [];
 let child, server, parentExit, failure;
 let tail = "", parentCalls = 0;
@@ -89,7 +99,7 @@ try {
             ["write", { path: cwdFile, content: "WORKTREE_ALLOWED" }],
             ["edit", { path: cwdFile, edits: [{ oldText: "WORKTREE_ALLOWED", newText: "WORKTREE_EDIT_ALLOWED" }] }],
             ["write", { path: path.join(tmp, "scratch-write.txt"), content: "SCRATCH_ALLOWED" }],
-            ["bash", { command: `printf 'CHILD_TMPDIR=%s\\n' "$TMPDIR"; printf 'SHELL_GAP_ALLOWED' > ${JSON.stringify(shellOutside)}`, timeout: 10 }],
+            ["bash", { command: `printf 'CHILD_TMPDIR=%s\\n' "$TMPDIR"; printf 'SHELL_GAP_ALLOWED' > "$TASK_WRITE_SCOPE_SHELL_OUTSIDE"`, timeout: 10 }],
           ]);
         } else if (scenario === "readonly") stream.tools([["write", { path: path.join(evidence, "readonly-refused.txt"), content: "MUST_BE_REFUSED" }]]);
         else stream.tools([["write", { path: outside, content: "UNRESTRICTED_ALLOWED" }]]);
@@ -102,7 +112,7 @@ try {
   json(path.join(agent, "settings.json"), { enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false }, extensions: [], packages: [] });
   json(path.join(agent, "fabric.json"), { configVersion: 4, fullCodeMode: false, autoReload: false, executor: { kernel: "typescript", timeoutMs: guard, maxTimeoutMs: guard, resultFormat: "json", landlock: { mode: "off" } }, agents: { enabled: true, runner: "pi", transport: "process", timeoutMs: guard, maxDepth: 2, maxConcurrent: 2, extensions: false, retainRuns: true, sessionExport: false, notifyOnComplete: false, deniedModels: [], modelPolicy: { requireReason: [] } }, mesh: { enabled: true, root: path.join(scratch, "mesh"), announce: true, actorScope: "session" }, capture: { enabled: false }, mcp: { enabled: false }, jev: { enabled: false }, prewalk: { enabled: false }, ui: { enabled: false }, compaction: { engine: "pi" }, approvals: { read: "allow", write: "allow", execute: "allow", network: "allow", agent: "allow" } });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|SMARTY_|HERDR_|ORG_|OPENAI_|ANTHROPIC_|GOOGLE_|GEMINI_|OPENROUTER_|TYPESAFE_|AWS_|AZURE_|AI_GATEWAY_|OTEL_|SENTRY_)/.test(key)));
-  Object.assign(env, { HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
+  Object.assign(env, { HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
   child = spawn(process.execPath, [nativePi, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, stdio: ["pipe", "pipe", "pipe"] });
   parentExit = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));
   const settled = new Promise((resolve, reject) => {

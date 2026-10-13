@@ -46,7 +46,7 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolati
     for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction", "--system-prompt"]) expect(launch.argv).toContain(flag);
     expect(launch.argv[launch.argv.indexOf("--tools") + 1]).toBe("fabric_reply");
     // Delivery is a host command consuming private worker metadata, not a model tool.
-    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["principal-delivery.js", "session-id.js", "reply-tool.js", "model-route-hook.js", "sender-headers.js"]);
+    expect(launch.argv.filter((_: string, i: number) => launch.argv[i - 1] === "-e").map((p: string) => path.basename(p))).toEqual(["principal-delivery.js", "session-id.js", "reply-tool.js", "model-route-hook.js", "sender-headers.js", "write-guard.js"]);
     expect(launch.header).toContain(`judgment-agent:${result.decisionId}`);
   });
   it("refuses an effort downgrade before sending any task prompt", async () => {

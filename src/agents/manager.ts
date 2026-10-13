@@ -1570,7 +1570,7 @@ export class AgentManager {
         if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(applyTaskWriteDefault
-              ? { writableRoots: [agentCwd, tmpdir!], shell: "unconfined" }
+              ? { writableRoots: [agentCwd, runDirectory], shell: "unconfined" }
               : request, this.#parentWritePolicy, agentCwd)
           : undefined;
         const auditWritePolicy = (type: string, warning?: string, policy?: FabricWritePolicy): void => {

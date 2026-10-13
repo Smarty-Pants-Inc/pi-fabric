@@ -337,7 +337,7 @@ describe("agent manager spawning primitives", () => {
     });
     const secondArgs = launchArgs(runRoot, second.id);
     expect(JSON.parse(secondArgs["write-policy"]!)).toEqual({
-      readOnly: false, writableRoots: [cwd, secondArgs.tmpdir!].sort(), shell: "unconfined",
+      readOnly: false, writableRoots: [cwd, path.join(runRoot, second.id)].sort(), shell: "unconfined",
     });
     expect(secondArgs.tmpdir).toBe(path.join(runRoot, second.id, "tmp"));
     expect(readAgentLineage(secondArgs.lineage)).toMatchObject({ runId: second.id, childIndex: 1 });

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
+import { MESH_RETENTION_APPLY_DISABLED_CODE, MeshRetentionApplyDisabledError, summaryLines, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { claimMeshRetentionSweep, MESH_RETENTION_SWEEP_PREFIX, recordMeshRetentionSweeper, removeUnreferencedRun, startLockedMeshRetentionSweep } from "../src/storage/retention.js";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -51,7 +51,8 @@ const deadRootMesh = (actorStatus = "idle") => {
   return { root, registry, actor, runs, old, latest, young, inflight, orphan };
 };
 
-// Every sweep here is a dry run: apply is disabled until smarty-dev#7916 (sweepMeshRetention throws on dryRun:false).
+// Every sweep here is a dry run: apply is disabled until smarty-dev#10678 (sweepMeshRetention rejects dryRun:false with
+// MeshRetentionApplyDisabledError before it reads the mesh; pi-fabric#1014 SEC P2-1).
 // Each fence still decides what the plan lists; `applied` names the plan.
 describe("mesh-wide age-based run retention", () => {
   // Dry run (smarty-dev#7916): the plan lists what an apply would remove; the disk is unchanged.
@@ -388,7 +389,10 @@ describe("final pre-delete check fences", () => {
   // Race shape of round 3 (CODE c6106235901, SEC c6106236419): a session directory vanishes during a re-walk, then
   // reappears under the same name with an actors.json that references the run. Strict: the vanished entry makes the
   // walk uncertain, so every later delete stops before the reappearance can matter.
-  it.skipIf(process.platform !== "linux")("--apply keeps a run a session directory references after it vanished during a re-walk and reappeared", async () => {
+  // smarty-dev#10678: the after-move race below cannot be reached through the public sweep any more. Apply rejects at the
+  // boundary, so every seam stays unarmed; the dry-run re-walk coverage stays in the tests around it. The race returns
+  // with the #10678 protocol.
+  it.skipIf(process.platform !== "linux")("--apply rejects before the vanish-and-reappear re-walk seam is armed (smarty-dev#10678)", async () => {
     const mesh = deadRootMesh();
     write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
     const flicker = path.join(mesh.root, "actors", "01a118ab-flicker-session");
@@ -412,11 +416,10 @@ describe("final pre-delete check fences", () => {
       write(path.join(flicker, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
     };
     try {
-      const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-      expect([injected(), moved]).toEqual([true, true]);
-      expect(applied.removedRuns).not.toContain(mesh.old);
+      await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
+        .rejects.toMatchObject({ name: "MeshRetentionApplyDisabledError", code: MESH_RETENTION_APPLY_DISABLED_CODE });
+      expect([injected(), armed, moved, restored]).toEqual([false, false, false, false]);
       expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
-      expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/(?:uncertain|registry roots changed during the sweep)/) });
     } finally { delete verifiedRemoveTestHooks.beforeOpen; }
   });
 
@@ -436,7 +439,8 @@ describe("final pre-delete check fences", () => {
   // the race shape of round 4 (CODE c6106402825): a listed non-registry directory gains actors.json after the check's
   // probe; the helper's second check (proceed) probes again, stops the sweep and moves the run back.
   for (const when of ["new session directory", "existing session directory", "after the graveyard move", "existing session directory, after the graveyard move"] as const) {
-    it.skipIf(process.platform !== "linux")(`--apply keeps a run a new actors/<session>/actors.json references (${when})`, async () => {
+    // smarty-dev#10678: apply rejects at the boundary; the seam is never armed (the race returns with the protocol).
+    it.skipIf(process.platform !== "linux")(`--apply rejects before the new actors/<session>/actors.json seam is armed (${when}; smarty-dev#10678)`, async () => {
       const mesh = deadRootMesh();
       write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
       const session = path.join(mesh.root, "actors", "01a118ab-new-session");
@@ -451,11 +455,11 @@ describe("final pre-delete check fences", () => {
         injected = () => done;
       } else injected = onStatusRead(mesh.old, create);
       try {
-        const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-        expect(injected()).toBe(true);
-        expect(applied.removedRuns).not.toContain(mesh.old);
+        await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
+          .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+        expect(injected()).toBe(false);
+        expect(fs.existsSync(path.join(session, "actors.json"))).toBe(false);
         expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
-        expect(applied.skipped).toContainEqual(stopped(mesh.root));
       } finally {
         const { verifiedRemoveTestHooks } = await import("../src/storage/verified-remove.js");
         delete verifiedRemoveTestHooks.beforeOpen;
@@ -665,9 +669,10 @@ describe("resident launcher log cap", () => {
   });
 });
 
-// smarty-dev#7916: --apply is back. It deletes exactly the dry run's plan (only expired, unreferenced data, through the
-// same judgment and verification), and refuses on any doubt about state.json.
-describe.skipIf(process.platform !== "linux")("apply through verified removal (smarty-dev#7916)", () => {
+// smarty-dev#7916 built --apply through verified removal; smarty-dev#10678 (pi-fabric#1014 SEC P2-1) disables it at the
+// public boundary until owner-attributed callback fencing lands. The dry run still plans what it would delete and its
+// summary still names any state.json doubt; the public apply rejects, typed, and changes nothing.
+describe.skipIf(process.platform !== "linux")("apply disabled at the public boundary (smarty-dev#10678)", () => {
   const tree = (root: string): unknown[] => fs.readdirSync(root).sort().map(name => {
     const file = path.join(root, name); const stat = fs.lstatSync(file);
     return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.isDirectory() ? tree(file) : fs.readFileSync(file, "utf8")];
@@ -685,23 +690,21 @@ describe.skipIf(process.platform !== "linux")("apply through verified removal (s
     return { mesh, resident };
   };
 
-  it("deletes exactly the dry run's plan: expired, unreferenced runs and old backups; keeps latest, in-flight and young", async () => {
+  it("plans expired, unreferenced runs and old backups, keeps latest, in-flight and young; apply rejects and changes nothing", async () => {
     const { mesh, resident } = await withState();
     const before = tree(mesh.root);
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(tree(mesh.root)).toEqual(before);
     expect(plan.summary.applyRefusal).toBeUndefined();
     expect(plan.removedRuns.sort()).toEqual([mesh.old, mesh.orphan, resident].sort());
-    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-    expect(applied.skipped).toEqual([]);
-    expect(applied.removedRuns.sort()).toEqual(plan.removedRuns.sort());
-    expect(applied.changes.map(change => change.path).sort()).toEqual(plan.changes.map(change => change.path).sort());
-    for (const gone of plan.removedRuns) expect(fs.existsSync(gone)).toBe(false);
-    for (const kept of [mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
-    expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak"))).toEqual(["session.jsonl.20260922T150000000Z.bak"]);
-    // The summary's bytes are the same in both modes; no graveyard is left behind.
+    expect(plan.changes.map(change => change.path)).toEqual(expect.arrayContaining([
+      path.join(mesh.actor, "session.jsonl.20260920T150000000Z.bak"), path.join(mesh.actor, "session.jsonl.20260921T150000000Z.bak")]));
+    await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
+      .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+    expect(tree(mesh.root)).toEqual(before);
+    for (const kept of [...plan.removedRuns, mesh.latest, mesh.young, mesh.inflight]) expect(fs.existsSync(path.join(kept, "reply.json"))).toBe(true);
+    expect(fs.readdirSync(mesh.actor).filter(name => name.endsWith(".bak")).sort()).toHaveLength(3);
     const total = (result: typeof plan) => Object.values(result.summary.deleters).reduce((sum, item) => sum + item.bytes, 0);
-    expect(total(applied)).toBe(total(plan));
     expect(total(plan)).toBeGreaterThan(0);
     expect(summaryLines(true, plan.summary).at(-1)).toMatch(/^WOULD_FREE_GIB=\d+\.\d{3}$/);
     const leftovers = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
@@ -715,15 +718,16 @@ describe.skipIf(process.platform !== "linux")("apply through verified removal (s
     ["an entry under another key", '{"format":1,"entries":{"k":{"key":"x","version":1,"updatedAt":1,"updatedBy":{"id":"a","name":"a","kind":"main"}}}}'],
     ["an unknown envelope field", '{"format":1,"entries":{},"surprise":1}'],
     ["not JSON", "{"],
-  ])("refuses --apply when state.json is %s, and changes nothing", async (_name, text) => {
+  ])("names state.json %s in the dry run's summary; apply rejects and changes nothing", async (_name, text) => {
     const { mesh } = await withState();
     if (text === undefined) fs.unlinkSync(path.join(mesh.root, "state.json"));
     else fs.writeFileSync(path.join(mesh.root, "state.json"), text, { mode: 0o600 });
     const before = tree(mesh.root);
-    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY });
-    expect(applied.removedRuns).toEqual([]);
-    expect(applied.changes).toEqual([]);
-    expect(applied.skipped).toEqual([{ path: mesh.root, reason: expect.stringMatching(/mesh state is unknown/) }]);
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(plan.summary.applyRefusal).toMatch(/mesh state is unknown/);
+    expect(tree(mesh.root)).toEqual(before);
+    await expect(sweepMeshRetention(mesh.root, { now: NOW, dryRun: false, runRetentionMs: 7 * DAY }))
+      .rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
     expect(tree(mesh.root)).toEqual(before);
   });
 });

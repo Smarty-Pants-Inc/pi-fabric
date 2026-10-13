@@ -101,6 +101,8 @@ export interface FabricParticipantRecord {
 export interface FabricParticipantInfo extends FabricParticipantRecord {
   local: boolean;
   stale: boolean;
+  /** Retained remote routing attribution; transport freshness is unknown, not owner death. */
+  bridgeStale?: true;
 }
 
 export interface FabricHostRecord {
@@ -116,6 +118,8 @@ export interface FabricHostRecord {
   expiresAt: number;
   /** Set on a host lease that the mesh bridge mirrors from another host's mesh (smarty-dev#2004). */
   remoteHost?: string;
+  /** This projection requires a matching source-clock mirror lease; no legacy expiry fallback. */
+  mirrorLease?: 1;
 }
 
 export interface FabricParticipantListOptions {

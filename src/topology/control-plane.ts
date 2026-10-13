@@ -1,6 +1,6 @@
 import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outcomes.js";
 import type { MeshControlIncarnationFence } from "../config.js";
-import { FabricParticipantStaleError, participantLeaseGraceMs } from "./host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredLeaseStatus, participantLeaseGraceMs, type FabricMirrorLease } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
 import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
@@ -312,6 +312,19 @@ const controlSeenRecord = (value: unknown): FabricControlSeenRecord | undefined 
   return value as unknown as FabricControlSeenRecord;
 };
 
+export interface MirroredControlOwner {
+  remoteHost: string;
+  expiresAt: number;
+  mirror?: FabricMirrorLease;
+  /** Observation exists but does not belong to this owner/link. Never fall back to legacy expiry. */
+  bridgeStale?: true;
+}
+
+const mirrorStatus = (owner: MirroredControlOwner, now: number) => owner.bridgeStale ? "bridge-stale" : owner.mirror
+  ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now)
+  // An older bridge can prove only its unexpired projection, never an origin's death.
+  : owner.expiresAt > now ? "live" : "bridge-stale";
+
 export interface FabricControlPlaneOptions {
   /** Missing epochs are admitted with sender warnings by default during mixed-release rollout. */
   controlIncarnationFence?: MeshControlIncarnationFence;
@@ -337,7 +350,7 @@ export interface FabricControlPlaneOptions {
     ownerHostId: string,
     ownerIdentityId: string | undefined,
     targetId: string,
-  ) => { remoteHost: string; expiresAt: number } | undefined;
+  ) => MirroredControlOwner | undefined;
 }
 
 export interface FabricControlInput {
@@ -408,7 +421,7 @@ interface PendingControlRequest {
   readonly destinationRemoteHost?: string | null;
   cancellationRequested?: boolean;
   cancellationPublished?: boolean;
-  mirroredOwner?: { remoteHost: string; expiresAt: number };
+  mirroredOwner?: MirroredControlOwner;
   signal?: AbortSignal;
   onAbort?: () => void;
 }
@@ -666,6 +679,12 @@ export class FabricControlPlane {
       destination.remoteHost = mirroredOwner?.remoteHost ?? (this.options.readMirroredOwner ? null : undefined);
     }
     const destinationRemoteHost = destination.remoteHost;
+    if (mirroredOwner) {
+      const status = mirrorStatus(mirroredOwner, (this.options.now ?? Date.now)());
+      if (status === "bridge-stale") throw new FabricBridgeStaleError(mirroredOwner.remoteHost, targetId, false);
+      if (status === "lease-stale") throw new Error(
+        `Fabric lease observed on remote host ${mirroredOwner.remoteHost} lapsed for ${targetId}; this attempt was not published.`);
+    }
     if (ownerIncarnation === undefined && notRunAttempt === 0) {
       // Once per logical legacy delivery, not once per proven-notRun resend.
       warnUnfencedControlDelivery(operation, targetId, ++this.#legacyDeliveryCount);
@@ -950,14 +969,15 @@ export class FabricControlPlane {
           continue;
         }
         // Never adopt a different link's label. Missing ownership cannot renew this lease.
-        if (current?.remoteHost === captured.remoteHost) captured.expiresAt = current.expiresAt;
-        if (captured.expiresAt > Date.now()) continue;
+        if (current?.remoteHost === captured.remoteHost) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
+        const status = mirrorStatus(captured, (this.options.now ?? Date.now)());
+        if (status === "live") continue;
         const lapsed = this.#clearPending(commandId);
         if (!lapsed) continue;
         void this.#publishCancellation(commandId, lapsed);
-        lapsed.reject(new Error(
-          `Fabric lease mirrored from remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
-            "the mesh bridge is down or the owner is unavailable; " +
+        lapsed.reject(status === "bridge-stale" ? new FabricBridgeStaleError(captured.remoteHost, pending.targetId) : new Error(
+          `Fabric lease observed on remote host ${captured.remoteHost} lapsed for ${pending.targetId}; ` +
+            "the bridge observation is fresh and the remote owner's lease is old; " +
             "the outcome is unknown and it may still be delivered, so a retry can deliver it twice.",
         ));
       }

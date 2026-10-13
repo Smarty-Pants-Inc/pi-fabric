@@ -376,14 +376,15 @@ describe("FabricControlPlane", () => {
     );
     const unknown = "the outcome is unknown and it may still be delivered, so a retry can deliver it twice";
 
-    it("observes a dynamic lapse after a live send, publishes once and cancels once", async () => {
+    it("reports an expired legacy projection as bridge-stale, publishes once and cancels once", async () => {
       const f = await setup();
       const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
       const { commandId } = await f.command();
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       const { error } = await outcome;
-      expect(error?.message).toContain("remote host forge lapsed for agent:target");
-      expect(error?.message).toContain("mesh bridge is down or the owner is unavailable");
+      expect(error?.message).toContain("bridge-stale for remote host forge, target agent:target");
+      expect(error?.message).not.toContain("lapsed");
+      expect(error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
       expect(error?.message).toContain(unknown);
       expect(error).not.toHaveProperty("notRun");
       expect(f.readMirroredOwner).toHaveBeenCalledWith("host:owner", "identity:owner", "agent:target");
@@ -459,7 +460,7 @@ describe("FabricControlPlane", () => {
       try {
         // This must settle before the original publish gate opens.
         const { error } = await outcome;
-        expect(error?.message).toContain(winner === "lapse" ? "lapsed" : winner === "abort" ? "cancelled" : "closed");
+        expect(error?.message).toContain(winner === "lapse" ? "bridge-stale" : winner === "abort" ? "cancelled" : "closed");
         controller.abort();
         await f.sender.close();
       } finally {
@@ -507,7 +508,8 @@ describe("FabricControlPlane", () => {
       f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
       try {
         const { error } = await outcome;
-        expect(error?.message).toContain("lapsed");
+        expect(error?.message).toContain("bridge-stale");
+        expect(error?.message).not.toContain("lapsed");
         await f.ack(commandId);
         await f.sender.close();
         expect(spy.mock.calls.filter(([input]) => input.kind === "cancel")).toHaveLength(1);
@@ -643,8 +645,9 @@ describe("FabricControlPlane", () => {
 
     it("never adopts an unvalidated replacement link label", async () => {
       const f = await setup();
-      f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
+      f.setLease({ remoteHost: "forge", expiresAt: Date.now() + 200 });
       const outcome = settle(f.sender.request("host:owner", "agent:target", "steer", { ownerIncarnation: fixtureOwnerIncarnation }, "identity:owner"));
+      await f.command();
       f.setLease({ remoteHost: "forged-label", expiresAt: Date.now() + 60_000 });
       const { error } = await outcome;
       expect(error?.message).toContain("remote host forge");
@@ -871,7 +874,7 @@ describe("FabricControlPlane", () => {
           f.setLease({ remoteHost: "forge", expiresAt: Date.now() - 1 });
           await vi.advanceTimersByTimeAsync(20);
         }
-        expect((await outcome).error?.message).toContain(winner === "abort" ? "cancelled" : winner === "close" ? "closed" : "lapsed");
+        expect((await outcome).error?.message).toContain(winner === "abort" ? "cancelled" : winner === "close" ? "closed" : "bridge-stale");
         controller.abort();
         await f.sender.close();
         expect(vi.getTimerCount()).toBe(0);
@@ -1065,7 +1068,8 @@ describe("FabricControlPlane", () => {
       const { commandId } = await f.command();
       await f.advertise("forge", Date.now() - 1);
       const error = await outcome;
-      expect(error?.message).toContain("remote host forge lapsed for X");
+      expect(error?.message).toContain("bridge-stale for remote host forge, target X");
+      expect(error?.message).not.toContain("lapsed");
       expect(error).not.toHaveProperty("notRun");
       await f.withdraw();
       await f.advertise("forge");

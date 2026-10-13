@@ -95,6 +95,50 @@ export const meshWriterLeaseRecord = (lockProtocol: number, stateBackend: string
   lockProtocol, stateBackend, startedAt,
 });
 
+/** A source-clock lease observation, attributed to one physical bridge peer. */
+export interface FabricMirrorLease {
+  remoteHost: string;
+  /** Receiving clock before the mirror's dispatch/write wait, never the delayed commit time. */
+  observedAt: number;
+  sourceObservedAt: number;
+  sourceUpdatedAt: number;
+  sourceExpiresAt: number;
+}
+
+export const MIRROR_FRESH_MS = 15_000;
+export type MirroredLeaseStatus = "live" | "lease-stale" | "bridge-stale";
+
+const validMirrorLease = (value: unknown): value is FabricMirrorLease => {
+  if (typeof value !== "object" || value === null) return false;
+  const mirror = value as Record<string, unknown>;
+  return typeof mirror.remoteHost === "string" && mirror.remoteHost.length > 0 &&
+    [mirror.observedAt, mirror.sourceObservedAt, mirror.sourceUpdatedAt, mirror.sourceExpiresAt]
+      .every(n => typeof n === "number" && Number.isFinite(n));
+};
+
+/** Transport staleness is not evidence that the remote Main's own lease lapsed. */
+export const mirroredLeaseStatus = (
+  remoteHost: string,
+  mirror: FabricMirrorLease | undefined,
+  now = Date.now(),
+): MirroredLeaseStatus => {
+  if (!validMirrorLease(mirror) || mirror.remoteHost !== remoteHost ||
+    mirror.observedAt > now || now - mirror.observedAt >= MIRROR_FRESH_MS) return "bridge-stale";
+  return mirror.sourceExpiresAt <= mirror.sourceObservedAt ? "lease-stale" : "live";
+};
+
+export class FabricBridgeStaleError extends Error {
+  override readonly name = "FabricBridgeStaleError";
+  readonly code = "FABRIC_BRIDGE_STALE";
+  readonly retryable = true;
+  constructor(readonly remoteHost: string, readonly targetId: string, published = true) {
+    super(`Fabric bridge-stale for remote host ${remoteHost}, target ${targetId}; ` +
+      "no fresh mirror from that host; the remote owner's lease is unconfirmed; " +
+      (published ? "the outcome is unknown and it may still be delivered, so a retry can deliver it twice." :
+        "this attempt was not published."));
+  }
+}
+
 export interface FabricHostLease {
   id: string;
   rootId: string;
@@ -109,6 +153,10 @@ export interface FabricHostLease {
   reloadUntil?: number;
   /** Main session has a fixed 15 s TTL, independent of the host TTL. */
   session?: Liveness & { id: string; startedAt: number };
+  /** Bridge-written observation of this root's native lease on its physical remote host. */
+  mirror?: FabricMirrorLease;
+  /** Missing/malformed required observation is doubt, not native owner-death evidence. */
+  mirrorLease?: 1;
   /** Writer census metadata, absent on leases from pre-census releases. */
   writer?: MeshWriterRecord;
 }
@@ -360,6 +408,8 @@ const leaseOf = (text: string, name: string): FabricHostLease | undefined => {
       ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
       ...(typeof value.reloadUntil === "number" ? { reloadUntil: value.reloadUntil } : {}),
       ...(validSession(value.session) ? { session: value.session } : {}),
+      ...(validMirrorLease(value.mirror) ? { mirror: value.mirror } : {}),
+      ...(value.mirrorLease === 1 || value.mirror !== undefined ? { mirrorLease: 1 as const } : {}),
       ...(validWriter(value.writer) ? { writer: value.writer } : {}),
     };
   } catch {
@@ -548,16 +598,39 @@ const validSession = (value: unknown): value is NonNullable<FabricHostLease["ses
     [session.startedAt, session.updatedAt, session.expiresAt].every(n => typeof n === "number" && Number.isFinite(n));
 };
 
+type HostLeaseOwner = { id: string; rootId: string; identity: { id: string }; incarnationToken?: string;
+  startedAt?: number; updatedAt?: number; expiresAt: number; remoteHost?: string; mirrorLease?: 1 };
+
+const matchingHostLease = (leases: ReadonlyMap<string, FabricHostLease>, host: HostLeaseOwner): FabricHostLease | undefined => {
+  const lease = leases.get(host.id);
+  return lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
+    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
+      (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt)) ? lease : undefined;
+};
+
+/** Mirror provenance is accepted only for this host's current identity and incarnation. */
+export const hostMirrorLease = (leases: ReadonlyMap<string, FabricHostLease>, host: HostLeaseOwner): FabricMirrorLease | undefined => {
+  const mirror = matchingHostLease(leases, host)?.mirror;
+  return host.remoteHost && mirror?.remoteHost === host.remoteHost ? mirror : undefined;
+};
+
 /** Matching identity and incarnation only; an old file cannot revive a takeover. */
 export const hostLiveness = (
   leases: ReadonlyMap<string, FabricHostLease>,
-  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number; updatedAt?: number; expiresAt: number },
+  host: HostLeaseOwner,
 ): Liveness => {
-  const lease = leases.get(host.id);
-  const matching = lease && lease.rootId === host.rootId && lease.identityId === host.identity.id &&
-    (host.incarnationToken !== undefined ? lease.incarnationToken === host.incarnationToken :
-      (lease.startedAt === undefined || host.startedAt === undefined || lease.startedAt === host.startedAt));
-  return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, matching ? lease : undefined);
+  const lease = matchingHostLease(leases, host);
+  if (lease && host.remoteHost && lease.mirror?.remoteHost === host.remoteHost) {
+    // Routing judges the source sample with mirroredLeaseStatus, never the hub clock.
+    // Bridge traffic authority keeps the stricter translated TTL, so short-lease origins
+    // are reobserved before forwarding. Expired authority is not proof of a dead Main.
+    return { updatedAt: lease.mirror.observedAt, expiresAt: lease.mirror.sourceExpiresAt > lease.mirror.sourceObservedAt
+      ? Math.min(lease.expiresAt, lease.mirror.observedAt + MIRROR_FRESH_MS) : lease.mirror.observedAt - 1 };
+  }
+  // No observation grants no authority, but retain the last checkpoint's age for reapers:
+  // a missing/corrupt file must not turn a recent projection into an epoch-old record.
+  if (host.remoteHost && host.mirrorLease === 1) return { updatedAt: host.updatedAt ?? 0, expiresAt: (host.updatedAt ?? 0) - 1 };
+  return effectiveLiveness({ updatedAt: host.updatedAt ?? 0, expiresAt: host.expiresAt }, lease);
 };
 
 /** Reapers also accept incomplete historical records, retaining them conservatively. */
@@ -569,7 +642,9 @@ export const hostEntryLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<str
   if (typeof value.rootId === "string" && typeof identity.id === "string") return hostLiveness(leases, {
     id: value.id, rootId: value.rootId, identity: { id: identity.id },
     ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}),
-    ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}), ...stored,
+    ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
+    ...(typeof value.remoteHost === "string" ? { remoteHost: value.remoteHost } : {}),
+    ...(value.mirrorLease === 1 ? { mirrorLease: 1 as const } : {}), ...stored,
   });
   return effectiveLiveness(stored, leases.get(value.id));
 };
@@ -577,7 +652,7 @@ export const hostEntryLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<str
 /** Compatibility alias: every host reader uses the same effective-liveness rule. */
 export const hostLeaseExpiry = (
   leases: ReadonlyMap<string, FabricHostLease>,
-  host: { id: string; rootId: string; identity: { id: string }; incarnationToken?: string; startedAt?: number; updatedAt?: number; expiresAt: number },
+  host: HostLeaseOwner,
 ): number => hostLiveness(leases, host).expiresAt;
 
 /** Whether the fleet owner has moved lease renewals to files (see LIVENESS_POLICY_KEY). */

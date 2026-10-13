@@ -1,0 +1,361 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { PassThrough } from "node:stream";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BridgeMirrorDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePresence } from "../src/mesh/bridge.js";
+import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
+import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
+import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { deadHostRecords, DEAD_HOST_RECORDS_MS } from "../src/topology/host-reaper.js";
+
+// No deletion in this suite (#11199); isolated fixture bytes are retained for the owner.
+const close: Array<() => void | Promise<void>> = [];
+afterEach(async () => { for (const stop of close.splice(0)) await stop(); vi.useRealTimers(); vi.restoreAllMocks(); });
+const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
+const rootId = "session:ryzen4-lane-00000000";
+const senderId = "session:ryzen1-lead-00000000";
+const identity: MeshIdentity = { id: rootId, name: "lane", kind: "main", sessionId: "ryzen4-lane-00000000" };
+const mirror = (at: number, patch: Partial<FabricMirrorLease> = {}): FabricMirrorLease => ({ remoteHost: "ryzen4",
+  observedAt: at, sourceObservedAt: at - 60_000, sourceUpdatedAt: at - 62_000, sourceExpiresAt: at - 47_000, ...patch });
+
+const fixture = async (sourceOffset = -60_000) => {
+  let now = Date.now();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mirror-liveness-"));
+  const store = new MeshStore(path.join(dir, "hub"), 64 * 1024, 100);
+  const local = new StoreBridgeSide(store, "ryzen4", () => now);
+  const record = { format: 1 as const, id: rootId, rootId, identity, incarnationToken: "incarnation-1",
+    startedAt: now - 120_000, updatedAt: now + sourceOffset - 2_000, expiresAt: now + sourceOffset + 13_000 };
+  const participant = { format: 1 as const, id: rootId, rootId, kind: "root" as const, name: "lane", ownerHostId: rootId,
+    ownerIdentityId: rootId, ownerIncarnation: "activation-1", status: "idle", runner: "pi" as const, transport: "host" as const,
+    capabilities: ["steer" as const, "followUp" as const], controlProtocol: "v1" as const, sessionId: identity.sessionId!,
+    startedAt: record.startedAt, updatedAt: record.updatedAt };
+  const presence: BridgePresence = { hosts: [{ record, expiresAt: record.expiresAt, observedAt: now + sourceOffset }],
+    participants: [participant], reserved: [] };
+  await local.mirror(presence, now);
+  const directory = new ParticipantDirectory(store, { enabled: true, hostId: senderId, rootId: senderId,
+    identity: { id: senderId, name: "lead", kind: "main" } });
+  const control = new FabricControlPlane(store, { id: senderId, name: "lead", kind: "main" }, {
+    enabled: true, hostId: senderId, now: () => now, pollMs: 10,
+    readMirroredOwner: (...args) => directory.mirroredControlOwner(...args),
+  });
+  control.start(() => ({ accepted: false }));
+  close.push(() => control.close());
+  const lease = () => readHostLease(store.root, rootId)!;
+  const advertise = (observation: FabricMirrorLease) => writeHostLease(store.root, { ...lease(), mirror: observation });
+  return { store, local, directory, control, presence, lease, advertise, now: () => now, advance: (ms: number) => { now += ms; } };
+};
+
+const settle = <T>(promise: Promise<T>) => promise.then(value => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }));
+const request = (f: Awaited<ReturnType<typeof fixture>>) => f.control.request(rootId, rootId, "followUp", {
+  ownerIncarnation: "activation-1", message: "recorded-path probe" }, rootId, { routedRemoteHost: "ryzen4" });
+const commands = (f: Awaited<ReturnType<typeof fixture>>) => f.store.read({ topic: "fabric.control.command" });
+
+describe("source-clock root liveness (#10068)", () => {
+  it.each([-60_000, 60_000])("judges the native sample, not hub/source skew (%i ms), then accepts only the attributed ACK", async offset => {
+    const f = await fixture(offset);
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ id: rootId, stale: false, remoteHost: "ryzen4" });
+    expect(f.lease().mirror).toMatchObject({ remoteHost: "ryzen4", sourceObservedAt: f.now() + offset });
+    const outcome = request(f);
+    void outcome.catch(() => undefined);
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "accepted", bridge: { from: "wrong-host" } } });
+    let resolved = false;
+    void outcome.then(() => { resolved = true; });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(resolved).toBe(false);
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "accepted", bridge: { from: "ryzen4" } } });
+    await expect(outcome).resolves.toMatchObject({ acknowledged: true });
+  });
+
+  it.each(["v1", "legacy"] as const)("the agent message router rejects a stale %s bridge instead of returning unknown or queued", async protocol => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const sender = { id: senderId, name: "lead", kind: "main" as const };
+    const steerRemote = vi.fn(async () => ({ queued: true }));
+    const router = new AgentMessageRouter({} as any, { identity: sender, steerRemote } as any,
+      { local: true, id: senderId, matches: (id: string) => id === senderId } as any,
+      f.directory, f.control, binding => binding);
+    const healthy = router.routeMessage(rootId, "healthy recorded call", undefined, "followUp");
+    void healthy.catch(() => undefined);
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "router-accepted", bridge: { from: "ryzen4" } } });
+    await expect(healthy).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+    await f.local.mirror({ ...f.presence, participants: f.presence.participants.map(p => ({ ...p, controlProtocol: protocol })) }, f.now());
+    f.advance(MIRROR_FRESH_MS + 1);
+    await expect(router.routeMessage(rootId, "no fresh bridge", undefined, "followUp"))
+      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE" });
+    expect(commands(f)).toHaveLength(1);
+    expect(steerRemote).not.toHaveBeenCalled();
+  });
+
+  it("retains a root behind an old bridge, but refuses publication with bridge-stale, never lease lapsed", async () => {
+    const f = await fixture();
+    f.advance(MIRROR_FRESH_MS + 1);
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ id: rootId, stale: false });
+    const result = await settle(request(f));
+    expect(result.error).toBeInstanceOf(FabricBridgeStaleError);
+    expect(result.error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect(result.error?.message).not.toContain("lapsed");
+    expect(result.error?.message).toContain("not published");
+    expect(commands(f)).toHaveLength(0);
+    expect(f.local.holds(rootId)).toBe(false); // Retained routing attribution is NOT bridge authority.
+  });
+
+  it.each(["bridge-stale", "lease-stale"] as const)("pending command distinguishes %s, cancels once and preserves unknown outcome", async status => {
+    const f = await fixture();
+    const outcome = settle(request(f));
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    if (status === "bridge-stale") f.advance(MIRROR_FRESH_MS + 1);
+    else f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
+    const result = await outcome;
+    expect(result.error?.message).toContain("outcome is unknown");
+    expect(result.error).not.toHaveProperty("notRun");
+    if (status === "bridge-stale") {
+      expect(result.error).toBeInstanceOf(FabricBridgeStaleError);
+      expect(result.error?.message).not.toContain("lapsed");
+    } else {
+      expect(result.error?.message).toContain("remote host ryzen4 lapsed");
+      expect(f.directory.get(rootId, f.now())).toBeUndefined();
+    }
+    await vi.waitFor(() => expect(commands(f).filter(event => event.kind === "cancel")).toHaveLength(1));
+  });
+
+  it("a late mirror commit does not renew freshness; a new sample restores it", async () => {
+    const f = await fixture();
+    const observedAt = f.now();
+    f.advance(60_000);
+    await f.local.mirror(f.presence, observedAt);
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("bridge-stale");
+    const sourceAt = f.now() - 60_000;
+    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
+      record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt - 2_000 }, expiresAt: sourceAt + 13_000 }] }, f.now());
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("live");
+  });
+
+  it("never uses another host's freshness or another incarnation's observation", async () => {
+    const f = await fixture();
+    f.advertise(mirror(f.now(), { remoteHost: "ryzen3" }));
+    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    writeHostLease(f.store.root, { ...f.lease(), incarnationToken: "other-incarnation", mirror: mirror(f.now()) });
+    const host = f.store.get(key("topology/hosts/", rootId))!.value as typeof f.presence.hosts[0]["record"];
+    expect(hostMirrorLease(new Map([[rootId, f.lease()]]), host)).toBeUndefined();
+  });
+
+  it("a withdrawn mirror's removal cannot erase a same-start-time replacement incarnation", async () => {
+    const f = await fixture();
+    const replacement = { ...f.lease(), incarnationToken: "replacement-incarnation", updatedAt: f.now() + 1 };
+    const writeBatch = f.store.writeBatch.bind(f.store);
+    vi.spyOn(f.store, "writeBatch").mockImplementation(input => writeBatch({ ...input, afterCommit: view => {
+      writeHostLease(f.store.root, replacement); // Successor claims its file before publishing its state row.
+      input.afterCommit?.(view);
+    } }));
+    await f.local.mirror({ hosts: [], participants: [] }, f.now());
+    expect(f.lease().incarnationToken).toBe("replacement-incarnation");
+  });
+
+  it.each(["missing", "malformed"] as const)("a %s required observation never falls back to a fresh state expiry", async kind => {
+    const f = await fixture();
+    if (kind === "missing") fs.renameSync(hostLeasePath(f.store.root, rootId), path.join(f.store.root, "retained-lease.json"));
+    else fs.writeFileSync(hostLeasePath(f.store.root, rootId), JSON.stringify({ format: 1, ...f.lease(),
+      mirror: { ...f.lease().mirror, sourceObservedAt: null } }));
+    expect(f.local.holds(rootId)).toBe(false);
+    expect((await settle(request(f))).error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect(commands(f)).toHaveLength(0);
+    // Read-only selection probe: unconfirmed authority does not mean an epoch-old owner.
+    expect(deadHostRecords(f.store, { ownHostId: senderId, now: f.now() })).toHaveLength(0);
+    expect(deadHostRecords(f.store, { ownHostId: senderId, now: f.now() + DEAD_HOST_RECORDS_MS + 1 }).length).toBeGreaterThan(0);
+  });
+
+  it("does not mirror a source-clock expired root even if hub time would consider it live", async () => {
+    const f = await fixture(60_000);
+    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, expiresAt: f.now() + 59_999 }] }, f.now());
+    expect(f.store.get(key("topology/hosts/", rootId))).toBeUndefined();
+    expect(f.directory.get(rootId, f.now())).toBeUndefined();
+  });
+
+  it("a stale bridge wins over an old remote lease; freshness requires finite matching observations", () => {
+    const at = Date.now();
+    expect(mirroredLeaseStatus("ryzen4", mirror(at, { sourceExpiresAt: at - 60_001 }), at)).toBe("lease-stale");
+    expect(mirroredLeaseStatus("ryzen4", mirror(at - MIRROR_FRESH_MS, { sourceExpiresAt: at - 90_000 }), at)).toBe("bridge-stale");
+    expect(mirroredLeaseStatus("ryzen4", mirror(at, { observedAt: NaN }), at)).toBe("bridge-stale");
+    expect(mirroredLeaseStatus("ryzen4", mirror(at + 1), at)).toBe("bridge-stale");
+  });
+});
+
+const transport = (timeout = 30) => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const remote = new RemoteBridgeSide(input, output, timeout);
+  const sent: Array<{ id: number; op: string }> = [];
+  output.on("data", buffer => { sent.push(JSON.parse(buffer.toString())); });
+  const reply = (id: number, result: unknown = undefined, error?: string) => input.write(JSON.stringify({ id,
+    ok: error === undefined, ...(error === undefined ? { result } : { error }) }) + "\n");
+  close.push(() => remote.close());
+  return { remote, sent, reply };
+};
+
+describe("a slow mirror degrades, not disconnects (#10068)", () => {
+  it("bounds the missed answer, gates all queued calls, and accepts a late answer before retrying a fresh mirror", async () => {
+    const f = transport();
+    const result = settle(f.remote.mirror({ hosts: [], participants: [] }));
+    expect((await result).error).toBeInstanceOf(BridgeMirrorDeferredError);
+    expect(f.sent).toHaveLength(1);
+    const next = await settle(f.remote.presence());
+    expect(next.error).toHaveProperty("code", "FABRIC_BRIDGE_STALE");
+    expect(f.sent).toHaveLength(1); // No unbounded RPC queue behind the remote serial dispatch.
+    f.reply(f.sent[0]!.id);
+    const renewed = f.remote.mirror({ hosts: [], participants: [] });
+    expect(f.sent).toHaveLength(2);
+    f.reply(f.sent[1]!.id);
+    await expect(renewed).resolves.toBeUndefined();
+    const presence = f.remote.presence();
+    f.reply(f.sent[2]!.id, { hosts: [], participants: [], reserved: [] });
+    await expect(presence).resolves.toMatchObject({ hosts: [] });
+  });
+
+  it("a late permanent mirror rejection still closes the transport", async () => {
+    const f = transport();
+    await settle(f.remote.mirror({ hosts: [], participants: [] }));
+    f.reply(f.sent[0]!.id, undefined, "Bridge presence is invalid");
+    await expect(f.remote.closed).resolves.toHaveProperty("message", "Bridge agent: Bridge presence is invalid");
+  });
+
+  it("a serially queued mirror keeps the receiver's arrival time, not its late dispatch time", async () => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const input = new PassThrough(), output = new PassThrough();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const sequence = vi.spyOn(f.local, "latestSequence").mockImplementation(async () => { await gate; return 0; });
+    const replies: number[] = [];
+    output.on("data", data => { replies.push(JSON.parse(data.toString()).id); });
+    const serving = serveBridgeAgent(f.local, input, output);
+    input.write(JSON.stringify({ id: 1, op: "latestSequence" }) + "\n");
+    input.write(JSON.stringify({ id: 2, op: "mirror", args: f.presence }) + "\n");
+    f.advance(60_000);
+    release();
+    await vi.waitFor(() => expect(replies).toContain(2));
+    expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("bridge-stale");
+    sequence.mockRestore();
+    input.end();
+    await serving;
+  });
+
+  it("non-mirror silence still closes the transport; an explicit close settles an in-flight mirror", async () => {
+    const f = transport();
+    const result = await settle(f.remote.presence());
+    expect(result.error?.message).toContain("did not answer presence");
+    await expect(f.remote.closed).resolves.toBe(result.error);
+    const g = transport(100);
+    const pending = settle(g.remote.mirror({ hosts: [], participants: [] }));
+    g.remote.close(new Error("owned stop"));
+    expect((await pending).error?.message).toBe("owned stop");
+  });
+
+  it.each([-120_000, 120_000])("resamples a silent long-lease origin across source clock skew (%i ms)", async offset => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const start = Date.now();
+    const side = new StoreBridgeSide(f.store, "ryzen4");
+    let samples = 0;
+    const remote = {
+      protocolVersion: 2, latestSequence: async () => 0, read: async () => ({ events: [], through: 0 }),
+      presence: async () => { samples++; return { ...f.presence, hosts: [{
+        record: { ...f.presence.hosts[0]!.record, updatedAt: start + offset, expiresAt: start + offset + 90_000 },
+        expiresAt: start + offset + 90_000, observedAt: Date.now() + offset }] }; },
+      bridgedIds: async () => ({ ids: [], through: 0, done: true }), publish: async () => ({ sequence: 1 }),
+      mirror: async () => undefined, subscribeChanges: () => () => undefined,
+    };
+    const local = { ...remote, presence: () => side.presence(), mirror: (p: BridgePresence, at?: number) => side.mirror(p, at),
+      owned: () => side.owned(), withdraw: () => side.withdraw() };
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen4", local, remote,
+      cursorPath: path.join(f.store.root, "skew-cursor.json") });
+    const running = bridge.run();
+    void running.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(samples).toBeGreaterThan(0));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(samples).toBeGreaterThan(1);
+    expect(side.holds(rootId)).toBe(true);
+    await bridge.stop();
+    await running;
+  });
+
+  it("keeps the real stdio bridge alive through a missed mirror answer, marks the host stale, then reobserves it", async () => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const far = new MeshStore(path.join(f.store.root, "far"), 64 * 1024, 100);
+    const agent = new StoreBridgeSide(far, "ryzen1", f.now);
+    vi.spyOn(agent, "presence").mockImplementation(async () => {
+      const at = f.now() - 60_000;
+      return { ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: at, expiresAt: at + 13_000,
+        record: { ...f.presence.hosts[0]!.record, updatedAt: at - 2_000, expiresAt: at + 13_000 } }] };
+    });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let mirrors = 0;
+    const apply = agent.mirror.bind(agent);
+    vi.spyOn(agent, "mirror").mockImplementation(async (presence, at) => {
+      if (++mirrors === 1) { f.advance(30_001); await gate; }
+      return apply(presence, at);
+    });
+    const input = new PassThrough(), output = new PassThrough();
+    const serving = serveBridgeAgent(agent, input, output);
+    const remote = new RemoteBridgeSide(output, input, 40);
+    const logs: string[] = [];
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen4", local: f.local, remote,
+      cursorPath: path.join(f.store.root, "stdio-cursor.json"), walCapRetryMinMs: 10, stopMs: 30, log: message => logs.push(message) });
+    let failure: unknown;
+    let ended = false;
+    const running = bridge.run().catch(error => { failure = error; }).finally(() => { ended = true; });
+    close.push(async () => { release(); await bridge.stop(); remote.close(); input.end(); await serving; await running; });
+    await vi.waitFor(() => expect(logs.some(message => message.includes("bridge mirror degraded"))).toBe(true));
+    expect(ended).toBe(false);
+    expect(failure).toBeUndefined();
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ bridgeStale: true });
+    expect(f.local.holds(rootId)).toBe(false);
+    release();
+    await vi.waitFor(() => expect(mirrors > 1 && f.local.holds(rootId)).toBe(true));
+    expect(ended).toBe(false);
+    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
+    await bridge.stop();
+    await running;
+    expect(failure).toBeUndefined();
+  });
+
+  it("keeps run alive with bounded backoff and recovers, while stop remains bounded for a silent mirror", async () => {
+    const f = await fixture();
+    const empty = { hosts: [], participants: [], reserved: [] };
+    let mirrors = 0;
+    const remote = {
+      protocolVersion: 2, latestSequence: async () => 0, read: async () => ({ events: [], through: 0 }),
+      presence: async () => f.presence, bridgedIds: async () => ({ ids: [], through: 0, done: true }),
+      publish: async () => ({ sequence: 1 }), subscribeChanges: () => () => undefined,
+      mirror: async () => { if (++mirrors === 1) throw new BridgeMirrorDeferredError(true, 30); },
+    };
+    const local = { ...remote, presence: async () => empty, mirror: (p: BridgePresence, at?: number) => f.local.mirror(p, at),
+      owned: () => f.local.owned(), withdraw: () => f.local.withdraw() };
+    const bridge = new MeshBridge({ localName: "ryzen1", remoteName: "ryzen4", local, remote,
+      cursorPath: path.join(f.store.root, "cursor.json"), walCapRetryMinMs: 10, stopMs: 20 });
+    let ended = false;
+    const running = bridge.run().finally(() => { ended = true; });
+    close.push(async () => { await bridge.stop(); await running; });
+    await vi.waitFor(() => expect(mirrors).toBeGreaterThan(1));
+    expect(ended).toBe(false);
+    await bridge.stop();
+    await running;
+    expect(ended).toBe(true);
+  });
+});

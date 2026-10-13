@@ -17,7 +17,7 @@ import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { FabricParticipantStaleError } from "../topology/host-leases.js";
+import { FabricBridgeStaleError, FabricParticipantStaleError } from "../topology/host-leases.js";
 import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
@@ -544,6 +544,7 @@ export class AgentMessageRouter {
         }
         participant = refreshed;
       }
+      if (participant.remoteHost && participant.bridgeStale) throw new FabricBridgeStaleError(participant.remoteHost, participant.id, false);
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);

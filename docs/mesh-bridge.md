@@ -42,16 +42,25 @@ existing events and mirrors root presence. There is no new store or protocol.
   deferrals; waiting at <topic> <id>, retry in N ms; nothing dropped`.
 - Presence: each side's live native hosts and root participants go into the other side's state at
   the same keys, with `remoteHost: <side name>` and the source identity as `updatedBy`. A mirrored
-  lease retains the source's expiry, capped at 15 s from the mirror commit. A slow pass can shift
-  that expiry by at most one additional 15 s lease. File-only heartbeats carry their effective
-  renewal time. Presence
-  is refreshed on every bridge (re)connect before startup completes, then on store notifications
+  lease carries the native renewal and expiry plus the source clock at which they were read
+  (`mirror.sourceUpdatedAt`, `sourceExpiresAt`, `sourceObservedAt`). Its local `observedAt` is
+  captured before the mirror's dispatch/write wait, not when a delayed write committed. Source lease
+  age is judged on the source clock; bridge freshness lasts 15 s on the receiving clock. A
+  root is lease-stale only when that host's bridge observation is fresh and its sampled native
+  lease is old. A stale bridge instead yields `FABRIC_BRIDGE_STALE` (`bridge-stale`), never a
+  claim that the remote Main's lease lapsed. New projections advertise `mirrorLease: 1` and
+  require matching identity/incarnation metadata; missing or malformed metadata cannot fall
+  back to an old state expiry. Older projections retain their bounded compatibility expiry.
+  Presence is refreshed on every bridge (re)connect before startup completes, then on store notifications
   and actual lease deadlines, not a periodic poll. Each pass reads the current native records, including file-only roots in
   `participants/`, and does not replay a saved projection set. A lapsed mirror is refreshed
   and revalidated once before an event is refused. A source that stops renewing can remain mirrored
   for at most twice its TTL from its last renewal (at most one extra capped TTL after the last live
-  observation). When the bridge stops, its mirrors lapse within 15 s. On a clean stop or
-  transport failure it deletes them at once.
+  observation). Without a fresh bridge sample, roots remain discoverable with `bridgeStale: true`
+  for a precise routing error, but do not authorize bridged traffic. Traffic retains its stricter
+  translated TTL and reobserves short-lease origins before forwarding. Clean stop or transport
+  failure withdraws the projections. A fresh snapshot withdraws origins that no longer report
+  a live native lease.
 - Nothing else. This excludes `github.*`, actor output, state and cache keys, and agent and actor
   participants.
 
@@ -118,8 +127,13 @@ existing events and mirrors root presence. There is no new store or protocol.
   records do not rewrite shared state. Expired/pruned projections can still be restored even when
   the source set is unchanged. Host file leases renew separately; compatibility state lease
   checkpoints remain bounded to their existing cadence.
-- Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A remote that misses it
-  closes the transport. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
+- Each remote call has a deadline (`--call-timeout-ms`, default 30 s). A missed mirror answer
+  degrades that link instead of closing the bridge. One mirror response slot stays in flight;
+  the bridge queues no additional RPCs behind it and retries with 1 s to 30 s exponential
+  backoff. A late answer opens the gate for a new presence snapshot; it does not renew the old
+  snapshot's freshness. The agent stamps mirror arrival time before its serial dispatch wait.
+  Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
+  fatal. On stop, the bridge fences the loop, gives the remote withdrawal a bounded
   wait, withdraws the local mirrors regardless, and then reaps the transport child
   (SIGTERM, then SIGKILL after 2 s).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
@@ -190,10 +204,15 @@ not event/frame limits or the default. For example, `--max-state-bytes 67108864`
 `--ssh-port` and `--ssh-known-hosts FILE` (which also sets `StrictHostKeyChecking=yes`) reach a
 host without a global `~/.ssh/config` entry.
 
-When the bridge dies, the other side's copies stay live until their lease lapses, at most 15 s
-(about 13 s on average). A steer or followUp sent in that window is not delivered; it fails when
-its acknowledgement times out (the control plane's bounded wait), and nothing hangs. After the
-lapse, senders get the lease-lapsed error at once.
+When a bridge stops providing fresh observations, its authority expires within 15 s. A retained
+root is not proof that the Main ended: routing reports `bridge-stale`. Before publication, that
+error says the attempt was not published. After publication, it preserves the unknown-outcome
+warning because a delayed command or ACK may still arrive. Only a fresh source observation of an
+old native lease can report a lease lapse. The command's admission/ACK budget is unchanged.
+The dead-root activation filter follows the same distinction: a stale bridge or a live source
+sample is doubt/alive, not owner death. Only a fresh observation of a source-expired root,
+past its existing ten-minute grace and without live native participant evidence, permits a
+skip. Required but missing/malformed mirror metadata fails open.
 
 ## Moving a Main off the hub (handoff)
 

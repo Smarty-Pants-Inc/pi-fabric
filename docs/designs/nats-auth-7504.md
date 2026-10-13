@@ -926,7 +926,7 @@ no write without the tag.
   1. The item exists, its recipient is `paul`, it is answered `accept` by Paul (`unverified:` that the inbox
      records who answered; T18 checks), and the answer is under 24 h old.
   2. The item's org, stream and config SHA-256 equal `--org`, the target stream and the SHA-256 of `--config`.
-  3. `--person` is not the approver.
+  3. The session principal (from its participant record, never a command-line name) is not the approver.
   4. `--audit` resolves, through a GitHub REST read with the fleet App, to a comment on the named issue, by the
      fleet write App, created after Paul's answer and before this mint, that carries the same item id and SHA-256.
   5. (slice 2+) The approval is reserved atomically before anything is signed: mint creates `consumed/<item id>` in the

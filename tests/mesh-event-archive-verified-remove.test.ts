@@ -838,6 +838,36 @@ it.runIf(process.platform === "linux")("r5: a failed directory barrier after the
   expect(claimNames(seeded.file).some(name => /\.claim-[0-9a-f-]{36}$/.test(name))).toBe(true);
 });
 
+// r5 re-review (Luna G-1): a successor that won the name retires the claim only after a directory barrier makes it durable.
+it.runIf(process.platform === "linux")("r5: a successor's entry must be durable before the claim stops fencing the key", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  const fsyncSync = fs.fsyncSync;
+  const state = { armed: false, failed: 0 };
+  const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
+    if (state.armed && fs.fstatSync(fd).isDirectory()) { state.failed += 1; throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" }); }
+    return fsyncSync(fd);
+  }) as never);
+  let successorIno = 0;
+  // The off-lock successor lands after the claim, before the install link; every directory barrier from then on fails.
+  const seam = beforeIntentNameOp(seeded.file, "install", () => {
+    installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = real.lstatSync(seeded.file).ino; state.armed = true;
+  });
+  const outcome = await restoreOutcome(seeded);
+  vi.mocked(fs.renameSync).mockRestore(); vi.mocked(fs.linkSync).mockRestore(); fsync.mockRestore();
+  expect(seam.fired).toBe(true);
+  expect(state.failed).toBeGreaterThan(0);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(real.lstatSync(seeded.file).ino).toBe(successorIno);
+  expect(rawBytes(seeded.file).toString("utf8")).toBe(successorText(seeded.archiveDir));
+  // The exact in-flight claim (the original) still fences the key: not moved to evidence, not removed.
+  expect(claimNames(seeded.file)).toEqual([`${path.basename(seeded.file)}.claim`]);
+  expect(real.lstatSync(`${seeded.file}.claim`).ino).toBe(deadIno);
+  expect(rawBytes(`${seeded.file}.claim`).equals(original)).toBe(true);
+  expect(removals.filter(target => target.startsWith(`${seeded.file}.claim`))).toEqual([]);
+});
+
 // r5 review (Luna F-2): a crash-left claim reserves its key's capacity slot until a hold links it back.
 it.runIf(process.platform === "linux")("r5: a claim-only key still counts against the dedupe capacity", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-1036-"));

@@ -452,8 +452,8 @@ export class EventLog {
       try { fs.unlinkSync(probe); } catch { /* a stray probe name matches no intent, receipt or claim scan */ }
       if (!isOriginal(file, true)) throw changed();
       // Only this hold uses the in-flight name. #reinstateIntentClaim already linked any crash leftover back before the
-      // judgment, so a claim still here only duplicates a name (its unlink failed): it moves to evidence, never over.
-      if (fs.lstatSync(claim, { throwIfNoEntry: false })) this.#keepIntentClaim(claim);
+      // judgment, so a claim still here only duplicates a name (its unlink failed): the same path retires it, never over.
+      this.#reinstateIntentClaim(file);
       if (fs.lstatSync(claim, { throwIfNoEntry: false })) throw changed();
       try { fs.renameSync(file, claim); }
       catch (error) { throw errorCode(error) === "ENOENT" ? changed() : unreadable(error); }
@@ -489,15 +489,20 @@ export class EventLog {
 
   /** Under the lock, before an intent name is judged: a `<file>.claim` left by a refused or interrupted restore. With the
    * name absent, link it back (no-replace) and drop the claim name. EEXIST means a newer intent holds the name: that
-   * one is kept and the claim moves to evidence. Any other failure keeps the claim and refuses, so the key stays fenced
-   * (never treated as unreserved). */
+   * one is kept, and only once its entry is durable (an off-lock writer may not have run its own barrier yet) does the
+   * claim move to evidence. Any other failure keeps the exact claim and refuses, so the key stays fenced (never treated
+   * as unreserved). */
   #reinstateIntentClaim(file: string): void {
     const claim = `${file}.claim`;
     if (!fs.lstatSync(claim, { throwIfNoEntry: false })) return;
+    const kept = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent claim ${path.basename(claim)}: it cannot be reinstated and is kept`, { cause });
     try { fs.linkSync(claim, file); }
     catch (error) {
-      if (errorCode(error) === "EEXIST") { this.#keepIntentClaim(claim); return; }
-      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent claim ${path.basename(claim)}: it cannot be reinstated and is kept`, { cause: error });
+      if (errorCode(error) !== "EEXIST") throw kept(error);
+      try { syncDirectoryChain(path.dirname(file)); } // the competing name is durable before the claim stops fencing
+      catch (barrier) { throw kept(barrier); }
+      if (fs.lstatSync(file, { throwIfNoEntry: false })) this.#keepIntentClaim(claim);
+      return;
     }
     syncDirectoryChain(path.dirname(file)); // the reinstated name is durable before the claim name goes
     // ponytail: plain unlink of a private name whose inode `file` now also names.

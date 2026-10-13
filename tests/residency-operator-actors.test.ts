@@ -15,6 +15,9 @@ import { hostLeasePath, readHostLease, writeHostLease } from "../src/topology/ho
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
+import { writeParticipantFile } from "../src/topology/participant-files.js";
+import { rootParticipantKey } from "./helpers/dead-root-fixture.js";
 
 beforeEach(() => installInProcessResidentFence());
 const waitFor = (predicate: () => boolean) => vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 15_000, interval: 30 });
@@ -43,7 +46,13 @@ const fixture = async () => {
   };
   const create = (name: string) => host.actors.create({ name, instructions: "Run", model: "fixture/visible",
     residency: "durable", transport: "process", extensions: false });
-  return { root, host, config, cli, create, confirm, close: async () => {
+  // pi-fabric#1031: an allowed live operator remove needs explicit Linux proof that the root's Main is gone: a stale
+  // root participant whose recorded pid (above pid_max) and start time are gone. Seeded per allowed test, never globally.
+  const deadMain = () => writeParticipantFile(meshRoot, { key: rootParticipantKey(config.rootId),
+    value: { id: config.rootId, rootId: config.rootId, kind: "root", ownerHostId: config.rootId, ownerIdentityId: config.rootId,
+      mainProcess: { pid: 2147483647, host: os.hostname(), startTime: "1" } },
+    version: 1, updatedAt: Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS, updatedBy: { id: config.rootId, name: "main", kind: "main" } });
+  return { root, host, config, cli, create, confirm, deadMain, close: async () => {
     for (const actor of host.actors.listOwned()) await host.actors.stop(actor.id, undefined, true);
     await host.close(); fs.rmSync(root, { recursive: true, force: true });
   } };
@@ -73,6 +82,7 @@ describe("same-user resident actor operator", () => {
       expect(f.host.actors.status(victim.id).inFlightRun).toBeUndefined();
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
+      f.deadMain();
       const removed = await f.cli("remove", victim.id, f.confirm);
       expect(removed).toMatchObject({ code: 0, err: "" });
       await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
@@ -94,6 +104,7 @@ describe("same-user resident actor operator", () => {
       await waitFor(() => ("turns" in f.host.agents.status(runId) && Number((f.host.agents.status(runId) as { turns?: number }).turns) > 0));
       const runPid = Number(f.host.agents.status(runId).sessionId);
 
+      f.deadMain();
       expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
       await f.host.actors.removalSettled(victim.id);
       await f.host.participants.refresh();
@@ -312,6 +323,7 @@ describe("same-user resident actor operator", () => {
       await expect(run(process.execPath, argv("remove", actor.id))).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("Missing --confirm-dead-root") });
       const dry = await run(process.execPath, [...argv("remove", actor.name), "--dry-run", ...f.confirm]);
       expect(JSON.parse(dry.stdout).operatorEvidence).toMatchObject({ rootId: f.config.rootId, mainSessionId: f.config.sessionId, lastLeaseTime: null });
+      f.deadMain();
       const result = await run(process.execPath, [...argv("remove", actor.name), ...f.confirm]);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, action: "remove", resident: f.config.residencyRoot });
       await f.host.participants.refresh();

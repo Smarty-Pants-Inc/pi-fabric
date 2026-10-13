@@ -143,6 +143,10 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
     return "unknown: Main process identity unavailable (no pid in the root participant record)";
   }
   if (main.host !== os.hostname()) return `unknown: Main process identity unavailable (recorded on host ${String(main.host)}, not this host)`;
+  // pi-fabric#1031: a pid without its start time is no identity; an absent pid alone never proves this Main dead.
+  if (typeof main.startTime !== "string" || !main.startTime) {
+    return `unknown: Main process identity unavailable (no start time for pid ${main.pid} in the root participant record)`;
+  }
   if (processStartTime(process.pid) === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
   let exists: boolean;
   try { fs.statSync(`/proc/${main.pid}`); exists = true; }
@@ -151,7 +155,6 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
     exists = false;
   }
   if (!exists) return `gone: Main pid ${main.pid} does not exist on this host`;
-  if (typeof main.startTime !== "string") return `unknown: Main pid ${main.pid} exists and the record has no start time`;
   const current = processStartTime(main.pid);
   if (current === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
   if (current === main.startTime) return `live: Main process ${main.pid} is alive on this host`;

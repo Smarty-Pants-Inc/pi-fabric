@@ -31,12 +31,13 @@ export const mainPublicationFencePath = (meshRoot: string, rootId: string): stri
 /** Cheap and synchronous, for the Main's publish step. No fence file: not fenced. A fence file: held
  * exactly while its exclusive flock is held (a non-blocking shared flock test fails). Unknown: fenced. */
 export const mainPublicationFenced = (meshRoot: string, rootId: string): boolean => {
+  // Linux-only fence (smarty-dev#8090 ruling): off Linux no fence is ever taken (main's path there, smarty-dev#7858),
+  // so a Main there is never blocked by one.
+  if (process.platform !== "linux") return false;
   const file = mainPublicationFencePath(meshRoot, rootId);
   try { fs.lstatSync(file); }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
-  // No flock on Windows (smarty-dev#7858): no fence is ever taken there, so a fence file present is unknown: fenced.
   // No pid or time guess stands in for the kernel lock (smarty-dev#8090).
-  if (process.platform === "win32") return true;
   const probe = spawnSync("flock", ["-s", "-n", file, "true"], { stdio: "ignore", timeout: 5_000 });
   return probe.status !== 0; // 1: held; anything else (no flock, error): fail closed
 };
@@ -57,11 +58,8 @@ const ensureFenceFile = (file: string, record: FenceRecord): void => {
 export const takeMainPublicationFence = async (meshRoot: string, rootId: string): Promise<() => void> => {
   // Before any file is made: without a kernel lock there is no fence, and nothing is deleted (smarty-dev#8090).
   const kept = `the root ${rootId} actor tree is kept`;
-  if (process.platform === "win32") throw new Error(`The Main publication fence needs flock, unavailable on Windows (smarty-dev#7858); ${kept}`);
-  if (!(process.platform === "linux" ? kernelFenceAvailable() : (flockFound ??= spawnSync("sh", ["-c", "command -v flock"],
-    { stdio: "ignore", timeout: 5_000 }).status === 0))) {
-    throw new Error(`The Main publication fence needs flock(1)${process.platform === "linux" ? " and setpriv" : ""}, not found; ${kept}`);
-  }
+  if (process.platform !== "linux") throw new Error(`The Main publication fence is Linux-only (smarty-dev#7858); ${kept}`);
+  if (!kernelFenceAvailable()) throw new Error(`The Main publication fence needs flock(1) and setpriv, not found; ${kept}`);
   const file = mainPublicationFencePath(meshRoot, rootId);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const record: FenceRecord = { format: 1, pid: process.pid, host: os.hostname(), createdAt: new Date().toISOString() };
@@ -95,7 +93,6 @@ export const takeMainPublicationFence = async (meshRoot: string, rootId: string)
   }
 };
 
-let flockFound: boolean | undefined;
 const held = new Map<string, { count: number; release: Promise<() => void> }>();
 
 /** Take this root's fence, shared (reference-counted) by the removals of this process. */
@@ -128,11 +125,13 @@ export const actorTreeDeletionHooks: {
  * THE path that deletes (or moves to its archive) a root's whole actor tree (smarty-dev#7817, smarty-dev#8090): the
  * offline archive move, the live host's ActorManager cleanup, and a non-persistent manager's close. Hold the
  * root's Main publication fence, run the final check under it, delete, release in finally. A Main cannot
- * publish its root participant between the check and the delete; without the fence nothing is deleted.
+ * publish its root participant between the check and the delete; on Linux, without the fence nothing is deleted.
+ * Off Linux (fabric-store ruling, smarty-dev#8090) this is main's existing path on that platform: the same
+ * check-then-delete order with no fence (no flock primitive there; residual smarty-dev#7858).
  */
 export const deleteRootActorTree = async (meshRoot: string, rootId: string, remove: () => void | Promise<void>,
   check?: () => void | Promise<void>): Promise<void> => {
-  const release = await acquireMainPublicationFence(meshRoot, rootId);
+  const release = process.platform === "linux" ? await acquireMainPublicationFence(meshRoot, rootId) : () => {};
   try {
     await actorTreeDeletionHooks.beforeCheck?.();
     await check?.();

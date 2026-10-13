@@ -691,8 +691,23 @@ export class ResidentHost {
           if (rootId !== config.rootId) throw new Error(`Operator cleanup for foreign root ${rootId}; tree kept`);
           const { fencedOperatorCheck } = await import("../actors/remove-offline.js");
           await fencedOperatorCheck(this.mesh, this.identity as { id: string; name: string; kind: "agent" }, rootId, get => {
-            assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), rootId);
-            assertRootParticipantQuiet(config, { get });
+            if (process.platform !== "linux") {
+              // pi-fabric#1014: off Linux this is main's existing path on this platform (no kernel fence, no Main
+              // identity primitive): the lease veto and the participant quiet check only.
+              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }), rootId);
+              assertRootParticipantQuiet(config, { get });
+              return;
+            }
+            // pi-fabric#1031: the same Main-identity verdict as the offline removal. A stale record needs its Main
+            // pid+start identity independently gone and no live lease file; no record or no identity is unknown.
+            try {
+              assertResidentOperatorConfirmed(readResidentOperatorEvidence(config, { get }, undefined, { mainStopped: true }),
+                rootId, false, true);
+              assertRootParticipantQuiet(config, { get });
+            } catch (error) {
+              if (!(error instanceof ResidentActorAuthorizationError)) throw error;
+              throw new ResidentActorAuthorizationError(`${error.message}; the actor tree is kept: stop the Main, or let a host start finish it`);
+            }
           });
         },
         resolvePiModel: (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false, closest: false }),

@@ -7,8 +7,9 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { actorTreeDeletionHooks, deleteRootActorTree, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
+import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
+import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { processHarness } from "./helpers/process-harness.js";
 
 // smarty-dev#8090, LOCAL recorded-call boundary probe (#4664: it must never remove actor-tree bytes). Only the
@@ -57,6 +58,8 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       const actor = await f.create("recorded");
       const dir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
+      // pi-fabric#1031: the allowed operator removal needs explicit proof its Main is gone (stale record, pid+start gone).
+      f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS);
       const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
       const calls: Call[] = [];
       let refused: unknown;
@@ -122,7 +125,9 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
     } finally { vi.restoreAllMocks(); await main.close(); await f.close(); }
   }, 60_000);
 
-  it("fails closed without a kernel fence: no flock keeps the tree (direct manager, supplemental) and win32 never calls the removal", async () => {
+  // pi-fabric#1031 ruling item 1: off Linux the removal is main's existing unfenced path (the publication helper's
+  // non-Linux branch is owned by another writer), so the former win32-refusal assertion is gone; Linux without flock fails closed.
+  it("fails closed without a kernel fence: no flock keeps the tree (direct manager, supplemental)", async () => {
     const f = await fixture();
     try {
       const actor = await f.create("no-flock");
@@ -139,14 +144,6 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       expect(outcome).toMatch(/flock|fence/i);
       expect(calls).toEqual([]);
       expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
-
-      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-      const remove = vi.fn();
-      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-      try {
-        await expect(deleteRootActorTree(f.config.meshRoot, f.config.rootId, remove)).rejects.toThrow(/flock/);
-      } finally { Object.defineProperty(process, "platform", platform); }
-      expect(remove).not.toHaveBeenCalled();
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); await f.close(); }
   }, 60_000);
 

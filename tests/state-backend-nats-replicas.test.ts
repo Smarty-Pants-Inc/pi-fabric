@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { inspect } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Stream replicas: omitted values come only from the agent-dir fabric.json reader (default 1); explicit values still
@@ -72,7 +73,7 @@ vi.mock("@nats-io/jetstream", () => ({
 }));
 
 const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
-const { MeshStateNatsRefusedError, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
+const { MeshStateNatsRefusedError, connectNatsEndpoint, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
 const { normalizeFabricConfig } = await import("../src/config.js");
 
 const STREAM = "FABRIC_MESH_REPLICAS_TEST";
@@ -381,6 +382,56 @@ describe("NATS replicas: real agent-only reader on private fixture", () => {
     await expect(actualReader().then(reader => reader(unreadableDir))).rejects.toThrow(/mesh\.nats\.replicas/);
     expect(existsSync(unreadableFile)).toBe(true);
     expect(existsSync(`${unreadableFile}.corrupt`)).toBe(false);
+  });
+
+  it.skipIf(!inFleet)("keeps malformed parser details out of direct and NATS entry-point refusals", async () => {
+    const directory = readerFixture("malformed-canary");
+    const file = path.join(directory, "fabric.json");
+    const root = path.join(directory, "mesh-root");
+    const canary = "__FABRIC_JSON_PARSER_CANARY__";
+    const malformed = `{"mesh":{"nats":{"replicas":3}},"broken":"${canary}`;
+    writeFileSync(file, malformed);
+
+    const reader = await actualReader();
+    fake.loadAgent.mockImplementation(reader);
+    vi.stubEnv("PI_CODING_AGENT_DIR", directory);
+    const originalParse = JSON.parse;
+    const parseSpy = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+      if (text === malformed) throw new SyntaxError(`synthetic JSON parser excerpt: ${canary}`);
+      return originalParse(text, reviver);
+    });
+    const assertSafeRefusal = async (receiver: string, promise: Promise<unknown>) => {
+      const error = await refusal(promise);
+      expect(error, receiver).toBeInstanceOf(Error);
+      expect((error as Error).message, receiver).toBe(`mesh.nats.replicas: ${file} is not valid JSON`);
+      expect.soft((error as Error).cause, receiver).toBeUndefined();
+      const inspections = [
+        inspect(error, { showHidden: true, depth: null }),
+        inspect((error as Error).message),
+        inspect((error as Error).cause),
+      ].join("\n");
+      expect.soft(inspections, receiver).not.toContain(canary);
+      expect(readFileSync(file, "utf8"), receiver).toBe(malformed);
+      expect(existsSync(`${file}.corrupt`), receiver).toBe(false);
+    };
+
+    try {
+      expect(JSON.parse('{"delegated":true}')).toEqual({ delegated: true });
+      await assertSafeRefusal("loadAgentNatsReplicas", Promise.resolve().then(() => reader(directory)));
+      await assertSafeRefusal("connectJetStream", connectJetStream(SERVERS));
+      await assertSafeRefusal("connectNatsEndpoint", connectNatsEndpoint({ servers: [...SERVERS] }));
+      await assertSafeRefusal("openNatsStateBackend", openNatsStateBackend({
+        root, servers: [...SERVERS], acceptPeriodicSync: true,
+      }));
+      expect(parseSpy.mock.calls.filter(([text]) => text === malformed)).toHaveLength(4);
+      expect(fake.loadAgent).toHaveBeenCalledTimes(3);
+      expect(fake.loadGlobal).not.toHaveBeenCalled();
+      expect(connects()).toBe(0);
+      expect(mutations()).toEqual([]);
+      expect(fake.log).toEqual([]);
+    } finally {
+      parseSpy.mockRestore();
+    }
   });
 });
 

@@ -51,7 +51,7 @@ export interface JetStreamPort {
   /** Creates the stream if absent (file storage, these subjects; an existing stream gains missing ones); returns its last sequence.
    * `replicas` (smarty-dev#11373): the stream's num_replicas on create; an existing stream whose num_replicas differs is
    * refused (MeshStateNatsRefusedError) before anything is changed, never lowered or raised. Omitted: the real client
-   * uses the replicas it was connected with (explicit, else the global config's mesh.nats.replicas). */
+   * uses the replicas it was connected with (explicit, else the agent fabric.json layer's mesh.nats.replicas). */
   ensureStream(stream: string, subjects: string[], options: { maxMsgSize: number; replicas?: number }): Promise<{ lastSeq: number; maxMsgSize?: number }>;
   /** The stream's last sequence now (leader). */
   lastSequence(stream: string): Promise<number>;
@@ -1241,7 +1241,7 @@ export interface NatsEndpointOptions {
   /** Tests: the resolver for the loopback check (default dns.promises.lookup). */
   lookup?: NatsLookup;
   /** The stream's replicas for the real client (positive integer, validated before anything is resolved or connected).
-   * Omitted: the real client reads the global config's mesh.nats.replicas at first use. */
+   * Omitted: the real client reads the agent fabric.json layer's mesh.nats.replicas at first use. */
   replicas?: number;
 }
 

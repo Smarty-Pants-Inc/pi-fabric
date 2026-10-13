@@ -951,8 +951,9 @@ export const loadAgentNatsReplicas = (agentDir: string): number => {
   let document: unknown;
   try {
     document = JSON.parse(source);
-  } catch (error) {
-    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`, { cause: error });
+  } catch {
+    // Parser diagnostics can quote config contents; expose only the path, never the raw cause.
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`);
   }
   if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
   const { mesh } = document;

@@ -9,6 +9,8 @@ import { main } from "../src/mesh/mesh-backend-cli.js";
 import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "../src/mesh/state-file.js";
 import { MeshStateUnsupportedError, openNodeSqlite, type SqliteConnection, type SqliteOpener, type SqliteStatement } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { pinImportRoot, type RefusalCleanupReport } from "../src/mesh/owned-import-files.js";
+import { openPrivateStateDb } from "../src/mesh/state-gate.js";
 
 // Review 1029: a deterministic randomBytes(16) failure (only the quarantine entry name draws 16 bytes), armed only at
 // the importing refusal; every other call delegates to the real node:crypto.
@@ -236,7 +238,8 @@ type RaceMode = "swap" | "swap-link-eexist" | "gone" | "gone-after-check" | "swa
  * "swap": exactly AFTER an lstat returns the owned inode (or BEFORE a rename of it), the owned file is renamed to
  * moved-away.db and a foreign file is written as state.db. "swap-link-eexist": the same, and after the foreign inode is
  * renamed into a quarantine path a third file takes state.db (a link-back must fail EEXIST). "gone": BEFORE that
- * check or move the owned file is renamed to gone-elsewhere.db. "swap-in-quarantine": exactly AFTER an lstat of the
+ * check or move the owned file is renamed to gone-elsewhere.db ("gone-after-check": after the checks, BEFORE the
+ * rename). "swap"/"swap-link-eexist" fire BEFORE the rename, after the preflight and per-move checks. "swap-in-quarantine": exactly AFTER an lstat of the
  * MOVED entry `<slot>/state.db` returns the owned inode (and so BEFORE any unlink of it), the owned file is renamed to
  * moved-away.db and a foreign file is written at that quarantine path. "occupy" (for a sidecar `name`): BEFORE the
  * first check of `<root>/<name>`, a foreign file takes that name (an existing owned one is renamed to moved-away.db).
@@ -281,7 +284,9 @@ const raceCleanup = (root: string, mode: RaceMode, name = "state.db") => {
     if (mode === "occupy" && race.armed && !race.fired && isRootDb(target)) fire();
     if (mode === "gone" && isRootDb(target) && live()) fire();
     const result = realLstat(target, options);
-    if (rootRace && mode !== "gone" && isRootDb(target) && live() && idOf(result as fs.Stats | undefined) === race.owned) fire();
+    // The root races (swap, swap-link-eexist, gone-after-check) fire in renameSpy, just BEFORE the rename: the cleanup's
+    // preflight lstat now precedes every move, so firing after the first owned lstat would hit the preflight instead
+    // of the check-to-move window these cases target.
     if (mode === "swap-in-quarantine" && race.armed && !race.fired && isQuarantineDb(target)
       && idOf(result as fs.Stats | undefined) === race.owned) fire(String(target));
     return result;
@@ -945,5 +950,302 @@ describe.runIf(process.env.CI === "true" && process.platform === "linux")("hoste
     const done = await run(root, "import");
     expect(done.code, done.err).toBe(0);
     expect((await meshBackendStatus(root)).backend).toBe("sqlite");
+  });
+});
+
+// smarty-dev#11466: a pure in-memory emulation of pinImportRoot's root (no real files, no SQLite, no removal). Every
+// file this run creates must stay held by its own open fd through the database close, until owned.close() closes each
+// exactly once. Ownership compares the HELD fd's fstat against the name's lstat (dev/ino and size/birthtime): a recycled
+// dev/ino with other bytes, a dead held fd or an fstat failure fails closed and keeps every file, logged once.
+describe("emulated held-file ownership", () => {
+  type Node = { dev: number; ino: number; size: number; birth: number; dir: boolean };
+  const ROOT = "/emulated-11466-root";
+  const WAL = "state.db-wal";
+  const SHM = "state.db-shm";
+  const FD0 = 9_000;
+  const errno = (code: string): Error => Object.assign(new Error(`${code}: emulated`), { code });
+  const emulate = (pre: Record<string, Partial<Node>> = {}) => {
+    let nextIno = 200;
+    let clock = 1_000;
+    let nextFd = FD0;
+    const node = (over: Partial<Node> = {}): Node => ({ dev: 7, ino: nextIno++, size: 0, birth: clock++, dir: false, ...over });
+    const rootNode = node({ dir: true });
+    const names = new Map<string, Node>(Object.entries(pre).map(([name, over]) => [name, node(over)]));
+    const fds = new Map<number, Node>();
+    const closes = new Map<number, number>();
+    const m = { names, fds, closes, removals: [] as string[], renames: [] as string[], mkdtemps: 0,
+      fstatFail: undefined as ((n: Node) => Error | undefined) | undefined };
+    const rel = (target: fs.PathLike): string | undefined => {
+      const text = String(target);
+      const proc = /^\/proc\/self\/fd\/(\d+)(?:\/(.*))?$/.exec(text);
+      if (proc && fds.get(Number(proc[1])) === rootNode) return (proc[2] ?? "").replace(/^\.$/, "");
+      if (text === ROOT) return "";
+      return text.startsWith(`${ROOT}/`) ? text.slice(ROOT.length + 1) : undefined;
+    };
+    const at = (name: string): Node | undefined => name === "" ? rootNode : names.get(name);
+    const statOf = (n: Node): fs.Stats => ({ dev: n.dev, ino: n.ino, size: n.size, birthtimeMs: n.birth, birthtime: new Date(n.birth),
+      uid: process.getuid?.(), mode: n.dir ? 0o40700 : 0o100600, isFile: () => !n.dir, isDirectory: () => n.dir, isSymbolicLink: () => false }) as unknown as fs.Stats;
+    const real = { openSync: fs.openSync, fstatSync: fs.fstatSync, closeSync: fs.closeSync, lstatSync: fs.lstatSync, statSync: fs.statSync };
+    // Removal recorders never delegate: any call is recorded and dropped.
+    const record = (api: string) => (target: unknown): void => { m.removals.push(`${api}:${String(target)}`); };
+    vi.spyOn(fs, "unlinkSync").mockImplementation(record("unlinkSync"));
+    vi.spyOn(fs, "rmSync").mockImplementation(record("rmSync"));
+    vi.spyOn(fs, "rmdirSync").mockImplementation(record("rmdirSync"));
+    vi.spyOn(fs.promises, "unlink").mockImplementation(async (target) => record("promises.unlink")(target));
+    vi.spyOn(fs.promises, "rm").mockImplementation(async (target) => record("promises.rm")(target));
+    vi.spyOn(fs.promises, "rmdir").mockImplementation(async (target) => record("promises.rmdir")(target));
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, flags?: number | string, mode?: number) => {
+      const name = rel(target);
+      if (name === undefined) return real.openSync(target, flags as never, mode);
+      let n = at(name);
+      if (n && name !== "" && typeof flags === "number" && (flags & fs.constants.O_EXCL)) throw errno("EEXIST");
+      if (!n) { n = node(); names.set(name, n); }
+      const fd = nextFd++;
+      fds.set(fd, n);
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: never) => {
+      if (fd < FD0) return real.fstatSync(fd, options);
+      const n = fds.get(fd);
+      if (!n) throw errno("EBADF");
+      const failure = n.dir ? undefined : m.fstatFail?.(n);
+      if (failure) throw failure;
+      return statOf(n);
+    }) as typeof fs.fstatSync);
+    vi.spyOn(fs, "closeSync").mockImplementation((fd: number) => {
+      if (fd < FD0) { real.closeSync(fd); return; }
+      closes.set(fd, (closes.get(fd) ?? 0) + 1);
+      if (!fds.delete(fd)) throw errno("EBADF");
+    });
+    const lookup = (fallback: typeof fs.lstatSync) => ((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const name = rel(target);
+      if (name === undefined) return fallback(target, options);
+      const n = at(name);
+      if (n) return statOf(n);
+      if (options?.throwIfNoEntry === false) return undefined;
+      throw errno("ENOENT");
+    }) as typeof fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(lookup(real.lstatSync));
+    vi.spyOn(fs, "statSync").mockImplementation(lookup(real.statSync as typeof fs.lstatSync) as typeof fs.statSync);
+    vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+      const name = rel(prefix);
+      if (name === undefined) throw errno("EACCES");
+      const suffix = `q${m.mkdtemps++}`;
+      names.set(`${name}${suffix}`, node({ dir: true }));
+      return `${prefix}${suffix}`;
+    }) as typeof fs.mkdtempSync);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      const a = rel(from); const b = rel(to);
+      const n = a === undefined ? undefined : names.get(a);
+      if (b === undefined || !n) throw errno("ENOENT");
+      m.renames.push(`${a}->${b}`);
+      names.delete(a!); names.set(b, n);
+    });
+    vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+      const a = rel(from); const b = rel(to);
+      const n = a === undefined ? undefined : names.get(a);
+      if (b === undefined || !n) throw errno("ENOENT");
+      if (names.has(b)) throw errno("EEXIST");
+      names.set(b, n);
+    });
+    return m;
+  };
+  type Model = ReturnType<typeof emulate>;
+  type Owned = ReturnType<typeof pinImportRoot>;
+  /** Pin, create state.db and its sidecars, as the importing run does. */
+  const created = (m: Model) => {
+    const owned = pinImportRoot(ROOT);
+    expect(owned.pinned).toBe(true);
+    expect(owned.create("state.db")).toBe(true);
+    owned.createSidecars();
+    return { owned, db: m.names.get("state.db")!, wal: m.names.get(WAL)!, shm: m.names.get(SHM)! };
+  };
+  /** The emulated DatabaseSync.close(): SQLite drops its sidecar NAMES from the map; open descriptors stay live. */
+  const nativeClose = (m: Model): void => { m.names.delete(WAL); m.names.delete(SHM); };
+  const heldFiles = (m: Model): Node[] => [...m.fds.values()].filter(n => !n.dir);
+  /** owned.close() releases every descriptor, each closed exactly once; nothing was ever removed. */
+  const finish = (m: Model, owned: Owned): void => {
+    owned.close();
+    owned.close();
+    expect(m.fds.size, "descriptors left open after owned.close()").toBe(0);
+    expect([...m.closes.entries()].filter(([, count]) => count !== 1), "every descriptor closed exactly once").toEqual([]);
+    expect(m.removals).toEqual([]);
+  };
+  const keptAll = (m: Model, report: RefusalCleanupReport, kept: Record<string, Node>, reason: RefusalCleanupReport["reason"]): void => {
+    expect(m.renames, "nothing moved").toEqual([]);
+    expect(m.mkdtemps, "no quarantine made").toBe(0);
+    for (const [name, n] of Object.entries(kept)) {
+      expect(m.names.get(name), `${name} kept at its name`).toBe(n);
+      expect(report.retained).toContain(name);
+    }
+    expect(report.reason).toBe(reason);
+    expect(report.cleanupWarnings.length).toBeGreaterThan(0);
+    expect(new Set(report.cleanupWarnings).size, "logged once").toBe(report.cleanupWarnings.length);
+    expect(new Set(report.retained).size, "retained once").toBe(report.retained.length);
+  };
+
+  it("holds an open fd for state.db and each sidecar through the native close", () => {
+    const m = emulate();
+    const { owned, db, wal, shm } = created(m);
+    expect(heldFiles(m), "a held fd per created file").toEqual(expect.arrayContaining([db, wal, shm]));
+    nativeClose(m);
+    expect(heldFiles(m), "held fds outlive the sidecar names").toEqual(expect.arrayContaining([db, wal, shm]));
+    owned.removeAfterRefusal();
+    expect(heldFiles(m), "cleanup keeps the held fds until owned.close()").toEqual(expect.arrayContaining([db, wal, shm]));
+    finish(m, owned);
+  });
+
+  it.each([
+    ["recycled dev/ino with different size and birthtime", (old: Node): Partial<Node> => ({ size: 7, birth: old.birth + 5_000 })],
+    ["recycled dev/ino with the same size but a changed birthtime", (old: Node): Partial<Node> => ({ size: old.size, birth: old.birth + 5_000 })],
+    ["a distinct dev/ino", (): Partial<Node> => ({ dev: 8, size: 7 })],
+  ] as const)("a foreign WAL after the close (%s) keeps the WAL and state.db at their names", (_, foreignOf) => {
+    const m = emulate();
+    const { owned, db, wal } = created(m);
+    nativeClose(m);
+    const foreign: Node = { ...wal, ...foreignOf(wal) };
+    m.names.set(WAL, foreign);
+    const report = owned.removeAfterRefusal();
+    keptAll(m, report, { [WAL]: foreign, "state.db": db }, "not-this-runs-file");
+    finish(m, owned);
+  });
+
+  it.each([
+    ["a dead held fd (EBADF)", "EBADF"],
+    ["an unknown fstat failure", "EIO"],
+  ] as const)("%s at cleanup keeps every file, moves nothing", (_, code) => {
+    const m = emulate();
+    const { owned, db, wal, shm } = created(m);
+    m.fstatFail = () => errno(code);
+    let report: RefusalCleanupReport;
+    try { report = owned.removeAfterRefusal(); }
+    catch (error) { report = owned.keepAfterFailure("cleanup-failed", error); }
+    keptAll(m, report, { [WAL]: wal, [SHM]: shm, "state.db": db }, "cleanup-failed");
+    m.fstatFail = undefined;
+    finish(m, owned);
+  });
+
+  it("this run's untouched files are freed into the reported quarantine, never removed", () => {
+    const m = emulate();
+    const { owned, db, wal, shm } = created(m);
+    const report = owned.removeAfterRefusal();
+    expect(report.reason).toBe("quarantined-after-refusal");
+    for (const name of [WAL, SHM, "state.db"]) expect(m.names.has(name), `${name} freed`).toBe(false);
+    expect(report.retained).toHaveLength(3);
+    for (const entry of report.retained) {
+      expect(entry).toMatch(/^\.import-quarantine-[^/]+\/state\.db(?:-wal|-shm)?-[a-f0-9]{32}$/);
+      expect([db, wal, shm]).toContain(m.names.get(entry));
+    }
+    finish(m, owned);
+  });
+
+  it("after the close unlinked the sidecars, state.db alone is freed into the reported quarantine", () => {
+    const m = emulate();
+    const { owned, db } = created(m);
+    nativeClose(m);
+    const report = owned.removeAfterRefusal();
+    expect(report.reason).toBe("quarantined-after-refusal");
+    expect(report.retained).toHaveLength(1);
+    expect(m.names.get(report.retained[0]!)).toBe(db);
+    expect(m.names.has("state.db")).toBe(false);
+    finish(m, owned);
+  });
+
+  it("an existing name is never claimed", () => {
+    const m = emulate({ [WAL]: { size: 3 } });
+    const existing = m.names.get(WAL)!;
+    const owned = pinImportRoot(ROOT);
+    expect(owned.create(WAL)).toBe(false);
+    expect(owned.createdDb).toBe(false);
+    expect(owned.create("state.db")).toBe(true);
+    owned.createSidecars();
+    const report = owned.removeAfterRefusal();
+    expect(m.names.get(WAL)).toBe(existing);
+    expect(m.names.get("state.db")).toBeDefined();
+    expect(report.retained).toEqual(expect.arrayContaining([WAL, "state.db"]));
+    finish(m, owned);
+  });
+
+  it("a failed close keeps every created-file pin until process death: owned.close releases only the root, once", () => {
+    const m = emulate();
+    const { owned, db, wal, shm } = created(m);
+    const rootFds = [...m.fds.entries()].filter(([, n]) => n.dir).map(([fd]) => fd);
+    expect(rootFds).toHaveLength(1);
+    const report = owned.keepAfterFailure("close-failed", new Error("emulated close failure"));
+    owned.close();
+    owned.close();
+    expect(heldFiles(m), "created-file fds stay live").toEqual(expect.arrayContaining([db, wal, shm]));
+    expect(heldFiles(m)).toHaveLength(3);
+    expect([...m.closes.keys()], "only the root fd was closed").toEqual(rootFds);
+    expect(m.closes.get(rootFds[0]!), "root released once").toBe(1);
+    expect(m.renames).toEqual([]);
+    expect(m.removals).toEqual([]);
+    expect(report.reason).toBe("close-failed");
+    expect(report.cleanupWarnings).toHaveLength(1);
+    const [warning] = report.cleanupWarnings;
+    for (const name of ["state.db", WAL, SHM]) expect(warning).toContain(`${ROOT}/${name}`);
+    expect(warning).toMatch(/fcntl/);
+    expect(warning).toMatch(/process exits/);
+  });
+
+  it("the gate's failed close after a refused open rides on the unchanged refusal; close-failed keeps every pin", () => {
+    const m = emulate();
+    const { owned, db, wal, shm } = created(m);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const realpath = fs.realpathSync;
+    vi.spyOn(fs, "realpathSync").mockImplementation(((p: fs.PathLike) => String(p) === ROOT ? ROOT : realpath(p)) as typeof fs.realpathSync);
+    Object.defineProperty(process, "platform", { value: "darwin" }); // the post-open lstat path, not a platform claim
+    const gate = (closeThrows: boolean): unknown => {
+      const closeError = errno("EIO");
+      const open = (() => {
+        m.names.set("state.db", { ...db, ino: 99_999 }); // swapped after the precheck
+        return { close: () => { if (closeThrows) throw closeError; } } as unknown as SqliteConnection;
+      }) as SqliteOpener;
+      try { openPrivateStateDb(`${ROOT}/state.db`, open); } catch (error) { return { error, closeError }; }
+      throw new Error("the gate did not refuse");
+    };
+    let swapped: { error: Error & { sqliteCloseError?: unknown }; closeError: Error };
+    let clean: { error: Error & { sqliteCloseError?: unknown } };
+    try {
+      clean = gate(false) as typeof clean;
+      m.names.set("state.db", db);
+      swapped = gate(true) as typeof swapped;
+      m.names.set("state.db", db);
+    } finally { Object.defineProperty(process, "platform", platform); }
+    expect("sqliteCloseError" in clean.error, "a successful close carries no marker").toBe(false);
+    expect(swapped.error).toBeInstanceOf(MeshStateUnsupportedError);
+    expect((swapped.error as MeshStateUnsupportedError).code).toBe("FABRIC_MESH_STATE_UNSUPPORTED");
+    expect(swapped.error.message).toBe(`Fabric mesh SQLite state refuses ${ROOT}/state.db: it was replaced while opening`);
+    expect(swapped.error.sqliteCloseError).toBe(swapped.closeError);
+    // The receiver's contract (FenceDb.open's first catch): keepAfterFailure("close-failed", marker), then owned.close().
+    const report = owned.keepAfterFailure("close-failed", swapped.error.sqliteCloseError);
+    const rootFds = [...m.fds.entries()].filter(([, n]) => n.dir).map(([fd]) => fd);
+    owned.close();
+    expect(report.reason).toBe("close-failed");
+    expect(report.cleanupWarnings[0]).toMatch(/EIO: emulated/);
+    expect(heldFiles(m), "created-file pins stay").toEqual(expect.arrayContaining([db, wal, shm]));
+    expect([...m.closes.keys()], "only the root fd was closed").toEqual(rootFds);
+    expect(m.renames).toEqual([]);
+    expect(m.removals).toEqual([]);
+  });
+
+  it("a failed cleanup (not a failed close) still releases every created-file descriptor once", () => {
+    const m = emulate();
+    const { owned } = created(m);
+    owned.keepAfterFailure("cleanup-failed", new Error("emulated cleanup failure"));
+    finish(m, owned);
+  });
+
+  it("a failed fstat of a fresh create closes that descriptor once and claims nothing", () => {
+    const m = emulate();
+    const owned = pinImportRoot(ROOT);
+    m.fstatFail = () => errno("EIO");
+    expect(() => owned.create("state.db")).toThrow(/EIO/);
+    m.fstatFail = undefined;
+    expect(heldFiles(m), "no leaked descriptor").toEqual([]);
+    expect(owned.createdDb).toBe(false);
+    expect(owned.removeAfterRefusal()).toEqual({ cleanupWarnings: [], retained: [] });
+    expect(m.renames).toEqual([]);
+    finish(m, owned);
   });
 });

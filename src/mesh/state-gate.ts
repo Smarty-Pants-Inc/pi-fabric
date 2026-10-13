@@ -178,7 +178,11 @@ const openPinned = (file: string, open: SqliteOpener, validated: fs.Stats): Sqli
     if (!now?.isFile() || now.dev !== validated.dev || now.ino !== validated.ino) throw refuse("it was replaced while opening");
     return tracked(db, `${validated.dev}:${validated.ino}`, path.dirname(name));
   } catch (error) {
-    try { db.close(); } catch { /* best effort */ }
+    try { db.close(); }
+    catch (closeError) {
+      // smarty-dev#11466: a failed close rides on the original error (message, code unchanged) for the caller's cleanup.
+      if (error instanceof Error) { try { Object.assign(error, { sqliteCloseError: closeError }); } catch { /* keep the original */ } }
+    }
     throw error;
   }
 };

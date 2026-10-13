@@ -427,6 +427,11 @@ class FenceDb {
     } catch (error) {
       // A refused state root is a fence failure for the operator too (#846 SEC P2): alarm, then rethrow it as is.
       if (error instanceof MeshStateUnsupportedError) meshFenceAlarm(options, root, error.message);
+      // smarty-dev#11466: the gate's failed close (sqliteCloseError) keeps this run's file pins; the report rides on it.
+      if (owned?.createdDb && error instanceof Error && "sqliteCloseError" in error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", error.sqliteCloseError);
+        Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      }
       throw error;
     }
     try {
@@ -453,7 +458,16 @@ class FenceDb {
       // smarty-dev#9501: a WAL setup refusal on a state.db this run created gets the refusal cleanup; this catch owns the
       // connection, so it knows whether the close succeeded. Anything else keeps the files, as before.
       if (owned?.createdDb && error instanceof MeshStateUnsupportedError) cleanupAfterRefusal(error, owned, () => db.close());
-      else { try { db.close(); } catch { /* closing anyway */ } }
+      else {
+        try { db.close(); }
+        catch (closeError) {
+          // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the report rides on the original error.
+          if (owned?.createdDb && error instanceof Error) {
+            const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+            Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+          } else if (owned?.createdDb) owned.keepAfterFailure("close-failed", closeError);
+        }
+      }
       throw error;
     }
   }
@@ -914,7 +928,17 @@ const cutoverWithFence = (root: string, options: MeshBackendOptions, lock: MeshL
       }
       throw error;
     }
-  } finally { fence.close(); }
+  } finally {
+    try { fence.close(); }
+    catch (closeError) {
+      // smarty-dev#11466: a failed close keeps this run's file pins (close-failed); the same close error is rethrown.
+      if (owned.createdDb && closeError instanceof Error) {
+        const { cleanupWarnings, retained, reason } = owned.keepAfterFailure("close-failed", closeError);
+        Object.assign(closeError, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      } else if (owned.createdDb) owned.keepAfterFailure("close-failed", closeError);
+      throw closeError;
+    }
+  }
 };
 
 /**

@@ -587,3 +587,100 @@ describe("restore to an older release (smarty-dev#3324)", () => {
     dev.emit("session_shutdown", context);
   });
 });
+
+// smarty-dev#8881: AgentSession.dispose() invalidates the captured ctx without session_shutdown.
+describe("self-reload after session disposal", () => {
+  const disposable = (base: Record<string, unknown>) => {
+    let stale = false;
+    const touched: string[] = [];
+    const context: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(base)) {
+      Object.defineProperty(context, key, { get() {
+        if (stale) { touched.push(key); throw new Error("This extension ctx is stale after session replacement or reload."); }
+        return value;
+      } });
+    }
+    return { context, touched, dispose: () => { stale = true; } };
+  };
+
+  it("the idle retry retires without reading a disposed ctx", async () => {
+    vi.useFakeTimers();
+    let busy = 1;
+    const old = release("aaa"), next = release("bbb");
+    activate(old);
+    const { pi, emit, sent } = fakePi();
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => busy, selfReloadConcurrency: () => 0, autoReloadConfigured: () => true,
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href, settingsPath: settingsPath(), reloadTargetUiHold,
+    });
+    const base = fakeContext("s-disposed-retry", { idle: true, pending: false });
+    const isIdle = vi.fn(base.isIdle);
+    const stale = disposable({ ...base, isIdle });
+    selfReload.sessionStart("startup", stale.context as never);
+    activate(next);
+    emit("agent_settled", stale.context);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sent).toEqual([]); // held by busy work: the retry is armed
+    stale.dispose();
+    busy = 0;
+    isIdle.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(isIdle).not.toHaveBeenCalled();
+    expect(stale.touched.filter(key => key !== "hasUI")).toEqual([]);
+    expect(sent).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an automatic reload disposed during slot admission never calls the stale command context", async () => {
+    vi.useFakeTimers();
+    const old = release("disposed-slot-old"), next = release("disposed-slot-next");
+    activate(old);
+    const { pi, commands } = fakePi();
+    const selfReload = installSelfReload(pi as never, {
+      busy: () => 0, selfReloadConcurrency: () => 1, reloadJitterMs: () => 0,
+      autoReloadConfigured: () => true, reloadSlotsDirectory: path.join(dir, "slots"),
+      moduleUrl: pathToFileURL(path.join(old, "dist", "index.js")).href, settingsPath: settingsPath(),
+    });
+    const base = fakeContext("s-disposed-slot", { idle: true, pending: false });
+    const stale = disposable(base);
+    selfReload.sessionStart("startup", stale.context as never);
+    activate(next);
+    const pending = commands.get(SELF_RELOAD_COMMAND)!.handler("auto", stale.context);
+    stale.dispose(); // the lazy slots import is still pending; no shutdown event
+    await expect(pending).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(base.reload).not.toHaveBeenCalled();
+    expect(stale.touched.filter(key => key !== "hasUI")).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a reload-target request whose session is disposed during the lazy profile import is rejected", async () => {
+    const resource = path.join(dir, "code.js");
+    fs.writeFileSync(resource, "export default () => {};\n");
+    fs.writeFileSync(settingsPath(), JSON.stringify({ packages: [process.cwd()], extensions: [resource] }));
+    const listeners = new Map<string, Set<(data: any) => void>>();
+    const events = {
+      on: (topic: string, handler: (data: any) => void) => {
+        const set = listeners.get(topic) ?? new Set(); set.add(handler); listeners.set(topic, set);
+        return () => { set.delete(handler); };
+      },
+      emit: (topic: string, data: unknown) => { for (const handler of listeners.get(topic) ?? []) handler(data); },
+    };
+    const { pi } = fakePi();
+    Object.assign(pi, { events });
+    const selfReload = installSelfReload(pi as never, {
+      moduleUrl: pathToFileURL(path.join(process.cwd(), "src/index.ts")).href,
+      settingsPath: settingsPath(), busy: () => 0, autoReloadConfigured: () => true,
+    });
+    const stale = disposable(fakeContext("s-disposed-target", { idle: true, pending: false }));
+    selfReload.sessionStart("startup", stale.context as never);
+    const result = new Promise<any>(resolve => {
+      const off = events.on("pi-fabric:reload-target:v1:result", reply => { off(); resolve(reply); });
+    });
+    events.emit("pi-fabric:reload-target:v1", { requestId: "disposed", owner: "code", resource,
+      loaded: resource, configured: resource, reason: "bind" });
+    stale.dispose(); // no session_shutdown fires on AgentSession.dispose()
+    expect(await result).toMatchObject({ requestId: "disposed", accepted: false, reason: "session-changed" });
+    expect(stale.touched.filter(key => key !== "hasUI")).toEqual([]);
+  });
+});

@@ -1221,3 +1221,70 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 });
+
+// smarty-dev#8881: AgentSession.dispose() invalidates the controller's captured ctx without
+// session_shutdown; each getter then throws Pi's stale-ctx error from timers and subscriptions.
+describe("FabricUiController after session disposal", () => {
+  const disposable = () => {
+    let stale = false;
+    const touched: string[] = [];
+    const ui = { setWidget: vi.fn(), notify: vi.fn() };
+    const context = {} as ExtensionContext;
+    for (const [key, value] of Object.entries({ mode: "tui", hasUI: true, ui, isIdle: () => true })) {
+      Object.defineProperty(context, key, { get() {
+        if (stale) { touched.push(key); throw new Error("This extension ctx is stale after session replacement or reload."); }
+        return value;
+      } });
+    }
+    return { context, ui, touched, dispose: () => { stale = true; } };
+  };
+
+  it("retires a pending refresh, stale subscriptions and stop() without touching the disposed ctx", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    const controller = new FabricUiController(state);
+    const old = disposable();
+    try {
+      controller.start(old.context);
+      changed();
+      expect(vi.getTimerCount()).toBe(1);
+      old.dispose();
+      const widgetCalls = old.ui.setWidget.mock.calls.length;
+      let timerError: unknown;
+      try { await vi.advanceTimersByTimeAsync(60_001); } catch (error) { timerError = error; }
+      expect(timerError).toBeUndefined();
+      expect(() => changed()).not.toThrow(); // a subscription emission after disposal
+      expect(() => controller.setHostStreaming(true)).not.toThrow();
+      expect(() => controller.stop()).not.toThrow();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(old.ui.notify).not.toHaveBeenCalled();
+      expect(old.ui.setWidget).toHaveBeenCalledTimes(widgetCalls);
+      expect(old.touched.filter(key => key !== "hasUI")).toEqual([]);
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+
+  it("starts cleanly on a new session after the old ctx was disposed, keeping UI refresh", async () => {
+    vi.useFakeTimers();
+    const state = stubState();
+    let changed = () => {};
+    vi.mocked(state.actors.subscribe).mockImplementation(listener => { changed = listener; return () => {}; });
+    const controller = new FabricUiController(state);
+    const old = disposable();
+    const fresh = disposable();
+    try {
+      controller.start(old.context);
+      changed();
+      old.dispose();
+      expect(() => controller.start(fresh.context)).not.toThrow();
+      expect(old.touched.filter(key => key !== "hasUI")).toEqual([]);
+      vi.mocked(state.mainAgentInfo).mockClear();
+      changed();
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(state.mainAgentInfo).toHaveBeenCalledWith(fresh.context);
+      expect(fresh.ui.notify).not.toHaveBeenCalled();
+    } finally { controller.stop(); vi.useRealTimers(); }
+  });
+});

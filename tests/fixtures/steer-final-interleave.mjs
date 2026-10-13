@@ -18,7 +18,7 @@ if (root && path.basename(process.argv[1] ?? "") === "worker.js") {
     fs.appendFileSync(path.join(root, "interleave-log.jsonl"), JSON.stringify({ event: "receipt-before-injection", pid: process.pid }) + "\n");
   };
   fs.openSync = (file, ...args) => {
-    if (!fired && path.basename(String(file)) === "steer.jsonl" && args[0] === "r" && fs.existsSync(armed)) {
+    if (!fired && path.basename(String(file)) === "steer.jsonl" && (args[0] === "r" || (typeof args[0] === "number" && (args[0] & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) === 0)) && fs.existsSync(armed)) {
       const setting = JSON.parse(fs.readFileSync(armed, "utf8"));
       if (setting.mode === "read") {
         fired = true;
@@ -36,7 +36,7 @@ if (root && path.basename(process.argv[1] ?? "") === "worker.js") {
       const setting = JSON.parse(fs.readFileSync(armed, "utf8"));
       if (setting.mode === "inject") {
         fired = true;
-        pauseForReceipt(path.dirname(path.dirname(String(file))));
+        pauseForReceipt(path.dirname(path.dirname(String(file))) + ".ctl");
       }
     }
     return result;

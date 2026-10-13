@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 const root = process.env.STEER_ENDED_ROOT;
 const runDirectory = process.env.PI_FABRIC_AGENT_RUN_DIR;
 const runId = process.env.PI_FABRIC_PARENT_RUN;
+const controlDirectory = path.resolve(runDirectory) + ".ctl";
 const deliveries = process.env.PI_FABRIC_DELIVERY_DIR;
 const log = value => fs.appendFileSync(path.join(root, "fake.jsonl"), JSON.stringify({ pid: process.pid, ...value }) + "\n");
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");
@@ -31,7 +32,7 @@ const recordReceipt = () => {
     receipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text: "AUTHORIZED_FINAL_ANSWER" };
     const temporary = path.join(runDirectory, `.final-answer.${process.pid}.tmp`);
     fs.writeFileSync(temporary, JSON.stringify(receipt));
-    fs.renameSync(temporary, path.join(runDirectory, "final-answer.json"));
+    fs.renameSync(temporary, path.join(controlDirectory, "final-answer.json"));
   }
   log({ type: "receipt", id: receipt.id });
 };
@@ -73,7 +74,7 @@ input.on("line", line => {
     return;
   }
   // Pre-final continuation: the native context hook marks consumption.
-  const file = path.join(runDirectory, "terminal-controls", id + ".json");
+  const file = path.join(controlDirectory, "terminal-controls", id + ".json");
   const control = JSON.parse(fs.readFileSync(file, "utf8"));
   fs.writeFileSync(file, JSON.stringify({ ...control, state: "delivered" }));
   send({ type: "response", id, command: "prompt", success: true });

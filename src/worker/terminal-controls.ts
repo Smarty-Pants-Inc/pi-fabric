@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
+import { withTaskControlDirectory } from "./terminal-answer.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
 export interface TerminalControl {
@@ -16,14 +17,16 @@ const controlFile = (directory: string, id: string): string => {
   if (!validId(id)) throw new Error("Invalid terminal control identity");
   return path.join(directory, "terminal-controls", id + ".json");
 };
-export const trackTerminalControl = (directory: string, control: Omit<TerminalControl, "state">): void => {
-  const file = controlFile(directory, control.id);
+export const trackTerminalControl = (directory: string, control: Omit<TerminalControl, "state">): void => withTaskControlDirectory(directory, pinned => {
+  // The durable atomic writer fsyncs ancestors; /proc is not fsync-able.
+  // Resolve the validated host-owned fd to its canonical namespace for writes.
+  const file = controlFile(fs.realpathSync(pinned), control.id);
   if (fs.existsSync(file)) return; // A replay never resurrects consumed/refused input.
   writeFileAtomic(file, JSON.stringify({ ...control, state: "queued" }), { durable: true });
-};
+});
 export const readTerminalControl = (directory: string, id: string): TerminalControl | undefined => {
   try {
-    const item = JSON.parse(fs.readFileSync(controlFile(directory, id), "utf8"));
+    const item = withTaskControlDirectory(directory, pinned => JSON.parse(fs.readFileSync(controlFile(pinned, id), "utf8")));
     if (item.id === id && ["steer", "followUp"].includes(item.delivery) && ["queued", "delivered", "refused"].includes(item.state)) {
       return { id, delivery: item.delivery, state: item.state, provenance: copyFabricProvenance(item.provenance),
         ...(item.state === "refused" && item.reason === "run-ended" ? { reason: "run-ended" as const } : {}) };
@@ -33,13 +36,12 @@ export const readTerminalControl = (directory: string, id: string): TerminalCont
 };
 export const settleTerminalControl = (directory: string, id: string, state: "delivered" | "refused", reason?: "run-ended"): void => {
   const item = readTerminalControl(directory, id);
-  if (item?.state === "queued") writeFileAtomic(controlFile(directory, id),
-    JSON.stringify({ ...item, state, ...(state === "refused" && reason ? { reason } : {}) }), { durable: true });
+  if (item?.state === "queued") withTaskControlDirectory(directory, pinned => writeFileAtomic(controlFile(fs.realpathSync(pinned), id),
+    JSON.stringify({ ...item, state, ...(state === "refused" && reason ? { reason } : {}) }), { durable: true }));
 };
 export const queuedTerminalControls = (directory: string): TerminalControl[] => {
-  const root = path.join(directory, "terminal-controls");
   try {
-    return fs.readdirSync(root).flatMap(name => {
+    return withTaskControlDirectory(directory, pinned => fs.readdirSync(path.join(pinned, "terminal-controls"))).flatMap(name => {
       if (!name.endsWith(".json") || !validId(name.slice(0, -5))) return [];
       const item = readTerminalControl(directory, name.slice(0, -5));
       return item?.state === "queued" ? [item] : [];

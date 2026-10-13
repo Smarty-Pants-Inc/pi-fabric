@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import principalDelivery from "../src/worker/principal-delivery.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
@@ -23,7 +24,8 @@ const wait = async (check: () => boolean) => {
 async function setup(deadlineMs = 80) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-follow-up-deadline-")); roots.push(root);
   const alarm = vi.fn();
-  const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
+  const manager = new AgentManager(workspace, DEFAULT_FABRIC_CONFIG.agents, {
     runRoot: root, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     onFollowUpAlarm: alarm,
   }); managers.push(manager);
@@ -170,7 +172,7 @@ describe("task follow-up delivery deadlines", () => {
     expect(() => p.manager.cancelFollowUp(p.handle.id, "foreign")).toThrow(/Unknown follow-up/);
   });
   it("rejects invalid delivery deadlines before queue mutation", async () => {
-    const p = await setup(); const file = path.join(p.run, "steer.jsonl");
+    const p = await setup(); const file = taskSteerFile(p.run);
     const before = fs.readFileSync(file, "utf8");
     for (const deadlineMs of [0, -1, NaN, Infinity, 0.5]) {
       expect(() => p.manager.followUp(p.handle.id, "bad", undefined, undefined, { deadlineMs })).toThrow(/deadlineMs/);

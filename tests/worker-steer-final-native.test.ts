@@ -46,7 +46,7 @@ export default function (pi) {
     calls++;
     log({type:"request",calls,messages:context.messages});
     // This is the concrete custody violation a second native turn would cause.
-    if (calls > 1) fs.writeFileSync(path.join(root,"source.ts"),"FORBIDDEN_SOURCE_EDIT");
+    if (calls > 1) fs.writeFileSync(path.join(root,"workspace","source.ts"),"FORBIDDEN_SOURCE_EDIT");
     const events = createAssistantMessageEventStream();
     const message = {role:"assistant",provider:selected.provider,model:selected.id,api:selected.api,timestamp:Date.now(),content:[{type:"text",text:"FINAL_AUTHORIZED_RESULT"}],stopReason:"stop",usage:{input:3,output:4,cacheRead:0,cacheWrite:0,totalTokens:7,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
     events.push({type:"start",partial:message});events.push({type:"done",reason:"stop",message});events.end();
@@ -54,7 +54,7 @@ export default function (pi) {
   };
   pi.registerProvider({id:"final-steer-proof",name:"Offline native proof",auth:{apiKey:{name:"Offline",check:async()=>({type:"api_key",source:"fixture"}),resolve:async()=>({auth:{}})}},getModels:()=>[model],stream,streamSimple:stream});
   const appendAfterFinal = () => {
-    const directory = path.dirname(process.env.PI_FABRIC_DELIVERY_DIR);
+    const directory = path.dirname(process.env.PI_FABRIC_DELIVERY_DIR) + ".ctl";
     const receipt = JSON.parse(fs.readFileSync(path.join(directory,"final-answer.json"),"utf8"));
     const ids = JSON.parse(process.env.FINAL_STEER_PROOF_IDS);
     const sender = {id:"session:native-proof-sender",name:"Native proof sender",kind:"main",verified:"mesh"};
@@ -78,16 +78,17 @@ export default function (pi) {
 describe("real process task steered at its native final report", () => {
   it("retains an undelivered receipt, exits without a new turn, and leaves source unchanged", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-final-steer-"));
+    const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
     const profile = path.join(root, "profile");
     fs.mkdirSync(path.join(profile, "extensions"), { recursive: true });
     fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, defaultProjectTrust: "never" }));
     fs.writeFileSync(path.join(profile, "extensions", "provider.ts"), provider);
-    fs.writeFileSync(path.join(root, "source.ts"), "AUTHORIZED_SOURCE\n");
+    fs.writeFileSync(path.join(workspace, "source.ts"), "AUTHORIZED_SOURCE\n");
     const ids = [randomUUID(), randomUUID()];
     vi.stubEnv("PI_CODING_AGENT_DIR", profile); vi.stubEnv("PI_OFFLINE", "1");
     vi.stubEnv("FINAL_STEER_PROOF_ROOT", root); vi.stubEnv("FINAL_STEER_PROOF_IDS", JSON.stringify(ids));
     const notices: Record<string, any>[] = [];
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30_000, nice: 19, retainRuns: true }, {
+    const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30_000, nice: 19, retainRuns: true }, {
       workerPath: path.resolve(process.env.FABRIC_FINAL_STEER_WORKER ?? "src/worker.ts"),
       piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
       runRoot: path.join(root, "runs"), onTerminalNotice: notice => { notices.push(notice); }, fullCodeMode: false,
@@ -105,7 +106,7 @@ describe("real process task steered at its native final report", () => {
     expect(notices.map(notice => notice.messageId).sort()).toEqual([...ids].sort());
     expect(notices.every(notice => notice.sender?.id === "session:native-proof-sender" && notice.finalAnswerReceiptId === receipt.id)).toBe(true);
     expect(rows(path.join(root, "native.jsonl")).filter(row => row.type === "request")).toHaveLength(1);
-    expect(fs.readFileSync(path.join(root, "source.ts"), "utf8")).toBe("AUTHORIZED_SOURCE\n");
+    expect(fs.readFileSync(path.join(workspace, "source.ts"), "utf8")).toBe("AUTHORIZED_SOURCE\n");
     const pid = rows(path.join(root, "native.jsonl"))[0]!.pid;
     expect(alive(pid)).toBe(false);
     console.log(`REAL_PATH: PASS worker=${process.env.FABRIC_FINAL_STEER_WORKER ?? "src/worker.ts"} root=${root} run=${handle.id} nativePid=${pid} nativeAlive=false providerCalls=1 sourceUnchanged=true refused=${ids.join(",")} finalReceipt=${receipt.id}`);

@@ -13,7 +13,7 @@ import {
 } from "../thinking.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
@@ -100,9 +100,9 @@ import type {
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
-import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { readFinalAnswerReceipt, taskControlDirectory, taskSteerFile, withTaskControlDirectory, FabricTaskControlDirectoryError, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
+import { TerminalNoticeOutbox, appendTerminalAdmission, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
@@ -1520,7 +1520,7 @@ export class AgentManager {
       const statusFile = path.join(runDirectory, "status.json");
       const lifecycleFile = path.join(runDirectory, "lifecycle.jsonl");
       const logFile = path.join(runDirectory, "events.jsonl");
-      const steerFile = path.join(runDirectory, "steer.jsonl");
+      const steerFile = taskSteerFile(runDirectory);
       const schemaFile = request.schema ? path.join(runDirectory, "schema.json") : undefined;
       const imagesFile = request.images && request.images.length > 0
         ? path.join(runDirectory, "images.json")
@@ -1560,6 +1560,8 @@ export class AgentManager {
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(request, this.#parentWritePolicy, agentCwd)
           : undefined;
+        this.#assertTaskControlRoot(runDirectory, agentCwd, writePolicy);
+        mkdirPrivate(taskControlDirectory(runDirectory), this.#trustRoot());
         const parentSessionId = this.#sessionId?.();
         const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
         const lineage: FabricAgentLineage = {
@@ -3097,7 +3099,7 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory);
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
@@ -3302,7 +3304,7 @@ export class AgentManager {
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await removeTree(runDirectory);
+      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory);
       this.#queued.delete(id);
       this.#invalidateUiList();
       return { cleaned: cleaned || !fs.existsSync(runDirectory) };
@@ -3337,7 +3339,7 @@ export class AgentManager {
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
-      await removeTree(managed.runDirectory);
+      await this.#removeRunTree(managed.runDirectory);
     }
     this.#runs.delete(id);
     for (const messageId of this.#followUps.get(id)?.keys() ?? []) this.#clearFollowUpTimer(messageId);
@@ -3540,6 +3542,39 @@ export class AgentManager {
     return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id, managed.finalAnswerResult?.status ?? "final-answer-pending");
   }
 
+  async #removeRunTree(runDirectory: string): Promise<void> {
+    const control = taskControlDirectory(runDirectory);
+    // Remove the paired host metadata first: failure retains the run, and a
+    // later run-removal failure never leaves an orphan control directory.
+    if (fs.existsSync(control)) {
+      withTaskControlDirectory(runDirectory, () => undefined);
+      await removeTree(control);
+    }
+    await removeTree(runDirectory);
+  }
+
+  #assertTaskControlRoot(runDirectory: string, cwd: string, policy: FabricWritePolicy | undefined): void {
+    const control = taskControlDirectory(runDirectory);
+    const physical = (value: string): string => {
+      const resolved = path.resolve(value);
+      let ancestor = resolved;
+      while (!fs.existsSync(ancestor)) ancestor = path.dirname(ancestor);
+      return path.join(fs.realpathSync(ancestor), path.relative(ancestor, resolved));
+    };
+    // The parent controls its children already; only the CHILD's grants must
+    // exclude this sibling. Its TMPDIR is replaced with the private run leaf.
+    const roots = [cwd, path.join(runDirectory, "tmp"), ...(policy?.writableRoots ?? []),
+      ...[".cache", ".npm", ".bun"].map(name => path.join(os.homedir(), name)), "/dev/null", "/dev/tty", "/dev/pts"];
+    try { roots.push(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); }
+    catch { /* A non-Git cwd has no common-Git write grant. */ }
+    for (const root of roots) {
+      const writable = physical(root), target = physical(control);
+      if (target === writable || target.startsWith(writable + path.sep)) {
+        throw new FabricTaskControlDirectoryError(`Task control directory ${control} overlaps writable root ${root}; choose a runRoot outside task write grants`);
+      }
+    }
+  }
+
   #requireSteerAdmission(managed: ManagedAgent, bytes = 0) {
     const index = readTerminalAdmissions(managed.runDirectory);
     if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
@@ -3578,7 +3613,6 @@ export class AgentManager {
         `Fabric agent ${id} already finished (${record.status}); steering has no target`,
       );
     }
-    const steerFile = path.join(managed.runDirectory, "steer.jsonl");
     const messageId = ("followUpId" in entry ? entry.followUpId : undefined) ?? randomUUID();
     const admitted = { ...entry, id: messageId, ts: Date.now() };
     const line = JSON.stringify(admitted) + "\n";
@@ -3593,7 +3627,7 @@ export class AgentManager {
         managed.onOutputPrincipalDowngrade?.();
       }
     }
-    fs.appendFileSync(steerFile, line, { encoding: "utf8", mode: 0o600 });
+    appendTerminalAdmission(managed.runDirectory, line);
     const undelivered = entry.type === "steer" || entry.type === "follow_up"
       ? this.#appendRaceRefusal(managed, messageId, entry.type === "steer" ? "steer" : "followUp") : undefined;
     return {
@@ -3751,7 +3785,7 @@ export class AgentManager {
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
-        .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
+        .map(managed => this.#removeRunTree(managed.runDirectory).catch(() => undefined)));
     }
     // A failed stop is not authority to delete a child's working files.
     if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
@@ -3764,7 +3798,7 @@ export class AgentManager {
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
+            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
@@ -3848,7 +3882,7 @@ export class AgentManager {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
-      await removeTree(managed.runDirectory).catch(() => undefined);
+      await this.#removeRunTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) this.#runs.delete(managed.id);
     }
     if (expired.length > 0) {
@@ -4379,7 +4413,7 @@ export class AgentManager {
     const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
     if (!admission || admission.delivery !== notice.delivery) return;
     try {
-      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
+      const control = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(managed.runDirectory), "terminal-controls", `${notice.messageId}.json`), "utf8"));
       if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     // Worker event fields cannot select the recipient. Verify supplied attribution
@@ -4408,7 +4442,7 @@ export class AgentManager {
     const admissions = readTerminalAdmissions(managed.runDirectory);
     for (const admission of admissions.byId.values()) {
       let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${admission.id}.json`), "utf8")); }
+      try { state = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(managed.runDirectory), "terminal-controls", `${admission.id}.json`), "utf8")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
       // Refused registry entries may already have emitted a worker notice. The

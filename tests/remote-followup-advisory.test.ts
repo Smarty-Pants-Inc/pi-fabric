@@ -8,6 +8,7 @@ import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 
@@ -93,7 +94,7 @@ describe("remote followUp advisory ACK budget (#3005)", () => {
         });
         const data = { unchanged: "payload" };
         const receipt = await sending.invoke("agents.followUp", { id: child.id, message: "later", data }).catch(error => error);
-        const entries = () => fs.readFileSync(path.join(run, "steer.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        const entries = () => fs.readFileSync(taskSteerFile(run), "utf8").trim().split("\n").map(line => JSON.parse(line));
         // Assert the commit even if the sender received a rejection (the original bug).
         expect(entries()).toHaveLength(1);
         expect(entries()[0]).toMatchObject({ type: "follow_up", message: "later", data });

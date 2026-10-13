@@ -9,8 +9,9 @@ import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
-import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
+import { readFinalAnswerReceipt, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
+import { readTerminalAdmissions, terminalControlMatchesAdmission, terminalSenderMatches } from "../agents/terminal-notices.js";
+import { boundedRunTree } from "./reference-scan.js";
 
 export const FABRIC_RUN_ROOT_PREFIX = "pi-fabric-runs-";
 const RUN_ROOT_OWNER_FILE = ".fabric-owner.json";
@@ -262,23 +263,15 @@ const safeFollowUps = (directory: string, expired: Deadline): boolean => {
 /** A refusal journal is not a sender route receipt. Every unconsumed admission
  * needs its retained delivered notice; pending, malformed and linked artifacts veto. */
 const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
-  const answerFile = path.join(root, "final-answer.json");
-  const controls = path.join(root, "terminal-controls"), notices = path.join(root, "terminal-notices");
+  const answerFile = path.join(taskControlDirectory(root), "final-answer.json");
+  const controls = path.join(taskControlDirectory(root), "terminal-controls"), notices = path.join(taskControlDirectory(root), "terminal-notices");
   // Read original native admissions before trusting any worker consumption row.
-  const admissions = new Map<string, TerminalAdmission>();
-  const steering = path.join(root, "steer.jsonl");
-  if (fs.existsSync(steering)) {
-    if (!ownedStat(steering)?.isFile()) return false;
-    for (const line of fs.readFileSync(steering, "utf8").split("\n")) {
-      if (expired()) return false;
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line);
-      if (entry?.type !== "steer" && entry?.type !== "follow_up") continue;
-      const admission = terminalAdmissionFromEntry(entry);
-      if (!admission || admissions.has(admission.id)) return false;
-      admissions.set(admission.id, admission);
-    }
-  }
+  // Legacy/task-written run-dir journals confer no authority and veto cleanup,
+  // without opening their possibly oversized/FIFO content.
+  if (["steer.jsonl", "final-answer.json", "terminal-controls", "terminal-notices"].some(name => fs.existsSync(path.join(root, name)))) return false;
+  const index = readTerminalAdmissions(root);
+  if (index.truncated || expired()) return false;
+  const admissions = index.byId;
   if (!fs.existsSync(answerFile)) {
     if (fs.existsSync(notices) && (!ownedStat(notices)?.isDirectory() || fs.readdirSync(notices).length > 0)) return false;
     if (!fs.existsSync(controls)) return true;
@@ -326,11 +319,12 @@ const safeTerminalArtifacts = (root: string, expired: Deadline): boolean => {
     if (!ownedStat(controls)?.isDirectory()) return false;
     for (const name of fs.readdirSync(controls)) {
       if (expired() || !/^[a-zA-Z0-9_-]{1,200}\.json$/.test(name)) return false;
-      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown }>(path.join(controls, name));
+      const control = readJson<{ id?: string; state?: string; delivery?: string; provenance?: unknown; reason?: unknown }>(path.join(controls, name));
       const id = name.slice(0, -5), admission = admissions.get(id);
       if (!control || !admission || typeof control.id !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(control.id) ||
           !["steer", "followUp"].includes(control.delivery ?? "") || !["queued", "refused", "delivered"].includes(control.state ?? "") ||
-          Object.keys(control).some(key => !["id", "state", "delivery", "provenance"].includes(key)) ||
+          Object.keys(control).some(key => !["id", "state", "delivery", "provenance", "reason"].includes(key)) ||
+          control.reason !== undefined && (control.state !== "refused" || control.reason !== "run-ended") ||
           control.provenance !== undefined && !copyFabricProvenance(control.provenance)) return false;
       if (control.state === "delivered" && terminalControlMatchesAdmission(control, admission)) consumed.add(id);
       else if (!routed.has(id)) return false; // Only the original-attributed refusal discharges mismatched rows.
@@ -368,7 +362,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
       const stat = ownedStat(file);
       if (!stat) return false;
       if (stat.isFile() && (runFile(name) || name === "final-answer.json" || (name === "queued-result.json" && record?.queuedArchiveCommitted === true))) continue;
-      if (stat.isDirectory() && (name === "terminal-controls" || name === "terminal-notices")) continue;
+      if (stat.isDirectory() && name === "tmp") {
+        if (!boundedRunTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
@@ -395,7 +392,10 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        for (const child of fs.readdirSync(file)) {
+          if (child.endsWith(".ctl") && ownedStat(path.join(file, child.slice(0, -4)))?.isDirectory()) continue;
+          if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        }
         continue;
       }
       return false;
@@ -417,7 +417,7 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
       const stat = ownedStat(path.join(root, name));
       if (!stat) return "an entry is a link, hard-linked or not ours";
       const known = stat.isFile() ? runFile(name) || name === "final-answer.json" || name === "queued-result.json"
-        : ["terminal-controls", "terminal-notices", "handoff-session", "follow-ups", "deliveries", "nested"].includes(name);
+        : ["handoff-session", "follow-ups", "deliveries", "nested", "tmp"].includes(name);
       if (!known) return `unknown entry ${name.replace(/[0-9a-f-]{8,}/gi, "<id>")}`;
     }
   } catch { return "run tree unreadable"; }
@@ -430,7 +430,8 @@ export const canRemoveTerminalRun = (directory: string, expired: Deadline = noDe
   return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, acceptPidReuse);
 };
 const safeRootContents = (root: string, childrenStopped: boolean): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped)); }
+  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE ||
+    (name.endsWith(".ctl") && ownedStat(path.join(root, name.slice(0, -4)))?.isDirectory()) || safeRunTree(path.join(root, name), childrenStopped)); }
   catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
@@ -464,7 +465,7 @@ const pruneClosedRunRoot = (
   try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return removed; }
   for (const entry of entries) {
     if (expired()) break;
-    if (!entry.isDirectory()) continue;
+    if (!entry.isDirectory() || entry.name.endsWith(".ctl")) continue;
     const directory = path.join(root, entry.name);
     // Age first: a young run is kept either way, so it needs no full tree walk (smarty-dev#2010).
     const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
@@ -479,7 +480,7 @@ const pruneClosedRunRoot = (
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
-    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
+    if (removeUnreferencedRun(directory, judged, undefined, false, "pruneClosedRunRoot")) removed.push(directory);
   }
   return removed;
 };
@@ -652,7 +653,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.
-      verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
+      removeUnreferencedRun(directory, judged, undefined, false, "sweepTempRunRoots");
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
@@ -1017,6 +1018,13 @@ export const removeUnreferencedRun = (
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
+  const control = taskControlDirectory(directory);
+  if (fs.existsSync(control)) {
+    try { withTaskControlDirectory(directory, () => undefined); } catch { return false; }
+    // Paired host metadata goes first, so an interrupted run removal cannot
+    // strand orphan control metadata. A failed control delete retains the run.
+    if (!verifiedRemove(control, ownedStat(control), { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(), fallback: rmTree(control) }).removed) return false;
+  }
   return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
 };

@@ -13,6 +13,7 @@ import { Agent, type AgentMessage, type QueueMode } from "@earendil-works/pi-age
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import principalDelivery from "../src/worker/principal-delivery.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { CONTROL_STALE_INCARNATION, FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
@@ -47,7 +48,8 @@ const router = (manager: Ports[0], entries: FabricParticipantInfo[] = [], contro
 };
 const running = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-followup-advisory-")); roots.push(root);
-  const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
+  const manager = new AgentManager(workspace, DEFAULT_FABRIC_CONFIG.agents, {
     runRoot: path.join(root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false,
   });
   managers.push(manager);
@@ -59,8 +61,8 @@ const running = async () => {
     expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).status).toBe("running");
   });
   const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-  const entries = () => fs.existsSync(path.join(run, "steer.jsonl"))
-    ? fs.readFileSync(path.join(run, "steer.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  const entries = () => fs.existsSync(taskSteerFile(run))
+    ? fs.readFileSync(taskSteerFile(run), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
   return { root, manager, id: handle.id, statusFile, record, entries };
 };
 const remote = (id: string, status = "running", kind = "agent") => ({ id, kind, status, local: false,

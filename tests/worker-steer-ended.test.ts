@@ -8,7 +8,7 @@ import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { readFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { readFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import { readTerminalControl } from "../src/worker/terminal-controls.js";
 
 // Fixtures are retained under the (scoped) TMPDIR: these tests never delete.
@@ -51,7 +51,7 @@ const setup = () => {
   buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "esm" });
   vi.stubEnv("STEER_ENDED_HELPER", pathToFileURL(helper).href);
   const notices: Record<string, any>[] = [];
-  const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
+  const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
     workerPath: path.resolve(process.env.FABRIC_STEER_ENDED_WORKER ?? "src/worker.ts"), piBinary: fakeSdk(root), runRoot: path.join(root, "runs"),
     fullCodeMode: false, onTerminalNotice: notice => { notices.push(notice as Record<string, any>); },
   }); managers.push(manager);
@@ -79,7 +79,7 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     expect(receipt).toBeDefined();
     // Raw manager-format appends racing the receipt (manager ingress would already refuse).
     const lateSteer = randomUUID(); const lateFollow = randomUUID();
-    const steerFile = path.join(directory, "steer.jsonl");
+    const steerFile = taskSteerFile(directory);
     fs.appendFileSync(steerFile, JSON.stringify({ type: "steer", message: "WRITE SOURCE_WRITE_SENTINEL", provenance, id: lateSteer, ts: Date.now() }) + "\n");
     fs.appendFileSync(steerFile, JSON.stringify({ type: "follow_up", message: "WRITE SOURCE_WRITE_SENTINEL", provenance: { ...provenance, via: "followUp" }, id: lateFollow, ts: Date.now() }) + "\n");
 
@@ -118,7 +118,7 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     const entry = { id, type: "steer", message: "WRITE SOURCE_WRITE_SENTINEL", provenance, ts: Date.now() };
     // Arm before the next poll. 'read' records a size snapshot of zero, appends,
     // then blocks the real worker until the other process publishes its receipt.
-    fs.writeFileSync(path.join(directory, "steer.jsonl"), "");
+    fs.writeFileSync(taskSteerFile(directory), "");
     fs.writeFileSync(path.join(s.root, "interleave.json"), JSON.stringify({ mode, entry }));
     const messageId = mode === "read" ? id : s.manager.steer(handle.id, entry.message, undefined, provenance).messageId;
     await until(() => readTerminalControl(directory, messageId)?.state === "refused");
@@ -142,7 +142,7 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     // Proves the sentinel is live: without the worker fence, the fake obeys.
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "worker-steer-ended-counter-"));
     const runDirectory = path.join(root, "run"); const deliveries = path.join(root, "deliveries"); const workspace = path.join(root, "workspace");
-    for (const dir of [runDirectory, deliveries, workspace]) fs.mkdirSync(dir);
+    for (const dir of [runDirectory, taskControlDirectory(runDirectory), deliveries, workspace]) fs.mkdirSync(dir, { mode: 0o700 });
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveries, id + ".json"), JSON.stringify({ message: "LATE", delivery: "steer", controlId: id }));
     const child = spawnProcess(process.execPath, [fixture], { cwd: workspace, stdio: ["pipe", "ignore", "inherit"],

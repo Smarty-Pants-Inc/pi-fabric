@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import type { AgentTerminalNotice, AgentUndeliveredMessage } from "./terminal-target.js";
+import { readFinalAnswerReceipt, taskControlDirectory, withTaskControlDirectory } from "../worker/terminal-answer.js";
+import { FabricSteerAdmissionLimitError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
@@ -55,27 +55,44 @@ export interface TerminalAdmissionIndex {
 // Bounded cache, invalidated by the journal's exact native identity/version.
 // One streaming pass is reused by scan, recovery, routing and receipt views.
 const admissionCache = new Map<string, { signature: string; index: TerminalAdmissionIndex }>();
-const signature = (file: string): string => {
-  const s = fs.statSync(file, { bigint: true });
-  return `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+const signature = (s: fs.BigIntStats): string => `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+export class FabricSteerJournalError extends Error {
+  override readonly name = "FabricSteerJournalError";
+  readonly code = "FABRIC_STEER_JOURNAL_INVALID";
+}
+const requireJournal = (fd: number): fs.BigIntStats => {
+  const stat = fs.fstatSync(fd, { bigint: true });
+  if (!stat.isFile() || stat.nlink !== 1n || (process.getuid && stat.uid !== BigInt(process.getuid()))) {
+    throw new FabricSteerJournalError("Steering journal must be an owned regular file with one link");
+  }
+  return stat;
 };
+export const appendTerminalAdmission = (directory: string, line: string): void => withTaskControlDirectory(directory, control => {
+  // Recheck at the actual write too: a host downgrade hook may re-enter admission.
+  const index = readTerminalAdmissions(directory), bytes = Buffer.byteLength(line);
+  if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
+    throw new FabricSteerAdmissionLimitError(path.basename(directory), MAX_STEER_CONTROLS, MAX_STEER_BYTES);
+  }
+  const fd = fs.openSync(path.join(control, "steer.jsonl"), fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT |
+    (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0), 0o600);
+  try { requireJournal(fd); fs.appendFileSync(fd, line, "utf8"); }
+  finally { fs.closeSync(fd); }
+});
 const cacheIndex = (directory: string, version: string, index: TerminalAdmissionIndex): void => {
   admissionCache.delete(directory);
   if (admissionCache.size >= 64) admissionCache.delete(admissionCache.keys().next().value!);
   admissionCache.set(directory, { signature: version, index });
 };
 export const readTerminalAdmissions = (directory: string): TerminalAdmissionIndex => {
-  const file = path.join(directory, "steer.jsonl");
   const empty = (): TerminalAdmissionIndex => ({ byId: new Map(), controls: 0, bytes: 0, truncated: false });
-  let version: string;
-  try { version = signature(file); }
-  catch (error) { admissionCache.delete(directory); if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty(); throw error; }
-  const cached = admissionCache.get(directory);
-  if (cached?.signature === version) return cached.index;
-  const index = empty();
-  const fd = fs.openSync(file, "r");
+  try { return withTaskControlDirectory(directory, control => {
+  const fd = fs.openSync(path.join(control, "steer.jsonl"), fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
   try {
-    index.bytes = fs.fstatSync(fd).size;
+    const stat = requireJournal(fd), version = signature(stat);
+    const cached = admissionCache.get(directory);
+    if (cached?.signature === version) return cached.index;
+    const index = empty();
+    index.bytes = Number(stat.size);
     index.truncated = index.bytes > MAX_STEER_BYTES;
     const buffer = Buffer.alloc(16 * 1024);
     let offset = 0, remainder = Buffer.alloc(0), skipping = false;
@@ -105,17 +122,24 @@ export const readTerminalAdmissions = (directory: string): TerminalAdmissionInde
       if (remainder.length > MAX_STEER_ENTRY_BYTES) { remainder = Buffer.alloc(0); skipping = true; index.truncated = true; }
     }
     if (remainder.length || skipping) index.truncated = true; // incomplete/oversized ingress fails closed
+    // Never cache a pass across a concurrent append/replacement.
+    if (signature(requireJournal(fd)) === version) cacheIndex(directory, version, index);
+    return index;
   } finally { fs.closeSync(fd); }
-  // Never cache a pass across a concurrent append/replacement.
-  if (signature(file) === version) cacheIndex(directory, version, index);
-  return index;
+  }); } catch (error) {
+    admissionCache.delete(directory);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
+    const refused = error instanceof FabricSteerJournalError ? error : new FabricSteerJournalError(`Cannot safely open steering journal: ${String(error)}`);
+    console.warn(`[pi-fabric] ${refused.code}: ${refused.message}`);
+    throw refused;
+  }
 };
 export const readTerminalAdmission = (directory: string, id: string): TerminalAdmission | undefined => readTerminalAdmissions(directory).byId.get(id);
 
 const retainedNotice = (directory: string, admission: TerminalAdmission, receiptId: string): AgentTerminalNotice | undefined => {
   for (const suffix of [".json.delivered", ".json"]) {
     try {
-      const notice = JSON.parse(fs.readFileSync(path.join(directory, "terminal-notices", admission.id + suffix), "utf8"));
+      const notice = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(directory), "terminal-notices", admission.id + suffix), "utf8"));
       if (notice?.code === "FABRIC_TARGET_TERMINAL" && notice.targetId === path.basename(directory) && notice.finalAnswerReceiptId === receiptId &&
           notice.messageId === admission.id && notice.delivery === admission.delivery && terminalSenderMatches(notice.sender, admission.sender)) return notice;
     } catch { /* An uncertain notice never establishes a refusal. */ }
@@ -151,7 +175,7 @@ export class TerminalNoticeOutbox {
   constructor(readonly deliver?: (notice: AgentTerminalNotice) => void | Promise<void>) {}
 
   retain(directory: string, notice: AgentTerminalNotice, route = true): void {
-    const file = path.join(directory, "terminal-notices", `${notice.messageId}.json`);
+    const file = path.join(taskControlDirectory(directory), "terminal-notices", `${notice.messageId}.json`);
     if (fs.existsSync(`${file}.delivered`)) return;
     writeJsonAtomic(file, notice, { durable: true });
     if (notice.delivery === "followUp" && /^[0-9a-f-]{36}$/.test(notice.messageId)) {
@@ -175,7 +199,7 @@ export class TerminalNoticeOutbox {
       const index = readTerminalAdmissions(directory);
       for (const admission of index.byId.values()) {
         let state: { state?: string } | undefined;
-        try { state = JSON.parse(fs.readFileSync(path.join(directory, "terminal-controls", `${admission.id}.json`), "utf8")); }
+        try { state = JSON.parse(fs.readFileSync(path.join(taskControlDirectory(directory), "terminal-controls", `${admission.id}.json`), "utf8")); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
         this.retain(directory, { code: "FABRIC_TARGET_TERMINAL", targetId: receipt.runId,
@@ -189,7 +213,7 @@ export class TerminalNoticeOutbox {
   hasPending(directory: string): boolean {
     let entries: fs.Dir | undefined;
     try {
-      entries = fs.opendirSync(path.join(directory, "terminal-notices"));
+      entries = fs.opendirSync(path.join(taskControlDirectory(directory), "terminal-notices"));
       for (let count = 0; count <= MAX_STEER_CONTROLS * 2; count++) {
         const entry = entries.readSync();
         if (!entry) return false;
@@ -202,7 +226,7 @@ export class TerminalNoticeOutbox {
 
   route(directory: string): void {
     if (!this.deliver) return;
-    const outbox = path.join(directory, "terminal-notices");
+    const outbox = path.join(taskControlDirectory(directory), "terminal-notices");
     const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
     if (!receipt) return;
     const index = readTerminalAdmissions(directory);

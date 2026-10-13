@@ -23,6 +23,7 @@ import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
@@ -37,9 +38,10 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const fixture = (retention: Partial<ResidentHostConfig["retention"]> = {}, canonicalRoot = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-host-review-"));
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const config: ResidentHostConfig = {
     format: RESIDENT_HOST_FORMAT, rootId: "session:review", sessionId: "review",
-    cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"),
+    cwd: workspace, projectRoot: workspace, meshRoot: path.join(root, "mesh"),
     actorRoot: path.join(root, "actors"), residencyRoot: canonicalRoot ? residentRoot(path.join(root, "mesh"), "session:review") : path.join(root, "resident"),
     fullCodeMode: true, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: { ...DEFAULT_FABRIC_CONFIG.retention, ...retention }, workerPath: path.resolve("dist/agents/worker.js"),
@@ -1077,7 +1079,7 @@ describe("resident host ownership", () => {
       const command = host.mesh.read({ topic: "fabric.control.command", limit: 10 })[0]!;
       await host.mesh.publish({ topic: command.topic, kind: command.kind, from: command.from, to: command.to!, data: command.data });
       await vi.waitFor(() => expect(host.mesh.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(2));
-      const entries = fs.readFileSync(path.join(host.agents.runDirectory(child.id)!, "steer.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const entries = fs.readFileSync(taskSteerFile(host.agents.runDirectory(child.id)!), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(entries).toHaveLength(1); expect(entries[0]).toMatchObject({ type: "follow_up", message: "later" });
       expect(entries[0]).not.toHaveProperty("warning");
       for (const ack of host.mesh.read({ topic: "fabric.control.ack", limit: 10 })) expect(ack.data).toMatchObject({ accepted: true, warning });

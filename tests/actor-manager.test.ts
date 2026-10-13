@@ -15,6 +15,7 @@ import type { FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { createMeshGrant, postWithMeshGrant } from "../src/mesh/grants.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { closeWithActors } from "../src/actors/close-order.js";
@@ -5622,11 +5623,13 @@ describe("ActorManager steering relay", () => {
     const meshPath = path.join(shared, "mesh");
     const meshA = new MeshStore(meshPath, 64 * 1024, 100);
     const meshB = new MeshStore(meshPath, 64 * 1024, 100);
-    const agentsA = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const workspaceA = path.join(shared, "workspaceA"), workspaceB = path.join(shared, "workspaceB");
+    fs.mkdirSync(workspaceA); fs.mkdirSync(workspaceB);
+    const agentsA = new AgentManager(workspaceA, DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: fakeWorker,
       runRoot: path.join(shared, "runsA"),
     });
-    const agentsB = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const agentsB = new AgentManager(workspaceB, DEFAULT_FABRIC_CONFIG.agents, {
       workerPath: fakeWorker,
       runRoot: path.join(shared, "runsB"),
     });
@@ -5656,7 +5659,7 @@ describe("ActorManager steering relay", () => {
     const handle = await agentsA.spawn({ task: "HANG", transport: "process" });
     const remote = await actorsB.steerRemote(handle.id, "redirect from B", "steer");
     expect(remote).toEqual({ queued: true, messageId: expect.any(String), routed: "mesh" });
-    const steerFile = path.join(agentsA.runDirectory(handle.id)!, "steer.jsonl");
+    const steerFile = taskSteerFile(agentsA.runDirectory(handle.id)!);
     await waitFor(
       () => fs.existsSync(steerFile) && fs.readFileSync(steerFile, "utf8").includes("redirect from B"),
       3_000,

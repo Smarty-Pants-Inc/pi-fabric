@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { taskSteerFile } from "../src/worker/terminal-answer.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { MainAgentController } from "../src/main-agent.js";
@@ -21,13 +22,14 @@ const root = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "principa
 const waitFor = (check: () => void) => vi.waitFor(check, { timeout: 10_000, interval: 20 });
 const fixture = (dir = root(), ownership = { owned: true }) => {
   const pi = { hostCapabilities: { turnProvenance: 1 }, sendMessage: vi.fn(), sendUserMessage: vi.fn(), on: vi.fn() };
-  const context = { cwd: process.cwd(), isIdle: () => false, hasPendingMessages: () => false,
+  const workspace = path.join(dir, "workspace"); fs.mkdirSync(workspace, { recursive: true });
+  const context = { cwd: workspace, isIdle: () => false, hasPendingMessages: () => false,
     sessionManager: { getSessionId: () => "security", getEntries: () => [], getBranch: () => [], isPersisted: () => false } } as unknown as ExtensionContext;
-  const main = new MainAgentController(pi as any, identity.id, true, process.cwd(), "security");
+  const main = new MainAgentController(pi as any, identity.id, true, workspace, "security");
   main.attachFollowUpDrain(context, 120_000, path.join(dir, "main-followups.json"));
   cleanup.push(() => main.closeFollowUpDrain());
   const mesh = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+  const agents = new AgentManager(workspace, DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker-principal-recovery.mjs"), runRoot: path.join(dir, "runs"),
   });
   cleanup.push(() => agents.close());
@@ -75,7 +77,7 @@ describe("round-three cumulative activation lineage (#821 F3)", () => {
       expect(first.agents.outputPrincipal(id)).toEqual(A);
       const append = fs.appendFileSync.bind(fs);
       const spy = vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
-        if (String(file).endsWith("steer.jsonl")) expect.soft(queue(first.dir, actor.id)[0].provenance?.principal, "downgrade persisted before steering admission").toBeUndefined();
+        if (typeof file === "number" ? fs.fstatSync(file).ino === fs.statSync(taskSteerFile(first.agents.runDirectory(id)!)).ino : String(file).endsWith("steer.jsonl")) expect.soft(queue(first.dir, actor.id)[0].provenance?.principal, "downgrade persisted before steering admission").toBeUndefined();
         return append(file, data, options);
       });
       first.agents[method](id, "FOREIGN_INPUT", undefined, fabricTurnProvenance(sender, method, "mesh", origin === "B" ? B : undefined));
@@ -137,7 +139,7 @@ describe("round-three cumulative activation lineage (#821 F3)", () => {
     });
     expect.soft(() => h.agents.steer(id, "REJECTED_FOREIGN", undefined, fabricTurnProvenance(sender, "steer", "mesh", origin === "B" ? B : undefined))).toThrow(/persist|downgrade/);
     spy.mockRestore();
-    const steer = path.join(h.agents.runDirectory(id)!, "steer.jsonl");
+    const steer = taskSteerFile(h.agents.runDirectory(id)!);
     expect.soft(fs.existsSync(steer) ? fs.readFileSync(steer, "utf8") : "").not.toContain("REJECTED_FOREIGN");
     // A retry from A cannot upgrade the conservative in-memory downgrade.
     h.agents.followUp(id, "A_AGAIN", undefined, fabricTurnProvenance(sender, "followUp", "mesh", A));

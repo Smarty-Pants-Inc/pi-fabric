@@ -10,13 +10,14 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { saveFinalAnswerReceipt, taskControlDirectory } from "../src/worker/terminal-answer.js";
 
 beforeEach(() => installInProcessResidentFence());
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-terminal-"));
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const config: ResidentHostConfig = { format: RESIDENT_HOST_FORMAT, rootId: "session:terminal-root", sessionId: "terminal-root",
-    cwd: process.cwd(), projectRoot: process.cwd(), meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
+    cwd: workspace, projectRoot: workspace, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
     fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true }, mesh: DEFAULT_FABRIC_CONFIG.mesh,
     retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("src/index.ts"),
     piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" } };
@@ -72,7 +73,7 @@ describe("resident ordinary-task terminal notices", () => {
       const queued = await sender.request(f.host.hostId, task.id, "steer", { message: "stale queued assignment" }, f.host.identity.id);
       const { receipt, run } = await freeze(f.host, task.id);
       await f.host.agents.wait(task.id, { timeoutMs: 3000 });
-      const noticeFile = path.join(run, "terminal-notices", `${queued.messageId}.json`);
+      const noticeFile = path.join(taskControlDirectory(run), "terminal-notices", `${queued.messageId}.json`);
       await vi.waitFor(() => expect(fs.existsSync(noticeFile)).toBe(true));
       expect(accepted).toHaveLength(0);
       peerDirectory.registerSource(() => [{ format: 1, id: who.id, kind: "root", rootId: who.id, ownerHostId: who.id, ownerIdentityId: who.id,

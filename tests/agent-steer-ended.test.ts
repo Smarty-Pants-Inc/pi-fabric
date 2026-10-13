@@ -6,7 +6,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
-import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
+import { saveFinalAnswerReceipt, taskControlDirectory, taskSteerFile } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { MAX_STEER_BYTES, MAX_STEER_CONTROLS, MAX_PUBLIC_REFUSALS, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
@@ -20,9 +20,10 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-const harness = () => {
+const harness = (retainRuns = true) => {
   const notices: AgentTerminalNotice[] = [];
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "steer-ended-"));
+  const workspace = path.join(root, "workspace"); fs.mkdirSync(workspace);
   const records = new Map<string, AgentRunRecord>();
   const closures = new Map<string, () => void>();
   const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
@@ -41,7 +42,7 @@ const harness = () => {
     return { kind: "process", sessionId: "99999999", closed, stopDebt: () => undefined,
       waitForClose: () => closed, isAlive: async () => alive, stop: async () => { await closed; } };
   });
-  const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns: true },
+  const manager = new AgentManager(workspace, { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0, retainRuns },
     { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, onTerminalNotice: notice => { notices.push(notice); } });
   managers.push(manager);
   const finish = (id: string, text: string) => {
@@ -64,12 +65,12 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     const { manager, root, launch, records, notices, finish, close } = harness();
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const directory = path.join(root, handle.id);
-    const steerFile = path.join(directory, "steer.jsonl");
+    const steerFile = taskSteerFile(directory);
     const append = fs.appendFileSync;
     let receipt: ReturnType<typeof finish> | undefined;
     vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: string | Uint8Array, options?: fs.WriteFileOptions) => {
       // The pre-checks passed; the worker records its immutable final answer while this input is being appended.
-      if (file === steerFile && !receipt) receipt = finish(handle.id, "done");
+      if (typeof file === "number" && fs.fstatSync(file).ino === fs.statSync(steerFile).ino && !receipt) receipt = finish(handle.id, "done");
       return append(file, data, options);
     }) as typeof fs.appendFileSync);
     const sent = kind === "steer"
@@ -85,13 +86,13 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     // The parent consumes the result; it reports the same refusal, still without native exit.
     const result = await manager.wait(handle.id, { timeoutMs: 1000 });
     expect(result).toMatchObject({ status: "completed", text: "done", undeliveredMessages: [expected] });
-    await waitUntil(() => fs.existsSync(path.join(directory, "terminal-notices", `${sent.messageId}.json.delivered`)));
+    await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(directory), "terminal-notices", `${sent.messageId}.json.delivered`)));
     expect(notices).toEqual([{ code: "FABRIC_TARGET_TERMINAL", targetId: handle.id, finalAnswerReceiptId: receipt!.id,
       messageId: sent.messageId, delivery: kind, sender }]);
     // No new turn, no relaunch, and the final answer source is untouched.
     expect(launch).toHaveBeenCalledTimes(1);
     expect(records.get(handle.id)!.turns).toBe(1);
-    expect(fs.readFileSync(path.join(directory, "final-answer.json"), "utf8")).toContain("done");
+    expect(fs.readFileSync(path.join(taskControlDirectory(directory), "final-answer.json"), "utf8")).toContain("done");
     close(handle.id);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(notices).toHaveLength(1);
@@ -107,7 +108,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     expect(manager.hasRunCustody(handle.id)).toBe(true);
     expect(manager.status(handle.id).undeliveredMessages).toEqual([{ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended",
       messageId: sent.messageId, delivery: "steer", finalAnswerReceiptId: receipt.id, sender }]);
-    await waitUntil(() => fs.existsSync(path.join(root, handle.id, "terminal-notices", `${sent.messageId}.json.delivered`)));
+    await waitUntil(() => fs.existsSync(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices", `${sent.messageId}.json.delivered`)));
     expect(notices.map(notice => notice.sender)).toEqual([sender]);
   });
 
@@ -116,7 +117,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const sent = manager.steer(handle.id, "consumed before final", undefined, provenance);
     expect(sent.undelivered).toBeUndefined();
-    writeJsonAtomic(path.join(root, handle.id, "terminal-controls", `${sent.messageId}.json`),
+    writeJsonAtomic(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-controls", `${sent.messageId}.json`),
       { id: sent.messageId, delivery: "steer", state: "delivered", provenance });
     finish(handle.id, "done");
     expect(manager.status(handle.id).undeliveredMessages).toBeUndefined();
@@ -124,7 +125,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     close(handle.id);
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(notices).toEqual([]);
-    expect(fs.existsSync(path.join(root, handle.id, "terminal-notices"))).toBe(false);
+    expect(fs.existsSync(path.join(taskControlDirectory(path.join(root, handle.id)), "terminal-notices"))).toBe(false);
   });
 
   it("5,000 small requests stay bounded: every excess request is typed, every admitted refusal reaches its original sender", async () => {
@@ -144,14 +145,14 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     }
     expect(admitted).toHaveLength(MAX_STEER_CONTROLS);
     expect(refused).toBe(5000 - MAX_STEER_CONTROLS);
-    expect(fs.statSync(path.join(directory, "steer.jsonl")).size).toBeLessThan(MAX_STEER_BYTES);
+    expect(fs.statSync(taskSteerFile(directory)).size).toBeLessThan(MAX_STEER_BYTES);
     // Deadline refusal happens before any follow-up payload is created.
     expect(() => manager.followUp(handle.id, "overflow", undefined, provenance, { deadlineMs: 60000 })).toThrow(FabricSteerAdmissionLimitError);
     expect(fs.existsSync(path.join(directory, "follow-ups"))).toBe(false);
     finish(handle.id, "done");
     const read = fs.readFileSync;
     const journalReads = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: any[]) => {
-      if (file === path.join(directory, "steer.jsonl")) throw new Error("unbounded admission read");
+      if (file === taskSteerFile(directory)) throw new Error("unbounded admission read");
       return (read as any)(file, ...args);
     }) as typeof fs.readFileSync);
     const streaming = vi.spyOn(fs, "readSync");
@@ -162,7 +163,7 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     expect(new Set(notices.map(notice => notice.messageId))).toEqual(new Set(admitted));
     expect(notices.every(notice => notice.sender?.id === sender.id)).toBe(true);
     // One <=1MiB stream pass shared by scan, view and routing, not N full reads.
-    expect(streaming.mock.calls.length).toBeLessThanOrEqual(Math.ceil(fs.statSync(path.join(directory, "steer.jsonl")).size / (16 * 1024)) + 1);
+    expect(streaming.mock.calls.length).toBeLessThanOrEqual(Math.ceil(fs.statSync(taskSteerFile(directory)).size / (16 * 1024)) + 1);
     journalReads.mockRestore(); streaming.mockRestore();
     const elapsedMs = performance.now() - started, heapGrowth = process.memoryUsage().heapUsed - heap;
     expect(elapsedMs).toBeLessThan(20000);
@@ -171,13 +172,45 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
       total: status.undeliveredMessagesTotal, truncated: status.undeliveredMessagesTruncated, elapsedMs, heapGrowth }));
   }, 30000);
 
+  it("records paired ctl/run cleanup together without deleting either fixture", async () => {
+    const { manager, root, finish, close } = harness(false);
+    const handle = await manager.spawn({ task: "paired cleanup", transport: "process" });
+    finish(handle.id, "done"); await manager.wait(handle.id, { timeoutMs: 1000 }); close(handle.id);
+    const remove = vi.spyOn(fs.promises, "rm").mockResolvedValue(undefined);
+    // Join the owning close barrier, not registry presence or final-result settlement.
+    await manager.close();
+    const directory = path.join(root, handle.id);
+    expect(remove.mock.calls.map(call => call[0])).toContain(taskControlDirectory(directory));
+    expect(remove.mock.calls.map(call => call[0])).toContain(directory);
+    expect(fs.existsSync(directory)).toBe(true); expect(fs.existsSync(taskControlDirectory(directory))).toBe(true);
+    remove.mockRestore();
+  });
+
+  it("fails launch closed with a typed error when the ctl sibling overlaps the task cwd", async () => {
+    const { manager, root, launch } = harness();
+    await expect(manager.spawn({ task: "unsafe custom root", transport: "process", cwd: root })).rejects.toMatchObject({
+      name: "FabricTaskControlDirectoryError", code: "FABRIC_TASK_CONTROL_UNSAFE", message: expect.stringContaining("overlaps writable root"),
+    });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("allows a trusted parent run to contain its child's control sibling outside the child's own grants", async () => {
+    const { manager, root, launch } = harness();
+    vi.stubEnv("PI_FABRIC_AGENT_RUN_DIR", root);
+    try {
+      const handle = await manager.spawn({ task: "nested caller", transport: "process" });
+      expect(handle.id).toBeTruthy();
+      expect(launch).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("enforces the durable byte bound and fails closed on an oversized retained journal", async () => {
     const { manager, root } = harness();
     const handle = await manager.spawn({ task: "byte admission", transport: "process" });
     const directory = path.join(root, handle.id);
     for (let i = 0; i < 16; i++) manager.steer(handle.id, "x".repeat(63000), undefined, provenance);
     expect(() => manager.steer(handle.id, "x".repeat(63000), undefined, provenance)).toThrow(FabricSteerAdmissionLimitError);
-    const file = path.join(directory, "steer.jsonl");
+    const file = taskSteerFile(directory);
     expect(fs.statSync(file).size).toBeLessThanOrEqual(MAX_STEER_BYTES);
     // Retained data, not a volatile counter, establishes the bound on resume.
     fs.appendFileSync(file, "x".repeat(MAX_STEER_BYTES));
@@ -195,6 +228,6 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     await manager.wait(handle.id, { timeoutMs: 1000 });
     expect(() => manager.followUp(handle.id, "late")).toThrow(expect.objectContaining({ code: "FABRIC_TARGET_TERMINAL",
       reason: "run-ended", runState: "completed", message: expect.stringMatching(/run ended \(completed\)/) }));
-    expect(fs.existsSync(path.join(root, handle.id, "steer.jsonl"))).toBe(false); // nothing was admitted
+    expect(fs.existsSync(taskSteerFile(path.join(root, handle.id)))).toBe(false); // nothing was admitted
   });
 });

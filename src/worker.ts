@@ -661,6 +661,9 @@ const main = async (): Promise<void> => {
     options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
   );
   // Native session metadata belongs to this child, never its parent/resident host.
+  const childTmp = path.join(path.dirname(options.statusFile), "tmp");
+  mkdirPrivate(childTmp, runRoot);
+  childEnvironment.TMPDIR = childTmp;
   delete childEnvironment.PI_SESSION_ID;
   delete childEnvironment.PI_SESSION_FILE;
   delete childEnvironment.PI_FABRIC_ACTOR_BASH_TIMEOUT_S;
@@ -1018,8 +1021,8 @@ const main = async (): Promise<void> => {
   const injectPiControl = (frame: string, controlId?: string): void => {
     if (!persistentPiTask || !piRetrySdk) { child.stdin?.write(frame); return; }
     const directory = path.dirname(options.statusFile);
-    const ended = withTaskFinalAnswerLock(directory, () => {
-      const receipt = finalAnswerReceipt ?? readFinalAnswerReceipt(directory, options.id);
+    const ended = withTaskFinalAnswerLock(directory, readReceipt => {
+      const receipt = finalAnswerReceipt ?? readReceipt(options.id);
       if (!receipt) child.stdin?.write(frame);
       return receipt;
     });
@@ -2161,12 +2164,14 @@ const main = async (): Promise<void> => {
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
     try {
-      descriptor = fs.openSync(options.steerFile, "r");
+      descriptor = fs.openSync(options.steerFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
     } catch {
       return;
     }
     try {
-      const size = fs.fstatSync(descriptor).size;
+      const journal = fs.fstatSync(descriptor);
+      if (!journal.isFile() || journal.nlink !== 1) throw new Error("Steering journal is not an owned regular control file");
+      const size = journal.size;
       if (size < steerOffset) {
         steerOffset = 0;
         steerRemainder = Buffer.alloc(0);

@@ -227,8 +227,8 @@ interface ManagedActor {
   principalScope?: FabricScope;
   latestActivationSequence: number;
   sessionFile: string;
-  /** Last measured use of this session; persisted so the 80% reset survives a host restart. */
-  lastContextUsage?: { tokens: number; contextWindow: number };
+  /** Last measured use of this native session; persisted so the 80% reset survives a host restart. */
+  lastContextUsage?: { tokens: number; contextWindow: number; measuredAt: number; sessionId: string };
   queue: ActorQueueItem[];
   messages: FabricActorMessage[];
   createdAt: number;
@@ -1873,7 +1873,8 @@ export class ActorManager {
         ? overflow ? "session reset (context overflow): retrying the event once on a fresh session"
           : `session reset (context window): last run used ${usage?.tokens} of ${usage?.contextWindow} tokens`
         : "session reset (requested)",
-      data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow, ...(usage ? { contextUsage: usage } : {}) } : {}) } },
+      data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow,
+        ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
     });
   }
 
@@ -3802,7 +3803,18 @@ export class ActorManager {
             throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
           }
           actor.lastRunId = result.id;
-          if (result.contextUsage) this.#liveActor(actor).lastContextUsage = { ...result.contextUsage };
+          if (result.contextUsage) {
+            const live = this.#liveActor(actor);
+            let sessionId: string | undefined;
+            try { sessionId = readPiSessionHeader(live.sessionFile)?.id; } catch { /* No native session: do not bind usage to an unknown history. */ }
+            if (sessionId) {
+              const prior = live.lastContextUsage;
+              const unchanged = prior !== undefined && prior.tokens === result.contextUsage.tokens &&
+                prior.contextWindow === result.contextUsage.contextWindow && prior.sessionId === sessionId;
+              // The existing settlement registry save persists this; unchanged usage adds no write or timestamp churn.
+              if (!unchanged) live.lastContextUsage = { ...result.contextUsage, measuredAt: Date.now(), sessionId };
+            }
+          }
           if (actor.runner === "claude" && result.runnerSessionId) {
             actor.runnerSessionId = result.runnerSessionId;
             await this.#saveActors();
@@ -6282,11 +6294,18 @@ export class ActorManager {
         ...(principalScope ? { principalScope } : {}),
         latestActivationSequence: 0,
         sessionFile: path.join(this.#actorRoot, record.id, "session.jsonl"),
-        ...(typeof record.lastContextUsage?.tokens === "number" && Number.isFinite(record.lastContextUsage.tokens) &&
-          record.lastContextUsage.tokens >= 0 && typeof record.lastContextUsage.contextWindow === "number" &&
-          Number.isFinite(record.lastContextUsage.contextWindow) && record.lastContextUsage.contextWindow > 0
-          ? { lastContextUsage: { tokens: record.lastContextUsage.tokens, contextWindow: record.lastContextUsage.contextWindow } }
-          : {}),
+        ...(() => {
+          const usage = record.lastContextUsage;
+          if (typeof usage?.tokens !== "number" || !Number.isFinite(usage.tokens) || usage.tokens < 0 ||
+              typeof usage.contextWindow !== "number" || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0 ||
+              typeof usage.measuredAt !== "number" || !Number.isFinite(usage.measuredAt) || usage.measuredAt <= 0 ||
+              typeof usage.sessionId !== "string" || usage.sessionId.length === 0) return {};
+          try {
+            return readPiSessionHeader(path.join(this.#actorRoot, record.id, "session.jsonl"))?.id === usage.sessionId
+              ? { lastContextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow, measuredAt: usage.measuredAt, sessionId: usage.sessionId } }
+              : {};
+          } catch { return {}; }
+        })(),
         queue: [],
         draining: false,
         messages: [],

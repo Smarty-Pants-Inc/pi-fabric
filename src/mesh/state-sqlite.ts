@@ -26,11 +26,17 @@
  * SQLite's own busy handler would freeze the caller's event loop and is unfair (sleep-and-poll with
  * growing sleeps). `busy_timeout` is clamped to <= 5 ms (default 2 ms); a busy `BEGIN IMMEDIATE` is
  * retried ASYNCHRONOUSLY with short jittered sleeps capped at 4 ms, and the waiter joins the existing advisory
- * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 0).
- * Fairness (smarty-dev#9805): a newcomer that finds anyone queued takes its ticket before its first attempt, so it
- * never barges the head, and the head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it
- * synchronously, so it is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms. Only a writer that finds the queue empty tries once directly (the uncontended path: one readdir). The wait honours `writeSignal`, the
- * `withTryLock` budget and `lockTimeoutMs`, and times out with the existing `MeshLockTimeoutError`.
+ * `MeshLockTicket` FIFO (keyed on `state.db`, separate from the `.lock` queue) after `fifoAfterMs` (default 25 ms).
+ * The FIFO head waits inside SQLite's busy handler for HEAD_BUSY_MS (5 ms: node:sqlite runs it synchronously, so it
+ * is an event-loop stall, kept within the existing busy_timeout clamp) and re-polls after 1 ms.
+ * Mixed releases (smarty-dev#10516): the default is the contest of the releases before pi-fabric#936 (8d0af4b0),
+ * 25 ms without a ticket and then the FIFO, so on a shared store a writer does no worse than they do. Strict FIFO
+ * (smarty-dev#9805: with `fifoAfterMs: 0` a newcomer that finds anyone queued takes its ticket before its first
+ * attempt) starved next to those barging writers (smarty-dev#10391), so it is opt-in. A waiter passes a head whose
+ * heartbeat stalled (its event loop blocked, or it stopped attempting) as soon as the stall bound shows it, not only
+ * past 80% of its budget: the ticket closes at BEGIN IMMEDIATE, so a stale head here never holds the lock.
+ * The wait honours `writeSignal`, the `withTryLock` budget and `lockTimeoutMs`, and times out with the existing
+ * `MeshLockTimeoutError`.
  *
  * Durability (review-luna P1-3, review-opus P3-3): `synchronous=NORMAL`. A commit is atomic and
  * never torn; a process crash loses nothing committed; an OS crash or power loss can drop the most
@@ -116,8 +122,12 @@ import { processStartTime, residentProcessAlive } from "../residency/process-ide
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
-import { formatWalReaders, walReaderPids } from "./wal-readers.js";
+import { formatWalReaders, walReaderPids, walWriterPid } from "./wal-readers.js";
+import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
 import { assertPrivatePath, assertPrivateStateRoot, filesystemRefusal, MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
+
+// The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
+const lockEvents = createLockEvents();
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -373,7 +383,8 @@ export interface SqliteStateStoreOptions {
   lockTimeoutMs?: number;
   /** SQLite's synchronous busy handler, clamped to 0..5 ms. Default 2 ms. */
   busyTimeoutMs?: number;
-  /** A waiter older than this joins the advisory FIFO ticket queue. Default 0 (smarty-dev#9805: no barging window). */
+  /** A waiter older than this joins the advisory FIFO ticket queue. Default 25 ms, the contest of releases before
+   * pi-fabric#936 (smarty-dev#10516). 0 is strict FIFO (smarty-dev#9805): a newcomer queues before its first attempt. */
   fifoAfterMs?: number;
   /** Host-owned lifetime of writes: abort stops acquisition, never a started transaction. */
   writeSignal?: AbortSignal;
@@ -410,6 +421,8 @@ export interface SqliteStateStoreOptions {
   changesRetained?: number;
   /** Driver adapter. Default: node:sqlite, loaded at first use. */
   open?: SqliteOpener;
+  /** A writer-lock hold longer than this emits a `held` lock event (smarty-dev#9290). Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
   /**
    * Who may initialise state.db (smarty-dev#6477). Default: nobody; only an imported mesh root opens (an
    * initialised state.db plus the moved marker), anything else refuses with no side effect. "create":
@@ -706,6 +719,7 @@ export class SqliteStateStore {
   readonly #lockTimeoutMs: number;
   readonly #busyTimeoutMs: number;
   readonly #fifoAfterMs: number;
+  readonly #lockHeldEventMs: number;
   readonly #signal: AbortSignal | undefined;
   readonly #checkpointBytes: number;
   readonly #emergencyBytes: number;
@@ -757,7 +771,8 @@ export class SqliteStateStore {
     this.#maxTombstones = Math.max(0, Math.floor(options.maxStateTombstones ?? DEFAULT_MAX_STATE_TOMBSTONES));
     this.#lockTimeoutMs = Math.max(0, options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     this.#busyTimeoutMs = clampBusy(options.busyTimeoutMs);
-    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 0);
+    this.#fifoAfterMs = Math.max(0, options.fifoAfterMs ?? 25);
+    this.#lockHeldEventMs = lockHeldEventThreshold(options.lockHeldEventMs);
     this.#signal = options.writeSignal;
     this.#checkpointBytes = Math.max(0, options.checkpointBytes ?? 4 * 1024 * 1024);
     this.#emergencyBytes = Math.max(this.#checkpointBytes, options.emergencyCheckpointBytes ?? 64 * 1024 * 1024);
@@ -1029,7 +1044,7 @@ export class SqliteStateStore {
     const { key, value, identity, ifVersion } = input;
     validateMeshStateKey(key);
     const request = captureStoragePut({ key, value, identity, ifVersion }, this.maxEventBytes);
-    return this.#write((tx) => {
+    return this.#write("put/delete", (tx) => {
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind !== "put") throw new Error("Invalid verified storage put plan");
@@ -1041,7 +1056,7 @@ export class SqliteStateStore {
     const { key, ifVersion } = input;
     validateMeshStateKey(key);
     const request = captureStorageDelete({ key, ifVersion });
-    return this.#write<{ deleted: boolean; version?: number }>((tx) => {
+    return this.#write<{ deleted: boolean; version?: number }>("put/delete", (tx) => {
       const slot = this.#slot(request.key);
       const plan = request.transition(slot.present, slot.version, tx.highWater);
       if (plan.kind === "unchanged") return { deleted: false };
@@ -1063,11 +1078,14 @@ export class SqliteStateStore {
     prepare?: (view: MeshBatchView) => MeshBatchOperation[];
     afterCommit?: (view: MeshBatchView) => void;
     beforeCommit?: () => void;
+    /** Lock-event class for the bridge's own writes (as the file store's lock stats). */
+    lockClass?: "bridge";
   }): Promise<MeshBatchResult[]> {
+    const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
     for (const op of input.ops) validateMeshStateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.beforeCommit) return [];
     let committed: number | undefined;
-    const results = await this.#write((tx) => {
+    const results = await this.#write(lockClass, (tx) => {
       if (input.beforeCommit) tx.beforeCommit = input.beforeCommit;
       const view = this.#view();
       const started = performance.now();
@@ -1120,7 +1138,7 @@ export class SqliteStateStore {
     if (committed !== undefined && input.afterCommit) {
       const afterCommit = input.afterCommit;
       this.#stats.afterCommitReacquired += 1;
-      await this.#write((tx) => {
+      await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
         this.#timedAfterCommit(afterCommit, this.#view());
       });
@@ -1140,7 +1158,7 @@ export class SqliteStateStore {
 
   /** Runs a synchronous operation excluded from every state commit (review-opus P1-2 group (a)). */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
-    return this.#write(() => operation(), lockTimeoutMs);
+    return this.#write("custody", () => operation(), lockTimeoutMs);
   }
 
   /**
@@ -1162,6 +1180,7 @@ export class SqliteStateStore {
       throw new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
     }
     this.#inTransaction = true;
+    const began = performance.now();
     try {
       const meta = this.#meta();
       if (meta.backend !== "sqlite" || meta.epoch !== this.#epoch) throw new MeshStateRetiredError(meta.backend, meta.epoch, this.#epoch);
@@ -1173,12 +1192,18 @@ export class SqliteStateStore {
     } finally {
       try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* connection ends it */ }
       this.#inTransaction = false;
+      this.#heldEvent("other", performance.now() - began);
     }
+  }
+
+  // smarty-dev#9290: a writer-lock hold longer than the threshold, reported by the holder at release.
+  #heldEvent(lockClass: MeshLockClass, heldMs: number): void {
+    if (this.#lockHeldEventMs > 0 && heldMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "sqlite", lockClass, heldMs);
   }
 
   /** Proves the state is writable now (and not retired): acquires and releases the write lock. */
   async confirmWritable(onAcquired?: (at: number) => void): Promise<void> {
-    await this.#write(() => { onAcquired?.(Date.now()); });
+    await this.#write("heartbeat/confirm", () => { onAcquired?.(Date.now()); });
   }
 
   /**
@@ -1187,7 +1212,7 @@ export class SqliteStateStore {
    */
   async retire(): Promise<number> {
     // Exempt from the WAL cap: retiring is the roll-back the cap's refusal advises (a few meta rows).
-    return this.#write((tx) => {
+    return this.#write("other", (tx) => {
       const epoch = this.#epoch + 1;
       // data_version does not move for this connection's own commits: drop the cached value so the
       // next read on this store re-checks the retirement flag (review round 2 P2).
@@ -1202,7 +1227,7 @@ export class SqliteStateStore {
   /** One-time import of a file-store snapshot into an empty database (lane L4 drives migration). */
   async importState(state: { entries: Record<string, MeshStateEntry>; versions?: Record<string, number>;
     tombstoneOrder?: string[]; highWater?: number }): Promise<{ entries: number; tombstones: number; highWater: number }> {
-    return this.#write((tx) => {
+    return this.#write("other", (tx) => {
       if (Number(this.#sql.kvCount.get()?.n ?? 0) > 0 || Number(this.#sql.tombCount.get()?.n ?? 0) > 0 || tx.commit !== 0) {
         throw new Error("Fabric mesh SQLite import needs an empty database");
       }
@@ -1574,7 +1599,8 @@ export class SqliteStateStore {
   // Asynchronous, fair acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
-  async #write<T>(body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs, walCapExempt = false): Promise<T> {
+  async #write<T>(lockClass: MeshLockClass, body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs,
+    walCapExempt = false): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1588,9 +1614,10 @@ export class SqliteStateStore {
     let waiting = true;
     this.#writesWaiting += 1;
     try {
-      // smarty-dev#9805: a newcomer that finds anyone queued queues behind them, never barging the FIFO head. Inside
-      // the try (pi-fabric#936 round 3): the finally always releases the ticket and #writesWaiting.
-      if (this.#queueBusy()) {
+      // smarty-dev#9805, strict FIFO only (fifoAfterMs 0, smarty-dev#10516): a newcomer that finds anyone queued
+      // queues behind them, never barging the FIFO head. Inside the try (pi-fabric#936 round 3): the finally always
+      // releases the ticket and #writesWaiting.
+      if (this.#fifoAfterMs === 0 && this.#queueBusy()) {
         ticket = this.#ticket(Math.max(0, deadline - started));
         if (ticket) this.#stats.fifoJoins += 1;
       }
@@ -1634,7 +1661,7 @@ export class SqliteStateStore {
             ticket = undefined;
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body);
+            return this.#run(body, lockClass);
           }
         }
         const now = performance.now();
@@ -1643,6 +1670,13 @@ export class SqliteStateStore {
           this.#window.lockTimeouts += 1;
           this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, now - started);
           this.#flushCheckpointWindow();
+          // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
+          // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
+          // Leave the FIFO first: the /proc/locks read and the append must not keep this timed-out
+          // ticket at the head (pi-fabric#905 review round 3).
+          ticket?.close();
+          ticket = undefined;
+          if (!scope?.active && budget > 0) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
         if (!ticket && now - started >= this.#fifoAfterMs) {
@@ -1683,12 +1717,12 @@ export class SqliteStateStore {
   }
 
   #ticket(budgetMs: number): MeshLockTicket | undefined {
-    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs); }
+    try { return new MeshLockTicket(this.file, randomUUID(), budgetMs, { passStalledHead: true }); }
     catch { return undefined; } // Advisory only: an unusable queue leaves the plain jittered contest.
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1719,6 +1753,7 @@ export class SqliteStateStore {
       const hold = performance.now() - began;
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
+      this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only
         // imports also notify, but write-free fences never schedule unnecessary maintenance.

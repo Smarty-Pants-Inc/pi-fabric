@@ -55,6 +55,8 @@ export class MeshLockTicket {
   readonly #staleMs: number;
   readonly #gated: boolean;
   readonly #stallMs: number;
+  readonly #passStalledHead: boolean;
+  #headCheckedAt = 0;
   #closed = false;
   #head = false;
   #predecessor: string | undefined;
@@ -67,7 +69,10 @@ export class MeshLockTicket {
   #wake: (() => void) | undefined;
   #signalled = false;
 
-  constructor(root: string, token: string, budgetMs: number) {
+  /** `passStalledHead` (smarty-dev#10516): pass a stalled head at any time, not only past 80% of the budget. Only for
+   * a queue whose ticket closes when the lock is taken (SQLite state writes): there a stale head never holds the lock.
+   * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled. */
+  constructor(root: string, token: string, budgetMs: number, options: { passStalledHead?: boolean } = {}) {
     this.#directory = meshLockQueueDirectory(root);
     this.#root = root;
     // hrtime is a host-wide monotonic clock, unlike a wall clock that can step backwards.
@@ -77,6 +82,7 @@ export class MeshLockTicket {
     this.#staleMs = Math.max(30_000, budgetMs * 2);
     this.#gated = budgetMs >= GATED_BUDGET_MS;
     this.#stallMs = Math.min(2000, Math.max(4 * HEARTBEAT_MS, budgetMs * 0.1));
+    this.#passStalledHead = options.passStalledHead === true;
     const namespace = path.dirname(this.#directory);
     // No external sibling exists for a filesystem root. Admission is optional: a
     // read-only parent or unsafe namespace must not break otherwise writable meshes.
@@ -97,7 +103,8 @@ export class MeshLockTicket {
 
   /** True when this waiter may probe .lock: it is the head, or admission is closed/fell back.
    * Non-heads stat only their predecessor's receipt (never .lock/owner) and list the queue only
-   * when that receipt goes, or once past the fallback point to judge the head's progress. */
+   * when that receipt goes, or once past the fallback point (with `passStalledHead`, at most once
+   * per heartbeat interval at any time) to judge the head's progress. */
   mayContend(): boolean {
     if (this.#closed) return true;
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.
@@ -133,12 +140,17 @@ export class MeshLockTicket {
     return false;
   }
 
-  /** Past 80% of an ordinary budget, join the plain contest only if the head is stalled: neither
-   * its heartbeat nor our first sight of it as head is within the stall bound. The second term
+  /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
+   * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
    * keeps a head that has only just taken over from being judged by its old creation time. */
   #holdBack(): boolean {
     const now = Date.now();
-    if (now < this.#fallbackAt) return false;
+    if (now < this.#fallbackAt) {
+      // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
+      // the last 20%. One queue listing per heartbeat interval at most, not one per poll.
+      if (!this.#passStalledHead || now - this.#headCheckedAt < HEARTBEAT_MS) return false;
+      this.#headCheckedAt = now;
+    }
     const head = fs.readdirSync(this.#directory).filter(name => TICKET.test(name)).sort()[0];
     if (head === undefined || head === this.#name) return false; // the next scan makes us head
     if (head !== this.#observedHead) { this.#observedHead = head; this.#observedAt = now; }

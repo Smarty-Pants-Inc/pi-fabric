@@ -336,6 +336,24 @@ describe("final pre-delete check fences", () => {
     expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
+  it("stops when an actors entry changes from a file to a directory that references the run (#9160)", async () => {
+    const mesh = deadRootMesh();
+    write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    const session = path.join(mesh.root, "actors", "file-session");
+    fs.writeFileSync(session, "not a registry");
+    const away = path.join(tmp("fabric-9160-away-"), "file-session");
+    const injected = onStatusRead(mesh.old, () => {
+      fs.renameSync(session, away);
+      fs.mkdirSync(session);
+      write(path.join(session, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old" }] }));
+    });
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
+    expect(applied.skipped).toContainEqual(stopped(mesh.root));
+  });
+
   it("stops every later delete when an unrelated registry root is created after discovery", async () => {
     const mesh = deadRootMesh();
     const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, []));
@@ -398,7 +416,7 @@ describe("final pre-delete check fences", () => {
       expect([injected(), moved]).toEqual([true, true]);
       expect(applied.removedRuns).not.toContain(mesh.old);
       expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
-      expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/uncertain/) });
+      expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/(?:uncertain|registry roots changed during the sweep)/) });
     } finally { delete verifiedRemoveTestHooks.beforeOpen; }
   });
 

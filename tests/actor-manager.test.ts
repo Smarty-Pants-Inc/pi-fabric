@@ -3829,7 +3829,8 @@ describe("ActorManager", () => {
     }
     expect(actors.status(actor.id).activationBlocked).toMatchObject({ reason, code, count: ACTOR_FAILURE_NOTICE_AFTER, since: expect.any(Number) });
     await waitFor(() => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 }).length === 1);
-    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason, code });
+    // smarty-dev#10067 P2-2: the owner alarm carries the fixed code, not the error text; the Main notice keeps the text.
+    expect(mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })[0]!.data).toMatchObject({ reason: code, code });
     expect(deliveries.filter(text => text.startsWith("Fabric host notice:"))).toHaveLength(1);
     expect(deliveries.find(text => text.startsWith("Fabric host notice:"))).toContain(`Last error: ${reason}`);
   });
@@ -3858,7 +3859,10 @@ describe("ActorManager", () => {
     await expect(next.ask(actor.id, "next caller")).rejects.toThrow("Activation window lost current activation messages");
     await waitFor(() => next.status(actor.id).status === "failed" && !next.status(actor.id).inFlightRun);
     expect(next.status(actor.id).activationBlocked?.count).toBe(4);
-    expect(s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 })).toHaveLength(1);
+    const alarms = s.mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 20 });
+    expect(alarms.filter(alarm => alarm.kind === "actor-activation-blocked")).toHaveLength(1);
+    // smarty-dev#9332: the two callerless events were dropped with no retry: one alarm for the episode.
+    expect(alarms.filter(alarm => alarm.kind === "actor-event-dropped")).toHaveLength(1);
   });
 
   it("persists the failure budget and one alarm per uninterrupted streak across restarts", async () => {
@@ -3973,6 +3977,34 @@ describe("ActorManager", () => {
       expect(presence()).not.toHaveProperty("activationBlocked");
     }, 60_000);
 
+    // smarty-dev#9890: a lost authorized compaction left a hard "unknown" block that never expired.
+    it("expires an authorized-compaction activation-window loss; the next event runs and clears it", async () => {
+      const s = setup(true);
+      const time = clock();
+      const LOST = "Fabric activation window failed: Error: Activation window lost its authorized compaction";
+      const actor = await s.actors.create({ name: "compacted-route", instructions: "Respond.", responseMode: "text" });
+      const wakes = captureWakes();
+      await failOnce(s.actors, s.agents, actor.id, LOST);
+      const blocked = s.actors.status(actor.id).activationBlocked!;
+      expect(blocked).toMatchObject({ code: "activation-window-lost", class: "transient", count: 1,
+        retryAt: blocked.since + ACTOR_TRANSIENT_BLOCK_BACKOFF_MS });
+      const presence = () => s.mesh.get(`actors/test/${actor.id}`)?.value as Record<string, unknown> | undefined;
+      await waitFor(() => presence()?.activationBlocked !== undefined);
+      const wake = wakes.filter(entry => entry.ms === ACTOR_TRANSIENT_BLOCK_BACKOFF_MS);
+      expect(wake).toHaveLength(1);
+      time.set(blocked.retryAt! + 1_000);
+      expect(s.actors.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "activation-window-lost" } });
+      wake[0]!.fire();
+      await waitFor(() => presence()?.activationBlocked === undefined);
+      const runs = vi.spyOn(s.agents, "run");
+      const before = runs.mock.calls.length;
+      s.actors.tell(actor.id, "next review event");
+      await waitFor(() => s.actors.status(actor.id).status === "idle" && s.actors.status(actor.id).queued === 0 &&
+        !s.actors.status(actor.id).activationBlockExpired);
+      expect(runs.mock.calls.length - before).toBe(1);
+      expect(s.actors.status(actor.id)).not.toHaveProperty("activationBlocked");
+    }, 60_000);
+
     it("doubles the backoff on each further failure, up to the cap, across a restart", async () => {
       const s = setup(true);
       const time = clock();
@@ -4076,6 +4108,29 @@ describe("ActorManager", () => {
       [{ lastError: "Error: read ECONNRESET" }, "provider-transient", /^transient: network failure/],
       [{ lastError: "Agent timed out after 600000ms" }, "provider-transient", /^transient: timeout/],
       [{ lastError: "Error: Activation window lost current activation messages" }, "activation-window-lost", /^transient: activation window lost/],
+      // smarty-dev#9890: every terminal "Activation window lost …" is the same transient class.
+      [{ lastError: "Error: Activation window lost its authorized compaction" }, "activation-window-lost", /^transient: activation window lost/],
+      [{ lastError: "Error: Activation window lost its native history boundary" }, "activation-window-lost", /^transient: activation window lost/],
+      [{ lastError: "Error: Activation window lost its native system records" }, "activation-window-lost", /^transient: activation window lost/],
+      [{ lastError: "Error: Activation window lost its native system prompt" }, "activation-window-lost", /^transient: activation window lost/],
+      [{ lastError: "Error: Activation window lost the Google config object" }, "activation-window-lost", /^transient: activation window lost/],
+      // ...but a permanent cause anywhere still wins, quoted model prose is no evidence, and only the terminal line counts.
+      [{ lastError: "Error: Activation window lost its authorized compaction",
+        error: "Error: 401 Unauthorized: invalid x-api-key\nError: Activation window lost its authorized compaction" }, "auth",
+        /^permanent: credential or authentication failure \(matched "401" in another failure line\)$/],
+      [{ lastError: "Error: Structured agent output was invalid (output: Activation window lost its authorized compaction)" }, "unknown",
+        /^fail-closed: no transient cause recognised$/],
+      // An unrelated terminal error that merely mentions the refusal stays fail-closed (#1008 SEC P1).
+      [{ lastError: "Error: tool bash failed: upstream said Activation window lost its authorized compaction" }, "unknown",
+        /^fail-closed: no transient cause recognised$/],
+      [{ lastError: "Error: Activation window lost its authorized compaction; then the registry write failed" }, "unknown",
+        /^fail-closed: no transient cause recognised$/],
+      [{ lastError: "Error: Activation window lost its keys" }, "unknown", /^fail-closed: no transient cause recognised$/],
+      [{ lastError: "Fabric activation window failed: Error: Activation window lost its authorized compaction" }, "activation-window-lost",
+        /^transient: activation window lost/],
+      [{ lastError: "Error: unrelated terminal failure",
+        error: "Error: Activation window lost its authorized compaction\nError: unrelated terminal failure" }, "unknown",
+        /^fail-closed: no transient cause recognised$/],
       [{ lastError: "Child Pi exited before requested model admission completed; task was not sent" }, "child-exit-before-admission", /^transient: child Pi exited/],
       [{ lastError: "Directive reply missing: the run ended without a fabric_reply call",
         evidence: ["Pi provider recovery: same-session resume 1/3 scheduled after 5000ms"] }, "provider-transient",

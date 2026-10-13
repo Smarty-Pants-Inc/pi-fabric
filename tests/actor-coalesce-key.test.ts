@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -73,6 +73,53 @@ describe("actor coalesceKey for mesh events", () => {
     expect(tasks[0]).not.toMatch(/rev-a|rev-b/);
     expect(tasks[1]).toContain("rev-x");
     expect(tasks[2]).toContain("rev-other");
+  }, 30_000);
+
+  it("records targeted publishes only after inference and supersedes replaced event identities", async () => {
+    const { root, mesh, actors } = setup();
+    const actor = await actors.create({ name: "outcomes", instructions: "Review.", topics: [], coalesce: false, coalesceKey: "key" });
+    actors.tell(actor.id, "LIVE_WITH_PROGRESS");
+    await waitFor(() => actors.status(actor.id).status === "running");
+    const publish = (text: string) => mesh.publish({ topic: "work", to: actor.id, from, text, data: { key: "same" } });
+    const first = await publish("old"); await waitFor(() => actors.status(actor.id).queued === 1);
+    const second = await publish("new");
+    const directory = path.join(mesh.root, "delivery-outcomes");
+    const outcomes = () => fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+    await waitFor(() => outcomes().some(row => row.eventId === first.id));
+    expect(outcomes().map(row => [row.eventId, row.outcome])).toEqual([[first.id, "superseded"]]);
+    await waitFor(() => outcomes().some(row => row.eventId === second.id && row.outcome === "delivered"));
+    expect(outcomes().map(row => [row.eventId, row.outcome])).toEqual([[first.id, "superseded"], [second.id, "delivered"]]);
+    expect(outcomes()[1]).toMatchObject({ to: actor.id, from: from.id, mode: "publish" });
+  }, 30_000);
+
+  it("retains a failed final receipt append across restart without turning it back into runnable work", async () => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "receipt-retry", instructions: "Review.", topics: [], coalesce: false });
+    const send = { eventId: "append-retry", to: actor.id, from: from.id, mode: "followUp" as const };
+    const open = fs.openSync.bind(fs);
+    const blocked = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (String(file).includes("delivery-outcomes") && String(file).endsWith(".jsonl")) throw new Error("outcome volume unavailable");
+      return open(file, flags, mode);
+    });
+    try {
+      first.actors.tell(actor.id, "work", undefined, { outcomeSend: send });
+      await waitFor(() => first.actors.status(actor.id).status === "idle" && first.actors.messages(actor.id).some(message => message.direction === "out"));
+      const directory = path.join(first.root, "actors", actor.id);
+      const file = fs.readdirSync(directory).find(name => /^queue-.+\.json$/.test(name))!;
+      const saved = JSON.parse(fs.readFileSync(path.join(directory, file), "utf8"));
+      expect(saved.items).toEqual([]);
+      expect(saved.pendingDeliveryOutcomes).toEqual([{ ...send, outcome: "delivered", reason: "consumed by actor inference as itself", at: expect.any(Number) }]);
+      await first.actors.close(); await first.agents.close(); closers.length = 0;
+    } finally { blocked.mockRestore(); }
+    const second = setup(first.root);
+    const directory = path.join(second.mesh.root, "delivery-outcomes");
+    const outcomes = () => fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line))) : [];
+    await waitFor(() => outcomes().some(row => row.eventId === send.eventId));
+    expect(outcomes().filter(row => row.eventId === send.eventId)).toHaveLength(1);
+    expect(second.actors.status(actor.id).queued).toBe(0);
+    expect(second.actors.messages(actor.id).filter(message => message.direction === "out")).toHaveLength(1);
   }, 30_000);
 
   // review/astra on #61: a ':'-joined key merged topic "work" with value "review:string:42" and

@@ -276,6 +276,10 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-restart-exit",
+      // Same 8 s startup budget as terminated-recover and kill-worker: this tests restart failure,
+      // not the run deadline. Loaded Windows worker + fake Pi startup and terminate-and-restart
+      // can outlast 2 s, otherwise reporting timed_out (smarty-dev#10379; pi-fabric#982, #967).
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("failed");
         expect(r.error).toContain("Error: Terminated");
@@ -283,6 +287,10 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     },
     {
       behavior: "terminated-recover",
+      // Same-child recovery, not the run deadline: loaded Windows worker and fake Pi startup
+      // can exhaust the shared 2 s budget before the 25 ms recovery fires, reporting timed_out.
+      // Match kill-worker's 8 s room; outcome checks are unchanged (smarty-dev#10379; pi-fabric#982, #967).
+      timeoutMs: 8_000,
       check: (r) => {
         expect(r.status).toBe("completed");
         expect(r.error).toBeUndefined();

@@ -35,6 +35,7 @@ import {
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
 import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
+import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/stuck-preparing.js";
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
@@ -278,6 +279,7 @@ export class ResidentHost {
   #wakeWatchErrorUnsubscribe: (() => Promise<void>) | undefined;
   #processWorkUnsubscribe: (() => void) | undefined;
   #wakeWatchNeedsReprobe = false;
+  #stuckPreparingCheckedAt = 0;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #scheduleTimer: NodeJS.Timeout | undefined;
   #scheduleWakeAt: number | undefined;
@@ -552,6 +554,8 @@ export class ResidentHost {
         startedAt: config.mainStartedAt ?? this.participants.lastKnown?.(config.rootId)?.participant.startedAt ?? 0 }),
       hostId: this.hostId,
       identityId: this.identity.id,
+      // Launches on Main's behalf: Main's published name, not this host's ("main" is only the unnamed default).
+      spawnerName: () => { const name = currentConfig().mainName ?? config.mainName; return name && name !== "main" ? name : undefined; },
       retention: this.#retention,
       preparePiModel: async (model, requiredPin) => resolveResidentPiModel(model, { requiredPin: requiredPin ?? false }),
       resolveParticipantGuidance: ({ model }) => {
@@ -1344,8 +1348,19 @@ export class ResidentHost {
 
   #maintainRequests(): void {
     const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh() ||
-        (!retentionV2Enabled() && !this.#requestRetention.due(now))) return;
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
+    // smarty-dev#6337: a hung preparation never fails, so the failure-streak notice
+    // cannot fire. Check on this tick, at most every 10 s (or the threshold, if shorter).
+    const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
+    if (now - this.#stuckPreparingCheckedAt >= Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)) {
+      this.#stuckPreparingCheckedAt = now;
+      try {
+        this.actors.reportStuckPreparing(stuckPreparingMs, now);
+      } catch {
+        // Best effort: the next tick retries; retention below must still run.
+      }
+    }
+    if (!retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     // ensureHost/syncPiModels already publishes reloads to config.json. Apply
     // only the same-release/root/session overlay at the next existing sweep;
     // actor archives and agent collectors hold this same policy object.

@@ -18,6 +18,8 @@ import * as fs from "node:fs";
  *
  * /proc/locks (fs/locks.c lock_get_status) prints `N: POSIX  ADVISORY  READ  <pid> <maj:min hex>:<inode> <start> <end|EOF>`;
  * blocked waiters carry a `->` marker and are skipped. Linux only; elsewhere every function returns empty.
+ * The writer holds an exclusive POSIX WRITE lock on WAL_WRITE_LOCK, byte 120, for its whole write transaction
+ * (`BEGIN IMMEDIATE` through COMMIT/ROLLBACK, and a FULL/RESTART/TRUNCATE checkpoint): walWriterPid names it.
  */
 
 export interface WalReader {
@@ -116,6 +118,39 @@ export function walReaderPids(dbPath: string): WalReader[] {
     found.sort((a, b) => a.pid - b.pid || a.slot - b.slot);
   } catch { /* never throw: return what we have */ }
   return found;
+}
+
+/**
+ * The process holding SQLite's WAL writer lock (POSIX WRITE lock on shm byte 120) on `dbPath`'s `-shm`
+ * file, for a waiter that gave up on it (smarty-dev#9290). The kernel's lock table is the writer lock's only
+ * owner record: SQLite keeps none. Read only on that rare path, never per transaction. Never throws;
+ * undefined on non-Linux, without a `-shm` file, or when no single process holds the byte.
+ */
+export function walWriterPid(dbPath: string): number | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const st = fs.statSync(`${dbPath}-shm`, { bigint: true });
+    const major = devMajor(st.dev);
+    const minor = devMinor(st.dev);
+    const locks = readText("/proc/locks");
+    if (locks === undefined) return undefined;
+    const exact = new Set<number>();
+    const inodeOnly = new Set<number>();
+    for (const line of locks.split("\n")) {
+      if (line.includes("->")) continue; // blocked waiter, not a holder
+      const m = /^\d+:\s+POSIX\s+\S+\s+WRITE\s+(-?\d+)\s+([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)\s+(\d+)\s+(\d+|EOF)\s*$/.exec(line.trim());
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (!(pid > 0) || BigInt(m[4]!) !== st.ino) continue;
+      const start = Number(m[5]);
+      const end = m[6] === "EOF" ? Number.POSITIVE_INFINITY : Number(m[6]);
+      if (!(start <= WALINDEX_LOCK_OFFSET && WALINDEX_LOCK_OFFSET <= end)) continue;
+      (BigInt(`0x${m[2]}`) === major && BigInt(`0x${m[3]}`) === minor ? exact : inodeOnly).add(pid);
+    }
+    // As for readers: fall back to an inode-only match (btrfs subvolumes) when nothing matched both.
+    const hits = exact.size > 0 ? exact : inodeOnly;
+    return hits.size === 1 ? [...hits][0] : undefined;
+  } catch { return undefined; }
 }
 
 const formatAge = (ms: number): string => {

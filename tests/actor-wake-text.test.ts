@@ -518,6 +518,28 @@ describe("wake text in actor activations", () => {
     expect(otherOnAcme).not.toContain("Please rebase");
   }, 30_000);
 
+  it("applies wakeText filters to work already queued when the filter is set", async () => {
+    const config = granting(receiptDb(tempRoot()));
+    const { root, mesh, actors } = setup(config);
+    const actor = await actors.create({ name: "queued-triage", instructions: "Triage.", topics: ["github.demo"], coalesce: false });
+    grant(config, actor.id, "acme/demo");
+    const release = path.join(root, "release-worker");
+    closers.unshift(async () => { fs.writeFileSync(release, "release"); });
+    actors.tell(actor.id, "LIVE_WITH_PROGRESS", { fakeWorkerReleasePath: release });
+    await waitFor(() => actors.status(actor.id).status === "running");
+    await publish(mesh, projected("pull_request_review_comment", 9)); // NONE, available only after receipt hydration
+    await publish(mesh, projected("issue_comment", 7));
+    await waitFor(() => actors.status(actor.id).queued === 2);
+    const changed = await actors.setActivationFilter(actor.id, [{ id: "outsiders", topic: ["github.demo"],
+      where: [{ path: "wakeText.authorAssociation", equals: "NONE" }] }]);
+    expect(changed).toMatchObject({ queued: 1, status: "running", filterSkipped: { count: 1 } });
+    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
+      .toEqual(["filtered: outsiders"]);
+    fs.writeFileSync(release, "release");
+    await waitFor(() => runTasks(root, actor.id).length === 2 && actors.status(actor.id).status === "idle");
+    expect(fenced(runTasks(root, actor.id)[1]!)).toMatchObject({ event: "issue_comment", author: "alice" });
+  }, 30_000);
+
   it("exposes the text to the activation filter (wakeText.*) and to validWhile facts", async () => {
     const config = granting(receiptDb(tempRoot()));
     const { root, mesh, actors } = setup(config);

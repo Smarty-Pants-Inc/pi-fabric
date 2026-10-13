@@ -7,6 +7,7 @@ import type {
   AgentUsage,
   AgentWorkerOptions,
 } from "../agents/types.js";
+import { actorNameClass } from "../guards/sender-headers.js";
 
 const MAX_RUN_ERROR_CHARS = 20_000;
 const MAX_RUN_TEXT_CHARS = 100_000;
@@ -29,11 +30,7 @@ export const createRunRouteMetadata = (
   }
   let routeClass: string;
   if (facts.actorId || facts.actorName) {
-    const name = facts.actorName ?? "";
-    const role = /(?:^|-)review-astra$/.test(name) ? "review"
-      : /(?:^|-)security-astra$/.test(name) ? "security"
-      : /(?:^|-)supervisor$/.test(name) ? "status-groom" : "other";
-    routeClass = `actor:${role}`;
+    routeClass = `actor:${actorNameClass(facts.actorName ?? "")}`;
   } else {
     routeClass = facts.handoff ? "handoff" : `task:${facts.runner}:${facts.transport}`;
   }

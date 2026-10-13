@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
@@ -187,6 +187,7 @@ const escapeXmlText = (value: string): string =>
 
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
+import { senderAgent } from "./guards/sender-headers.js";
 
 // Loaded-code identity of this lazy runtime module. Stable-path lazy imports
 // keep their first evaluation for the life of the host process, so a hash
@@ -769,6 +770,10 @@ export class FabricRuntimeState {
       !enforceSchema &&
       projectTrusted &&
       this.#config.mesh.enabled;
+    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
+    const configuredMeshRoot = this.#config.mesh.root;
+    const meshRoot = process.env.PI_FABRIC_MESH_ROOT ?? (configuredMeshRoot
+      ? path.resolve(projectRoot, configuredMeshRoot) : path.join(projectRoot, ".pi", "fabric", "mesh"));
     const mainAgent = new MainAgentController(
       this.pi,
       mainAgentId,
@@ -786,6 +791,7 @@ export class FabricRuntimeState {
         },
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
+      meshRoot,
     );
     this.#mainAgent = mainAgent;
     // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
@@ -800,13 +806,6 @@ export class FabricRuntimeState {
       });
     }
     const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
-    const projectRoot = process.env.PI_FABRIC_PROJECT_ROOT ?? context.cwd;
-    const configuredMeshRoot = this.#config.mesh.root;
-    const meshRoot =
-      process.env.PI_FABRIC_MESH_ROOT ??
-      (configuredMeshRoot
-        ? path.resolve(projectRoot, configuredMeshRoot)
-        : path.join(projectRoot, ".pi", "fabric", "mesh"));
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;
@@ -1059,6 +1058,7 @@ export class FabricRuntimeState {
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
+      spawnerName: () => senderAgent(process.env, this.pi.getSessionName?.()),
       retention: this.#config.retention,
       ...(this.#paths
         ? {
@@ -1119,6 +1119,22 @@ export class FabricRuntimeState {
           from: { id: notice.targetId, name: `Task ${notice.targetId}`, kind: "agent" },
           triggerTurn: false, idempotencyKey: `terminal-refusal:${notice.targetId}:${notice.messageId}`,
         });
+      },
+      // smarty-dev#9855: held admission permits at half of maxConcurrent. The fabric.alarm envelope, routed to the
+      // owner identity as the provider-dead alarm is (PI_FABRIC_OWNER_IDENTITY_ID).
+      onAdmissionAlarm: (alarm) => {
+        if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
+        const mesh = this.#mesh, from = this.#identity;
+        // Always addressed (pi-fabric#939 P2-b): the owner identity, else this Main itself; never a broadcast.
+        const to = admissionAlarmRecipient(process.env.PI_FABRIC_OWNER_IDENTITY_ID, from);
+        if (!to) {
+          console.warn("[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
+          return;
+        }
+        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
+        const owner = alarm.kind === "recovered-answer-save-failed";
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: owner ? "ops.owner" : "fabric.alarm.agent-admission",
+          kind: owner ? "actor.alarm" : "agent-admission-held", from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
@@ -2201,7 +2217,9 @@ export class FabricRuntimeState {
     if (this.capturedTools.suspended) return;
     this.#repairs.setCatalogSurface({
       providers: this.#registry.providers().map((provider) => provider.name),
-      capturedTools: this.capturedTools.list().map((entry) => entry.name),
+      // The repair digest tracks registrations, not the host's per-turn
+      // visibility, so toggling a tool off cannot churn repair tables.
+      capturedTools: this.capturedTools.listRegistered().map((entry) => entry.name),
     });
   }
 

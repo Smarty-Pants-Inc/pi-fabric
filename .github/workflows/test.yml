@@ -107,6 +107,20 @@ jobs:
         env:
           FABRIC_8742_REAL_PI: '1'
         run: bunx vitest run tests/main-provider-dead-real-pi.test.ts
+      - name: Real Pi extension-hidden tools (smarty-dev#5492)
+        # A real Pi process (RPC mode) loads the built dist/ and a fixture extension that hides three of its
+        # tools through pi.setActiveTools; fabric_exec's catalog, the prompt roster and invocation must agree.
+        if: runner.os == 'Linux'
+        env:
+          FABRIC_5492_REAL_PI: '1'
+        run: bunx vitest run tests/extension-hidden-tools-real-pi.test.ts
+      - name: Real Pi sender headers (smarty-dev#6207)
+        # A real Pi process (RPC mode) loads the built dist/; a Main request and its process child's request
+        # reach a local stub that records the HTTP headers: X-Smarty-* on the wire, once, never caller-set.
+        if: runner.os == 'Linux'
+        env:
+          FABRIC_6207_REAL_PI: '1'
+        run: bunx vitest run tests/sender-headers-real-pi.test.ts
       # smarty-dev#8953: agents.processSlice runs workers in systemd --user scopes. GitHub-hosted ubuntu boots
       # systemd as PID 1 but starts no user manager for the runner: linger starts one, with its session bus.
       - name: Start a user systemd manager
@@ -228,7 +242,7 @@ jobs:
           NATS_SERVER_REQUIRED: '1'
           NATS_SERVER_URL: nats://127.0.0.1:4222
           NATS_MONITOR_URL: http://127.0.0.1:8222
-        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts
+        run: bunx vitest run tests/mesh-state-backend.test.ts tests/mesh-state-backend-multiprocess.test.ts tests/mesh-backend-migration-nats.test.ts
       - name: Server log
         if: failure()
         run: cat "$RUNNER_TEMP/nats.log"

@@ -57,10 +57,13 @@ export class WriteReceiptRecorder {
     if (WRITE_TOOLS.has(event.toolName)) {
       const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string" && value !== "");
       if (typeof raw !== "string") return;
+      // Checked before resolving, and stored as a copy: a short result of normalizing a huge path must not keep the
+      // child-sized source alive as a V8 slice (round-3 review P2).
+      if (raw.length > WRITE_RECEIPT_MAX_COMMAND_CHARS) return this.#drop();
       let resolved: string;
       try { resolved = resolveToolPath(raw, this.cwd); } catch { resolved = raw; }
       if (resolved.length > WRITE_RECEIPT_MAX_COMMAND_CHARS) return this.#drop();
-      call = { path: resolved };
+      call = { path: resolved.split("").join("") };
     } else if (SHELL_TOOLS.has(event.toolName) && typeof args.command === "string") {
       // A copy, not a slice: V8 may keep a slice's whole (child-sized) source string alive (round-2 review P2).
       call = args.command.length > WRITE_RECEIPT_MAX_COMMAND_CHARS

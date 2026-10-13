@@ -79,6 +79,8 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     }
     recorder.start({ toolCallId: "i".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS + 1), toolName: "bash", args: { command: "x" } });
     recorder.start({ toolCallId: "p", toolName: "write", args: { path: "z".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS + 1) } });
+    // A huge raw path that would normalize short is refused before resolving (never held as a slice of it).
+    recorder.start({ toolCallId: "q", toolName: "write", args: { path: `${"./".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS)}a.txt` } });
     expect(recorder.pending).toBe(WRITE_RECEIPT_MAX_PENDING);
     expect(recorder.receipt.truncated).toBe(true);
     // A held call's end records its text cut to the limit; the dropped ones never appear.

@@ -665,3 +665,115 @@ it.runIf(process.platform === "linux")("r4 control: an unchanged but unreadable 
   expect((outcome as Error).message).toMatch(/unreadable or changed/);
   expectRestoreRefused(seeded, outcome, seam, deadIno, original);
 });
+
+// r5 P1 (Astra 6152580710): a successor that lands AFTER the restore's final check. The seam is a hook on the namespace
+// call itself, not timing: `act` runs once, immediately before the first renameSync/linkSync whose TARGET is the intent
+// (b2bfcee7's replacing rename of its staged temporary; the fix's no-replace install link) or, at "take", whose SOURCE
+// is the intent (the fix's claim rename). Every check has already run when it fires.
+const beforeIntentNameOp = (file: string, at: "take" | "install", act: () => void) => {
+  const state = { fired: false, op: "" };
+  for (const name of ["renameSync", "linkSync"] as const) {
+    const original = fs[name] as (source: fs.PathLike, target: fs.PathLike) => void;
+    vi.spyOn(fs, name).mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+      if (!state.fired && (String(target) === file || (at === "take" && String(source) === file))) {
+        state.fired = true; state.op = `${name} ${path.basename(String(source))} -> ${path.basename(String(target))}`; act();
+      }
+      return original(source, target);
+    }) as never);
+  }
+  return state;
+};
+/** The intent's in-flight claim and kept evidence names. */
+const claimNames = (file: string) => real.readdirSync(path.dirname(file)).filter(name => name.startsWith(`${path.basename(file)}.claim`));
+
+it.runIf(process.platform === "linux")("r5 P1: a successor renamed in after the final check, before the claim, survives and the restore refuses", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  let successorIno = 0;
+  const seam = beforeIntentNameOp(seeded.file, "take", () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = real.lstatSync(seeded.file).ino; });
+  const outcome = await restoreOutcome(seeded);
+  vi.mocked(fs.renameSync).mockRestore(); vi.mocked(fs.linkSync).mockRestore();
+  expect(seam.fired).toBe(true);
+  expect(successorIno).not.toBe(deadIno);
+  // First the successor itself (b2bfcee7: its rename clobbered it), then the refusal.
+  expect(rawBytes(seeded.file).toString("utf8"), seam.op).toBe(successorText(seeded.archiveDir));
+  expect(real.lstatSync(seeded.file).ino).toBe(successorIno);
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expectRestoreRefused(seeded, outcome, seam, successorIno, successorText(seeded.archiveDir));
+  expect(rawBytes(seeded.file).equals(Buffer.from(successorText(seeded.archiveDir)))).toBe(true);
+});
+
+it.runIf(process.platform === "linux")("r5 P1: a successor renamed in after the claim, before the install, survives; the original is kept as evidence", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  let successorIno = 0;
+  const seam = beforeIntentNameOp(seeded.file, "install", () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = real.lstatSync(seeded.file).ino; });
+  const outcome = await restoreOutcome(seeded);
+  vi.mocked(fs.renameSync).mockRestore(); vi.mocked(fs.linkSync).mockRestore();
+  expect(seam.fired).toBe(true);
+  expect(successorIno).not.toBe(deadIno);
+  // First the successor itself (b2bfcee7: its rename clobbered it), then the refusal.
+  expect(rawBytes(seeded.file).toString("utf8"), seam.op).toBe(successorText(seeded.archiveDir));
+  expect(real.lstatSync(seeded.file).ino).toBe(successorIno);
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expectRestoreRefused(seeded, outcome, seam, successorIno, successorText(seeded.archiveDir));
+  expect(rawBytes(seeded.file).equals(Buffer.from(successorText(seeded.archiveDir)))).toBe(true);
+  // The claimed original left the in-flight name for a unique evidence name, intact, and is never reinstated.
+  const kept = claimNames(seeded.file);
+  expect(kept).toHaveLength(1);
+  expect(kept[0]).toMatch(/\.pending\.json\.claim-[0-9a-f-]{36}$/);
+  const evidence = path.join(path.dirname(seeded.file), kept[0]!);
+  expect(real.lstatSync(evidence).ino).toBe(deadIno);
+  expect(rawBytes(evidence).equals(original)).toBe(true);
+});
+
+it.runIf(process.platform === "linux")("r5: a failed install link (EPERM) refuses and links the original back, never a replacing rename", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  const linkSync = fs.linkSync;
+  const installs: string[] = [];
+  const link = vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+    if (String(source).endsWith(".tmp")) { installs.push(String(target)); throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" }); }
+    return linkSync(source, target);
+  }) as never);
+  const outcome = await restoreOutcome(seeded);
+  link.mockRestore();
+  expect(installs).toEqual([seeded.file]);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expect(real.lstatSync(seeded.file).ino).toBe(deadIno); // the judged original is back under its name
+  expect(rawBytes(seeded.file).equals(original)).toBe(true);
+  expect(fs.existsSync(receiptPath(seeded.root, "k"))).toBe(false);
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0);
+  // The retry restores the same archived event (no new id) once links work again.
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
+});
+
+it.runIf(process.platform === "linux")("r5: a restore interrupted between claim and install is reinstated by the next hold, never read as unreserved", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  // Emulated death in the window: every link fails, so neither the install nor the put-back runs; only the claim remains.
+  const link = vi.spyOn(fs, "linkSync").mockImplementation((() => { throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" }); }) as never);
+  const outcome = await restoreOutcome(seeded);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(real.lstatSync(seeded.file, { throwIfNoEntry: false })).toBeUndefined();
+  const claim = `${seeded.file}.claim`;
+  expect(real.lstatSync(claim).ino).toBe(deadIno);
+  expect(rawBytes(claim).equals(original)).toBe(true);
+  // While the claim cannot be linked back the key stays fenced: a retryable refusal, never a new publication.
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0);
+  link.mockRestore();
+  // The next hold links the claim back before judging the key, then restores the same archived event once.
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  const live = (fs.readFileSync(path.join(seeded.root, "events.jsonl"), "utf8") as string).trim().split("\n");
+  expect(live.map(line => (JSON.parse(line) as { id: string }).id)).toEqual([event.id]); // restored once, no new id
+  expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
+  // The in-flight claim's removal is requested (recorded, never executed here: #4664); the evidence names are never.
+  expect(removals.filter(target => target.startsWith(`${seeded.file}.claim`))).toContain(`${seeded.file}.claim`);
+  expect(removals.filter(target => target.startsWith(`${seeded.file}.claim-`))).toEqual([]);
+});

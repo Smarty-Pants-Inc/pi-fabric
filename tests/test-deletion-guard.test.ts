@@ -288,6 +288,40 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
   }
 });
 
+// smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. Own list, not the config's.
+const realDeleteSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
+  "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
+  "tests/scratch-platform-retention.test.ts"];
+// Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs.
+const configChild = `
+import fs from "node:fs";
+import { registerHooks } from "node:module";
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (specifier.endsWith(".js") && specifier.startsWith(".") && context.parentURL?.startsWith("file:")) {
+    const source = new URL(specifier.slice(0, -3) + ".ts", context.parentURL);
+    if (fs.existsSync(source)) return nextResolve(source.href, context);
+  }
+  return nextResolve(specifier, context);
+}});
+const config = (await import(process.argv[2])).default;
+const project = config.test.projects.find((entry) => entry.test.name === "default");
+console.log("CONFIG:" + JSON.stringify({ include: project.test.include, exclude: project.test.exclude ?? [] }));
+`;
+
+it.each([[undefined, false], ["false", false], ["true", true]] as const)(
+  "vitest.config.ts selects real-delete suites only when GITHUB_ACTIONS=%s is hosted", (value, selected) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
+    if (value === undefined) delete env.GITHUB_ACTIONS;
+    const result = runChild(`config-child-${value}.mjs`, configChild,
+      [new URL("../vitest.config.ts", import.meta.url).href], env);
+    const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("CONFIG:"));
+    expect(line, result.stdout + result.stderr).toBeDefined();
+    const { include, exclude } = JSON.parse(line!.slice("CONFIG:".length)) as { include: string[]; exclude: string[] };
+    expect(include).toEqual(["tests/**/*.test.ts"]);
+    expect(realDeleteSuites.filter((suite) => exclude.includes(suite))).toEqual(selected ? [] : realDeleteSuites);
+  });
+
 describe("deletion guard in child processes", () => {
   it("refuses every outside API, path form and symlink escape in a child that inherits NODE_OPTIONS", () => {
     requireGuard();

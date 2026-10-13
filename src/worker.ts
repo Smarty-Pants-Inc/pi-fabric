@@ -1616,6 +1616,8 @@ const main = async (): Promise<void> => {
     validateCompletedResult();
     terminalStatus = record.status;
     terminalError = record.error;
+    // pi-fabric#1034: the final receipt, including a truncation no end event reported.
+    if (isPi) record.writeReceipt = writeReceipt.receipt;
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
@@ -2710,6 +2712,8 @@ const main = async (): Promise<void> => {
     record.status = "failed";
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
+  // pi-fabric#1034: the final receipt, including a truncation no end event reported (a child that exits mid-call).
+  if (isPi) record.writeReceipt = writeReceipt.receipt;
   // The owning Main may already be dead. Publish through its immutable launch return address.
   saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);

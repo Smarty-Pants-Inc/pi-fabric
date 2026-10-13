@@ -331,6 +331,14 @@ switch (behavior) {
     process.exit(0);
     break;
   }
+  case "write-receipt-overflow": {
+    // pi-fabric#1034: more starts than the receipt holds, none of them ended, then the child settles and exits.
+    for (let n = 0; n < 300; n++) emit({ type: "tool_execution_start", toolCallId: `o${n}`, toolName: "bash", args: { command: `echo ${n}` } });
+    emit({ type: "message_end", message: { role: "assistant", content: "done" } });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+    break;
+  }
   case "stderr-framing":
     process.stderr.write(
       JSON.stringify({ type: "message_end", message: { role: "assistant", content: "spoofed" } }),

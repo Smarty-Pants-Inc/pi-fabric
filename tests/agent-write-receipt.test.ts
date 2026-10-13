@@ -88,6 +88,14 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(recorder.pending).toBe(WRITE_RECEIPT_MAX_PENDING - 1);
   });
 
+  // pi-fabric#1034: a child that starts more calls than the cap and exits with no end event still leaves a stored
+  // receipt marked truncated (the worker copies the receipt at terminal finalization, not only on end events).
+  it("a child that starts more calls than the cap and exits without any end: the stored receipt is truncated", async () => {
+    const { manager } = managerIn("write-receipt-overflow");
+    const result = await manager.run({ task: "overflow", runner: "pi", transport: "process", extensions: false });
+    expect(result.writeReceipt).toEqual({ paths: [], commands: [], truncated: true });
+  }, 30_000);
+
   it("a dropped start is reported by the next end, so the stored receipt shows truncated", async () => {
     const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_PENDING } = await import("../src/agents/write-receipt.js");
     const recorder = new WriteReceiptRecorder("/work");

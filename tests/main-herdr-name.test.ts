@@ -2,12 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
-import { herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
-import { rootParticipantName } from "../src/topology/participant-name.js";
+import { resolveFabricIdentity } from "../src/host-compatibility.js";
+import * as herdrModule from "../src/topology/herdr-name.js";
+import { HERDR_NAME_RETRY_MS, herdrNameLookup, herdrPaneId, readHerdrAgentName } from "../src/topology/herdr-name.js";
+import { rootParticipantName, validName } from "../src/topology/participant-name.js";
 
 // smarty-dev#6758: Herdr names and panes are Main display metadata, not new routing targets.
 
@@ -21,6 +23,7 @@ const stubHerdr = (dir: string, body: string): string => {
 };
 const agentJson = (name: unknown) => JSON.stringify({ id: "cli:agent:get", result: { type: "agent_info", agent: { name, pane_id: "x" } } });
 
+// scripts/test-temp.ts scrubs the fleet's SMARTY_AGENT per file; tests that need one stub it.
 afterEach(() => { vi.unstubAllEnvs(); });
 
 describe.skipIf(process.platform === "win32")("readHerdrAgentName", () => {
@@ -63,13 +66,119 @@ describe.skipIf(process.platform === "win32")("readHerdrAgentName", () => {
     expect(herdrPaneId({ HERDR_PANE_ID: " w3Q:p1 " })).toBe("w3Q:p1");
     fs.rmSync(dir, { recursive: true, force: true });
   });
+});
 
+// Pure name ordering: platform-independent, so outside the win32 skip.
+describe("rootParticipantName", () => {
   it("prefers a valid Pi session name, then the Herdr name, then main", () => {
     expect(rootParticipantName("pi-name", "lane-a")).toBe("pi-name");
     expect(rootParticipantName(undefined, "lane-a")).toBe("lane-a");
     expect(rootParticipantName("bad/name", " lane-a ")).toBe("lane-a");
     expect(rootParticipantName(undefined, "bad/name")).toBe("main");
     expect(rootParticipantName()).toBe("main");
+  });
+
+  it("orders session, then SMARTY_AGENT, then Herdr, then main, validating each", () => {
+    expect(rootParticipantName("pi-name", "lane-a", "agent-a")).toBe("pi-name");
+    expect(rootParticipantName(undefined, "lane-a", "agent-a")).toBe("agent-a");
+    expect(rootParticipantName("bad/name", "lane-a", " agent-a ")).toBe("agent-a");
+    expect(rootParticipantName(undefined, "lane-a", "bad/agent")).toBe("lane-a");
+    expect(rootParticipantName(undefined, undefined, "agent-a")).toBe("agent-a");
+    expect(rootParticipantName(undefined, "bad/name", "")).toBe("main");
+    // Counterexample for the runtime retry predicate: an explicit name literally "main" is a
+    // valid name, so "display name is main" alone cannot mean "unnamed, retry Herdr".
+    expect(rootParticipantName("main", undefined, undefined)).toBe("main");
+    expect(rootParticipantName(undefined, undefined, "main")).toBe("main");
+    expect(validName("main")).toBe("main");
+  });
+});
+
+describe("herdrNameLookup bounded retry", () => {
+  // Real Vitest fake timers; the helper owns no timers, so faking Date is sufficient.
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"], now: 1_000 }); });
+  afterEach(() => { vi.useRealTimers(); });
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+  const harness = (answers: Array<string | undefined>) => {
+    let alive = true;
+    let eligible = true;
+    const names: string[] = [];
+    const pending: Array<(name: string | undefined) => void> = [];
+    const read = vi.fn(() => new Promise<string | undefined>((resolve) => { pending.push(resolve); }));
+    const lookup = herdrNameLookup({ read, live: () => alive, eligible: () => eligible,
+      onName: (name) => { names.push(name); } }); // default clock: the faked Date.now
+    const answer = async () => { pending.shift()!(answers.shift()); await flush(); };
+    return { lookup, read, names, answer,
+      advance: (ms: number) => { vi.advanceTimersByTime(ms); },
+      retire: () => { alive = false; },
+      setEligible: (value: boolean) => { eligible = value; } };
+  };
+
+  it("retries a failed read only on refresh pokes after 5s, 15s, 60s and 5min, then stops", async () => {
+    const h = harness([undefined, undefined, undefined, undefined, undefined]);
+    h.lookup.start();
+    h.lookup.start(); // single-flight
+    expect(h.read).toHaveBeenCalledTimes(1);
+    await h.answer();
+    for (const delay of HERDR_NAME_RETRY_MS) {
+      h.advance(delay - 1);
+      h.lookup.poke();
+      const before = h.read.mock.calls.length;
+      expect(before).toBe(HERDR_NAME_RETRY_MS.indexOf(delay) + 1);
+      h.advance(1);
+      h.lookup.poke();
+      h.lookup.poke(); // single-flight while in flight
+      expect(h.read).toHaveBeenCalledTimes(before + 1);
+      await h.answer();
+    }
+    expect(HERDR_NAME_RETRY_MS).toEqual([5_000, 15_000, 60_000, 300_000]);
+    expect(h.lookup.pending).toBe(false);
+    h.advance(24 * 3_600_000);
+    h.lookup.poke();
+    expect(h.read).toHaveBeenCalledTimes(5);
+    expect(h.names).toEqual([]);
+  });
+
+  it("publishes a recovered name once and stops reading after success", async () => {
+    const h = harness([undefined, "lane-late"]);
+    h.lookup.start();
+    await h.answer();
+    h.advance(5_000);
+    h.lookup.poke();
+    await h.answer();
+    expect(h.names).toEqual(["lane-late"]);
+    expect(h.lookup.pending).toBe(false);
+    h.advance(3_600_000);
+    h.lookup.poke();
+    expect(h.read).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips retries while the Main is named and stops on retirement before or after a read", async () => {
+    const h = harness([undefined, undefined]);
+    h.lookup.start();
+    await h.answer();
+    h.advance(5_000);
+    h.setEligible(false);
+    h.lookup.poke();
+    expect(h.read).toHaveBeenCalledTimes(1);
+    h.setEligible(true);
+    h.lookup.poke();
+    expect(h.read).toHaveBeenCalledTimes(2);
+    h.retire(); // retired while the read is in flight: its result is dropped
+    await h.answer();
+    expect(h.lookup.pending).toBe(false);
+    h.advance(3_600_000);
+    h.lookup.poke();
+    expect(h.read).toHaveBeenCalledTimes(2);
+
+    const late = harness(["lane-x"]);
+    late.lookup.start();
+    late.retire();
+    await late.answer();
+    expect(late.names).toEqual([]);
+    const dead = harness([]);
+    dead.retire();
+    dead.lookup.start();
+    expect(dead.read).not.toHaveBeenCalled();
   });
 });
 
@@ -94,6 +203,18 @@ const main = (cwd: string, sessionId: string, sessionName?: string) => {
     extensionContext: context, update() {}, approve: async () => {}, audits: [], maxResultChars: 10_000,
   });
   return { runtime, context, invoke, sendMessage, id: `session:${sessionId}` };
+};
+
+// smarty-dev#11077: a Main's inbox accepts fleet.work.* sent to its published name (real mesh/router).
+const sendWork = (via: ReturnType<typeof main>, to: string) => via.runtime.mesh.publish({ topic: "fleet.work.herdr-name",
+  kind: "ask", to, from: { id: "review-actor", name: "review-actor", kind: "actor" }, text: `hello ${to}` });
+/** The `to` targets of a Main's next inbox batch; only bypasses the inbox's existing 60s steer grace. */
+const inboxTargets = async (m: ReturnType<typeof main>) => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+  try {
+    const batch = await m.runtime.nextRootInbox({ holdsBatch: () => true, holdsSteer: () => false });
+    return batch?.events.map(event => event.to).sort();
+  } finally { clock.mockRestore(); }
 };
 
 describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
@@ -138,6 +259,10 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
         expect.objectContaining({ id: named.id, name: "pi-named", herdrPane: "w5:p1" }),
       ])), { timeout: 8000, interval: 100 });
       expect(calls().sort()).toEqual([1, 2, 3, 4, 5].map(n => `agent get w${n}:p1`));
+      // A Herdr-named Main receives work sent to its Herdr name; a Pi-named Main does not take its Herdr name.
+      for (const to of ["lane-a", "lane-e", "pi-named"]) await sendWork(b, to);
+      expect(await inboxTargets(a)).toEqual(["lane-a"]);
+      expect(await inboxTargets(named)).toEqual(["pi-named"]);
 
       // A Herdr rename is not polled by directory reads/heartbeats; reload reads once again.
       stubHerdr(root, herdrBody("lane-renamed"));
@@ -183,6 +308,57 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
     }
   }, 40_000);
 
+  it("retries the Herdr read with the pane and binary captured at start, not the current process env", async () => {
+    // smarty-dev#11077: root A's first read fails; another root later changes the process's
+    // HERDR_PANE_ID/HERDR_BIN_PATH. A's heartbeat retry must still ask about A's own pane.
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() }); // before initialize: the lookup captures Date.now
+    const root = temp();
+    const dirA = path.join(root, "a");
+    const dirB = path.join(root, "b");
+    fs.mkdirSync(dirA); fs.mkdirSync(dirB);
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    const failed = path.join(dirA, "failed-once");
+    const binA = stubHerdr(dirA, `[ -e "${failed}" ] || { touch "${failed}"; exit 1; }\n[ "$3" = w1:p1 ] && echo '${agentJson("lane-a")}'`);
+    const binB = stubHerdr(dirB, `echo '${agentJson("lane-b")}'`);
+    const config = normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: path.join(root, "mesh"), actorPollMs: 20 },
+      agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
+      mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const a = main(root, "18181818-0000-4000-8000-00000000000e");
+    const callsA = () => fs.existsSync(path.join(dirA, "calls"))
+      ? fs.readFileSync(path.join(dirA, "calls"), "utf8").trim().split("\n") : [];
+    // Spy through the real implementation only to await the first read before advancing the clock.
+    const read = vi.spyOn(herdrModule, "readHerdrAgentName");
+    try {
+      vi.stubEnv("HERDR_PANE_ID", "w1:p1");
+      vi.stubEnv("HERDR_BIN_PATH", binA);
+      await a.runtime.initialize(a.context, config);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(await read.mock.results[0]!.value).toBeUndefined();
+      expect(fs.existsSync(failed)).toBe(true);
+      for (let i = 0; i < 10; i++) await Promise.resolve(); // the lookup schedules its backoff
+      // The process env now belongs to another root (B).
+      vi.stubEnv("HERDR_PANE_ID", "w2:p1");
+      vi.stubEnv("HERDR_BIN_PATH", binB);
+      vi.advanceTimersByTime(5_000); // the first backoff is due; the next real heartbeat retries
+      await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: a.id, name: "lane-a", herdrPane: "w1:p1" }),
+      ])), { timeout: 8000, interval: 100 });
+      expect(callsA()).toEqual(["agent get w1:p1", "agent get w1:p1"]);
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(read.mock.calls[1]![0]).toMatchObject({ HERDR_PANE_ID: "w1:p1", HERDR_BIN_PATH: binA });
+      expect(fs.existsSync(path.join(dirB, "calls"))).toBe(false);
+    } finally {
+      read.mockRestore();
+      await a.runtime.shutdown();
+      vi.useRealTimers();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 30_000);
+
   it("keeps main for a Main whose Herdr lookup fails and for a print-mode root", async () => {
     const root = temp();
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
@@ -206,8 +382,76 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       expect(fs.existsSync(path.join(root, "calls"))).toBe(false);
       const sessions = await failing.invoke("agents.sessions") as Array<{ id: string; name: string }>;
       expect(sessions.find((s) => s.id === failing.id)).toMatchObject({ name: "main", herdrPane: "w6:p1" });
+      // The unnamed fallback "main" is not an inbox alias; its exact id still is.
+      for (const to of ["main", failing.id]) await sendWork(printed, to);
+      expect(await inboxTargets(failing)).toEqual([failing.id]);
     } finally {
       await failing.runtime.shutdown(); await printed.runtime.shutdown();
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 30_000);
+
+  it("names an interactive Main from SMARTY_AGENT before Herdr, after its session name, never in print/JSON mode or a child", async () => {
+    const root = temp();
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_FABRIC_")) vi.stubEnv(key, undefined);
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    vi.stubEnv("HERDR_BIN_PATH", stubHerdr(root, `echo '${agentJson("lane-h")}'`));
+    vi.stubEnv("SMARTY_AGENT", "agent-s");
+    const config = normalizeFabricConfig({ fullCodeMode: false,
+      mesh: { enabled: true, root: path.join(root, "mesh"), actorPollMs: 20 },
+      agents: { enabled: false }, residency: { enabled: false }, records: { enabled: false },
+      mcp: { enabled: false }, memory: { enabled: false }, jev: { enabled: false },
+      prewalk: { enabled: false, alwaysRearm: false },
+    });
+    const agent = main(root, "12121212-0000-4000-8000-000000000008");
+    const named = main(root, "13131313-0000-4000-8000-000000000009", "pi-named");
+    const printed = main(root, "14141414-0000-4000-8000-00000000000a");
+    (printed.context as { mode: string }).mode = "print";
+    const json = main(root, "15151515-0000-4000-8000-00000000000b");
+    (json.context as { mode: string }).mode = "json";
+    // Interactive (rpc) children inherit SMARTY_AGENT and HERDR_PANE_ID, but resolveFabricIdentity
+    // makes them actor/agent participants, so they are not a local Main and own no root record.
+    const actorChild = main(root, "16161616-0000-4000-8000-00000000000c");
+    const agentChild = main(root, "17171717-0000-4000-8000-00000000000d");
+    const actorEnv = { PI_FABRIC_MAIN_AGENT_ID: agent.id, PI_FABRIC_ACTOR_ID: "actor:gate", PI_FABRIC_PARENT_RUN: "c".repeat(32) };
+    const agentEnv = { PI_FABRIC_MAIN_AGENT_ID: agent.id, PI_FABRIC_PARENT_RUN: "d".repeat(32) };
+    expect(resolveFabricIdentity("16161616-0000-4000-8000-00000000000c", { ...actorEnv, SMARTY_AGENT: "agent-s" }).identity.kind).toBe("actor");
+    expect(resolveFabricIdentity("17171717-0000-4000-8000-00000000000d", { ...agentEnv, SMARTY_AGENT: "agent-s" }).identity.kind).toBe("agent");
+    const all = [agent, named, printed, json, actorChild, agentChild];
+    const calls = () => fs.existsSync(path.join(root, "calls"))
+      ? fs.readFileSync(path.join(root, "calls"), "utf8").trim().split("\n") : [];
+    try {
+      vi.stubEnv("HERDR_PANE_ID", "w8:p1");
+      for (const m of [agent, named]) await m.runtime.initialize(m.context, config);
+      // Gated roots get their own pane, so any Herdr call they made would be visible.
+      vi.stubEnv("HERDR_PANE_ID", "w9:p1");
+      for (const m of [printed, json]) await m.runtime.initialize(m.context, config);
+      for (const [m, env] of [[actorChild, actorEnv], [agentChild, agentEnv]] as const) {
+        for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+        await m.runtime.initialize(m.context, config);
+        for (const key of Object.keys(env)) vi.stubEnv(key, undefined);
+      }
+      await vi.waitFor(async () => expect(await agent.invoke("agents.sessions")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: agent.id, name: "agent-s" }),
+        expect.objectContaining({ id: named.id, name: "pi-named" }),
+        expect.objectContaining({ id: printed.id, name: "main" }),
+        expect.objectContaining({ id: json.id, name: "main" }),
+      ])), { timeout: 8000, interval: 100 });
+      const sessions = await agent.invoke("agents.sessions") as Array<{ id: string; name: string }>;
+      // Only the interactive Main claims the launcher name; no child owns a root record.
+      expect(sessions.filter(s => s.name === "agent-s").map(s => s.id)).toEqual([agent.id]);
+      expect(sessions.map(s => s.id)).not.toContain(actorChild.id);
+      expect(sessions.map(s => s.id)).not.toContain(agentChild.id);
+      expect(sessions.some(s => s.name === "lane-h")).toBe(false);
+      // The launcher-named Main receives work sent to SMARTY_AGENT; when the Pi name wins,
+      // neither the launcher nor the Herdr name is an alias.
+      for (const to of ["agent-s", "lane-h", "pi-named"]) await sendWork(printed, to);
+      expect(await inboxTargets(agent)).toEqual(["agent-s"]);
+      expect(await inboxTargets(named)).toEqual(["pi-named"]);
+      // No print/JSON root or child ever asked Herdr.
+      expect(calls().filter(call => call.includes("w9:p1"))).toEqual([]);
+    } finally {
+      for (const m of all.reverse()) await m.runtime.shutdown();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 30_000);

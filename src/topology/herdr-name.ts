@@ -10,6 +10,51 @@ export const herdrPaneId = (environment: NodeJS.ProcessEnv = process.env): strin
   return pane && HERDR_PANE_PATTERN.test(pane) ? pane : undefined;
 };
 
+/** Backoffs after a failed Herdr lookup (smarty-dev#11077); after the last one the Main stays "main". */
+export const HERDR_NAME_RETRY_MS: readonly number[] = [5_000, 15_000, 60_000, 300_000];
+
+/**
+ * Bounded, single-flight Herdr name lookup. `start()` runs the initial read; `poke()` is called
+ * from an existing participant refresh (no own timer or poll) and re-reads only once the next
+ * backoff is due and `eligible()` (the Main is still unnamed) holds. `live()` is checked before
+ * and after every read; a retired lifecycle or a found name stops all further reads.
+ */
+export const herdrNameLookup = (options: {
+  read: () => Promise<string | undefined>;
+  live: () => boolean;
+  eligible: () => boolean;
+  onName: (name: string) => void;
+}): { start(): void; poke(): void; readonly pending: boolean } => {
+  let failures = 0;
+  let nextAt: number | undefined;
+  let busy = false;
+  let done = false;
+  const run = (): void => {
+    if (done || busy) return;
+    if (!options.live()) { done = true; return; }
+    busy = true;
+    nextAt = undefined;
+    void options.read().catch(() => undefined).then((name) => {
+      busy = false;
+      if (!options.live()) { done = true; return; }
+      if (name) { done = true; options.onName(name); return; }
+      const delay = HERDR_NAME_RETRY_MS[failures++];
+      if (delay === undefined) done = true;
+      else nextAt = Date.now() + delay;
+    });
+  };
+  return {
+    start: run,
+    poke: () => {
+      if (done || busy || nextAt === undefined || Date.now() < nextAt) return;
+      if (!options.live()) { done = true; return; }
+      if (!options.eligible()) return;
+      run();
+    },
+    get pending() { return !done; },
+  };
+};
+
 /**
  * The Herdr agent name of this pane (smarty-dev#6758), read once with `herdr agent get <pane>`.
  * No shell, a hard timeout, and any failure (no pane, missing binary, slow, bad JSON, invalid

@@ -92,8 +92,8 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
-import { rootParticipantName } from "./topology/participant-name.js";
-import { herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
+import { rootParticipantName, validName } from "./topology/participant-name.js";
+import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
   FabricParticipantListOptions,
@@ -795,17 +795,24 @@ export class FabricRuntimeState {
     );
     this.#mainAgent = mainAgent;
     // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
-    // start or reload (no polling); any failure keeps "main". Print/JSON roots and children inherit
-    // HERDR_PANE_ID but are not the pane's agent, so they never ask.
-    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId() };
-    if (identity.kind === "main" && mainAgent.local && mainAgent.interactive && herdr.pane) {
-      void readHerdrAgentName().then((name) => {
-        if (!name || !live.current()) return;
+    // start or reload; a failure is retried only on the existing participant refresh with bounded
+    // backoff while the Main is still "main" (smarty-dev#11077). Print/JSON roots and children
+    // inherit HERDR_PANE_ID and SMARTY_AGENT but are not the pane's agent, so they never use them.
+    const namedMain = identity.kind === "main" && mainAgent.local && mainAgent.interactive;
+    const smartyAgent = namedMain ? process.env.SMARTY_AGENT : undefined;
+    const herdrEnvironment = { ...process.env };
+    const herdr: { pane: string | undefined; name?: string } = { pane: herdrPaneId(herdrEnvironment) };
+    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name, smartyAgent);
+    const herdrLookup = namedMain && herdr.pane ? herdrNameLookup({
+      read: () => readHerdrAgentName(herdrEnvironment),
+      live: live.current,
+      eligible: () => mainName() === "main" && !validName(live.sessionName()) && !validName(smartyAgent),
+      onName: (name) => {
         herdr.name = name;
         this.#participants?.scheduleRefresh();
-      });
-    }
-    const mainName = (): string => rootParticipantName(live.sessionName(), herdr.name);
+      },
+    }) : undefined;
+    herdrLookup?.start();
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
       ? new AbortController() : undefined;
@@ -827,7 +834,8 @@ export class FabricRuntimeState {
     if (this.#config.mesh.enabled) this.#registry.setResidentProcessWorkSession(sessionId);
     // A Main on the shared mesh reconciles the work events a steer missed (smarty-dev#754).
     this.#rootInbox = identity.kind === "main" && mainAgent.local && this.#config.mesh.enabled
-      ? new RootInbox(this.#mesh, identity, () => [mainAgentId, live.sessionName() ?? ""])
+      ? new RootInbox(this.#mesh, identity, () => [mainAgentId,
+          validName(live.sessionName()) ?? validName(smartyAgent) ?? herdr.name ?? ""])
       : undefined;
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     const mesh = this.#mesh;
@@ -837,6 +845,7 @@ export class FabricRuntimeState {
     this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       beforePublication: async () => {
+        herdrLookup?.poke();
         // Hand the early acquisition failure to start() once, without another inline
         // timeout. Its existing warning/heartbeat path owns recovery from here.
         if (initialMeshError !== undefined) {
@@ -943,6 +952,13 @@ export class FabricRuntimeState {
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       ownerIncarnation: controlParticipants.ownerIncarnation,
       controlIncarnationFence: this.#config.mesh.controlIncarnationFence,
+      onUnfencedSenderWarning: message => {
+        if (live.read(ctx => {
+          if (!ctx.hasUI) return false;
+          ctx.ui.notify(message, "warning");
+          return true;
+        }) !== true) console.warn(`[pi-fabric] ${message}`);
+      },
       // Both gates: this activation's custody/succession completed (main) AND its
       // directory epoch is committed under a live, renewed lease (#709).
       canConsumeMesh: () => meshActivationReady && controlParticipants.canConsumeMesh(),
@@ -1054,7 +1070,7 @@ export class FabricRuntimeState {
       hostId,
       identityId: identity.id,
       ...(ownsPersistentActorRegistry ? { completionRecipient: () => ({
-        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name), role,
+        rootId: mainAgentId, sessionId, cwd: context.cwd, projectRoot, name: rootParticipantName(this.pi.getSessionName?.(), herdr.name, smartyAgent), role,
         startedAt: mainAgent.info(context).startedAt ?? Date.now(),
       }) } : {}),
       spawnerSessionId: sessionId,
@@ -1330,7 +1346,7 @@ export class FabricRuntimeState {
             sessionId,
             cwd: context.cwd,
             projectRoot,
-            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name),
+            mainName: rootParticipantName(this.pi.getSessionName?.(), herdr.name, smartyAgent),
             mainStartedAt: mainAgent.info(context).startedAt ?? Date.now(),
             ...(role ? { role } : {}),
             project: participantProject(context.cwd),

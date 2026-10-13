@@ -26,6 +26,10 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { BRIDGE_BATCH_MAX_EVENTS as MAX_EVENTS, BRIDGE_BATCH_MAX_MS as MAX_MS } from "../src/mesh/event-log.js";
 // One synchronous append/ownership check and scheduler jitter cannot be preempted.
 const HOLD_MARGIN_MS = 25;
+// Hosted runners (shared, slow disks; pi-fabric#558 Ubuntu saw 178 and 217 ms against MAX_MS + HOLD_MARGIN_MS)
+// cannot hold a wall-clock bar. The gates are the mechanism (count cap, a writer interleaving the drain, order);
+// wall-clock stays a gross-regression ceiling only, and the numbers are printed.
+const CEILING_MS = 3000;
 const roots: string[] = [];
 const stores: MeshStore[] = [];
 const scratch = () => {
@@ -99,12 +103,12 @@ const holds = (mesh: MeshStore): Hold[] => fs.readFileSync(path.join(mesh.root, 
 const texts = (mesh: MeshStore) => mesh.read({ limit: 1000 }).map(event => event.text);
 
 describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => {
-  it.each(["toRemote", "toLocal"] as const)("500 events: bounded holds and a writer between %s batches within 100 ms", async direction => {
+  it.each(["toRemote", "toLocal"] as const)("500 events: batches of at most MAX_EVENTS and a writer between %s batches", async direction => {
     const f = await setup(direction);
     const writer = new MeshStore(f.target.root, 65536, 1000, { stateBackend: "sqlite" });
     stores.push(writer);
     const before = holds(f.target).length;
-    let writerAt = -1, writerWaitMs = Infinity;
+    let writerAt = -1, writerWaitMs = Infinity, writerAfterBatches = -1;
     let writing: Promise<void> | undefined;
     f.side.afterPrefix = () => {
       if (writing) return;
@@ -112,7 +116,7 @@ describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => 
         writerAt = f.target.read({ limit: 1000 }).length;
         const asked = performance.now();
         writer.put({ key: "probe/interleaved", value: writerAt, identity: { id: "concurrent", name: "concurrent", kind: "agent" } })
-          .then(() => { writerWaitMs = performance.now() - asked; resolve(); }, reject);
+          .then(() => { writerWaitMs = performance.now() - asked; writerAfterBatches = f.side.prefixes.length; resolve(); }, reject);
       }));
     };
     let result;
@@ -125,17 +129,23 @@ describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => 
     const maxStateHoldMs = Math.max(0, ...stateHolds.map(e => e.heldMs));
     console.log(JSON.stringify({ direction, events: 500, batches: f.side.prefixes.length,
       maxBatchEvents: Math.max(...f.side.prefixes), meshTransactions: meshHolds.length, sqliteTransactions: stateHolds.length,
-      maxMeshHoldMs, maxStateHoldMs, capMs: MAX_MS, marginMs: HOLD_MARGIN_MS, writerAt, writerWaitMs: +writerWaitMs.toFixed(3) }));
+      maxMeshHoldMs, maxStateHoldMs, capMs: MAX_MS, marginMs: HOLD_MARGIN_MS, writerAt, writerAfterBatches,
+      writerWaitMs: +writerWaitMs.toFixed(3) }));
     expect(result).toMatchObject({ [direction]: 500, dropped: 0 });
     expect(f.side.prefixes.length).toBeGreaterThanOrEqual(Math.ceil(500 / MAX_EVENTS));
     expect(f.side.prefixes.every(n => n > 0 && n <= MAX_EVENTS)).toBe(true);
     expect(meshHolds.length).toBe(f.side.prefixes.length);
     expect(stateHolds.length).toBe(direction === "toLocal" ? 500 : 0);
-    expect(maxMeshHoldMs).toBeLessThanOrEqual(MAX_MS + HOLD_MARGIN_MS);
-    expect(maxStateHoldMs).toBeLessThanOrEqual(MAX_MS + HOLD_MARGIN_MS);
+    // The writer asked after the first batch and committed while later batches were still to come: it got the
+    // lock between batches, not after the drain.
+    expect(writerAfterBatches).toBeGreaterThanOrEqual(1);
+    expect(writerAfterBatches).toBeLessThan(f.side.prefixes.length);
     expect(writerAt).toBeGreaterThan(0);
     expect(writerAt).toBeLessThan(500);
-    expect(writerWaitMs).toBeLessThan(100);
+    // Gross-regression ceilings only.
+    expect(maxMeshHoldMs).toBeLessThanOrEqual(CEILING_MS);
+    expect(maxStateHoldMs).toBeLessThanOrEqual(CEILING_MS);
+    expect(writerWaitMs).toBeLessThan(CEILING_MS);
     expect(writer.get("probe/interleaved")?.value).toBe(writerAt);
     expect(texts(f.target)).toEqual(Array.from({ length: 500 }, (_, index) => String(index)));
   }, 30000);
@@ -157,9 +167,10 @@ describe("bridge transaction cap (smarty-dev#10391), real SQLite stores", () => 
     console.log(JSON.stringify({ timed: true, applied: prefix.length, maxMeshHoldMs, maxStateHoldMs, capMs: MAX_MS, marginMs: HOLD_MARGIN_MS }));
     expect(prefix.length).toBeGreaterThan(0);
     expect(prefix.length).toBeLessThan(MAX_EVENTS);
+    // The time cap (not the count cap) ended the prefix: it held at least MAX_MS. Upper bounds: ceilings only.
     expect(maxMeshHoldMs).toBeGreaterThanOrEqual(MAX_MS);
-    expect(maxMeshHoldMs).toBeLessThanOrEqual(MAX_MS + HOLD_MARGIN_MS);
-    expect(maxStateHoldMs).toBeLessThanOrEqual(MAX_MS + HOLD_MARGIN_MS);
+    expect(maxMeshHoldMs).toBeLessThanOrEqual(CEILING_MS);
+    expect(maxStateHoldMs).toBeLessThanOrEqual(CEILING_MS);
     expect(texts(mesh)).toEqual(inputs.slice(0, prefix.length).map(e => e.text));
   });
 

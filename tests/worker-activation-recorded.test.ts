@@ -12,6 +12,11 @@
 //   real run compacted only after 647-650). It is NOT used: every compaction here is the real persisted one,
 //   including 647-650. The resimulated prefix through 635 matched the journal, as prior fidelity evidence only.
 // - The data is structure-only: real lengths, usages, ids and references; all text is filler.
+// - Provenance (verifiable on Ryzen 1, where the private source stays): SOURCE.sha256 is the output of the
+//   sanitizer (sha256 966d6fecec008d9acc2752af836d6449c9f055d06a4a4c63d465784dfcc74e29) run on the recorded
+//   session of actor 39d0eee958694fbdbbc7f21dc5eea5e0 (run 2aefdb94), session.jsonl.20261012T214524629Z.bak,
+//   10,839,524 bytes, sha256 992f6b929643ca31dd18ffb1da3104eb48e93c4c42ac962f75717c406b699020. Re-derive with
+//   ~/.local/state/smarty/org/fabric-store-replay-2aefdb94/verify.sh (smarty-dev#10560).
 //
 // Decision C: this is NOT E2E and does not claim the exact live session's failure end to end. Excluded: the
 // context hook projection and verifySystem's system witness (dispatch context.messages is [], as in
@@ -20,6 +25,7 @@
 // readiness ACK) and the native compaction chain (turn_end drafting: usage reports carry toolResults: [],
 // so the hook records each real report without resimulating a compaction). Planned named E2E:
 // tests/worker-activation-window.test.ts "native activation window" > "fits the recorded 2aefdb94 activation"
+// (target 2026-10-20, owner fabric-store, smarty-dev#10049)
 // with PI_FABRIC_ACTIVATION_TEST_PI_BINARY and AgentManager.run({inferenceContext: "activation",
 // transport: "process"}) over this recorded persisted state: pass = the old hook's typed CONTEXT_OVERFLOW
 // refusal, the new hook's completion with the final request served byte-exact, and a true visible overflow

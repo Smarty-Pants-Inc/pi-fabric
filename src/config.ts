@@ -930,6 +930,40 @@ const readJsonObjectFile = (filePath: string): JsonObjectFile | undefined => {
 const readJsonObject = (filePath: string): Record<string, unknown> | undefined =>
   readJsonObjectFile(filePath)?.document;
 
+const isJsonObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * smarty-dev#11373: the NATS stream replicas from the agent layer only (`<agentDir>/fabric.json` mesh.nats.replicas),
+ * validated by meshNatsReplicas (default 1). A missing file or an absent value is 1. Read-only: no project layer,
+ * host policy, migration, quarantine, warning or write. An unreadable file, malformed JSON, a non-object document or
+ * mesh/nats section, or an invalid value is refused (throws), never defaulted to a lower replica count.
+ */
+export const loadAgentNatsReplicas = (agentDir: string): number => {
+  const filePath = path.join(agentDir, "fabric.json");
+  let source: string;
+  try {
+    source = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return meshNatsReplicas(undefined);
+    throw new Error(`mesh.nats.replicas: cannot read ${filePath}`, { cause: error });
+  }
+  let document: unknown;
+  try {
+    document = JSON.parse(source);
+  } catch (error) {
+    throw new Error(`mesh.nats.replicas: ${filePath} is not valid JSON`, { cause: error });
+  }
+  if (!isJsonObject(document)) throw new Error(`mesh.nats.replicas: ${filePath} must be a JSON object`);
+  const { mesh } = document;
+  if (mesh === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(mesh)) throw new Error("mesh must be an object");
+  const { nats } = mesh;
+  if (nats === undefined) return meshNatsReplicas(undefined);
+  if (!isJsonObject(nats)) throw new Error("mesh.nats must be an object");
+  return meshNatsReplicas(nats.replicas);
+};
+
 const mergeObjects = (
   base: Record<string, unknown>,
   override: Record<string, unknown>,

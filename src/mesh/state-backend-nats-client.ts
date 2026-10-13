@@ -24,23 +24,24 @@ export interface ConnectJetStreamOptions {
   monitoringUrl?: string;
   /** Set: every connection must be TLS (these files, or the system CAs for `{}`). */
   tls?: NatsTlsFiles;
-  /** The stream's replicas (positive integer, smarty-dev#11373). Omitted: the global config's mesh.nats.replicas. */
+  /** The stream's replicas (positive integer, smarty-dev#11373). Omitted: the agent-layer fabric.json mesh.nats.replicas. */
   replicas?: number;
 }
 
 /**
- * smarty-dev#11373: omitted replicas come from the global Fabric configuration (mesh.nats.replicas, validated with its
- * default of 1 by the loader), read at first use. Dynamic imports keep this client's lazy graph unchanged; the agent
- * dir is the host's getAgentDir convention (PI_CODING_AGENT_DIR, else ~/.pi/agent) through its local mirror.
+ * smarty-dev#11373: omitted replicas come only from the agent layer (`<agentDir>/fabric.json` mesh.nats.replicas, default
+ * 1 when the file or value is absent; unreadable, malformed or invalid is refused), read read-only at first use, not
+ * the full merged config. Dynamic imports keep this client's lazy graph unchanged; the agent dir is the host's
+ * getAgentDir convention (PI_CODING_AGENT_DIR, else ~/.pi/agent) through its local mirror.
  */
 const configuredReplicas = async (): Promise<number> => {
-  const [{ loadGlobalFabricConfig }, { resolveAgentDir }] = await Promise.all([import("../config.js"), import("../core/agent-dir.js")]);
-  return assertNatsReplicas(loadGlobalFabricConfig(resolveAgentDir()).mesh.nats?.replicas, "mesh.nats.replicas");
+  const [{ loadAgentNatsReplicas }, { resolveAgentDir }] = await Promise.all([import("../config.js"), import("../core/agent-dir.js")]);
+  return assertNatsReplicas(loadAgentNatsReplicas(resolveAgentDir()), "mesh.nats.replicas");
 };
 
 export const connectJetStream = async (servers: string[], options: ConnectJetStreamOptions = {}): Promise<JetStreamPort> => {
   if (servers.length === 0) throw new Error("NATS mesh state: no servers configured");
-  // Decided before any connection: an explicit value is validated, an omitted one is the global config's.
+  // Decided before any connection: an explicit value is validated, an omitted one is the agent layer's.
   const replicas = options.replicas === undefined ? await configuredReplicas() : assertNatsReplicas(options.replicas, "replicas");
   // smarty-dev#9663 item 2: a client or fetch error may quote a server URL; never pass its credentials on.
   let nc: Awaited<ReturnType<typeof connect>>;

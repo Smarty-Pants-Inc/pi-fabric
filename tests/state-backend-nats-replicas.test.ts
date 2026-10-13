@@ -1,13 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Stream replicas (proposed contract): ConnectJetStreamOptions.replicas (default 1) is the stream's num_replicas on
-// create; an existing stream whose num_replicas differs is refused with MeshStateNatsRefusedError
-// (FABRIC_MESH_STATE_NATS_REFUSED, configured/observed replicas named) BEFORE any update, add or publish, and a stream
-// is never lowered (3 -> 1). Both @nats-io modules are pure fakes: the real connectJetStream/ensureStream path runs,
-// with no server, network or filesystem write. Options are passed through wide variables so the file compiles against
-// the old option types and the old code fails on BEHAVIOR, not on types.
+// Stream replicas: omitted values come only from the agent-dir fabric.json reader (default 1); explicit values still
+// win. The real-reader cases use private fixtures and check the agent reader/client path without global config/policy
+// loads, warnings, or config rewrites. Both @nats-io modules are pure fakes: no server/network.
+// Options are passed through wide variables so assertions remain behavioral across the old option types.
 const fake = vi.hoisted(() => {
   class FakeJetStreamApiError extends Error {
     constructor(readonly errCode: number) { super(`fake JetStream API error ${errCode}`); this.name = "JetStreamApiError"; }
@@ -19,10 +17,11 @@ const fake = vi.hoisted(() => {
     streams: new Map<string, StreamInfo>(),
     log: [] as { op: string; args: unknown[] }[],
     addStop: false,
-    /** mesh.nats.replicas the fake global config holds; reset to 1 before every case. */
+    /** mesh.nats.replicas returned by the fake agent-only reader; reset to 1 before every case. */
     configuredReplicas: 1 as unknown,
-    /** Stands in for config.loadGlobalFabricConfig: no real config file, migration or cleanup path runs. */
+    /** Guards that NATS replica lookup never enters the global config / policy path. */
     loadGlobal: vi.fn<(agentDir: string) => unknown>(),
+    loadAgent: vi.fn<(agentDir: string) => number>(),
   };
 });
 
@@ -30,6 +29,7 @@ const fake = vi.hoisted(() => {
 vi.mock("../src/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../src/config.js")>()),
   loadGlobalFabricConfig: fake.loadGlobal,
+  loadAgentNatsReplicas: fake.loadAgent,
 }));
 
 vi.mock("@nats-io/transport-node", () => ({
@@ -125,7 +125,9 @@ beforeEach(() => {
   fake.configuredReplicas = 1;
   fake.loadGlobal.mockReset();
   fake.loadGlobal.mockImplementation(() => normalizeFabricConfig({ mesh: { nats: { replicas: fake.configuredReplicas } } }));
-  // The agent dir the client resolves: a nonexistent path, only ever handed to the fake loader.
+  fake.loadAgent.mockReset();
+  fake.loadAgent.mockImplementation(() => fake.configuredReplicas as number);
+  // The agent dir the client resolves: a nonexistent path, only ever handed to the fake reader.
   vi.stubEnv("PI_CODING_AGENT_DIR", AGENT_DIR);
   vi.stubGlobal("fetch", async () => { throw new Error("fake: no network"); });
 });
@@ -175,6 +177,18 @@ describe("NATS stream replicas: real client ensureStream (pure fakes)", () => {
     expect(mutations()[0]!.args[0]).toMatchObject({ name: STREAM, subjects: SUBJECTS, num_replicas: 3, max_msg_size: 1024 * 1024 });
   });
 
+  it("creates every JetStream stream asset with configured replicas 3", async () => {
+    fake.configuredReplicas = 3;
+    const port = await connectJetStream(SERVERS);
+    await port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
+    const secondStream = `${STREAM}_SECOND`;
+    await port.ensureStream(secondStream, [`${secondStream}.state`, `${secondStream}.snapshot`], { maxMsgSize: 1024 * 1024 });
+    const adds = mutations().filter(entry => entry.op === "add");
+    expect(adds).toHaveLength(2);
+    expect(adds.map(entry => (entry.args[0] as { name: string; num_replicas: number }).name)).toEqual([STREAM, secondStream]);
+    expect(adds.every(entry => (entry.args[0] as { num_replicas: number }).num_replicas === 3)).toBe(true);
+  });
+
   it("creates an absent stream with num_replicas 1 by default", async () => {
     const port = await connectJetStream(SERVERS);
     await port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
@@ -206,19 +220,20 @@ describe("NATS stream replicas: OpenNatsStateBackendOptions.replicas wiring (pur
   });
 });
 
-describe("NATS stream replicas: global config mesh.nats.replicas wiring (fake loader, pure fakes)", () => {
+describe("NATS stream replicas: agent fabric.json mesh.nats.replicas wiring (fake reader, pure fakes)", () => {
   const root = "/nonexistent-fabric-replicas-test/root";
   const openOmitted = (): { root: string; servers: string[]; acceptPeriodicSync: boolean } =>
     ({ root, servers: [...SERVERS], acceptPeriodicSync: true });
   const openExplicit = (replicas: unknown): { root: string; servers: string[]; acceptPeriodicSync: boolean; replicas: number } =>
     ({ ...openOmitted(), replicas: replicas as number });
 
-  it("omitted replicas: connectJetStream reads the global config at first use and creates 3 when 3 are configured", async () => {
+  it("omitted replicas: connectJetStream reads the agent-only value at first use and creates 3 when configured", async () => {
     fake.configuredReplicas = 3;
-    expect(fake.loadGlobal).not.toHaveBeenCalled();
+    expect(fake.loadAgent).not.toHaveBeenCalled();
     const port = await connectJetStream(SERVERS);
-    expect(fake.loadGlobal).toHaveBeenCalledTimes(1);
-    expect(fake.loadGlobal).toHaveBeenCalledWith(AGENT_DIR);
+    expect(fake.loadAgent).toHaveBeenCalledTimes(1);
+    expect(fake.loadAgent).toHaveBeenCalledWith(AGENT_DIR);
+    expect(fake.loadGlobal).not.toHaveBeenCalled();
     await port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
     expect(mutations().map(entry => entry.op)).toEqual(["add"]);
     expect(mutations()[0]!.args[0]).toMatchObject({ name: STREAM, num_replicas: 3 });
@@ -251,7 +266,8 @@ describe("NATS stream replicas: global config mesh.nats.replicas wiring (fake lo
     fake.configuredReplicas = 3;
     fake.addStop = true;
     await openNatsStateBackend(openOmitted()).catch(() => undefined);
-    expect(fake.loadGlobal).toHaveBeenCalledWith(AGENT_DIR);
+    expect(fake.loadAgent).toHaveBeenCalledWith(AGENT_DIR);
+    expect(fake.loadGlobal).not.toHaveBeenCalled();
     const adds = mutations().filter(entry => entry.op === "add");
     expect(adds).toHaveLength(1);
     expect(adds[0]!.args[0]).toMatchObject({ name: natsStreamName(root), num_replicas: 3 });
@@ -273,9 +289,99 @@ describe("NATS stream replicas: global config mesh.nats.replicas wiring (fake lo
       const opened = await refusal(openNatsStateBackend(openExplicit(replicas)));
       expect(opened).toBeInstanceOf(MeshStateNatsRefusedError);
       expect(connects()).toBe(0);
+      expect(fake.loadAgent).not.toHaveBeenCalled();
       expect(fake.loadGlobal).not.toHaveBeenCalled();
       expect(mutations()).toEqual([]);
     });
+});
+
+describe("NATS replicas: real agent-only reader on private fixture", () => {
+  const inFleet = FIXTURE_AGENT_DIR !== undefined && /pi-fabric-test-fleet-[^/\\]+[/\\]agent[/\\]?$/.test(FIXTURE_AGENT_DIR);
+  const actualReader = async (): Promise<(agentDir: string) => number> => {
+    const actualConfig = await vi.importActual<typeof import("../src/config.js")>("../src/config.js");
+    const reader = (actualConfig as unknown as { loadAgentNatsReplicas?: (agentDir: string) => number }).loadAgentNatsReplicas;
+    expect(reader).toBeTypeOf("function");
+    return reader!;
+  };
+  const readerFixture = (name: string): string => {
+    const directory = path.join(FIXTURE_AGENT_DIR!, `reader-${name}`);
+    mkdirSync(directory, { recursive: true });
+    return directory;
+  };
+
+  it.skipIf(!inFleet)("the real reader feeds connectJetStream: creates replicas 3 without policy/global reads, warnings, or writes", async () => {
+    const file = path.join(FIXTURE_AGENT_DIR!, "fabric.json");
+    const before = existsSync(file) ? readFileSync(file, "utf8") : undefined;
+    const document = before === undefined ? {} : JSON.parse(before) as Record<string, unknown>;
+    const mesh = (document.mesh ?? {}) as Record<string, unknown>;
+    const nats = (mesh.nats ?? {}) as Record<string, unknown>;
+    const configured = JSON.stringify({ ...document, mesh: { ...mesh, nats: { ...nats, replicas: 3 } } }, null, 2);
+    const reader = await actualReader();
+    fake.loadAgent.mockImplementation(reader);
+    vi.stubEnv("PI_CODING_AGENT_DIR", FIXTURE_AGENT_DIR!);
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const policy = await import("../src/host-policy.js");
+    const policyRead = vi.spyOn(policy, "readHostPolicy");
+    try {
+      writeFileSync(file, configured);
+      const port = await connectJetStream(SERVERS);
+      await port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 });
+      expect(fake.loadAgent).toHaveBeenCalledTimes(1);
+      expect(fake.loadAgent).toHaveBeenCalledWith(FIXTURE_AGENT_DIR);
+      expect(mutations().map(entry => entry.op)).toEqual(["add"]);
+      expect(mutations()[0]!.args[0]).toMatchObject({ name: STREAM, subjects: SUBJECTS, num_replicas: 3 });
+      expect(fake.loadGlobal).not.toHaveBeenCalled();
+      expect(policyRead).not.toHaveBeenCalled();
+      expect(warnings).not.toHaveBeenCalled();
+      expect(readFileSync(file, "utf8")).toBe(configured);
+    } finally {
+      if (before === undefined) writeFileSync(file, "{}");
+      else writeFileSync(file, before);
+      policyRead.mockRestore();
+      warnings.mockRestore();
+    }
+  });
+
+  it.skipIf(!inFleet)("defaults a missing agent fabric.json to one replica", async () => {
+    const directory = readerFixture("missing-file");
+    expect((await actualReader())(directory)).toBe(1);
+    expect(existsSync(path.join(directory, "fabric.json"))).toBe(false);
+  });
+
+  it.skipIf(!inFleet)("defaults an absent mesh.nats.replicas key to one without rewriting the file", async () => {
+    const directory = readerFixture("absent-key");
+    const file = path.join(directory, "fabric.json");
+    const raw = JSON.stringify({ mesh: { nats: {} } });
+    writeFileSync(file, raw);
+    expect((await actualReader())(directory)).toBe(1);
+    expect(readFileSync(file, "utf8")).toBe(raw);
+  });
+
+  it.skipIf(!inFleet)("refuses invalid replicas without rewriting the file", async () => {
+    const directory = readerFixture("invalid-replicas");
+    const file = path.join(directory, "fabric.json");
+    const raw = JSON.stringify({ mesh: { nats: { replicas: 0 } } });
+    writeFileSync(file, raw);
+    await expect(actualReader().then(reader => reader(directory))).rejects.toThrow(/mesh\.nats\.replicas/);
+    expect(readFileSync(file, "utf8")).toBe(raw);
+  });
+
+  it.skipIf(!inFleet)("refuses malformed and unreadable config without rewriting or quarantining it", async () => {
+    const malformedDir = readerFixture("malformed");
+    const malformedFile = path.join(malformedDir, "fabric.json");
+    const malformed = "{not-json";
+    writeFileSync(malformedFile, malformed);
+    await expect(actualReader().then(reader => reader(malformedDir))).rejects.toThrow(/mesh\.nats\.replicas/);
+    expect(readFileSync(malformedFile, "utf8")).toBe(malformed);
+    expect(existsSync(`${malformedFile}.corrupt`)).toBe(false);
+
+    const unreadableDir = readerFixture("unreadable");
+    const unreadableFile = path.join(unreadableDir, "fabric.json");
+    mkdirSync(unreadableFile);
+    await expect(actualReader().then(reader => reader(unreadableDir))).rejects.toThrow(/mesh\.nats\.replicas/);
+    expect(existsSync(unreadableFile)).toBe(true);
+    expect(existsSync(`${unreadableFile}.corrupt`)).toBe(false);
+  });
 });
 
 describe("config mesh.nats.replicas (pure)", () => {

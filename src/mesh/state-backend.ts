@@ -674,6 +674,28 @@ export class SqliteStateBackend implements StateBackend {
     return this.stateStamp();
   }
 
+  /**
+   * smarty-dev#10391: whether no key under `prefixes` changed in any commit after `stamp` (a `stateStamp()` of
+   * this database and epoch). One meta read, and the trimmed change feed only when a commit landed since; inside
+   * `withWriteFence` it reads that fence's snapshot. False whenever it cannot prove it (another epoch, a trimmed feed).
+   */
+  /** smarty-dev#10391: a read-only view of the committed state now and its stamp, for a plan made before a write. */
+  stateView(): { stamp: string; view: MeshBatchView } {
+    const snapshot = this.#read(() => this.#current());
+    return { stamp: snapshot.stamp, view: snapshotView(() => snapshot) };
+  }
+
+  unchangedSince(stamp: string, prefixes: readonly string[]): boolean {
+    const store = this.#read(() => this.#open());
+    const current = store.stateStamp();
+    if (current === stamp) return true;
+    const lineage = lineageOf(stamp);
+    const after = Number(stamp.slice(lineage.length + 1));
+    if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
+    const feed = this.#read(() => store.changesSince(after));
+    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)));
+  }
+
   // ------------------------------------------------------------ writes
 
   async put(input: StateBackendPutInput): Promise<MeshStateEntry> {

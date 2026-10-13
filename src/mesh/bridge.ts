@@ -5,15 +5,16 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
-import { type FabricHostLease, hostLeaseExpiry, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
+import { type FabricHostLease, hostLeaseExpiry, hostLeasePath, hostLiveness, readHostLease, readHostLeases, removeHostLeaseIf, STATE_LEASE_RENEW_MS, writeHostLease } from "../topology/host-leases.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles } from "../topology/participant-files.js";
-import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshStateEntry, type MeshStore } from "./store.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
+import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 
 /**
  * Fabric mesh bridge v1 (smarty-dev#2004). Each host keeps its own mesh; one bridge process on the
@@ -325,6 +326,17 @@ const contentDigest = (value: unknown): string => createHash("sha256").update(JS
 // voids it (a live native always wins), and a bridge deletes a void handoff in its next mirror commit.
 
 export const BRIDGE_HANDOFF_PREFIX = "topology/handoffs/";
+/** Every state row a held event's ownership check reads (holds(): its records and #reservedNow()). */
+const HELD_STATE_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, BRIDGE_HANDOFF_PREFIX] as const;
+/** #mirror: plans made before the transaction before the last one plans inside it. */
+const MIRROR_PLAN_ATTEMPTS = 3;
+/** A mirror plan made before the transaction no longer matches its snapshot: roll back, plan again. */
+class MirrorPlanStale extends Error {}
+/** #heldFence: pre-check attempts before the full check runs inside the fence. */
+const HELD_FENCE_ATTEMPTS = 3;
+const HELD_FENCE_STALE = Symbol("held fence stale");
+const HOST_LEASE_DIR = "host-leases";
+const PARTICIPANT_FILE_DIR = "participants";
 
 export interface BridgeHandoff {
   format: 1;
@@ -367,6 +379,10 @@ const NO_HANDOFFS: BridgeHandoffScope = { reserved: [], waived: () => false, voi
 const nativeLeaseLive = (lease: FabricHostLease, now: number): boolean =>
   (lease.writer !== undefined || lease.session !== undefined) &&
   Math.max(lease.expiresAt, lease.session?.expiresAt ?? -Infinity, lease.reloadUntil ?? -Infinity) >= now;
+
+/** smarty-dev#10391: every lease bridgeHandoffScope judged at `then` is judged the same at `now`, either way. */
+const sameLeaseLiveness = (leases: ReadonlyMap<string, FabricHostLease>, then: number, now: number): boolean =>
+  [...leases.values()].every((lease) => nativeLeaseLive(lease, then) === nativeLeaseLive(lease, now));
 
 /**
  * The handoffs as `peer`'s link sees them. A handoff is void when any native record (host or
@@ -580,7 +596,24 @@ export class StoreBridgeSide implements BridgeSide {
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
     // against the pending writer, retrying actual contention only, never idle polling.
-    const capture = () => this.store.stateBackend === "sqlite" ? this.store.withStateWriteFence(snapshot) : snapshot();
+    // smarty-dev#10391: the snapshot reads every host, participant and handoff row and the participant and
+    // lease files. Taken inside the fence, it held state.db's write lock on EVERY change notification of the
+    // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
+    // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
+    // that no such row changed since its revision (the pending writer has committed by then) and that both
+    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
+    const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    const capture = (): ReturnType<typeof snapshot> => {
+      if (this.store.stateBackend !== "sqlite") return snapshot();
+      for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
+        const revision = this.store.stateRevision();
+        const stamps = files();
+        const value = snapshot();
+        if (revision !== undefined && this.store.withStateWriteFence(() =>
+          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
+      }
+      return this.store.withStateWriteFence(snapshot);
+    };
     const flush = (): void => {
       queued = false;
       if (!active) return;
@@ -619,7 +652,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   #scan(
     hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
-  ): { presence: BridgePresence; voided: MeshStateEntry[] } {
+  ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
     const leases = readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
@@ -669,6 +702,8 @@ export class StoreBridgeSide implements BridgeSide {
     return {
       presence: { hosts, participants: [...participants.values()].map(({ record }) => record), reserved: [...reserved] },
       voided: handoffs.voided,
+      // smarty-dev#10391: what the scan judged by time, for a plan made before its transaction.
+      leases, now,
     };
   }
 
@@ -727,18 +762,7 @@ export class StoreBridgeSide implements BridgeSide {
       // acquired asynchronously). Under the participants-files policy a native's first file is
       // written without it; its host record, which reserves the root id, still goes through the
       // lock, and a mirror never outranks a native file (#142 S2).
-      ...(held.length > 0 ? {
-        fence: <R>(commit: () => R): R => this.store.withStateWriteFence(commit),
-        admit: () => {
-          for (const id of held) {
-            // An inbound sender's name, kind and session id must be its mirrored record's, at commit
-            // (pi-fabric#876 security pass, (b)): a body identity never gets the bridge's mark.
-            if (!this.holds(id, id === checked.from.id ? checked.from : undefined)) {
-              throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
-            }
-          }
-        },
-      } : {}),
+      ...(held.length > 0 ? this.#heldFence(held, checked.from) : {}),
       data,
     };
   }
@@ -754,22 +778,114 @@ export class StoreBridgeSide implements BridgeSide {
    * id, name, kind and session id (pi-fabric#876 security pass, (b)).
    */
   holds(id: string, identity?: MeshIdentity): boolean {
+    // Inside #heldFence, after its proof: this exact (id, identity) was checked at a revision the fence
+    // proved current. Set and cleared in one synchronous segment, so no other caller can see it.
+    if (this.#proven.has(id) && this.#proven.get(id) === identity) return true;
+    return this.#heldUntil(id, identity) > this.now();
+  }
+
+  /** #heldFence's proven pre-checks, by id, live only inside its fence (see holds()). */
+  readonly #proven = new Map<string, MeshIdentity | undefined>();
+
+  /**
+   * smarty-dev#10391: the ownership check of a held event, split around the SQLite write fence. The full check
+   * (every host, participant and handoff row, the participant and lease files) reads O(fleet) data: inside the
+   * fence it held state.db's write lock for each bridged event, so a bridge behind on a large hub kept the lock
+   * busy for its whole catch-up. It now runs just before the fence, after recording the state revision and the
+   * stamps of the files it reads. In the fence, with the time read there, a cheap proof stands in for it: no host,
+   * participant or handoff row changed since (the change feed), no participant file was added, replaced or
+   * removed (the directory stamp), the lease files it used are unchanged (each held id's own file; the whole
+   * directory when a handoff row exists, since handoffs read every lease), and every held lease is still live.
+   * A failed proof releases the fence and checks again, twice; the third attempt runs the full check in the
+   * fence, as before. admit() still calls holds() for each id inside the fence; after the proof, holds()
+   * answers from the proven pre-check. A link that does not hold an id at the pre-check refuses it without
+   * taking the fence (refusing is fail-closed; the caller's one refresh-and-retry still applies). The file
+   * backend (no state revision) keeps the full check in its `.lock` passthrough fence, unchanged.
+   */
+  #heldFence(held: readonly string[], from: MeshIdentity): Pick<MeshPublishInput, "fence" | "admit"> {
+    const identityOf = (id: string): MeshIdentity | undefined => id === from.id ? from : undefined;
+    return {
+      fence: <R>(commit: () => R): R => {
+        for (let attempt = 0; ; attempt += 1) {
+          const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
+          const outcome = this.store.withStateWriteFence(() => {
+            if (observed !== undefined) {
+              if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
+                this.#heldFiles(held, observed.leasesAll) === observed.files)) return HELD_FENCE_STALE;
+              for (const id of held) this.#proven.set(id, identityOf(id));
+            }
+            try { return { value: commit() }; }
+            finally { this.#proven.clear(); }
+          });
+          if (outcome !== HELD_FENCE_STALE) return outcome.value;
+        }
+      },
+      admit: () => {
+        for (const id of held) {
+          // An inbound sender's name, kind and session id must be its mirrored record's, at commit
+          // (pi-fabric#876 security pass, (b)): a body identity never gets the bridge's mark.
+          if (!this.holds(id, identityOf(id))) {
+            throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+          }
+        }
+      },
+    };
+  }
+
+  // The pre-check of #heldFence: undefined when it cannot run outside the fence (no SQLite state revision).
+  // Throws BridgeOwnershipError when this link does not hold an id now.
+  #heldObservation(held: readonly string[], from: MeshIdentity):
+    { revision: string; until: number; files: string; leasesAll: boolean } | undefined {
+    const revision = this.store.stateRevision();
+    if (revision === undefined) return undefined;
+    // Handoff rows are proven by the change feed; with none, no lease but the held ids' own is read.
+    const leasesAll = this.store.list(BRIDGE_HANDOFF_PREFIX, 1, { fresh: true }).length > 0;
+    const files = this.#heldFiles(held, leasesAll);
+    let until = Infinity;
+    for (const id of held) {
+      const expiry = this.#heldUntil(id, id === from.id ? from : undefined);
+      if (expiry <= this.now()) throw new BridgeOwnershipError(`${id} is no longer bound to bridge link ${this.peer}`);
+      until = Math.min(until, expiry);
+    }
+    return { revision, until, files, leasesAll };
+  }
+
+  // Stamps of the files the ownership check reads: one stat per held lease file (or the lease directory) and
+  // the participant directory. Atomic writes rename into the directory, so any change moves its stamp.
+  #heldFiles(held: readonly string[], leasesAll: boolean): string {
+    const stat = (file: string): string => {
+      try {
+        const value = fs.statSync(file, { bigint: true });
+        return `${value.ino}:${value.mtimeNs}:${value.ctimeNs}:${value.size}`;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return "-";
+        throw error;
+      }
+    };
+    const leases = leasesAll ? [meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)]
+      : held.map((id) => stat(hostLeasePath(this.store.root, id)));
+    return [meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR), ...leases].join("|");
+  }
+
+  // The lease expiry of `id` when this link holds it now (see holds()), else 0.
+  #heldUntil(id: string, identity?: MeshIdentity): number {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
-    if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return false;
-    if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return false;
+    if (!hostEntry || remoteHostOf(hostEntry.value) !== this.peer) return 0;
+    if (participantEntry && remoteHostOf(participantEntry.value) !== this.peer) return 0;
     // A native's own file, readable or not (fail closed, security pass S3 on #142).
-    if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return false;
+    if (participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, id))) return 0;
     const host = hostOf(hostEntry.key, hostEntry.value);
-    if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return false;
-    if (identity && !sameIdentity(host.identity, identity)) return false;
-    if (hostLeaseExpiry(readHostLeases(this.store.root), host) <= now) return false;
+    if (!host || host.id !== id || host.identity.id !== id || host.rootId !== id || hostEntry.updatedBy.id !== id) return 0;
+    if (identity && !sameIdentity(host.identity, identity)) return 0;
+    const until = hostLeaseExpiry(readHostLeases(this.store.root), host);
+    if (until <= now) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
-      if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return false;
+      if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return 0;
     }
-    return !this.#reservedNow().has(id);
+    return this.#reservedNow().has(id) ? 0 : until;
   }
 
   mirrored(id: string): boolean {
@@ -851,34 +967,21 @@ export class StoreBridgeSide implements BridgeSide {
     // observedAt counts as now: NaN would admit every lapsed host and -Infinity would resurrect
     // one for a full lease (independent review, P2).
     const liveAt = typeof observedAt === "number" && Number.isFinite(observedAt) ? Math.min(now, observedAt) : now;
-    const leases: BridgeLease[] = [];
-    const removed: BridgeUnlease[] = [];
+    let leases: BridgeLease[] = [];
+    let removed: BridgeUnlease[] = [];
     // One idempotency key per host: a later lease write or removal supersedes an earlier one.
     const effects = (): CommitOutboxEffect[] => [
       ...leases.map((lease) => ({ kind: "lease", key: `lease:${lease.id}`, payload: lease })),
       ...removed.map((gone) => ({ kind: "unlease", key: `lease:${gone.id}`, payload: gone })),
     ];
-    // Participant files are read before the state transaction and revalidated in it by their
-    // directory stamp (R11): only a change in between reads them again under the lock.
-    const filesStamp = meshDirectoryStamp(this.store.root, "participants");
-    const files = participantFileSnapshot(this.store.root);
-    const plan = this.#outbox.plan();
-    await this.store.writeBatch({
-      identity: this.#identity(),
-      lockClass: "bridge",
-      ops: [],
-      // Admission, reservations and CAS all observe ONE authoritative snapshot under the
-      // write lock. No native takeover can fit between that observation and this commit
-      // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
-      prepare: (view) => {
-        if (halted()) return plan.stage([], []);
-        // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
-        // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
-        if (!this.#recovered) plan.replay(view);
+    // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
+    const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
+      { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
+        judged: { leases: ReadonlyMap<string, FabricHostLease>; now: number } } | undefined => {
+        const leases: BridgeLease[] = [];
+        const removed: BridgeUnlease[] = [];
         const hostEntries = view.listAll(HOST_PREFIX);
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
-        const participantFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp
-          ? files : participantFileSnapshot(this.store.root);
         const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
         const own = new Set(scan.presence.reserved);
         const wanted = new Map<string, { value: Record<string, unknown>; identity: MeshIdentity }>();
@@ -933,11 +1036,11 @@ export class StoreBridgeSide implements BridgeSide {
               ? typeof existing.value.updatedAt !== "number" || now - existing.value.updatedAt < STATE_LEASE_RENEW_MS
               : existing.value.updatedAt === value.updatedAt)
           ) continue;
-          if (halted()) return plan.stage([], []);
+          if (halted()) return undefined;
           ops.push({ kind: "put", key, value, identity, ifVersion: view.version(key), onConflict: "skip" });
         }
         for (const [key, { value, version }] of mirrored) {
-          if (halted()) return plan.stage([], []);
+          if (halted()) return undefined;
           if (wanted.has(key) || remoteHostOf(value) !== this.peer) continue;
           if (key.startsWith(HOST_PREFIX) && isObject(value) && typeof value.id === "string") {
             const gone = hostOf(key, value);
@@ -949,13 +1052,63 @@ export class StoreBridgeSide implements BridgeSide {
         }
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
         for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
-        // A changing commit records its lease effects in the same commit; a lease-only renewal
-        // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
-        return plan.stage(ops, effects());
-      },
-      // After the commit, on the committed owner, never a fresh per-record state read.
-      afterCommit: (view) => { plan.run(view, halted); },
-    });
+        return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
+    };
+    for (let attempt = 0; ; attempt += 1) {
+      // Participant files are read before the state transaction and revalidated in it by their
+      // directory stamp (R11): only a change in between reads them again under the lock.
+      const filesStamp = meshDirectoryStamp(this.store.root, "participants");
+      const files = participantFileSnapshot(this.store.root);
+      // smarty-dev#10391: the plan reads every host, participant and handoff row. Planned inside the
+      // transaction it held state.db's write lock for the whole scan on every presence pass. It is planned
+      // first on the committed state at a recorded revision; the transaction uses it only when the change
+      // feed proves no host, participant or handoff row changed since and the participant directory stamp is
+      // unchanged, so it still decides on the snapshot it commits on (security review rounds 2/3, F1/F2).
+      // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
+      // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
+      const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
+      // With a handoff row, #scan reads every lease file and judges each native lease live or not at its own
+      // time (bridgeHandoffScope: a live native voids a handoff). Stamp the directory first; in the transaction,
+      // every lease must also be judged the same at the time read there, or the plan runs again.
+      const leaseStamp = early && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0
+        ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
+      const planned = early && !halted() ? compute(early.view, files) : undefined;
+      const plan = this.#outbox.plan();
+      try {
+        await this.store.writeBatch({
+          identity: this.#identity(),
+          lockClass: "bridge",
+          ops: [],
+          // Admission, reservations and CAS all observe ONE authoritative snapshot under the
+          // write lock. No native takeover can fit between that observation and this commit
+          // (security review rounds 2/3, F1/F2), including recreation over retained tombstones.
+          prepare: (view) => {
+            if (halted()) return plan.stage([], []);
+            // A crashed predecessor's effects run first, on this snapshot: no separate recovery read
+            // or transaction (smarty-dev#3752: one read, lock and commit per presence pass).
+            if (!this.#recovered) plan.replay(view);
+            const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
+            let result: ReturnType<typeof compute>;
+            if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
+              (leaseStamp === undefined || (meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp &&
+                sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now())))) result = planned;
+            else if (early) throw new MirrorPlanStale();
+            else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
+            if (!result) return plan.stage([], []);
+            ({ leases, removed } = result);
+            // A changing commit records its lease effects in the same commit; a lease-only renewal
+            // commits nothing, records nothing and loses nothing in a crash (the next pass redoes it).
+            return plan.stage(result.ops, effects());
+          },
+          // After the commit, on the committed owner, never a fresh per-record state read.
+          afterCommit: (view) => { plan.run(view, halted); },
+        });
+      } catch (error) {
+        if (error instanceof MirrorPlanStale) continue;
+        throw error;
+      }
+      break;
+    }
     // Only a committed pass ends recovery; a failed one leaves the rows for the next pass.
     if (!final) this.#recovered = true;
   }
@@ -1920,7 +2073,7 @@ export class MeshBridge {
           let spending = 0;
           let spendingBytes = 0;
           let bytes = 0;
-          for (const candidate of page.events.slice(index, index + 256)) {
+          for (const candidate of page.events.slice(index, index + BRIDGE_BATCH_MAX_EVENTS)) {
             if (candidate.sequence <= cursor.after || seen.has(candidate.id) || this.#refusal(candidate, rules, direction)) break;
             if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(candidate.to!)) break;
             const data = isObject(candidate.data) ? candidate.data : {};
@@ -1965,6 +2118,9 @@ export class MeshBridge {
               for (const id of ids) seen.delete(id);
               this.#reportUnaddressed();
               index += committed.length - 1;
+              // Locks are released and the durable prefix is checkpointed. Yield a real event-loop
+              // turn (not a microtask) before reacquiring, so local writers and transport I/O run.
+              await new Promise<void>(resolve => setImmediate(resolve));
               continue;
             }
           }
@@ -2052,6 +2208,8 @@ export class MeshBridge {
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
             seen.delete(event.id);
             this.#reportUnaddressed();
+            // Legacy/singleton drains must also give waiting writers a turn after checkpoint.
+            await new Promise<void>(resolve => setImmediate(resolve));
           } catch (error) {
             // Too large or refused by the far side: never retried, or it would stall the source.
             if (!isPermanent(error)) throw error;

@@ -101,8 +101,8 @@ import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFol
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
 import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
-import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
-import { TerminalNoticeOutbox, readTerminalAdmission, readUndeliveredMessages, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
+import { FabricTargetTerminalError, FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "./terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, readTerminalAdmissions, readUndeliveredMessage, readUndeliveredMessageView, MAX_STEER_CONTROLS, MAX_STEER_BYTES, MAX_STEER_ENTRY_BYTES, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
@@ -2784,8 +2784,9 @@ export class AgentManager {
     if (previous && !this.#runs.has(id)) {
       const directory = path.join(this.#runRoot, previous.id);
       this.#terminalNoticeOutbox.recover(directory);
-      const undeliveredMessages = previous.runner === "pi" && !previous.actorId && previous.finalAnswerReceipt ? readUndeliveredMessages(directory) : [];
-      return structuredClone(undeliveredMessages.length ? { ...previous, undeliveredMessages } : previous);
+      const view = previous.runner === "pi" && !previous.actorId && previous.finalAnswerReceipt ? this.#refusalView(directory) : {};
+      const { undeliveredMessages: _messages, undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safe } = previous;
+      return structuredClone({ ...safe, ...view });
     }
     const managed = this.#requireRun(id);
     // A recorded receipt makes unconsumed admissions final now, not at native exit.
@@ -2800,8 +2801,7 @@ export class AgentManager {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
       if (deliveries.length) info.followUpDeliveries = deliveries;
-      const undelivered = managed.finalAnswer ? readUndeliveredMessages(managed.runDirectory) : [];
-      if (undelivered.length) info.undeliveredMessages = undelivered;
+      if (managed.finalAnswer) Object.assign(info, this.#refusalView(managed.runDirectory));
       return info;
     }
     managed.latestRecord = record;
@@ -3389,6 +3389,7 @@ export class AgentManager {
     const messageId = randomUUID();
     const deadlineAt = Date.now() + options.deadlineMs;
     if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
+    this.#requireSteerAdmission(managed, Buffer.byteLength(JSON.stringify({ type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt, id: messageId, ts: Date.now() }) + "\n"));
     const file = followUpFile(managed.runDirectory, messageId);
     mkdirPrivate(path.dirname(file), this.#trustRoot());
     fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
@@ -3465,6 +3466,7 @@ export class AgentManager {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     if (managed.finalAnswer) throw this.#terminalError(managed);
+    this.#requireSteerAdmission(managed);
     if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
         managed.runner === "veda"
@@ -3538,6 +3540,22 @@ export class AgentManager {
     return new FabricTargetTerminalError(managed.id, managed.finalAnswer!.id, managed.finalAnswerResult?.status ?? "final-answer-pending");
   }
 
+  #requireSteerAdmission(managed: ManagedAgent, bytes = 0) {
+    const index = readTerminalAdmissions(managed.runDirectory);
+    if (index.truncated || index.controls >= MAX_STEER_CONTROLS || bytes > MAX_STEER_ENTRY_BYTES || index.bytes + bytes > MAX_STEER_BYTES) {
+      throw new FabricSteerAdmissionLimitError(managed.id, MAX_STEER_CONTROLS, MAX_STEER_BYTES);
+    }
+    return index;
+  }
+
+  #refusalView(directory: string): Pick<AgentRunRecord, "undeliveredMessages" | "undeliveredMessagesTotal" | "undeliveredMessagesTruncated"> {
+    const view = readUndeliveredMessageView(directory);
+    return {
+      ...(view.messages.length ? { undeliveredMessages: view.messages } : {}),
+      ...(view.total || view.truncated ? { undeliveredMessagesTotal: view.total, undeliveredMessagesTruncated: view.truncated } : {}),
+    };
+  }
+
   /** Pre-check/append race: a receipt that landed during append fences this exact unconsumed admission now. */
   #appendRaceRefusal(managed: ManagedAgent, messageId: string, delivery: "steer" | "followUp"): AgentSteerResult["undelivered"] {
     if (!this.#observeFinalAnswer(managed) || !managed.finalAnswer) return undefined;
@@ -3545,11 +3563,11 @@ export class AgentManager {
       this.#retainTerminalNotice(managed, { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId, delivery,
         finalAnswerReceiptId: managed.finalAnswer.id });
       this.#routeTerminalNotices(managed);
-      return readUndeliveredMessages(managed.runDirectory).find(message => message.messageId === messageId);
+      return readUndeliveredMessage(managed.runDirectory, messageId);
     } catch { return undefined; /* Exit scan and status retain the refusal from durable sources. */ }
   }
 
-  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
+  #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts"> | { type: "ui_response"; requestId: string; value?: string; cancelled?: boolean }): AgentSteerResult {
     const managed = this.#requireRun(id);
     this.#observeFinalAnswer(managed);
     if (managed.finalAnswer) throw this.#terminalError(managed);
@@ -3561,8 +3579,11 @@ export class AgentManager {
       );
     }
     const steerFile = path.join(managed.runDirectory, "steer.jsonl");
-    const messageId = entry.followUpId ?? randomUUID();
-    const line = JSON.stringify({ ...entry, id: messageId, ts: Date.now() }) + "\n";
+    const messageId = ("followUpId" in entry ? entry.followUpId : undefined) ?? randomUUID();
+    const admitted = { ...entry, id: messageId, ts: Date.now() };
+    const line = JSON.stringify(admitted) + "\n";
+    const bytes = Buffer.byteLength(line);
+    this.#requireSteerAdmission(managed, bytes);
     if (entry.type === "steer" || entry.type === "follow_up") {
       const incoming = copyFabricPrincipal(entry.provenance?.principal);
       if (!incoming || incoming.id !== managed.outputPrincipal?.id || incoming.binding !== managed.outputPrincipal?.binding) {
@@ -4368,7 +4389,7 @@ export class AgentManager {
       finalAnswerReceiptId: receipt.id, messageId: notice.messageId, delivery: admission.delivery,
       ...(admission.sender ? { sender: admission.sender } : {}) };
     // Save BEFORE routing: a failed sender route cannot erase the refusal.
-    this.#terminalNoticeOutbox.retain(managed.runDirectory, attributed);
+    this.#terminalNoticeOutbox.retain(managed.runDirectory, attributed, false);
     if (admission.delivery === "followUp" && /^[0-9a-f-]{36}$/.test(notice.messageId)) {
       const file = followUpFile(managed.runDirectory, notice.messageId);
       if (fs.existsSync(file)) {
@@ -4384,23 +4405,16 @@ export class AgentManager {
 
   #refuseUnreadTerminalControls(managed: ManagedAgent): void {
     if (!managed.finalAnswer || managed.actorId) return;
-    let lines: string[];
-    try { lines = fs.readFileSync(path.join(managed.runDirectory, "steer.jsonl"), "utf8").split("\n"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const entry = JSON.parse(line) as AgentSteerEntry;
-      if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
-      const admission = readTerminalAdmission(managed.runDirectory, entry.id);
-      if (!admission) continue;
+    const admissions = readTerminalAdmissions(managed.runDirectory);
+    for (const admission of admissions.byId.values()) {
       let state: { state?: string } | undefined;
-      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
+      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${admission.id}.json`), "utf8")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
       // Refused registry entries may already have emitted a worker notice. The
       // original admission id deduplicates both paths, including an unread tail.
       this.#retainTerminalNotice(managed, {
-        code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
+        code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: admission.id,
         delivery: admission.delivery,
         finalAnswerReceiptId: managed.finalAnswer.id, ...(admission.sender ? { sender: admission.sender } : {}),
       });
@@ -4948,20 +4962,17 @@ export class AgentManager {
         // Ignore malformed worker lifecycle records; status monitoring remains authoritative.
       }
     }
+    this.#routeTerminalNotices(managed);
   }
 
   // Answer one routed child dialog through the steer channel. Without a router
   // (or on any router failure) the child gets a cancelled response.
   #routeChildQuestion(managed: ManagedAgent, data: unknown): void {
     if (typeof data !== "object" || data === null || typeof (data as { requestId?: unknown }).requestId !== "string") return;
-    const question = data as Record<string, unknown>;
+    const question = data as Record<string, unknown> & { requestId: string };
     const respond = (response: AgentChildQuestionResponse): void => {
       try {
-        fs.appendFileSync(
-          path.join(managed.runDirectory, "steer.jsonl"),
-          `${JSON.stringify({ type: "ui_response", requestId: question.requestId, ...response, id: randomUUID(), ts: Date.now() })}\n`,
-          { encoding: "utf8", mode: 0o600 },
-        );
+        this.#appendSteer(managed.id, { type: "ui_response", requestId: question.requestId, ...response });
       } catch {
         // The worker's own deadline cancels the dialog if this write is lost.
       }
@@ -5237,14 +5248,15 @@ export class AgentManager {
       terminalStatuses.has(record.status) && !managed.settled,
     ), record);
     const budget = this.#budgetSummary();
-    const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
+    const { logFile: _logFile, nestedAgents: _nestedAgents, undeliveredMessages: _messages,
+      undeliveredMessagesTotal: _total, undeliveredMessagesTruncated: _truncated, ...safeRecord } = record;
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
-    const undeliveredMessages = managed.finalAnswer ? readUndeliveredMessages(managed.runDirectory) : [];
+    const view = managed.finalAnswer ? this.#refusalView(managed.runDirectory) : {};
     return {
       ...safeRecord,
-      ...(undeliveredMessages.length ? { undeliveredMessages } : {}),
+      ...view,
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...(managed.finalAnswerResult ? {
         status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,

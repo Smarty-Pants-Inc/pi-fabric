@@ -8,7 +8,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
-import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import { FabricSteerAdmissionLimitError, type AgentTerminalNotice } from "../src/agents/terminal-target.js";
+import { MAX_STEER_BYTES, MAX_STEER_CONTROLS, MAX_PUBLIC_REFUSALS, readTerminalAdmissions } from "../src/agents/terminal-notices.js";
 
 // Private scratch roots are retained as evidence; this regression never deletes fixtures.
 const managers: AgentManager[] = [];
@@ -124,6 +125,64 @@ describe("steer/followUp after an ordinary Pi task's final answer", () => {
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(notices).toEqual([]);
     expect(fs.existsSync(path.join(root, handle.id, "terminal-notices"))).toBe(false);
+  });
+
+  it("5,000 small requests stay bounded: every excess request is typed, every admitted refusal reaches its original sender", async () => {
+    const { manager, root, notices, finish } = harness();
+    const handle = await manager.spawn({ task: "bounded admission", transport: "process" });
+    const directory = path.join(root, handle.id);
+    const started = performance.now(), heap = process.memoryUsage().heapUsed;
+    const admitted: string[] = [];
+    let refused = 0;
+    for (let i = 0; i < 5000; i++) {
+      try { admitted.push(manager.steer(handle.id, `small ${i}`, undefined, provenance).messageId); }
+      catch (error) {
+        expect(error).toBeInstanceOf(FabricSteerAdmissionLimitError);
+        expect(error).toMatchObject({ code: "FABRIC_STEER_ADMISSION_LIMIT", targetId: handle.id, controlLimit: 256, byteLimit: MAX_STEER_BYTES });
+        refused++;
+      }
+    }
+    expect(admitted).toHaveLength(MAX_STEER_CONTROLS);
+    expect(refused).toBe(5000 - MAX_STEER_CONTROLS);
+    expect(fs.statSync(path.join(directory, "steer.jsonl")).size).toBeLessThan(MAX_STEER_BYTES);
+    // Deadline refusal happens before any follow-up payload is created.
+    expect(() => manager.followUp(handle.id, "overflow", undefined, provenance, { deadlineMs: 60000 })).toThrow(FabricSteerAdmissionLimitError);
+    expect(fs.existsSync(path.join(directory, "follow-ups"))).toBe(false);
+    finish(handle.id, "done");
+    const read = fs.readFileSync;
+    const journalReads = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (file === path.join(directory, "steer.jsonl")) throw new Error("unbounded admission read");
+      return (read as any)(file, ...args);
+    }) as typeof fs.readFileSync);
+    const streaming = vi.spyOn(fs, "readSync");
+    const status = manager.status(handle.id);
+    expect(status.undeliveredMessages).toHaveLength(MAX_PUBLIC_REFUSALS);
+    expect(status).toMatchObject({ undeliveredMessagesTotal: 256, undeliveredMessagesTruncated: true });
+    await waitUntil(() => notices.length === MAX_STEER_CONTROLS);
+    expect(new Set(notices.map(notice => notice.messageId))).toEqual(new Set(admitted));
+    expect(notices.every(notice => notice.sender?.id === sender.id)).toBe(true);
+    // One <=1MiB stream pass shared by scan, view and routing, not N full reads.
+    expect(streaming.mock.calls.length).toBeLessThanOrEqual(Math.ceil(fs.statSync(path.join(directory, "steer.jsonl")).size / (16 * 1024)) + 1);
+    journalReads.mockRestore(); streaming.mockRestore();
+    const elapsedMs = performance.now() - started, heapGrowth = process.memoryUsage().heapUsed - heap;
+    expect(elapsedMs).toBeLessThan(20000);
+    expect(heapGrowth).toBeLessThan(128 * 1024 * 1024);
+    console.log(JSON.stringify({ proof: "5000 admission attempts", admitted: admitted.length, refused, routed: notices.length, publicEntries: status.undeliveredMessages?.length,
+      total: status.undeliveredMessagesTotal, truncated: status.undeliveredMessagesTruncated, elapsedMs, heapGrowth }));
+  }, 30000);
+
+  it("enforces the durable byte bound and fails closed on an oversized retained journal", async () => {
+    const { manager, root } = harness();
+    const handle = await manager.spawn({ task: "byte admission", transport: "process" });
+    const directory = path.join(root, handle.id);
+    for (let i = 0; i < 16; i++) manager.steer(handle.id, "x".repeat(63000), undefined, provenance);
+    expect(() => manager.steer(handle.id, "x".repeat(63000), undefined, provenance)).toThrow(FabricSteerAdmissionLimitError);
+    const file = path.join(directory, "steer.jsonl");
+    expect(fs.statSync(file).size).toBeLessThanOrEqual(MAX_STEER_BYTES);
+    // Retained data, not a volatile counter, establishes the bound on resume.
+    fs.appendFileSync(file, "x".repeat(MAX_STEER_BYTES));
+    expect(readTerminalAdmissions(directory)).toMatchObject({ truncated: true });
+    expect(() => manager.steer(handle.id, "tiny", undefined, provenance)).toThrow(FabricSteerAdmissionLimitError);
   });
 
   it("refuses later input with a typed error naming the run state, keeping FABRIC_TARGET_TERMINAL", async () => {

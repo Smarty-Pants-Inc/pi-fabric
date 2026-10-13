@@ -20,14 +20,19 @@ const deliveries = process.env.PI_FABRIC_DELIVERY_DIR;
 const log = value => fs.appendFileSync(path.join(root, "fake.jsonl"), JSON.stringify({ pid: process.pid, ...value }) + "\n");
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");
 const model = { provider: "steer-ended", id: "fake" };
+// The race proof compiles the production receipt helper into its private root.
+const terminal = process.env.STEER_ENDED_HELPER ? await import(process.env.STEER_ENDED_HELPER) : undefined;
 let receipt;
 let released = false;
 
 const recordReceipt = () => {
-  receipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text: "AUTHORIZED_FINAL_ANSWER" };
-  const temporary = path.join(runDirectory, `.final-answer.${process.pid}.tmp`);
-  fs.writeFileSync(temporary, JSON.stringify(receipt));
-  fs.renameSync(temporary, path.join(runDirectory, "final-answer.json"));
+  if (terminal) receipt = terminal.saveFinalAnswerReceipt(runDirectory, runId, "AUTHORIZED_FINAL_ANSWER");
+  else {
+    receipt = { version: 1, id: randomUUID(), runId, recordedAt: Date.now(), text: "AUTHORIZED_FINAL_ANSWER" };
+    const temporary = path.join(runDirectory, `.final-answer.${process.pid}.tmp`);
+    fs.writeFileSync(temporary, JSON.stringify(receipt));
+    fs.renameSync(temporary, path.join(runDirectory, "final-answer.json"));
+  }
   log({ type: "receipt", id: receipt.id });
 };
 const release = () => {

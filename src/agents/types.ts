@@ -241,6 +241,10 @@ export interface AgentRunRecord {
   followUpDeliveries?: AgentFollowUpDelivery[];
   /** Ordinary Pi task: admitted steer/followUp input the ended run refused (validated retained notices). */
   undeliveredMessages?: AgentUndeliveredMessage[];
+  /** Count of validated refusals; public snapshots include at most 64 entries. */
+  undeliveredMessagesTotal?: number;
+  /** True when the public view or retained admission journal exceeds its bound. */
+  undeliveredMessagesTruncated?: boolean;
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
@@ -331,6 +335,8 @@ export interface AgentHandleInfo {
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
   undeliveredMessages?: AgentUndeliveredMessage[];
+  undeliveredMessagesTotal?: number;
+  undeliveredMessagesTruncated?: boolean;
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
   protected?: boolean;

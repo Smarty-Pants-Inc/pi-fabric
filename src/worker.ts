@@ -51,7 +51,7 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
@@ -896,7 +896,7 @@ const main = async (): Promise<void> => {
   const questionRelay = options.childQuestionTimeoutMs !== undefined && isPi && options.steerFile
     ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
         emit: (question) => emitLifecycle("question", { ...question }),
-        send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
+        send: (frame) => { injectPiControl(`${JSON.stringify(frame)}\n`); },
         blocked: (since) => {
           if (since === undefined) delete record.blockedOn;
           else record.blockedOn = { since };
@@ -1012,6 +1012,22 @@ const main = async (): Promise<void> => {
     closeTimer.unref();
   };
 
+  // The child publishes its receipt under this same lock. Envelope/tracking and
+  // refusal durability stay outside; the critical section only reads and writes
+  // one stdin frame. A stale poll snapshot never authorizes a later injection.
+  const injectPiControl = (frame: string, controlId?: string): void => {
+    if (!persistentPiTask || !piRetrySdk) { child.stdin?.write(frame); return; }
+    const directory = path.dirname(options.statusFile);
+    const ended = withTaskFinalAnswerLock(directory, () => {
+      const receipt = finalAnswerReceipt ?? readFinalAnswerReceipt(directory, options.id);
+      if (!receipt) child.stdin?.write(frame);
+      return receipt;
+    });
+    if (ended && controlId) {
+      const control = readTerminalControl(directory, controlId);
+      if (control?.state === "queued") refuseTerminalControl(control, ended.id);
+    }
+  };
   // Auth checks and model_select hooks can be slow under concurrent launches.
   // Startup and admission share the overall run timeout below, not a shorter cap.
   const sendPiDelivery = (message: string, provenance: FabricTurnProvenance | undefined, delivery: "steer" | "followUp", images?: readonly ImageContent[], controlId?: string): void => {
@@ -1019,17 +1035,17 @@ const main = async (): Promise<void> => {
     if (persistentPiTask && piRetrySdk && controlId) {
       trackTerminalControl(path.dirname(options.statusFile), { id: controlId, delivery, provenance });
       fs.writeFileSync(path.join(deliveryDirectory, controlId + ".json"), JSON.stringify({ message, provenance, delivery, images, controlId }), { mode: 0o600 });
-      child.stdin?.write(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n");
+      injectPiControl(JSON.stringify({ type: "prompt", id: controlId, message: "/fabric-delivery " + controlId, streamingBehavior: delivery }) + "\n", controlId);
       return;
     }
     if (!provenance?.principal) {
-      child.stdin?.write(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
-        ...(controlId ? { id: controlId } : {}) }) + "\n");
+      injectPiControl(JSON.stringify({ type: delivery === "steer" ? "steer" : "follow_up", message,
+        ...(controlId ? { id: controlId } : {}) }) + "\n", controlId);
       return;
     }
     const id = randomUUID();
     fs.writeFileSync(path.join(deliveryDirectory, id + ".json"), JSON.stringify({ message, provenance, delivery, images }), { mode: 0o600 });
-    child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n");
+    injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: delivery }) + "\n", controlId);
   };
   const hasUnsettledFollowUps = (): boolean => {
     const directory = path.join(path.dirname(deliveryDirectory), "follow-ups");
@@ -1054,7 +1070,7 @@ const main = async (): Promise<void> => {
         if (item.followUpId !== id || item.delivery !== "followUp") continue;
         const receipt = followUpFile(path.dirname(deliveryDirectory), id);
         if (followUpState(receipt) !== "queued") { releaseFollowUpPayload(receipt); continue; }
-        child.stdin?.write(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+        injectPiControl(JSON.stringify({ type: "prompt", message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
       } catch { /* Retain malformed/uncertain envelopes; never invent delivery. */ }
     }
   };
@@ -1234,7 +1250,7 @@ const main = async (): Promise<void> => {
       if (!child.stdin || child.stdin.writableEnded || child.stdin.destroyed) {
         throw new Error("Child Pi stdin closed before compaction could start");
       }
-      child.stdin.write(`${JSON.stringify(frame)}\n`);
+      injectPiControl(`${JSON.stringify(frame)}\n`);
     },
     close: closeChild,
     update(status) {
@@ -2140,11 +2156,7 @@ const main = async (): Promise<void> => {
     // The native receipt can precede its IPC frame. Reuse this bounded file
     // reader to record unread input, but never inject it after that boundary.
     let endedReceipt = finalAnswerReceipt;
-    if (options.steerFile && persistentPiTask && piRetrySdk && !endedReceipt) {
-      let size = -1;
-      try { size = fs.statSync(options.steerFile).size; } catch { /* no steer input yet */ }
-      if (size >= 0 && size !== steerOffset) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
-    }
+    if (persistentPiTask && piRetrySdk && !endedReceipt) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
     if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
         (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
@@ -2203,6 +2215,9 @@ const main = async (): Promise<void> => {
           continue;
         }
         try {
+          // Re-read for every parsed row too; actual injection is serialized
+          // with publication below, including rows appended after preflight.
+          if (persistentPiTask && piRetrySdk) endedReceipt = finalAnswerReceipt ?? readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
           if (endedReceipt) {
             if ((command.type === "steer" || command.type === "follow_up") && typeof command.id === "string" && /^[0-9a-f-]{36}$/.test(command.id)) {
               const directory = path.dirname(options.statusFile);
@@ -2251,12 +2266,12 @@ const main = async (): Promise<void> => {
                 message: command.message, provenance: command.provenance, delivery: "followUp", followUpId: id,
                 ...(persistentPiTask && piRetrySdk ? { controlId: id } : {}),
               }), { mode: 0o600 });
-              child.stdin?.write(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n");
+              injectPiControl(JSON.stringify({ type: "prompt", id, message: "/fabric-delivery " + id, streamingBehavior: "followUp" }) + "\n", id);
             } else sendPiDelivery(command.message, copyFabricProvenance(command.provenance), "followUp", undefined, command.id);
           } else if (command.type === "set_steering_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_steering_mode", mode: command.mode }) + "\n");
           } else if (command.type === "set_follow_up_mode" && typeof command.mode === "string") {
-            child.stdin?.write(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
+            injectPiControl(JSON.stringify({ type: "set_follow_up_mode", mode: command.mode }) + "\n");
           } else if (command.type === "compact") {
             compactControl.queue(command.instructions);
           } else if (command.type === "ui_response") {

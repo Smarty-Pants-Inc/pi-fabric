@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricSteerAdmissionLimitError } from "../src/agents/terminal-target.js";
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
 import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
@@ -53,6 +54,13 @@ catch (error) {
     expect(result.error).toBeUndefined();
     expect(result.value).toEqual({ name: "FabricControlStaleIncarnationError", code: "FABRIC_CONTROL_STALE_INCARNATION",
       message: STALE_INCARNATION_ERROR, extra: "undefined", targetId: "undefined" });
+  });
+
+  it("preserves only the vetted steering admission limit classification", async () => {
+    const error = Object.assign(new FabricSteerAdmissionLimitError("run", 256, 1024 * 1024), { secret: "host-only" });
+    const result = await new QuickJsRuntime().execute('try { await agents.steer({ id: "run", message: "overflow" }); } catch (error) { return { name: error.name, code: error.code, extra: typeof error.secret, targetId: typeof error.targetId, controlLimit: typeof error.controlLimit }; }', async () => { throw error; }, options);
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricSteerAdmissionLimitError", code: "FABRIC_STEER_ADMISSION_LIMIT", extra: "undefined", targetId: "undefined", controlLimit: "undefined" });
   });
 
   it("preserves a non-lock host Error name without transferring its arbitrary code", async () => {

@@ -13,6 +13,15 @@ export class FabricTargetTerminalError extends Error {
   }
 }
 
+/** A durable run-local steering budget refuses excess input before append. */
+export class FabricSteerAdmissionLimitError extends Error {
+  override readonly name = "FabricSteerAdmissionLimitError";
+  readonly code = "FABRIC_STEER_ADMISSION_LIMIT";
+  constructor(readonly targetId: string, readonly controlLimit: number, readonly byteLimit: number) {
+    super(`Fabric run ${targetId} reached its steering admission bound (${controlLimit} controls / ${byteLimit} bytes); input was not queued. Start a new run.`);
+  }
+}
+
 export type FabricTargetRunState = "final-answer-pending" | "final-answer-recorded" | "completed" | "failed" | "stopped" | "timed_out";
 
 /** Sender-visible receipt for one admitted control that the ended run never consumed. */

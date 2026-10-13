@@ -38,6 +38,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_CONTROL_STALE_INCARNATION: "FabricControlStaleIncarnationError",
   FABRIC_INTERRUPT_NOT_AUTHORIZED: "FabricInterruptNotAuthorizedError",
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
+  FABRIC_STEER_ADMISSION_LIMIT: "FabricSteerAdmissionLimitError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_PARTICIPANT_NOT_YET_MIRRORED: "FabricParticipantNotYetMirroredError",
   FABRIC_PARTICIPANT_NON_INTERACTIVE: "FabricParticipantNonInteractiveError",

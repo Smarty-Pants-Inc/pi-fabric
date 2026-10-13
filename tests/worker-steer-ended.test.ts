@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn as spawnProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -46,6 +47,9 @@ const setup = () => {
   const agentDir = path.join(root, "agent"); fs.mkdirSync(agentDir);
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ retry: { enabled: false } }));
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("PI_OFFLINE", "1"); vi.stubEnv("STEER_ENDED_ROOT", root);
+  const helper = path.join(root, "terminal-answer.mjs");
+  buildSync({ entryPoints: [path.resolve("src/worker/terminal-answer.ts")], outfile: helper, bundle: true, platform: "node", format: "esm" });
+  vi.stubEnv("STEER_ENDED_HELPER", pathToFileURL(helper).href);
   const notices: Record<string, any>[] = [];
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
     workerPath: path.resolve(process.env.FABRIC_STEER_ENDED_WORKER ?? "src/worker.ts"), piBinary: fakeSdk(root), runRoot: path.join(root, "runs"),
@@ -100,6 +104,38 @@ describe("runner-end steer fence (persisted receipt before its worker event)", (
     fs.writeFileSync(path.join(s.root, "no-source-write.json"), JSON.stringify({
       sentinel: path.join(s.workspace, "SOURCE_WRITE_SENTINEL"), present: fs.existsSync(path.join(s.workspace, "SOURCE_WRITE_SENTINEL")) }));
     expect(fs.existsSync(path.join(s.workspace, "SOURCE_WRITE_SENTINEL"))).toBe(false);
+  }, 45000);
+
+  it.each(["read", "inject"] as const)("%s interleaving: receipt between poll preflight and injection is refused with original sender evidence", async mode => {
+    const s = setup();
+    const hook = pathToFileURL(path.resolve("tests/fixtures/steer-final-interleave.mjs")).href;
+    vi.stubEnv("NODE_OPTIONS", `${process.env.NODE_OPTIONS ?? ""} --import=${hook}`);
+    const handle = await s.manager.spawn({ task: "deterministic publication race", model: "steer-ended/fake", thinking: "off",
+      transport: "process", extensions: false, tools: [], cwd: s.workspace });
+    const directory = path.join(s.root, "runs", handle.id);
+    await until(() => rows(path.join(s.root, "fake.jsonl")).some(row => row.type === "task"));
+    const id = randomUUID();
+    const entry = { id, type: "steer", message: "WRITE SOURCE_WRITE_SENTINEL", provenance, ts: Date.now() };
+    // Arm before the next poll. 'read' records a size snapshot of zero, appends,
+    // then blocks the real worker until the other process publishes its receipt.
+    fs.writeFileSync(path.join(directory, "steer.jsonl"), "");
+    fs.writeFileSync(path.join(s.root, "interleave.json"), JSON.stringify({ mode, entry }));
+    const messageId = mode === "read" ? id : s.manager.steer(handle.id, entry.message, undefined, provenance).messageId;
+    await until(() => readTerminalControl(directory, messageId)?.state === "refused");
+    const receipt = readFinalAnswerReceipt(directory, handle.id)!;
+    expect(readTerminalControl(directory, messageId)).toMatchObject({ state: "refused", reason: "run-ended", provenance });
+    const evidence = rows(path.join(s.root, "interleave-log.jsonl"));
+    expect(evidence.some(row => row.event === "receipt-before-injection")).toBe(true);
+    if (mode === "read") expect(evidence[0]).toMatchObject({ event: "stat-before-append", bytes: 0 });
+    expect(rows(path.join(s.root, "fake.jsonl")).some(row => row.type === "delivery")).toBe(false);
+    fs.writeFileSync(path.join(s.root, "release"), "");
+    const result = await s.manager.wait(handle.id, { timeoutMs: 30000 });
+    expect(result).toMatchObject({ status: "completed", turns: 1, text: receipt.text });
+    await until(() => s.notices.some(notice => notice.messageId === messageId));
+    expect(s.notices.find(notice => notice.messageId === messageId)).toMatchObject({ sender: provenance.sender, finalAnswerReceiptId: receipt.id });
+    await s.manager.close();
+    expect(fs.existsSync(path.join(s.workspace, "SOURCE_WRITE_SENTINEL"))).toBe(false);
+    console.log(`INTERLEAVING: PASS mode=${mode} receiptFirst=true injected=false refused=${messageId} childExited=true root=${s.root}`);
   }, 45000);
 
   it("counterexample: an injected post-receipt delivery is a recorded source write", async () => {

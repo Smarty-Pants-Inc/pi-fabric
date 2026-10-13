@@ -879,6 +879,12 @@ const main = async (): Promise<void> => {
   const unresolvedToolCalls = new Set<string>();
   // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
   const writeReceipt = new WriteReceiptRecorder(options.cwd);
+  // pi-fabric#1034 round 6 (Astra P1): an event line over MAX_EVENT_LINE_CHARS is dropped unread, so the recorder
+  // may miss a tool start or end in it. Rule chosen, the simplest that never under-reports: EVERY dropped line of a
+  // Pi child marks the receipt truncated, whatever the line was (the line is not parsed for its type).
+  let receiptLineDropped = false;
+  const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
+    receiptLineDropped ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -1617,7 +1623,7 @@ const main = async (): Promise<void> => {
     terminalStatus = record.status;
     terminalError = record.error;
     // pi-fabric#1034: the final receipt, including a truncation no end event reported.
-    if (isPi) record.writeReceipt = writeReceipt.receipt;
+    if (isPi) record.writeReceipt = receiptNow();
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
@@ -1928,7 +1934,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
-      if (writeReceipt.end(event)) record.writeReceipt = writeReceipt.receipt;
+      if (writeReceipt.end(event)) record.writeReceipt = receiptNow();
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {
@@ -2277,6 +2283,10 @@ const main = async (): Promise<void> => {
   let oversizedCount = 0;
   const startOversizedEvent = (text: string): void => {
     toolCallStreamGuard.discardedEvent();
+    if (isPi) {
+      receiptLineDropped = true;
+      record.writeReceipt = receiptNow(); // stored now too, in case no later end or terminal write comes
+    }
     oversized = { chars: text.length, prefix: text.slice(0, MAX_EVENT_LINE_CHARS) };
   };
   const finishOversizedEvent = (): void => {
@@ -2713,7 +2723,7 @@ const main = async (): Promise<void> => {
     record.error = `${record.error ? record.error + "\n" : ""}Activation journal retention failed: ${String(error)}`;
   }
   // pi-fabric#1034: the final receipt, including a truncation no end event reported (a child that exits mid-call).
-  if (isPi) record.writeReceipt = writeReceipt.receipt;
+  if (isPi) record.writeReceipt = receiptNow();
   // The owning Main may already be dead. Publish through its immutable launch return address.
   saveWorkerCompletion(options.statusFile, record);
   writeRunRecord(options.statusFile, record);

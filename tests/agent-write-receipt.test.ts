@@ -30,6 +30,44 @@ const managerIn = (behavior: string) => {
   return { root, manager };
 };
 
+// pi-fabric#1034 round 6 (Astra P1): a tool event line over the 4 Mi-char cap is dropped by the worker unread, so
+// the recorder never sees that start or end. Every such drop marks the receipt truncated. A one-off fake Pi (written
+// to this test's temp root) emits one write or bash call whose start or end line is oversized.
+const oversizedPi = (which: string) => `#!/usr/bin/env node
+import fs from "node:fs";
+process.stdin.resume(); process.stdin.on("data", () => {});
+const [tool, side] = ${JSON.stringify(which)}.split(":");
+const emit = (event) => process.stdout.write(JSON.stringify(event) + String.fromCharCode(10));
+const huge = "x".repeat(5 * 1024 * 1024);
+const args = tool === "write" ? { path: "big.txt", content: side === "start" ? huge : "B" } : { command: side === "start" ? "echo " + huge : "echo small" };
+emit({ type: "tool_execution_start", toolCallId: "c1", toolName: tool, args });
+if (tool === "write") fs.writeFileSync("big.txt", "B");
+emit({ type: "tool_execution_end", toolCallId: "c1", toolName: tool, isError: false, durationMs: 1,
+  result: { content: [{ type: "text", text: side === "end" ? huge : "ok" }] } });
+emit({ type: "message_end", message: { role: "assistant", content: "I changed nothing." } });
+emit({ type: "agent_settled" });
+// Exit only after the 5 Mi-char line is flushed and the worker has had time to read it, as a live Pi would.
+process.stdout.write("", () => setTimeout(() => process.exit(0), 1000));
+`;
+
+describe("oversized tool event lines (pi-fabric#1034 round 6)", () => {
+  it.each(["write:start", "write:end", "bash:start", "bash:end"])("a dropped %s line marks the receipt truncated", async (which) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-big-")));
+    roots.push(root);
+    const fake = path.join(root, "oversized-pi.mjs");
+    fs.writeFileSync(fake, oversizedPi(which), { mode: 0o700 });
+    {
+      const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30_000 }, {
+        workerPath: path.resolve("src/worker.ts"), piBinary: fake, runRoot: path.join(root, "runs"), fullCodeMode: false,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: "oversized", runner: "pi", transport: "process", extensions: false });
+      expect(result.warnings?.join("\n") ?? "", JSON.stringify({ status: result.status, error: result.error, text: result.text })).toContain("Dropped an oversized agent event line");
+      expect(result.writeReceipt?.truncated).toBe(true);
+    }
+  }, 60_000);
+});
+
 describe("agent write receipt (smarty-dev#8758 item 2)", () => {
   it("a spawned child that writes two files and runs one bash command: the envelope lists exactly those", async () => {
     const { root, manager } = managerIn("write-receipt");

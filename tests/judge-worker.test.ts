@@ -119,11 +119,11 @@ describe("retained owned judgment receipts", () => {
     expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
     expect(attempt.error).toContain(ownedRoots[0]);
     expect(rows.at(-1)).toMatchObject({ type: "judgment-outcome", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
-    // Returning a failed diagnostic receipt must not settle or discharge the
+    // The failed diagnostic receipt is terminal, but it never discharges the
     // exact execution fence, even when no persistent marker could be written.
-    await expect(owner.wait(attempt.childAgentId, { timeoutMs: 20 })).rejects.toThrow(/still running/);
+    expect(await owner.wait(attempt.childAgentId)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
     await expect(owner.stop(attempt.childAgentId)).rejects.toThrow(/execution exit unconfirmed/);
-    await expect(owner.cleanup(attempt.childAgentId)).rejects.toThrow("running agent");
+    await expect(owner.cleanup(attempt.childAgentId)).rejects.toThrow(/lost track/);
     await expect(owner.close()).rejects.toThrow(/execution exit unconfirmed/);
   });
   it("records unknown-launch custody even before a worker status receipt exists", async () => {

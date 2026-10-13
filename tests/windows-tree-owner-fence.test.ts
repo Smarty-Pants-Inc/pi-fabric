@@ -63,28 +63,27 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
         };
         fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(record));
-        const waiting = manager.wait(handle.id);
+        let reported = false;
+        const waiting = manager.wait(handle.id).then(result => { reported = true; return result; });
         await vi.advanceTimersByTimeAsync(250);
-        expect(await waiting).toMatchObject({ status: "completed" });
+        expect(reported).toBe(false);
+        expect(manager.status(handle.id).status).toBe("finishing");
         let collected = false;
         let cleanupError: unknown;
-        cleaning = manager.cleanup(handle.id).then(() => { collected = true; }, error => { cleanupError = error; });
-        await vi.advanceTimersByTimeAsync(0);
-        expect(collected).toBe(false);
-        expect(cleanupError, "ordinary cleanup must join, not reject incidental native-close ordering").toBeUndefined();
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/running/);
         expect(fs.existsSync(run)).toBe(true);
         expect(manager.retentionReferences().has("normal-close-owner")).toBe(true);
-        await expect(manager.checkpointForRelease()).rejects.toThrow(/pending/);
+        await expect(manager.checkpointForRelease()).rejects.toThrow(/pending|unresolved/);
         const probe = await manager.spawn({ task: "native capacity stays owned", transport: "process" });
         expect(probe.status).toBe("queued");
         await manager.stop(probe.id);
         const stoppingDuringJoin = outcome.startsWith("stop-");
         if (stoppingDuringJoin) {
-          stopping = manager.stop(handle.id);
+          stopping = manager.stop(handle.id).catch(error => error);
           await vi.advanceTimersByTimeAsync(0);
           expect(spawn).toHaveBeenCalledTimes(2);
           // Explicit teardown still vetoes a second cleanup call immediately.
-          await expect(manager.cleanup(handle.id)).rejects.toThrow(/pending|teardown/);
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/pending|teardown|running/);
         }
         exited = true;
         worker.emit("exit", 0);
@@ -101,8 +100,12 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         // existing seven-second stop bound must expire without faking tree exit.
         if (outcome === "timeout" || outcome === "stop-failure") await vi.advanceTimersByTimeAsync(7_000);
         await vi.advanceTimersByTimeAsync(0);
-        await Promise.all([cleaning, stopping]);
+        await stopping;
         const uncertain = outcome === "timeout" || outcome === "stop-failure";
+        expect(await waiting).toMatchObject(uncertain
+          ? { status: "failed", errorCode: "CUSTODY_UNCONFIRMED" } : { status: "completed" });
+        cleaning = manager.cleanup(handle.id).then(() => { collected = true; }, error => { cleanupError = error; });
+        await cleaning;
         expect(collected).toBe(!uncertain);
         expect(fs.existsSync(run)).toBe(uncertain);
         if (uncertain) {
@@ -132,7 +135,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
   );
   it.each((["confirmed", "worker-close-last", "failure", "timeout"] as const).flatMap(outcome =>
     [false, true].map(closeDuringStop => [outcome, closeDuringStop] as const),
-  ))("fences teardown started after settlement (%s, close=%s)", async (outcome, closeDuringStop) => {
+  ))("fences teardown started while finishing (%s, close=%s)", async (outcome, closeDuringStop) => {
     vi.useFakeTimers();
     vi.spyOn(process, "emitWarning").mockImplementation(() => {});
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-settled-tree-"));
@@ -160,11 +163,13 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
       };
       fs.writeFileSync(path.join(run, "status.json"), JSON.stringify(record));
-      const waiting = manager.wait(handle.id);
+      let reported = false;
+      const waiting = manager.wait(handle.id).then(result => { reported = true; return result; });
       await vi.advanceTimersByTimeAsync(250);
-      expect(await waiting).toMatchObject({ status: "completed" });
+      expect(reported).toBe(false);
+      expect(manager.status(handle.id).status).toBe("finishing");
       let stopped = false;
-      stopping = manager.stop(handle.id).then(result => { stopped = true; return result; });
+      stopping = manager.stop(handle.id).then(result => { stopped = true; return result; }, error => { stopped = true; return error; });
       await vi.advanceTimersByTimeAsync(0);
       expect(spawn).toHaveBeenCalledTimes(2);
       if (outcome === "worker-close-last") killer.emit("close", 0);
@@ -175,7 +180,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
       expect(manager.retentionReferences().has(handle.id)).toBe(true);
       expect(manager.retentionReferences().has("settled-owner")).toBe(true);
       await expect(manager.checkpointForRelease()).rejects.toThrow(/pending|unresolved/);
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/pending|teardown/);
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/pending|teardown|running/);
       const next = await manager.spawn({ task: "capacity probe", transport: "process" });
       expect(next.status, "settlement must not release the pending native permit").toBe("queued");
       let closed = false;
@@ -190,9 +195,12 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
       else if (outcome === "failure") killer.emit("close", 1);
       else { await vi.advanceTimersByTimeAsync(1_000); killer.emit("close", 0); }
       await vi.advanceTimersByTimeAsync(10_000);
-      expect(await stopping).toMatchObject({ status: "completed" });
-      expect(stopped).toBe(true);
       const uncertain = outcome === "failure" || outcome === "timeout";
+      expect(await stopping).toMatchObject(uncertain
+        ? { status: "failed", errorCode: "CUSTODY_UNCONFIRMED" } : { status: "completed" });
+      expect(await waiting).toMatchObject(uncertain
+        ? { status: "failed", errorCode: "CUSTODY_UNCONFIRMED" } : { status: "completed" });
+      expect(stopped).toBe(true);
       if (uncertain) {
         expect(hasUnresolvedWorker(run)).toBe(true);
         expect(manager.retentionReferences().has(handle.id)).toBe(true);
@@ -387,15 +395,15 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
           expect(stopped, "closed failed attempt must not add seven seconds to logical stop").toBe(true);
           expect(hasUnresolvedWorker(run)).toBe(true);
           expect(manager.retentionReferences().has(handle.id)).toBe(true);
-          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
-          // Later monitoring must preserve the stop/terminal result without transferring custody.
+          await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track|running/);
+          // Later monitoring must preserve the custody failure without transferring custody.
           await vi.advanceTimersByTimeAsync(10_000);
         }
         // Keep Windows active through the later admission/close probe too;
         // restoring Linux here used to hide that launch's captured-close debt.
         const result = await manager.wait(handle.id);
-        expect(result.status).toBe(outcome === "terminal-before-error" ? "completed" : outcome === "failed-before-error" ? "failed" : "stopped");
-        if (outcome === "failed-before-error") expect(result.error).toBe("real worker failure");
+        expect(result.status).toBe(outcome === "confirmed" ? "stopped" : "failed");
+        if (outcome !== "confirmed") expect(result.errorCode).toBe("CUSTODY_UNCONFIRMED");
         if (outcome === "confirmed") {
           expect(hasUnresolvedWorker(run)).toBe(false);
           expect(manager.retentionReferences().has(handle.id)).toBe(false);
@@ -411,7 +419,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         }
         expect(stopped, "the bounded stop must return without transferring custody").toBe(true);
         expect(spawn, "uncertain tree exit cannot launch a replacement worker").toHaveBeenCalledTimes(2);
-        if (outcome === "resume-error") expect(result.error).toMatch(/not relaunched/);
+        if (outcome === "resume-error") expect(result.error).toMatch(/unconfirmed|unknown|not relaunched/);
         // A terminal report must not free the uncertain tree's one native permit.
         vi.mocked(spawn).mockReturnValueOnce(worker as unknown as ChildProcess);
         const next = await manager.spawn({ task: "capacity probe", transport: "process" });

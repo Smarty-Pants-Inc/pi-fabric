@@ -1420,7 +1420,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(seeded.runDirectory, "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(seeded.runDirectory)).toBe(true);
       expect(fs.existsSync(seeded.metadataPath)).toBe(true);
     } finally {
@@ -1541,7 +1542,8 @@ describe("durable completion receipts", () => {
     markUnresolvedWorker(path.join(seeded.runDirectory, "nested", "child"), "the Herdr server has been unreachable for 300 s");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
     try {
-      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/may still be running/);
+      expect(client.statusAgent(seeded.id).status).toBe("finishing");
+      await expect(client.cleanupAgent(seeded.id)).rejects.toThrow(/running durable/);
       expect(fs.existsSync(path.join(seeded.runDirectory, "nested", "child"))).toBe(true);
     } finally {
       await client.close();

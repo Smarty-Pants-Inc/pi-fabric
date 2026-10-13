@@ -90,7 +90,7 @@ describe.skipIf(process.platform !== "linux")("absent native worker stop fence",
 // Inject only the parent's product branch. These are deterministic contract
 // probes, not native Windows process-tree certification.
 describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform => {
-  it.each([false, true])("does not settle an unchecked terminal handle (close hook=%s)", async closeHook => {
+  it.each([false, true])("does not publish unchecked terminal success or release custody (close hook=%s)", async closeHook => {
     vi.useFakeTimers(); vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     let gone = false;
     const stop = vi.fn(async () => {});
@@ -104,7 +104,7 @@ describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform =
     const handle = await manager.spawn({ task: "terminal" });
     try {
       await vi.advanceTimersByTimeAsync(2_000);
-      await stillRunning(manager, handle.id);
+      expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
       expect(stop).not.toHaveBeenCalled();
       expect(hasUnresolvedWorker(manager.runDirectory(handle.id)!)).toBe(true);

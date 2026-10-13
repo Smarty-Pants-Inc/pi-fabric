@@ -3289,7 +3289,7 @@ export class AgentManager {
     await this.#captureWorktree(managed);
     this.#settle(managed, record);
     if (!managed.settled) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained`);
-    return record;
+    return this.#settledResult(managed);
   }
 
   async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
@@ -3589,8 +3589,14 @@ export class AgentManager {
     await Promise.all(runs.map(run => this.#waitForTransportExit(run, deadline)));
     if (runs.some(run => run.lostContact)) throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
     for (const transport of transports) {
-      if (await this.#transportAliveUntil(transport, deadline) || transport.lostContact?.() !== undefined) {
-        throw new Error("Agent release quiescence cannot confirm worker exit");
+      try {
+        if (await this.#transportAliveUntil(transport, deadline) || transport.lostContact?.() !== undefined) {
+          throw new Error("worker execution exit unconfirmed");
+        }
+      } catch (error) {
+        const run = runs.find(candidate => candidate.transport === transport);
+        if (run) this.#markLost(run, error instanceof Error ? error.message : String(error));
+        throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
       }
     }
     // Check preserved trees from previous hosts too. Reuse the conservative
@@ -3958,6 +3964,10 @@ export class AgentManager {
         : managed.transport;
       if (transport.lostContact?.() !== undefined || !await this.#stopUnregisteredTransport(transport)) {
         this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained");
+        // An exact bounded native stop receipt can end the logical attempt, but
+        // #settle must publish custody failure, never success, while holding the
+        // execution permit and persisted uncertainty fence.
+        if (this.#hasNativeStopDebt(managed)) return;
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
       managed.executionExited = true;

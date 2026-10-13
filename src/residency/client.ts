@@ -952,6 +952,11 @@ export class ResidencyClient {
   #record(metadata: ResidentAgentMetadata): AgentRunRecord | undefined {
     const saved = readJson<AgentRunRecord>(residentResultPath(this.options.config.residencyRoot, metadata.id));
     if (saved?.id === metadata.id && terminal(saved.status)) return saved;
+    // A supervisor-published exact-owner journal outcome is also authoritative.
+    // Do not re-mask it using a provisional/missing worker identity: the same
+    // journal already discharges #attemptMayRetry and its consumption fence.
+    const committed = this.#completions.result(metadata.id);
+    if (committed && "text" in committed && "startedAt" in committed && terminal(committed.status)) return committed;
     const live = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
     if (live?.id === metadata.id) {
       if (live.transport === "process" && terminal(live.status) &&

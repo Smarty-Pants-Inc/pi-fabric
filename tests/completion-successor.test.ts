@@ -573,8 +573,8 @@ describe("round 3 completion fences", () => {
       turns: mode === "credential startup" ? 0 : 2, text: "PROVISIONAL_R3",
       error: mode === "credential startup" ? "No API key found for openai-codex" : "Agent stopped" };
     fs.writeFileSync(statusFile, JSON.stringify(attempt)); saveWorkerCompletion(statusFile, attempt);
-    await waitFor(() => manager.status(handle.id).status === attempt.status);
-    expect(await provider.invoke("status", { id: handle.id }, invocation)).toMatchObject({ status: attempt.status });
+    await waitFor(() => manager.status(handle.id).status === "finishing");
+    expect(await provider.invoke("status", { id: handle.id }, invocation)).toMatchObject({ status: "finishing", text: attempt.text });
     // Also enforce the owning-manager boundary, not just this provider's caller-side guard.
     manager.markForeground(handle.id);
     expect(consumed).not.toHaveBeenCalled(); expect(completionConsumed(h.meshRoot, handle.id)).toBe(false);
@@ -604,7 +604,7 @@ describe("round 3 completion fences", () => {
     const attempt = { ...h.result, status, text: "PROVISIONAL_R3" };
     const statusFile = path.join(runDirectory, "status.json"); fs.writeFileSync(statusFile, JSON.stringify(attempt)); saveWorkerCompletion(statusFile, attempt);
     const provider = providerFor(h, a.client);
-    expect(await provider.invoke("status", { id: h.result.id }, invocation)).toMatchObject({ status });
+    expect(await provider.invoke("status", { id: h.result.id }, invocation)).toMatchObject({ status: "finishing", text: attempt.text });
     a.client.acknowledgeCompletion(h.result.id);
     a.client.acknowledgeCompletion(h.result.id, true); // ordinary-owner fallback cannot certify a resident attempt
     expect(JSON.parse(fs.readFileSync(metadataFile, "utf8"))).not.toHaveProperty("completionConsumedAt");

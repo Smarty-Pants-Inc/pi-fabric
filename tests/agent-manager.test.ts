@@ -1939,15 +1939,16 @@ describe("AgentManager", () => {
       expect(settled).toBe(false);
       releaseWorker();
       if (outcome === "uncertain") {
-        // A captured primary/helper close is not whole-tree exit on either\n        // platform. The task stays non-terminal and retains its custody.
+        // A captured primary/helper close is not whole-tree exit on either
+        // platform. Publish custody failure without releasing the execution fence.
         await expect(stopping).rejects.toThrow(/execution exit unconfirmed/);
-        await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
-        expect(manager.status(handle.id).status).toBe("running");
+        expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+        expect(manager.status(handle.id).status).toBe("failed");
         expect(workerJoined).toBe(true);
         expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
-        await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
-        if (platform === "win32") await manager.close(); // bounded native shutdown retains immutable custody debt
-        else await expectUnconfirmedClose(manager);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+        // This custom handle has no exact bounded native stop-debt receipt.
+        await expectUnconfirmedClose(manager);
         return;
       }
       const expected = outcome === "failed-result" ? "failed" : "stopped";
@@ -1971,7 +1972,8 @@ describe("AgentManager", () => {
         await closed;
         // Join Windows logical close before restoring the native platform seam.
         if (platform === "win32") {
-          await manager.close();
+          if (outcome === "uncertain") await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+          else await manager.close();
           const index = managers.indexOf(manager);
           if (index !== -1) managers.splice(index, 1);
         }
@@ -2004,7 +2006,7 @@ describe("AgentManager", () => {
       const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
       writeJsonAtomic(statusFile, { ...record, status: "completed", text: "finished before native close", finishedAt: Date.now() });
       if (state === "settled result") {
-        // POSIX settlement now includes the execution drain. A terminal file
+        // Settlement on both platforms includes the execution drain. A terminal file
         // alone remains insufficient; release the existing join before wait.
         release();
         await manager.wait(handle.id);

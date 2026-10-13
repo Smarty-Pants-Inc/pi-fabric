@@ -380,6 +380,10 @@ const nativeLeaseLive = (lease: FabricHostLease, now: number): boolean =>
   (lease.writer !== undefined || lease.session !== undefined) &&
   Math.max(lease.expiresAt, lease.session?.expiresAt ?? -Infinity, lease.reloadUntil ?? -Infinity) >= now;
 
+/** smarty-dev#10391: every lease bridgeHandoffScope judged at `then` is judged the same at `now`, either way. */
+const sameLeaseLiveness = (leases: ReadonlyMap<string, FabricHostLease>, then: number, now: number): boolean =>
+  [...leases.values()].every((lease) => nativeLeaseLive(lease, then) === nativeLeaseLive(lease, now));
+
 /**
  * The handoffs as `peer`'s link sees them. A handoff is void when any native record (host or
  * participant, state or file, live or not) or a live native lease answers to its id: the handoff
@@ -648,7 +652,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   #scan(
     hostEntries: MeshStateEntry[], participantEntries: MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
-  ): { presence: BridgePresence; voided: MeshStateEntry[] } {
+  ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
     const leases = readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
@@ -698,6 +702,8 @@ export class StoreBridgeSide implements BridgeSide {
     return {
       presence: { hosts, participants: [...participants.values()].map(({ record }) => record), reserved: [...reserved] },
       voided: handoffs.voided,
+      // smarty-dev#10391: what the scan judged by time, for a plan made before its transaction.
+      leases, now,
     };
   }
 
@@ -970,7 +976,8 @@ export class StoreBridgeSide implements BridgeSide {
     ];
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
     const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>):
-      { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[] } | undefined => {
+      { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
+        judged: { leases: ReadonlyMap<string, FabricHostLease>; now: number } } | undefined => {
         const leases: BridgeLease[] = [];
         const removed: BridgeUnlease[] = [];
         const hostEntries = view.listAll(HOST_PREFIX);
@@ -1045,7 +1052,7 @@ export class StoreBridgeSide implements BridgeSide {
         }
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
         for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
-        return { ops, leases, removed };
+        return { ops, leases, removed, judged: { leases: scan.leases, now: scan.now } };
     };
     for (let attempt = 0; ; attempt += 1) {
       // Participant files are read before the state transaction and revalidated in it by their
@@ -1060,7 +1067,9 @@ export class StoreBridgeSide implements BridgeSide {
       // A stale plan rolls back and plans again; the last attempt, a backend without a revision view, and
       // a recovery pass (whose replay must run on the transaction's snapshot) plan inside, as before.
       const early = this.#recovered && attempt < MIRROR_PLAN_ATTEMPTS - 1 ? this.store.stateView() : undefined;
-      // With a handoff row, #scan reads every lease file (bridgeHandoffScope): stamp their directory first.
+      // With a handoff row, #scan reads every lease file and judges each native lease live or not at its own
+      // time (bridgeHandoffScope: a live native voids a handoff). Stamp the directory first; in the transaction,
+      // every lease must also be judged the same at the time read there, or the plan runs again.
       const leaseStamp = early && early.view.listAll(BRIDGE_HANDOFF_PREFIX).length > 0
         ? meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) : undefined;
       const planned = early && !halted() ? compute(early.view, files) : undefined;
@@ -1081,7 +1090,8 @@ export class StoreBridgeSide implements BridgeSide {
             const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
             let result: ReturnType<typeof compute>;
             if (early && planned && sameFiles && this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) &&
-              (leaseStamp === undefined || meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp)) result = planned;
+              (leaseStamp === undefined || (meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) === leaseStamp &&
+                sameLeaseLiveness(planned.judged.leases, planned.judged.now, this.now())))) result = planned;
             else if (early) throw new MirrorPlanStale();
             else result = compute(view, sameFiles ? files : participantFileSnapshot(this.store.root));
             if (!result) return plan.stage([], []);

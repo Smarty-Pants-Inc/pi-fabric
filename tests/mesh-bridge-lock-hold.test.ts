@@ -281,6 +281,39 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     await bridge.stop();
   });
 
+  // Review round 2 (P1): a void handoff depends on a native lease being live NOW. A plan made before the
+  // transaction judged it at its own time; with no row or file change, the time read in the transaction must
+  // judge every lease the same, or the plan runs again. Both directions; the clock is the side's own.
+  it.each([
+    ["expires", 0, 20_000, true],
+    ["becomes live (clock back)", 20_000, 0, false],
+  ] as const)("mirror plan: a native lease that %s before the transaction re-plans", async (_name, planAt, txAt, kept) => {
+    const hub = store();
+    const T0 = Date.now();
+    let clock = T0 + planAt;
+    const side = new StoreBridgeSide(hub, "far", () => clock);
+    await side.mirror({ hosts: [], participants: [] }); // the recovery pass; later passes plan first
+    const id = "session:handoff-12345678";
+    const identity: MeshIdentity = { id: "session:operator", name: "operator", kind: "main" };
+    const key = `topology/handoffs/${createHash("sha256").update(id).digest("hex")}`;
+    await hub.put({ key, identity, value: { format: 1, id, sessionId: "handoff-12345678", link: "far",
+      handedOffAt: T0, operator: "operator", hub: "hub" } });
+    // The moved Main's native lease, live until T0 + 10 s.
+    writeHostLease(hub.root, { id, rootId: id, identityId: id, updatedAt: T0, expiresAt: T0 + 10_000, startedAt: T0,
+      session: { id: "main-session", startedAt: T0, updatedAt: T0, expiresAt: T0 + 10_000 } });
+    const writeBatch = hub.writeBatch.bind(hub);
+    let batches = 0;
+    hub.writeBatch = (input) => {
+      batches += 1;
+      clock = T0 + txAt; // time passes (or steps back) between the plan and its transaction
+      return writeBatch(input);
+    };
+    await side.mirror({ hosts: [], participants: [] });
+    // A native lease live at the transaction's time voids (deletes) the handoff; a dead one keeps it.
+    expect(hub.get(key, { fresh: true }) !== undefined).toBe(kept);
+    expect(batches).toBe(2);
+  });
+
   it("the change-feed proof: other keys pass, a host, participant or handoff row since the revision fails", async () => {
     const mesh = store();
     const other = new MeshStore(mesh.root, 65536, 1000, { stateBackend: "sqlite" });

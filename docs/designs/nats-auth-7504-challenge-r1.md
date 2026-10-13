@@ -103,3 +103,44 @@ consumer-create-unnamed=transport-or-permission-error:RequestError
 ## Probe cleanup handoff
 
 The local server probe was started as PID `3626203`. I accidentally omitted a loopback-only `host` setting, so NATS logged a bind on `0.0.0.0:43934` (monitor `0.0.0.0:42050`). I only connected to `127.0.0.1`; I did not contact another host. The fleet shell guard refused my exact `kill 3626203` attempt because this process has no Herdr-pane ancestry, and also refused the server's `--signal` control form. (Resolved: fabric-store stopped it at 05:04Z; tracked on smarty-dev#8266.) Its config and data are under `/srv/scratch/paul/smarty-pi-tmp/pi-d8dbb921aab6/p.L71mmv/` and use only fake probe credentials.
+
+## Constraints added after round 1 (10-13, #958)
+
+This record of round 1 is unchanged above. After it, the design note gained section 9: three constraints from the
+agreed #8031 addendum. They were not part of this challenge and this pass did not test them. In short:
+
+- One machine is a cluster of one by configuration (`bus: {nodes: 1, replicas: 1}`), with the same adapter,
+  accounts, users and creds; replicas 3 is the fleet's configuration, not an unconditional barrier. Replicas are
+  never lowered at runtime. Current main hard-codes `num_replicas: 1` and its CI runs one standalone server
+  (smarty-dev#11373).
+- `owner.<agent>` is a CAS record with no TTL; a TTL liveness key only signals; only #8639's confirmed-termination
+  handoff starts a successor. Ownership reads go to the leader: custody storage sets `allow_direct: false`, and
+  every role has an explicit `DIRECT.GET` deny on it. The ACL call-path note above (the root adapter uses no
+  `DIRECT.GET`) still holds for root streams; custody storage is a separate stream.
+- Human debug attach uses no NATS creds; no role gets attach subjects.
+
+Effect on the findings: C7's stale window gains a one-node case (design note 2.4, not measured). C1's "no agent
+purge" now also covers custody and liveness storage. The other findings are unchanged. Open implementation gates are
+in the design note, 9.4. The amendment challenge below covers the draft conflicts; no named security pass is claimed.
+
+## Amendment review round 1 (10-13, #958): findings and resolutions
+
+An independent reviewer (Luna) read section 9 against the #8031 addendum and found two material contradictions.
+The author fixed both in the design note. This is not a final pass: a new delta review of the fix comes next.
+C1-C9 above are unchanged.
+
+- **F1 (P1) Maintainer purge reached custody and liveness storage.** The maintainer's `$JS.API.STREAM.PURGE.*`
+  matched `<CUS>` and liveness storage, so a purge could erase owner records and their CAS history.
+  **Resolution:** a new `<LIVE>` placeholder names the liveness storage's stream (exact names stay O-2). Every role,
+  maintainer included, has an explicit publish deny on `$JS.API.STREAM.PURGE.<CUS>` and `.<LIVE>`, in a separate
+  deny table in 1.4. The parent also applies the same denial to `STREAM.DELETE` on `<CUS>` and `<LIVE>`: deleting
+  those streams would erase the same records. Mesh-root lifecycle authority stays; agents purge nothing. T2 and
+  T14 require both verbs refused on custody/liveness plus permitted mesh-root controls. Closes O-4.
+- **F2 (P1) A config mismatch was only reported.** G-9 required a check at open, but the failure row said
+  "reported" and O-3 left "report and continue" open. **Resolution:** a replicas, `allow_direct` or expiry mismatch
+  is a hard open failure: no ownership decision and no write until a maintainer corrects it; replicas are never
+  lowered automatically. G-9, the failure table, T8, T14, 9.1 and 9.2 now say the same. Closes O-3.
+
+Still open, as pre-enable gates (not results): O-1 (smarty-dev#11373 implementation and clustered CI), O-2 (custody
+and liveness mapping, CAS writer role, allow entries), O-5 (one-node revoke after a stop, not measured), O-6 (phase
+of G-9/T14, lead decides), O-7 (scope of the named security pass, lead decides).

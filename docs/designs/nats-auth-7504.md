@@ -2,7 +2,7 @@ DESIGN (design-pair, challenge record: docs/designs/nats-auth-7504-challenge-r1.
 
 # NATS authentication: one login per issued launch and principal, one account per org
 
-smarty-dev#7504 / #8031 R1 (goals G1, G2). Owner: fabric-store. Status: DESIGN, revision 1 (final before fabric-store).
+smarty-dev#7504 / #8031 R1 (goals G1, G2). Owner: fabric-store. Status: DESIGN DRAFT, revision 1 with Amendment A (10-13, section 9); implementation and named security approval remain pending. Section 9 is docs only, not implemented or measured.
 Code read: main `fs-main-44da` (this tree) and `feat/sd-9690-reader-proof` @6fadd911 (`../fs-nats2`, cited as `b:`).
 Measured: the challenger's local nats-server 2.14.7 ACL probe (static password, not JWT; challenge record, "ACL call-path").
 
@@ -82,13 +82,24 @@ any root. So a role limits **verbs**; only a per-user exact name limits **stream
 
 ### 1.4 Permissions per role (in the scoped signing key; templates expand per user)
 
-`<B>` = `FABRIC_MESH_{{tag(mesh)}}`, the user's bound stream names.
+`<B>` = `FABRIC_MESH_{{tag(mesh)}}`, the user's bound stream names. `<CUS>` = the configured custody stream (9.2); it is never a `<B>`.
+`<LIVE>` = the configured liveness storage's stream (for a KV bucket, its underlying stream) (9.2); it is never a `<B>`. The
+exact names behind `<CUS>` and `<LIVE>` are open item O-2; this note does not invent them.
 
 | role | publish allow | subscribe allow |
 |---|---|---|
 | `agent` | `<B>.state`, `<B>.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.<B>`, `$JS.API.STREAM.MSG.GET.<B>`, `$JS.API.CONSUMER.{CREATE,MSG.NEXT,DELETE,INFO}.<B>.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `principal` | `$JS.API.INFO`, `$JS.API.STREAM.INFO.*`, `$JS.API.STREAM.MSG.GET.*`, the 4 consumer verbs `.*.>`, `$JS.API.STREAM.NAMES`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `maintainer` | `*.state`, `*.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.{INFO,MSG.GET,CREATE,UPDATE,DELETE,PURGE}.*`, `$JS.API.STREAM.NAMES`, the 4 consumer verbs `.*.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
+
+Explicit publish **deny** (in each scoped signing key; deny wins over every allow above, so it also overrides the
+maintainer's `PURGE.*`):
+
+| role | publish deny |
+|---|---|
+| every role (agent, principal, maintainer) | `$JS.API.DIRECT.GET.<CUS>`, `$JS.API.DIRECT.GET.<CUS>.>` (9.2) |
+| every role (agent, principal, maintainer) | `$JS.API.STREAM.PURGE.<CUS>`, `$JS.API.STREAM.PURGE.<LIVE>` (9.2, amendment review F1) |
+| every role (agent, principal, maintainer) | `$JS.API.STREAM.DELETE.<CUS>`, `$JS.API.STREAM.DELETE.<LIVE>` (same record-erasure boundary) |
 
 - **Root binding (C4).** Stream names are one token, so a prefix rule is impossible; the tag gives exact names. An
   agent that opens a root it was not minted for gets `Permissions Violation`; Fabric maps it to a clear error.
@@ -97,14 +108,18 @@ any root. So a role limits **verbs**; only a per-user exact name limits **stream
 - **Denied to every role** (allow lists deny the rest): `CONSUMER.DURABLE.CREATE`, the unnamed one-token
   `CONSUMER.CREATE.<S>` (the probe refused it; nats.js 3.4.0 uses the named form), `STREAM.MSG.DELETE`,
   `$JS.API.ACCOUNT.>`, other `$SYS.>` (no explicit deny: deny wins and would block USER.INFO), `$JS.ACK`/`$JS.FC`
-  (pull consumers need neither), and subscribe outside the own inbox.
+  (pull consumers need neither), and subscribe outside the own inbox. No allow list holds `$JS.API.DIRECT.GET`;
+  on `<CUS>` the explicit deny (table) also keeps a later allow from opening it. Purge and stream deletion on `<CUS>`
+  and `<LIVE>` are explicitly denied to every role; maintainer mesh-root operations stay allowed; agents purge nothing. No role holds debug-attach
+  subjects (9.3).
 - **Private inbox.** The client sets `inboxPrefix: "_INBOX.<own U key>"` (gate G-3).
 - **Compaction (gate G-2, C1).** Agent `compact()` publishes the snapshot and does not purge. One maintainer job per
   org on Ryzen 1 (hourly timer) mints a 1 h maintainer user, reads each root's latest snapshot, checks it as a
   reader does, and purges below its first sequence. A bad writer can still forge a snapshot and so cause loss, but
   only in the roots it is bound to.
 - **Later sets (not designed here):** event log (`origin/feat/nats-event-log`) and KV leases
-  (`origin/feat/nats-kv-leases`) each need their own bound allow entries.
+  (`origin/feat/nats-kv-leases`) each need their own bound allow entries. Custody and liveness storage (9.2) have the
+  explicit deny above; their allow entries are open item O-2.
 - **Expiry.** Agent `exp` = 7 days; Fabric's own cutoff at `exp − 1 h` (C6). Maintainer: 2 h migration, 1 h
   compaction. Principal: 90 days. `iat` 60 s in the past; no `nbf`. `SYS` serves only the resolver and the tools.
 
@@ -169,6 +184,10 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
   `interval` (2 min) after it joins the cluster. Partitioned but client-reachable node: no bound while the
   partition lasts. Response: put that node in lame-duck mode over ssh. With R3 streams (Q6) a minority node has no
   stream quorum, so the revoked user cannot read or write mesh state there; with R1 streams it can.
+  *Amended (9.1):* R3 is the fleet configuration. One-machine configuration (`nodes: 1`): only the up-node case
+  applies while the node runs. A node stopped during `revoke` restarts with its old resolver dir and has no peer to
+  sync from, so it accepts the revoked user until `revoke` is re-run against it (`partial`, exit 2, until then; O-5).
+  Not measured.
 - A session that ends normally needs no revocation: its seed dies with its process tree.
 
 ## 3. Fleet and self-hosted custody (C3)
@@ -187,7 +206,8 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
   launcher refuses a local operator.
 - `init --local` writes the server config (`operator`, `system_account`, `resolver: { type: full }`,
   `resolver_preload` of `SYS`). Embedded: Fabric starts `nats-server` as a child, bound to `127.0.0.1` unless the
-  user sets a listen address. One node, no external service. No-auth loopback stays only in unit tests.
+  user sets a listen address. One node, no external service. It renders `bus: {nodes: 1, replicas: 1}` with the fleet's adapter,
+  accounts, users and creds (9.1). No-auth loopback stays only in unit tests.
 
 ## 4. Ordering gates (all before the first fleet root switches to NATS)
 
@@ -195,9 +215,17 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 - **G-2** Agent compaction without purge, plus the maintainer compaction job (C1). T13.
 - **G-4** docs/mesh-backends.md "Required nats-server configuration (pi-fabric#907)" is replaced by the role matrix
   of 1.4 in the same PR. The new rule: only agent users bound to that root, and maintainers, publish to its state
-  subjects; only maintainers purge, create, update or delete. T2 on the deployed cluster is the deploy check.
-- **G-5** T2 proves root binding, or fabric-store decides D2. **G-6** Q6 (replicas 3) is done.
+  subjects; only maintainers purge or delete mesh-root streams (never `<CUS>` or `<LIVE>`, 9.2), create or update.
+  T2 on the deployed cluster is the deploy check.
+- **G-5** T2 proves root binding, or fabric-store decides D2. **G-6** Q6 (replicas 3) is done. *Amended (9.1):* the
+  fleet configuration selects replicas 3, the adapter takes replicas from the configuration and checks existing
+  streams and buckets against it (smarty-dev#11373); a one-machine install selects 1.
 - **G-7** Prior art pinned and inspected, encoder chosen (D4), security pass passed. **G-8** All T11 cases pass.
+- **G-9** (9.2, before any engine keeps `owner.<agent>` in NATS) `<CUS>` has `allow_direct: false`, no expiry and the
+  configured replicas, checked at open; a mismatch is a hard open failure (no ownership decision and no owner write
+  until a maintainer corrects it; replicas are never lowered automatically); liveness storage `<LIVE>` is separate
+  and its replicas are checked the same way; purge and stream deletion on `<CUS>` and `<LIVE>` are denied to every role (1.4); the engine
+  mapping (O-2) is written; T14 passes.
 
 ## 5. Failure modes
 
@@ -212,6 +240,9 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 | compaction job stopped | streams grow to the account limit, then writes fail | alert on job age; run the job by hand |
 | revoke `partial` | stale node accepts the user (2.4) | lame duck the node; re-run revoke |
 | credential cutoff reached | the process and its children lose NATS | relaunch through the launcher |
+| liveness key lapses (9.2) | ownership does not change | a successor starts only after the #8639 confirmed-termination handoff |
+| stream or bucket differs from configured replicas, or `<CUS>` from `allow_direct: false` or no expiry | open fails with an error naming the field; no ownership decision and no write to it; never lowered automatically | a maintainer corrects the stream, then the open is retried |
+| a maintainer job sends `STREAM.PURGE` or `STREAM.DELETE` for `<CUS>` or `<LIVE>` | `Permissions Violation` (explicit deny, 1.4); owner records and history intact | none; mesh-root operations are unaffected |
 
 ## 6. Test plan
 
@@ -220,18 +251,19 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 
 | test | checks |
 |---|---|
-| T1 `nats-auth-cluster-form` | 3 nodes route in operator mode; `/varz` cluster size 3; `/accountz` shows `SYS` and the org; T3: no creds, connect refused |
-| T2 `nats-auth-role-matrix` | per role, every verb of 1.3-1.4 passes or gets `Permissions Violation`; agent: other root refused, purge refused, 2 `mesh:` tags both work |
+| T1 `nats-auth-cluster-form` | fleet configuration `{nodes: 3, replicas: 3}`: 3 nodes route in operator mode; `/varz` cluster size 3; `/accountz` shows `SYS` and the org; streams and buckets the adapter opens report replicas 3; T3: no creds, connect refused |
+| T2 `nats-auth-role-matrix` | per role, every verb of 1.3-1.4 passes or gets `Permissions Violation`; agent: other root refused, purge refused, 2 `mesh:` tags both work; every role: `DIRECT.GET` on `<CUS>` refused, `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused (maintainer included), no attach subjects (9.2, 9.3); control: maintainer purge and deletion of a mesh-root `<B>` pass |
 | T4 `nats-auth-revoke-propagation` | live connections on all nodes close and reconnect fails within 5 s; stopped node; partitioned node gives `partial` |
 | T5 `nats-auth-expiry-skew` | a live connection past `exp`; reconnect after `exp` refused; Fabric cutoff at `exp − 1 h`; +30 s skew connects |
 | T6 `nats-auth-org-isolation` | a `playful-test` user sees no Smarty stream in `STREAM.NAMES` and cannot get its messages |
 | T7 `nats-auth-reader-proof-bind` | a proof signed by reader A is refused as reader B's proof |
-| T8 `nats-auth-single-node` (CI) | `init --local`, one loopback `nats-server`, the conformance suite over creds |
+| T8 `nats-auth-single-node` (CI) | `init --local` renders `{nodes: 1, replicas: 1}`; one loopback `nats-server`; the same adapter and the conformance suite over creds; a stream or bucket whose replicas differ from the configuration fails to open, gets no write and is not lowered. Not in CI today (9.1) |
 | T9 `nats-auth-1password-down` | a launch with the cached profile mints; revoke reports the outage |
 | T10 `nats-auth-fd-core` | FD 3 closed in Pi before tools; absent in children; core limit 0; no seed pattern in logs (count only) |
 | T11 `nats-auth-launch-graph` | cases a-l of 2.2: each gets its stated user or refuses with `FABRIC_MESH_STATE_NATS_NO_CREDS` |
 | T12 `nats-auth-root-lifecycle` | new root (provision, then agent open), migrated root, migration rerun; agent open of a missing stream refuses |
 | T13 `nats-auth-compaction` | agent compaction publishes without purge; the job purges below the snapshot |
+| T14 `nats-auth-custody-leader` | `<CUS>` info: `allow_direct: false`, no expiry, configured replicas; ownership reads use `STREAM.MSG.GET`; a CAS write on a stale revision fails; a lapsed liveness key leaves `owner.<agent>` unchanged; maintainer `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); a `<CUS>` whose replicas, `allow_direct` or expiry differ from the configuration fails to open, no ownership read decides and no owner write is sent, and nothing is lowered (needs O-2) |
 
 ## 7. The reader-proof gap (smarty-dev#9834)
 
@@ -262,6 +294,7 @@ chart (nats-io/k8s) and NACK (nats-io/nack), same config shape and creds split. 
 - **Q4.** Cache the `nats-admin` profile for revocation during a 1Password outage, or not.
 - **Q5.** Route auth on 6222: TLS plus the tailnet ACL only, or also a route password.
 - **Q6.** Streams use `num_replicas: 1` (`b:…-client.ts:66,79`). R3 is needed for the claims and for the 2.4 bound.
+  *Amended (9.1):* R3 is the fleet configuration; one machine selects 1. Main `c9b9a1d4` also hard-codes 1.
 
 ## Open disagreements
 
@@ -309,10 +342,13 @@ The design is accepted as the R1 basis. A named security pass on this note runs 
 - **D4: the encoder is decided at G-7, leaning toward the recommendation.** The own encoder (~80 lines over `@nats-io/nkeys`) wins only if its output matches `nsc describe` and nats-server accepts it, in a test. The `ponytail:` comment says why `@nats-io/jwt` (pre-1.0) is not used. If G-7 finds `@nats-io/jwt` sound and maintained, it is used instead.
 - **D5 accepted.** mesh-bridge carries no NATS root in R1.
 - **D6 accepted.** A hard 7-day cutoff, the lame-duck runbook, and replicas 3 (Q6). Renewal moves to phase C.
+  *Amended 10-13 (9.1):* replicas 3 is the fleet's configuration; a one-machine install is `{nodes: 1, replicas: 1}`.
 - **Q3:** fail closed, as written now. No per-host bootstrap creds file.
 - **Q4:** no cache for `nats-admin`. During a 1Password outage, the response to a leak is lame duck or stopping the node over ssh (runbook row). A cached operator-signing-key file on Ryzen 1 is a worse risk than a delayed revoke.
 - **Q5:** routes use **mutual TLS with known-URL checking** (`verify_cert_and_check_known_urls` on the route block) plus the tailnet ACL, which limits 6222 to the 3 nodes. There is no route password, so there is no new secret on the nodes beyond F1. T1 adds one more check: a 4th tailnet host with a valid certificate cannot join as a route.
 - **Q6:** replicas 3 are required before the fleet switch (G-6, unchanged).
+  *Amended 10-13 (9.1):* for the fleet configuration only. It does not block a one-machine install and is not a
+  runtime branch.
 
 **Phasing, for the S8 date (logins ready for the direct-route S8 run by 10-13 12:00Z):**
 - **Phase 1, for S8:**
@@ -325,3 +361,90 @@ The design is accepted as the R1 basis. A named security pass on this note runs 
   - FD 3 delivery and the launch graph (T10, T11);
   - G-1, G-2 (the maintainer compaction job), G-3, G-4;
   - the reader-proof binding (section 7, #9834).
+
+## 9. Amendment A (10-13, #958): three agreed #8031 constraints
+
+Docs only. Nothing in this section is implemented, tested or measured unless it says so. It adds three constraints
+from the agreed #8031 addendum (engine-lead to fabric-store on #7504, posted 10-12 06:10Z). It does not change the
+auth model, the roles, key custody or the decisions above, except where they now say "amended". The three problems:
+replication is a configuration value; ownership is a CAS record while liveness is an expiring signal; human debug
+attach is its own authentication, not NATS.
+
+### 9.1 One machine is a cluster of one, by configuration
+
+- The configuration names the topology: the fleet selects `bus: {nodes: 3, replicas: 3}`, one machine
+  `bus: {nodes: 1, replicas: 1}`. Both use the same adapter, operator/account/user model, creds delivery and role
+  matrix (1.4). Goal G2 applies on one host too.
+- No code branches on host count at runtime. Rendering the server config from `bus` is fine.
+- Replicas are never lowered at runtime. The adapter checks each existing stream and bucket against the configured
+  replicas; a mismatch is a hard open failure, not an automatic change: nothing is written to that stream or bucket
+  until it is corrected. Agents hold no `STREAM.UPDATE` (1.4); a correction is a maintainer step (O-3, resolved).
+  Replicas are never reduced automatically.
+- Replicas 3 (Q6, G-6, D6) is the fleet's selected configuration, not an unconditional barrier. It does not block a
+  one-machine install (section 3). Its part in the 2.4 stale-window bound applies to the fleet configuration.
+- **Implementation and CI gap (smarty-dev#11373).** Current main
+  `c9b9a1d44cb723589bcbd54d46ed7fc7814c5993`: `src/mesh/state-backend-nats-client.ts:59` creates streams with
+  `num_replicas: 1` hard-coded; lines 62-64 add missing subjects and do not check replicas.
+  `.github/workflows/test.yml:194-232` (`nats-state-conformance`) runs one standalone loopback nats-server 2.14.7
+  with JetStream, no cluster and no auth. So neither the fleet R3 configuration nor T1/T8 is covered today. Read
+  with `git show`; nothing was run.
+
+### 9.2 Custody is a CAS record; liveness only signals
+
+- `owner.<agent>` = `{engine, epoch, state}`, written by compare-and-set on its last revision, with no TTL. It
+  lives in a configured custody stream `<CUS>` with no expiry (no max age, no per-message TTL). No TTL bucket may
+  hold or expire an owner record.
+- A separate liveness key with a TTL lives in separately configured storage. It only signals. A lapsed liveness key
+  never authorizes a successor; only the confirmed-termination handoff of smarty-dev#8639 does.
+- Reads that decide ownership go to the stream leader: `<CUS>` has `allow_direct: false`, every role has the
+  explicit `DIRECT.GET` deny of 1.4, and ownership reads use `$JS.API.STREAM.MSG.GET.<CUS>`.
+- Do not assume the leader path by default. The NATS KV docs (9.5) show a KV bucket created with Direct Get on (the KV
+  default, per the prior read). So
+  `<CUS>` sets `allow_direct: false` explicitly and the adapter checks it in `STREAM.INFO` at open, as for
+  replicas. A mismatch in replicas, `allow_direct` or expiry is a hard open failure: no ownership read decides and
+  no `owner.<agent>` write goes out until a maintainer corrects `<CUS>`; nothing is changed automatically. Which request a nats.js 3.4.0 KV `get` sends: not measured.
+- `<CUS>` and liveness storage are not a mesh root's state stream `<B>`. The root binding, compaction and purge rules
+  for `<B>` do not cover them. `<LIVE>` (1.4) names the liveness storage's stream. Agents hold no purge anywhere.
+  The maintainer purges mesh-root streams `<B>` (G-2), but every role, maintainer included, has an explicit deny on
+  `$JS.API.STREAM.PURGE.<CUS>` and `$JS.API.STREAM.PURGE.<LIVE>` (1.4). The same explicit deny covers
+  `$JS.API.STREAM.DELETE.<CUS>` and `$JS.API.STREAM.DELETE.<LIVE>`: deleting the stream would erase the same
+  owner records and CAS history. Mesh-root stream lifecycle authority is unchanged.
+- **Not fixed here:** the engine's exact bucket or stream names, subjects, and which role writes `owner.<agent>`.
+  The #8031 addendum does not give that mapping and this note does not invent it: O-2, gate G-9, test T14.
+
+### 9.3 Human debug attach is not NATS
+
+- Attach goes to the owner's socket through upstream `pi-server`. Each operation carries an SSH signature over the
+  op and a digest of its payload. It uses no NATS creds.
+- `watch` comes now. `drive` comes only after agents run under their own Unix users (org decision 10-12).
+- No role in 1.4 has attach subjects: agent users need none, and principal users are for the mesh only (T2).
+- The attach transport, its keys and its tests are outside this note.
+
+### 9.4 Open items
+
+- **O-1** smarty-dev#11373: replicas from the
+  configuration, checks of existing streams and buckets, and a clustered, authenticated CI job.
+- **O-2** The engine's custody and liveness mapping (names, subjects, CAS writer role) and the 1.4 allow entries for
+  it, including subject-space isolation from the maintainer's `*.state` / `*.snapshot` mesh grants. Gate G-9.
+- **O-3 resolved** (amendment review F2): a replicas, `allow_direct` or expiry mismatch is a hard open failure, with
+  no ownership decision or write until a maintainer corrects it; never lowered automatically (9.1, 9.2, G-9, T8, T14).
+- **O-4 resolved** (amendment review F1): purge and stream deletion on `<CUS>` and `<LIVE>` are explicitly denied
+  to every role, maintainer included; mesh-root lifecycle operations stay allowed (1.4, G-4, T2, T14).
+- **O-5** One-node revoke after a stop (2.4): re-run `revoke`; not measured.
+- **O-6** The phase of G-9 and T14 relative to the phase 1 / phase 2 split above.
+- **O-7** This amendment is not a security pass. Whether `nats-auth-7504-security` also covers section 9: lead
+  decides.
+
+### 9.5 Prior art
+
+- Read 10-13 18:02Z (HTTP 200, text checked): NATS docs
+  [KV under the hood](https://docs.nats.io/learn/key-value/under-the-hood): the example bucket shows
+  `Direct Get: true`; a direct get goes to `$JS.API.DIRECT.GET.<stream>.<subject>`.
+  [etcd API](https://etcd.io/docs/v3.5/learning/api/): transactions as compare-and-swap; a key may carry a lease ID
+  (0 = none).
+- Read by the prior writer 17:56Z, not re-read: [KV TTL and limits](https://docs.nats.io/learn/key-value/ttl-and-limits)
+  (per-key TTL needs server 2.11+ and limit markers).
+- The difference: an etcd key attached to a lease goes away when the lease expires (not re-checked here). We keep
+  the owner record free of any TTL and treat the TTL key as a signal, because a successor needs confirmed
+  termination (#8639). `unverified:` fencing-token write-ups such as Kleppmann's "How to do distributed locking"
+  (not fetched).

@@ -351,6 +351,11 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
   lock and the renewal job run,
   and clients renew and fail closed (T17, T19). The break-glass approval checks (11.3, T18) pass before any
   break-glass user is minted for a fleet account.
+- **G-12** (11.2, smarty-dev#8639) The #8639 confirmed-termination handoff and its admission proof are in place
+  before any fleet root switches and before any engine uses a fleet owner record (`owner.<agent key>` in
+  `KV_FABRIC_CUSTODY`). While the prior owner is live or its termination is unconfirmed, no successor engine starts
+  and the issuer grants no `custody:` tag. T14's ACL and CAS checks do not prove the handoff. smarty-dev#8639 is
+  open: until it lands with its acceptance test, no fleet root switches to NATS. T20.
 
 ## 5. Failure modes
 
@@ -399,6 +404,7 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 | T17 `nats-auth-partition-expiry` | `{nodes: 3, replicas: 3}`, test lifetime 120 s, renewal every 30 s (the same code with short values). An R3 stream has no quorum on a minority node (2.4), so the access observed is what the node itself serves: a test-only R1 stream `FABRIC_MESH_<test hex>` placed on node C (bound to U and W by their `mesh:` tag), and `$SYS.REQ.USER.INFO`, which C answers locally. U, W and X are raw nats.js clients with creds (no Fabric cutoff), so the server's own expiry is what is observed; Fabric's `exp − 5 min` cutoff is T19's. Users U and W connect to node C, X to node A. Cut C's routes (6222) while its client port stays reachable. `revoke U`: `partial`, naming C. Through U's real client on C: before `exp`, U's `USER.INFO`, its publish to that stream's `.state` and its `$JS.API.STREAM.MSG.GET` on it succeed (the window); at U's `exp` plus at most 30 s, C closes U's connection with `User Authentication Expired`, those three calls fail, a reconnect to C with that JWT is refused, and no renewal for U arrives. Control: C also closes W at its `exp` (no renewal crosses the partition); X on A keeps access over 3 renewals; after the routes heal W renews and U stays refused on every node (11.1) |
 | T18 `nats-auth-breakglass-approval` | each case exits 2 and mints nothing: no `--approval`; unknown item; item not answered or answered `ignore`; answered by a person other than Paul; answered over 24 h ago; item already reserved; org, stream or config SHA-256 differs (one byte changed in `--config`); mint run from a session whose principal is Paul (a command-line name is ignored); no `--audit`; the audit comment is on another issue, by another author, created before Paul's answer, or lacks the item id or the SHA-256. Two concurrent mints with one item: exactly one mints. A crash injected after the reservation and before the signature: the item stays reserved, no credential exists, a retry is refused. Positive: everything matches: one 1 h user; the mint record holds the comment snapshot (id, author, `created_at`, body SHA-256); after an edit or deletion of that comment the runbook's audit check reports the mismatch (11.3) |
 | T19 `nats-auth-renewal` | a renewed JWT has the same `sub`, name, tags and permissions, a later `iat` and `exp`, and `exp − iat` at most 3660 s; a JWT for another key, from a key outside the account, with other permissions, an older `iat` (a replay of an earlier valid JWT), `exp − iat` over 3660 s (slice 1's 7-day form included), or `exp` over 1 h 90 s ahead is ignored; a `revoke` that runs while the renewal job is signing: no JWT for the revoked key is signed after R, and every JWT signed for it is refused by an up node after the push; the client reconnects once in the last 20 min and continues; with the job stopped (test lifetime 10 min), Fabric fails closed at `exp − 5 min` and the node closes at `exp`; a revoked user gets no renewal; a principal's 1Password `jwt` field is updated and its seed field is not touched (11.1) |
+| T20 `nats-auth-custody-handoff` | the issuer grants a `custody:<agent key>` tag only to the unique current engine: (a) first placement grants one tag to one engine; (b) a second engine that asks for the same agent while the first is live or its termination is unconfirmed gets no tag, and its CAS write to `$KV.FABRIC_CUSTODY.owner.<agent key>` gets `Permissions Violation`; (c) after the #8639 confirmed-termination handoff the successor gets the tag and the predecessor's custodian user is revoked, so its write is refused; (d) an unconfirmed termination (timeout, unknown) grants nothing. The handoff proof is smarty-dev#8639's own acceptance test (https://github.com/Smarty-Pants-Inc/smarty-dev/issues/8639) (G-12, 11.2) |
 
 ## 7. The reader-proof gap (smarty-dev#9834)
 
@@ -755,7 +761,7 @@ Slice 1 (fs-fence's unmerged slice 1 branch, cited at 48fe892f) keeps its fixed 
 metadata returned per credential (U key, role, signer, `issuedAt`, expiry, digest: `src/mesh/nats-auth/mint.ts`,
 at 48fe892f ~L375-389, and the CLI output, `cli.ts` ~L232; no durable record or inventory is written), a per-key
 retirement guard, POSIX mint checks of the real file mode and UID before secret bytes are written, and win32
-refusing to write seeds (smarty-dev#11482). Rotate, inventory, reissue and revoke are later slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switches before it (G-9, G-10, G-11).
+refusing to write seeds (smarty-dev#11482). Rotate, inventory, reissue and revoke are later slices. Everything below beyond slice 1 is **slice 2+**, and no fleet root switches before it (G-9, G-10, G-11, G-12).
 
 ### 11.1 Revocation bound on every node: a 1 h user JWT (Astra P1, partition; C7)
 
@@ -859,11 +865,14 @@ Per org account. `unverified:` that `@nats-io/kv` 3.4.0 names a bucket's stream 
 name `custodian/<host>/<engine-session>`, tag `lease:<host key>`, and one tag `custody:<agent key>` per agent that
 engine holds; 1 h with renewal (11.1). A custodian user writes only its tagged `owner.<agent key>` keys, always by
 CAS on the last revision (KV update with the expected last subject sequence). The issuer adds a `custody:` tag for
-an agent only to a newly minted custodian user (renewal keeps tags unchanged, 11.1): at the agent's first
-placement, or after it has recorded the #8639 confirmed-termination handoff from the previous engine, and in that
-handoff it revokes the previous engine's custodian user if it still holds that tag. So NATS refuses a write by an
-engine that was never handed the agent. Agents, principals, maintainers and break-glass users write no custody or
-liveness key (1.4 deny).
+an agent only to a newly minted custodian user (renewal keeps tags unchanged, 11.1), and it issues and transfers
+the tag only through the proven #8639 confirmed-termination handoff (G-12, T20). At the agent's first placement it
+grants the tag only to the unique current engine, after it confirms that no other engine holds or held a live tag
+for that agent. On a transfer it grants the tag only after it has recorded the handoff from the previous engine, and
+in that handoff it revokes the previous engine's custodian user if it still holds that tag. While the previous
+owner is live or its termination is unconfirmed, it grants nothing. So NATS refuses a write by an engine that was
+never handed the agent. No engine uses a fleet owner record before G-12 passes. Agents, principals, maintainers and
+break-glass users write no custody or liveness key (1.4 deny).
 
 Reads are not scoped per agent: `$JS.API.STREAM.MSG.GET.<stream>` carries the wanted subject in its request body,
 so a subject permission cannot narrow it. Every custodian (and every principal and maintainer, 1.4) can read every
@@ -986,6 +995,7 @@ no write without the tag.
   delegate (10.2).
 - Still open: O-1; O-6 (phases, now including section 11's slice 2+ items); O-7 (security pass scope, now including
   section 11).
+- smarty-dev#8639 (confirmed-termination handoff) is open and blocks G-12 and the fleet switch (T20).
 - `unverified:` items, each with its test: `@nats-io/kv` stream names and KV `get` with `allow_direct: false`
   (T14); a non-inbox `{{subject()}}` and the whole-token `{{tag(lease)}}` (T2); the inbox records who answered (T18);
   JetStream refuses overlapping stream subjects (T14); SSH from each node to Ryzen 1 (T16).

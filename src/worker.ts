@@ -883,8 +883,9 @@ const main = async (): Promise<void> => {
   // may miss a tool start or end in it. Rule chosen, the simplest that never under-reports: EVERY dropped line of a
   // Pi child marks the receipt truncated, whatever the line was (the line is not parsed for its type).
   let receiptLineDropped = false;
+  // A call still pending (started, never ended: cancelled, failed or cut off) may have had its effect: also truncated.
   const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
-    receiptLineDropped ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
+    receiptLineDropped || writeReceipt.pending > 0 ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -1646,6 +1647,9 @@ const main = async (): Promise<void> => {
       event = parsed as Record<string, unknown>;
     } catch {
       runLog.event(line, undefined);
+      // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
+      // start or end; the receipt cannot vouch for it.
+      if (isPi && line.trim()) receiptLineDropped = true;
       return;
     }
     runLog.event(line, event);

@@ -42,7 +42,8 @@ const huge = "x".repeat(5 * 1024 * 1024);
 const args = tool === "write" ? { path: "big.txt", content: side === "start" ? huge : "B" } : { command: side === "start" ? "echo " + huge : "echo small" };
 emit({ type: "tool_execution_start", toolCallId: "c1", toolName: tool, args });
 if (tool === "write") fs.writeFileSync("big.txt", "B");
-emit({ type: "tool_execution_end", toolCallId: "c1", toolName: tool, isError: false, durationMs: 1,
+if (side === "garbage") process.stdout.write('{"type":"tool_execution_end","toolCallId":"c1"' + String.fromCharCode(10));
+else if (side !== "pending") emit({ type: "tool_execution_end", toolCallId: "c1", toolName: tool, isError: false, durationMs: 1,
   result: { content: [{ type: "text", text: side === "end" ? huge : "ok" }] } });
 emit({ type: "message_end", message: { role: "assistant", content: "I changed nothing." } });
 emit({ type: "agent_settled" });
@@ -51,7 +52,7 @@ process.stdout.write("", () => setTimeout(() => process.exit(0), 1000));
 `;
 
 describe("oversized tool event lines (pi-fabric#1034 round 6)", () => {
-  it.each(["write:start", "write:end", "bash:start", "bash:end"])("a dropped %s line marks the receipt truncated", async (which) => {
+  it.each(["write:start", "write:end", "bash:start", "bash:end", "bash:pending", "write:garbage"])("a dropped %s line marks the receipt truncated", async (which) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-big-")));
     roots.push(root);
     const fake = path.join(root, "oversized-pi.mjs");
@@ -62,7 +63,10 @@ describe("oversized tool event lines (pi-fabric#1034 round 6)", () => {
       });
       managers.push(manager);
       const result = await manager.run({ task: "oversized", runner: "pi", transport: "process", extensions: false });
-      expect(result.warnings?.join("\n") ?? "", JSON.stringify({ status: result.status, error: result.error, text: result.text })).toContain("Dropped an oversized agent event line");
+      // A call left pending, or an unparsable frame, is not an oversized line: only the truncated flag is asserted.
+      if (/:(start|end)$/.test(which)) {
+        expect(result.warnings?.join("\n") ?? "", JSON.stringify({ status: result.status, error: result.error, text: result.text })).toContain("Dropped an oversized agent event line");
+      }
       expect(result.writeReceipt?.truncated).toBe(true);
     }
   }, 60_000);

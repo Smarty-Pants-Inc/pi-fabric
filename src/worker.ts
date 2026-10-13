@@ -300,7 +300,8 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 
 
 
-let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
+// receipt: pi-fabric#1034 round 7, the live write receipt (pending calls and dropped lines marked truncated).
+let crashContext: { statusFile: string; record: AgentRunRecord; receipt?: () => AgentRunRecord["writeReceipt"] } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
 let flushRunLog: (() => void) | undefined;
@@ -310,7 +311,7 @@ const writeCrashStatus = (error: unknown): void => {
   if (terminalWritten) return;
   try {
     if (crashContext && runRecordHelpers) {
-      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error);
+      runRecordHelpers.writeCrashRunRecord(crashContext.statusFile, crashContext.record, error, crashContext.receipt?.());
     } else {
       writeWorkerStartupFailure(process.argv, error);
     }
@@ -886,6 +887,7 @@ const main = async (): Promise<void> => {
   // A call still pending (started, never ended: cancelled, failed or cut off) may have had its effect: also truncated.
   const receiptNow = (): NonNullable<typeof record.writeReceipt> =>
     receiptLineDropped || writeReceipt.pending > 0 ? { ...writeReceipt.receipt, truncated: true } : writeReceipt.receipt;
+  if (isPi && crashContext) crashContext.receipt = receiptNow;
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -1649,7 +1651,10 @@ const main = async (): Promise<void> => {
       runLog.event(line, undefined);
       // pi-fabric#1034 round 6: an unparsable Pi frame (cut at close, or a projection sentinel) may have been a tool
       // start or end; the receipt cannot vouch for it.
-      if (isPi && line.trim()) receiptLineDropped = true;
+      if (isPi && line.trim()) {
+        receiptLineDropped = true;
+        record.writeReceipt = receiptNow();
+      }
       return;
     }
     runLog.event(line, event);
@@ -1926,6 +1931,8 @@ const main = async (): Promise<void> => {
     }
     if (event.type === "tool_execution_start") {
       writeReceipt.start(event);
+      // Stored at once: a checkpoint read by the manager (timeout, stop, lost worker) shows the pending call.
+      if (isPi) record.writeReceipt = receiptNow();
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;

@@ -707,6 +707,19 @@ const writeRecord = (filePath: string, record: AgentRunRecord): void => {
   writeJsonAtomic(filePath, record, { space: 2 });
 };
 
+// pi-fabric#1034 round 7: a manager-made result (timeout, stop, lost worker) keeps the child's last stored write
+// receipt. Unless the worker itself wrote a terminal record, what ran after that checkpoint is unknown, so the receipt
+// is marked truncated; a Pi child with no stored receipt gets an empty truncated one, never none.
+const carriedWriteReceipt = (
+  runner: string,
+  previous: AgentRunRecord | undefined,
+): { writeReceipt?: NonNullable<AgentRunRecord["writeReceipt"]> } => {
+  const receipt = previous?.writeReceipt;
+  const known = previous !== undefined && previous.status !== "queued" && previous.status !== "running";
+  if (receipt) return { writeReceipt: known ? receipt : { ...receipt, truncated: true } };
+  return runner === "pi" || runner === "pi-durable" ? { writeReceipt: { paths: [], commands: [], truncated: true } } : {};
+};
+
 const failedRecord = (
   managed: Omit<
     ManagedAgent,
@@ -750,6 +763,7 @@ const failedRecord = (
     ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
+    ...carriedWriteReceipt(managed.runner, previous),
     ...(managed.model ? { model: managed.model } : {}),
     ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
     ...(managed.thinking ? { thinking: managed.thinking } : {}),

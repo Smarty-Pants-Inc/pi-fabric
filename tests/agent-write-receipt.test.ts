@@ -72,6 +72,120 @@ describe("oversized tool event lines (pi-fabric#1034 round 6)", () => {
   }, 60_000);
 });
 
+// pi-fabric#1034 round 7 (Astra P1 c6152886488): terminal results the worker does not write itself. A one-off fake Pi
+// writes f.txt through a write call (ended, or left pending), then waits until the run times out or is stopped.
+const lifecyclePi = (mode: string) => `#!/usr/bin/env node
+import fs from "node:fs";
+process.stdin.resume(); process.stdin.on("data", () => {});
+const mode = ${JSON.stringify(mode)};
+const emit = (event) => process.stdout.write(JSON.stringify(event) + String.fromCharCode(10));
+emit({ type: "tool_execution_start", toolCallId: "w1", toolName: "write", args: { path: "f.txt", content: "F" } });
+fs.writeFileSync("f.txt", "F");
+if (!mode.endsWith("pending")) emit({ type: "tool_execution_end", toolCallId: "w1", toolName: "write", isError: false, durationMs: 1, result: { content: [{ type: "text", text: "ok" }] } });
+setInterval(() => {}, 1000);
+`;
+
+describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () => {
+  const lifecycleManager = (mode: string, timeoutMs = 30_000) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-end-")));
+    roots.push(root);
+    const fake = path.join(root, "lifecycle-pi.mjs");
+    fs.writeFileSync(fake, lifecyclePi(mode), { mode: 0o700 });
+    process.env.FAKE_PI_BEHAVIOR = "unused";
+    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs }, {
+      workerPath: path.resolve("src/worker.ts"), piBinary: fake, runRoot: path.join(root, "runs"), fullCodeMode: false,
+    });
+    managers.push(manager);
+    return { root, manager };
+  };
+
+  // Manager-made results (failedRecord): the test SIGKILLs the worker (its pid is the status record's sessionId) once the
+  // receipt checkpoint is stored, so the manager sees a lost worker, not a worker-written terminal record.
+  const killWorkerAfterCheckpoint = async (root: string, id: string, ready: (receipt: { paths?: string[]; truncated?: boolean } | undefined) => boolean) => {
+    const statusFile = path.join(root, "runs", id, "status.json");
+    const until = Date.now() + 20_000;
+    let pid: number | undefined;
+    while (Date.now() < until) {
+      try {
+        const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        if (ready(status.writeReceipt)) { pid = Number(status.sessionId); break; }
+      } catch { /* not written yet */ }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(pid).toBeGreaterThan(0);
+    process.kill(pid!, "SIGKILL");
+  };
+
+  it("a lost worker after a completed write: the manager's result keeps the path, marked truncated", async () => {
+    const { root, manager } = lifecycleManager("lost", 8_000);
+    const handle = await manager.spawn({ task: "write then hang", runner: "pi", transport: "process", extensions: false });
+    await killWorkerAfterCheckpoint(root, handle.id, (receipt) => (receipt?.paths?.length ?? 0) > 0);
+    const result = await manager.wait(handle.id);
+    // With the worker dead, the manager makes the result: lost transport (failed) or its own deadline (timed_out).
+    expect(["failed", "timed_out"]).toContain(result.status);
+    expect(result.writeReceipt).toEqual({ paths: [path.join(root, "f.txt")], commands: [], truncated: true });
+  }, 60_000);
+
+  it("a lost worker with an unended write call: the manager's result is marked truncated", async () => {
+    const { root, manager } = lifecycleManager("lost-pending", 8_000);
+    const handle = await manager.spawn({ task: "start a write then hang", runner: "pi", transport: "process", extensions: false });
+    // f8090829 never stores a receipt for a start, so wait for the start itself (toolCalls) there.
+    const statusFile = path.join(root, "runs", handle.id, "status.json");
+    await killWorkerAfterCheckpoint(root, handle.id, () => {
+      try { return JSON.parse(fs.readFileSync(statusFile, "utf8")).toolCalls > 0; } catch { return false; }
+    });
+    const result = await manager.wait(handle.id);
+    expect(["failed", "timed_out"]).toContain(result.status);
+    expect(result.writeReceipt?.truncated).toBe(true);
+  }, 60_000);
+
+  // Worker-written terminal records (regression guards; green on f8090829 too).
+  it("a timed-out child after a completed write keeps the path", async () => {
+    const { root, manager } = lifecycleManager("timeout", 4_000);
+    const result = await manager.run({ task: "write then hang", runner: "pi", transport: "process", extensions: false });
+    expect(result.status).toBe("timed_out");
+    expect(result.writeReceipt?.paths).toEqual([path.join(root, "f.txt")]);
+  }, 60_000);
+
+  it("a timed-out child with an unended write call: the receipt is marked truncated", async () => {
+    const { manager } = lifecycleManager("timeout-pending", 4_000);
+    const result = await manager.run({ task: "start a write then hang", runner: "pi", transport: "process", extensions: false });
+    expect(result.status).toBe("timed_out");
+    expect(result.writeReceipt?.truncated).toBe(true);
+  }, 60_000);
+
+  it("an explicit stop after a completed write keeps the path", async () => {
+    const { root, manager } = lifecycleManager("stop");
+    const handle = await manager.spawn({ task: "write then wait", runner: "pi", transport: "process", extensions: false });
+    const statusFile = path.join(root, "runs", handle.id, "status.json");
+    const until = Date.now() + 20_000;
+    const seen = (): boolean => {
+      try { return (JSON.parse(fs.readFileSync(statusFile, "utf8")).writeReceipt?.paths?.length ?? 0) > 0; } catch { return false; }
+    };
+    while (!seen() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(seen()).toBe(true);
+    const result = await manager.stop(handle.id);
+    expect(result.status).toBe("stopped");
+    expect(result.writeReceipt?.paths).toEqual([path.join(root, "f.txt")]);
+  }, 60_000);
+
+  it("a worker crash keeps the live receipt: an unended write call is published as truncated", async () => {
+    const { createRunningRecord, writeCrashRunRecord } = await import("../src/worker/run-record.js");
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-receipt-crash-")));
+    roots.push(root);
+    const file = path.join(root, "status.json");
+    const record = createRunningRecord({
+      id: "id", name: "crash", runner: "pi", transport: "process", cwd: root,
+      taskFile: "task.txt", statusFile: file, lifecycleFile: "lifecycle.jsonl", logFile: "events.jsonl",
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda", vedaBackend: "", vedaPersona: "",
+      timeoutMs: 1000, depth: 0, fullCodeMode: false, extensions: false, tools: [], grantedRisks: [],
+    } as never, "task", undefined, 1);
+    record.writeReceipt = { paths: [], commands: [] }; // the last stored receipt, before the start
+    writeCrashRunRecord(file, record, new Error("crash"), { paths: [], commands: [], truncated: true });
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ status: "failed", writeReceipt: { paths: [], commands: [], truncated: true } });
+  });
+});
+
 describe("agent write receipt (smarty-dev#8758 item 2)", () => {
   it("a spawned child that writes two files and runs one bash command: the envelope lists exactly those", async () => {
     const { root, manager } = managerIn("write-receipt");

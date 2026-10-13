@@ -833,11 +833,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #retiredDuring(error: unknown): boolean {
+    // smarty-dev#8881: the owner lifecycle decides first. When it already retired (SDK dispose,
+    // reload, replacement) any failure is that retirement's side effect: suspend quietly, with no
+    // degraded notice. Only a stale SOURCE under a still-live OWNER is a degraded directory.
+    if (!this.#closed && !this.#live()) {
+      this.suspend();
+      return true;
+    }
     if (isStaleExtensionContextError(error)) {
       this.#lifecycleRetired();
       return true;
     }
-    return !this.#closed && !this.#live();
+    return false;
   }
 
   #lifecycleRetired(): void {

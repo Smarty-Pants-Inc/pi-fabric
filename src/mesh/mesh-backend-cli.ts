@@ -52,6 +52,13 @@ release. Required: each distinct release of a live Fabric writer (host leases an
 the built-in installed readers (factory) and each --require-reader. --accept-unready NAME,... is the
 only override. The intent is written to <root>/backend-switches.jsonl before the switch; the check
 runs again under the fence right before each flag commit (importing, sqlite), crash reruns included.
+A refusal before the importing commit moves the state.db, -wal and -shm that run created into a reported
+quarantine directory (smarty-dev#9501), through a root directory fd held via /proc/self/fd. Cleanup deletes
+nothing; inspect the quarantine and remove it manually once its contents are not needed. Kept paths are
+reported on stderr and in JSON ("cleanupWarnings", "retained", "reason"). Reasons: quarantined-after-refusal,
+no-held-dir-fd (no working /proc/self/fd: nothing is moved), close-failed (the database close failed: nothing
+is moved), cleanup-failed, not-this-runs-file. Refusal exit 3 is unchanged. Errors (exit 1) keep the files
+so a rerun converges.
 
 --scratch-proof-from STATE_JSON (import only, smarty-dev#9404): a reader's proof step. The CLI itself
 creates a fresh 0700 scratch directory (mkdtemp in --scratch-parent, default the OS temp directory; its
@@ -593,8 +600,15 @@ export const main = async (argv: string[], io: {
     const refused = error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError;
     const message = error instanceof Error ? error.message : String(error);
     if (gate) closeGate(options.root, gate, warn, { ok: false, refused, error: message });
+    // smarty-dev#9501: what a refused import could not remove (the library attaches it to the refusal itself).
+    const carried = (error ?? {}) as { cleanupWarnings?: unknown; retained?: unknown; reason?: unknown };
+    const cleanupWarnings = Array.isArray(carried.cleanupWarnings) ? carried.cleanupWarnings as string[] : [];
+    const cleanup = cleanupWarnings.length === 0 ? {} : { cleanupWarnings, ...(Array.isArray(carried.retained) ? { retained: carried.retained } : {}),
+      ...(typeof carried.reason === "string" ? { reason: carried.reason } : {}) };
+    for (const text of cleanupWarnings) warn(`fabric-mesh-backend: ${text}\n`);
     if (options.json) {
-      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message, alarms }, null, 2)}\n`);
+      write(`${JSON.stringify({ command: options.command, ok: false, refused, code: (error as { code?: unknown }).code, error: message,
+        ...cleanup, alarms }, null, 2)}\n`);
     }
     warn(`fabric-mesh-backend: ${options.command} ${refused ? "refused" : "failed"}: ${message}\n`);
     return refused ? 3 : 1;

@@ -225,6 +225,34 @@ export const settleEnodevRun = (directory: string, actorId: string, activationId
 };
 
 /**
+ * smarty-dev#9855: an ENODEV-unconfirmed TASK-AGENT run (no actorId; #912 recovers actor runs) found by offline
+ * retention, whose manager is gone. The same facts as #912: the exact ENODEV marker, this run's own process status
+ * record, its worker proven gone (pid-reuse safe). Then it settles the run LOST, once, and delivers nothing: a
+ * record its manager already made terminal keeps its outcome and gains settledLost; a running one becomes completed
+ * when its worker saved an answer (a settlement.json receipt for exactly this run), or failed with none. Recovery never
+ * writes answer text into status.json: a saved answer stays only in settlement.json. The marker goes last, so retention can collect the run. Nothing is deleted here. Undefined keeps the
+ * veto. Delivery was removed in pi-fabric#1027 review round 1 (principal-data P1): a same-uid worker can rewrite the
+ * run's recipient manifest and its exit proof, so no answer recovered here may cross to another session.
+ */
+export const recoverEnodevTaskRun = (directory: string): "lost" | undefined => {
+  const id = path.basename(directory);
+  if (!RUN_ID.test(id)) return undefined;
+  const marker = readJson(path.join(directory, UNRESOLVED_WORKER_FILE));
+  if (typeof marker?.reason !== "string" || !marker.reason.startsWith(ENODEV_UNRESOLVED_REASON)) return undefined;
+  const statusFile = path.join(directory, "status.json");
+  const record = readJson(statusFile);
+  if (!record || record.id !== id || record.transport !== "process" || record.actorId !== undefined) return undefined;
+  if (!enodevWorkerGone(record)) return undefined;
+  const saved = savedEnodevAnswer(directory) !== undefined;
+  const terminal = record.status !== "running" && record.status !== "queued";
+  // settle() writes the record plus these fields only: no answer text is added (or removed).
+  settle(directory, { id, statusFile, record, activationId: "" }, terminal ? { settledLost: true } : !saved
+    ? { status: "failed", settledLost: true, error: "lost: the worker exit was unconfirmed (ENODEV), no answer was saved and its manager is gone" }
+    : { status: "completed", settledLost: true });
+  return "lost";
+};
+
+/**
  * pi-fabric#912 round 4, crash safety. The actor writes this durable receipt when it delivered a recovered answer,
  * BEFORE it acknowledges the activation in its queue and long before the marker goes. Each crash point then has one
  * outcome on restart:

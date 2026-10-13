@@ -343,15 +343,31 @@ describe("resident channel owner check", () => {
     } finally { c.close(); }
   });
 
-  it("win32 refuses a foreign or malformed owner SID and accepts only all-matching SIDs", () => {
+  it("win32 refuses foreign or malformed owner SIDs and accepts all current-user SIDs", () => {
     const c = channel();
     try {
-      const win = (owners: string[], user = userSid) => ({ platform: "win32" as const, windowsOwnerSids: () => ({ owners, user }) });
+      const win = (owners: string[], user = userSid) => ({ platform: "win32" as const,
+        windowsOwnerSids: () => ({ owners, user, isAdministrator: false }) });
       expect(() => assertResidentChannelOwned(c.files, win([userSid, otherSid, userSid]))).toThrow(`not owned by this OS user: ${c.files[1]}`);
       expect(() => assertResidentChannelOwned(c.files, win([userSid, "BUILTIN\\Administrators", userSid]))).toThrow("not owned by this OS user");
       expect(() => assertResidentChannelOwned(c.files, win([userSid, userSid]))).toThrow("malformed SID query result");
       expect(() => assertResidentChannelOwned(c.files, win(["", "", ""], ""))).toThrow("malformed SID query result");
       expect(() => assertResidentChannelOwned(c.files, win([userSid, userSid, userSid]))).not.toThrow();
+    } finally { c.close(); }
+  });
+
+  it.each([
+    { name: "Administrators owner with an admin token", owner: "S-1-5-32-544", isAdministrator: true, accepted: true },
+    { name: "Administrators owner with a non-admin token", owner: "S-1-5-32-544", isAdministrator: false, accepted: false },
+    { name: "SYSTEM owner with a non-admin token", owner: "S-1-5-18", isAdministrator: false, accepted: true },
+    { name: "another user owner even with an admin token", owner: otherSid, isAdministrator: true, accepted: false },
+  ])("win32 checks $name", ({ owner, isAdministrator, accepted }) => {
+    const c = channel();
+    try {
+      const check = () => assertResidentChannelOwned(c.files, { platform: "win32",
+        windowsOwnerSids: () => ({ owners: c.files.map(() => owner), user: userSid, isAdministrator }) });
+      if (accepted) expect(check).not.toThrow();
+      else expect(check).toThrow(`not owned by this OS user: ${c.root}`);
     } finally { c.close(); }
   });
 

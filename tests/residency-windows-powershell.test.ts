@@ -23,8 +23,8 @@ afterEach(() => { vi.unstubAllEnvs(); });
 describe("actors CLI owner PowerShell launch under a pwsh parent", () => {
   it("pins owner queries to Windows security PowerShell while keeping paths out of the script", () => {
     const files = ["R:\\resident\\quote'$;日本語", "R:\\resident\\owner.json"];
-    subprocess.execFileSync.mockReturnValue(`${user}\r\n${user}\r\n${user}\r\n`);
-    expect(windowsOwnerSids(files)).toEqual({ owners: [user, user], user });
+    subprocess.execFileSync.mockReturnValue(`${user}\r\n${user}\r\n${user}\r\nTrue\r\n`);
+    expect(windowsOwnerSids(files)).toEqual({ owners: [user, user], user, isAdministrator: true });
     expect(subprocess.execFileSync).toHaveBeenCalledTimes(1);
     const [file, args, options] = subprocess.execFileSync.mock.calls[0]! as [string, string[], { env: NodeJS.ProcessEnv }];
     expect(args).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", expect.any(String)]);
@@ -40,6 +40,8 @@ describe("actors CLI owner PowerShell launch under a pwsh parent", () => {
     expect(Object.keys(options.env).filter(key => key.toLowerCase() === "psmodulepath")).toEqual(["PSModulePath"]);
     expect(source).toContain("$env:FABRIC_ACTORS_OWNER_PATHS");
     expect(source).toContain("Get-Acl -LiteralPath $p");
+    expect(source).toContain("$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()");
+    expect(source).toContain("[System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)");
     expect(source).not.toContain(files[0]);
   });
 
@@ -48,7 +50,13 @@ describe("actors CLI owner PowerShell launch under a pwsh parent", () => {
     expect(subprocess.execFileSync).not.toHaveBeenCalled();
   });
 
-  it.each(["", `${user}\r\n`, `${user}\r\n${user}\r\n${user}\r\n`])("refuses missing or extra owner query rows %j", output => {
+  it("reads a non-admin token from the same owner query", () => {
+    subprocess.execFileSync.mockReturnValue(`${user}\r\n${user}\r\nFalse\r\n`);
+    expect(windowsOwnerSids(["R:\\resident"])).toEqual({ owners: [user], user, isAdministrator: false });
+  });
+
+  it.each(["", `${user}\r\n`, `${user}\r\n${user}\r\n`, `${user}\r\n${user}\r\nTrue\r\nextra\r\n`,
+    `${user}\r\n${user}\r\nunknown\r\n`])("refuses missing, extra or malformed owner query rows %j", output => {
     subprocess.execFileSync.mockReturnValue(output);
     expect(() => windowsOwnerSids(["R:\\resident"])).toThrow("unexpected owner query output");
   });

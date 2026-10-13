@@ -53,8 +53,8 @@ export function resolveResidentDirectory(selector: string, meshRoot: string): st
 export interface ResidentChannelOwnerProbe {
   platform: NodeJS.Platform;
   getuid?: () => number;
-  /** win32 only: owner SID of each path followed by the current user's SID. */
-  windowsOwnerSids?: (files: string[]) => { owners: string[]; user: string };
+  /** win32 only: channel owner SIDs, current user SID and token Administrators membership. */
+  windowsOwnerSids?: (files: string[]) => { owners: string[]; user: string; isAdministrator: boolean };
 }
 
 const windowsSidScript = [
@@ -63,11 +63,13 @@ const windowsSidScript = [
   // Paths are data, never interpolated into the script.
   "$paths = $env:FABRIC_ACTORS_OWNER_PATHS -split [char]10",
   "foreach ($p in $paths) { [Console]::Out.WriteLine((Get-Acl -LiteralPath $p).GetOwner($sid).Value) }",
-  "[Console]::Out.WriteLine([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)",
+  "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+  "[Console]::Out.WriteLine($identity.User.Value)",
+  "[Console]::Out.WriteLine([System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator))",
 ].join("; ");
 
 /** Query owner SIDs with a fixed argv; the paths travel in the environment, never the command line. */
-export function windowsOwnerSids(files: string[]): { owners: string[]; user: string } {
+export function windowsOwnerSids(files: string[]): { owners: string[]; user: string; isAdministrator: boolean } {
   if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
   const command = windowsSecurityPowerShell(windowsSidScript);
   const output = execFileSync(command.file, command.args, {
@@ -75,15 +77,18 @@ export function windowsOwnerSids(files: string[]): { owners: string[]; user: str
     env: { ...command.env, FABRIC_ACTORS_OWNER_PATHS: files.join("\n") },
   });
   const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  if (lines.length !== files.length + 1) throw new Error("unexpected owner query output");
-  return { owners: lines.slice(0, files.length), user: lines[files.length]! };
+  const administrator = lines[files.length + 1];
+  if (lines.length !== files.length + 2 || (administrator !== "True" && administrator !== "False")) {
+    throw new Error("unexpected owner query output");
+  }
+  return { owners: lines.slice(0, files.length), user: lines[files.length]!, isAdministrator: administrator === "True" };
 }
 
 const defaultOwnerProbe = (): ResidentChannelOwnerProbe => ({ platform: process.platform,
   ...(process.getuid ? { getuid: () => process.getuid!() } : {}), windowsOwnerSids });
 const sidPattern = /^S-1-\d+(-\d+)+$/;
 
-/** Fail closed unless every channel path is a non-symlink owned by the invoking OS user. */
+/** Fail closed unless every channel path is non-symlink and has an allowed OS owner. */
 export function assertResidentChannelOwned(files: string[], probe: ResidentChannelOwnerProbe = defaultOwnerProbe()): void {
   const stats = files.map(file => {
     const stat = fs.lstatSync(file);
@@ -92,19 +97,21 @@ export function assertResidentChannelOwned(files: string[], probe: ResidentChann
   });
   if (probe.platform === "win32") {
     // Node reports uid 0 on Windows, so stat cannot prove ownership; compare owner SIDs instead.
-    let result: { owners: string[]; user: string };
+    let result: { owners: string[]; user: string; isAdministrator: boolean };
     try {
       if (!probe.windowsOwnerSids) throw new Error("no owner SID query is available");
       result = probe.windowsOwnerSids(files);
     } catch (error) {
       throw new Error(`Cannot verify that the resident channel is owned by this Windows user (${error instanceof Error ? error.message : String(error)}); refusing stop/remove`);
     }
-    if (!sidPattern.test(result.user) || result.owners.length !== files.length) {
+    if (!sidPattern.test(result.user) || result.owners.length !== files.length || typeof result.isAdministrator !== "boolean") {
       throw new Error("Cannot verify that the resident channel is owned by this Windows user (malformed SID query result); refusing stop/remove");
     }
     files.forEach((file, index) => {
       const owner = result.owners[index]!;
-      if (!sidPattern.test(owner) || owner !== result.user) throw new Error(`Resident channel is not owned by this OS user: ${file}`);
+      // Windows StrictModes: Administrators-owned paths require an admin token; SYSTEM is trusted.
+      const allowed = owner === result.user || owner === "S-1-5-18" || (owner === "S-1-5-32-544" && result.isAdministrator);
+      if (!sidPattern.test(owner) || !allowed) throw new Error(`Resident channel is not owned by this OS user: ${file}`);
     });
     return;
   }

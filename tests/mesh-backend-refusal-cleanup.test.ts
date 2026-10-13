@@ -10,10 +10,15 @@ import { decodeMeshStateFile, encodeMeshStateFile, type MeshStateFile } from "..
 import { openNodeSqlite, type SqliteConnection, type SqliteOpener } from "../src/mesh/state-sqlite.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
-// smarty-dev#9501: a readiness refusal under the fence, before the importing commit, removes the state.db,
-// -wal and -shm this run created (lstat identity re-checked, through the held directory fd, fence still held).
-// Exit-1 errors and committed phases keep the database. #4664: "recorded cleanup" never deletes state.db*: every
-// unlink of such a name is recorded (path, identity, held locks) and dropped. Only "hosted cleanup" (CI) deletes.
+// smarty-dev#9501 (no-deletion goal): a readiness refusal under the fence, before the importing commit, MOVES the
+// state.db, -wal and -shm this run created (lstat identity re-checked, through the held directory fd, fence still held)
+// into a private `.import-quarantine-*` slot and RETAINS every moved entry: no unlink and no rmdir, ever. The report
+// names each retained entry by its root-relative path (`<slot>/<name>`, never just the directory) with warnings and
+// operator manual-cleanup guidance. A late foreign replacement keeps its original name AND its quarantine alias.
+// Exit-1 errors and committed phases keep the database. #4664: "recorded cleanup" installs the removal recorder BEFORE
+// every run: any removal call (state.db*, quarantine entry or directory, protected inode) is recorded and dropped, and
+// GREEN requires calls == []. "hosted cleanup" (CI) runs the same product with no recorder: nothing is deleted there
+// either, and the reported quarantine paths must hold the created inodes.
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const dirs: string[] = [];
@@ -195,47 +200,80 @@ const whereIs = (root: string, id: string | undefined): string[] => {
   return out;
 };
 
-type RaceMode = "swap" | "swap-link-eexist" | "gone" | "gone-after-check";
+/** The reported quarantine entries: root-relative `<slot>/<name>` paths (an entry, never a bare directory). */
+const quarantinePaths = (result: Awaited<ReturnType<typeof run>>): string[] => {
+  const q = (result.json.retained ?? []).filter(kept => kept.startsWith(".import-quarantine"));
+  for (const kept of q) expect(kept).toMatch(/^\.import-quarantine-[^/]+\/state\.db(?:-wal|-shm)?-[a-f0-9]{32}$/);
+  return q;
+};
+/** Retained entries are warned about (both channels), each quarantine path by name, with manual-cleanup guidance. */
+const operatorGuidance = (result: Awaited<ReturnType<typeof run>>, q: string[]): void => {
+  const warnings = result.json.cleanupWarnings ?? [];
+  expect(warnings.length).toBeGreaterThan(0);
+  for (const kept of q) expect(warnings.some(text => text.includes(kept)), kept).toBe(true);
+  expect(warnings.some(text => /manual/i.test(text))).toBe(true);
+  for (const text of warnings) expect(result.err).toContain(text);
+};
+
+type RaceMode = "swap" | "swap-link-eexist" | "gone" | "gone-after-check" | "swap-in-quarantine" | "occupy";
 /**
  * The same-UID race on the original basename, armed at the refusal (importing commit) and fired once at the first
  * check or move of `<root>/state.db` (by path or through a held root fd) while it still names this run's inode:
  * "swap": exactly AFTER an lstat returns the owned inode (or BEFORE a rename of it), the owned file is renamed to
  * moved-away.db and a foreign file is written as state.db. "swap-link-eexist": the same, and after the foreign inode is
  * renamed into a quarantine path a third file takes state.db (a link-back must fail EEXIST). "gone": BEFORE that
- * check or move the owned file is renamed to gone-elsewhere.db. Real rename/write in this test's own mkdtemp root.
+ * check or move the owned file is renamed to gone-elsewhere.db. "swap-in-quarantine": exactly AFTER an lstat of the
+ * MOVED entry `<slot>/state.db` returns the owned inode (and so BEFORE any unlink of it), the owned file is renamed to
+ * moved-away.db and a foreign file is written at that quarantine path. "occupy" (for a sidecar `name`): BEFORE the
+ * first check of `<root>/<name>`, a foreign file takes that name (an existing owned one is renamed to moved-away.db).
+ * Real rename/write in this test's own mkdtemp root.
  */
-const raceCleanup = (root: string, mode: RaceMode) => {
+const raceCleanup = (root: string, mode: RaceMode, name = "state.db") => {
   const realLstat = fs.lstatSync;
   const realRename = fs.renameSync;
-  const db = path.join(root, "state.db");
+  const db = path.join(root, name);
   const rootId = idOf(fs.statSync(root));
   const realRoot = fs.realpathSync(root);
   const race = { armed: false, fired: false, owned: undefined as string | undefined, foreign: undefined as string | undefined,
     third: undefined as string | undefined };
   const isRootDb = (target: fs.PathLike): boolean => {
     const text = String(target);
-    const pinned = /^(?:\/proc\/self\/fd|\/dev\/fd)\/(\d+)\/state\.db$/.exec(text);
+    const pinned = /^(?:\/proc\/self\/fd|\/dev\/fd)\/(\d+)\/([^/]+)$/.exec(text);
     try {
-      if (pinned) return idOf(fs.fstatSync(Number(pinned[1]))) === rootId;
-      return path.basename(text) === "state.db" && fs.realpathSync(path.dirname(path.resolve(text))) === realRoot;
+      if (pinned) return pinned[2] === name && idOf(fs.fstatSync(Number(pinned[1]))) === rootId;
+      return path.basename(text) === name && fs.realpathSync(path.dirname(path.resolve(text))) === realRoot;
     } catch { return false; }
   };
-  const fire = (): void => {
+  /** `<root>/.import-quarantine-*\/state.db`, by path or through the held root fd. */
+  const isQuarantineDb = (target: fs.PathLike): boolean => {
+    const text = String(target);
+    const pinned = /^(?:\/proc\/self\/fd|\/dev\/fd)\/(\d+)\/\.import-quarantine-[^/]+\/state\.db(?:-[a-f0-9]{32})?$/.exec(text);
+    try {
+      if (pinned) return idOf(fs.fstatSync(Number(pinned[1]))) === rootId;
+      return /^\.import-quarantine-[^/]+$/.test(path.basename(path.dirname(text))) && /^state\.db(?:-[a-f0-9]{32})?$/.test(path.basename(text))
+        && fs.realpathSync(path.dirname(path.dirname(path.resolve(text)))) === realRoot;
+    } catch { return false; }
+  };
+  const fire = (at = db): void => {
     race.fired = true;
     if (mode === "gone" || mode === "gone-after-check") { realRename(db, path.join(root, "gone-elsewhere.db")); return; }
-    realRename(db, path.join(root, "moved-away.db"));
-    fs.writeFileSync(db, "foreign", { mode: 0o600, flag: "wx" });
-    race.foreign = idOf(realLstat(db));
+    if (mode !== "occupy" || realLstat(at, { throwIfNoEntry: false })) realRename(at, path.join(root, "moved-away.db"));
+    fs.writeFileSync(at, "foreign", { mode: 0o600, flag: "wx" });
+    race.foreign = idOf(realLstat(at));
   };
   const live = (): boolean => race.armed && !race.fired && idOf(realLstat(db, { throwIfNoEntry: false })) === race.owned;
+  const rootRace = mode !== "swap-in-quarantine" && mode !== "occupy";
   vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+    if (mode === "occupy" && race.armed && !race.fired && isRootDb(target)) fire();
     if (mode === "gone" && isRootDb(target) && live()) fire();
     const result = realLstat(target, options);
-    if (mode !== "gone" && isRootDb(target) && live() && idOf(result as fs.Stats | undefined) === race.owned) fire();
+    if (rootRace && mode !== "gone" && isRootDb(target) && live() && idOf(result as fs.Stats | undefined) === race.owned) fire();
+    if (mode === "swap-in-quarantine" && race.armed && !race.fired && isQuarantineDb(target)
+      && idOf(result as fs.Stats | undefined) === race.owned) fire(String(target));
     return result;
   }) as typeof fs.lstatSync);
   vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-    if (isRootDb(from) && live()) fire();
+    if (rootRace && isRootDb(from) && live()) fire();
     realRename(from, to);
     if (mode === "swap-link-eexist" && race.foreign !== undefined && race.third === undefined && !isRootDb(to)
       && idOf(realLstat(to, { throwIfNoEntry: false })) === race.foreign) {
@@ -245,7 +283,7 @@ const raceCleanup = (root: string, mode: RaceMode) => {
   });
   const arm = (commit: Commit): void => {
     if (commit.phase !== "importing") return;
-    race.owned = idOf(realLstat(db));
+    race.owned = idOf(realLstat(db, { throwIfNoEntry: false }));
     race.armed = true;
   };
   return { race, arm, protect: () => new Set([race.owned, race.foreign, race.third]) };
@@ -254,7 +292,7 @@ const raceCleanup = (root: string, mode: RaceMode) => {
 // ponytail: Linux only (held-directory-fd paths under /proc/self/fd, the gate's /proc scan). The readiness proofs
 // fail closed off POSIX (mesh-backend-readiness.test.ts), so Windows has no refusal-under-the-fence path to clean.
 describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
-  it.each(["import", "cutover"] as const)("%s: a refusal before the importing commit removes this run's state.db* under the fence; state.json is unchanged", async (command) => {
+  it.each(["import", "cutover"] as const)("%s: a refusal before the importing commit quarantines this run's state.db* and removes nothing; state.json is unchanged", async (command) => {
     const root = await fileRoot();
     await proveSqlite(root);
     const before = fs.readFileSync(path.join(root, "state.json"));
@@ -262,11 +300,15 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     const result = await run(root, command, { refuseAt: "importing" });
     refusedUnderFence(result, "importing");
     expect(fs.readFileSync(path.join(root, "state.json")).equals(before)).toBe(true);
-    fencedRemovals(calls);
-    // The recorded calls deleted nothing: every state.db* name still here must have been removed by this run.
-    expect(dbNames(root).filter(name => !calls.some(call => call.name === name))).toEqual([]);
-    expect(calls.find(call => call.name === "state.db")?.target).toBe(result.opened[0]);
-    expect(result.json.cleanupWarnings ?? []).toEqual([]);
+    expect(calls).toEqual([]); // no unlink/rm/rmdir of anything, ever
+    expect(dbNames(root)).toEqual([]); // the root names are free
+    const q = quarantinePaths(result);
+    const dbAt = q.find(kept => /^state\.db-[a-f0-9]{32}$/.test(path.basename(kept)));
+    expect(dbAt).toBeDefined();
+    expect(whereIs(root, result.opened[0])).toEqual([dbAt]);
+    for (const kept of q) expect(fs.lstatSync(path.join(root, kept)).isFile(), kept).toBe(true);
+    operatorGuidance(result, q);
+    console.info("QUARANTINE_SEQUENCE", JSON.stringify({ case: `normal-${command}`, calls, report: result.json }));
   });
 
   it("keeps a state.db replaced by another inode, and warns on stderr and in --json", async () => {
@@ -282,22 +324,28 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     } });
     refusedUnderFence(result, "importing");
     expect(foreign).toBeDefined();
-    fencedRemovals(calls);
-    expect(calls.filter(call => call.target === foreign)).toEqual([]);
+    expect(calls).toEqual([]);
     expect(fs.readFileSync(path.join(root, "state.db"), "utf8")).toBe("foreign");
     expect(result.json.cleanupWarnings?.some(text => text.includes("state.db"))).toBe(true);
     for (const text of result.json.cleanupWarnings ?? []) expect(result.err).toContain(text);
   });
 
-  it("a failed removal keeps the refusal (exit 3) and warns on stderr and in --json", async () => {
+  it("a failed move into quarantine keeps the refusal (exit 3), keeps state.db at its name, removes nothing, and warns", async () => {
     const root = await fileRoot();
     await proveSqlite(root);
-    const calls = recordRemovals(root, (name, target) => name === "state.db"
-      ? Object.assign(new Error(`EACCES: permission denied, unlink '${target}'`), { code: "EACCES" }) : undefined);
+    const calls = recordRemovals(root);
+    const realRename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (/^\/proc\/self\/fd\/\d+\/state\.db$/.test(String(from)) && String(to).includes(".import-quarantine")) {
+        throw Object.assign(new Error(`EACCES: permission denied, rename '${String(from)}'`), { code: "EACCES" });
+      }
+      realRename(from, to);
+    });
     const result = await run(root, "cutover", { refuseAt: "importing" });
     refusedUnderFence(result, "importing");
-    fencedRemovals(calls);
-    expect(calls.some(call => call.name === "state.db")).toBe(true);
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(result.opened[0]);
+    expect(result.json.retained).toContain("state.db");
     const warnings = result.json.cleanupWarnings ?? [];
     expect(warnings.some(text => text.includes("state.db") && text.includes("EACCES"))).toBe(true);
     for (const text of warnings) expect(result.err).toContain(text);
@@ -424,7 +472,7 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     expect(file.entries["rogue/key"]?.value).toBe(1);
   };
 
-  it("a state.json moved at import-read (fresh root): removes only this run's state.db*, under the fence", async () => {
+  it("a state.json moved at import-read (fresh root): quarantines only this run's state.db*, removes nothing", async () => {
     const root = await fileRoot();
     await proveSqlite(root);
     const calls = recordRemovals(root);
@@ -432,10 +480,12 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     expect(result.code, result.err).toBe(3);
     expect(result.json.error).toMatch(/changed before the flag commit/);
     rogueKept(root);
-    fencedRemovals(calls);
-    expect(calls.find(call => call.name === "state.db")?.target).toBe(result.opened[0]);
-    expect(dbNames(root).filter(name => !calls.some(call => call.name === name))).toEqual([]);
-    expect(result.json.cleanupWarnings ?? []).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(dbNames(root)).toEqual([]);
+    const q = quarantinePaths(result);
+    expect(whereIs(root, result.opened[0])).toEqual(q.filter(kept => /^state\.db-[a-f0-9]{32}$/.test(path.basename(kept))));
+    expect(whereIs(root, result.opened[0])).toHaveLength(1);
+    operatorGuidance(result, q);
   });
 
   it("refusals over a database an exit-1 run left keep its inode, bytes and meta (backend=file, epoch 0)", async () => {
@@ -468,7 +518,7 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
 
   // #9501 security finding: a same-UID writer swaps the original basename after its lstat showed this run's inode and
   // before the removal (or the move into quarantine). The foreign inode must keep a name, with its bytes.
-  it("a state.db swapped after the owned-inode check, before its removal: the foreign file survives and is reported", async () => {
+  it("a state.db swapped after the owned-inode check, before its move: the foreign file keeps its name and its quarantine alias", async () => {
     const root = await fileRoot();
     await proveSqlite(root);
     const { race, arm, protect } = raceCleanup(root, "swap");
@@ -476,18 +526,67 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     const result = await run(root, "import", { refuseAt: "importing", beforeCommit: arm });
     refusedUnderFence(result, "importing");
     expect(race.fired).toBe(true);
-    onlyRestoredAliasRemoved(calls, race.foreign);
-    expect(calls.filter(call => call.target === race.owned)).toEqual([]); // the moved original is not at this run's name
-    fencedRemovals(calls);
-    // The recorder keeps the quarantine alias physically present; only the restored original is authoritative.
-    const aliases = calls.filter(call => call.target === race.foreign && call.quarantine).map(call => call.rel);
-    expect(whereIs(root, race.foreign).sort()).toEqual(["state.db", ...aliases].sort());
+    onlyRestoredAliasRemoved(calls, race.foreign); // the dangerous call, named first
+    expect(calls).toEqual([]); // no alias drop either
     console.info("QUARANTINE_SEQUENCE", JSON.stringify({ case: "mismatch-restored", race, calls, report: result.json }));
     expect(fs.readFileSync(path.join(root, "state.db"), "utf8")).toBe("foreign");
     expect(whereIs(root, race.owned)).toEqual(["moved-away.db"]);
+    const q = quarantinePaths(result);
+    const aliases = whereIs(root, race.foreign).filter(at => at !== "state.db");
+    expect(whereIs(root, race.foreign)).toContain("state.db");
+    expect(aliases).toHaveLength(1);
+    expect(q).toContain(aliases[0]);
     expect(result.json.retained).toContain("state.db");
+    operatorGuidance(result, q);
+    expect((result.json.cleanupWarnings ?? []).some(text => text.includes(`${root}/state.db`))).toBe(true);
+  });
+
+  // The inside-quarantine window: the MOVED entry's lstat returned this run's inode, then (before any unlink of it) a
+  // same-UID writer renames it away and writes a foreign file at the quarantine path. Unlinking there would drop the
+  // foreign inode's last link: the new helper never unlinks, so the foreign file stays, reported by its path.
+  it("a quarantine entry swapped after its owned-inode lstat, before any unlink: the foreign file keeps its quarantine path", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const { race, arm, protect } = raceCleanup(root, "swap-in-quarantine");
+    const calls = recordRemovals(root, undefined, protect);
+    const result = await run(root, "import", { refuseAt: "importing", beforeCommit: arm });
+    refusedUnderFence(result, "importing");
+    console.info("QUARANTINE_SEQUENCE", JSON.stringify({ case: "swap-in-quarantine", race, calls, report: result.json }));
+    expect(race.fired).toBe(true);
+    expect(calls.filter(call => call.target === race.foreign)).toEqual([]); // the foreign last-link removal
+    expect(calls).toEqual([]);
+    expect(whereIs(root, race.owned)).toEqual(["moved-away.db"]);
+    const kept = whereIs(root, race.foreign);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatch(/^\.import-quarantine-[^/]+\/state\.db-[a-f0-9]{32}$/);
+    expect(fs.readFileSync(path.join(root, kept[0]!), "utf8")).toBe("foreign");
+    expect(dbNames(root)).toEqual([]);
+    const q = quarantinePaths(result);
+    expect(q).toContain(kept[0]);
+    operatorGuidance(result, q);
+  });
+
+  // ROOT sidecar late replacement: a foreign -wal takes the sidecar name before its check. The sidecar name stays
+  // occupied by the foreign file, so the main database stays at its original name (never quarantined without it).
+  it("a foreign state.db-wal at the sidecar name keeps the main state.db at its original name; nothing is removed", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const { race, arm, protect } = raceCleanup(root, "occupy", "state.db-wal");
+    let owned: string | undefined;
+    const calls = recordRemovals(root, undefined, () => new Set([...protect(), owned]));
+    const result = await run(root, "cutover", { refuseAt: "importing", beforeCommit: (commit) => {
+      arm(commit);
+      if (commit.phase === "importing") owned = idOf(fs.lstatSync(path.join(root, "state.db")));
+    } });
+    refusedUnderFence(result, "importing");
+    expect(race.fired).toBe(true);
+    expect(calls).toEqual([]);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(owned);
+    expect(idOf(fs.lstatSync(path.join(root, "state.db-wal")))).toBe(race.foreign);
+    expect(fs.readFileSync(path.join(root, "state.db-wal"), "utf8")).toBe("foreign");
+    expect(result.json.retained).toEqual(expect.arrayContaining(["state.db-wal", "state.db"]));
     const warnings = result.json.cleanupWarnings ?? [];
-    expect(warnings.some(text => text.includes(`${root}/state.db`))).toBe(true);
+    expect(warnings.length).toBeGreaterThan(0);
     for (const text of warnings) expect(result.err).toContain(text);
   });
 
@@ -501,21 +600,19 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     expect(race.fired).toBe(true);
     // Link-back failed: no removal of the foreign inode at all, nor of the retaken original or the moved owned file.
     expect(calls.filter(call => call.target === race.foreign || call.target === race.owned || call.target === race.third)).toEqual([]);
-    fencedRemovals(calls);
+    expect(calls).toEqual([]);
     expect(race.third).toBeDefined();
     expect(fs.readFileSync(path.join(root, "state.db"), "utf8")).toBe("third");
     const kept = whereIs(root, race.foreign);
     expect(kept).toHaveLength(1);
-    expect(kept[0]).toMatch(/^[^/]+\/state\.db$/);
+    expect(kept[0]).toMatch(/^[^/]+\/state\.db-[a-f0-9]{32}$/);
     expect(fs.readFileSync(path.join(root, kept[0]!), "utf8")).toBe("foreign");
     expect(result.json.retained).toContain(kept[0]);
     console.info("QUARANTINE_SEQUENCE", JSON.stringify({ case: "link-back-eexist", race, calls, report: result.json }));
-    const warnings = result.json.cleanupWarnings ?? [];
-    expect(warnings.some(text => text.includes(kept[0]!))).toBe(true);
-    for (const text of warnings) expect(result.err).toContain(text);
+    operatorGuidance(result, quarantinePaths(result));
   });
 
-  it("unchanged owned state.db: the one recorded state.db removal targets this run's inode, nothing retained", async () => {
+  it("unchanged owned state.db: no removal; this run's inode is retained at its reported quarantine path", async () => {
     const root = await fileRoot();
     await proveSqlite(root);
     let owned: string | undefined;
@@ -524,15 +621,31 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
       if (commit.phase === "importing") owned = idOf(fs.lstatSync(path.join(root, "state.db")));
     } });
     refusedUnderFence(result, "importing");
-    fencedRemovals(calls);
+    expect(calls).toEqual([]);
     expect(owned).toBe(result.opened[0]);
-    const dbCalls = calls.filter(call => call.name === "state.db");
-    expect(dbCalls).toHaveLength(1);
-    expect(dbCalls[0]!.target).toBe(owned);
-    // Recorded, not performed: the owned inode is still at the path the removal named (original or quarantine).
-    expect(whereIs(root, owned)).toContain(dbCalls[0]!.rel);
-    expect(result.json.retained ?? []).toEqual([]);
-    expect(result.json.cleanupWarnings ?? []).toEqual([]);
+    const q = quarantinePaths(result);
+    const at = whereIs(root, owned);
+    expect(at).toHaveLength(1);
+    expect(q).toContain(at[0]);
+    expect(result.json.retained ?? []).not.toContain("state.db");
+    operatorGuidance(result, q);
+  });
+
+  it("a normal rerun after a quarantining refusal converges to sqlite; the quarantine stays, nothing is removed", async () => {
+    const root = await fileRoot();
+    await proveSqlite(root);
+    const calls = recordRemovals(root); // installed BEFORE both runs
+    const refused = await run(root, "import", { refuseAt: "importing" });
+    refusedUnderFence(refused, "importing");
+    const q = quarantinePaths(refused);
+    expect(q.length).toBeGreaterThan(0);
+    const held = new Map(q.map(kept => [kept, idOf(fs.lstatSync(path.join(root, kept)))]));
+    const done = await run(root, "import");
+    expect(done.code, done.err).toBe(0);
+    expect((await meshBackendStatus(root)).backend).toBe("sqlite");
+    expect(calls).toEqual([]);
+    for (const [kept, id] of held) expect(idOf(fs.lstatSync(path.join(root, kept))), kept).toBe(id);
+    expect(whereIs(root, refused.opened[0])).toEqual(q.filter(kept => /^state\.db-[a-f0-9]{32}$/.test(path.basename(kept))));
   });
 
   it.each(["gone", "gone-after-check"] as const)("an owned state.db disappears (%s): no state.db removal, the moved file survives", async (mode) => {
@@ -543,8 +656,8 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     const result = await run(root, "import", { refuseAt: "importing", beforeCommit: arm });
     refusedUnderFence(result, "importing");
     expect(race.fired).toBe(true);
-    fencedRemovals(calls);
     expect(calls.filter(call => call.name === "state.db" || call.target === race.owned)).toEqual([]);
+    expect(calls).toEqual([]);
     expect(whereIs(root, race.owned)).toEqual(["gone-elsewhere.db"]);
     expect(result.json.retained ?? []).not.toContain("state.db");
   });
@@ -560,9 +673,10 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
   });
 });
 
-// #4664: REAL deletion. Hosted CI only (CI=true), never in a lane. Same scenarios without the recorder.
+// #4664: the real product with no recorder. Hosted CI only (CI=true), never in a lane. Nothing is deleted: the root
+// names are free and the reported quarantine paths hold the created inodes.
 describe.runIf(process.env.CI === "true" && process.platform === "linux")("hosted cleanup", () => {
-  it.each(["import", "cutover"] as const)("%s: a refusal before the importing commit leaves no state.db*", async (command) => {
+  it.each(["import", "cutover"] as const)("%s: a refusal before the importing commit frees every root state.db* name into the reported quarantine", async (command) => {
     const root = await fileRoot();
     await proveSqlite(root);
     const before = fs.readFileSync(path.join(root, "state.json"));
@@ -571,7 +685,10 @@ describe.runIf(process.env.CI === "true" && process.platform === "linux")("hoste
     expect(dbNames(root)).toEqual([]);
     expect(fs.readFileSync(path.join(root, "state.json")).equals(before)).toBe(true);
     expect((await meshBackendStatus(root)).backend).toBe("none");
-    expect(result.json.cleanupWarnings ?? []).toEqual([]);
+    const q = quarantinePaths(result);
+    expect(whereIs(root, result.opened[0])).toEqual(q.filter(kept => /^state\.db-[a-f0-9]{32}$/.test(path.basename(kept))));
+    expect(whereIs(root, result.opened[0])).toHaveLength(1);
+    operatorGuidance(result, q);
   });
 
   it("keeps a state.db replaced by another inode and warns", async () => {
@@ -585,6 +702,7 @@ describe.runIf(process.env.CI === "true" && process.platform === "linux")("hoste
     refusedUnderFence(result, "importing");
     expect(fs.readFileSync(path.join(root, "state.db"), "utf8")).toBe("foreign");
     expect(result.json.cleanupWarnings?.some(text => text.includes("state.db"))).toBe(true);
+    expect(fs.readFileSync(path.join(root, "moved-away.db"), "utf8")).not.toBe("foreign");
   });
 
   it("an exit-1 error keeps the database and the rerun converges; a final-phase refusal keeps it", async () => {

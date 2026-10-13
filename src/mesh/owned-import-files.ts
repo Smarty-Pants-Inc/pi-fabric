@@ -1,7 +1,7 @@
 /**
- * smarty-dev#9501: the files an import or cutover run creates in the mesh root, and their removal when the switch is
+ * smarty-dev#9501: the files an import or cutover run creates in the mesh root, and their quarantine when the switch is
  * refused before its importing commit. The root is held by a no-follow directory fd for the whole fenced section.
- * Every create and every removal goes through `/proc/self/fd/<fd>/<name>`, so renaming or swapping the root path
+ * Every create and every move goes through `/proc/self/fd/<fd>/<name>`, so renaming or swapping the root path
  * cannot redirect either one. A file counts as this run's only when this run created it with O_EXCL, and its dev/ino
  * comes from an fstat of that very descriptor. A name counts as this run's file only while its lstat still shows that
  * inode.
@@ -9,24 +9,29 @@
  * platform-name gate and no `/dev/fd` fallback (fabric-store, #9501; macOS residual smarty-dev#11066, Windows
  * smarty-dev#7858). Without it nothing is removed: the run reports what it kept (reason `no-held-dir-fd`), never a
  * path-based unlink.
- * Pinned removal first renames a name into a fresh mkdtemp (0700) `.import-quarantine-*` directory of the held root and
- * checks the moved entry's dev/ino there: only this run's inode is unlinked; anything else is linked back (never over a
- * newer name) or kept in quarantine and reported. Nothing is ever removed recursively.
+ * The cleanup never unlinks or rmdirs. It frees the original names by rename into a fresh 0700 mkdtemp directory.
+ * A rename can replace a destination only if another process creates that exact random name inside our private
+ * quarantine between mkdtemp and rename. No honest writer does that: the name is unguessable and the directory is new
+ * and private. A process that does is a deliberately hostile same-UID process, which can already delete any file in
+ * the mesh root directly. Isolating same-UID processes is smarty-dev#11066. Data written by honest writers, including
+ * a late replacement at the original name, is never removed. Mismatches are linked back without clobbering; the
+ * quarantine link stays too. Operators inspect the reported quarantine and remove it manually when no longer needed.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 
 const STATE_DB = "state.db";
-/** Removal order: the sidecars first. A WAL kept without its database could otherwise meet a new state.db. */
+/** Move order: the sidecars first. A WAL kept without its database could otherwise meet a new state.db. */
 const SIDECARS = [`${STATE_DB}-wal`, `${STATE_DB}-shm`];
 const PROC_FD = "/proc/self/fd";
 
 /**
  * Stable reasons for kept files: `no-held-dir-fd` (no usable /proc/self/fd traversal), `close-failed` (the database
- * close threw: nothing is removed), `cleanup-failed` (a check or removal threw), `not-this-runs-file` (a name no longer
- * names the inode this run created, or existed before it).
+ * close threw: nothing is moved), `cleanup-failed` (a check or move threw), `not-this-runs-file` (a name no longer
+ * names the inode this run created, or existed before it), `quarantined-after-refusal` (this run's files were moved).
  */
-export type RetainReason = "no-held-dir-fd" | "close-failed" | "cleanup-failed" | "not-this-runs-file";
+export type RetainReason = "no-held-dir-fd" | "close-failed" | "cleanup-failed" | "not-this-runs-file" | "quarantined-after-refusal";
 /** `retained` names are root-relative: a state.db name, or `.import-quarantine-*` (and `/<name>`) left in quarantine. */
 export interface RefusalCleanupReport { cleanupWarnings: string[]; retained: string[]; reason?: RetainReason }
 
@@ -40,8 +45,8 @@ export interface OwnedImportFiles {
   /** The SQLite sidecars of a state.db this run created, made empty before SQLite opens them (call after the WAL pragma). */
   createSidecars(): void;
   /**
-   * After a refusal before the importing commit, with the database connection closed and the fence still held: remove
-   * the files this run created whose names still name them. Returns what to report (empty when nothing was created).
+   * After a refusal before the importing commit, with the database connection closed and the fence still held: move
+   * the files this run created into quarantine, never delete them. Report what stays (empty when nothing was created).
    */
   removeAfterRefusal(): RefusalCleanupReport;
   /**
@@ -116,6 +121,7 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         return { cleanupWarnings, retained, reason };
       }
       let failed = false;
+      let foreign = false;
       const removeOne = (name: string): void => {
         const at = path.join(pinnedDir!, name);
         let found: fs.Stats | undefined;
@@ -125,55 +131,57 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         const mine = owned.get(name);
         const isMine = (stat: fs.Stats): boolean => !!mine && stat.isFile() && stat.dev === mine.dev && stat.ino === mine.ino;
         if (!isMine(found)) {
+          foreign = true;
           retained.push(name);
           cleanupWarnings.push(`kept ${root}/${name}: it is not the file this run created (${mine ? "replaced" : "it existed before"})`);
           return;
         }
         const keep = (kept: string, warning: string): void => { failed = true; retained.push(kept); cleanupWarnings.push(warning); };
-        // ponytail: the name may change between that lstat and a removal, so move it into a fresh private slot first and
-        // judge the moved entry. A same-UID process can still find and race inside the slot (accepted residual, #11066).
+        // ponytail: no unlink/rmdir, even after checking the moved inode. Fresh random private destinations protect
+        // honest writers; deliberately hostile same-UID writes inside the quarantine require isolation (#11066).
         let slot: string;
         try { slot = path.basename(fs.mkdtempSync(path.join(pinnedDir!, ".import-quarantine-"))); }
         catch (error) { keep(name, `could not make a quarantine directory in ${root} for ${name}: ${messageOf(error)}`); return; }
-        const dir = path.join(pinnedDir!, slot);
-        const moved = path.join(dir, name);
-        const qname = `${slot}/${name}`;
-        const rmdir = (): void => {
-          try { fs.rmdirSync(dir); }
-          catch (error) { keep(slot, `could not remove the empty quarantine directory ${root}/${slot}: ${messageOf(error)}`); }
-        };
+        const entry = `${name}-${randomBytes(16).toString("hex")}`;
+        const moved = path.join(pinnedDir!, slot, entry);
+        const qname = `${slot}/${entry}`;
+        const inspect = `inspect ${root}/${slot}, then remove it manually once its contents are not needed`;
         try { fs.renameSync(at, moved); }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") keep(name, `could not move ${root}/${name} to quarantine: ${messageOf(error)}`);
-          rmdir(); // ENOENT: already gone, nothing to remove
+          retained.push(slot);
+          cleanupWarnings.push(`kept the empty quarantine directory ${root}/${slot}: ${inspect}`);
           return;
         }
+        retained.push(qname);
         let inSlot: fs.Stats;
         try { inSlot = fs.lstatSync(moved); }
-        catch (error) { keep(qname, `could not check ${root}/${qname} (moved from ${name}): ${messageOf(error)}`); return; }
-        if (!isMine(inSlot)) {
-          // Not this run's file: link it back under its name (never over a newer one), then drop the quarantine alias.
-          try { fs.linkSync(moved, at); }
-          catch (error) {
-            keep(qname, `kept ${root}/${qname}: it replaced ${name} before the move and could not be put back: ${messageOf(error)}`);
-            try { if (fs.lstatSync(at, { throwIfNoEntry: false })) retained.push(name); }
-            catch { retained.push(name); }
-            return;
-          }
-          retained.push(name);
-          cleanupWarnings.push(`kept ${root}/${name}: it is not the file this run created (replaced)`);
+        catch (error) { failed = true; cleanupWarnings.push(`kept ${root}/${qname} (moved from ${name}), could not check it: ${messageOf(error)}; ${inspect}`); return; }
+        if (isMine(inSlot)) { cleanupWarnings.push(`moved this run's ${root}/${name} to ${root}/${qname}: ${inspect}`); return; }
+        // A foreign entry gets a no-clobber link back; its quarantine link is never dropped.
+        foreign = true;
+        try { fs.linkSync(moved, at); }
+        catch (error) {
+          failed = true;
+          cleanupWarnings.push(`kept ${root}/${qname}: it replaced ${name} before the move and could not be put back: ${messageOf(error)}; ${inspect}`);
+          try { if (fs.lstatSync(at, { throwIfNoEntry: false })) retained.push(name); }
+          catch { retained.push(name); }
+          return;
         }
-        try { fs.unlinkSync(moved); }
-        catch (error) { keep(qname, `could not remove ${root}/${qname} (moved from ${name}): ${messageOf(error)}`); return; }
-        rmdir();
+        retained.push(name);
+        cleanupWarnings.push(`kept ${root}/${name}: it is not the file this run created (replaced); a second link stays at ${root}/${qname}: ${inspect}`);
       };
       for (const name of SIDECARS) removeOne(name);
-      if (retained.length > 0) {
+      // Only sidecars still under their original names block the database move, not quarantined sidecars.
+      let stayed: string[];
+      try { stayed = SIDECARS.filter(name => fs.lstatSync(path.join(pinnedDir!, name), { throwIfNoEntry: false }) !== undefined); }
+      catch (error) { failed = true; stayed = [...SIDECARS]; cleanupWarnings.push(`could not check the sidecars in ${root}: ${messageOf(error)}`); }
+      if (stayed.length > 0) {
         retained.push(STATE_DB);
-        cleanupWarnings.push(`kept ${root}/${STATE_DB}: ${retained.join(" and ")} stayed`);
+        cleanupWarnings.push(`kept ${root}/${STATE_DB}: ${stayed.join(" and ")} stayed`);
       } else removeOne(STATE_DB);
       if (retained.length === 0) return { cleanupWarnings, retained };
-      return { cleanupWarnings, retained, reason: failed ? "cleanup-failed" : "not-this-runs-file" };
+      return { cleanupWarnings, retained, reason: failed ? "cleanup-failed" : foreign ? "not-this-runs-file" : "quarantined-after-refusal" };
     },
     keepAfterFailure(reason, cause) {
       let retained: string[];

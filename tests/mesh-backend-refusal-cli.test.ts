@@ -11,8 +11,9 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 // dist/mesh/mesh-backend-cli.js (no main() call, no source import in the child). The readiness gate is real: an extra
 // --require-reader with a custom install root and an installed proof makes the first check ready; a --import preload
 // fixture (written into this test's own mkdtemp root) moves that proof away right after the CLI's exclusive create of
-// state.db, so the fenced re-check before the importing commit refuses for real. The product's cleanup then really
-// unlinks this run's state.db*: Linux GitHub-hosted runners only. Locally this file is collected and skipped.
+// state.db, so the fenced re-check before the importing commit refuses for real. No-deletion goal: the product then
+// moves this run's state.db* into a `.import-quarantine-*` slot and RETAINS them (no unlink/rmdir ever), reporting
+// each entry path with warnings. Linux GitHub-hosted runners only. Locally this file is collected and skipped.
 
 const HOSTED = process.env.GITHUB_ACTIONS === "true" && process.platform === "linux";
 const BIN = path.resolve("bin/fabric-mesh-backend");
@@ -30,6 +31,8 @@ afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: 
  * 1. after the CLI's O_CREAT|O_EXCL open of state.db: record its inode, rename readers/forwarder.json out of the root;
  * 2. "swap" only: when an lstat of state.db returned that inode and the very next step is a quarantine mkdtemp, a
  *    rename or an unlink of state.db, first rename the owned file to moved-away.db and write a foreign state.db.
+ * 3. "swap-in-quarantine" only: right after an lstat of a MOVED `.import-quarantine-*\/state.db` returns that inode,
+ *    rename it to moved-away.db and write a foreign file at that quarantine path (the inside-quarantine window).
  * Everything is a real fs operation in this test's own root; the log is written at exit.
  */
 const PRELOAD = String.raw`
@@ -52,13 +55,22 @@ if (cfg) {
       return path.basename(text) === "state.db" && fs.realpathSync(path.dirname(path.resolve(text))) === realRoot;
     } catch { return false; } finally { busy = false; }
   };
-  const fire = (at) => {
+  const fire = (at, target = db) => {
     state.fired = true;
     state.firedAt = at;
-    real.renameSync(db, path.join(cfg.root, "moved-away.db"));
-    fs.writeFileSync(db, "foreign", { flag: "wx", mode: 0o600 });
-    state.foreign = idOf(real.lstatSync(db));
+    real.renameSync(target, path.join(cfg.root, "moved-away.db"));
+    fs.writeFileSync(target, "foreign", { flag: "wx", mode: 0o600 });
+    state.foreign = idOf(real.lstatSync(target));
     state.events.push("swap before " + at);
+  };
+  const isQuarantineDb = (target) => {
+    if (busy) return false;
+    busy = true;
+    try {
+      const text = target instanceof URL ? target.pathname : String(target);
+      return /^state\.db(?:-[a-f0-9]{32})?$/.test(path.basename(text)) && path.basename(path.dirname(text)).startsWith(".import-quarantine")
+        && fs.realpathSync(path.dirname(path.dirname(path.resolve(text)))) === realRoot;
+    } catch { return false; } finally { busy = false; }
   };
   const armedSwap = () => cfg.mode === "swap" && state.created && state.checked && !state.fired;
   fs.openSync = function (target, flags, mode) {
@@ -78,6 +90,10 @@ if (cfg) {
     const isDb = isRootDb(target);
     state.checked = isDb && state.created && !state.fired && idOf(result) === state.owned;
     if (state.checked) state.events.push("lstat state.db -> owned via " + String(target));
+    if (cfg.mode === "swap-in-quarantine" && state.created && !state.fired && idOf(result) === state.owned && isQuarantineDb(target)) {
+      state.events.push("lstat moved entry -> owned via " + String(target));
+      fire("use of the moved entry", String(target));
+    }
     return result;
   };
   fs.mkdtempSync = function (prefix) {
@@ -105,9 +121,24 @@ interface Refusal { ok: boolean; refused?: boolean; error?: string; cleanupWarni
 
 const idOf = (stat: fs.Stats | undefined): string | undefined => stat ? `${stat.dev}:${stat.ino}` : undefined;
 const dbNames = (root: string): string[] => fs.readdirSync(root).filter(name => DB_NAME.test(name)).sort();
+/** Every path under `root` whose lstat identity is `id`, relative to the root. */
+const whereIs = (root: string, id: string | undefined): string[] => {
+  const out: string[] = [];
+  const walk = (rel: string): void => {
+    for (const entry of fs.readdirSync(path.join(root, rel))) {
+      const child = rel ? `${rel}/${entry}` : entry;
+      const stat = fs.lstatSync(path.join(root, child));
+      if (idOf(stat) === id) out.push(child);
+      if (stat.isDirectory()) walk(child);
+    }
+  };
+  walk("");
+  return out;
+};
+const Q_ENTRY = /^\.import-quarantine-[^/]+\/state\.db(?:-wal|-shm)?-[a-f0-9]{32}$/;
 
 describe.skipIf(!HOSTED)("the built fabric-mesh-backend: readiness refusal before the importing commit (hosted Linux only)", () => {
-  it("clean refusal removes this run's state.db*; a state.db swapped between the check and the move is kept", async () => {
+  it("clean refusal quarantines and keeps this run's state.db*; swaps before the move or inside quarantine keep the foreign file", async () => {
     // Required on CI: a fresh `bun run build` (never skip when absent here).
     expect(fs.existsSync(BIN), BIN).toBe(true);
     expect(fs.existsSync(BUILT_CLI), `${BUILT_CLI}: run bun run build before the tests`).toBe(true);
@@ -134,7 +165,7 @@ describe.skipIf(!HOSTED)("the built fabric-mesh-backend: readiness refusal befor
       return { code: child.status, out: child.stdout, err: child.stderr };
     };
 
-    const scenario = async (name: string, command: "import" | "cutover", mode: "clean" | "swap") => {
+    const scenario = async (name: string, command: "import" | "cutover", mode: "clean" | "swap" | "swap-in-quarantine") => {
       const root = path.join(base, name);
       fs.mkdirSync(root, { mode: 0o700 });
       const store = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -172,29 +203,49 @@ describe.skipIf(!HOSTED)("the built fabric-mesh-backend: readiness refusal befor
       expect(fs.readFileSync(path.join(root, "state.json")).equals(stateJson)).toBe(true);
       // The cleanup report is visible in both channels.
       for (const text of json.cleanupWarnings ?? []) expect(result.err).toContain(text);
+      // Reports are entry paths, never a bare directory; every non-empty quarantine slot is reported by its entries.
+      const q = (json.retained ?? []).filter(kept => kept.startsWith(".import-quarantine"));
+      for (const kept of q) expect(kept, trace).toMatch(Q_ENTRY);
       for (const entry of fs.readdirSync(root).filter(entry => entry.startsWith(".import-quarantine"))) {
-        expect((json.retained ?? []).some(kept => kept === entry || kept.startsWith(`${entry}/`)), `unreported quarantine ${entry}`).toBe(true);
+        for (const inside of fs.readdirSync(path.join(root, entry))) expect(q, `unreported ${entry}/${inside}`).toContain(`${entry}/${inside}`);
       }
-      return { root, json, fixture, trace };
+      expect(json.cleanupWarnings?.length ?? 0, trace).toBeGreaterThan(0);
+      for (const kept of q) expect(json.cleanupWarnings!.some(text => text.includes(kept)), kept).toBe(true);
+      return { root, json, fixture, trace, q };
     };
 
-    // 1. Clean refusal: every state.db* this run created is really removed, nothing retained or warned.
+    // 1. Clean refusal: the created state.db's original name is GONE and its inode is at the reported quarantine path.
     const clean = await scenario("clean", "import", "clean");
     expect(clean.fixture.fired).toBe(false);
     expect(dbNames(clean.root), clean.trace).toEqual([]);
-    expect(fs.readdirSync(clean.root).filter(entry => entry.startsWith(".import-quarantine"))).toEqual([]);
-    expect(clean.json.retained ?? []).toEqual([]);
-    expect(clean.json.cleanupWarnings ?? []).toEqual([]);
+    const cleanAt = whereIs(clean.root, clean.fixture.owned);
+    expect(cleanAt, clean.trace).toHaveLength(1);
+    expect(cleanAt[0]).toMatch(Q_ENTRY);
+    expect(clean.q).toContain(cleanAt[0]);
 
-    // 2. Swap after the owned-inode lstat, before the move/removal: the foreign replacement keeps its name and bytes.
+    // 2. Swap after the owned-inode lstat, before the move: the late foreign original is KEPT at state.db and its
+    // quarantine alias is KEPT too (no alias drop); the owned file stays where the race put it.
     const swap = await scenario("swap", "cutover", "swap");
     expect(swap.fixture.fired, swap.trace).toBe(true);
     expect(idOf(fs.lstatSync(path.join(swap.root, "state.db")))).toBe(swap.fixture.foreign);
     expect(fs.readFileSync(path.join(swap.root, "state.db"), "utf8")).toBe("foreign");
     expect(idOf(fs.lstatSync(path.join(swap.root, "moved-away.db")))).toBe(swap.fixture.owned);
     expect(dbNames(swap.root), swap.trace).toEqual(["state.db"]);
+    const aliases = whereIs(swap.root, swap.fixture.foreign).filter(at => at !== "state.db");
+    expect(aliases, swap.trace).toHaveLength(1);
+    expect(swap.q).toContain(aliases[0]);
     expect(swap.json.retained).toContain("state.db");
     expect(swap.json.cleanupWarnings?.some(text => text.includes(`${swap.root}/state.db`)), swap.trace).toBe(true);
-    expect(swap.json.cleanupWarnings!.length).toBeGreaterThan(0);
-  }, 5 * CHILD_TIMEOUT);
+
+    // 3. Inside-quarantine window: after the moved entry's lstat showed the owned inode, a foreign file takes that
+    // quarantine path. It is never unlinked: it stays there, reported by its path.
+    const inside = await scenario("inside", "import", "swap-in-quarantine");
+    expect(inside.fixture.fired, inside.trace).toBe(true);
+    expect(idOf(fs.lstatSync(path.join(inside.root, "moved-away.db")))).toBe(inside.fixture.owned);
+    const insideAt = whereIs(inside.root, inside.fixture.foreign);
+    expect(insideAt, inside.trace).toHaveLength(1);
+    expect(insideAt[0]).toMatch(Q_ENTRY);
+    expect(fs.readFileSync(path.join(inside.root, insideAt[0]!), "utf8")).toBe("foreign");
+    expect(inside.q).toContain(insideAt[0]);
+  }, 8 * CHILD_TIMEOUT);
 });

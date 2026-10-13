@@ -152,6 +152,8 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
   // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
   "src/mesh/state-backend-nats-client.ts",
+  "src/config.ts",
+  "src/core/agent-dir.ts",
 ];
 
 // smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).

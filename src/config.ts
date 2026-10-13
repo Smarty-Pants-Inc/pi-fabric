@@ -477,6 +477,18 @@ const meshControlIncarnationFence = (value: unknown): MeshControlIncarnationFenc
   throw new Error("mesh.controlIncarnationFence must be warn or enforce");
 };
 
+/** JetStream stream num_replicas for the NATS state backend; an explicit invalid value is refused, never defaulted. */
+const meshNatsReplicas = (value: unknown): number => {
+  if (value === undefined) return 1;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return value;
+  throw new Error("mesh.nats.replicas must be a positive integer");
+};
+
+export interface FabricMeshNatsConfig {
+  /** Stream num_replicas on create; an existing stream with a different count is refused (default 1). */
+  replicas: number;
+}
+
 export const RESIDENT_IDLE_EXIT_MS = 10 * 60_000;
 
 export interface FabricMeshConfig {
@@ -486,6 +498,8 @@ export interface FabricMeshConfig {
   lockProtocol: MeshLockProtocol;
   /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
   stateBackend: MeshStateBackend;
+  /** NATS state-backend settings; only read when stateBackend is "nats". */
+  nats: FabricMeshNatsConfig;
   enabled: boolean;
   root?: string;
   /** Publish the Main participant at session start instead of on first Fabric use. */
@@ -815,6 +829,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
     stateBackend: "file",
+    nats: { replicas: 1 },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -1721,6 +1736,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
       stateBackend: meshStateBackend(mesh.stateBackend),
+      nats: { replicas: meshNatsReplicas(objectValue(mesh.nats).replicas) },
       enabled: booleanValue(mesh.enabled, DEFAULT_FABRIC_CONFIG.mesh.enabled),
       ...(meshRoot ? { root: meshRoot } : {}),
       announce: booleanValue(mesh.announce, DEFAULT_FABRIC_CONFIG.mesh.announce),

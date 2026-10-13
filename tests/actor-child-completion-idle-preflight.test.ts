@@ -156,7 +156,8 @@ it.each([false, true])("wakes a real idle owner and retries a failed durable que
 
 // Child spool watch failure contract: one immediate rescan/re-arm, then finite
 // 60/120/240/300 s one-shots. Only delivered events reset the budget. Exhaustion
-// exposes unavailable and warns once; close joins native close or a bounded grace.
+// exposes observation-degraded and warns once; one60s scan/re-arm keeps late work
+// recoverable. Native recovery stops scans; close joins native close or bounded grace.
 type FakeWatcher = EventEmitter & { close: ReturnType<typeof vi.fn>; listener: fs.WatchListener<string> };
 const fakeWatchers = (fail: () => boolean = () => false) => {
   const made: FakeWatcher[] = [];
@@ -224,7 +225,7 @@ it("child watch: one immediate recovery then minute-scale backoff, reset only by
   }
 });
 
-it("child watch: persistent arm failure retries no faster than once per minute and stops with one warning and health flag", async () => {
+it("child watch: persistent arm failure retries no faster than once per minute, then stays visibly degraded with one warning", async () => {
   vi.useFakeTimers();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-arm-"));
   const { watch } = fakeWatchers(() => true);
@@ -245,13 +246,81 @@ it("child watch: persistent arm failure retries no faster than once per minute a
     expect(watch).toHaveBeenCalledTimes(6);
     expect(wake).toHaveBeenCalledOnce(); // retry attempts never poll the spool
     expect(spool.unavailable).toBe(true);
+    expect(spool.health).toBe("observation-degraded");
     expect(warning).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("observation-degraded"));
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(59_999);
     expect(watch).toHaveBeenCalledTimes(6);
+    expect(wake).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(watch).toHaveBeenCalledTimes(7);
+    expect(wake).toHaveBeenCalledTimes(2); // bounded degraded scan, not abandoned work
     expect(warning).toHaveBeenCalledOnce();
   } finally {
     const closing = spool.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await closing;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    await fs.promises.rm(root, { recursive: true, force: true });
+  }
+});
+
+it("child watch: late durable work is claimed in one degraded tick; native recovery stops all fallback scans", async () => {
+  vi.useFakeTimers();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-degraded-"));
+  const session = path.join(root, "session.jsonl");
+  fs.writeFileSync(session, "");
+  const store = new ActorChildCompletionStore(session);
+  const id = "a".repeat(32);
+  const file = path.join(store.directory, `${id}.json`);
+  const remove = fs.rmSync;
+  const removals: string[] = [];
+  vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    if (String(target) === file) { removals.push(String(target)); return; }
+    return remove(target, options);
+  });
+  let fail = true;
+  const { made, watch } = fakeWatchers(() => fail);
+  const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const claimed: string[] = [];
+  const wake = vi.fn(() => {
+    for (const { result } of store.pending({ actorId: "actor:owner" })) {
+      store.acknowledge(result.id, { handoff: true });
+      claimed.push(result.id);
+    }
+  });
+  const spool = new ActorChildCompletionWatch(store.directory, wake);
+  try {
+    for (const delay of [60_000, 120_000, 240_000, 300_000]) await vi.advanceTimersByTimeAsync(delay);
+    expect(spool.health).toBe("observation-degraded");
+    expect(wake).toHaveBeenCalledOnce();
+    const result = { id, name: "late", status: "completed", text: "late saved result", startedAt: Date.now(), finishedAt: Date.now() } as AgentRunResult;
+    store.enqueue(result, { id: "actor:owner", kind: "actor", runId: "b".repeat(32) });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(claimed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(claimed).toEqual([id]);
+    expect(store.mailboxClaimed(id)).toBe(true);
+    expect(removals.length).toBeGreaterThan(0); // recorded, never executed
+    expect(fs.existsSync(store.resultFile(id))).toBe(true);
+    expect(warning).toHaveBeenCalledOnce();
+    expect(spool.health).toBe("observation-degraded");
+    fail = false;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(watch).toHaveBeenCalledTimes(8);
+    expect(spool.health).toBe("observing");
+    expect(spool.unavailable).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    const scans = wake.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(wake).toHaveBeenCalledTimes(scans);
+    expect(claimed).toEqual([id]);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    const closing = spool.close();
+    made.at(-1)?.emit("close");
     await vi.advanceTimersByTimeAsync(1_000);
     await closing;
     vi.useRealTimers();

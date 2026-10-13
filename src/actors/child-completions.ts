@@ -34,25 +34,30 @@ class UnsafeCompletionEntry extends Error {}
  * the callback only schedules the owner's existing fresh ownership/claim reconcile.
  * Arm it BEFORE the first empty preflight so a later write cannot fall between them.
  * A failed watch gets one immediate rescan/re-arm, then 60/120/240/300 s one-shots.
- * Six consecutive failures stop re-arming, expose unavailable and warn once. Only a
- * delivered event resets this budget. Existing owner events still reconcile the spool.
+ * Six consecutive failures enter observation-degraded health and warn once. Only a
+ * delivered event resets the budget. Degraded recovery scans/re-arms once per minute;
+ * a successful re-arm stops that fallback and restores the native event path.
  */
 export class ActorChildCompletionWatch {
   #watcher: FSWatcher | undefined;
   #timer: NodeJS.Timeout | undefined;
   #failures = 0;
   #unavailable = false;
+  #warnedUnavailable = false;
   #closed = false;
   // Watchers closed after an error whose native close may still be in flight.
   readonly #closing = new Set<Promise<void>>();
   constructor(readonly directory: string, readonly wake: () => void) { this.#arm(); }
 
-  /** Exhausted native-watch recovery; existing actor events remain available. */
+  /** Native observation is unavailable; the degraded durable-source fallback remains active. */
   get unavailable(): boolean { return this.#unavailable; }
+  get health(): "observing" | "recovering" | "observation-degraded" | "closed" {
+    return this.#closed ? "closed" : this.#unavailable ? "observation-degraded" : this.#watcher ? "observing" : "recovering";
+  }
 
   #arm(): void {
     this.#timer = undefined;
-    if (this.#closed || this.#unavailable || this.#watcher) return;
+    if (this.#closed || this.#watcher) return;
     try {
       // Create the empty spool once (never recursively: a removed actor stays removed).
       try { fs.mkdirSync(this.directory, { mode: 0o700 }); }
@@ -60,14 +65,17 @@ export class ActorChildCompletionWatch {
       const watcher = fs.watch(this.directory, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#watcher !== watcher) return;
         this.#failures = 0; // Only a delivered event, never arming, resets the failure budget.
+        this.#warnedUnavailable = false;
         const name = filename == null ? undefined : path.basename(filename.toString());
         // A nameless event is a wake, not evidence that nothing changed.
         if (name === undefined || WAKE_FILE.test(name)) this.wake();
       });
       watcher.on("error", () => this.#failed(watcher));
+      const degraded = this.#unavailable;
       this.#watcher = watcher;
-      // Edges may have been missed while unarmed: rescan once after a successful re-arm.
-      if (this.#failures) this.wake();
+      this.#unavailable = false;
+      // A degraded tick already rescanned. Other re-arms cover their missed edges once.
+      if (this.#failures && !degraded) this.wake();
     } catch { this.#failed(undefined); }
   }
 
@@ -86,10 +94,29 @@ export class ActorChildCompletionWatch {
     }
     if (this.#failures >= WATCH_FAILURE_LIMIT) {
       this.#unavailable = true;
-      console.warn(`[pi-fabric] child completion watch unavailable after ${this.#failures} failures for ${this.directory}; re-arm stopped, actor events still reconcile pending work`);
+      if (!this.#warnedUnavailable) {
+        this.#warnedUnavailable = true;
+        console.warn(`[pi-fabric] observation-degraded: child completion watch unavailable for ${this.directory}; using bounded 60 s durable-source scan/re-arm until native observation recovers`);
+      }
+      this.#scheduleDegraded();
       return;
     }
     this.#timer = setTimeout(() => this.#arm(), Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_MS * 2 ** (this.#failures - 2)));
+    this.#timer.unref();
+  }
+
+  #scheduleDegraded(): void {
+    if (this.#closed || !this.#unavailable || this.#timer) return;
+    // ponytail: named R-no-polling exception (#1047/#11172), exhausted observer only.
+    // One bounded durable-source wake plus re-arm each minute; never abandon late work,
+    // and never retain a safety poll when native observation has recovered.
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#closed || !this.#unavailable) return;
+      this.wake();
+      this.#arm();
+      this.#scheduleDegraded();
+    }, WATCH_REARM_MS);
     this.#timer.unref();
   }
 

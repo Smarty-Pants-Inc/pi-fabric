@@ -460,10 +460,105 @@ it("off Linux every intent cleanup is verified-only: retained, fails closed or b
   }
 });
 
+// r4: between an archive restore's initial intent read and its own rewrite, the judged intent may be replaced (a new
+// inode, even with the same bytes) or changed in place (same inode, new bytes). Two seams: right after the restore's
+// archive lookup (after the initial read, before any rewrite staging), and at the rewrite's staging boundary (the staged
+// temporary's fsync, after its bytes are written, immediately before its rename).
+const afterRestoreLookup = (sequence: number, act: () => void) => {
+  const lookup = MeshArchive.prototype.lookupEntry;
+  const state = { fired: false };
+  vi.spyOn(MeshArchive.prototype, "lookupEntry").mockImplementation(function (this: InstanceType<typeof MeshArchive>, ...args: Parameters<typeof lookup>) {
+    const entry = lookup.apply(this, args);
+    if (!state.fired && args[0] === sequence) { state.fired = true; act(); }
+    return entry;
+  });
+  return state;
+};
+const atRestoreStaging = (file: string, act: () => void) => {
+  const openSync = fs.openSync;
+  const fsyncSync = fs.fsyncSync;
+  const staged = new Set<number>();
+  const state = { fired: false };
+  vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    const fd = (openSync as (...args: unknown[]) => number)(target, ...rest);
+    const name = String(target);
+    if (name.startsWith(`${file}.`) && name.endsWith(".tmp")) staged.add(fd); // writeFileAtomic's staged temporary
+    return fd;
+  }) as never);
+  vi.spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
+    fsyncSync(fd);
+    if (!state.fired && staged.has(fd)) { state.fired = true; act(); }
+  }) as never);
+  return state;
+};
+/** The restore stopped before its rewrite took the name: the interloper (inode and exact bytes) is kept, no receipt, no
+ * live append, no compaction, and the interloper was never verified (nor any removal authorized). */
+const expectRestoreRefused = (seeded: ReturnType<typeof seedArchived>, outcome: unknown, seam: { fired: boolean }, ino: number, bytes: string) => {
+  expect(seam.fired).toBe(true);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(fs.lstatSync(seeded.file).ino).toBe(ino);
+  expect(fs.readFileSync(seeded.file, "utf8")).toBe(bytes);
+  expect(fs.existsSync(receiptPath(seeded.root, "k"))).toBe(false);
+  expect(fs.readFileSync(path.join(seeded.root, "events.jsonl"), "utf8")).toBe("");
+  expect(fs.existsSync(path.join(seeded.root, "generation"))).toBe(false);
+  expect(probe.calls.filter(call => call.target === seeded.file && (call.ino === ino || call.removed))).toEqual([]);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+};
+const restoreOutcome = (seeded: ReturnType<typeof seedArchived>) =>
+  seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" }).then(event => event, (error: unknown) => error);
+
+it.runIf(process.platform === "linux")("an archive restore refuses a successor renamed in after its initial intent read", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  let successorIno = 0;
+  const seam = afterRestoreLookup(event.sequence, () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = fs.lstatSync(seeded.file).ino; });
+  const outcome = await restoreOutcome(seeded);
+  expect(successorIno).not.toBe(deadIno);
+  expectRestoreRefused(seeded, outcome, seam, successorIno, successorText(seeded.archiveDir));
+});
+
+it.runIf(process.platform === "linux")("an archive restore refuses a successor renamed in at its rewrite's staging boundary", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  let successorIno = 0;
+  const seam = atRestoreStaging(seeded.file, () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = fs.lstatSync(seeded.file).ino; });
+  const outcome = await restoreOutcome(seeded);
+  expect(successorIno).not.toBe(deadIno);
+  expectRestoreRefused(seeded, outcome, seam, successorIno, successorText(seeded.archiveDir));
+});
+
+it.runIf(process.platform === "linux")("an archive restore refuses the judged inode changed in place before its rewrite", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const seam = afterRestoreLookup(event.sequence, () => fs.writeFileSync(seeded.file, successorText(seeded.archiveDir)));
+  const outcome = await restoreOutcome(seeded);
+  expectRestoreRefused(seeded, outcome, seam, deadIno, successorText(seeded.archiveDir)); // same inode, new bytes
+});
+
+it.runIf(process.platform === "linux")("an archive restore refuses a same-byte replacement inode before its rewrite", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const original = fs.readFileSync(seeded.file, "utf8") as string;
+  let replacementIno = 0;
+  const seam = afterRestoreLookup(event.sequence, () => {
+    fs.writeFileSync(`${seeded.file}.swap`, original, { mode: 0o600 });
+    fs.renameSync(`${seeded.file}.swap`, seeded.file);
+    replacementIno = fs.lstatSync(seeded.file).ino;
+  });
+  const outcome = await restoreOutcome(seeded);
+  expect(replacementIno).not.toBe(deadIno);
+  expectRestoreRefused(seeded, outcome, seam, replacementIno, original); // new inode, exact same bytes
+});
+
 it.runIf(process.platform === "linux")("an unchanged archive restore settles its own rewritten intent by that inode (dry run)", async () => {
   const seeded = seedArchived();
   const { event, deadIno } = await seedRestore(seeded);
+  // Both r4 seams are reached on the unchanged path and, acting on nothing, never block the restore.
+  const lookupSeam = afterRestoreLookup(event.sequence, () => {});
+  const stagingSeam = atRestoreStaging(seeded.file, () => {});
   await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  expect(lookupSeam.fired).toBe(true);
+  expect(stagingSeam.fired).toBe(true);
   const restoredIno = fs.lstatSync(seeded.file).ino; // dry run: the verified intent stays
   expect(restoredIno).not.toBe(deadIno);
   expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([{ target: seeded.file, ino: restoredIno, deleter: "meshDedupeIntent", removed: true }]);

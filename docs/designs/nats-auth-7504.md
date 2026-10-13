@@ -49,7 +49,7 @@ finding. Section 10 has the detail. Docs only: nothing is implemented, tested or
   restarts; engines recheck `<CUS>` on every reconnect and refuse a mismatch, so no already-open engine continues under
   a changed `<CUS>` configuration (the review's point). T14 adds the refusal. Sections 1, 1.4,
   2.1, 4, 5, 6, 9.1, 9.2, 10.1.
-- **B2 (security P1, c6152848625) ACCEPTED as a security gap, smarty-dev#TBD-UID.** Fleet agents under one UID on
+- **B2 (security P1, c6152848625) ACCEPTED as a security gap, smarty-dev#11465.** Fleet agents under one UID on
   one host are one trust domain. Per-launch creds give network authentication, org isolation and root binding, not
   same-host isolation. Fixes: a per-host broker under a separate UID, or per-lane Unix users. Measure first:
   `ptrace_scope` and `PR_SET_DUMPABLE=0` (not implemented, not a fix). C8's FD and core guards stay. Sections 1.1,
@@ -99,7 +99,7 @@ Self-hosting runs the same code; only key custody differs (Section 3).
 - **What it does NOT give.** All writers of one root share one stream, and any writer can forge a self-consistent
   snapshot (docs/mesh-backends.md, "Snapshot integrity"). A child shares its parent's user (2.2), so NATS logs name
   the parent launch, not the child. Nor does it give same-host isolation: one UID on one host is one trust domain
-  (accepted security gap smarty-dev#TBD-UID, 10.2).
+  (accepted security gap smarty-dev#11465, 10.2).
 
 ### 1.2 Finding: the documented ACL does not match anything
 
@@ -221,7 +221,7 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 
 - Inherited means: NATS logs show the parent; revoking the parent cuts its children; a child has the parent's
   cutoff. The seed is in more processes, but on one host and one UID, already one trust domain (docs/agents.md):
-  an accepted security gap, not isolation (10.2, smarty-dev#TBD-UID).
+  an accepted security gap, not isolation (10.2, smarty-dev#11465).
 - The resident host keeps the user of the Main that started it. At its cutoff, or on revocation, it closes its NATS
   roots and exits as on host exit; the next durable request from a Main with valid creds starts a new one, which
   resumes the suspended actors (T11h).
@@ -234,7 +234,7 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
   it. It keeps the bytes in one process-global slot and gives them only to `credsAuthenticator` and child pipes.
 - The wrapper sets `ulimit -c 0` before it starts Pi. T10 reads `/proc/<pid>/limits`, `core_pattern` and the FD list
   of Pi and of a child. It reads no credential bytes and prints none.
-- **Same-UID boundary (accepted security gap, smarty-dev#TBD-UID, 10.2).** All code in the Pi process can read the
+- **Same-UID boundary (accepted security gap, smarty-dev#11465, 10.2).** All code in the Pi process can read the
   seed. A same-UID process can read its memory where `ptrace_scope` allows. This is the same exposure as the
   lane-host model-gateway key in that process. The lead accepts it as a recorded security gap, not as isolation; the
   FD and core guards above stay. Measuring `ptrace_scope` and `PR_SET_DUMPABLE=0` comes first (10.2); neither is
@@ -582,7 +582,7 @@ security review of the frozen text follow; this note does not claim them.
 
 ### 10.2 Same-UID seed exposure: accepted security gap (security P1)
 
-- Lead decision: ACCEPTED as a security gap, smarty-dev#TBD-UID (number pending). All fleet agents under one UID on
+- Lead decision: ACCEPTED as a security gap, smarty-dev#11465. All fleet agents under one UID on
   one host are one trust domain. That is already true for the file mesh, registries and session files.
 - Per-launch creds give network authentication, org isolation and root binding (1.1, 1.4). They do not isolate a
   launch from another same-UID process on the same host, and this note no longer treats them as that.
@@ -671,4 +671,4 @@ security review of the frozen text follow; this note does not claim them.
   through the existing issuer, control files and runbook. Implementation gate; no new daemon or transport.
 - **O-10 resolved** (10.5): SYS publish allow is only `$SYS.REQ.CLAIMS.UPDATE`. Every configured server ID must
   acknowledge the exact broadcast JWT for `complete`; there is no per-server read-back, a known accepted limit.
-- smarty-dev#TBD-UID: the lead replaces the issue number.
+- Resolved: the same-UID security-gap issue is smarty-dev#11465.

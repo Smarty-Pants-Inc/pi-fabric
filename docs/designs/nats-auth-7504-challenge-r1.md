@@ -158,7 +158,7 @@ P2). This record adds no finding and claims no review pass. Design note: "Round 
   purge and delete deny stays); a separate 1 h break-glass user, minted only by an explicit
   `fabric nats mint --break-glass` after approval, makes such changes; the runbook stops the engines first (#8639),
   rechecks, restarts; engines recheck `<CUS>` on every reconnect and refuse a mismatch. T2, T14.
-- **B2 ACCEPTED as security gap smarty-dev#TBD-UID (security P1, same UID).** One UID on one host is one trust
+- **B2 ACCEPTED as security gap smarty-dev#11465 (security P1, same UID).** One UID on one host is one trust
   domain; per-launch creds are network authentication, org isolation and root binding, not same-host isolation.
   Fixes: per-host broker under a separate UID, or per-lane Unix users. `ptrace_scope` and `PR_SET_DUMPABLE=0` are
   to be measured first, not implemented, not a fix. C8's guards stay.
@@ -177,6 +177,6 @@ P2). This record adds no finding and claims no review pass. Design note: "Round 
   the lead accepts this known limit. No LOOKUP grant or new read-back mechanism. O-10 resolved (10.5).
 
 Limits: docs only; nothing implemented, tested or measured; the mint later follows Amendment B. Still open: O-1, O-2,
-O-6, O-7, and new O-8 (break-glass approver and audit record), O-9 (fleet location of the latest-JWT record), and the
-smarty-dev#TBD-UID number. A delta design review and security review of the frozen text come next; neither is
+O-6, O-7, and new O-8 (break-glass approver and audit record) and O-9 (fleet location of the latest-JWT record). The
+same-UID gap is filed as smarty-dev#11465. A delta design review and security review of the frozen text come next; neither is
 claimed here.

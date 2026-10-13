@@ -1,0 +1,70 @@
+
+ ▀▀█  v1.1.0
+ █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Skills]
+  fabric-advisor, fabric-ambient, fabric-council, fabric-exec, fabric-foreman, fabric-fusion, fabric-graph, fabric-guide,
+fabric-jev, fabric-rlm, fabric-schema, fabric-spec, fabric-supervisor, fabric-swarm, fabric-workflow
+
+[Extensions]
+  dist, proof-extension.ts
+
+
+ Tool output: collapsed
+
+
+ Paul: show me your full reply while incoming Fabric chatter stays available for inspection.
+
+
+
+ Agent
+ ✓ Tools · 2 calls
+ › load · 5ms
+ › main · 3ms
+ ╰─ Took 479ms
+
+
+ ↳ org-agent: [1 handoff] Inbox report: a shadow record is present, with the complete handoff content incl…
+
+ ↳ main: [3 followUp/mail.inbound] Build report: the release candidate is staged, with the compiler output and revi…
+
+ ORG REPLY TO PAUL
+ Here is my full reply, separate from the incoming agent chatter.
+ The complete assistant reply remains visible, including this final sentence.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✓ Fabric Agent
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/lanes/fv2-5049-collapse/.local/out/probe-after-h4NpkU/project (fv2-5049-collapse)
+1.5%/200k                                                                                                                  org-proof
+principal view · Ctrl+Alt+P

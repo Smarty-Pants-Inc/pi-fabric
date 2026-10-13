@@ -1,0 +1,70 @@
+[Skills]
+  fabric-advisor, fabric-ambient, fabric-council, fabric-exec, fabric-foreman, fabric-fusion, fabric-graph, fabric-guide,
+fabric-jev, fabric-rlm, fabric-schema, fabric-spec, fabric-supervisor, fabric-swarm, fabric-workflow
+
+[Extensions]
+  before-dist, proof-extension.ts
+
+
+ Tool output: collapsed
+
+
+ Paul: show me your full reply while incoming Fabric chatter stays available for inspection.
+
+
+
+ Agent
+ ✓ Tools · 2 calls
+ › load · 4ms
+ › main · 2ms
+ ╰─ Took 422ms
+
+
+
+ [pi-fabric-inbox]
+
+ <fabric-inbox count="1">
+ Work events addressed to you that no steer or follow-up delivered (a shadow copy can repeat a message you already saw):
+ <event id="shadow-5049" sequence="1" topic="fleet.work.pi-fabric.5049" kind="handoff" from_name="org-agent"
+ from_id="session:inbox-proof-peer" key="unseen-shadow-5049" at="2026-10-13T17:33:03.984Z">Inbox report: a shadow record is
+ present, with the complete handoff content included below for the org.
+ INBOX_DETAIL_5049: full shadow stays in model context and expands with Ctrl+O.</event>
+ </fabric-inbox>
+
+
+
+ [pi-fabric-agent-message]
+
+ <fabric-agent-message from_name="main" from_id="session:01a13653-31cd-702e-866c-103a5b6544da" from_kind="main" delivery="followUp"
+ sent_at="2026-10-13T17:33:05.426Z">
+ Build report: the release candidate is staged, with the compiler output and review evidence below for the org.
+ AGENT_DETAIL_1: compiler detail must remain available to the model and Ctrl+O.
+ <data>{"to":"principal"}</data>
+ </fabric-agent-message>
+
+ <fabric-agent-message from_name="main" from_id="session:01a13653-31cd-702e-866c-103a5b6544da" from_kind="main" delivery="followUp"
+ sent_at="2026-10-13T17:33:05.438Z">
+ Review report: the targeted checks are green, and the complete review notes are included below for the org.
+ AGENT_DETAIL_2: review detail must remain available to the model and Ctrl+O.
+ <data>{"to":"principal"}</data>
+ </fabric-agent-message>
+
+ <fabric-agent-message from_name="main" from_id="session:01a13653-31cd-702e-866c-103a5b6544da" from_kind="main" delivery="followUp"
+ sent_at="2026-10-13T17:33:05.449Z">
+ mail.inbound: this is a queued incoming notice with the complete mail metadata included below for the org.
+ AGENT_DETAIL_3: mail detail must remain available to the model and Ctrl+O.
+ <data>{"to":"principal"}</data>
+ </fabric-agent-message>
+
+
+ ORG REPLY TO PAUL
+ Here is my full reply, separate from the incoming agent chatter.
+ The complete assistant reply remains visible, including this final sentence.
+
+✓ Fabric Agent
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/lanes/fv2-5049-collapse/.local/out/probe-before-8NHenY/project (fv2-5049-collapse)
+1.5%/200k                                                                                                                  org-proof
+principal view · Ctrl+Alt+P

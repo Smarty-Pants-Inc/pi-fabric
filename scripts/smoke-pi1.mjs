@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, mkdtemp, readFile, rm, writeFile, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
-await mkdir(path.join(root, ".tmp"), { recursive: true });
-const scratch = await mkdtemp(path.join(root, ".tmp/pi1-sdk-"));
+// smarty-dev#11145: scratch lives under the caller TMPDIR, the test temp root the deletion guard pins (under
+// vitest, test-temp's private TMPDIR). Not isolatedTestTemp(): on a Windows runner it returns the shared job
+// directory, which the cleanup below would remove.
+const scratch = await mkdtemp(path.join(tmpdir(), "pi1-sdk-"));
 for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) delete process.env[name];
 process.env.PI_CODING_AGENT_DIR = scratch;
 process.env.PI_FABRIC_AGENT_DIR = path.join(scratch, "exports");

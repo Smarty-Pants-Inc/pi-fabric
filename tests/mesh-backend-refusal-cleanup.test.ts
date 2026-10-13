@@ -615,6 +615,11 @@ describe.skipIf(process.platform !== "linux")("recorded cleanup", () => {
     } });
     refusedUnderFence(result, "importing");
     expect(race.fired).toBe(true);
+    // SQLite unlinked the old WAL on close. Its creation fd must keep that inode alive, so the foreign WAL
+    // cannot reuse its dev/ino and be mistaken for this run's file (smarty-dev#11604).
+    expect(race.owned).toBeDefined();
+    expect(race.foreign).toBeDefined();
+    expect(race.foreign).not.toBe(race.owned);
     expect(calls).toEqual([]);
     expect(idOf(fs.lstatSync(path.join(root, "state.db")))).toBe(owned);
     expect(idOf(fs.lstatSync(path.join(root, "state.db-wal")))).toBe(race.foreign);

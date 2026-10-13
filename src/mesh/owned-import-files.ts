@@ -4,7 +4,8 @@
  * Every create and every move goes through `/proc/self/fd/<fd>/<name>`, so renaming or swapping the root path
  * cannot redirect either one. A file counts as this run's only when this run created it with O_EXCL, and its dev/ino
  * comes from an fstat of that very descriptor. A name counts as this run's file only while its lstat still shows that
- * inode.
+ * inode. Keep each creation descriptor open until SQLite is closed and cleanup ends: SQLite may unlink a sidecar
+ * on close, and a foreign replacement can otherwise reuse that inode number and pass the ownership check.
  * Only a working `/proc/self/fd` traversal of the held fd pins the root. It is probed on every platform; there is no
  * platform-name gate and no `/dev/fd` fallback (fabric-store, #9501; macOS residual smarty-dev#11066, Windows
  * smarty-dev#7858). Without it nothing is removed: the run reports what it kept (reason `no-held-dir-fd`), never a
@@ -77,6 +78,8 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
   } catch { /* unpinned */ }
   if (pinnedDir === undefined && fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } fd = undefined; }
   const owned = new Map<string, Identity | undefined>();
+  const inodeGuards: number[] = [];
+  let closeFailed = false;
   /** The state.db names present now, through the held root when pinned. Throws when a name cannot be checked. */
   const present = (): string[] => [STATE_DB, ...SIDECARS]
     .filter(name => fs.lstatSync(path.join(pinnedDir ?? root, name), { throwIfNoEntry: false }) !== undefined);
@@ -95,7 +98,8 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         try {
           const stat = fs.fstatSync(descriptor);
           owned.set(name, { dev: stat.dev, ino: stat.ino });
-        } finally { fs.closeSync(descriptor); }
+          inodeGuards.push(descriptor);
+        } catch (error) { fs.closeSync(descriptor); throw error; }
         return true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
@@ -185,6 +189,9 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
       return { cleanupWarnings, retained, reason: failed ? "cleanup-failed" : foreign ? "not-this-runs-file" : "quarantined-after-refusal" };
     },
     keepAfterFailure(reason, cause) {
+      // A failed SQLite close may still hold POSIX locks. Closing any plain-fs descriptor on the same inode drops
+      // those locks, so keep the inode guards until process exit on this failure path (the CLI is one-shot).
+      if (reason === "close-failed") closeFailed = true;
       let retained: string[];
       let unlisted = "";
       try { retained = present(); }
@@ -199,6 +206,10 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         retained, reason };
     },
     close() {
+      // The caller closes SQLite first. Only then can these descriptors be closed without dropping its locks.
+      if (!closeFailed) for (const descriptor of inodeGuards.splice(0)) {
+        try { fs.closeSync(descriptor); } catch { /* closed */ }
+      }
       if (fd === undefined) return;
       try { fs.closeSync(fd); } catch { /* closed */ }
       fd = undefined;

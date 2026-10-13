@@ -46,13 +46,9 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     const current = generation;
     // smarty-dev#10718: dispose/replacement invalidates this ctx and emits no session_shutdown here.
     // Every continuation below (await, backoff, idle poll) retires quietly on a stale ctx instead of
-    // throwing Pi's stale-ctx error out of a timer, which is uncaught and exits Pi.
-    const live = (): boolean => {
-      if (generation !== current) return false;
-      if (extensionContextLive(context)) return true;
-      cancel();
-      return false;
-    };
+    // throwing Pi's stale-ctx error out of a timer, which is uncaught and exits Pi. No timer of this
+    // settle is pending when live() runs (wakeWhenIdle clears it first), so retiring is just returning.
+    const live = (): boolean => generation === current && extensionContextLive(context);
     // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
     // would otherwise split into its own eager startup chunk.
     const { classifyProviderError } = await import("./provider-error-class.js");

@@ -682,11 +682,7 @@ export class FabricUiController {
     this.#scheduledRefresh = undefined;
   }
 
-  /**
-   * smarty-dev#8881: AgentSession.dispose() invalidates the retained ctx without session_shutdown.
-   * Timers and subscriptions probe it first; a disposed ctx retires this controller locally (views,
-   * timers, subscriptions) without another getter, leaving a later start() a clean slate.
-   */
+  /** Dispose emits no shutdown (#8881): retire local views, timers and subscriptions before a stale ctx read. */
   #liveTuiContext(): ExtensionContext | undefined {
     const context = this.#context;
     if (!context) return undefined;

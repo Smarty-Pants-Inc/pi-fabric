@@ -12,6 +12,8 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const probe = vi.hoisted(() => ({
   dryRun: true,
   moveAway: undefined as ((target: string) => void) | undefined,
+  /** A verifier refusal shape the dry run cannot produce (an entry held in a graveyard), emulated by a test rename. */
+  graveyard: undefined as ((target: string) => { removed: false; reason: string; graveyard: string }) | undefined,
   calls: [] as Array<{ target: string; ino: number | undefined; deleter: string; removed: boolean }>,
 }));
 vi.mock("../src/storage/verified-remove.js", async importOriginal => {
@@ -21,7 +23,8 @@ vi.mock("../src/storage/verified-remove.js", async importOriginal => {
     verifiedRemove: (target: string, judged: fs.Stats | undefined, options: Parameters<typeof real.verifiedRemove>[2]) => {
       // Never a real Linux removal: a dry run whenever requested and always on Linux.
       const dryRun = probe.dryRun || process.platform === "linux";
-      const result = real.verifiedRemove(target, judged, dryRun ? { ...options, dryRun: true } : options);
+      const result = options.deleter === "meshDedupeIntent" && probe.graveyard ? probe.graveyard(target)
+        : real.verifiedRemove(target, judged, dryRun ? { ...options, dryRun: true } : options);
       // Only this lane's deleters are recorded; an auxiliary (lock) release's dry-run success is emulated by a rename.
       if (!options.deleter.startsWith("meshDedupe")) { if (dryRun && result.removed) probe.moveAway?.(target); return result; }
       probe.calls.push({ target, ino: judged?.ino, deleter: options.deleter, removed: result.removed });
@@ -31,7 +34,7 @@ vi.mock("../src/storage/verified-remove.js", async importOriginal => {
 });
 
 const { MeshStore } = await import("../src/mesh/store.js");
-const { MeshDedupeStoreFullError } = await import("../src/mesh/event-log.js");
+const { MeshDedupeStoreFullError, MeshDedupeRecoveryError } = await import("../src/mesh/event-log.js");
 
 const from = { id: "session:8907", name: "8907", kind: "main" as const };
 const roots: string[] = [];
@@ -71,7 +74,7 @@ const emulate = (op: "rmSync" | "unlinkSync" | "rmdirSync", target: string, opti
 };
 
 beforeEach(() => {
-  probe.dryRun = true; probe.calls = []; removals = []; failRemoval = false;
+  probe.dryRun = true; probe.calls = []; removals = []; failRemoval = false; probe.graveyard = undefined;
   trash = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-8907-trash-"));
   probe.moveAway = target => { if (real.lstatSync(target, { throwIfNoEntry: false })) real.renameSync(target, path.join(trash, randomUUID())); };
   for (const name of ["rmSync", "unlinkSync", "rmdirSync"] as const) {
@@ -116,6 +119,97 @@ it.runIf(process.platform === "linux")("verifies an unchanged expired receipt by
   expect(probe.calls[0]).toEqual({ target: file, ino, deleter: "meshDedupeReceiptPrune", removed: true });
   expect(receiptRemovals(file)).toEqual([]);
   expect(fs.existsSync(file)).toBe(true); // dry run: nothing was deleted
+});
+
+// F-01: a dead publisher's intent (nothing committed at its offset) in a no-archive store, judged by the retry.
+const intentText = (key: string, eventId: string, reservedSequence: number) =>
+  JSON.stringify({ dedupeKey: key, reservedSequence, eventId, liveOffset: 0 });
+const seedIntent = (options: ConstructorParameters<typeof MeshStore>[3] = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-8907-"));
+  roots.push(root);
+  fs.mkdirSync(path.join(root, "event-receipts"), { mode: 0o700 });
+  const file = receiptPath(root, "k").replace(/\.json$/, ".pending.json");
+  fs.writeFileSync(file, intentText("k", "dead-id", 1), { mode: 0o600 });
+  return { root, file, ino: fs.lstatSync(file).ino, store: new MeshStore(root, 1024, 100, options) };
+};
+/** Runs `act` once, right after the settle read the intent's bytes (between judgment and removal, shared by main's
+ * by-path primitive and the verifier). */
+const afterIntentRead = (file: string, act: () => void) => {
+  const readFileSync = fs.readFileSync;
+  const state = { fired: false };
+  vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    const text = (readFileSync as (...args: unknown[]) => unknown)(target, ...rest);
+    if (target === file && !state.fired) { state.fired = true; act(); }
+    return text;
+  }) as never);
+  return state;
+};
+const installSuccessor = (file: string) => {
+  fs.writeFileSync(`${file}.swap`, intentText("k", "successor-id", 7), { mode: 0o600 });
+  fs.renameSync(`${file}.swap`, file);
+};
+const nothingWritten = (root: string) => {
+  for (const name of ["sequence", "events.jsonl", "generation"]) expect(fs.existsSync(path.join(root, name))).toBe(false);
+  expect(fs.existsSync(receiptPath(root, "k"))).toBe(false);
+};
+
+it.runIf(process.platform === "linux")("refuses a no-archive intent swapped after judgment and never overwrites it", async () => {
+  const { root, file, ino, store } = seedIntent();
+  const swap = afterIntentRead(file, () => installSuccessor(file));
+  await expect(store.publish({ topic: "mesh.8907", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(swap.fired).toBe(true);
+  const successor = fs.lstatSync(file).ino;
+  expect(successor).not.toBe(ino); // a real new inode was installed
+  expect(probe.calls).toEqual([{ target: file, ino, deleter: "meshDedupeIntent", removed: false }]);
+  expect(fs.lstatSync(file).ino).toBe(successor);
+  expect(JSON.parse(fs.readFileSync(file, "utf8") as string)).toMatchObject({ eventId: "successor-id", reservedSequence: 7 });
+  expect(receiptRemovals(file)).toEqual([]); // the intent name's primitive was never reached
+  nothingWritten(root);
+});
+
+it.runIf(process.platform === "linux")("settles an unchanged stale intent by its judged inode and publishes fresh", async () => {
+  const { file, ino, store } = seedIntent();
+  await expect(store.publish({ topic: "mesh.8907", from, dedupeKey: "k" })).resolves.toMatchObject({ dedupeKey: "k", sequence: 1 });
+  expect(probe.calls[0]).toEqual({ target: file, ino, deleter: "meshDedupeIntent", removed: true });
+  expect(receiptRemovals(file)).toEqual([]);
+});
+
+it.runIf(process.platform === "linux")("treats an intent confirmed gone before verification as settled", async () => {
+  const { file, ino, store } = seedIntent();
+  // Moved away (a test rename, not a product delete) before the verifier opens it: confirmed absent, no graveyard.
+  afterIntentRead(file, () => real.renameSync(file, path.join(trash, randomUUID())));
+  await expect(store.publish({ topic: "mesh.8907", from, dedupeKey: "k" })).resolves.toMatchObject({ dedupeKey: "k", sequence: 1 });
+  expect(probe.calls[0]).toEqual({ target: file, ino, deleter: "meshDedupeIntent", removed: false });
+  expect(receiptRemovals(file)).toEqual([]);
+});
+
+it.runIf(process.platform === "linux")("never treats a graveyard-held refusal as an absent intent", async () => {
+  const { root, file, store } = seedIntent();
+  const held = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-8907-grave-"));
+  roots.push(held);
+  probe.graveyard = target => {
+    const graveyard = path.join(held, path.basename(target));
+    real.renameSync(target, graveyard); // the name is now absent, the entry held
+    return { removed: false, reason: "target inode was replaced since judgment (swapped during removal; left in the graveyard)", graveyard };
+  };
+  await expect(store.publish({ topic: "mesh.8907", from, dedupeKey: "k" })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(fs.existsSync(file)).toBe(false);
+  expect(probe.calls).toHaveLength(1);
+  nothingWritten(root);
+});
+
+it.runIf(process.platform === "linux")("compaction stops before rewriting the log when an intent removal is refused", async () => {
+  const { root, file, ino, store } = seedIntent({ maxEventLogBytes: 1 });
+  const line = (sequence: number) => JSON.stringify({ id: `fill-${sequence}`, sequence, topic: "mesh.8907", kind: "message", from, text: "x".repeat(600), createdAt: 1 });
+  fs.writeFileSync(path.join(root, "events.jsonl"), `${line(1)}\n${line(2)}\n`, { mode: 0o600 });
+  const swap = afterIntentRead(file, () => installSuccessor(file));
+  await expect(store.publish({ topic: "mesh.8907", from })).rejects.toBeInstanceOf(MeshDedupeRecoveryError);
+  expect(swap.fired).toBe(true);
+  expect(probe.calls).toEqual([{ target: file, ino, deleter: "meshDedupeIntent", removed: false }]);
+  expect(JSON.parse(fs.readFileSync(file, "utf8") as string)).toMatchObject({ eventId: "successor-id" });
+  expect(fs.existsSync(path.join(root, "generation"))).toBe(false); // the log was not rewritten
+  expect((fs.readFileSync(path.join(root, "events.jsonl"), "utf8") as string).startsWith(`${line(1)}\n`)).toBe(true);
+  expect(receiptRemovals(file)).toEqual([]);
 });
 
 it("off Linux runs main's removal as the fallback and propagates its failure", async () => {

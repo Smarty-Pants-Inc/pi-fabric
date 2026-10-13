@@ -61,6 +61,8 @@ export const readDenyCommands = (raw = process.env[DENY_COMMANDS_ENV]): string[]
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error(`${DENY_COMMANDS_ENV} is not valid JSON`); }
   checkDenyCommands(value);
+  // The worker's encoding of an empty list is the unset variable: a present "[]" is malformed too (round 2 P2).
+  if ((value as string[]).length === 0) throw new Error(`${DENY_COMMANDS_ENV} is present but lists no command`);
   return (value as string[]).map((command) => command.trim());
 };
 

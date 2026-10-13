@@ -104,6 +104,9 @@ describe("denyCommands carried to the child (smarty-dev#8758 item 3)", () => {
     const { manager } = managerIn("child-contract");
     await expect(manager.run({ ...EXT })).rejects.toThrow("PI_FABRIC_DENY_COMMANDS is present but empty");
     await expect(manager.run({ ...EXT, denyCommands: ["git"] })).rejects.toThrow("present but empty");
+    // A present serialized empty list is malformed too: the worker never sets one (round 2 P2).
+    process.env.PI_FABRIC_DENY_COMMANDS = "[]";
+    await expect(manager.run({ ...EXT })).rejects.toThrow("PI_FABRIC_DENY_COMMANDS is present but lists no command");
   }, 30_000);
 
   it("a confined caller cannot drop or shorten its list; omitting it inherits, and adding to it is allowed", async () => {

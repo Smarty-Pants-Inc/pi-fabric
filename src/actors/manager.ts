@@ -5432,7 +5432,11 @@ export class ActorManager {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     if (this.#closing || this.#canConsumeMesh?.() === false) return;
-    if (this.#persistent && this.meshConfig.enabled) void this.#startMeshRetentionSweep();
+    // smarty-dev#9508: joined, so close's await of #retentionSweep covers script preparation and a pending acquire.
+    if (this.#persistent && this.meshConfig.enabled) {
+      await this.#startMeshRetentionSweep();
+      if (this.#closing) return;
+    }
     if (this.#deadSessionReap && this.#persistent && this.meshConfig.enabled) {
       void this.#notifications.enqueue(() => reapDeadSessionPresence(this.mesh, this.identity, {
         ownSessionId: this.sessionId,

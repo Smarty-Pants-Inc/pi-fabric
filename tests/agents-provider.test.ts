@@ -2537,38 +2537,51 @@ describe("AgentsProvider runner support", () => {
     }
   });
 
-  it("#201 never exposes a sensitive marker through projectAgent provider construction or invocation", async () => {
+  // Decision C: provider-construction unit probes, NOT new-Pi-session E2E.
+  // Named E2E: malformed .local/lead starts a new Pi session and warns; fabric-v2, after install.
+  it.each(["garbage", "empty", "directory", "symlink"])("provider starts with an ignored %s marker and warns only once without exposing contents", async (kind) => {
+    if (kind === "symlink" && process.platform === "win32") return;
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-marker-error-"));
     roots.push(lane);
     fs.mkdirSync(path.join(lane, ".local"));
-    const secret = "ghp_sensitive_provider_marker_secret";
-    fs.writeFileSync(path.join(lane, ".local", "lead"), secret);
-    const lookup = async () => {
-      const { provider } = setup([], [], undefined, { cwd: lane });
-      return provider.invoke("projectAgent", {}, { ...context, cwd: lane });
-    };
-    await expect(lookup()).rejects.toMatchObject({
-      name: "FabricProjectLeadInvalidError", code: "FABRIC_PROJECT_LEAD_INVALID",
-      message: "Invalid project lead launch metadata: expected a regular, bounded marker containing session:<UUID>.",
+    const marker = path.join(lane, ".local", "lead");
+    if (kind === "directory") fs.mkdirSync(marker);
+    else if (kind === "symlink") fs.symlinkSync("/dev/null", marker);
+    else fs.writeFileSync(marker, kind === "empty" ? "" : "ghp_sensitive_provider_marker_secret");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { provider } = setup([], [], undefined, { cwd: lane });
+    await expect(provider.invoke("sessions", {}, { ...context, cwd: lane })).resolves.toEqual([]);
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).rejects.toMatchObject({
+      name: "FabricProjectAgentUnresolvedError", code: "FABRIC_PROJECT_AGENT_UNRESOLVED",
     });
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      `[pi-fabric] Ignoring invalid or unreadable project lead marker ${JSON.stringify(marker)}: expected session:<uuid>.`,
+    );
   });
 
-  it("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch", async () => {
+  it.each(["session:11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111"])("projectAgent resolves a moved lane's same-origin remote lead using the id captured at launch: %s", async (marker) => {
     const lane = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-moved-lane-"));
     roots.push(lane);
     const git = (...args: string[]) => execFileSync("git", args, { cwd: lane, stdio: "ignore" });
     git("init", "-q");
     git("remote", "add", "origin", "git@github.com:Smarty-Pants-Inc/pi-fabric.git");
     fs.mkdirSync(path.join(lane, ".local"));
-    fs.writeFileSync(path.join(lane, ".local", "lead"), "session:11111111-1111-4111-8111-111111111111\n");
+    fs.writeFileSync(path.join(lane, ".local", "lead"), `${marker}\n`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = { ownerIncarnation: "fixture:owner", format: 1, kind: "root", name: "main", status: "idle", runner: "pi", transport: "host",
       capabilities: ["steer", "followUp", "fabric"], startedAt: 1, updatedAt: 2, controlProtocol: "v1", local: false,
       stale: false, role: "project-agent", repository: "github.com/smarty-pants-inc/pi-fabric", project: "/remote/repo", cwd: "/remote/repo" };
     const lead = { ...base, id: "session:11111111-1111-4111-8111-111111111111", rootId: "session:11111111-1111-4111-8111-111111111111", ownerHostId: "remote", ownerIdentityId: "remote", remoteHost: "forge" } as FabricParticipantInfo;
     const other = { ...base, id: "session:newer", rootId: "session:newer", ownerHostId: "other", ownerIdentityId: "other", startedAt: 99 } as FabricParticipantInfo;
     const { provider } = setup([], [other, lead], undefined, { cwd: lane });
+    expect(fs.readFileSync(path.join(lane, ".local", "lead"), "utf8")).toBe(`${marker}\n`);
     fs.writeFileSync(path.join(lane, ".local", "lead"), "session:newer\n"); // must not change launch identity
     await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
+    expect(warn).not.toHaveBeenCalled();
+    lead.repository = "github.com/foreign/repo";
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).rejects.toMatchObject({
+      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("belongs to another repository"),
+    });
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.

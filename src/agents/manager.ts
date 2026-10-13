@@ -751,6 +751,7 @@ const failedRecord = (
     ...(managed.kernel ? { kernel: managed.kernel } : {}),
     transport: managed.transport.kind,
     ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+    ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
     cwd: managed.cwd,
     ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
     startedAt: now,
@@ -1048,7 +1049,7 @@ export class AgentManager {
     this.#budgetOwned =
       !inheritedBudget && this.#currentDepth === 0 && config.budgetUsd > 0;
     const adapters: AgentTransportAdapter[] = [
-      new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath),
+      new ProcessTransport(config.processSlice, config.placement, options.placementConfigPath, config.processMemoryMaxBytes),
       new TmuxTransport(),
       new ScreenTransport(),
       new LocaltermTransport(),
@@ -3948,9 +3949,14 @@ export class AgentManager {
       // join against the generic RPC grace: its escalation can start at the
       // grace boundary, and the captured child must still be reaped afterwards.
       if (managed.transport.stopDebt && managed.transport.waitForClose &&
-          managed.transport.lostContact?.() === undefined) {
+          (managed.transport.cgroup !== undefined || managed.transport.lostContact?.() === undefined)) {
+        // A capped scope must still join its actual subtree after a prior watcher
+        // failure. Do not let immutable observation debt swallow a typed PID stop
+        // failure or substitute logical stop for the live boundary's teardown.
         try { await this.#stopManagedTransport(managed); }
-        catch {
+        catch (error) {
+          // smarty-dev#8257: keep core's typed capped-cgroup stop failure (and its code) visible at agents.stop.
+          if ((error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError") throw error;
           throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
         }
       }
@@ -5169,6 +5175,7 @@ export class AgentManager {
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       transport: managed.transport.kind,
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+      ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       cwd: managed.cwd,
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(model ? { model } : {}),
@@ -5244,6 +5251,7 @@ export class AgentManager {
       runner: managed.runner,
       ...(managed.kernel ? { kernel: managed.kernel } : {}),
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
+      ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),

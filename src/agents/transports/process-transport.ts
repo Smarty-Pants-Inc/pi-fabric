@@ -50,20 +50,70 @@ const selectWorkerRelease = (workerPath: string): { workerPath: string; fabricRe
   return fallback;
 };
 
+/** Default per-task memory.max (24 GiB, swap 0), mirrored from config to keep this module light. */
+const DEFAULT_TASK_MEMORY_MAX_BYTES = 24 * 1024 ** 3;
+
+const isSocket = (file: string): boolean => {
+  try { return fs.statSync(file).isSocket(); } catch { return false; }
+};
+
+/**
+ * smarty-dev#8257: cheap, D-Bus-free proof that `systemd-run --user --scope` can
+ * create a memory-capped scope. All of: Linux, unified cgroup v2, an explicit and
+ * usable user-bus environment (XDG_RUNTIME_DIR/bus or a unix:path=
+ * DBUS_SESSION_BUS_ADDRESS socket; a bare /run/user socket is not enough, so
+ * scrubbed test environments stay legacy), and the memory controller delegated
+ * to this UID's user manager. Any doubt answers false: the launch stays legacy.
+ */
+export const delegatedUserCgroupAvailable = (
+  environment: NodeJS.ProcessEnv = process.env,
+  cgroupRoot = "/sys/fs/cgroup",
+): boolean => {
+  if (process.platform !== "linux") return false;
+  const uid = process.getuid?.();
+  if (uid === undefined) return false;
+  const runtime = environment.XDG_RUNTIME_DIR;
+  const bus = environment.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
+  const busUsable = (runtime && path.isAbsolute(runtime) && isSocket(path.join(runtime, "bus")))
+    || (bus && path.isAbsolute(bus) && isSocket(bus));
+  if (!busUsable) return false;
+  try {
+    if (!fs.statSync(path.join(cgroupRoot, "cgroup.controllers")).isFile()) return false;
+    const manager = path.join(cgroupRoot, "user.slice", `user-${uid}.slice`, `user@${uid}.service`);
+    return fs.readFileSync(path.join(manager, "cgroup.subtree_control"), "utf8").split(/\s+/).includes("memory");
+  } catch { return false; }
+};
+
+/** Exact flag-position `--actor-id` only; a flag-shaped value is not an actor identity. */
+const isActorLaunch = (workerArguments: readonly string[]): boolean =>
+  workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id");
+
 export class ProcessTransport implements AgentTransportAdapter {
   readonly kind = "process" as const;
   #scopeWarningLogged = false;
 
   readonly #placement: () => AgentPlacementConfig | undefined;
 
-  constructor(private readonly processSlice?: string, placement?: AgentPlacementConfig, placementConfigPath?: string) {
+  readonly #memoryMaxBytes: number;
+
+  constructor(
+    private readonly processSlice?: string,
+    placement?: AgentPlacementConfig,
+    placementConfigPath?: string,
+    memoryMaxBytes: number = DEFAULT_TASK_MEMORY_MAX_BYTES,
+  ) {
     this.#placement = placementConfigPath ? liveAgentPlacement(placementConfigPath, placement) : () => placement;
+    if (!Number.isSafeInteger(memoryMaxBytes) || memoryMaxBytes <= 0) {
+      throw new Error("ProcessTransport memoryMaxBytes must be a positive safe integer");
+    }
+    this.#memoryMaxBytes = memoryMaxBytes;
   }
 
   #warnScope = (reason: string): void => {
     if (this.#scopeWarningLogged) return;
     this.#scopeWarningLogged = true;
-    console.warn(`[pi-fabric] agents.processSlice=${this.processSlice}: ${reason}; launching worker normally`);
+    const source = this.processSlice ? `agents.processSlice=${this.processSlice}` : "default task memory cap (app.slice)";
+    console.warn(`[pi-fabric] ${source}: ${reason}; launching worker normally`);
   };
 
   async available(): Promise<boolean> {
@@ -121,8 +171,28 @@ export class ProcessTransport implements AgentTransportAdapter {
     }
     // Check on Main only after the remote decision; required paths may exist solely on the target.
     assertAgentRequiredInputsExist(requires, file => fs.existsSync(file));
-    const executable = this.processSlice && process.platform === "linux" ? findExecutable("systemd-run") : undefined;
+    const actor = isActorLaunch(request.workerArguments);
+    // smarty-dev#8257: tasks get their own memory-capped scope only on a proven
+    // delegated v2 user manager. Actors and unproven hosts keep the legacy path:
+    // explicit processSlice still scopes them uncapped; otherwise no systemd-run.
+    const capEligible = !actor && process.platform === "linux" && delegatedUserCgroupAvailable();
+    const slice = this.processSlice ?? (capEligible ? "app.slice" : undefined);
+    // A nested Fabric launch needs the real backend, not its parent's command
+    // shim: the shim keeps ordinary suites in the parent leaf and cannot admit
+    // a new task scope. Preserve PATH for task commands; exclude only that exact
+    // launcher-owned wrapper from this backend lookup.
+    const wrapper = process.env.FABRIC_TASK_SYSTEMD_RUN_WRAPPER;
+    const backendEnvironment = wrapper ? {
+      ...process.env,
+      PATH: (process.env.PATH ?? "").split(path.delimiter)
+        .filter(directory => path.resolve(directory, "systemd-run") !== wrapper).join(path.delimiter),
+    } : process.env;
+    const executable = slice && process.platform === "linux" ? findExecutable("systemd-run", backendEnvironment) : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
+    const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number } | undefined =
+      executable && slice
+        ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}) }
+        : undefined;
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
     if (selected.extensionPath) {
@@ -153,17 +223,20 @@ export class ProcessTransport implements AgentTransportAdapter {
       // Worker arguments are flag/value pairs. A flag-shaped value is not an
       // actor identity; explicit actor ids alone retain the parent's role env.
       applyTaskReturnAddress(
-        workerArguments.some((arg, index) => index % 2 === 0 && arg === "--actor-id")
-          ? { ...process.env } : taskAgentEnvironment(),
+        isActorLaunch(workerArguments) ? { ...process.env } : taskAgentEnvironment(),
         workerArguments,
       ),
-      executable ? { executable, slice: this.processSlice!, warn: this.#warnScope } : undefined,
+      scope,
       7_000, // allow the worker's five-second execution-child cleanup
       process.platform !== "win32", // Windows retains its native-close/helper contract
     );
+    // Core sets cgroup only after admitting a capped receipt; structural read keeps
+    // this compatible with handles that never carry one.
+    const { cgroup } = processHandle as typeof processHandle & { cgroup?: string };
     return {
       kind: this.kind,
       ...(selected.fabricRelease ? { fabricRelease: selected.fabricRelease } : {}),
+      ...(cgroup ? { cgroup } : {}),
       sessionId: String(processHandle.pid),
       ...(processHandle.treeClosed ? { liveness: "events" as const } : {}),
       isAlive: processHandle.isAlive,

@@ -841,6 +841,114 @@ model/effort; the public calls retain their ordinary Fabric execution audit.
 Native artifact proof (keyless, offline real Pi RPC; no external inference):
 `nice -n 19 node scripts/prove-main-bindings.mjs dist/index.js "$TASK_OUT"`.
 
+### Per-task memory cap (Linux, smarty-dev#8257)
+
+On a host where the check passes, each process **task** runs in its own transient
+systemd user scope with `memory.max` set to `agents.processMemoryMaxBytes` and
+swap capped at 0. The default is 24 GiB, and only root policy can change it (see
+[configuration](configuration.md)). A runaway task then hits its own OOM boundary
+instead of exhausting the host. Stopping the task stops its whole scope.
+
+To be eligible, a launch must be a task: the worker arguments carry no exact
+`--actor-id` flag. The host must also pass these checks:
+
+- Linux with unified cgroup v2.
+- An explicit, usable user-bus environment (`$XDG_RUNTIME_DIR/bus` or a
+  `unix:path=` `DBUS_SESSION_BUS_ADDRESS` socket).
+- The `memory` controller delegated to the user manager.
+- `systemd-run` on `PATH`.
+
+These checks only stat or read files; Fabric runs no D-Bus command. The scope goes
+in `agents.processSlice` when root policy sets it, and in `app.slice` otherwise.
+
+Everything else keeps the legacy launch exactly. This covers actors, non-Linux
+hosts, and scrubbed environments such as CI or `smarty-test-env`. Without an
+explicit `processSlice` they do not run `systemd-run`, and an explicit slice still
+gives an uncapped scope as before.
+
+Task environments drop inherited `FABRIC_TASK_MEMORY_MAX`,
+`FABRIC_TASK_CGROUP` and `FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The launcher
+exports them into the task's worker only after it admits a capped receipt. The
+worker passes those same values to its own native agent (same run), which is how
+that agent's bash hook and `PATH` see the cap. They never come from a parent. The admitted path appears as
+`cgroup` on the run record and handle. A missing `cgroup` means the task ran
+uncapped.
+
+#### Task-local `systemd-run`
+
+Tasks often run `systemd-run --user --scope ... -- CMD`. A real scope would leave
+the task's capped cgroup leaf, and stopping the task would not stop it. After the
+boundary is verified, the launcher writes a task-local shim to
+`<scope root>/bin/systemd-run` (mode 0700). It puts that directory first on
+`PATH` and exports its path as `FABRIC_TASK_SYSTEMD_RUN_WRAPPER`. The shim is a
+self-contained POSIX `sh` script, so it needs no Node or Bun features.
+
+- **`--user --scope` from inside the task leaf** (or a cgroup nested under it):
+  the shim parses the options strictly and then `exec`s `CMD` in place. The pid
+  is the same, the cgroup leaf is the same, and argv is passed through byte for
+  byte. Nothing is evaluated, and `${VAR}` is not expanded. A task stop therefore
+  stops `CMD` too.
+  - Accepted options: `--user`, `--scope`, `-q`/`--quiet`, `-G`/`--collect`,
+    `--no-ask-password`, `--description` and `-u`/`--unit`. Unit names are
+    validated, then ignored. `-p`/`--property` accepts `MemoryMax=` and
+    `MemorySwapMax=` only. Separate, `=` and attached (`-pX`) forms all work.
+    Sizes are `N`, `NK`, `NM`, `NG`, `NT` or `infinity`.
+  - Any other option or property in this mode (`--slice`, `--setenv`,
+    `--machine`, `CPUQuota=`, `1.5G` and so on) exits 1 with a message. It never
+    falls through to the real binary, which would create an escaping scope.
+- **Every other mode** (`--version`, service units without `--scope`, a
+  system-manager `--scope` without `--user`) runs the absolute real
+  `systemd-run` with the original arguments. So does a process outside the
+  task leaf, which the cap never covered.
+
+**Tighter limits apply to the whole task (ponytail tradeoff).** A process in a
+leaf cgroup that holds processes cannot get its own memory sub-cgroup (cgroup v2
+has a no-internal-processes rule), and a real separate scope would escape. So
+`MemoryMax=X` lowers the **whole task leaf's** `memory.max` to
+`min(X, current memory.max, agents.processMemoryMaxBytes)`, and that lower cap
+lasts for the rest of the task. The shim refuses the request, without changing
+anything, unless all of these hold:
+
+- the leaf's swap is 0;
+- `memory.max` is a byte cap;
+- the new cap is above the task's current `memory.current`.
+
+It never raises the cap. `MemorySwapMax=` is only validated, because swap is
+already 0. A later `systemctl --user daemon-reload` can reset `memory.max` to the
+scope's own `MemoryMax` (the root cap), which is never higher than the root cap.
+
+Inside a capped task, the native `bash` tool's hook allows plain `systemd-run` on
+`PATH` only when all of these hold:
+
+- `FABRIC_TASK_SYSTEMD_RUN_WRAPPER` is truthful: the first executable
+  `systemd-run` on `PATH` resolves to it.
+- The command does not rewrite lookup. That rules out `PATH` assignments or
+  `unset`/`read PATH`, `hash`/`alias`, `sudo`/`doas`/`busybox`, `command -p`, and
+  `env -i`/`-u`/`-S`/`-`.
+
+PATH-preserving wrappers such as `nice`, `timeout`, `env X=1` and `bash -c` work,
+and so does the shim's own absolute path. Any other absolute or path-qualified
+spelling, such as `/usr/bin/systemd-run` or `./systemd-run`, is refused, as are
+plain spellings when the shim is not truthful. The reason says the cap is
+already applied. Uncapped fallbacks and Mains still allow the same commands.
+
+This guard covers supported agent tools. It is **not a security sandbox**:
+
+- Scripts, other tools and same-UID native code can still call the real binary
+  or the user manager.
+- The check reads command words only. A `bash -c` that merely mentions an
+  absolute `systemd-run` is refused too.
+- Pi's bash tool may prepend its own bin directory to `PATH`, and the check does
+  not model that directory.
+
+The shim and its scratch directory live until the task boundary is really
+closed.
+
+Ponytail tradeoff: Fabric gives each task its own cap. It does not scan or
+account for other user units, so it does not enforce a host-wide total, and a
+host running many tasks can still commit more than its RAM. Set aggregate limits
+on the slice itself.
+
 ### Transports
 
 **Execution-custody scope cut (smarty-dev#2566 / pi-fabric#218):** agent

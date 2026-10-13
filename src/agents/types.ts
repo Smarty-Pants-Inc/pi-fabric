@@ -199,6 +199,8 @@ export interface AgentCompactionStatus {
 export interface AgentRunRecord {
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   /** Always populated for new runs; optional for legacy records. */
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -328,6 +330,8 @@ export interface AgentHandleInfo {
   heldPermits?: number;
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
+  /** Admitted memory-capped task cgroup (smarty-dev#8257); absent when uncapped. */
+  cgroup?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
@@ -532,6 +536,9 @@ export interface AgentTransportHandle {
    * observation failure rejects, never authorizes collection/replacement.
    * Unverified scopes and unscoped workers omit this field entirely. */
   treeClosed?: Promise<void>;
+  /** Admitted, memory-capped task cgroup path (smarty-dev#8257). Present only after the
+   * launcher verified the capped scope receipt; uncapped/fallback launches omit it. */
+  cgroup?: string;
   /** Bounded diagnostic tail for workers that fail before writing a status record. */
   readStderr?(): string;
   isAlive(options?: AgentTransportObservationOptions): Promise<boolean>;

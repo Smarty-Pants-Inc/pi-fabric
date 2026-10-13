@@ -662,8 +662,10 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_priority_error", error: message })}\n`));
   }
   // smarty-dev#2339 F4: a nested actor gets its own default, never its parent's override.
+  // smarty-dev#8257: this is the same run's native child, so it keeps the boundary evidence
+  // (memory cap, cgroup, systemd-run shim) that the launcher exported into this worker.
   const childEnvironment = applyTaskReturnAddress(
-    options.actorId ? { ...process.env } : taskAgentEnvironment(), process.argv.slice(2),
+    options.actorId ? { ...process.env } : taskAgentEnvironment(process.env, true), process.argv.slice(2),
   );
   // Native session metadata belongs to this child, never its parent/resident host.
   delete childEnvironment.PI_SESSION_ID;

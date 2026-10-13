@@ -634,8 +634,16 @@ describe.skipIf(process.platform !== "linux")("scoped tree-empty event delivery"
   });
 });
 
+// smarty-dev#8257: a bus socket on disk is not a usable bus; systemd-run --user needs it in THIS
+// environment (the no-bus suite wrapper scrubs it). A delegated host now admits a capped task scope.
+const userBusUsable = (): boolean => {
+  const runtime = process.env.XDG_RUNTIME_DIR;
+  const bus = process.env.DBUS_SESSION_BUS_ADDRESS?.match(/^unix:path=([^,;]+)/)?.[1];
+  const socket = (file: string | undefined) => { try { return Boolean(file) && fs.statSync(file!).isSocket(); } catch { return false; } };
+  return socket(runtime ? path.join(runtime, "bus") : undefined) || socket(bus);
+};
 describe.skipIf(process.platform !== "linux")("real owned systemd user scope", () => {
-  it.skipIf(!fs.existsSync(`/run/user/${process.getuid?.()}/bus`))("waits for a real cgroup-v2 descendant after primary native close", async () => {
+  it.skipIf(!userBusUsable())("waits for a real cgroup-v2 descendant after primary native close", async () => {
     const directory = root();
     const workerPath = path.join(directory, "scoped-worker.mjs");
     const descendant = `const fs = require("node:fs");
@@ -655,7 +663,9 @@ describe.skipIf(process.platform !== "linux")("real owned systemd user scope", (
       expect(handle.treeClosed).toBeInstanceOf(Promise);
       const pid = Number(handle.sessionId);
       const cgroup = fs.readFileSync(`/proc/${pid}/cgroup`, "utf8").trim();
-      expect(cgroup).toMatch(/^0::\/.*\/app\.slice\/fabric-scope-.+\.scope$/);
+      const { delegatedUserCgroupAvailable } = await import("../src/agents/transports/process-transport.js");
+      expect(cgroup).toMatch(delegatedUserCgroupAvailable()
+        ? /^0::\/.*\/app\.slice\/fabric-task-.+\.scope$/ : /^0::\/.*\/app\.slice\/fabric-scope-.+\.scope$/);
       expect(fs.statSync(`/sys/fs/cgroup${cgroup.slice(3)}`).uid).toBe(process.getuid!());
       await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "worker-ready"))).toBe(true), { timeout: 3_000 });
       expect(await handle.isAlive()).toBe(true); // retain the separate descendant birth before reparenting

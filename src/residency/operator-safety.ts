@@ -136,6 +136,11 @@ const checkPid = (pid: number, host: string, startedAt: number | undefined): Mai
   return { pid, host, onThisHost, alive, startMatches };
 };
 
+/** A /proc/<pid>/stat field 22 start time as the kernel prints it: canonical unsigned decimal (%llu), no sign, space,
+ * fraction, exponent, hex or leading zero, at most 2^64-1. Compared as strings, so no Number precision loss. */
+const procStartTick = (value: unknown): value is string => typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) &&
+  BigInt(value) <= BigInt("18446744073709551615");
+
 /** The recorded Main process is gone from this host ("gone: ..."), or why that cannot be verified. */
 const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unknown } | undefined): string => {
   if (process.platform !== "linux") return "unknown: Main process identity unavailable (non-Linux; smarty-dev#7956)";
@@ -147,6 +152,10 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
   if (typeof main.startTime !== "string" || !main.startTime) {
     return `unknown: Main process identity unavailable (no start time for pid ${main.pid} in the root participant record)`;
   }
+  // pi-fabric#1031 round 3: a malformed start time is no identity either, before pid-absence or reuse can prove anything.
+  if (!procStartTick(main.startTime)) {
+    return `unknown: Main process identity unavailable (malformed start time ${JSON.stringify(main.startTime)} for pid ${main.pid} in the root participant record)`;
+  }
   if (processStartTime(process.pid) === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
   let exists: boolean;
   try { fs.statSync(`/proc/${main.pid}`); exists = true; }
@@ -156,7 +165,7 @@ const mainProcessGone = (main: { pid?: unknown; host?: unknown; startTime?: unkn
   }
   if (!exists) return `gone: Main pid ${main.pid} does not exist on this host`;
   const current = processStartTime(main.pid);
-  if (current === undefined) return "unknown: Main process identity unavailable (/proc is unreadable)";
+  if (!procStartTick(current)) return "unknown: Main process identity unavailable (/proc is unreadable)";
   if (current === main.startTime) return `live: Main process ${main.pid} is alive on this host`;
   return `gone: Main pid ${main.pid} was reused (start time ${current}, recorded ${main.startTime})`;
 };

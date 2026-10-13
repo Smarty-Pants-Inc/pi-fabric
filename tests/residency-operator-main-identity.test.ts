@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
-import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
+import { readResidentOperatorEvidence, ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { createHash } from "node:crypto";
@@ -114,6 +114,51 @@ describe.skipIf(process.platform !== "linux")("live operator removal final check
         refused(await operatorRemove(f, () => f.mainParticipant(STALE(), f.config.rootId, mainProcess)), /identity unavailable/);
       } finally { await f.close(); }
     }, 60_000);
+
+  // pi-fabric#1031 round 3 (c6148722668): a malformed recorded start time is no identity: unknown, never "reused".
+  const BAD = ["not-a-proc-tick", " 1", "1 ", "+1", "-1", "1.0", "1e3", "0x1", "01", "18446744073709551616"];
+  it.each(BAD.map(startTime => [startTime] as const))("malformed start time %j on the live current pid refuses", async startTime => {
+    const f = await fixture();
+    try {
+      refused(await operatorRemove(f, () => f.mainParticipant(STALE(), f.config.rootId,
+        { pid: process.pid, host: os.hostname(), startTime })), /identity unavailable \(malformed start time/);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("malformed start time on a gone pid refuses (unknown, not gone)", async () => {
+    const f = await fixture();
+    try {
+      refused(await operatorRemove(f, () => f.mainParticipant(STALE(), f.config.rootId, { ...GONE, startTime: "not-a-proc-tick" })),
+        /identity unavailable \(malformed start time/);
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("control: the live current pid with a valid but different start tick is a reused pid; removed under the fence", async () => {
+    const f = await fixture();
+    try {
+      const other = String(BigInt(processStartTime(process.pid)!) + 1n);
+      allowed(await operatorRemove(f, () => f.mainParticipant(STALE(), f.config.rootId,
+        { pid: process.pid, host: os.hostname(), startTime: other })));
+    } finally { await f.close(); }
+  }, 60_000);
+
+  it("offline --main-stopped evidence (shared verdict): malformed is unknown, a valid different tick is stale/reused", async () => {
+    const f = await fixture();
+    try {
+      const mesh = new MeshStore(f.config.meshRoot, 64 * 1024, 1_000);
+      const verdict = (startTime: string) => {
+        f.mainParticipant(STALE(), f.config.rootId, { pid: process.pid, host: os.hostname(), startTime });
+        return readResidentOperatorEvidence(f.config, mesh, undefined, { mainStopped: true });
+      };
+      const bad = verdict("not-a-proc-tick");
+      expect(bad.mainLiveness).toMatch(/^unknown: .*malformed start time/);
+      expect(bad.liveLease).toBe(true);
+      const reused = verdict(String(BigInt(processStartTime(process.pid)!) + 1n));
+      expect(reused.mainLiveness).toMatch(/^stale:/);
+      expect(reused.toolEvidence?.participants.every(p => /^gone: .* was reused/.test(p.identity))).toBe(true);
+      expect(reused.liveLease).toBe(false);
+    } finally { await f.close(); }
+  }, 60_000);
 
   it("a fresh record refuses even when its pid is gone", async () => {
     const f = await fixture();

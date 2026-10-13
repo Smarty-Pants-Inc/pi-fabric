@@ -734,8 +734,9 @@ it.runIf(process.platform === "linux")("r5: a failed install link (EPERM) refuse
   const original = rawBytes(seeded.file);
   const linkSync = fs.linkSync;
   const installs: string[] = [];
+  // The link-support probe passes; only the install link onto the intent name fails (EPERM).
   const link = vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
-    if (String(source).endsWith(".tmp")) { installs.push(String(target)); throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" }); }
+    if (String(source).endsWith(".tmp") && String(target) === seeded.file) { installs.push(String(target)); throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" }); }
     return linkSync(source, target);
   }) as never);
   const outcome = await restoreOutcome(seeded);
@@ -756,8 +757,13 @@ it.runIf(process.platform === "linux")("r5: a restore interrupted between claim 
   const seeded = seedArchived();
   const { event, deadIno } = await seedRestore(seeded);
   const original = rawBytes(seeded.file);
-  // Emulated death in the window: every link fails, so neither the install nor the put-back runs; only the claim remains.
-  const link = vi.spyOn(fs, "linkSync").mockImplementation((() => { throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" }); }) as never);
+  // Emulated death in the window: every link onto the intent name fails (the private probe passes), so neither the
+  // install nor the put-back runs; only the claim remains.
+  const linkSync = fs.linkSync;
+  const link = vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+    if (String(target) === seeded.file) throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" });
+    return linkSync(source, target);
+  }) as never);
   const outcome = await restoreOutcome(seeded);
   expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
   expect(real.lstatSync(seeded.file, { throwIfNoEntry: false })).toBeUndefined();
@@ -776,4 +782,71 @@ it.runIf(process.platform === "linux")("r5: a restore interrupted between claim 
   // The in-flight claim's removal is requested (recorded, never executed here: #4664); the evidence names are never.
   expect(removals.filter(target => target.startsWith(`${seeded.file}.claim`))).toContain(`${seeded.file}.claim`);
   expect(removals.filter(target => target.startsWith(`${seeded.file}.claim-`))).toEqual([]);
+});
+
+// r5 review (Luna F-3): a volume without hard links is detected on the private staged file, before the intent moves.
+it.runIf(process.platform === "linux")("r5: a volume without hard links refuses before the intent moves", async () => {
+  const seeded = seedArchived();
+  const { deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  const linkSync = fs.linkSync;
+  const link = vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+    if (String(source).endsWith(".tmp")) throw Object.assign(new Error("EPERM: operation not permitted, link"), { code: "EPERM" });
+    return linkSync(source, target);
+  }) as never);
+  const outcome = await restoreOutcome(seeded);
+  link.mockRestore();
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect((outcome as Error).message).toMatch(/cannot hard-link/);
+  expect(real.lstatSync(seeded.file).ino).toBe(deadIno); // never claimed: the intent never left its name
+  expect(rawBytes(seeded.file).equals(original)).toBe(true);
+  expect(claimNames(seeded.file)).toEqual([]);
+  expect(fs.existsSync(receiptPath(seeded.root, "k"))).toBe(false);
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0);
+});
+
+// r5 review (Luna F-1): the claim is the fence until the restored name's directory barrier succeeds.
+it.runIf(process.platform === "linux")("r5: a failed directory barrier after the install keeps the claim as the fence", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file);
+  const linkSync = fs.linkSync;
+  const fsyncSync = fs.fsyncSync;
+  const state = { armed: false, failed: false };
+  const link = vi.spyOn(fs, "linkSync").mockImplementation(((source: fs.PathLike, target: fs.PathLike) => {
+    linkSync(source, target);
+    if (!state.failed && String(source).endsWith(".tmp") && String(target) === seeded.file) state.armed = true;
+  }) as never);
+  const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
+    if (state.armed && fs.fstatSync(fd).isDirectory()) { state.armed = false; state.failed = true; throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" }); }
+    return fsyncSync(fd);
+  }) as never);
+  const outcome = await restoreOutcome(seeded);
+  link.mockRestore(); fsync.mockRestore();
+  expect(state.failed).toBe(true);
+  expect((outcome as { code?: string }).code).toBe("EIO");
+  const claim = `${seeded.file}.claim`;
+  expect(real.lstatSync(claim).ino).toBe(deadIno); // neither unlinked nor moved to evidence
+  expect(rawBytes(claim).equals(original)).toBe(true);
+  expect(removals).not.toContain(claim);
+  expect(real.lstatSync(seeded.file).ino).not.toBe(deadIno); // the restored intent holds the name
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0);
+  // The next hold keeps the claim as evidence (a newer intent holds the name) and restores the same event once.
+  await expect(seeded.store.publish({ topic: "mesh.1036", from, dedupeKey: "k" })).resolves.toMatchObject({ id: event.id });
+  const live = (fs.readFileSync(path.join(seeded.root, "events.jsonl"), "utf8") as string).trim().split("\n");
+  expect(live.map(line => (JSON.parse(line) as { id: string }).id)).toEqual([event.id]);
+  expect(claimNames(seeded.file).some(name => /\.claim-[0-9a-f-]{36}$/.test(name))).toBe(true);
+});
+
+// r5 review (Luna F-2): a crash-left claim reserves its key's capacity slot until a hold links it back.
+it.runIf(process.platform === "linux")("r5: a claim-only key still counts against the dedupe capacity", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-1036-"));
+  roots.push(root);
+  fs.mkdirSync(path.join(root, "event-receipts"), { mode: 0o700 });
+  const claim = `${receiptPath(root, "a").replace(/\.json$/, ".pending.json")}.claim`;
+  fs.writeFileSync(claim, intentText("a", "a-id", 1), { mode: 0o600 });
+  const store = new MeshStore(root, 1024, 100, { maxDedupeReceipts: 1 });
+  await expect(store.publish({ topic: "mesh.1036", from, dedupeKey: "b" })).rejects.toBeInstanceOf(MeshDedupeStoreFullError);
+  expect(fs.existsSync(receiptPath(root, "b"))).toBe(false);
+  expect(rawBytes(claim).toString("utf8")).toBe(intentText("a", "a-id", 1));
 });

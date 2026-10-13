@@ -414,9 +414,13 @@ export class EventLog {
    * ponytail: there is no native compare-and-swap rename to use instead. Node exposes neither renameat2's
    * RENAME_NOREPLACE/RENAME_EXCHANGE nor a Windows equivalent, so rename-to-claim (take the name and learn what it
    * held) plus link(2) (install only if absent, the Maildir delivery primitive) is the portable form. NTFS supports
-   * hard links (EEXIST included). A failed link (EPERM, EXDEV, ENOTSUP: no hard links on that volume) refuses and
-   * links the claim back, never a replacing rename. The name is absent between (3) and (5): a crash there leaves only
-   * `<file>.claim`, which #reinstateIntentClaim links back under the next hold before this key is judged. */
+   * hard links (EEXIST included). Link support is probed on the private staged file before the intent moves (a probe
+   * against the intent name itself proves nothing: linkat reports EEXIST before EPERM/EXDEV), so a volume without hard
+   * links refuses with the intent untouched; a later failed link refuses and links the claim back, never a replacing
+   * rename. The name is absent between (3) and (5): a crash there leaves only `<file>.claim`, which
+   * #reinstateIntentClaim links back under the next hold before this key is judged. The claim goes only after the
+   * restored name's directory barrier succeeded (Windows has no directory fsync: like writeFileAtomic's durable mode,
+   * this relies on NTFS journaling metadata operations in order). */
   #replaceJudgedIntent(file: string, judged: fs.Stats, original: Buffer, restored: string, key: string): void {
     const changed = () => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent was replaced or refreshed and is kept`);
     const unreadable = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent is unreadable or changed and is kept`, { cause });
@@ -434,10 +438,18 @@ export class EventLog {
     const staged = `${file}.${process.pid}.${randomUUID()}.tmp`;
     const release = trackTemporary(staged);
     let claimed = false;
+    let linked = false;
     let installed = false;
     try {
       const fd = fs.openSync(staged, "wx", 0o600);
       try { fs.writeFileSync(fd, restored, { encoding: "utf8" }); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      const probe = `${staged}.link`;
+      try { fs.linkSync(staged, probe); }
+      catch (error) {
+        throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: this volume cannot hard-link the restored intent; the intent is kept`, { cause: error });
+      }
+      // ponytail: plain unlink of this process's private probe name (the staged inode keeps its own name).
+      try { fs.unlinkSync(probe); } catch { /* a stray probe name matches no intent, receipt or claim scan */ }
       if (!isOriginal(file, true)) throw changed();
       // Only this hold uses the in-flight name. #reinstateIntentClaim already linked any crash leftover back before the
       // judgment, so a claim still here only duplicates a name (its unlink failed): it moves to evidence, never over.
@@ -449,14 +461,17 @@ export class EventLog {
       if (!isOriginal(claim, false)) throw changed();
       try { fs.linkSync(staged, file); }
       catch (error) { throw errorCode(error) === "EEXIST" ? changed() : unreadable(error); }
-      installed = true;
+      linked = true;
       syncDirectoryChain(path.dirname(file)); // the restored name is durable before the claim goes
+      installed = true;
     } finally {
       try {
         if (installed) {
           // ponytail: plain unlink of private names. The claim is the original, proven above and superseded by this
           // hold's restore; the staged name is this process's temporary (the same inode is now named by `file`).
           try { fs.unlinkSync(claim); } catch { this.#keepIntentClaim(claim); }
+        } else if (linked) {
+          // The restored name is not proven durable: the claim stays the fence; the next hold moves it to evidence.
         } else if (claimed) {
           try { this.#reinstateIntentClaim(file); } catch { /* the claim stays for the next hold; this refusal stands */ }
         }
@@ -1490,8 +1505,9 @@ export class EventLog {
     let names: string[];
     try { names = fs.readdirSync(directory); }
     catch (error) { if (errorCode(error) === "ENOENT") return 0; throw error; }
-    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json$/.test(name))
-      .map(name => name.slice(0, -".pending.json".length)));
+    // An in-flight restore claim (pi-fabric#1036 r5) still reserves its key until a hold links it back.
+    const pending = new Set(names.filter(name => /^[a-f0-9]{64}\.pending\.json(\.claim)?$/.test(name))
+      .map(name => name.slice(0, name.indexOf(".pending.json"))));
     const receipts = names.filter(name => /^[a-f0-9]{64}\.json$/.test(name));
     let count = new Set([...pending, ...receipts.map(name => name.slice(0, -".json".length))]).size;
     const initialCount = count;

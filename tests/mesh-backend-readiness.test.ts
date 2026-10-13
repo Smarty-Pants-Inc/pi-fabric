@@ -185,6 +185,29 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(switchOverrideAlarms(root)).toEqual([]);
   });
 
+  it("still publishes the override alarm when the best-effort outcome append fails, warning without changing exit 0", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const record = path.join(root, "backend-switches.jsonl");
+    let failOutcome = false;
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+      if (failOutcome && String(file) === record && flags === "a") throw new Error("outcome append unwritable");
+      return open(file, flags, mode);
+    }) as typeof fs.openSync);
+    const switched = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], {
+      leaseProbe: { platform: "darwin" }, options: { beforeCommit: commit => { if (commit.phase === "sqlite") failOutcome = true; } } });
+    expect(switched.code, switched.err).toBe(0);
+    const json = JSON.parse(switched.out);
+    expect(switched.err).toContain(`could not append the switch outcome ${json.readers.switchId}: outcome append unwritable`);
+    expect(switched.err.split("\n").filter(line => line.includes("could not append the switch outcome"))).toHaveLength(1);
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(records(root).at(-1)).toMatchObject({ phase: "intent", switchId: json.readers.switchId });
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+    expect(switchOverrideAlarms(root)[0]).toMatchObject({ to: SWITCH_OWNER, data: { switchId: json.readers.switchId,
+      acceptedUnready: [{ name: "holder@lease-probe", reason: expect.stringContaining("not Linux") }] } });
+  });
+
   it("reports a missing override alarm recipient as post-commit failure, never as a broadcast", async () => {
     vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
     vi.stubEnv("SMARTY_LEAD_SESSION", "");

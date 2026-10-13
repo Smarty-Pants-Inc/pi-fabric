@@ -615,7 +615,8 @@ export const main = async (argv: string[], io: {
     if (gate) {
       const final = gate.final ?? gate.readiness;
       result.readers = { switchId: gate.switchId, ready: final.ready, acceptedUnready: final.unready, checkedUnderFence: gate.checked };
-      // Record the committed switch before publishing: a post-commit alarm failure never changes the switch record.
+      // Outcome append attempted, then alarm; the alarm does not depend on the append succeeding.
+      // A post-commit alarm failure never changes the switch record.
       result.switchRecord = closeGate(options.root, gate, warn, { ok: true, epoch: result.epoch, converged: result.converged,
         checkedUnderFence: gate.checked, ownStateDbFds: gate.ownStateDbFds, required: gate.final?.required ?? gate.required, readersReady: final.ready, acceptedUnready: final.unready });
       const accepted = distinctReaders(gate.accepted);

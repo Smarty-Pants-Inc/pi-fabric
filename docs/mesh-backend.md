@@ -118,7 +118,8 @@ no `--accept-unready` lifts it (until Windows ACL checks exist: smarty-dev#7548)
 
 `--accept-unready NAME,...` is the only override. When a switch commits with accepted-unready readers, the CLI publishes exactly one addressed
 `fabric.alarm.mesh-switch-override` event through the existing mesh alarm path. The event carries the switch id and each accepted reader's
-name and reason, and goes to the owning lead selected by the normal alarm recipient configuration. If that post-commit publish fails,
+name and reason, and goes to the owning lead selected by the normal alarm recipient configuration. Outcome append attempted, then alarm;
+the alarm does not depend on the append succeeding. An outcome-append failure warns on stderr (the outcome remains best-effort). If that post-commit publish fails,
 the committed switch stays committed; the CLI prints the accepted readers and failure on stderr and exits non-zero, without changing the switch record.
 
 Order of a switch (crash reruns included):

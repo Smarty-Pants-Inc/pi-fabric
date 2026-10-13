@@ -235,6 +235,7 @@ const sweep = async (meshRoot: string, options: {
   // (not the inode): such a generation is not a replacement. This proves no writer provenance; it accepts a safe regular
   // generation per the registry's own contract, and the stamp in every final check still vetoes an overlapping save. Any
   // other kind, owner or link count (or no getuid) keeps the exact inode identity, so that flip is a sticky replacement.
+  // Windows: no uid/mode, so any registry change stops planning (fail closed); smarty-dev#7858
   const entryIdentity = (name: string, stat: fs.Stats): string =>
     name === "actors.json" && stat.isFile() && stat.nlink === 1 && (stat.mode & 0o022) === 0 &&
       typeof process.getuid === "function" && stat.uid === process.getuid()

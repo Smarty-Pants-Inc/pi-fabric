@@ -131,7 +131,7 @@ describe("smarty-dev#9058 final candidate check (dry run)", () => {
     });
     const plan = await sweep(m.root);
     expect(fake.statusRead()).toBe(true);
-    expect(trace).toEqual(["trigger", "vanish@actors/01a118ab-flicker-session", "reappear+reference"]);
+    expect(trace).toEqual(["trigger", `vanish@${path.join("actors", "01a118ab-flicker-session")}`, "reappear+reference"]);
     expect(plan.removedRuns).not.toContain(m.old);
     expect(plan.removedRuns).not.toContain(m.latest);
     // No sticky stop: the next, independent candidate (unreferenced, stable) is still planned.
@@ -393,6 +393,9 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     return store;
   };
   const ino = (file: string) => fs.lstatSync(file).ino;
+  // Windows has no uid/mode, so a store save is a sticky replacement there: planning stops (fail closed; omitting the
+  // orphan is safe). POSIX accepts the safe generation and still plans the orphan. smarty-dev#7858
+  const atomicSavePlan = (m: ReturnType<typeof mesh>) => process.platform === "win32" ? [] : [m.orphan];
 
   it("keeps old when a normal store save overlaps its final check, then plans the stable orphan", async () => {
     const m = mesh();
@@ -413,7 +416,7 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     expect(committed).toBe(true);
     expect(ino(project)).not.toBe(inoBefore);
     expect(plan.removedRuns).not.toContain(m.old);
-    expect(plan.removedRuns).toEqual([m.orphan]);
+    expect(plan.removedRuns).toEqual(atomicSavePlan(m));
     expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
   });
 
@@ -428,10 +431,14 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     vi.restoreAllMocks();
     expect(fake.statusRead()).toBe(true);
     expect(ino(project)).not.toBe(inoBefore);
-    expect(plan.removedRuns).toEqual([m.orphan]);
+    expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).toEqual(atomicSavePlan(m));
+    expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
   });
 
-  it.each(["directory", "symlink", "hardlink", "foreign-uid", "writable-by-others"] as const)("project actors.json becoming %s permanently keeps both", async kind => {
+  for (const kind of ["directory", "symlink", "hardlink", "foreign-uid", "writable-by-others"] as const) {
+  // foreign-uid / writable-by-others need POSIX uid and mode bits (no process.getuid on Windows; smarty-dev#7858).
+  it.skipIf((kind === "foreign-uid" || kind === "writable-by-others") && typeof process.getuid !== "function")(`project actors.json becoming ${kind} permanently keeps both`, async () => {
     const m = mesh();
     const project = path.join(m.actors, "actors.json");
     await projectStore(m);
@@ -457,4 +464,5 @@ describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
     expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
     expect(fs.existsSync(path.join(m.orphan, "reply.json"))).toBe(true);
   });
+  }
 });

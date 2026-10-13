@@ -94,6 +94,13 @@ export class ActorDirectory extends ActorManager {
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
+  override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
+    return super.hasDormantIdleActor(protectedIds) || this.#secondary.hasDormantIdleActor(protectedIds);
+  }
+  override async dormantIdleActors(protectedIds: ReadonlySet<string> = new Set()): Promise<number> {
+    return await super.dormantIdleActors(protectedIds) + await this.#secondary.dormantIdleActors(protectedIds);
+  }
+  override meshCaughtUp(): boolean { return super.meshCaughtUp() && this.#secondary.meshCaughtUp(); }
   override async create(request: FabricActorRequest, options: Parameters<ActorManager["create"]>[1] = {}): Promise<FabricActorInfo> {
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {
@@ -130,6 +137,7 @@ export class ActorDirectory extends ActorManager {
   }
   override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
   override hasOwnedActors(): boolean { return super.hasOwnedActors() || this.#secondary.hasOwnedActors(); }
+  override hasDurableActor(): boolean { return super.hasDurableActor() || this.#secondary.hasDurableActor(); }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }
   override presenceBatch(full: boolean): ReturnType<ActorManager["presenceBatch"]> {
     const first = super.presenceBatch(full), second = this.#secondary.presenceBatch(full);

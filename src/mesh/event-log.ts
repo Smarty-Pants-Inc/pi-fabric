@@ -823,7 +823,9 @@ export class EventLog {
               // After append begins, success may be unknown. Stop rather than replay a
               // possibly complete event; a restarted bridge reconciles its committed IDs.
               if (outcome.appendStarted) throw new Error("Mesh batch publication outcome is uncertain; reconcile before retry", { cause: error });
-              if (!events.length) throw error;
+              // A refused intent stays the fence (smarty-dev#8907 F-02): never compact (re-judge it) in this hold;
+              // the outer handler finishes the committed prefix's receipts and propagates the refusal.
+              if (!events.length || error instanceof MeshDedupeRecoveryError) throw error;
               break;
             }
           }

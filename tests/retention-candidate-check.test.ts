@@ -796,6 +796,34 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(runsPresent(m)).toBe(true);
   });
 
+  // SEC-01 (.local/976-e1-delta-audit.md), RECORDED probes: a private 0700 lock with a 0600 owner present BEFORE the first
+  // listing whose record is not exactly the store's grammar is UNKNOWN, so the sweep refuses its initial uncertainty.
+  // (a) short read: the file holds a valid prefix plus junk; lockIdentity's one readSync returns ONLY the prefix bytes.
+  const PREFIX = `00000000-0000-4000-8000-000000000000\n${process.pid}\n${NOW}\n`;
+  it.each([
+    { name: "(a) short read of valid prefix + trailing junk", owner: `${PREFIX}junk`, short: true },
+    { name: "(b) full read with trailing junk (control)", owner: `${PREFIX}junk`, short: false },
+    { name: "(c) 36-hyphen token", owner: `${"-".repeat(36)}\n${process.pid}\n${NOW}\n`, short: false },
+    { name: "(d) overflow pid", owner: `00000000-0000-4000-8000-000000000000\n${"9".repeat(40)}\n${NOW}\n`, short: false },
+    { name: "(e) overflow time", owner: `00000000-0000-4000-8000-000000000000\n${process.pid}\n${"9".repeat(40)}\n`, short: false },
+    { name: "(f) bad start grammar", owner: `${PREFIX}7x\n`, short: false },
+  ])("SEC-01 probe: refuses an initial lock owner that is not the exact store record: $name", async ({ owner, short }) => {
+    const m = mesh(), lock = path.join(m.actors, "actors.json.lock"), ownerFile = path.join(lock, "owner");
+    fs.mkdirSync(lock, { mode: 0o700 }); fs.writeFileSync(ownerFile, owner, { mode: 0o600 });
+    expect(Buffer.byteLength(owner)).toBeLessThanOrEqual(256);
+    const guard = guardRemovals(), realRead = fs.readSync as unknown as Call, shortReads: { got: unknown; size: number }[] = [];
+    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, buffer: Buffer, ...rest: unknown[]) => {
+      if (!short || shortReads.length || !rcFrames().includes("lockIdentity")) return realRead(fd, buffer, ...rest);
+      const got = realRead(fd, buffer, 0, Buffer.byteLength(PREFIX), 0);
+      shortReads.push({ got, size: fs.fstatSync(fd).size }); return got;
+    }) as never);
+    await expect(sweep(m.root)).rejects.toThrow("Actor references are uncertain");
+    expect(shortReads).toEqual(short ? [{ got: Buffer.byteLength(PREFIX), size: Buffer.byteLength(owner) }] : []);
+    expect(fs.readFileSync(ownerFile, "utf8")).toBe(owner);
+    expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+    expect(runsPresent(m)).toBe(true);
+  });
+
   it("keeps a candidate when the lock's raw directory generation changes during classification", async () => {
     const m = mesh(), lock = path.join(m.actors, "actors.json.lock");
     fs.mkdirSync(lock, { mode: 0o700 });
@@ -814,5 +842,32 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     expect(guard.effective()).toEqual({ removals: [], spawned: [] });
     expect(plan.skipped.some(item => item.reason.includes("changed type or identity"))).toBe(false);
     expect(runsPresent(m)).toBe(true);
+  });
+
+  // CODE-02 (.local/976-e1-delta-audit.md), RECORDED MODEL only (no native Windows claim): inside ownerSafe alone, the own
+  // actors.json reports mode 0666 and, when noUid, process.getuid is absent. Elsewhere getuid and lstat are real.
+  it.each([false, true])("recorded mode probe: an own 0666 actors.json inside ownerSafe (noUid=%s)", async noUid => {
+    const m = mesh(), own = path.join(m.registry, "actors.json");
+    const original = Object.getOwnPropertyDescriptor(process, "getuid")!, realGetuid = process.getuid;
+    const inOwnerSafe = () => rcFrames().includes("ownerSafe");
+    let hidden = 0, modes = 0;
+    try {
+      if (noUid) Object.defineProperty(process, "getuid", { configurable: true, enumerable: original.enumerable,
+        get: () => { if (!inOwnerSafe()) return realGetuid; hidden++; return undefined; } });
+      const guard = guardRemovals();
+      fakeFs({ candidate: m.old, onLstat: (file, real) => {
+        const stat = real();
+        if (file !== own || !(stat instanceof fs.Stats) || !inOwnerSafe()) return stat;
+        modes++; return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { mode: (stat.mode & ~0o777) | 0o666 });
+      } });
+      const plan = await sweep(m.root);
+      expect(modes).toBeGreaterThan(0);
+      expect(hidden > 0).toBe(noUid);
+      expect(guard.effective()).toEqual({ removals: [], spawned: [] });
+      expect(runsPresent(m)).toBe(true);
+      expect(plan.removedRuns).not.toContain(m.latest);
+      expect(plan.removedRuns.slice().sort()).toEqual(noUid ? [m.old, m.orphan].sort() : []);
+    } finally { Object.defineProperty(process, "getuid", original); }
+    expect(Object.getOwnPropertyDescriptor(process, "getuid")).toEqual(original);
   });
 });

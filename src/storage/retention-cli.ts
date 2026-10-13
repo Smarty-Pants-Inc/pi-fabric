@@ -259,7 +259,9 @@ const sweep = async (meshRoot: string, options: {
           if (!held.isFile() || held.nlink !== 1 || held.uid !== uid || (held.mode & 0o077) !== 0) return false;
           if (held.dev !== owner.dev || held.ino !== owner.ino) return undefined;
           if (held.size > 256) return undefined;
-          const buffer = Buffer.alloc(257); record = buffer.subarray(0, fs.readSync(fd, buffer, 0, 257, 0)).toString("utf8");
+          const buffer = Buffer.alloc(257), bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+          if (bytes !== held.size) return undefined; // a short read or a growth is unknown; never trust a prefix
+          record = buffer.subarray(0, bytes).toString("utf8");
           const canonical = fs.lstatSync(path.join(lockDir, "owner"), { throwIfNoEntry: false });
           if (canonical && (!canonical.isFile() || canonical.nlink !== 1 || canonical.uid !== uid || (canonical.mode & 0o077) !== 0)) return false;
           if (!canonical || canonical.dev !== held.dev || canonical.ino !== held.ino || canonical.size !== held.size ||
@@ -272,7 +274,9 @@ const sweep = async (meshRoot: string, options: {
     if (after && (!after.isDirectory() || after.uid !== uid || (after.mode & 0o077) !== 0)) return false;
     if (!after || after.dev !== stat.dev || after.ino !== stat.ino || after.mode !== stat.mode || after.uid !== stat.uid ||
         after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || after.nlink !== stat.nlink) return undefined;
-    return /^[0-9a-f-]{36}\n[1-9]\d*\n\d+\n(\d+\n)?$/.test(record) ? `directory\0${stat.dev}\0uid:${uid}\0project-registry-lock` : undefined;
+    const fields = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\n([1-9]\d*)\n(0|[1-9]\d*)\n(?:\d+\n)?$/.exec(record);
+    return fields && Number.isSafeInteger(Number(fields[1])) && Number.isSafeInteger(Number(fields[2]))
+      ? `directory\0${stat.dev}\0uid:${uid}\0project-registry-lock` : undefined;
   };
   const entryIdentity = (name: string, stat: fs.Stats): string | undefined => {
     if (name === "actors.json.lock") { const role = lockIdentity(stat); if (role !== false) return role; }
@@ -387,7 +391,8 @@ const sweep = async (meshRoot: string, options: {
   // smarty-dev#976 A: an own registry that is our regular, single-link, private file.
   const ownerSafe = (file: string): boolean => {
     const stat = ownedStat(file);
-    return stat?.isFile() === true && stat.nlink === 1 && (stat.mode & 0o022) === 0;
+    return stat?.isFile() === true && stat.nlink === 1 &&
+      (typeof process.getuid !== "function" || (stat.mode & 0o022) === 0);
   };
   // smarty-dev#976 A: at most 3 complete observations; only an otherwise-safe raw overlap (post.full !== pre.full) retries.
   // Every concrete id read on any attempt is kept (a reference removed before a stable attempt still keeps).

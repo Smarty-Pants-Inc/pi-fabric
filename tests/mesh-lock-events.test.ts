@@ -16,7 +16,7 @@ import type { MeshIdentity } from "../src/mesh/store.js";
 const lockKey = Symbol.for("pi-fabric.mesh.lock-stats");
 const eventsKey = Symbol.for("pi-fabric.mesh.lock-events");
 const registry = globalThis as typeof globalThis & {
-  [lockKey]?: { dispose(): void };
+  [lockKey]?: { dispose(): void; flush(): void };
   [eventsKey]?: { dispose(): void; events: LockEvents | undefined };
 };
 const reset = (): void => {
@@ -390,6 +390,99 @@ describe("lock events: rotation across processes", () => {
 });
 
 describe("lock events in one process", () => {
+  it.each([false, true])("FIFO expiry (bounded=%s) is counted separately, while real contention still fails the timeout gate", async (bounded) => {
+    const { events, MeshLock } = await load();
+    const { meshLockQueueDirectory, MeshLockTicket } = await import("../src/mesh/lock-queue.js");
+    const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
+    const { lockStats } = await import("../src/mesh/mesh-lock.js");
+    const { main } = await import("../src/mesh-lock-stats-cli.js");
+    const root = temp();
+    const lock = new MeshLock(root, { lockTimeoutMs: 2_000 }, () => undefined);
+    await lock.withLock(() => undefined); // seed the real stats file; no event for a quick acquisition
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const directory = meshLockQueueDirectory(root);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const head = path.join(directory, `${"0".repeat(24)}-${process.pid}-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`);
+    fs.writeFileSync(head, "");
+    const failed = vi.spyOn(lockStats!, "failed");
+    const waitTimeout = vi.spyOn(events, "waitTimeout");
+    const queueExpired = vi.spyOn(events, "queueExpired");
+    const close = vi.spyOn(MeshLockTicket.prototype, "close");
+    const operation = vi.fn();
+    const pending = Array.from({ length: 3 }, () => lock.withLock(operation, 2_000, "publish", bounded).catch((error: unknown) => error));
+    for (let elapsed = 0; elapsed < 2_000; elapsed += 50) {
+      const now = Date.now() / 1000;
+      fs.utimesSync(head, now, now); // live admission head, but canonical .lock is free
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    for (const error of await Promise.all(pending)) {
+      expect(error).toBeInstanceOf(MeshLockTimeoutError); // caller compatibility, not diagnostic attribution
+      expect(error).toMatchObject({ name: "MeshLockQueueExpiredError", code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: 0 });
+    }
+    expect(operation).not.toHaveBeenCalled();
+    expect(failed).not.toHaveBeenCalled();
+    expect(waitTimeout).not.toHaveBeenCalled();
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(close.mock.invocationCallOrder[0]!).toBeLessThan(queueExpired.mock.invocationCallOrder[0]!);
+    expect(readEvents(eventsFile(root))).toHaveLength(3);
+    for (const event of readEvents(eventsFile(root))) {
+      expect(event).toMatchObject({ v: 1, kind: "pre-lock", preLockCode: "queue-expired", store: "mesh-lock", class: "publish",
+        waitedMs: 2_000, holder: { pid: null, process: null, op: null }, waiter: { pid: process.pid, op: "publish" } });
+      expect(event.waitersAhead).toBeGreaterThanOrEqual(1);
+    }
+    const meter = () => {
+      registry[lockKey]!.flush();
+      let json = "";
+      const exit = main(["--mesh", root, "--json", "--max-timeouts", "0"],
+        { now: Date.now() + 60_000, stdout: text => { json += text; } });
+      return { exit, summary: JSON.parse(json) as { n: number; timeouts: number; tries: number } };
+    };
+    expect(meter()).toMatchObject({ exit: 0, summary: { n: 1, timeouts: 0, tries: 0 } });
+
+    // Counterexample: an eligible head really probes a held canonical lock. It must still count as contention.
+    fs.renameSync(head, path.join(root, "fixture-previous-head"));
+    fs.mkdirSync(path.join(root, ".lock"));
+    fs.writeFileSync(path.join(root, ".lock", "owner"), `held\n${process.pid}\n${Date.now()}\n`);
+    const contended = lock.withLock(operation, 100, "publish").catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(150);
+    const timeout = await contended;
+    expect(timeout).toBeInstanceOf(MeshLockTimeoutError);
+    expect(timeout).toMatchObject({ name: "MeshLockTimeoutError" });
+    expect((timeout as InstanceType<typeof MeshLockTimeoutError>).attempts).toBeGreaterThan(0);
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(waitTimeout).toHaveBeenCalledTimes(1);
+    expect(queueExpired).toHaveBeenCalledTimes(3);
+    expect(readEvents(eventsFile(root)).filter(event => event.kind === "wait-timeout")).toHaveLength(1);
+    expect(meter()).toMatchObject({ exit: 3, summary: { n: 1, timeouts: 1, tries: 0 } });
+  });
+
+  it("adds pre-lock events to a captured legacy appender without replacing its existing sink or losing append errors", async () => {
+    const original = createLockEvents("1", { warn: () => undefined })!;
+    const legacy = { held: original.held, waitTimeout: original.waitTimeout, get errors() { return original.errors; } };
+    registry[eventsKey] = { dispose() {}, events: legacy as LockEvents }; // pre-queue-event runtime generation
+    const upgraded = createLockEvents("0", { warn: () => undefined })!; // first owner's opt-in stays in force
+    expect(upgraded.held).toBe(legacy.held);
+    expect(upgraded.waitTimeout).toBe(legacy.waitTimeout);
+    const root = temp();
+    upgraded.queueExpired(root, "mesh-lock", "bridge", 2_000, 1);
+    upgraded.waitTimeout(root, "mesh-lock", "publish", 100, process.pid);
+    expect(readEvents(eventsFile(root)).map(event => [event.kind, event.preLockCode])).toEqual([
+      ["pre-lock", "queue-expired"], ["wait-timeout", undefined],
+    ]);
+    vi.resetModules();
+    const reloaded = await import("../src/mesh/commit-stats.js");
+    expect(reloaded.createLockEvents("0")).toBe(upgraded);
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      if (String(file) === eventsFile(root)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });
+      return (open as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    upgraded.held(root, "mesh-lock", "publish", 1_001);
+    upgraded.queueExpired(root, "mesh-lock", "bridge", 2_000, undefined);
+    expect(original.errors).toBe(1);
+    expect(upgraded.errors).toBe(2); // both old and new appender failures remain visible
+  });
+
   // Review P2: a protocol-2 store whose incarnation is still pending fails closed for a shorter
   // budget before it ever tries .lock: no wait-timeout event (and no owner-record read for one).
   it("a cold protocol-2 fail-closed acquisition records no wait-timeout event", async () => {

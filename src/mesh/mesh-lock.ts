@@ -281,6 +281,7 @@ export class MeshLock {
     let lockHeldAt = -1;
     let holdMs = -1;
     let failedWaitMs = -1;
+    let queueExpired: MeshLockQueueExpiredError | undefined;
     this.#writeAbortSignal?.throwIfAborted();
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
@@ -456,7 +457,10 @@ export class MeshLock {
         if (timed) holdMs = performance.now() - lockHeldAt;
       }
     } catch (error) {
-      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) failedWaitMs = performance.now() - lockWaitStart;
+      if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError) {
+        if (error instanceof MeshLockQueueExpiredError) queueExpired = error;
+        else failedWaitMs = performance.now() - lockWaitStart;
+      }
       throw error;
     } finally {
       ticket.close();
@@ -464,6 +468,9 @@ export class MeshLock {
       if (holdMs >= 0) {
         lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);
+      } else if (queueExpired) {
+        // No canonical acquisition attempt: neither a real-contention timeout nor a failed bounded lock try.
+        lockEvents?.queueExpired(this.root, "mesh-lock", lockClass, queueExpired.waitedMs, queueExpired.waitersAhead);
       } else if (failedWaitMs >= 0) {
         const tried = Boolean(scope?.active) || bounded;
         lockStats?.failed(this.root, lockClass, failedWaitMs, tried);

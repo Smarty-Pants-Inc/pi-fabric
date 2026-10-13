@@ -79,6 +79,7 @@ const lazyEntryPoints = [
   "src/decisions/command.ts",
   "src/programs/host.ts",
   "src/core/provider-operations.ts",
+  "src/core/model-served.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",

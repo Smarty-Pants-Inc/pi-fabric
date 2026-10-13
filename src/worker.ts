@@ -45,6 +45,7 @@ const executionSettled = (): Promise<void> => new Promise(resolve => {
   else resolve();
 });
 import { interruptedModelStreamError, retryableProviderError } from "./worker/provider-error.js";
+import { classifyProviderError } from "./provider-error-class.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "./fabric-provenance.js";
 import { ActivationSession } from "./worker/activation-session.js";
 import type { ActorContextReseed } from "./worker/context-admission.js";
@@ -2021,7 +2022,13 @@ const main = async (): Promise<void> => {
         terminalError = silentOverflow ? silentOverflowError(messageRecord, childContextWindow ?? 0) : assistantError(messageRecord);
         // Pi never retries a silent "stop" overflow (it compacts and keeps the answer), so no
         // recovery is pending; any other failed turn may still be recovered by Pi.
-        if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
+        const providerError = classifyProviderError(messageRecord);
+        if ((providerError?.type === "model_not_found" || providerError?.code === "model_not_found") &&
+          (providerError.status === 400 || providerError.status === 404)) {
+          // A catalog miss cannot recover on the same model. Stop before native or worker retries;
+          // retain the provider error in the failed result and the existing spawner completion.
+          failStalledChild(terminalError);
+        } else if (silentOverflow && messageRecord.stopReason === "stop") recoveryWatchdog.clear();
         else recoveryWatchdog.arm(terminalError);
       } else {
         recoveryWatchdog.clear();

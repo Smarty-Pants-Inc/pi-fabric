@@ -364,15 +364,36 @@ export class EventLog {
   }
 
   /** Removes the intent `judged` describes (smarty-dev#8907): a replacement or a refreshed intent
-   * is refused and left as the recovery fence (an intent beside its receipt settles again later).
-   * `judged` undefined: the caller's ponytail names why its by-path removal cannot race. */
-  #removeDedupeIntent(file: string, judged: fs.Stats | undefined): boolean {
+   * is refused and left as the recovery fence (an intent beside its receipt settles again later). */
+  #removeDedupeIntent(file: string, judged: fs.Stats): boolean {
     // File-only, as main's non-recursive rmSync: a directory (or link) at an intent name is never removed here.
-    if (judged && !judged.isFile()) return false;
-    const removed = judged === undefined ? (fs.rmSync(file, { force: true }), true)
-      : this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }));
+    if (!judged.isFile()) return false;
+    // Verified-only on every platform (smarty-dev#7858, pi-fabric#1036 r3 P1): no pathname fallback. Off Linux the
+    // verifier refuses and the intent is retained; a retained intent holds its key's slot, so admission stays bounded
+    // (MeshDedupeStoreFullError) and a receipt beside it stays authoritative for its key.
+    const removed = this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent" }));
     if (removed) syncPathNamespace(path.dirname(file));
     return removed;
+  }
+
+  /** Removes the intent this same .lock hold wrote as `written` (pi-fabric#1036 r3 P1). writeFileAtomic returns no
+   * identity, and a stat taken after its rename may already name a legacy off-lock successor, so a stat alone proves
+   * nothing. Only the exact written bytes (unique eventId) bind it: lstat, read, the same inode after the read, bytes
+   * equal. Unproved (other bytes, another inode, not a file) is kept and reported false; absent counts as gone. A
+   * refused removal of the proved intent (off Linux: no verifier) is true only while the name still holds that inode:
+   * the retained intent is our own, not a successor a same-hold compaction could re-judge. */
+  #removeWrittenIntent(file: string, written: string): boolean {
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!stat) return true;
+    if (!stat.isFile()) return false;
+    let text: string;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (error) { if (errorCode(error) === "ENOENT") return !fs.lstatSync(file, { throwIfNoEntry: false }); throw error; }
+    const named = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (text !== written || !named || named.dev !== stat.dev || named.ino !== stat.ino) return false;
+    if (this.#removeDedupeIntent(file, stat)) return true;
+    const kept = fs.lstatSync(file, { throwIfNoEntry: false });
+    return kept !== undefined && kept.dev === stat.dev && kept.ino === stat.ino && kept.size === stat.size && kept.mtimeMs === stat.mtimeMs;
   }
 
   /** A refusal is not absence (smarty-dev#8907 F-01): it counts as gone only when nothing was moved into a
@@ -406,9 +427,11 @@ export class EventLog {
   }
 
   #settleDedupeIntent(file: string, dedupeKey?: string, archive?: MeshArchive, after?: AfterUnlock): MeshEvent | undefined {
-    // The judged intent's identity, before its bytes are read; undefined once this hold rewrites it.
-    let judged = fs.lstatSync(file, { throwIfNoEntry: false });
+    // The judged intent's identity, before its bytes are read.
+    const judged = fs.lstatSync(file, { throwIfNoEntry: false });
     if (!judged) return undefined;
+    // The exact bytes of an archive restore's rewrite below, once this hold replaces the judged intent.
+    let restored: string | undefined;
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -434,6 +457,11 @@ export class EventLog {
         await this.#cleanupReceiptIntent(prior, file);
       };
       return prior;
+    }
+    // A receipt settles only its own intent (pi-fabric#1036 r3): a kept successor beside the original's receipt is not
+    // stale by that receipt. Fail closed before any removal, prune or rewrite (the retry's after-release CAS keeps it too).
+    if (prior && (intent.eventId !== prior.id || intent.reservedSequence !== prior.sequence)) {
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: it does not match the receipt for its key and is kept`);
     }
     const live = prior ? undefined : this.#readEventAtIntent(intent);
     let event = prior ?? live;
@@ -464,8 +492,8 @@ export class EventLog {
           let liveOffset = 0;
           try { liveOffset = fs.statSync(this.#eventsPath).size; }
           catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-          writeFileAtomic(file, JSON.stringify({ ...intent, liveOffset }), { durable: true });
-          judged = undefined;
+          restored = JSON.stringify({ ...intent, liveOffset });
+          writeFileAtomic(file, restored, { durable: true });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
         }
@@ -494,7 +522,8 @@ export class EventLog {
       // namespace barrier runs after release. A crash before it may bring the intent back,
       // which settles to nothing again: no line can ever match its unique event id.
       // A refused (replaced or refreshed) intent stays as the fence: fail closed before any sequence, intent or append.
-      if (!this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent", fallback: () => { fs.rmSync(file, { force: true }); return true; } }))) {
+      // Verified-only, no pathname fallback on any platform (smarty-dev#7858): off Linux this refuses and fails closed.
+      if (!this.#intentGone(file, verifiedRemove(file, judged, { deleter: "meshDedupeIntent" }))) {
         throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
       }
       after.receipt = undefined;
@@ -510,12 +539,12 @@ export class EventLog {
       }
       writeFileAtomic(this.#dedupePath(intent.dedupeKey, ".json"), JSON.stringify(event), { durable: true });
     }
-    // ponytail: judged undefined only after the archive restore above replaced the intent by this same
-    // synchronous .lock hold (writeFileAtomic: pid+uuid temp, rename); no pre-judgment stat names that
-    // inode and a stat taken now would be a refreshed one, so main's by-path removal stays there
-    // (residual: a legacy off-lock writer renaming over it inside this hold, reported in smarty-dev#8907).
-    // With no event, a kept (refused) intent must not be overwritten by a new append or invalidated by compaction.
-    if (!this.#removeDedupeIntent(file, judged) && !event) {
+    // After an archive restore the judged inode is gone: only the restored bytes can prove the name is still ours.
+    // A kept (refused) intent with no event must not be overwritten by a new append or invalidated by compaction; a
+    // kept successor of a restore fails closed too (its receipt is durable: a retry returns it), so no compaction in
+    // this hold re-judges that successor (pi-fabric#1036 r3 P1).
+    const removed = restored === undefined ? this.#removeDedupeIntent(file, judged) : this.#removeWrittenIntent(file, restored);
+    if (!removed && (!event || restored !== undefined)) {
       throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
     }
     return event;
@@ -608,21 +637,21 @@ export class EventLog {
         const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
-          // A single publish confirms the visible receipt and unlinks after release.
+          // A single publish confirms the visible receipt and unlinks after release, through the intent/receipt CAS.
+          // Every keyed caller passes `after` (publish, publishBatch; appendLocked rejects a dedupe key): there is no
+          // locked by-name cleanup of an intent judged stale by its receipt alone (pi-fabric#1036 r3).
           if (after) {
             after.receipt = undefined;
             after.finish = async () => {
               this.#confirmEventFile(receiptPath!);
               await this.#cleanupReceiptIntent(prior, intentPath!);
             };
-          } else {
-            // Judged stale by its receipt alone: the intent's identity is captured before that removal.
-            const stale = fs.lstatSync(intentPath!, { throwIfNoEntry: false });
-            if (stale) this.#removeDedupeIntent(intentPath!, stale);
           }
           return prior;
         }
       }
+      // The exact bytes of the intent this hold writes below (the crash fence), for its archive-coupled cleanup.
+      let writtenIntent: string | undefined;
       let archive: MeshArchive | undefined;
       try { archive = MeshArchive.fromRoot(this.root); }
       catch (error) {
@@ -707,10 +736,11 @@ export class EventLog {
           // with the synced archive line address, before any live append.
           archive?.reserveLookup(sequence);
           // This is the crash fence: the intent is durable before the live append begins.
-          writeFileAtomic(intentPath, JSON.stringify({
+          writtenIntent = JSON.stringify({
             dedupeKey: input.dedupeKey!, reservedSequence: sequence, eventId: event.id, liveOffset,
             ...(archive ? { archiveDir: archive.dir } : {}),
-          } satisfies MeshDedupeIntent), { durable: true });
+          } satisfies MeshDedupeIntent);
+          writeFileAtomic(intentPath, writtenIntent, { durable: true });
         }
         const pending = archive?.begin({ event, line });
         // Test-only process-death fence: unlike an append exception, no rollback can run.
@@ -739,9 +769,11 @@ export class EventLog {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true });
-        // ponytail: the intent this same synchronous .lock hold wrote above (writeFileAtomic, before the
-        // archive begin and live append), not a judged one: no pre-judgment stat exists, as in main.
-        if (intentPath) this.#removeDedupeIntent(intentPath, undefined);
+        // The intent this hold wrote above, proved by its exact bytes. A kept successor fails closed after the
+        // durable receipt (a retry returns it), before this hold's compaction could re-judge it (pi-fabric#1036 r3 P1).
+        if (intentPath && writtenIntent !== undefined && !this.#removeWrittenIntent(intentPath, writtenIntent)) {
+          throw new MeshDedupeRecoveryError(`Dedupe intent ${input.dedupeKey} was replaced after publication and is kept; its receipt is durable`);
+        }
       }
       if (batch) batch.bytes = bytes + 1;
       else {

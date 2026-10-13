@@ -124,7 +124,8 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     process.kill(pid!, "SIGKILL");
   };
 
-  it("a lost worker after a completed write: the manager's result keeps the path, marked truncated", async () => {
+  // No pid birth-time identity exists off Linux, so signalling there could hit a reused pid: skip, never signal.
+  it.skipIf(process.platform !== "linux")("a lost worker after a completed write: the manager's result keeps the path, marked truncated", async () => {
     const { root, manager } = lifecycleManager("lost", 8_000);
     const handle = await manager.spawn({ task: "write then hang", runner: "pi", transport: "process", extensions: false });
     await killWorkerAfterCheckpoint(root, handle.id, (receipt) => (receipt?.paths?.length ?? 0) > 0);
@@ -134,7 +135,8 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     expect(result.writeReceipt).toEqual({ paths: [path.join(root, "f.txt")], commands: [], truncated: true });
   }, 60_000);
 
-  it("a lost worker with an unended write call: the manager's result is marked truncated", async () => {
+  // No pid birth-time identity exists off Linux, so signalling there could hit a reused pid: skip, never signal.
+  it.skipIf(process.platform !== "linux")("a lost worker with an unended write call: the manager's result is marked truncated", async () => {
     const { root, manager } = lifecycleManager("lost-pending", 8_000);
     const handle = await manager.spawn({ task: "start a write then hang", runner: "pi", transport: "process", extensions: false });
     // f8090829 never stores a receipt for a start, so wait for the start itself (toolCalls) there.

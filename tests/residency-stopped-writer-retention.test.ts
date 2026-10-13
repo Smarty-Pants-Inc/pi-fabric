@@ -153,22 +153,6 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
       return !processAlive(Number(writer.sessionId)) && !refs.has("*") && !refs.has(actor.id);
     });
     expect(refs.has(actor.id)).toBe(false);
-    // Annotated, so it does not narrow process.platform for the checks below.
-    const verifiedDeletes: boolean = process.platform === "linux";
-    if (!verifiedDeletes) {
-      // Latest platform decision: off Linux verifiedRemove refuses (no path fallback), so even after checked writer
-      // exit a collection scan keeps the decision and acknowledgement byte-for-byte; nothing is removed.
-      const waited = scans;
-      scanTime = (scanTime ?? 0) + 60_001;
-      due.mockReturnValue(true);
-      await waitFor(() => scans > waited);
-      due.mockReturnValue(false);
-      expect(fs.readFileSync(decisionPath, "utf8")).toBe(committed);
-      expect(JSON.parse(fs.readFileSync(ackPath, "utf8"))).toEqual(ack);
-      expect(remove.mock.calls.filter(([file]) => file === decisionPath)).toHaveLength(0);
-      expect(create).toHaveBeenCalledTimes(1);
-      return;
-    }
     // Exercise a single conservative first-sample veto deterministically, rather
     // than depending on Windows filesystem/native-close timing to hit it.
     const custodyVeto = host.agents.retentionCustodyVeto.bind(host.agents);
@@ -220,8 +204,7 @@ it.each(["project", "session"] as const)("public actor stop retains its live wri
 // relies on POSIX detached process groups. Windows durable residency is unsupported
 // (src/residency/host.ts, docs/residency-runtime.md), and there the nested child does
 // not survive the primary's exit, so this descendant-tracking claim is not made.
-// The final collection premise is Linux-only now; off-Linux keep-after-exit is covered by the test above.
-it.skipIf(process.platform !== "linux").each([
+it.skipIf(process.platform === "win32").each([
   ["project", false, "known"], ["session", false, "known"], ["project", true, "known"], ["session", true, "known"],
   ["project", true, "unknown"], ["session", true, "unknown"],
 ] as const)("a crashed tracked activation retains custody or legacy reconciliation IDs while its real nested writer survives, then collects once (%s scope, restart=%s, descendant=%s)", async (scope, restart, descendant) => {

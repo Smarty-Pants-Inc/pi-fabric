@@ -17,9 +17,6 @@ import { acknowledgeResidentResponse, abandonResidentRequest, commitResidentRequ
 
 const roots: string[] = [];
 const nativePlatform = process.platform;
-// Latest platform decision: verifiedRemove deletes (and so compacts or collects) only on Linux; elsewhere it refuses
-// before any deletion and never invokes main's path fallback. Off Linux the same inputs are kept byte-for-byte.
-const verifiedDeletes = nativePlatform === "linux";
 afterEach(() => { Object.defineProperty(process, "platform", { value: nativePlatform }); vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const root = () => { const value = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-request-retention-")); roots.push(value); return value; };
 const write = (root: string, dir: string, id: string, value: unknown) => {
@@ -37,11 +34,6 @@ const seed = (root: string, time: number, acknowledged = true) => {
 };
 const sweep = (root: string, now: number, live = new Set<string>()) => new ResidentRequestRetention(root).sweep(now, live, 10_000);
 const exists = (root: string, dir: string, id: string) => fs.existsSync(path.join(root, dir, `${id}.json`));
-/** Linux: compacted to the bound. Off Linux: the original log, unchanged. */
-const expectBounded = (file: string, original: Buffer, bound = 256 * 1024) => {
-  if (verifiedDeletes) expect(fs.statSync(file).size).toBeLessThanOrEqual(bound);
-  else expect(fs.readFileSync(file).equals(original)).toBe(true);
-};
 
 describe("resident terminal event retention", () => {
   const day = 24 * 60 * 60 * 1000;
@@ -71,7 +63,7 @@ describe("resident terminal event retention", () => {
     expect(rename).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!verifiedDeletes).each(["age threshold", "byte cap"])("Linux-only verified compaction: completes a bounded run transaction after live %s reload despite consistently slow status reads", change => {
+  it.skipIf(process.platform === "win32").each(["age threshold", "byte cap"])("POSIX-only (Windows: smarty-dev#5132): completes a bounded run transaction after live %s reload despite consistently slow status reads", change => {
     const dir = root(), run = make(dir, "reload-retention", "completed", now - 8 * 60 * 60 * 1000);
     const events = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
     fs.writeFileSync(path.join(run, "events.jsonl"), events);
@@ -118,8 +110,8 @@ describe("resident terminal event retention", () => {
       for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
       expect(recover).toHaveBeenCalled();
       const events = fs.readFileSync(path.join(run, "events.jsonl"));
-      if (change === "none" && verifiedDeletes) expect(events.length).toBeLessThanOrEqual(128 * 1024);
-      else expect(events.equals(log)).toBe(true);
+      if (change === "none") expect(events.length).toBeLessThanOrEqual(128 * 1024);
+      else expect(events).toEqual(log);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
     } finally { collector.close(); }
   });
@@ -176,7 +168,7 @@ describe("resident terminal event retention", () => {
         expect(fs.readFileSync(path.join(run, name)).equals(before), `${run}/${name} must remain byte-identical`).toBe(true);
       }
     }
-    expectBounded(path.join(exited, "events.jsonl"), log);
+    expect(fs.statSync(path.join(exited, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
   });
 
   it("uses the existing streaming sweep to bound terminal residency runs, preserving results, latest references and idempotency", () => {
@@ -196,14 +188,13 @@ describe("resident terminal event retention", () => {
     const bounded = compacted.map(run => fs.readFileSync(path.join(run, "events.jsonl")));
     for (const [index, run] of compacted.entries()) {
       const tail = bounded[index]!;
-      expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statuses[index]);
-      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
-      if (!verifiedDeletes) { expect(tail.equals(log)).toBe(true); continue; }
       expect(tail.length).toBeLessThanOrEqual(128 * 1024);
       expect(JSON.parse(tail.subarray(0, tail.indexOf(0x0a)).toString())).toMatchObject({ fabricTruncated: true });
       const events = tail.subarray(tail.indexOf(0x0a) + 1);
       expect(events.equals(log.subarray(log.length - events.length))).toBe(true);
       expect(JSON.parse(events.toString().trim().split("\n").at(-1)!)).toMatchObject({ sequence: 14999 });
+      expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statuses[index]);
+      expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
     }
     for (const run of preserved) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
     expect(fs.readFileSync(path.join(dir, "results", "completed.json"))).toEqual(result);
@@ -222,12 +213,11 @@ describe("resident terminal event retention", () => {
     for (const run of [old, latest]) fs.utimesSync(run, day / 1000, day / 1000);
     const runs = path.join(dir, "runs");
     expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot], retainRuns: true })).toEqual([]);
-    expectBounded(path.join(old, "events.jsonl"), log);
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
     expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     fs.utimesSync(old, day / 1000, day / 1000);
-    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual(verifiedDeletes ? [old] : []);
-    if (!verifiedDeletes) expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([old]);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
   });
 
@@ -244,7 +234,7 @@ describe("resident terminal event retention", () => {
       const collector = new ResidentRequestRetention(dir, [actorRoot]);
       try { collector.sweep(now, new Set(), 10000); } finally { collector.close(); }
     }
-    expectBounded(path.join(old, "events.jsonl"), log);
+    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     expect(fs.readFileSync(path.join(actorRoot, "actors.json")).equals(registry)).toBe(true);
   });
@@ -276,13 +266,13 @@ describe("resident terminal event retention", () => {
       for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
       // Even consistently slow safety reads complete a count-bounded unit.
       // A deadline alone must not restart the same fresh proof forever.
-      expectBounded(path.join(old, "events.jsonl"), log);
+      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
       for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);
     } finally { collector.close(); }
   });
 
-  it.skipIf(!verifiedDeletes)("Linux-only verified compaction: retains an oversized run transaction without starving the next small run", () => {
+  it.skipIf(process.platform === "win32")("POSIX-only (Windows: smarty-dev#5132): retains an oversized run transaction without starving the next small run", () => {
     const dir = root(), large = make(dir, "large", "completed"), small = make(dir, "small", "completed");
     for (let i = 0; i < 65; i++) fs.writeFileSync(path.join(large, `oversized-event-prefix-${i}.txt`), "keep");
     const collector = new ResidentRequestRetention(dir);
@@ -342,8 +332,7 @@ describe("resident terminal event retention", () => {
     } finally { collector.close(); }
   });
 
-  // Delete-only: off Linux nothing is ever compacted (refusal covered by the platform-refusal suite).
-  it.skipIf(!verifiedDeletes)("eventually compacts via ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
+  it("eventually compacts via ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
     const held = make(dir, "held", "completed"); const worker = make(dir, "worker", "completed");
@@ -400,10 +389,8 @@ describe("bounded resident request retention", () => {
   it("collects old terminal acknowledged decisions/responses and refuses replay even with a refreshed createdAt", () => {
     const dir = root(); const command = seed(dir, old);
     sweep(dir, now);
-    // Off Linux the collection refuses (nothing deleted); the expiry fence still refuses replay.
-    for (const kind of ["decisions", "responses", "acknowledgements"]) expect(exists(dir, kind, command.requestId)).toBe(!verifiedDeletes);
+    for (const kind of ["decisions", "responses", "acknowledgements"]) expect(exists(dir, kind, command.requestId)).toBe(false);
     expect(() => commitResidentRequest(dir, { ...command, createdAt: now }, "duplicate", "host")).toThrow(/expired.*do not replay/i);
-    if (!verifiedDeletes) return;
     expect(readResidentRequestDecision(dir, command.requestId)).toBeUndefined();
     expect(residentHostStateNote(dir)).toMatch(/residency retention:.*0 entries.*0 bytes/);
   });
@@ -472,8 +459,7 @@ describe("bounded resident request retention", () => {
     expect(residentHostStateNote(dir)).toMatch(/collection disabled/);
     syncFault.mockRestore(); renameFault.mockRestore();
     sweep(dir, now);
-    // Only Linux deletes: a forced or native win32 collection refuses and keeps the decision.
-    expect(exists(dir, "decisions", command.requestId)).toBe(platform !== "linux");
+    expect(exists(dir, "decisions", command.requestId)).toBe(false);
   });
   it("negotiation preserves an existing generation request ID, including an expired replay", () => {
     const dir = root(); const command = seed(dir, old);
@@ -496,8 +482,7 @@ describe("bounded resident request retention", () => {
     vi.spyOn(fs, "linkSync").mockImplementation((...args) => { sweep(dir, now); return link(...args); });
     expect(() => commitResidentRequest(dir, command, "duplicate", "host")).toThrow(/expired/i);
   });
-  // Delete-only premise (collection vacates the fence): off Linux collection never deletes.
-  it.skipIf(!verifiedDeletes).each(["abandonment", "cancellation"] as const)("rejects expired %s after collection vacates a committed fence during its CAS", (kind) => {
+  it.each(["abandonment", "cancellation"] as const)("rejects expired %s after collection vacates a committed fence during its CAS", (kind) => {
     const dir = root(); const command = seed(dir, old);
     const link = fs.linkSync;
     vi.spyOn(fs, "linkSync").mockImplementation((...args) => {
@@ -524,8 +509,7 @@ describe("bounded resident request retention", () => {
     expect(exists(dir, "requests", command.requestId)).toBe(true);
     expect(exists(dir, "responses", command.requestId)).toBe(true);
   });
-  // Delete-only premise (collection wins by deleting the fence): off Linux collection never deletes.
-  it.skipIf(!verifiedDeletes).each(["main", "nested"] as const)("%s client reports expired, not ordinary timeout, when collection wins the abandonment CAS race", async (kind) => {
+  it.each(["main", "nested"] as const)("%s client reports expired, not ordinary timeout, when collection wins the abandonment CAS race", async (kind) => {
     const dir = root(); const rootId = "session:expiry-race"; const meshRoot = path.join(dir, "mesh");
     const residencyRoot = residentRoot(meshRoot, rootId);
     fs.mkdirSync(residencyRoot, { recursive: true });
@@ -570,9 +554,7 @@ describe("bounded resident request retention", () => {
     const dir = root(); const commands = Array.from({ length: 40 }, () => seed(dir, old));
     const collector = new ResidentRequestRetention(dir);
     for (let i = 0; i < 500 && commands.some(c => exists(dir, "decisions", c.requestId)); i++) collector.sweep(now, new Set(), 0.1);
-    // Off Linux every decision is kept (collection refuses); on Linux none starves.
-    expect(commands.every(c => exists(dir, "decisions", c.requestId))).toBe(!verifiedDeletes);
-    expect(commands.some(c => exists(dir, "decisions", c.requestId))).toBe(!verifiedDeletes);
+    expect(commands.some(c => exists(dir, "decisions", c.requestId))).toBe(false);
     collector.close();
   });
   it("retains a generation-looking legacy decision: rollback may still execute its format-1 envelope", () => {
@@ -592,7 +574,7 @@ describe("bounded resident request retention", () => {
     const recentAck = seed(dir, old);
     acknowledgeResidentResponse(dir, { format: 1, requestId: recentAck.requestId, ok: true, completedAt: old }, now, 3);
     sweep(dir, now);
-    expect(exists(dir, "decisions", abandoned)).toBe(!verifiedDeletes);
+    expect(exists(dir, "decisions", abandoned)).toBe(false);
     expect(exists(dir, "decisions", recentAck.requestId)).toBe(true);
   });
   it.each(["running", "queued", "unreadable"])("keeps persisted %s agent references after host loss", (status) => {
@@ -620,8 +602,8 @@ describe("bounded resident request retention", () => {
     const gone = new Set(kind === "stopped alone" ? [] : ["entity"]);
     const collector = new ResidentRequestRetention(dir, [actors]);
     try { collector.sweep(now, live, 10_000, gone); } finally { collector.close(); }
-    expect(exists(dir, "decisions", command.requestId)).toBe(kind !== "writer gone" || !verifiedDeletes);
-    expect(exists(dir, "acknowledgements", command.requestId)).toBe(kind !== "writer gone" || !verifiedDeletes);
+    expect(exists(dir, "decisions", command.requestId)).toBe(kind !== "writer gone");
+    expect(exists(dir, "acknowledgements", command.requestId)).toBe(kind !== "writer gone");
   });
   it("an acknowledgement publication failure retains the response", () => {
     const dir = root(); const command = seed(dir, old, false);
@@ -631,8 +613,7 @@ describe("bounded resident request retention", () => {
     expect(exists(dir, "decisions", command.requestId)).toBe(true);
     expect(exists(dir, "responses", command.requestId)).toBe(true);
   });
-  // Delete-only: off Linux no deletion starts, so there is no partial one (refusal covered elsewhere).
-  it.skipIf(!verifiedDeletes)("partial deletion still cannot reopen replay and leaves the acknowledgement for a later scan", () => {
+  it("partial deletion still cannot reopen replay and leaves the acknowledgement for a later scan", () => {
     const dir = root(); const command = seed(dir, old);
     const decision = path.join(dir, "decisions", `${command.requestId}.json`);
     // Linux removes through verifiedRemove (smarty-dev#7916): fault its seam; elsewhere main's fs.rmSync fallback.
@@ -650,8 +631,7 @@ describe("bounded resident request retention", () => {
     fault.mockRestore(); sweep(dir, now);
     expect(exists(dir, "decisions", command.requestId)).toBe(false);
   });
-  // Delete-only: waits for the host to collect, which off Linux never deletes.
-  it.skipIf(!verifiedDeletes)("the real host maintenance path collects and replay returns a definitive expired error without dispatch", async () => {
+  it("the real host maintenance path collects and replay returns a definitive expired error without dispatch", async () => {
     const dir = root(); const command = seed(dir, old);
     const config: ResidentHostConfig = {
       format: 1, rootId: command.rootId, sessionId: "retention", cwd: dir, projectRoot: dir,

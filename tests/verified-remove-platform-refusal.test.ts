@@ -4,9 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, verifiedRemove } from "../src/storage/verified-remove.js";
 
-// smarty-dev#7916 platform decision: without getuid OR geteuid nothing is deleted on any platform (Windows helper path
-// included), and off Linux the path-based `fallback` is never invoked, even where getuid exists. No product delete runs
-// here: fs.unlinkSync and fs.rmdirSync are recorders that capture each call without executing it.
+// smarty-dev#7916 platform decision (owner ruling, fabric-store): on Linux, without getuid OR geteuid nothing is deleted
+// and the `fallback` is never used. Off Linux main's branch is
+// unchanged (tests/verified-remove-platform-main-parity.test.ts); only WITHOUT a fallback is it a refusal. No product
+// delete runs here: fs.unlinkSync, fs.rmdirSync and fs.rmSync are recorders that capture each call without executing it.
 const DAY = 24 * 60 * 60 * 1_000;
 const OLD = (Date.now() - 30 * DAY) / 1000;
 const roots: string[] = [];
@@ -52,52 +53,51 @@ const record = () => {
   }) as never;
   vi.spyOn(fs, "unlinkSync").mockImplementation(capture("unlink"));
   vi.spyOn(fs, "rmdirSync").mockImplementation(capture("rmdir"));
+  vi.spyOn(fs, "rmSync").mockImplementation(capture("rm"));
   return calls;
 };
-
-describe("verified removal deletes nothing without ownership proof, on every platform", () => {
-  for (const platform of ["linux", "darwin", "win32"] as const) {
-    for (const missing of ["getuid", "geteuid"] as const) {
-      it(`${platform}: no ${missing} refuses apply and dry run; fallback never runs`, () => {
-        const { parent, target, file, before } = fixture();
-        const calls = record();
-        const judgedTree = fs.lstatSync(target), judgedFile = fs.lstatSync(file);
-        override(missing, undefined);
-        override("platform", platform);
-        setWindowsVerifiedRemoval(true);
-        const tally = startRemovalTally();
-        let fallbackRan = 0;
-        const fallback = () => { fallbackRan++; return true; };
-        const results = [
-          verifiedRemove(target, judgedTree, { deleter: "plat", fallback }),
-          verifiedRemove(target, judgedTree, { deleter: "plat", fallback, dryRun: true }),
-          verifiedRemove(file, judgedFile, { deleter: "plat", fallback, proceed: () => true }),
-        ];
-        for (const result of results) expect(result).toEqual({ removed: false, reason: expect.stringContaining("no getuid") });
-        expect(fallbackRan).toBe(0);
-        expect(calls).toEqual([]);
-        expect(tally.plat).toMatchObject({ removed: 0, bytes: 0 });
-        expect(shape(parent)).toEqual(before);
-      });
-    }
+describe("Linux: without getuid/geteuid nothing is deleted; the fallback is never used", () => {
+  for (const missing of ["getuid", "geteuid"] as const) {
+    it(`linux: no ${missing} refuses apply and dry run; fallback never runs`, () => {
+      const { parent, target, file, before } = fixture();
+      const calls = record();
+      const judgedTree = fs.lstatSync(target), judgedFile = fs.lstatSync(file);
+      override(missing, undefined);
+      override("platform", "linux");
+      setWindowsVerifiedRemoval(true);
+      const tally = startRemovalTally();
+      let fallbackRan = 0;
+      const fallback = () => { fallbackRan++; return true; };
+      const results = [
+        verifiedRemove(target, judgedTree, { deleter: "plat", fallback }),
+        verifiedRemove(target, judgedTree, { deleter: "plat", fallback, dryRun: true }),
+        verifiedRemove(file, judgedFile, { deleter: "plat", fallback, proceed: () => true }),
+      ];
+      for (const result of results) expect(result).toEqual({ removed: false, reason: expect.stringContaining("no getuid") });
+      expect(fallbackRan).toBe(0);
+      expect(calls).toEqual([]);
+      expect(tally.plat).toMatchObject({ removed: 0, bytes: 0 });
+      expect(shape(parent)).toEqual(before);
+    });
   }
+});
 
+describe("off Linux without a fallback: a refusal", () => {
   for (const platform of ["darwin", "win32"] as const) {
-    it(`${platform} with getuid: the path-based fallback is a refusal, never invoked`, () => {
+    it(`${platform} with getuid: no fallback deletes nothing`, () => {
       const { parent, target, file, before } = fixture();
       const calls = record();
       const judgedTree = fs.lstatSync(target), judgedFile = fs.lstatSync(file);
       if (typeof process.getuid !== "function") override("getuid", () => 0);
       if (typeof process.geteuid !== "function") override("geteuid", () => 0);
       override("platform", platform);
-      let fallbackRan = 0;
-      const fallback = () => { fallbackRan++; return true; };
+      const tally = startRemovalTally();
       for (const result of [
-        verifiedRemove(target, judgedTree, { deleter: "plat", fallback }),
-        verifiedRemove(target, judgedTree, { deleter: "plat", fallback, dryRun: true }),
-        verifiedRemove(file, judgedFile, { deleter: "plat", fallback }),
-      ]) expect(result).toMatchObject({ removed: false, reason: expect.stringContaining("nothing is deleted") });
-      expect(fallbackRan).toBe(0);
+        verifiedRemove(target, judgedTree, { deleter: "plat" }),
+        verifiedRemove(target, judgedTree, { deleter: "plat", dryRun: true }),
+        verifiedRemove(file, judgedFile, { deleter: "plat", proceed: () => true }),
+      ]) expect(result).toMatchObject({ removed: false, reason: expect.stringContaining("needs Linux /proc/self/fd; nothing is deleted") });
+      expect(tally.plat).toMatchObject({ removed: 0, bytes: 0 });
       expect(calls).toEqual([]);
       expect(shape(parent)).toEqual(before);
     });

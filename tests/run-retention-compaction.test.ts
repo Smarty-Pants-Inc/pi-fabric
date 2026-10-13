@@ -7,11 +7,6 @@ import { ActorLogStore } from "../src/actors/log-store.js";
 
 const roots: string[] = [];
 const HOUR = 3600000;
-// Latest platform decision: verifiedRemove compacts/deletes only on Linux; elsewhere it refuses (even a dry run) and
-// never invokes main's path fallback. Delete-only cases run on Linux; the refusal is covered by
-// tests/verified-remove-platform-refusal.test.ts.
-const verifiedDeletes = process.platform === "linux";
-const deleteIt = it.skipIf(!verifiedDeletes);
 const now = 10 * HOUR;
 const log = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
 const make = (record: Record<string, unknown> = {}) => {
@@ -29,7 +24,7 @@ const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("six-hour terminal run compaction", () => {
-  deleteIt("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
+  it("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
     const { root, run } = make();
     fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
     const directoryMtime = fs.statSync(run).mtimeMs;
@@ -72,7 +67,7 @@ describe("six-hour terminal run compaction", () => {
     expect(changes).toEqual([]);
   });
 
-  deleteIt("compacts exactly 201 events even when bytes fit, then is idempotent", () => {
+  it("compacts exactly 201 events even when bytes fit, then is idempotent", () => {
     const { run } = make();
     const file = path.join(run, "events.jsonl");
     const events = Array.from({ length: 201 }, (_, sequence) => JSON.stringify({ sequence }) + "\n");
@@ -89,7 +84,7 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(after);
   });
 
-  deleteIt("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
+  it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
     const { root, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
@@ -152,7 +147,7 @@ describe("six-hour terminal run compaction", () => {
 
   it("dry-run reports eligibility without changing bytes, inode or timestamps", () => {
     const { run } = make(); const before = snapshot(run);
-    expect(compactTerminalRunEvents(run, { now, dryRun: true } as Parameters<typeof compactTerminalRunEvents>[1] & { dryRun: boolean })).toBe(verifiedDeletes);
+    expect(compactTerminalRunEvents(run, { now, dryRun: true } as Parameters<typeof compactTerminalRunEvents>[1] & { dryRun: boolean })).toBe(true);
     expect(snapshot(run)).toEqual(before);
   });
 

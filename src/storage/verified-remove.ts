@@ -24,11 +24,13 @@ import { fileURLToPath } from "node:url";
  *    (our own child removals change its mtime).
  *
  * Directory-relative operations go through `/proc/self/fd/<fd>/<name>` (Node has no unlinkat or renameat; the same
- * pin as mesh/fence-lock.ts). Off Linux, or without getuid/geteuid (on any platform, Windows included), nothing is
- * deleted: the `fallback` option is kept for source compatibility and never invoked. smarty-dev#7858 carries the
- * verified path off Linux. Managed scratch alone keeps main's path removal off Linux in its own sweep (pi-fabric#1014);
- * it never reaches this helper there. Platform-cause refusals and every writable-entry refusal (initial or after the
- * move) are counted and logged (`reportRemovalSkip`).
+ * pin as mesh/fence-lock.ts). The verified path above is Linux only. Off Linux main's branch is unchanged: with the
+ * operator's Windows helper switched on it removes (below); otherwise a deleter that main already ran in-process passes
+ * its unchanged main-branch removal as `fallback` (never used on Linux), so nothing regresses there; without a
+ * fallback nothing is deleted. That off-Linux path-based removal is the accepted residual of smarty-dev#7858 and
+ * smarty-dev#10678 (none of the checks above apply to it). On Linux, missing getuid/geteuid deletes nothing.
+ * Platform-cause refusals, a failed fallback and every writable-entry refusal (initial or after the move) are counted
+ * and logged (`reportRemovalSkip`).
  * Every entry in the tree (symbolic links excepted, never followed: see `entryClosed`) and the target itself must be
  * ours and closed (no group/other write), checked at the walk, at each recheck and again at each removal step. For
  * directories: no other uid can then change any entry, by path (the 0700 graveyard blocks it) or through a
@@ -58,7 +60,7 @@ export const startRemovalTally = (): Record<string, DeleterTally> => (tally = {}
 export const stopRemovalTally = (): void => { tally = undefined; };
 
 /** smarty-dev#7858: Windows verified removal (the native helper) is on only where it is switched on: the operator's
- * `retention --apply` sweep. verifiedRemove reaches it only where getuid/geteuid exist (never on Windows today).
+ * `retention --apply` sweep. In-process sweeps keep main's path-based fallback.
  * ponytail: one helper process per removal costs tens of ms on Windows; resident sweeps of thousands of runs, and
  * their per-run metadata budget (actor-manager-startup #4250), cannot carry that (pi-fabric#913 Windows CI). */
 let windowsVerified = false;
@@ -266,6 +268,16 @@ const removeTree = (parent: number, name: string, snap: Snap, uid: number, depth
   fs.rmdirSync(at(parent, name));
 };
 
+/** Regular-file bytes below a path, by lstat (no link followed); for the off-Linux report only. */
+const pathBytes = (file: string, depth = 0): number => {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isDirectory()) return stat.isFile() ? stat.size : 0;
+    if (depth >= MAX_DEPTH) return 0;
+    return fs.readdirSync(file).reduce((sum, name) => sum + pathBytes(path.join(file, name), depth + 1), 0);
+  } catch { return 0; }
+};
+
 // smarty-dev#7858: Windows verified removal through the native helper (native/fabric-win-remove.c). It opens every
 // entry without following a reparse point, verifies ALL on their handles (owner SID = this token's user or default
 // owner, the judged volume serial and file index, the kind) and only then deletes each BY HANDLE, children first.
@@ -352,7 +364,8 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   dryRun?: boolean;
   /** The caller's last check, after the move and its re-verify, right before the delete. False keeps it (moved back). */
   proceed?: () => boolean;
-  /** Kept for source compatibility only: never invoked. Off Linux nothing is deleted (smarty-dev#7858). */
+  /** Not Linux only: main's unchanged path-based removal (smarty-dev#7858 carries the verified path there). Returns
+   * whether it removed the target. Never used on Linux. */
   fallback?: () => boolean;
   /** Bytes this removal frees, when not the whole target (a compaction replaces it with a smaller tail). */
   freed?: number;
@@ -365,13 +378,9 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
     if (graveyard !== undefined && tally) (entry(deleter).graveyards ??= []).push(graveyard);
     return graveyard === undefined ? { removed: false, reason } : { removed: false, reason, graveyard };
   };
-  // No ownership proof without getuid/geteuid: nothing is deleted on any platform, Windows included.
   /** A platform-cause refusal: also counted and logged where no report tally is on (pi-fabric#1014). */
   const skip = (reason: string): VerifiedRemoveResult => { reportRemovalSkip(deleter, reason, target); return no(reason); };
-  if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
-    return skip("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
-  }
-  // smarty-dev#7858: on Windows with the verified helper (unreachable while getuid is required).
+  // smarty-dev#7858: on Windows with the verified helper, it takes the place of main's path-based fallback.
   const windowsHelper = windowsVerified ? windowsRemoveHelper() : undefined;
   if (windowsHelper) {
     if (!judged) return no("no judged stat");
@@ -412,7 +421,22 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       return no(error instanceof Refusal ? error.message : `removal failed (${code(error)})`);
     }
   }
-  // The path-based fallback is never invoked (the latest platform decision): off Linux nothing is deleted.
+  if (process.platform !== "linux" && options.fallback) {
+    // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2). The size
+    // walk runs only for a report: in-process sweeps keep main's filesystem cost (actor-manager-startup #4250 guard).
+    const bytes = options.freed ?? (tally ? pathBytes(target) : 0);
+    if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
+    let removed = false;
+    try { removed = options.fallback(); } catch { /* main's best effort */ }
+    // A failed fallback is not silent outside a tally either (logged; no metadata work, pi-fabric#1014).
+    if (!removed) return skip("removal failed (main's path on this platform)");
+    countRemoval(deleter, bytes);
+    return { removed: true, bytes };
+  }
+  // No ownership proof without getuid/geteuid: nothing is deleted (Linux included).
+  if (typeof process.getuid !== "function" || typeof process.geteuid !== "function") {
+    return skip("file ownership cannot be proven on this platform (no getuid); nothing is deleted");
+  }
   if (process.platform !== "linux") return skip("directory-relative removal needs Linux /proc/self/fd; nothing is deleted");
   if (!judged) return no("no judged stat");
   const name = path.basename(target);

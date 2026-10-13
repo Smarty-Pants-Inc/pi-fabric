@@ -220,15 +220,20 @@ const rootHarness = async (name: string): Promise<RootHarness> => {
 
 // In-process hosts run by this file, by residency root: stopResident releases them through their own close path
 // (their abort signal), never by a signal to this process.
-const inProcessHosts = new Map<string, AbortController>();
+// Every host started for a root is kept (a second start for one root may lose to the first), and each removes only itself.
+const inProcessHosts = new Map<string, Set<AbortController>>();
 const runResidentHostFromConfigPath = (configPath: string, signal?: AbortSignal): Promise<void> => {
   const stopper = new AbortController();
   if (signal?.aborted) stopper.abort();
   else signal?.addEventListener("abort", () => stopper.abort(), { once: true });
   const residencyRoot = path.dirname(configPath);
-  inProcessHosts.set(residencyRoot, stopper);
-  return runResidentHostFromConfigPathInProcess(configPath, stopper.signal)
-    .finally(() => { if (inProcessHosts.get(residencyRoot) === stopper) inProcessHosts.delete(residencyRoot); });
+  const stoppers = inProcessHosts.get(residencyRoot) ?? new Set<AbortController>();
+  stoppers.add(stopper);
+  inProcessHosts.set(residencyRoot, stoppers);
+  return runResidentHostFromConfigPathInProcess(configPath, stopper.signal).finally(() => {
+    stoppers.delete(stopper);
+    if (stoppers.size === 0 && inProcessHosts.get(residencyRoot) === stoppers) inProcessHosts.delete(residencyRoot);
+  });
 };
 
 const readOwner = (ownerPath: string): ResidentHostOwner | undefined => {
@@ -245,9 +250,15 @@ const stopResident = async (config: ResidentHostConfig): Promise<void> => {
   if (owner?.pid && (owner.pid === process.pid || owner.pid === process.ppid)) {
     // An in-process host (this vitest fork) or the pool: a SIGTERM here, then the SIGKILL below once the fork never
     // looks dead, ends the fork with no output. Release an in-process host through its own close path instead.
-    inProcessHosts.get(config.residencyRoot)?.abort();
+    const stoppers = [...(inProcessHosts.get(config.residencyRoot) ?? [])];
+    if (stoppers.length === 0) {
+      // A host made directly (new ResidentHost): its test closes it. Never wait on or signal ourselves here.
+      console.warn(`stopResident: owner.json names this test process (pid ${owner.pid}); left to its own close`);
+      return;
+    }
+    for (const stopper of stoppers) stopper.abort();
     await waitFor(() => readOwner(ownerPath)?.token !== owner.token, 20_000).catch(() => {
-      throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}) and no in-process stop released it; never signalling it`);
+      throw new Error(`stopResident: owner.json still names this test process (pid ${owner.pid}) after its in-process stop; never signalling it`);
     });
     return;
   }
@@ -522,6 +533,7 @@ describe.skipIf(process.platform !== "linux" || !hasResidentHost)("S4 originatin
       // Release any faulted host/helper first, then join exact fixture-owned births.
       fs.rmSync(fault, { force: true });
       fs.writeFileSync(`${helperPath}.release`, "checked fixture drain");
+      await seed.close(); // the in-process seed first (idempotent): stopResident never signals this process
       await recovery?.close(); await client?.close();
       await stopResident(state.config);
       await stopAllOwned(launches.owned(), 2_000, 5_000);

@@ -649,6 +649,8 @@ export class ActorManager {
   // snapshot taken before the load (a passive view, or the empty queue a new owner parks before
   // it reloads) would replace or delete the owner's accepted work (review/astra F1 on #79).
   readonly #ownQueueRead = new Set<string>();
+  // One refusal notice per actor instance, without retaining removed actor ids forever.
+  readonly #queuePersistenceRefused = new WeakSet<ManagedActor>();
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
@@ -718,6 +720,7 @@ export class ActorManager {
   readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #childCompletionWatches = new Map<string, ActorChildCompletionWatch>();
+  readonly #childCompletionWatchCloses = new Map<string, Promise<void>>();
   readonly #childCompletionRetries = new Map<string, { failures: number; timer?: NodeJS.Timeout | undefined }>();
   readonly #acquireCapabilityView:
     | ((
@@ -1408,6 +1411,7 @@ export class ActorManager {
     this.#ceded.add(actor.id);
     this.#ownership.set(actor.id, false);
     actor.abortController?.abort();
+    await this.#releaseChildCompletionStore(actor);
     this.#drop(actor, [...this.#takeQueued(actor), ...this.#takeParked(actor.id)],
       `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`);
     if (actor.status !== "stopped") actor.status = "idle";
@@ -2582,6 +2586,7 @@ export class ActorManager {
     resets?.forEach(waiter => waiter.reject(new ActorSessionResetCancelledError(actor.id)));
     this.#stopRun(running);
     if (running !== actor) this.#stopRun(actor);
+    await this.#releaseChildCompletionStore(actor);
     if (stopped && running === actor) {
       if (wait) await this.#joinStoppedRun(actor.id);
       return this.#publicInfo(actor);
@@ -2980,6 +2985,7 @@ export class ActorManager {
   async #commitRemove(actor: ManagedActor): Promise<RemovalResult> {
     // Finalization and recovery must fence the actual old-object drain before revocation.
     await this.#joinStoppedRun(actor.id);
+    await this.#releaseChildCompletionStore(actor);
     const cleanup: RemovalCleanup = this.#removalCleanup.get(actor.id) ?? this.#readCleanup(actor.id) ?? {
       id: actor.id, sessionDir: path.dirname(actor.sessionFile), presenceKey: this.#presenceKey(actor.id),
       ...(actor.lastRunId ? { lastRunId: actor.lastRunId } : {}),
@@ -3075,7 +3081,7 @@ export class ActorManager {
     // Join native watch closes before any owned file can be released.
     const watches = [...this.#childCompletionWatches.values()];
     this.#childCompletionWatches.clear();
-    await Promise.all(watches.map(watch => watch.close()));
+    await Promise.all([...watches.map(watch => watch.close()), ...this.#childCompletionWatchCloses.values()]);
     for (const retry of this.#childCompletionRetries.values()) if (retry.timer) clearTimeout(retry.timer);
     this.#childCompletionRetries.clear();
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
@@ -3185,6 +3191,29 @@ export class ActorManager {
     return store;
   }
 
+  /** Release observation with actor custody, joining native close before stop/removal returns.
+   * The durable spool stays intact; a later owner/restart reconstructs its store. */
+  #releaseChildCompletionStore(actor: ManagedActor): Promise<void> {
+    const store = this.#childCompletionStores.get(actor.sessionFile);
+    this.#childCompletionStores.delete(actor.sessionFile);
+    const retry = this.#childCompletionRetries.get(actor.id);
+    if (retry?.timer) clearTimeout(retry.timer);
+    this.#childCompletionRetries.delete(actor.id);
+    const directory = store?.directory ?? path.join(path.dirname(actor.sessionFile), "child-completions");
+    const closing = this.#childCompletionWatchCloses.get(directory);
+    if (closing) return closing;
+    const watch = this.#childCompletionWatches.get(directory);
+    this.#childCompletionWatches.delete(directory);
+    if (!watch) return Promise.resolve();
+    const done = watch.close().finally(() => {
+      this.#childCompletionWatchCloses.delete(directory);
+      // A same-lineage regain while close was pending still gets its native observer.
+      if (!this.#closing) this.#meshMonitor.schedule();
+    });
+    this.#childCompletionWatchCloses.set(directory, done);
+    return done;
+  }
+
   /** Bound the actual pretty-printed UTF-8 context, independently of the runnable FIFO. */
   #handoffSnapshot(actor: ManagedActor): ActorQueueItem[] {
     const snapshot: ActorQueueItem[] = [];
@@ -3214,12 +3243,17 @@ export class ActorManager {
   #reconcileChildCompletions(completed?: ManagedActor): void {
     if (!this.#persistent || this.#closing) return;
     for (const actor of completed ? [completed] : this.#actors.values()) {
-      if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
+      if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) {
+        void this.#releaseChildCompletionStore(actor);
+        continue;
+      }
       this.#flushHandoffConsumption(actor);
       // A failed durable handoff already owes a retry deadline. Coalesced native spool
       // events must not bypass its backoff and repeatedly attempt the same failed write.
       if (this.#childCompletionRetries.get(actor.id)?.timer) continue;
       const store = this.#childCompletionStore(actor);
+      // Never overlap the old custody's native close with a replacement observer.
+      if (this.#childCompletionWatchCloses.has(store.directory)) continue;
       // Arm before the preflight; a cross-process write then reuses the monitor's gated poll.
       if (!this.#childCompletionWatches.has(store.directory)) {
         this.#childCompletionWatches.set(store.directory, new ActorChildCompletionWatch(store.directory, () => this.#meshMonitor.schedule()));
@@ -6079,6 +6113,7 @@ export class ActorManager {
     if (!ownsAny) {
       const previous = [...this.#actors.values()];
       for (const actor of this.#actors.values()) {
+        void this.#releaseChildCompletionStore(actor);
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, this.#takeQueued(actor),
@@ -6102,6 +6137,7 @@ export class ActorManager {
         owned.add(id);
         continue;
       }
+      void this.#releaseChildCompletionStore(actor);
       this.#markOwnershipAbort(actor);
       actor.abortController?.abort();
       this.#park(actor, this.#takeQueued(actor),
@@ -6484,6 +6520,22 @@ export class ActorManager {
         return true;
       });
     const file = this.#ownQueueFile(actor);
+    const mayPersistQueue = (): boolean => {
+      // A park can run inside a held poll snapshot. Every queue mutation needs
+      // fresh authority, not that snapshot's permission (same check as ownership refresh).
+      const cached = this.#directoryOwnership;
+      this.#directoryOwnership = undefined;
+      let owned = false;
+      try { owned = this.#ownershipDecision(actorId); }
+      catch { /* Unknown ownership cannot authorize a queue mutation. */ }
+      finally { this.#directoryOwnership = cached; }
+      if (owned) { this.#queuePersistenceRefused.delete(actor); return true; }
+      if (!this.#queuePersistenceRefused.has(actor)) {
+        this.#queuePersistenceRefused.add(actor);
+        console.warn(`[pi-fabric] actor ${actorId}: queue persistence refused; fresh ownership is not confirmed for this manager`);
+      }
+      return false;
+    };
     const cleanHandover = release || this.#releasePaused;
     const processedKeys = [...(this.#processedKeys.get(actorId) ?? [])];
     const pendingWindows = [...(this.#settledWindows.get(actorId) ?? [])]
@@ -6544,12 +6596,17 @@ export class ActorManager {
       // cancellation/predecessor fences require a file + namespace receipt.
       if (items.length === 0 && processedKeys.length === 0 && settledWindows.length === 0 && !cleanHandover && !durable && !cancelledPredecessors.length &&
           !pendingDeliveryOutcomes.length) {
+        if (!mayPersistQueue()) return false;
         fs.rmSync(file, { force: true });
-      } else writeJsonAtomic(file, snapshot, { durable });
+      } else {
+        if (!mayPersistQueue()) return false;
+        writeJsonAtomic(file, snapshot, { durable });
+      }
     } catch (error) {
       if (durable || pendingWindows.length || transfer) actor.lastError = errorText(error);
       if (release) throw error;
       if (cancellationFallback && snapshot) {
+        if (!mayPersistQueue()) return false;
         try {
           // This marker describes only this snapshot, not a permanent actor disable.
           const cancelled = settledWindows.length === 0 && items.every(item => item.deferredHandoff);
@@ -6570,6 +6627,7 @@ export class ActorManager {
       const sources = this.#takenOver.get(actorId);
       for (const source of sources ?? []) {
         if (source === file) continue;
+        if (!mayPersistQueue()) return false;
         try {
           fs.rmSync(source, { force: true });
           syncDirectoryChain(path.dirname(source));
@@ -7400,6 +7458,7 @@ export class ActorManager {
       const next = this.#ownershipDecision(actor.id, fresh);
       this.#ownership.set(actor.id, next);
       if (previous && !next) {
+        void this.#releaseChildCompletionStore(actor);
         this.#markOwnershipAbort(actor);
         actor.abortController?.abort();
         this.#park(actor, this.#takeQueued(actor),

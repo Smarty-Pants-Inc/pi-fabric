@@ -223,6 +223,39 @@ describe.each(["file", "sqlite"] as const)("fv2-11107 %s poll ownership stamp ga
     expect(rebuilds()).toBe(armed + 1);
   });
 
+  it("does not retain ownership after an expired lease is renewed during snapshot construction and expires again", async () => {
+    const { directory, poll, putHost, meshRoot, list, rebuilds } = await setup(backend);
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    await putHost(SELF, { expiresAt: now - 1, updatedAt: now });
+    const lease = { id: `host:${SELF.id}`, rootId: SELF.id, identityId: SELF.id, startedAt: 1, updatedAt: now };
+    writeHostLease(meshRoot, { ...lease, expiresAt: now - 1 });
+    const renewedExpiry = now + 100;
+    const realList = ParticipantDirectory.prototype.list;
+    let renewDuringListing = true;
+    list.mockImplementation((options, readNow) => {
+      // The observation has already read the expired lease. Atomically renewing the
+      // same identity here makes the following directory decision live without
+      // changing any selected ownership fact.
+      if (renewDuringListing) {
+        renewDuringListing = false;
+        writeHostLease(meshRoot, { ...lease, updatedAt: now + 1, expiresAt: renewedExpiry });
+      }
+      return realList.call(directory, options, readNow);
+    });
+    expect(poll().get("actor:a")).toBe(true);
+    expect(renewDuringListing).toBe(false);
+    // The rightful live owner remains allowed, including a second, stable observation.
+    expect(poll().get("actor:a")).toBe(true);
+    now = renewedExpiry - 1;
+    expect(poll().get("actor:a")).toBe(true);
+    const beforeExpiry = rebuilds();
+    now = renewedExpiry + 1;
+    expect(poll().get("actor:a")).not.toBe(true);
+    expect(rebuilds()).toBeGreaterThan(beforeExpiry);
+    expect(directory.actorOwnership(`host:${SELF.id}`, { fresh: true }).get("actor:a")).not.toBe(true);
+  });
+
   it("never arms from a cached list older than the observation (reported stale-cache sequence)", async () => {
     const { directory, writer, poll, putFile, fileEntry, list, freshOwner, meshRoot } = await setup(backend, { listReadCacheMs: 60_000 });
     // actor:b lives only in its participant FILE (no shared copy, so no arbitration is involved).

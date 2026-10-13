@@ -154,6 +154,77 @@ it.each([false, true])("wakes a real idle owner and retries a failed durable que
   }
 }, 30_000);
 
+it("releases completion watches on stop, transfer and 200 recorded actor removals without closing the manager", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-lifecycle-"));
+  const actorRoot = path.join(root, "actors");
+  const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const agents = new AgentManager(root, DEFAULT_FABRIC_CONFIG.agents, { runRoot: path.join(root, "runs") });
+  const lost = new Set<string>();
+  const live = new Set<fs.FSWatcher>();
+  let armed = 0;
+  const nativeWatch = fs.watch;
+  const watch = vi.spyOn(fs, "watch").mockImplementation(((...args: unknown[]) => {
+    const handle: fs.FSWatcher = Reflect.apply(nativeWatch, fs, args);
+    if (path.basename(String(args[0])) === "child-completions") {
+      armed++;
+      live.add(handle);
+      handle.once("close", () => live.delete(handle));
+    }
+    return handle;
+  }) as typeof fs.watch);
+  const remove = fs.rmSync;
+  const removals: string[] = [];
+  const recorder = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    const file = path.resolve(String(target));
+    // Record data removal, never execute it. Atomic-write lock/temp cleanup is
+    // fixture housekeeping, not a real actor/session purge (#4664).
+    if (file.startsWith(actorRoot + path.sep) &&
+        (path.basename(file).startsWith("queue-") || path.basename(file).startsWith("removal-") ||
+         /^[a-f0-9]{32}$/.test(path.basename(file)))) {
+      removals.push(file);
+      return;
+    }
+    return remove(target, options);
+  });
+  const owner = new ActorManager("watch-lifecycle", { id: "session:watch-lifecycle", name: "owner", kind: "main" },
+    mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600_000 }, agents, vi.fn(), {
+      persistent: true, actorRoot, retentionSweepMs: 600_000, canManageActor: id => !lost.has(id),
+      resolvePiModel: async model => model,
+    });
+  const create = async (name: string) => {
+    const actor = await owner.create({ name, instructions: "Wait", triggerTurn: false });
+    // A real monitor pass, not a direct store/watch call; its preflight arms the watch.
+    await vi.waitFor(() => expect(live.size).toBe(1), { timeout: 5000, interval: 10 });
+    return actor;
+  };
+  try {
+    expect(live.size).toBe(0);
+    const stopped = await create("stop-watch");
+    await owner.stop(stopped.id);
+    expect(live.size).toBe(0); // stop joins native close, manager stays open
+    for (let index = 0; index < 200; index++) {
+      const actor = await create(`churn-${index}`);
+      expect(await owner.remove(actor.id)).toMatchObject({ removed: true });
+      expect(live.size).toBe(0);
+    }
+    // A real foreign opinion intentionally blocks further registry creation, so
+    // exercise transfer after churn rather than bypassing that custody gate.
+    const transferred = await create("transfer-watch");
+    lost.add(transferred.id);
+    owner.listOwned();
+    await vi.waitFor(() => expect(live.size).toBe(0), { timeout: 5000, interval: 10 });
+    expect(armed).toBeGreaterThanOrEqual(202);
+    expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file)))).toHaveLength(200);
+    expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown
+  } finally {
+    await owner.close();
+    await agents.close();
+    watch.mockRestore();
+    recorder.mockRestore();
+    fs.rmSync(root, { recursive: true, force: true }); // own test fixture cleanup
+  }
+}, 120_000);
+
 // Child spool watch failure contract: one immediate rescan/re-arm, then finite
 // 60/120/240/300 s one-shots. Only delivered events reset the budget. Exhaustion
 // exposes observation-degraded and warns once; one60s scan/re-arm keeps late work

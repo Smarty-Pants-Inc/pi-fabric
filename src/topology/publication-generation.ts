@@ -122,7 +122,7 @@ export interface ActorOwnershipObservation {
   /** False once any ownership fact of a scoped actor changed since the observation, or once
    * the clock reached the earliest lease/reload deadline that was still live when observed. */
   unchanged(): boolean;
-  /** Earliest observed live deadline of the scoped actors (Infinity when none). */
+  /** Earliest scoped deadline (strict poll reuse retains expired deadlines too); Infinity when none. */
   deadline(): number;
 }
 
@@ -166,10 +166,12 @@ export const observeActorOwnership = (
   };
   const pFacts = (entry: MeshStateEntry | undefined): string => participantFacts(entry) + validity(entry, strict?.participant);
   const hFacts = (entry: MeshStateEntry | undefined): string => hostFacts(entry) + validity(entry, strict?.host);
-  // pi-fabric#637: read the clock BEFORE the inputs, as get() does after them; a deadline is
-  // kept only while still live at this instant (an already-lapsed lease was not relied on).
+  // pi-fabric#637: a registry save need not rely on an already-lapsed lease. Strict poll
+  // reuse must retain its real expired deadline: a renewal between observation and listing
+  // cannot turn a non-live observation into an indefinitely reusable owned map.
   const observedAt = clock();
-  const live = (deadline: number | undefined): number => deadline !== undefined && deadline >= observedAt ? deadline : Number.POSITIVE_INFINITY;
+  const live = (deadline: number | undefined): number => deadline !== undefined &&
+    (strict !== undefined || deadline >= observedAt) ? deadline : Number.POSITIVE_INFINITY;
   const meshRoot = typeof mesh === "string" ? mesh : mesh.root;
   // Stamp first, then content: a commit between them changes the stamp and is compared. The stamp
   // follows the ACTIVE backend (pi-fabric#640): SQLite commits never touch state.json, so a
@@ -260,11 +262,11 @@ export const observeActorOwnership = (
           const host = hosts.get(id)!;
           const entry = current(HOST_PREFIX + digest(id));
           if (hFacts(entry) !== host.shared) return false;
-          if (Number.isFinite(host.deadline)) {
-            const lease = movedLeases.has(id) ? movedLeases.get(id) : readHostLeaseCurrent(meshRoot, id);
-            const now = hostDeadline(id, entry, lease);
-            if (now === undefined || now < host.deadline) return false;
-          }
+          const lease = movedLeases.has(id) ? movedLeases.get(id) : readHostLeaseCurrent(meshRoot, id);
+          const deadline = hostDeadline(id, entry, lease);
+          // Check effective liveness even when the observation had no live deadline.
+          // Absence/non-live -> renewal must relist, never inherit an Infinity bound.
+          if (deadline === undefined || !Number.isFinite(deadline) || deadline < clock() || deadline < host.deadline) return false;
         }
         if (!sharedMoved) return true;
         return records.every(record => pFacts(current(record.key)) === record.shared) &&

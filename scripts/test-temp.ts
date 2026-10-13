@@ -29,18 +29,25 @@ const ownedRootCleanup = (directory: string): (() => void) => {
 // on stderr. On a Windows CI runner, reuse one path per job and leave it for the runner
 // to clean: no test process owns this shared parent or the lifetime of a pinned /tmp.
 // RUNNER_TEMP selects job lifetime only; caller TMPDIR remains the allocation boundary.
+// Not PI_FABRIC_-prefixed: isolateTestFleetEnvironment keeps it, so workers and children inherit it.
+const jobTempMarker = "PI_TEST_TEMP_JOB_DIR";
 const stableRoot = (prefix: string): string | undefined => {
   const runnerTemp = process.env.RUNNER_TEMP;
   if (process.platform !== "win32" || !runnerTemp) return;
   // Idempotent: vitest.config exports this directory as TMPDIR, so a later call in that process or an inheriting
   // child (a config probe, a worker) already stands in it and must not nest a second `<prefix>job` below it.
+  // Reuse only the directory this helper allocated (its inherited marker), never a caller directory that merely
+  // shares the name.
   const base = resolve(tmpdir());
   const name = `${prefix}job`;
-  const directory = basename(base) === name ? base : join(base, name);
+  const inherited = process.env[jobTempMarker];
+  const allocated = inherited !== undefined && resolve(inherited) === base && basename(base) === name;
+  const directory = allocated ? base : join(base, name);
   mkdirSync(directory, { recursive: true });
   if (!lstatSync(directory).isDirectory()) {
     throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${directory}`);
   }
+  process.env[jobTempMarker] = directory;
   return directory;
 };
 

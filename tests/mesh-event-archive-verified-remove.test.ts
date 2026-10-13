@@ -577,3 +577,91 @@ it.runIf(process.platform === "linux")("an unchanged archive-coupled publication
   expect(JSON.parse(fs.readFileSync(receiptPath(seeded.root, "k"), "utf8") as string)).toMatchObject({ id: event.id });
   await expectLaterCompactionClears(seeded, ino);
 });
+
+// r4 review (.local/r4-review.md). Raw bytes are read with the real primitive bound at module load, never a UTF-8 helper.
+const realReadFileSync = fs.readFileSync;
+const rawBytes = (file: string) => realReadFileSync(file) as Buffer;
+const eacces = (target: string) => Object.assign(new Error(`EACCES: permission denied, open '${target}'`), { code: "EACCES" });
+/** Fails a read of `file` with EACCES while `deny(ino)` holds for its current inode; counts those attempts. */
+const unreadableWhen = (file: string, deny: (ino: number) => boolean) => {
+  const state = { attempts: 0 };
+  const spy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    const stat = target === file ? real.lstatSync(file, { throwIfNoEntry: false }) : undefined;
+    if (stat && deny(stat.ino)) { state.attempts += 1; throw eacces(file); }
+    return (realReadFileSync as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as never);
+  return { state, spy };
+};
+
+it.runIf(process.platform === "linux")("r4 P1: an archive restore refuses an in-place invalid-UTF-8 byte change that decodes identically", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  // The original intent gains an unknown JSON string field holding raw byte 0x80 (decoded as U+FFFD), in place.
+  const json = rawBytes(seeded.file).toString("utf8");
+  const original = Buffer.concat([Buffer.from(`${json.slice(0, -1)},"x":"`), Buffer.from([0x80]), Buffer.from(`"}`)]);
+  fs.writeFileSync(seeded.file, original);
+  const originalStat = real.lstatSync(seeded.file); // snapshotted after the invalid byte, before the store's publish
+  expect(originalStat.ino).toBe(deadIno);
+  const at = original.indexOf(0x80);
+  const changed = Buffer.from(original);
+  changed[at] = 0x81;
+  expect(changed.equals(original)).toBe(false);
+  expect(changed.toString("utf8")).toBe(original.toString("utf8")); // same decoded string, same size
+  // Timestamp-precision collision: once changed, lstat of the intent reports its real dev/ino/size/mode with the
+  // original timestamps (identity is never fabricated; only the clock fields are pinned).
+  let mutated = false;
+  const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+    const stat = (real.lstatSync as (...args: unknown[]) => fs.Stats | undefined)(target, ...rest);
+    if (!mutated || target !== seeded.file || !stat) return stat;
+    return Object.assign(Object.create(Object.getPrototypeOf(stat) as object) as fs.Stats, stat, {
+      atimeMs: originalStat.atimeMs, mtimeMs: originalStat.mtimeMs, ctimeMs: originalStat.ctimeMs, birthtimeMs: originalStat.birthtimeMs,
+      atime: originalStat.atime, mtime: originalStat.mtime, ctime: originalStat.ctime, birthtime: originalStat.birthtime,
+    });
+  }) as never);
+  const seam = afterRestoreLookup(event.sequence, () => {
+    const fd = fs.openSync(seeded.file, "r+");
+    try { fs.writeSync(fd, Buffer.from([0x81]), 0, 1, at); } finally { fs.closeSync(fd); }
+    mutated = true;
+  });
+  const outcome = await restoreOutcome(seeded);
+  lstat.mockRestore();
+  expect(seam.fired).toBe(true);
+  expect(outcome).toBeInstanceOf(MeshDedupeRecoveryError);
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expect(real.lstatSync(seeded.file).ino).toBe(deadIno);
+  expect(rawBytes(seeded.file).equals(changed)).toBe(true); // the changed raw bytes are kept, never rewritten
+  expect(fs.existsSync(receiptPath(seeded.root, "k"))).toBe(false);
+  expect(rawBytes(path.join(seeded.root, "events.jsonl")).length).toBe(0); // no append
+  expect(fs.existsSync(path.join(seeded.root, "generation"))).toBe(false);
+  expect(probe.calls.filter(call => call.target === seeded.file)).toEqual([]);
+  expect(receiptRemovals(seeded.file)).toEqual([]);
+});
+
+it.runIf(process.platform === "linux")("r4 P2: an archive restore refuses an unreadable successor by its stat, before reading it", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  let successorIno = 0;
+  const seam = afterRestoreLookup(event.sequence, () => { installArchivedSuccessor(seeded.file, seeded.archiveDir); successorIno = fs.lstatSync(seeded.file).ino; });
+  const read = unreadableWhen(seeded.file, ino => successorIno !== 0 && ino === successorIno);
+  const outcome = await restoreOutcome(seeded);
+  read.spy.mockRestore(); // the shared helper below reads the kept successor
+  expect(successorIno).not.toBe(deadIno);
+  expect(read.state.attempts).toBe(0); // refused by its early stat; old code surfaced the read's raw EACCES
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expectRestoreRefused(seeded, outcome, seam, successorIno, successorText(seeded.archiveDir));
+});
+
+it.runIf(process.platform === "linux")("r4 control: an unchanged but unreadable original at the rename check is a retryable refusal", async () => {
+  const seeded = seedArchived();
+  const { event, deadIno } = await seedRestore(seeded);
+  const original = rawBytes(seeded.file).toString("utf8");
+  let armed = false;
+  const seam = afterRestoreLookup(event.sequence, () => { armed = true; });
+  const read = unreadableWhen(seeded.file, ino => armed && ino === deadIno);
+  const outcome = await restoreOutcome(seeded);
+  read.spy.mockRestore();
+  expect(read.state.attempts).toBeGreaterThan(0); // the unchanged original really was read at the check, and failed
+  expect((outcome as { retryable?: boolean }).retryable).toBe(true);
+  expect((outcome as Error).message).toMatch(/unreadable or changed/);
+  expectRestoreRefused(seeded, outcome, seam, deadIno, original);
+});

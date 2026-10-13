@@ -1,13 +1,14 @@
 // smarty-dev#11145: test-only deletion guard. Importing this module installs it (side effect).
-// Locally (GITHUB_ACTIONS !== "true" at install) fs/fs.promises rm, rmdir and unlink (and the Sync forms)
-// refuse any target outside the physical TMPDIR this process had at install. Under hosted CI they log one
-// TEST_DELETION_REPORT: line per outside target, then delegate. Children inherit it via NODE_OPTIONS --import.
+// Locally (GITHUB_ACTIONS !== "true" at install) deletion and rename operands, and copy/link destinations,
+// refuse paths outside the physical TMPDIR pinned at install. cp checks every kept recursive destination.
+// Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isPromise } from "node:util/types";
 
 const REFUSAL = "test deletion outside private temp (smarty-dev#11145)";
 const REPORT = "TEST_DELETION_REPORT:";
@@ -84,7 +85,7 @@ function rawPath(input) {
 }
 
 /** Kernel-faithful target: realpath of the raw parent (no lexical "..", so link/.. follows the link). */
-function resolveTarget(raw) {
+function resolveTarget(raw, followFinal = false) {
   // Do not collapse relative link/.. on Windows either. Ambiguous drive-relative paths fail closed.
   if (windows && /^[a-z]:(?![\\/])/i.test(raw)) throw new Error("drive-relative path");
   const absolute = isAbsolute(raw) ? raw : `${process.cwd()}${sep}${raw}`;
@@ -92,8 +93,8 @@ function resolveTarget(raw) {
   const trailingSeparator = windows ? /[\\/]$/ : /\/$/;
   while (trimmed.length > parse(trimmed).root.length && trailingSeparator.test(trimmed)) trimmed = trimmed.slice(0, -1);
   const name = basename(trimmed);
-  // A trailing separator, "." or ".." makes the kernel follow the final component: resolve it whole.
-  if (trimmed !== absolute || name === "" || name === "." || name === "..") return physical(trimmed);
+  // Copies follow the destination itself; deletions/renames/link creation retain its final symlink.
+  if (followFinal || trimmed !== absolute || name === "" || name === "." || name === "..") return physical(trimmed);
   return join(physical(trimmed.slice(0, trimmed.length - name.length) || sep), name);
 }
 
@@ -112,13 +113,13 @@ function install() {
   const state = { report, root: pinRoot(), count: 0 };
 
   /** An Error to refuse with, or undefined to delegate. */
-  const check = (operation, input) => {
+  const check = (operation, input, followFinal = false) => {
     let raw;
     let outside;
     try {
       raw = rawPath(input);
       if (raw === undefined) return undefined; // Node rejects it before any syscall.
-      outside = state.root === undefined || !within(state.root, resolveTarget(raw));
+      outside = state.root === undefined || !within(state.root, resolveTarget(raw, followFinal));
     } catch {
       outside = true; // Unresolvable: fail closed.
     }
@@ -136,25 +137,75 @@ function install() {
     return error;
   };
 
-  const sync = (operation, original) => function guardedSync(path, ...rest) {
-    const error = check(operation, path);
-    if (error) throw error;
-    return Reflect.apply(original, this, [path, ...rest]);
+  const checkArgs = (operation, args, indexes, followFinal = false) => {
+    let first;
+    for (const index of indexes) {
+      const error = check(operation, args[index], followFinal);
+      if (first === undefined && error) first = error;
+    }
+    return first;
   };
-  const callback = (operation, original) => function guardedCallback(path, ...rest) {
-    const error = check(operation, path);
+
+  // Node's filter covers root and recursive pairs, including its sync JS copy path.
+  // ponytail: conservative final-target checks also cover dereference:true and nested destination links.
+  const guardedCpOptions = (operation, options) => {
+    if (options === undefined) options = {};
+    if (options === null || typeof options !== "object") return options;
+    const filter = options.filter;
+    if (filter !== undefined && typeof filter !== "function") return options;
+    return {
+      ...options,
+      filter(source, destination) {
+        const selected = filter === undefined ? true : Reflect.apply(filter, this, [source, destination]);
+        // cpSync rejects real Promises but accepts truthy non-Promise objects without awaiting them.
+        if (operation === "cpSync" && isPromise(selected)) return selected;
+        if (operation !== "cpSync" && selected && typeof selected.then === "function") {
+          return Promise.resolve(selected).then((keep) => {
+            if (!keep) return keep;
+            const error = check(operation, destination, true);
+            if (error) throw error;
+            return keep;
+          });
+        }
+        if (!selected) return selected;
+        const error = check(operation, destination, true);
+        if (error) throw error;
+        return selected;
+      },
+    };
+  };
+
+  const sync = (operation, original, indexes = [0], followFinal = false) => function guardedSync(...args) {
+    const error = checkArgs(operation, args, indexes, followFinal);
+    if (error) throw error;
+    return Reflect.apply(original, this, args);
+  };
+  const callback = (operation, original, indexes = [0], followFinal = false) => function guardedCallback(...args) {
+    const error = checkArgs(operation, args, indexes, followFinal);
     if (error) {
-      const done = rest.at(-1);
+      const done = args.at(-1);
       if (typeof done !== "function") throw error;
       process.nextTick(done, error);
       return;
     }
-    return Reflect.apply(original, this, [path, ...rest]);
+    return Reflect.apply(original, this, args);
   };
-  const promise = (operation, original) => function guardedPromise(path, ...rest) {
-    const error = check(operation, path);
+  const promise = (operation, original, indexes = [0], followFinal = false) => function guardedPromise(...args) {
+    const error = checkArgs(operation, args, indexes, followFinal);
     if (error) return Promise.reject(error);
-    return Reflect.apply(original, this, [path, ...rest]);
+    return Reflect.apply(original, this, args);
+  };
+  const cpCallback = (operation, original) => function guardedCp(...args) {
+    if (typeof args[2] === "function") {
+      return Reflect.apply(original, this, [args[0], args[1], guardedCpOptions(operation, undefined), args[2]]);
+    }
+    return Reflect.apply(original, this, [args[0], args[1], guardedCpOptions(operation, args[2]), args[3]]);
+  };
+  const cpPromise = (operation, original) => function guardedCpPromise(src, dest, options) {
+    return Reflect.apply(original, this, [src, dest, guardedCpOptions(operation, options)]);
+  };
+  const cpSync = (operation, original) => function guardedCpSync(src, dest, options) {
+    return Reflect.apply(original, this, [src, dest, guardedCpOptions(operation, options)]);
   };
 
   // Wrap whatever is installed now (a test recorder included), once per process.
@@ -163,6 +214,21 @@ function install() {
     fs[`${name}Sync`] = sync(`${name}Sync`, fs[`${name}Sync`]);
     fs.promises[name] = promise(`promises.${name}`, fs.promises[name]);
   }
+  fs.rename = callback("rename", fs.rename, [0, 1]);
+  fs.renameSync = sync("renameSync", fs.renameSync, [0, 1]);
+  fs.promises.rename = promise("promises.rename", fs.promises.rename, [0, 1]);
+  fs.copyFile = callback("copyFile", fs.copyFile, [1], true);
+  fs.copyFileSync = sync("copyFileSync", fs.copyFileSync, [1], true);
+  fs.promises.copyFile = promise("promises.copyFile", fs.promises.copyFile, [1], true);
+  fs.link = callback("link", fs.link, [1]);
+  fs.linkSync = sync("linkSync", fs.linkSync, [1]);
+  fs.promises.link = promise("promises.link", fs.promises.link, [1]);
+  fs.symlink = callback("symlink", fs.symlink, [1]);
+  fs.symlinkSync = sync("symlinkSync", fs.symlinkSync, [1]);
+  fs.promises.symlink = promise("promises.symlink", fs.promises.symlink, [1]);
+  fs.cp = cpCallback("cp", fs.cp);
+  fs.cpSync = cpSync("cpSync", fs.cpSync);
+  fs.promises.cp = cpPromise("promises.cp", fs.promises.cp);
   syncBuiltinESMExports();
 
   process.once("exit", () => {

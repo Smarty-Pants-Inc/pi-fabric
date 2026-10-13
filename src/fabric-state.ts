@@ -39,6 +39,7 @@ import type {
 } from "./topology/types.js";
 import { resolveFabricIdentity } from "./fabric-provenance.js";
 import { ParticipantRoleGrant } from "./topology/project-identity.js";
+import { extensionContextLive } from "./session-liveness.js";
 import type {
   FabricAgentMessageDelivery,
   FabricAgentMessageResult,
@@ -293,7 +294,11 @@ export class FabricState {
       await booting;
     }
     const runtime = await this.#activate(context, false);
-    const lease: FabricLifecycleLease = { current: () => generation === this.#generation && !this.#shutDown };
+    // smarty-dev#8881: an SDK dispose stales the ctx without session_shutdown or a generation bump;
+    // the lease covers that ctx's freshness too.
+    const lease: FabricLifecycleLease = {
+      current: () => generation === this.#generation && !this.#shutDown && extensionContextLive(context),
+    };
     // Rebind background reads to the newest live ctx; never to a lease already retired.
     if (lease.current()) runtime.bindLifecycle?.(context, lease.current);
     return lease;
@@ -623,12 +628,18 @@ export class FabricState {
       if (generation !== this.#generation) {
         throw new Error("Pi Fabric activation was superseded by a session change");
       }
+      // smarty-dev#8881: AgentSession.dispose() stales this ctx with no session_shutdown, so the
+      // generation alone still reads current. Check after every await, before ctx-bound work.
+      if (!extensionContextLive(context)) {
+        throw new Error("Pi Fabric activation's session was disposed");
+      }
     };
     const activation = (async () => {
       try {
         await orphan?.shutdown("reload").catch(() => undefined);
         assertCurrent();
         candidate = reusable ?? await this.#createRuntime();
+        assertCurrent();
         if (!reusable) {
           for (const component of this.#externalComponents.values()) {
             candidate.registerExternalComponent(component, { overwrite: true });
@@ -638,6 +649,7 @@ export class FabricState {
         // the component plane here; executor/language policy remains bootstrapped.
         if (!this.#managedHost && !reinitialize) {
           const { FabricComponentConfiguration } = await import("./components/configuration.js");
+          assertCurrent();
           try {
             config.components = new FabricComponentConfiguration({
               cwd: context.cwd, agentDir: resolveAgentDir(), projectTrusted: () => context.isProjectTrusted(),
@@ -652,7 +664,7 @@ export class FabricState {
         // runtime installs it only after the predecessor's teardown: old sources never see
         // the successor ctx during session replacement (smarty-dev#5962).
         await candidate.initialize(context, config, {
-          lifecycle: () => generation === this.#generation && !this.#shutDown,
+          lifecycle: () => generation === this.#generation && !this.#shutDown && extensionContextLive(context),
         });
         assertCurrent();
         for (const provider of this.#externalProviders.values()) {

@@ -1,5 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
+import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import { rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE, type RootInboxBatch, type RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
@@ -619,9 +620,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // (pi-coding-agent docs/sdk.md), and Pi exposes no dispose hook; every getter of a stale context throws.
   // A compile scheduled by a disposed session stops before it reads or writes the agent dir, which may
   // already be the next session's.
-  const contextLive = (context: ExtensionContext): boolean => {
-    try { void context.hasUI; return true; } catch { return false; }
-  };
+  const contextLive = extensionContextLive;
 
   interface EntropyCompileRequest {
     context: ExtensionContext;
@@ -866,7 +865,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       context.isIdle();
     } catch {
       // A stale context (Pi disposed or replaced the session): this timer has no session left.
-      if (inboxWake.context === context) stopInboxWake();
+      // Dispose emits no session_shutdown, so retire the session's delayed work here (smarty-dev#8881).
+      if (inboxWake.context === context) retireSessionTimers();
       return;
     }
     // The host's whole settle counts, not only Fabric's handler (#111 review F4): a turn requested
@@ -893,6 +893,19 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     } finally {
       inboxWake.reading = false;
     }
+  };
+
+  // The one synchronous teardown of this session's ctx-bound delayed work: session_shutdown runs it,
+  // and a timer that finds its ctx disposed (no shutdown event) runs it quietly (smarty-dev#8881).
+  // ponytail: the entropy compile is advisory and machine-wide; session JSONL stays the source
+  // of truth, so the next compile on this machine reads this session's final window. Waiting
+  // for it here kept `pi -p` alive 14-98 s re-reading other agents' multi-hundred-MB sessions
+  // (smarty-dev#2010). Abort it instead; every write is gated on current().
+  const retireSessionTimers = (): void => {
+    stopInboxWake();
+    entropyStopping = true;
+    clearEntropyRetry();
+    endEntropyLifecycle();
   };
 
   pi.on("session_start", async (event, context) => {
@@ -1628,7 +1641,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   pi.on("session_shutdown", async (event, context) => {
-    stopInboxWake();
+    retireSessionTimers();
     const reason = event?.reason ?? "exit";
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
@@ -1639,13 +1652,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         "warning",
       );
     }
-    // ponytail: the entropy compile is advisory and machine-wide; session JSONL stays the source
-    // of truth, so the next compile on this machine reads this session's final window. Waiting
-    // for it here kept `pi -p` alive 14-98 s re-reading other agents' multi-hundred-MB sessions
-    // (smarty-dev#2010). Abort it instead; every write is gated on current().
-    entropyStopping = true;
-    clearEntropyRetry();
-    endEntropyLifecycle();
     unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
     unsubscribeProviderWithdrawal();

@@ -80,6 +80,16 @@ describe("mesh-wide age-based run retention", () => {
     expect(summaryLines(true, plan.summary).join("\n")).toMatch(/refused 1 \(0\.000 GiB\): unknown entry surprise\.bin/);
   });
 
+  // smarty-dev#9058 item 1: an offline removal (`fabric-actors remove --main-stopped`) moves the whole actor directory
+  // into its archive; until it finishes, it owns the actor's runs, like a pending removal.
+  it("keeps the runs of an actor with a pending offline removal", async () => {
+    const mesh = deadRootMesh();
+    write(path.join(mesh.registry, "offline-removal-actor.json"), JSON.stringify({ format: 1, kind: "offline-removal", id: "actor" }));
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.removedRuns).toContain(mesh.orphan); // another actor's home is unaffected
+  });
+
   it("without runRetentionMs removes nothing (compaction-only contract unchanged)", async () => {
     const mesh = deadRootMesh();
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true });
@@ -203,6 +213,15 @@ describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-del
     write(path.join(other, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle" }] }));
     return { mesh, resident, other };
   };
+  const onRead = (candidate: string, change: () => void) => {
+    const original = fs.readFileSync;
+    let done = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (!done && file === path.join(candidate, "status.json")) { done = true; change(); }
+      return (original as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.readFileSync);
+    return () => done;
+  };
   const afterSnapshot = (candidate: string, change: () => void) => {
     const original = fs.readFileSync;
     let done = false;
@@ -220,6 +239,48 @@ describe.skipIf(process.platform !== "linux")("dead-resident sweep final pre-del
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(applied.removedRuns).toContain(resident);
     expect(fs.existsSync(resident)).toBe(true);
+  });
+
+  // smarty-dev#9058 item 3: a run under the residency root is kept while a registry references it, whether that
+  // registry was discovered at the start or appeared during the sweep (read by the same final check).
+  // Dry-run selection: apply is disabled (smarty-dev#10678); the plan must not list the run.
+  it.each(["discovered", "appeared during the sweep"] as const)("dry run keeps the dead resident's run out of the plan while a registry %s references it", async when => {
+    const { mesh, resident, other } = deadResident();
+    write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    const reference = () => write(path.join(other, "actors.json"), JSON.stringify({ actors: [{ id: "adopter", status: "idle", lastRunId: "old-resident" }] }));
+    const appeared = path.join(mesh.root, "actors", "01a118ab-new-session");
+    let injected = () => true;
+    if (when === "discovered") reference();
+    else injected = afterSnapshot(resident, () => write(path.join(appeared, "actors.json"), JSON.stringify({ actors: [{ id: "adopter2", status: "idle", lastRunId: "old-resident" }] })));
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns).not.toContain(resident);
+    expect(fs.readFileSync(path.join(resident, "reply.json"), "utf8")).toBe('{"text":"done"}');
+  });
+
+  // smarty-dev#9058 item 2: a registry directory renamed (not deleted) during the sweep takes its runs with it: the
+  // candidate path is gone and its removal is a no-op. A new directory created at the same path is a new registry (read
+  // by the final check), and a run at the old candidate's path there is a different inode: never deleted as the old one.
+  // Dry-run selection (smarty-dev#10678 disables apply). This test renames a fixture directory: it is excluded from the
+  // local safe gate (.local/9058-test-rebase.md) and runs only where real fixture mutations are permitted.
+  it.each(["renamed away", "renamed away and recreated at the same path"] as const)("dry run leaves a registry directory %s during the sweep out of the plan and intact", async kind => {
+    const mesh = deadRootMesh();
+    write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
+    const away = path.join(tmp("fabric-renamed-registry-"), "session");
+    const injected = onRead(mesh.old, () => {
+      fs.renameSync(mesh.registry, away);
+      if (kind !== "renamed away") {
+        write(path.join(mesh.registry, "actors.json"), JSON.stringify({ actors: [{ id: "actor", status: "idle", sessionFile: path.join(mesh.actor, "session.jsonl") }] }));
+        run(mesh.old, { status: "completed", finishedAt: NOW - 8 * DAY });
+        write(path.join(mesh.old, "reply.json"), '{"text":"new"}');
+      }
+    });
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect(injected()).toBe(true);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    // The moved runs, intact where they went.
+    expect(fs.readFileSync(path.join(away, "actor", "runs", "old", "reply.json"), "utf8")).toBe('{"text":"done"}');
+    if (kind !== "renamed away") expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"new"}');
   });
 
   // pi-fabric#645 review round 3: the default CLI mode (--runs-older-than, dry run) previews the
@@ -324,9 +385,8 @@ describe("final pre-delete check fences", () => {
     return other;
   };
 
-  // pi-fabric#850 round 4: strict. Any registry-root change, a new actors.json in a watched directory, or an uncertain
-  // walk stops every later delete of the sweep (fail closed). Continuing on a live mesh is smarty-dev#9058.
-  const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
+  // smarty-dev#9058: decided per candidate. A registry root that appears during the sweep is read by the final check (a
+  // reference keeps the run); an unrelated one no longer stops every later delete (pi-fabric#850 round 4 was sticky).
   it("keeps a run when a registry root with a cross-root reference is created after discovery", async () => {
     const mesh = deadRootMesh();
     const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, [{ id: "adopter", status: "running", inFlightRun: { id: "old", startedAt: NOW, ageS: 0 } }]));
@@ -334,9 +394,11 @@ describe("final pre-delete check fences", () => {
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(mesh.old);
     expect(fs.existsSync(path.join(mesh.old, "reply.json"))).toBe(true);
-    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
+  // pi-fabric#850 round 4 / #9160: an actors entry that changes type or identity is still a stop. Only this identity-swap
+  // test asserts the sticky entry; the smarty-dev#9058 nonsticky tolerance tests never require it.
+  const stopped = (root: string) => ({ path: path.join(root, "actors"), reason: expect.stringMatching(/registry roots changed during the sweep/) });
   it("stops when an actors entry changes from a file to a directory that references the run (#9160)", async () => {
     const mesh = deadRootMesh();
     write(path.join(mesh.root, "state.json"), JSON.stringify({ format: 1, revisionFormat: 2, entries: {}, highWater: 0 }));
@@ -355,18 +417,38 @@ describe("final pre-delete check fences", () => {
     expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
-  it("stops every later delete when an unrelated registry root is created after discovery", async () => {
+  // smarty-dev#9058 race 3 (Ryzen 1: a new session arrives during every sweep).
+  it("plans an expired unreferenced run when an unrelated session registry appears during the sweep", async () => {
     const mesh = deadRootMesh();
-    const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, []));
+    const injected = onStatusRead(mesh.old, () => newRoot(mesh.root, [{ id: "newcomer", status: "idle", lastRunId: "its-own-run" }]));
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(injected()).toBe(true);
-    expect(applied.removedRuns).not.toContain(mesh.old);
-    expect(applied.skipped).toContainEqual(stopped(mesh.root));
+    expect(applied.removedRuns).toContain(mesh.old);
+    expect(applied.removedRuns).not.toContain(mesh.latest);
   });
 
-  // Race shape of round 2: a re-walk meets an entry that vanished between the listing and its lstat, or a hard-linked
-  // file. Strict: the walk is uncertain and every later delete stops.
-  it.each(["an entry that vanishes during the re-walk", "a hard-linked file"])("stops every later delete when a re-walk meets %s", async kind => {
+  // An incomplete walk keeps this candidate; a later independent check recovers after the transient entry is gone.
+  it("keeps the current candidate after a vanished walk entry and plans the next stable candidate", async () => {
+    const mesh = deadRootMesh();
+    const session = path.join(mesh.root, "actors", "01a118ab-new-session");
+    const injected = onStatusRead(mesh.old, () => write(path.join(session, "actors.json"), JSON.stringify({ actors: [] })));
+    const list = fs.readdirSync;
+    let vanished = false;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const names = (list as (...args: unknown[]) => unknown)(target, ...rest);
+      if (!vanished && target === session && Array.isArray(names) && names.every(name => typeof name === "string")) {
+        vanished = true;
+        return [...names, "actors.json.4242.tmp"];
+      }
+      return names;
+    }) as typeof fs.readdirSync);
+    const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect([injected(), vanished]).toEqual([true, true]);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.removedRuns).toContain(mesh.orphan);
+  });
+
+  it.each(["a hard-linked file"])("keeps the run while a re-walk meets %s", async kind => {
     const mesh = deadRootMesh();
     const session = path.join(mesh.root, "actors", "01a118ab-new-session");
     const injected = onStatusRead(mesh.old, () => {
@@ -383,7 +465,7 @@ describe("final pre-delete check fences", () => {
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(mesh.old);
-    expect(applied.skipped).toContainEqual(stopped(mesh.root));
+    expect(applied.skipped).toContainEqual({ path: path.join(mesh.root, "actors"), reason: expect.stringMatching(/uncertain/) });
   });
 
   // Race shape of round 3 (CODE c6106235901, SEC c6106236419): a session directory vanishes during a re-walk, then
@@ -467,6 +549,68 @@ describe("final pre-delete check fences", () => {
     });
   }
 
+  // smarty-dev#9058 races 1 and 2, the unrelated side, as dry-run selection: apply is disabled (smarty-dev#10678), so the
+  // after-move seam (verifiedRemoveTestHooks.beforeOpen) is unreachable through the public sweep. The same concurrent
+  // changes are modeled at the dry run's checks with mocked reads and in-place writes: no fixture path is deleted or
+  // renamed, and nothing is removed. A registry that does not reference the run no longer stops its selection (no
+  // sticky stop entry is required). The referencing side stays with the apply-refusal tests above until #10678.
+  it("plans an expired unreferenced run when a session directory vanishes during a re-walk and reappears with an unrelated registry (race 1)", async () => {
+    const mesh = deadRootMesh();
+    const flicker = path.join(mesh.root, "actors", "01a118ab-flicker-session");
+    write(path.join(flicker, "actors.json"), JSON.stringify({ actors: [] }));
+    let armed = false, vanished = false;
+    // A new session forces a re-walk at mesh.old's final check; the flicker registry is rewritten in place, unrelated.
+    const injected = onStatusRead(mesh.old, () => {
+      write(path.join(mesh.root, "actors", "01a118ab-new-session", "actors.json"), JSON.stringify({ actors: [] }));
+      write(path.join(flicker, "actors.json"), JSON.stringify({ actors: [{ id: "other", status: "idle", lastRunId: "its-own-run" }] }));
+      armed = true;
+    });
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      // The re-walk's first lstat of the flicker directory reports it gone; every later read sees it back.
+      if (armed && !vanished && String(file) === flicker) {
+        vanished = true;
+        if ((rest[0] as { throwIfNoEntry?: boolean } | undefined)?.throwIfNoEntry === false) return undefined;
+        throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${flicker}'`), { code: "ENOENT" });
+      }
+      return (lstat as (...args: unknown[]) => unknown)(file, ...rest);
+    }) as typeof fs.lstatSync);
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect([injected(), vanished]).toEqual([true, true]);
+    expect(plan.removedRuns).toContain(mesh.old);
+    expect(plan.removedRuns).not.toContain(mesh.latest);
+    expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
+  });
+
+  it("plans the old run after a stable recheck of an unrelated actors.json appearing after the probe (race 2)", async () => {
+    const mesh = deadRootMesh();
+    const session = path.join(mesh.root, "actors", "01a118ab-new-session");
+    fs.mkdirSync(session, { recursive: true }); // listed, watched, no registry yet
+    const probe = path.join(session, "actors.json");
+    const create = () => write(probe, JSON.stringify({ actors: [{ id: "other", status: "idle", lastRunId: "its-own-run" }] }));
+    let armed = false, done = false;
+    const injected = onStatusRead(mesh.old, () => { armed = true; });
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      // The probe reports no registry, then an unrelated registry appears: the stable recheck may plan the old run.
+      const after = !armed || done || String(file) !== probe ? undefined : () => { done = true; create(); };
+      try {
+        const result = (lstat as (...args: unknown[]) => unknown)(file, ...rest);
+        if (result === undefined) after?.();
+        return result;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") after?.();
+        throw error;
+      }
+    }) as typeof fs.lstatSync);
+    const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+    expect([injected(), done]).toEqual([true, true]);
+    expect(plan.removedRuns).toContain(mesh.old);
+    expect(plan.removedRuns).toContain(mesh.orphan);
+    expect(plan.removedRuns).not.toContain(mesh.latest);
+    expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
+  });
+
   it.skipIf(process.platform !== "linux")("keeps a dead resident's run when a registry root is created after discovery", async () => {
     const { mesh, resident } = deadResident();
     const injected = onStatusRead(resident, () => newRoot(mesh.root, [{ id: "adopter", status: "idle", lastRunId: "old-resident" }]));
@@ -474,7 +618,6 @@ describe("final pre-delete check fences", () => {
     expect(injected()).toBe(true);
     expect(applied.removedRuns).not.toContain(resident);
     expect(fs.existsSync(path.join(resident, "reply.json"))).toBe(true);
-    expect(applied.skipped).toContainEqual(stopped(mesh.root));
   });
 
   it("keeps a run another registry references during the size scan", async () => {

@@ -32,6 +32,8 @@ export const writeWorkerStartupFailure = (argv: readonly string[], error: unknow
     usage: { input: number(usage?.input), output: number(usage?.output), cacheRead: number(usage?.cacheRead), cacheWrite: number(usage?.cacheWrite), cost: number(usage?.cost) },
     stderr: (error instanceof Error ? error.stack ?? error.message : String(error)).slice(0, 20_000),
     ...(args.get("--log-file") ? { logFile: args.get("--log-file")! } : {}),
+    // pi-fabric#1034 round 7: a startup failure comes before any Pi event is read, so the receipt is empty and complete.
+    ...(["pi", "pi-durable"].includes(args.get("--runner") ?? "pi") ? { writeReceipt: { paths: [], commands: [] } } : {}),
   };
   writeCrashRunRecord(statusFile, record, error);
 };

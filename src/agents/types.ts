@@ -11,6 +11,7 @@ import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
 import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
+import type { AgentWriteReceipt } from "./write-receipt.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
 
@@ -236,6 +237,8 @@ export interface AgentRunRecord {
   finishedAt?: number;
   currentTool?: string;
   currentToolStartedAt?: number;
+  /** smarty-dev#8758: tool-generated receipt of the paths written and shell commands run (write-receipt.ts). */
+  writeReceipt?: AgentWriteReceipt;
   followUpDeliveries?: AgentFollowUpDelivery[];
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */

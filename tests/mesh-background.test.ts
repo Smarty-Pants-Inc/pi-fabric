@@ -302,7 +302,8 @@ describe("background outage alarm (smarty-dev#8825)", () => {
   });
 
   // smarty-dev#9848: a publish that never settles counts as a failed attempt at MESH_ALARM_ATTEMPT_MS, so the attempt
-  // limit still drains the queue; a late settle changes nothing.
+  // limit still drains the queue; a late settle changes nothing. pi-fabric#979 Astra P2: with NO other trigger (no
+  // flushAlarms(), failure() or success() call), advancing the deadlines alone reaches the bounded drop.
   it("a sink that never settles still runs the attempt limit: the event is dropped once and the queue drains", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -311,14 +312,31 @@ describe("background outage alarm (smarty-dev#8825)", () => {
     retry.failure(busy());
     await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
     retry.failure(busy()); // the alarm: attempt 1, which never settles
-    for (let i = 0; i < 20; i++) { await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS); void retry.flushAlarms(); }
-    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
+    for (let i = 0; i < MESH_ALARM_MAX_ATTEMPTS; i++) await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
     expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS);
+    expect(retry.idle).toBe(false); // the outage itself is still open; only the alarm queue drained
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS * 4);
+    expect(attempts).toBe(MESH_ALARM_MAX_ATTEMPTS); // dropped: no further attempt
     const journal = warn.mock.calls.map(([line]) => parse9729(String(line))).filter((alarm) => alarm?.reason === "mesh-alarm-undeliverable");
     expect(journal).toHaveLength(1);
     expect(journal[0]).toMatchObject({ droppedAfterRetries: 1, queued: 0 });
     retry.success(true);
     await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS);
+  });
+
+  it("close() clears the retry a timed-out attempt scheduled: no attempt after close", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let attempts = 0;
+    const retry = new MeshBackgroundRetry("inbox", 100, 400).alarmsTo(() => { attempts++; return new Promise(() => {}); });
+    retry.failure(busy());
+    await vi.advanceTimersByTimeAsync(MESH_OUTAGE_ALARM_AFTER_MS);
+    retry.failure(busy()); // attempt 1, which never settles
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS); // attempt 1 times out and schedules one retry
+    expect(attempts).toBe(1);
+    retry.close(); // clears that retry before it runs
+    await vi.advanceTimersByTimeAsync(MESH_ALARM_ATTEMPT_MS * 4);
+    expect(attempts).toBe(1);
   });
 
   it("drops an event after 8 failed attempts with one final journal line, and the queue empties", async () => {

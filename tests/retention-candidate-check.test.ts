@@ -852,7 +852,7 @@ describe.skipIf(process.platform !== "linux")("E1 live mesh: transient registry 
     const inOwnerSafe = () => rcFrames().includes("ownerSafe");
     let hidden = 0, modes = 0;
     try {
-      if (noUid) Object.defineProperty(process, "getuid", { configurable: true, enumerable: original.enumerable,
+      if (noUid) Object.defineProperty(process, "getuid", { configurable: true, enumerable: original.enumerable ?? false,
         get: () => { if (!inOwnerSafe()) return realGetuid; hidden++; return undefined; } });
       const guard = guardRemovals();
       fakeFs({ candidate: m.old, onLstat: (file, real) => {

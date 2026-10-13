@@ -335,7 +335,7 @@ describe("hosted Fabric agent service", () => {
     for (const action of ["resume", "steer", "compact", "create", "models", "handoff", "members"]) {
       await expect(Promise.resolve().then(() => provider.invoke(action, {id: "x"}, context))).rejects.toThrow("Unsupported");
     }
-    expect((await provider.list({}, context)).map((descriptor) => descriptor.name).sort()).toEqual(["join", "list", "run", "spawn", "status", "stop", "wait"]);
+    expect((await provider.list({}, context)).map((descriptor) => descriptor.name).sort()).toEqual(["join", "list", "result", "run", "spawn", "status", "stop", "wait"]);
     expect(prepare).not.toHaveBeenCalled();
     const pending = instance.spawn("root", {task: "pending"});
     const rejected = expect(pending).rejects.toThrow("aborted");
@@ -503,7 +503,7 @@ describe("hosted Fabric agent service", () => {
     const client = createAgentServiceClient(createAgentServiceHandler(instance, "root"), instance.capabilities);
     const provider = createAgentsProvider(client);
     expect((await provider.list({}, context)).map((descriptor) => descriptor.name).sort()).toEqual([
-      "create", "followUp", "join", "list", "members", "peers", "remove", "run", "self", "sessions", "spawn", "status", "steer", "stop", "wait",
+      "create", "followUp", "join", "list", "members", "peers", "remove", "result", "run", "self", "sessions", "spawn", "status", "steer", "stop", "wait",
     ]);
     expect(await instance.followUp("root", "peer", "please take this")).toMatchObject({id: "peer", name: "peer-bot"});
     expect(deliver).toHaveBeenCalledWith(expect.objectContaining({callerId: "root", id: "peer", operation: "followUp", message: "please take this"}));

@@ -96,7 +96,10 @@ export const isRemoteTaskOperation = (operation: string): boolean =>
 const commandBinding = (command: FabricControlCommand): string => createHash("sha256")
   .update(JSON.stringify([command.operation, command.targetId, command.replyTo, command.data])).digest("hex");
 const interruptedAcceptance = (operation: FabricControlOperation): FabricControlAcceptance => ({
-  accepted: false, error: "Fabric control outcome is indeterminate after owner restart; do not replay accepted work",
+  accepted: false,
+  error: isRemoteTaskOperation(operation)
+    ? "Fabric control outcome is indeterminate after owner restart; do not replay accepted work"
+    : "Fabric control outcome is indeterminate after owner restart",
   ...(isRemoteTaskOperation(operation) ? { errorCode: "FABRIC_REMOTE_TASK_LOST" as const } : {}),
 });
 

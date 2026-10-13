@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { homedir } from "node:os";
+import { formatWithOptions } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,3 +74,82 @@ export const activeFabricRoot = (settingsPath: string): string | undefined => {
 };
 
 export const releaseLabel = (root: string): string => path.basename(root);
+
+// Colocated with the existing cheap agent-dir module to avoid another eager shared chunk.
+const LOG_CAP_BYTES = 5 * 1024 * 1024;
+const NOTICE_WINDOW_MS = 10 * 60 * 1000;
+type DiagnosticLevel = "warn" | "error" | "info" | "debug";
+type DiagnosticContext = {
+  hasUI: boolean;
+  mode?: string;
+  ui: { notify(message: string, level: "warning" | "error" | "info"): void };
+};
+let interactive: DiagnosticContext["ui"] | undefined;
+const notices = new Map<string, number>();
+
+/** Bind before bootstrap. RPC has UI APIs, but no terminal editor. Keep protection through
+ * shutdown: late background settlements must not paint stderr. A new session replaces it. */
+export const configureFabricDiagnostics = (context?: DiagnosticContext): void => {
+  const next = context?.hasUI && (context.mode === undefined || context.mode === "tui" || context.mode === "interactive")
+    ? context.ui : undefined;
+  if (next !== interactive) notices.clear();
+  interactive = next;
+};
+
+/** No host imports, timers or log I/O until a diagnostic occurs with an active terminal UI. */
+const fabricDiagnostic = (level: DiagnosticLevel, args: unknown[]): void => {
+  if (!interactive) {
+    console[level](...args);
+    return;
+  }
+  let message: string;
+  try { message = formatWithOptions({ colors: false }, ...args); }
+  catch { message = "[pi-fabric] Diagnostic arguments could not be formatted"; }
+  const logPath = path.join(resolveAgentDir(), "fabric", "logs", "diagnostics.log");
+  let logFailed = false;
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    // One physical line per diagnostic; preserve multiline messages and stacks as escapes.
+    const line = `${new Date().toISOString()} ${message.replaceAll("\r", "\\r").replaceAll("\n", "\\n")}\n`;
+    let size = 0;
+    try {
+      const stat = fs.lstatSync(logPath);
+      if (!stat.isFile()) throw new Error("Diagnostic log is not a regular file");
+      size = stat.size;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW;
+    let fd = fs.openSync(logPath, flags, 0o600);
+    try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error("Diagnostic log is not a regular file");
+      fs.fchmodSync(fd, 0o600); // Also protect an existing file before it becomes the rotation.
+      if (size && size + Buffer.byteLength(line) > LOG_CAP_BYTES) {
+        // Rename replaces only the previous rotation, never follows a symlink or removes a directory.
+        fs.renameSync(logPath, `${logPath}.1`);
+        fs.closeSync(fd);
+        fd = fs.openSync(logPath, flags, 0o600);
+        fs.fchmodSync(fd, 0o600);
+      }
+      fs.appendFileSync(fd, line);
+    } finally { fs.closeSync(fd); }
+  } catch {
+    // Disk failure is not permission to corrupt the editor or alter caller retry semantics.
+    logFailed = true;
+  }
+  // Random delays, holders and labels must not create a notice for every mesh retry.
+  const key = /mesh lock timeout|FABRIC_MESH_LOCK_TIMEOUT/.test(message) ? "mesh-lock-timeout" : message;
+  const now = Date.now();
+  const last = notices.get(key);
+  if (last !== undefined && now - last < NOTICE_WINDOW_MS) return;
+  for (const [oldKey, at] of notices) if (now - at >= NOTICE_WINDOW_MS) notices.delete(oldKey);
+  if (notices.size >= 1024) return; // Do not evict live dedup keys and re-enable a notice storm.
+  notices.set(key, now);
+  try {
+    interactive.notify(`${key === "mesh-lock-timeout" ? "[pi-fabric] Mesh lock contention; background operations are retrying." : message.split("\n")[0]} ${logFailed ? "Diagnostic log unavailable:" : "Details:"} ${logPath}`,
+      level === "warn" ? "warning" : level === "error" ? "error" : "info");
+  } catch { /* A stale UI must not change operation or retry semantics. */ }
+};
+
+export const fabricWarn = (...args: unknown[]): void => fabricDiagnostic("warn", args);
+export const fabricError = (...args: unknown[]): void => fabricDiagnostic("error", args);
+export const fabricInfo = (...args: unknown[]): void => fabricDiagnostic("info", args);
+export const fabricDebug = (...args: unknown[]): void => fabricDiagnostic("debug", args);

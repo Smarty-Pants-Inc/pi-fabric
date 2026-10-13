@@ -175,6 +175,9 @@ const result = await build({
   plugins: [{
     name: "host-metadata-facades",
     setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
+      }));
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
       }));

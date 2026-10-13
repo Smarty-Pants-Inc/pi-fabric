@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -96,7 +97,7 @@ export const reportRemovalSkip = (deleter: string, reason: string, target: strin
   const key = `${deleter}: ${reason}`;
   const count = skipCounts[key] = (skipCounts[key] ?? 0) + 1;
   // ponytail: log only at exact powers of ten (1, 10, 100, ...), so a key warns O(log n) times.
-  if (count === 10 ** Math.floor(Math.log10(count))) console.warn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${key} x${count} (e.g. ${target})`);
+  if (count === 10 ** Math.floor(Math.log10(count))) fabricWarn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${key} x${count} (e.g. ${target})`);
 };
 
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */

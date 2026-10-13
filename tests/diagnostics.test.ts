@@ -1,0 +1,143 @@
+import fs from "node:fs";
+import { Console } from "node:console";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { configureFabricDiagnostics, fabricWarn, fabricError, fabricInfo, fabricDebug } from "../src/core/diagnostics.js";
+import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
+
+const scratch: string[] = [];
+afterEach(() => {
+  configureFabricDiagnostics();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  for (const root of scratch.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+const profile = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-diagnostics-"));
+  scratch.push(root);
+  vi.stubEnv("PI_CODING_AGENT_DIR", root);
+  return { root, log: path.join(root, "fabric", "logs", "diagnostics.log") };
+};
+const streams = () => {
+  // Vitest replaces global console with a reporter, which bypasses process.stderr.
+  // Use Node's real formatting/stream path so the no-UI case measures stderr, not a console mock.
+  const terminalConsole = new Console({ stdout: process.stdout, stderr: process.stderr });
+  for (const level of ["warn", "error", "info", "debug"] as const) {
+    vi.spyOn(console, level).mockImplementation(terminalConsole[level]);
+  }
+  return {
+    stderr: vi.spyOn(process.stderr, "write").mockImplementation(() => true),
+    stdout: vi.spyOn(process.stdout, "write").mockImplementation(() => true),
+  };
+};
+const timeout = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
+
+// Decision C: the real offline Pi TUI/held-lock proof is scripts/probe-main-diagnostics.py.
+// These small tests additionally prove the no-UI counterexample, failure and rotation branches.
+describe("Fabric diagnostics protect Pi's editor", () => {
+  it("a UI-active mesh lock timeout writes nothing to either terminal stream and logs the unchanged warning", () => {
+    const { log } = profile();
+    const notify = vi.fn();
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify } });
+    const { stderr, stdout } = streams();
+    const retry = new MeshBackgroundRetry("participant heartbeat/change refresh");
+    expect(retry.failure(timeout())).toBe(true);
+    expect(stderr).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    const line = fs.readFileSync(log, "utf8");
+    expect(line).toMatch(/\[pi-fabric\] participant heartbeat\/change refresh: mesh lock timeout; retrying in \d+ ms: FABRIC_MESH_LOCK_TIMEOUT/);
+    expect(line).toContain("held by pid 123 (alive, running)");
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify.mock.calls[0]![0]).toContain("Mesh lock contention");
+    expect(notify.mock.calls[0]![0]).not.toContain("FABRIC_MESH_LOCK_TIMEOUT");
+    if (process.platform !== "win32") {
+      expect(fs.statSync(log).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(log)).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it.each([undefined, { hasUI: false }, { hasUI: true, mode: "rpc" }])("without a terminal UI (%j) mesh lock warnings still reach stderr, never a log", (context) => {
+    const { log } = profile();
+    const notify = vi.fn();
+    configureFabricDiagnostics(context && { ...context, ui: { notify } });
+    const { stderr, stdout } = streams();
+    new MeshBackgroundRetry("headless heartbeat").failure(timeout());
+    expect(stderr).toHaveBeenCalledOnce();
+    expect(String(stderr.mock.calls[0]![0])).toContain("[pi-fabric] headless heartbeat: mesh lock timeout; retrying");
+    expect(stdout).not.toHaveBeenCalled();
+    expect(fs.existsSync(log)).toBe(false);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("logs every diagnostic, deduplicates varied mesh retries, and rebinds after session replacement", () => {
+    const { log } = profile();
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const notify = vi.fn();
+    configureFabricDiagnostics({ hasUI: true, ui: { notify } });
+    const { stderr, stdout } = streams();
+    fabricWarn("[pi-fabric] one: mesh lock timeout; retrying in 50 ms");
+    fabricWarn("[pi-fabric] two: mesh lock timeout; retrying in 100 ms");
+    expect(notify).toHaveBeenCalledOnce();
+    vi.setSystemTime(10 * 60 * 1000);
+    fabricWarn("[pi-fabric] three: mesh lock timeout; retrying in 200 ms");
+    expect(notify).toHaveBeenCalledTimes(2);
+    const next = vi.fn();
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify: next } });
+    fabricWarn("[pi-fabric] four: mesh lock timeout; retrying in 400 ms");
+    expect(next).toHaveBeenCalledOnce();
+    const error = new Error("failure\nsecond line");
+    fabricError("error %s", error);
+    fabricInfo("info %d", 3);
+    fabricDebug("debug %j", { value: true });
+    expect(stderr).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+    const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(7);
+    expect(lines[4]).toContain("failure\\nsecond line");
+    expect(lines[5]).toContain("info 3");
+    expect(lines[6]).toContain('debug {"value":true}');
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a symlink log without writing its target or either terminal stream", () => {
+    const { root, log } = profile();
+    fs.mkdirSync(path.dirname(log), { recursive: true, mode: 0o700 });
+    const target = path.join(root, "unrelated.txt");
+    fs.writeFileSync(target, "unchanged");
+    fs.symlinkSync(target, log);
+    const notify = vi.fn();
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify } });
+    const { stderr, stdout } = streams();
+    fabricWarn("symlink refused");
+    expect(fs.readFileSync(target, "utf8")).toBe("unchanged");
+    expect(notify.mock.calls[0]![0]).toContain("Diagnostic log unavailable:");
+    expect(stderr).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+  });
+
+  it("rotates the private log and does not fall back to terminal output when the log or host UI fails", () => {
+    const { root, log } = profile();
+    const notify = vi.fn((_message: string, _level: "warning" | "error" | "info") => { throw new Error("stale UI"); });
+    configureFabricDiagnostics({ hasUI: true, mode: "tui", ui: { notify } });
+    const { stderr, stdout } = streams();
+    fabricWarn("first");
+    fs.writeFileSync(log, "x".repeat(5 * 1024 * 1024), { mode: 0o600 });
+    if (process.platform !== "win32") fs.chmodSync(log, 0o644);
+    fabricError("after rotation");
+    expect(fs.statSync(`${log}.1`).size).toBe(5 * 1024 * 1024);
+    if (process.platform !== "win32") expect(fs.statSync(`${log}.1`).mode & 0o777).toBe(0o600);
+    expect(fs.readFileSync(log, "utf8")).toContain("after rotation");
+    fs.writeFileSync(log, "y".repeat(5 * 1024 * 1024));
+    fabricWarn("second rotation");
+    expect(fs.readFileSync(`${log}.1`, "utf8").startsWith("y")).toBe(true);
+    const blocked = path.join(root, "not-a-directory");
+    fs.writeFileSync(blocked, "blocking file");
+    vi.stubEnv("PI_CODING_AGENT_DIR", blocked);
+    expect(() => fabricWarn("disk failed")).not.toThrow();
+    expect(notify.mock.calls.at(-1)![0]).toContain("Diagnostic log unavailable:");
+    expect(stderr).not.toHaveBeenCalled();
+    expect(stdout).not.toHaveBeenCalled();
+  });
+});

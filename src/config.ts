@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { fabricWarn } from "./core/diagnostics.js";
 import { readHostPolicy, warnAgentLandlockDisabled, type HostPolicy } from "./host-policy.js";
 import type { ModelRoutingConfig } from "./agents/model-route.js";
 import { parsePerCallRouting } from "./agents/per-call-config.js";
@@ -333,7 +334,7 @@ export const normalizeDeadRootFilterConfig = (value: unknown): FabricDeadRootFil
   if (!deadRootExemptWarnings.has(shape)) {
     if (deadRootExemptWarnings.size >= 64) deadRootExemptWarnings.clear();
     deadRootExemptWarnings.add(shape);
-    console.warn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
+    fabricWarn(`[pi-fabric] agents.deadRootFilter.exempt must be an array of non-empty strings (got ${shape}); the dead-root filter is disabled.`);
   }
   return { mode: "off", exempt: [] };
 };

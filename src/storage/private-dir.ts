@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import os from "node:os";
 import path from "node:path";
 
@@ -97,7 +98,7 @@ const tighten = (fd: number, stat: fs.Stats, walked: string): fs.Stats => {
   if (!tightened.has(walked)) {
     if (tightened.size >= TIGHTENED_LOG_LIMIT) tightened.clear(); // bounded: a repeat line at worst
     tightened.add(walked);
-    console.warn(`[pi-fabric] tightened ${walked} from ${(stat.mode & 0o7777).toString(8)} to ${mode.toString(8)}`);
+    fabricWarn(`[pi-fabric] tightened ${walked} from ${(stat.mode & 0o7777).toString(8)} to ${mode.toString(8)}`);
   }
   return fs.fstatSync(fd);
 };

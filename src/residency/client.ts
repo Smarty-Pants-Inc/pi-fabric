@@ -1,6 +1,7 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
 import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
+import { fabricWarn } from "../core/diagnostics.js";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -1188,7 +1189,7 @@ export class ResidencyClient {
     } catch (error) {
       if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
-      if (diagnostic !== this.#completionFault) console.warn(diagnostic);
+      if (diagnostic !== this.#completionFault) fabricWarn(diagnostic);
       this.#completionFault = diagnostic;
     }
   }

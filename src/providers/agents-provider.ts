@@ -1,5 +1,6 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
+import { fabricWarn } from "../core/diagnostics.js";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
@@ -473,7 +474,7 @@ export class AgentsProvider implements FabricProvider {
       DEFAULT_LIFECYCLE_COALESCE_MS,
       (target, batch) => this.#routeLifecycleBatch(target, batch),
       (target, batch, error) => {
-        console.warn(
+        fabricWarn(
           `[pi-fabric] lifecycle delivery to ${target} failed for ${batch.length} event(s): ` +
             (error instanceof Error ? error.message : String(error)),
         );

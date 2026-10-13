@@ -2,6 +2,7 @@ import type { MeshLockProtocol } from "../config.js";
 import { meshJournalAlarmLine, type MeshOutageAlarm } from "../core/atomic-write.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import os from "node:os";
 import path from "node:path";
 import { MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -372,7 +373,7 @@ export const meshAlarmRecipient = (env: NodeJS.ProcessEnv = process.env): string
     if (ALARM_SESSION.test(configured)) return configured;
     if (refusedAlarmTo !== configured) {
       refusedAlarmTo = configured;
-      console.warn(`[pi-fabric] PI_FABRIC_MESH_ALARM_TO refused (${JSON.stringify(configured.slice(0, 80))}): `
+      fabricWarn(`[pi-fabric] PI_FABRIC_MESH_ALARM_TO refused (${JSON.stringify(configured.slice(0, 80))}): `
         + "only session:<uuid>; mesh alarms fall back to SMARTY_LEAD_SESSION or stderr only");
     }
   }
@@ -503,7 +504,7 @@ export class MeshStore {
       // Already committed: throwing would invite a duplicate publish. The durable pending
       // index and archived event survive even without a wake request; startup or the next
       // publish retries the drain. Report failure rather than inventing delivery.
-      console.warn(`[pi-fabric] resident wake deferred: ${String(error)}`);
+      fabricWarn(`[pi-fabric] resident wake deferred: ${String(error)}`);
     }
   }
 
@@ -822,7 +823,7 @@ export class MeshStore {
         const text = `mesh state write refused by the SQLite WAL cap (${String(walBytes)} > ${String(capBytes)} bytes; `
           + `${readerCount ?? 0} WAL reader(s))`;
         // The journal alarm line #9729 pages on; no mesh root path, no reader pids (pi-fabric#893 rounds 4-5).
-        console.warn(meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
+        fabricWarn(meshJournalAlarmLine({ label: "mesh state writes", state: "outage", sinceMs: now,
           reason: `SQLite WAL cap: ${text}`, walBytes, capBytes, readerCount: readerCount ?? 0 }));
         const from: MeshIdentity = identity ?? { id: `mesh-store:${process.pid}`, name: "Fabric mesh store", kind: "agent" };
         // publish() can throw synchronously (a size or validation refusal): it must never replace the WAL-cap error.

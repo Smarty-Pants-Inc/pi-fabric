@@ -1,4 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
+import { fabricInfo } from "../core/diagnostics.js";
 import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
@@ -683,7 +684,7 @@ export class StateFile implements StateBackend {
         } catch { /* A sibling sweep/rename or unavailable evidence never blocks the store. */ }
       }
     } catch { /* Best-effort cleanup; ordinary state operations retain their own errors. */ }
-    if (removed) console.info(`[mesh] Removed ${removed} abandoned prepared state file(s)`);
+    if (removed) fabricInfo(`[mesh] Removed ${removed} abandoned prepared state file(s)`);
   }
 
   /** A failed locked operation means this store's view is behind (see MeshLock.withLock). */

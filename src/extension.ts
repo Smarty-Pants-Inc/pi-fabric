@@ -29,6 +29,7 @@ import { isSelectedNativeMcpTool } from "./core/native-mcp-identity.js";
 import { installRegisteredToolCapture } from "./capture/interceptor.js";
 import { registerFabricCommand } from "./commands/fabric.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
+import { configureFabricDiagnostics, fabricWarn, fabricDebug } from "./core/diagnostics.js";
 import { setActiveCompiledSurface } from "./entropy/active.js";
 import {
   filterPrewalkContinuationMessages,
@@ -376,7 +377,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       const withdrawal = readFabricProviderWithdrawalV1(value);
       if (!withdrawal) throw new Error("Invalid Pi Fabric provider withdrawal");
       if (!state.withdrawExternal(withdrawal.name, withdrawal.generation) && process.env.PI_FABRIC_DEBUG) {
-        console.debug(`[pi-fabric] ignored provider withdrawal: ${withdrawal.name}`);
+        fabricDebug(`[pi-fabric] ignored provider withdrawal: ${withdrawal.name}`);
       }
     },
   );
@@ -431,6 +432,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
 
   pi.on("resources_discover", async (_event, context) => {
+    configureFabricDiagnostics(context);
     if (!state.bootstrapped) await state.bootstrap(context);
     return { skillPaths: fabricSkillPaths(FABRIC_SKILLS_DIR, state.config.executor.kernel) };
   });
@@ -678,7 +680,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = true;
       } else {
         // Advisory evidence cannot gate the normal-form compiler.
-        console.warn(`[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
+        fabricWarn(`[pi-fabric] observation pool update failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (!current()) return false;
@@ -737,7 +739,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         retry = await compileEntropyNow(request.context, request.epoch, request.signal);
       } catch (error) {
         if (request.signal.aborted || !extensionContextLive(request.context)) return;  // shutdown or dispose
-        console.warn(
+        fabricWarn(
           `[pi-fabric] entropy compile failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
@@ -906,6 +908,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (event, context) => {
+    configureFabricDiagnostics(context);
     await sealScope();
     // Retire the previous session's delayed work, then reopen entropy for this one.
     retireSessionTimers();
@@ -929,8 +932,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       compatibilityWarningShown = true;
       const warning = piHostCompatibilityWarning();
       if (warning) {
-        console.warn(`[pi-fabric] ${warning}`);
-        if (context.hasUI) context.ui.notify(warning, "warning");
+        fabricWarn(`[pi-fabric] ${warning}`);
+        if (context.hasUI && context.mode === "rpc") context.ui.notify(warning, "warning");
       }
     }
     state.thinking.invalidate();
@@ -948,7 +951,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       try {
         await state.thinking.enforceBounds(context);
       } catch (error) {
-        console.warn(`[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
+        fabricWarn(`[pi-fabric] thinking bounds: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     // bootstrap() cancels any live arm; the borrowed Main model survives so a
@@ -1028,7 +1031,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // Turn-scoped thinking overrides revert here, even before activation.
       await state.thinking.agentEnded(context);
     } catch (error) {
-      console.warn(`[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
+      fabricWarn(`[pi-fabric] thinking revert failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (state.initialized) await state.publishHostLifecycle("pi.agent_end", event);
   });
@@ -1324,7 +1327,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     );
     if (warning) {
       if (context.hasUI) context.ui.notify(warning, "warning");
-      else console.warn(`[pi-fabric] ${warning}`);
+      else fabricWarn(`[pi-fabric] ${warning}`);
     }
     if (!state.initialized) return;
     await state.publishHostLifecycle("pi.session_compact", event);
@@ -1687,7 +1690,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     foregroundNoticeSession = sessionId;
     const notice = `Fabric foreground policy ${formatForeground(foreground)}`;
     if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    else fabricWarn(`[pi-fabric] ${notice}`);
   });
 
   // A configured custom runner is kept even before its extension registers it
@@ -1709,7 +1712,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (runnerNoticeKey === key) return;
     runnerNoticeKey = key;
     if (context.hasUI) context.ui.notify(notice, "warning");
-    else console.warn(`[pi-fabric] ${notice}`);
+    else fabricWarn(`[pi-fabric] ${notice}`);
   });
 
   pi.on("context_with_system", (event) => {

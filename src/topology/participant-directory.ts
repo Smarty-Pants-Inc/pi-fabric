@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { fabricWarn } from "../core/diagnostics.js";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -642,7 +643,7 @@ export interface ParticipantDirectoryOptions {
   /** Stall checks share the committed heartbeat; secondary/resident hosts can participate. */
   presencePass?: () => Promise<void>;
   presencePassMs?: number;
-  /** Told once when close() could not withdraw this host's entries (default: console.warn). */
+  /** Told once when close() could not withdraw this host's entries (default: fabricWarn). */
   onWithdrawalFailure?: (message: string) => void;
   /**
    * Session lifecycle token (smarty-dev#5962). False once the owner's extension ctx retired
@@ -852,7 +853,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#degraded) return;
     this.#degraded = true;
     const ticks = Math.max(this.#retiredTicks, LIFECYCLE_LOST_TICKS + 1);
-    console.warn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
+    fabricWarn(`[pi-fabric] participant heartbeat: the session ctx it read was retired (reload or session replacement); ` +
       `${this.options.hostId} is degraded and its heartbeat is stopped until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(ticks); } catch { /* the warning above already surfaced it */ }
   }
@@ -893,7 +894,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (++this.#retiredTicks <= LIFECYCLE_LOST_TICKS || this.#degraded) return;
     this.#degraded = true;
-    console.warn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
+    fabricWarn(`[pi-fabric] participant heartbeat: no live session ctx for ${this.#retiredTicks} heartbeats; ` +
       `${this.options.hostId} is degraded and its lease is not renewed until a live session rebinds it.`);
     try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
   }
@@ -1009,7 +1010,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       "its entries now lapse with their unrenewed lease";
     try {
       if (this.options.onWithdrawalFailure) this.options.onWithdrawalFailure(message);
-      else console.warn(`[pi-fabric] ${message}`);
+      else fabricWarn(`[pi-fabric] ${message}`);
     } catch { /* A diagnostic sink never fails close(). */ }
   }
 

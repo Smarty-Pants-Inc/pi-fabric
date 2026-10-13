@@ -1,5 +1,6 @@
 import { bashProcessEnvironment, childProcessEnvironment } from "./atomic-write.js";
 import fs from "node:fs";
+import { fabricWarn } from "./diagnostics.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -23,7 +24,7 @@ export const landlockCommand = (command: string, allowEscape = false, environmen
   while (ESCAPE.test(command)) { requested = true; command = command.replace(ESCAPE, ""); }
   if (requested && allowEscape !== true && !warnedEscapeDenied) {
     warnedEscapeDenied = true;
-    console.warn("[pi-fabric] PI_FABRIC_LANDLOCK_ESCAPE ignored: no valid root policy grants executor.landlock.allowEscape: true; command remains confined");
+    fabricWarn("[pi-fabric] PI_FABRIC_LANDLOCK_ESCAPE ignored: no valid root policy grants executor.landlock.allowEscape: true; command remains confined");
   }
   return { escape: requested && allowEscape === true, command };
 };

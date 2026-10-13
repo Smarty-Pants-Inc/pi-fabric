@@ -11,6 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
+import { fabricWarn } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -725,7 +726,7 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
   const key = `${error.lockPath}\n${error.holderToken}`;
   if (alarmedHolders.has(key)) return;
   alarmedHolders.add(key);
-  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+  try { fabricWarn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
 };
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
@@ -838,7 +839,7 @@ export class MeshBackgroundRetry {
   }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
-    console.warn(meshJournalAlarmLine({ ...alarm }));
+    fabricWarn(meshJournalAlarmLine({ ...alarm }));
     if (this.#alarm) {
       this.#pendingAlarms.push({ alarm, attempts: 0, firstAt: performance.now() });
       while (this.#pendingAlarms.length > MESH_ALARM_QUEUE_MAX) { this.#pendingAlarms.shift(); this.#droppedOverflow++; this.#reportUndeliverable(); }
@@ -849,7 +850,7 @@ export class MeshBackgroundRetry {
   #reportUndeliverable(): void {
     if (this.#undeliverableReported) return;
     this.#undeliverableReported = true;
-    console.warn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
+    fabricWarn(meshJournalAlarmLine({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
       droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }));
   }
   /** Remove `head` by identity (pi-fabric#893 Astra P1): while its publish was awaited, an overflow in #raise may
@@ -916,7 +917,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    fabricWarn(`[pi-fabric] ${this.label}: mesh lock recovered (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -928,7 +929,7 @@ export class MeshBackgroundRetry {
       // retry cadence. Only a typed acquisition failure earns lock backoff/deduplication.
       // Not proof that the lock is free: no recovery summary, suppression is kept.
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
+      fabricWarn(`[pi-fabric] ${this.label}: background operation failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -952,7 +953,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      fabricWarn(`[pi-fabric] ${this.label}: ${isMeshLockTimeout(error) ? "mesh lock timeout; retrying" : "mesh WAL cap; retrying"} in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {
@@ -995,7 +996,7 @@ export class MeshBackgroundQueue {
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
       this.#failed = true;
-      console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
+      fabricWarn("[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
     const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));

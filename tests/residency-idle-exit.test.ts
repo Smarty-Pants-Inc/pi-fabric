@@ -9,6 +9,7 @@ import { readResidentIdleExit, residentIdleExitPath } from "../src/residency/idl
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { captureSafetyTick } from "./helpers/resident-safety-tick.js";
 
 // Windows runs the legacy retention path (retentionV2Enabled() is false on win32), which applies
 // config.json policy edits only at its 60 s request-retention sample. Tests that depend on that
@@ -42,11 +43,17 @@ async function fixture(idleExitMs = RESIDENT_IDLE_EXIT_MS) {
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const host = new ResidentHost(config, () => { exited++; });
-  cleanups.push(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  // smarty-dev#11107: samples come from the host's slow safety tick (captured, fired explicitly),
+  // no longer from the removed 50 ms request poll.
+  const safety = captureSafetyTick();
+  cleanups.push(async () => { safety.restore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   await host.start();
-  await sleep(150); // Actual request ticks, deterministic host clock.
+  // Capture only the host's own safety interval: a later 5 s interval (e.g. Main's participant
+  // heartbeat in the reload-lease case) must never stand in for the resident's sample.
+  safety.restore();
+  await sleep(150); await safety.tick(); // Deterministic host clock.
   return { root, config, configPath, host, log, exited: () => exited, now: () => now,
-    advance: async (ms: number) => { now += ms; await sleep(150); } };
+    advance: async (ms: number) => { now += ms; await sleep(150); await safety.tick(); } };
 }
 
 function rootLease(f: Awaited<ReturnType<typeof fixture>>, expiresAt: number) {

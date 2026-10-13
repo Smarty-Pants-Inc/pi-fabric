@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
+import { captureSafetyTick, type SafetyTickCapture } from "./helpers/resident-safety-tick.js";
 
 // Windows runs the legacy retention path (retentionV2Enabled() is false on win32). Both paths
 // run here on every platform, so a Windows-only difference shows up on Linux too.
@@ -48,6 +49,16 @@ const replace = (file: string, value: unknown) => {
 };
 const withRetention = (config: ResidentHostConfig, completedRequestMs: number) =>
   ({ ...config, retention: { ...config.retention, completedRequestMs } });
+// smarty-dev#11107: the 50 ms request poll and 100 ms maintenance tick are gone. These clock
+// tests fire the host's captured slow safety interval instead of waiting for a removed cadence.
+let safety: SafetyTickCapture;
+beforeEach(() => { safety = captureSafetyTick(); });
+afterEach(() => safety.restore());
+const tick = (_host: ResidentHost) => safety.tick();
+const tickUntil = async (host: ResidentHost, done: () => boolean, ticks = 100) => {
+  for (let index = 0; index < ticks && !done(); index++) { await tick(host); await sleep(20); }
+  return done();
+};
 
 describe("idle resident host polling (smarty-dev#6729)", () => {
   it("rebuilds the actor ownership view once per second of clock time, not on every 50 ms request tick", async () => {
@@ -80,18 +91,21 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
         try { return active(); } finally { inCheck--; }
       });
       reads.mockClear();
-      // About 20 request ticks with the clock still: at most the one current observation the
+      // 20 idle samples with the clock still: at most the one current observation the
       // reused one needs. Before: one check (and one fleet-wide listing) on every tick.
-      await sleep(1_000);
+      for (let index = 0; index < 20; index++) await tick(host);
       const first = checks.mock.calls.length;
       expect(first).toBeLessThanOrEqual(1);
       for (let second = 1; second <= 2; second++) {
         now += 1_000;
-        expect(await waitUntil(() => checks.mock.calls.length >= first + second)).toBe(true);
-        await sleep(500);
+        await tick(host);
+        expect(checks.mock.calls.length).toBe(first + second);
+        for (let index = 0; index < 10; index++) await tick(host);
         expect(checks.mock.calls.length).toBe(first + second);
       }
-      expect(checkListings).toBe(checks.mock.calls.length);
+      // Ownership stamps may now reuse the listing too; the old once-per-sample cadence
+      // is an upper bound, not a requirement to rebuild unchanged ownership.
+      expect(checkListings).toBeLessThanOrEqual(checks.mock.calls.length);
       // Before: the 100 ms maintenance tick re-read and parsed the unchanged config.json each time.
       expect(configReads()).toBe(0);
     } finally {
@@ -127,14 +141,14 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
         const configReads = () => reads.mock.calls.flatMap(([read], index) =>
           String(read) === file ? [String(reads.mock.results[index]?.value)] : []);
         replace(file, withRetention(config, 222_222));
-        expect(await waitUntil(() => configReads().some(text => text.includes("222222")))).toBe(true);
+        expect(await tickUntil(host, () => configReads().some(text => text.includes("222222")))).toBe(true);
         // Once the replacement is older than the settle window its stamp is trusted again.
         const old = new Date(Date.now() - 3_600_000);
         fs.utimesSync(file, old, old);
         reads.mockClear();
-        expect(await waitUntil(() => configReads().length > 0)).toBe(true);
+        expect(await tickUntil(host, () => configReads().length > 0)).toBe(true);
         reads.mockClear();
-        await sleep(500);
+        for (let index = 0; index < 10; index++) await tick(host);
         expect(configReads()).toHaveLength(0);
       } finally {
         await finish(host, root);
@@ -156,11 +170,11 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
         const stat = fs.statSync;
         vi.spyOn(fs, "statSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) =>
           String(target) === file ? stamp : stat(target, options)) as typeof fs.statSync);
-        expect(await waitUntil(() => configReads().some(text => text.includes("111111")))).toBe(true);
+        expect(await tickUntil(host, () => configReads().some(text => text.includes("111111")))).toBe(true);
         replace(file, withRetention(config, 222_222));
         expect(fs.statSync(file, { bigint: true })).toBe(stamp);
         // Before: the identical stamp kept the old overlay for good.
-        expect(await waitUntil(() => configReads().some(text => text.includes("222222")), 3_000)).toBe(true);
+        expect(await tickUntil(host, () => configReads().some(text => text.includes("222222")))).toBe(true);
       } finally {
         await finish(host, root);
       }
@@ -177,24 +191,24 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       await host.start();
       let active = false;
       const checks = vi.spyOn(host.actors, "hasOwnedActors").mockImplementation(() => active);
-      await sleep(200); // Start the continuously dead-and-empty observation window.
+      await sleep(200); await tick(host); // Start the continuously dead-and-empty observation window.
       // Just short of the idle window: the next tick takes a current (inactive) observation.
       now += 29_950;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBe(0);
       // An actor wakes; the reused observation still says inactive, and the window has elapsed.
       active = true;
       const before = checks.mock.calls.length;
       now += 100;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(checks.mock.calls.length).toBeGreaterThan(before);
       expect(idled).toBe(0);
       // Truly idle for the whole window again: the host exits.
       active = false;
       now += 1_000;
-      await sleep(200); // First confirmed zero-actor sample starts the new window.
+      await sleep(200); await tick(host); // First confirmed zero-actor sample starts the new window.
       now += 30_100;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBeGreaterThan(0);
     } finally {
       clock.mockRestore();
@@ -210,10 +224,10 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
     try {
       await host.start();
-      await sleep(200);
+      await sleep(200); await tick(host);
       // Close to the idle window with no actor: the next tick caches an inactive observation.
       now += 29_000;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBe(0);
       const sampledAt = now;
       const runs = vi.spyOn(host.agents, "run").mockImplementation(async (_request, _signal, onSpawned) => {
@@ -229,20 +243,20 @@ describe("idle resident host polling (smarty-dev#6729)", () => {
       expect(host.actors.status(actor.id).status).toBe("stopped");
       // A stopped actor still belongs to this resident. Only removal leaves zero actors.
       await host.actors.remove(actor.id);
-      await sleep(200);
+      await sleep(200); await tick(host);
       // The clock did not move: by time alone every tick during the run reused the inactive sample.
       expect(Date.now()).toBe(sampledAt);
       const ended = now;
       // Past the window since the host started, but only 1.1 s after the run ended.
       now += 1_100;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBe(0);
       now = ended + 29_900;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBe(0);
       // The full window after the run ended: the host exits.
       now = ended + 30_100;
-      await sleep(200);
+      await sleep(200); await tick(host);
       expect(idled).toBeGreaterThan(0);
     } finally {
       clock.mockRestore();

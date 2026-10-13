@@ -691,7 +691,7 @@ export class ActorManager {
   readonly #bindings: ActorBindingStore;
   readonly #mainAgent: FabricMainAgentTarget | undefined;
   readonly #canManageActor: ((id: string, fresh?: boolean) => boolean | undefined) | undefined;
-  readonly #snapshotActorOwnership: ((fresh?: boolean) => ReadonlyMap<string, boolean>) | undefined;
+  readonly #snapshotActorOwnership: ((fresh?: boolean, actorIds?: readonly string[]) => ReadonlyMap<string, boolean>) | undefined;
   #directoryOwnership: ReadonlyMap<string, boolean> | undefined;
   #directoryLineages: Map<string, boolean> | undefined;
   readonly #isOwnResidentActor: ((id: string) => boolean) | undefined;
@@ -828,8 +828,10 @@ export class ActorManager {
       mainAgent?: FabricMainAgentTarget;
       /** Fresh by default for authority; false is only an observational ownership view. */
       canManageActor?: (id: string, fresh?: boolean) => boolean | undefined;
-      /** Directory decisions for one synchronous batch; fresh by default, never a custody-lock cache. */
-      snapshotActorOwnership?: (fresh?: boolean) => ReadonlyMap<string, boolean>;
+      /** Directory decisions for one synchronous batch; fresh by default, never a custody-lock cache.
+       * A non-fresh (poll) call also names the managed actor ids, so the host may reuse its previous
+       * poll map while their ownership inputs are unchanged (fv2-11107). Fresh calls pass no ids. */
+      snapshotActorOwnership?: (fresh?: boolean, actorIds?: readonly string[]) => ReadonlyMap<string, boolean>;
       /** Creation-only proof of a live actor owned by this Main's resident host. Never grants management. */
       isOwnResidentActor?: (id: string) => boolean;
       /** May refresh the model registry on a miss, so it is awaited (smarty-dev#1830). */
@@ -7151,7 +7153,9 @@ export class ActorManager {
   /** Reuse one directory read only within this synchronous slice; never across an await. */
   #withOwnershipRead<T>(operation: () => T, fresh = true): T {
     if (this.#directoryOwnership || !this.#snapshotActorOwnership) return operation();
-    this.#directoryOwnership = this.#snapshotActorOwnership(fresh);
+    // fresh=true never names ids, so authority never reaches a host's poll reuse.
+    this.#directoryOwnership = fresh ? this.#snapshotActorOwnership(true)
+      : this.#snapshotActorOwnership(false, [...this.#actors.keys()]);
     this.#directoryLineages = new Map();
     try { return operation(); }
     finally { this.#directoryOwnership = undefined; this.#directoryLineages = undefined; }

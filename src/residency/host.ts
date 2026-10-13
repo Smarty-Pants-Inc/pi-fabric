@@ -94,7 +94,18 @@ import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentReq
 // Moved to ./retention.js so the mesh-wide sweep (storage/retention-cli.ts) can run it under the
 // dead host's fence without loading the host (smarty-dev#3252).
 export { RESIDENT_RUN_RETENTION_MS, sweepResidentRuns } from "./retention.js";
+// smarty-dev#11107: requests/ is watched natively. This 50 ms poll runs ONLY when fs.watch
+// is unsupported, throws or errors (one warning); the staged/handover phase keeps it too.
 const REQUEST_POLL_MS = 50;
+// One slow unref'd safety tick: a missed native event, a deferred delivery/request retry,
+// the accepted config overlay (including the idle-exit window) and due-gated maintenance.
+const SAFETY_TICK_MS = 5_000;
+// A retention sample already in progress keeps its old bounded slice cadence until complete.
+const MAINTENANCE_SLICE_MS = 100;
+// Requests admitted per bounded drain pass; a fuller queue continues on the next macrotask.
+const REQUEST_DRAIN_BATCH = 32;
+// After a native watch error Node emits no "close"; a late "close" is still awaited this long.
+const REQUEST_WATCH_ERROR_CLOSE_GRACE_MS = 1_000;
 // ponytail: 30s only amortizes deliveries racing clean close; no worker/session is kept warm.
 const IDLE_EXIT_MS = 30_000;
 // Reuse active-actor observations on the existing request poll, not dormancy checks.
@@ -272,6 +283,20 @@ export class ResidentHost {
   readonly #token = randomUUID();
   #requestTimer: NodeJS.Timeout | undefined;
   #maintenanceTimer: NodeJS.Timeout | undefined;
+  #safetyTimer: NodeJS.Timeout | undefined;
+  #stuckPreparingTimer: NodeJS.Timeout | undefined;
+  #releaseTimer: NodeJS.Timeout | undefined;
+  #requestRetryTimer: NodeJS.Timeout | undefined;
+  #deliveryRetryTimer: NodeJS.Timeout | undefined;
+  #idleDeadlineTimer: NodeJS.Timeout | undefined;
+  #requestWatcher: fs.FSWatcher | undefined;
+  #requestWatcherClosed: Promise<void> | undefined;
+  #requestPollFallback = false;
+  #requestDirty = false;
+  #requestDrainQueued = false;
+  #requestDraining = false;
+  #requestBacklog = false;
+  #maintenanceQueued = false;
   #idleCheckQueued = false;
   #idleCheckRequested = false;
   #idleCheckPending: Promise<void> | undefined;
@@ -279,7 +304,6 @@ export class ResidentHost {
   #wakeWatchErrorUnsubscribe: (() => Promise<void>) | undefined;
   #processWorkUnsubscribe: (() => void) | undefined;
   #wakeWatchNeedsReprobe = false;
-  #stuckPreparingCheckedAt = 0;
   #legacyArchive: ResidentLegacyRunArchive | undefined;
   #scheduleTimer: NodeJS.Timeout | undefined;
   #scheduleWakeAt: number | undefined;
@@ -570,6 +594,7 @@ export class ResidentHost {
       onTerminalNotice: notice => this.#deliverTerminalNotice(notice),
       onSettled: (result) => {
         this.#scheduleIdleCheck();
+        this.#wakeMaintenance(); // settlement changes retention references
         // Only public durable task runs: actor activations are cleaned by their actor (review/astra on #136).
         if (result.actorId) return;
         const file = residentResultPath(config.residencyRoot, result.id);
@@ -606,10 +631,9 @@ export class ResidentHost {
       const participant = this.participants.get(id, undefined, { fresh });
       return participant ? participant.ownerHostId === this.hostId : undefined;
     };
-    const snapshotActorOwnership = (fresh = true): ReadonlyMap<string, boolean> => new Map(
-      this.participants.list({ scope: "project", fresh })
-        .map((participant) => [participant.id, participant.ownerHostId === this.hostId]),
-    );
+    // Polls may reuse validated ownership inputs; authority decisions still read exactly.
+    const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
+      this.participants.actorOwnership(this.hostId, { fresh, ...(fresh ? {} : { actorIds }) });
     const lineageAlive = (rootId: string): boolean =>
       this.participants.lineageAlive(rootId);
     const actorRoots = residentActorRoots(config);
@@ -786,13 +810,11 @@ export class ResidentHost {
         this.lifecycle.pause();
         await this.#probeWorkerStartup();
       }
-      this.#requestTimer = setInterval(
-        () => {
-          void this.#backgroundRequests.run(() => this.#pollRequests());
-          void this.#retryDeliveries();
-        },
-        REQUEST_POLL_MS,
-      );
+      // Subscribe before the explicit post-readiness backlog drain: no request can fall between.
+      this.#startRequestWatch();
+      this.#ensureReleaseTimer();
+      this.#safetyTimer = setInterval(() => this.#safetyTick(), SAFETY_TICK_MS);
+      this.#safetyTimer.unref();
       const now = Date.now();
       const owner: ResidentHostOwner = {
         format: RESIDENT_HOST_FORMAT,
@@ -838,6 +860,13 @@ export class ResidentHost {
       // on failure; maintenance/collection stays on normal post-readiness ticks.
       this.#ready = true;
       fs.rmSync(residentSleepingPath(this.config.residencyRoot), { force: true });
+      // Startup backlog (and any event seen before readiness): one explicit drain, plus the
+      // first overlay/maintenance pass, after start() returns; then events and the safety tick.
+      setImmediate(() => this.#safetyTick());
+      const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
+      this.#stuckPreparingTimer = setInterval(() => this.#checkStuckPreparing(stuckPreparingMs),
+        Math.max(MAINTENANCE_SLICE_MS, Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)));
+      this.#stuckPreparingTimer.unref();
       this.#scheduleIdleCheck();
       this.#writeWakeRoutes();
       if (this.#wakeRecovery) {
@@ -847,7 +876,6 @@ export class ResidentHost {
       // Retention is not part of request admission/heartbeat/claim. A bounded
       // preparation cursor progresses even between request-retention samples.
       if (retentionV2Enabled()) {
-        this.#maintenanceTimer = setInterval(() => this.#maintainRequests(), 100);
         this.#legacyArchive = new ResidentLegacyRunArchive(this.config.residencyRoot, this.#retention, {
           actorRoots: [...new Set(Object.values(residentActorRoots(this.config)))],
           isRetained: id => this.#closed || !!this.#handover || !this.participants.canConsumeMesh() || this.agents.hasRunCustody(id),
@@ -937,8 +965,14 @@ export class ResidentHost {
     this.#requestTimer = undefined;
     if (this.#scheduleTimer) clearTimeout(this.#scheduleTimer);
     this.#scheduleTimer = undefined;
-    if (this.#maintenanceTimer) clearInterval(this.#maintenanceTimer);
+    if (this.#maintenanceTimer) clearTimeout(this.#maintenanceTimer);
     this.#maintenanceTimer = undefined;
+    for (const timer of [this.#safetyTimer, this.#stuckPreparingTimer, this.#releaseTimer]) if (timer) clearInterval(timer);
+    for (const timer of [this.#requestRetryTimer, this.#deliveryRetryTimer, this.#idleDeadlineTimer]) if (timer) clearTimeout(timer);
+    this.#safetyTimer = this.#stuckPreparingTimer = this.#releaseTimer = undefined;
+    this.#requestRetryTimer = this.#deliveryRetryTimer = this.#idleDeadlineTimer = undefined;
+    // Join the native requests/ watcher close before owner release (Windows directory removal).
+    const requestWatchClosed = this.#closeRequestWatch();
     const wakeWatchClosed = this.#wakeWatchErrorUnsubscribe?.();
     this.#wakeWatchErrorUnsubscribe = undefined;
     this.#processWorkUnsubscribe?.();
@@ -946,6 +980,7 @@ export class ResidentHost {
     // FSWatcher.close() schedules native handle closure. Join its close event before
     // owner release or callers removing the residency directory on Windows.
     await wakeWatchClosed;
+    await requestWatchClosed;
     await this.#wakeRecoveryPending;
     this.#wakeRecovery?.close(); this.#wakeRecovery = undefined;
     this.#requestRetention.close();
@@ -1246,11 +1281,26 @@ export class ResidentHost {
         !fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")))) return Promise.resolve();
     const flushing = this.#deliveryRetry.run(() => this.#flushDeliveries());
     this.#flushingDeliveries = flushing;
-    void flushing.finally(() => {
+    void flushing.catch(() => "failed" as const).then(outcome => {
       if (this.#flushingDeliveries === flushing) this.#flushingDeliveries = undefined;
       this.#scheduleIdleCheck(); // Delivery custody ended; do not wait for a timed nudge.
+      if (this.#closed || this.#staged) return;
+      // A deferred mesh write (or a skipped run) retries after its own backoff, not the slow safety tick.
+      if (outcome === "retry" || (outcome === "skipped" && this.#deliveryRetry.waitMs > 0)) {
+        if (!this.#deliveryRetryTimer) {
+          this.#deliveryRetryTimer = setTimeout(() => { this.#deliveryRetryTimer = undefined; void this.#retryDeliveries(); },
+            Math.max(1, this.#deliveryRetry.waitMs));
+          this.#deliveryRetryTimer.unref();
+        }
+      // A full 32-item batch (or a delivery written during this flush) continues at once.
+      } else if (outcome === "done" && this.#deliveryOutboxPending()) setImmediate(() => void this.#retryDeliveries());
     }).catch(() => undefined);
     return flushing;
+  }
+
+  #deliveryOutboxPending(): boolean {
+    try { return fs.readdirSync(this.#deliveryOutboxPath).some(entry => entry.endsWith(".json")); }
+    catch { return false; }
   }
 
   // The commit effect of a state-chosen delivery (see #queueDelivery). A replay never
@@ -1260,6 +1310,8 @@ export class ResidentHost {
     if (replay && (fs.existsSync(file) || [record.rootId, this.config.rootId].some(root =>
       view.version(`${residentDeliveryPrefix(root)}${record.id}`) > 0))) return;
     writeJsonAtomic(file, record, { durable: true });
+    // Commit-effect/replayed items flush on this event (after the commit), not on a tick.
+    setImmediate(() => void this.#retryDeliveries());
   }
 
   async #flushDeliveries(): Promise<void> {
@@ -1311,7 +1363,8 @@ export class ResidentHost {
         return;
       }
       if (entries.length) this.#idleSince = undefined;
-      for (const entry of entries.slice(0, 32)) {
+      let claimed = 0;
+      for (const entry of entries.slice(0, REQUEST_DRAIN_BATCH)) {
         if (this.#handover || this.#closed) break;
         const source = path.join(this.#requestsPath, entry);
         const processing = path.join(this.#processingPath, entry);
@@ -1322,6 +1375,7 @@ export class ResidentHost {
         } catch {
           continue;
         }
+        claimed++;
         let releaseAdmission!: () => void;
         let boundary = false;
         const admitted = new Promise<void>(resolve => { releaseAdmission = resolve; });
@@ -1339,34 +1393,155 @@ export class ResidentHost {
           void response.finally(() => this.#boundaryRequests.delete(processing)).catch(() => undefined);
         }
       }
+      // Continue at once only after actual progress: a batch whose entries all failed to rename
+      // or are boundary-held retries on the next real event or the safety tick, never a hot loop.
+      this.#requestBacklog = entries.length > REQUEST_DRAIN_BATCH && claimed > 0;
     } finally {
       this.#pollingRequests = false;
-      if (!retentionV2Enabled()) this.#maintainRequests();
+      // Dead-root retirement and dormancy deadlines sample on request activity and the safety tick.
       await this.#checkIdle(false);
     }
   }
 
-  #maintainRequests(): void {
-    const now = Date.now();
-    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
-    // smarty-dev#6337: a hung preparation never fails, so the failure-streak notice
-    // cannot fire. Check on this tick, at most every 10 s (or the threshold, if shorter).
-    const stuckPreparingMs = this.config.agents?.stuckPreparingMs ?? DEFAULT_STUCK_PREPARING_MS;
-    if (now - this.#stuckPreparingCheckedAt >= Math.min(STUCK_PREPARING_CHECK_MS, stuckPreparingMs)) {
-      this.#stuckPreparingCheckedAt = now;
-      try {
-        this.actors.reportStuckPreparing(stuckPreparingMs, now);
-      } catch {
-        // Best effort: the next tick retries; retention below must still run.
+  /** Native requests/ events, the fallback poll and the safety tick request one coalesced drain. */
+  #nudgeRequests(): void {
+    this.#requestDirty = true;
+    if (this.#requestDrainQueued || this.#requestDraining || this.#closed) return;
+    this.#requestDrainQueued = true;
+    setImmediate(() => { this.#requestDrainQueued = false; void this.#drainRequests(); });
+  }
+
+  /** Bounded batches until no event arrived during the last pass and no backlog remains. */
+  async #drainRequests(): Promise<void> {
+    if (this.#requestDraining || this.#closed) return;
+    this.#requestDraining = true;
+    try {
+      // Before readiness the dirty bit is kept: start() drains explicitly once ready.
+      while (this.#requestDirty && this.#ready && !this.#closed) {
+        this.#requestDirty = false;
+        this.#requestBacklog = false;
+        const outcome = await this.#backgroundRequests.run(() => this.#pollRequests());
+        // MeshBackgroundRetry.run drops a skipped/deferred operation: keep the work dirty and
+        // re-attempt after its backoff, not the slow safety tick.
+        if (outcome === "retry" || (outcome === "skipped" && this.#backgroundRequests.waitMs > 0)) {
+          this.#requestDirty = true;
+          if (!this.#requestRetryTimer && !this.#closed) {
+            this.#requestRetryTimer = setTimeout(() => { this.#requestRetryTimer = undefined; this.#nudgeRequests(); },
+              Math.max(1, this.#backgroundRequests.waitMs));
+            this.#requestRetryTimer.unref();
+          }
+          return;
+        }
+        if (this.#requestBacklog) {
+          this.#requestDirty = true;
+          await new Promise<void>(resolve => setImmediate(resolve)); // yield between bounded batches
+        }
       }
+    } finally {
+      this.#requestDraining = false;
     }
-    if (!retentionV2Enabled() && !this.#requestRetention.due(now)) return;
-    // ensureHost/syncPiModels already publishes reloads to config.json. Apply
-    // only the same-release/root/session overlay at the next existing sweep;
-    // actor archives and agent collectors hold this same policy object.
+  }
+
+  #startRequestWatch(): void {
+    try {
+      const watcher = fs.watch(this.#requestsPath, () => this.#nudgeRequests());
+      this.#requestWatcher = watcher;
+      // Normal close() emits "close". A native watch error closes the handle itself and emits
+      // only "error" (no "close" follows), so after an error custody waits for a "close" that
+      // may still come, bounded by a grace period instead of releasing on the error itself.
+      this.#requestWatcherClosed = new Promise<void>(resolve => {
+        watcher.once("close", resolve);
+        watcher.once("error", () => setTimeout(resolve, REQUEST_WATCH_ERROR_CLOSE_GRACE_MS).unref());
+      });
+      watcher.on("error", error => this.#requestWatchFailed(error));
+    } catch (error) { this.#requestWatchFailed(error); }
+  }
+
+  #requestWatchFailed(error: unknown): void {
+    void this.#closeRequestWatch();
+    if (this.#closed || this.#requestPollFallback) return;
+    this.#requestPollFallback = true;
+    console.warn(`[pi-fabric] resident request watch unavailable for ${this.#requestsPath}; polling every ${REQUEST_POLL_MS} ms: ${String(error)}`);
+    // Requests only: the delivery outbox flushes on enqueue/write, its own backoff and the safety tick.
+    this.#requestTimer = setInterval(() => this.#nudgeRequests(), REQUEST_POLL_MS);
+    this.#nudgeRequests(); // an event may have been lost with the watcher
+  }
+
+  #closeRequestWatch(): Promise<void> {
+    const watcher = this.#requestWatcher;
+    this.#requestWatcher = undefined;
+    try { watcher?.close(); } catch { /* already closed by its error */ }
+    return this.#requestWatcherClosed ?? Promise.resolve();
+  }
+
+  /**
+   * Named exception (smarty-dev#11107, lead ruling): the ONLY 50 ms timer outside the watch
+   * fallback. It runs solely during the active staged/handover phase, which is bounded by the
+   * handover deadline (HANDOVER_DRAIN_MS), and clears itself once that phase completes, falls
+   * back or is cancelled (and on close). It nudges requests only; #advanceRelease does the work.
+   */
+  #ensureReleaseTimer(): void {
+    if (this.#releaseTimer || this.#closed || !(this.#staged || this.#handover)) return;
+    this.#releaseTimer = setInterval(() => {
+      if (this.#closed || !(this.#staged || this.#handover)) {
+        clearInterval(this.#releaseTimer); this.#releaseTimer = undefined;
+        this.#nudgeRequests(); void this.#retryDeliveries(); // backlog held during the release
+        return;
+      }
+      this.#nudgeRequests();
+    }, REQUEST_POLL_MS);
+  }
+
+  #safetyTick(): void {
+    if (this.#closed) return;
+    this.#nudgeRequests();
+    void this.#retryDeliveries();
+    if (this.#ready) {
+      // ensureHost/syncPiModels publish reloads to config.json; one cached stat per slow tick keeps
+      // the accepted overlay, including the idle-exit window, current between retention samples.
+      try { Object.assign(this.#retention, this.#currentRetention()); } catch { /* next tick retries */ }
+    }
+    this.#wakeMaintenance();
+  }
+
+  /** Coalesced maintenance pass: the safety tick and retention-changing events. */
+  #wakeMaintenance(): void {
+    if (this.#maintenanceQueued || this.#closed) return;
+    this.#maintenanceQueued = true;
+    setImmediate(() => { this.#maintenanceQueued = false; this.#runMaintenance(); });
+  }
+
+  #runMaintenance(): void {
+    if (this.#closed) return;
+    let swept = false;
+    try { swept = this.#maintainRequests(); }
+    catch (error) { console.warn(`[pi-fabric] resident request maintenance failed: ${String(error)}`); }
+    // Only a sample already in progress continues at slice cadence; an idle host stays on the slow tick.
+    if (swept && !this.#maintenanceTimer && !this.#closed && this.#requestRetention.due()) {
+      this.#maintenanceTimer = setTimeout(() => { this.#maintenanceTimer = undefined; this.#runMaintenance(); }, MAINTENANCE_SLICE_MS);
+      this.#maintenanceTimer.unref();
+    }
+  }
+
+  /** smarty-dev#6337: a hung preparation never fails, so the failure-streak notice cannot
+   * fire. Its own timer: every 10 s, or the threshold if shorter; never the retention tick. */
+  #checkStuckPreparing(stuckPreparingMs: number): void {
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return;
+    try { this.actors.reportStuckPreparing(stuckPreparingMs, Date.now()); }
+    catch { /* Best effort: the next interval retries. */ }
+  }
+
+  /** Returns whether a sweep slice ran. */
+  #maintainRequests(): boolean {
+    const now = Date.now();
+    if (!this.#ready || this.#closed || !this.participants.canConsumeMesh()) return false;
+    // Due first, in both retention modes: a pass that is not due does no reference scan,
+    // config stat or actor listing.
+    if (!this.#requestRetention.due(now)) return false;
+    // Apply the same-release/root/session overlay at the sweep; actor archives and agent
+    // collectors hold this same policy object.
     Object.assign(this.#retention, this.#currentRetention(now));
     const live = retentionV2Enabled() ? this.agents.retentionReferences({ now }) : this.agents.retentionReferences();
-    if (retentionV2Enabled() && !this.#requestRetention.due(now)) return;
     for (const id of this.actors.inFlightActorIds()) live.add(id);
     const stoppedWritersGone = new Set<string>();
     for (const actor of this.actors.listOwned()) {
@@ -1379,10 +1554,11 @@ export class ResidentHost {
       if (removal.runId) live.add(removal.runId);
     }
     this.#requestRetention.sweep(now, live, 5, stoppedWritersGone);
+    return true;
   }
 
   /** The accepted retention overlay, re-read only when config.json was replaced or changed:
-   * this runs on every 100 ms maintenance tick, and Main rewrites the file atomically. */
+   * this runs on every slow safety tick and due sweep, and Main rewrites the file atomically. */
   #currentRetention(now = Date.now()): ResidentHostConfig["retention"] {
     let stamp: string | undefined;
     let settled = false;
@@ -1669,12 +1845,12 @@ export class ResidentHost {
       this.#idleSince = undefined;
       return;
     }
-    // Dead-root retirement starts its window on request-poll samples; event-driven checks serve dormancy.
+    // Dead-root retirement starts its window on request-drain/safety-tick samples; event-driven checks serve dormancy.
     if (!durableActor && includeDormancy) return;
     this.#idleSince ??= now;
     const idleMs = now - this.#idleSince;
     if (!durableActor) {
-      if (idleMs < this.#residentIdleExitMs) return;
+      if (idleMs < this.#residentIdleExitMs) { this.#armIdleDeadline(this.#residentIdleExitMs - idleMs); return; }
       // A disable/rollback may have arrived between maintenance and this deadline tick.
       // Revalidate the accepted policy before committing retirement, not just on maintenance.
       this.#currentRetention(now);
@@ -1692,7 +1868,7 @@ export class ResidentHost {
       this.onIdle("idle-exit"); // runResidentHost joins close(): withdraw lease/owner, then release the host fence.
       return;
     }
-    if (idleMs < IDLE_EXIT_MS) return;
+    if (idleMs < IDLE_EXIT_MS) { this.#armIdleDeadline(IDLE_EXIT_MS - idleMs); return; }
     // Never exit on a reused actor observation: confirm with a current actor check.
     if (this.#hasActiveActor(now, true)) {
       this.#idleSince = now;
@@ -1752,8 +1928,21 @@ export class ResidentHost {
         this.lifecycle.resume();
         this.#idleSince = Date.now();
         this.#scheduleIdleCheck();
+        this.#nudgeRequests(); // events seen while not ready kept their dirty bit
       }
     }
+  }
+
+  /** One-shot sample when an open idle window would elapse; replaces the former 50 ms samples. */
+  #armIdleDeadline(ms: number): void {
+    if (this.#idleDeadlineTimer) clearTimeout(this.#idleDeadlineTimer);
+    this.#idleDeadlineTimer = undefined;
+    if (this.#closed) return;
+    this.#idleDeadlineTimer = setTimeout(() => {
+      this.#idleDeadlineTimer = undefined;
+      if (!this.#closed) void this.#checkIdle(false).catch(() => undefined);
+    }, Math.min(Math.max(1, ms + 1), 2_147_000_000));
+    this.#idleDeadlineTimer.unref();
   }
 
   // Re-armed on every idle check: the due time of the earliest pending
@@ -1836,6 +2025,7 @@ export class ResidentHost {
     writeHandoverState(this.config.residencyRoot, plan, "preparing");
     this.#handover = plan;
     this.actors.pauseForRelease(); this.control.pause(); this.lifecycle.pause();
+    this.#ensureReleaseTimer();
   }
 
   #cancelRelease(plan: ResidentHandoverPlan, reason: string): void {
@@ -1843,6 +2033,7 @@ export class ResidentHost {
     writeHandoverState(this.config.residencyRoot, plan, "cancelled", reason);
     this.#handover = undefined;
     this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+    this.#nudgeRequests(); // requests held during preparation
   }
 
   async #advanceRelease(): Promise<void> {
@@ -1868,6 +2059,7 @@ export class ResidentHost {
         writeJsonAtomic(this.#ownerPath, servingOwner, { durable: true });
         this.#staged = false;
         this.actors.resumeAfterRelease(); this.control.resume(); this.lifecycle.resume();
+        this.#nudgeRequests(); void this.#retryDeliveries(); // backlog held while staged
         this.#trackPublication(this.#backgroundDeliveries.enqueue(async () => {
           await this.actors.finishPendingRemovals();
           this.#writeRemovals();
@@ -2269,6 +2461,7 @@ export class ResidentHost {
     const removals = this.actors.pendingRemovals();
     if (removals.length === 0) fs.rmSync(this.#removalsPath, { force: true });
     else atomicWrite(this.#removalsPath, { format: RESIDENT_HOST_FORMAT, removals });
+    this.#wakeMaintenance(); // actor removal changes retention references
   }
 
   /**

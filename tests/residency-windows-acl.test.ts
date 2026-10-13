@@ -10,11 +10,13 @@ import {
   WINDOWS_ACL_BATCH_ENV_BUDGET, WINDOWS_REQUESTS_ACL_TTL_MS, type WindowsDirectoryAcl, type WindowsRequestFileReport,
 } from "../src/residency/windows-acl.js";
 
+import { createSimulatedWindowsRequestsAcl } from "./helpers/simulated-windows-acl.js";
+
 const user = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 const other = "S-1-5-21-1111111111-2222222222-3333333333-1002";
 // FileSystemRights values Get-Acl reports for icacls (F), (M), (W), (RX) and GENERIC_ALL.
 const FULL = 2032127, MODIFY = 197055, WRITE = 278, READ_EXECUTE = 1179817, GENERIC_ALL = 268435456;
-// The SDDL access section Get-Acl reports for the private DACL icacls sets.
+// The SDDL access section Get-Acl reports for a protected private DACL.
 const PRIVATE_SDDL = `D:PAI(A;OICI;FA;;;${user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`;
 const reportWith = (sddl: string, ...lines: string[]) =>
   [`user ${user}`, `owner ${user}`, `dacl ${sddl}`, ...lines, "end", ""].join("\r\n");
@@ -73,14 +75,14 @@ describe("Windows resident requests DACL policy", () => {
       .rejects.toThrow(new RegExp(`^Refusing to serve resident requests: .*writable by other accounts \\(S-1-1-0 \\(${label}\\)\\)`));
   });
 
-  it("simulated win32 refuses a NULL-DACL residency directory before creating anything", async () => {
+  it("simulated win32 refuses a NULL DACL that remains after attempted hardening", async () => {
     const directory = path.join(tempRoot(), "requests");
     let restricted = false;
     await expect(prepareResidentRequestsDirectory(directory, "win32", {
       readAcl: async target => parseWindowsAclReport(target === path.dirname(directory) ? reportWith("D:NO_ACCESS_CONTROL") : ownerOnly),
       restrict: async () => { restricted = true; },
     })).rejects.toThrow(/^Refusing to serve resident requests: the residency directory .*\(S-1-1-0 \(NULL DACL\)\)/);
-    expect(restricted).toBe(false);
+    expect(restricted).toBe(true);
     expect(fs.readdirSync(path.dirname(directory))).toEqual([]);
   });
 
@@ -121,24 +123,26 @@ describe("Windows resident requests DACL policy", () => {
     await prepareResidentRequestsDirectory(directory, "win32", {
       readAcl: async target => {
         reads.push(target === directory ? "requests" : isStaging(target) ? "staging" : target);
-        return isStaging(target) && restricted.length === 0 ? inherited : parseWindowsAclReport(ownerOnly);
+        return isStaging(target) && !restricted.includes(target) ? inherited : parseWindowsAclReport(ownerOnly);
       },
       restrict: async (target, sid) => {
-        expect(fs.existsSync(directory)).toBe(false);
+        if (isStaging(target)) expect(fs.existsSync(directory)).toBe(false);
         expect(sid).toBe(user);
-        restricted.push(path.basename(target));
+        restricted.push(target);
       },
     });
     expect(fs.statSync(directory).isDirectory()).toBe(true);
-    expect(restricted).toHaveLength(1);
-    expect(restricted[0]).toMatch(/^requests\.create-/);
+    expect(restricted).toHaveLength(4);
+    expect(path.basename(restricted[2]!)).toMatch(/^requests\.create-/);
+    expect(restricted[3]).toBe(directory);
     expect(fs.readdirSync(path.dirname(directory))).toEqual(["requests"]);
-    // Parent chain first, then staging (owner SID, verify after restrict), then the final path.
-    expect(reads).toEqual([path.dirname(path.dirname(directory)), path.dirname(directory), "staging", "staging", "requests"]);
+    // Each owner read must precede hardening and its verification read.
+    const parent = path.dirname(path.dirname(directory)), residency = path.dirname(directory);
+    expect(reads).toEqual([parent, parent, residency, residency, "staging", "staging", "requests", "requests"]);
   });
 
   it.each([["residency directory", 1], ["residency parent", 2]])(
-    "simulated win32 refuses a %s with an extra writer before creating anything", async (role, depth) => {
+    "simulated win32 refuses a %s that retains an extra writer after hardening", async (role, depth) => {
       const directory = path.join(tempRoot(), "requests");
       const wide = path.dirname(depth === 1 ? directory : path.dirname(directory));
       let restricted = false;
@@ -147,7 +151,7 @@ describe("Windows resident requests DACL policy", () => {
           ? report(`ace Allow ${user} ${FULL}`, `ace Allow ${other} ${MODIFY}`) : ownerOnly),
         restrict: async () => { restricted = true; },
       })).rejects.toThrow(new RegExp(`^Refusing to serve resident requests: the ${role} .*writable by other accounts \\(${other}\\)`));
-      expect(restricted).toBe(false);
+      expect(restricted).toBe(true);
       expect(fs.readdirSync(path.dirname(directory))).toEqual([]);
     });
 
@@ -160,22 +164,52 @@ describe("Windows resident requests DACL policy", () => {
           ? report(`ace Allow ${user} ${FULL}`, `ace Allow ${other} ${WRITE}`) : ownerOnly),
         restrict: async target => {
           restricted = true;
-          if (plant) fs.writeFileSync(path.join(target, "forged.json"), "{}");
+          if (plant && path.basename(target).startsWith("requests.create-")) fs.writeFileSync(path.join(target, "forged.json"), "{}");
         },
       })).rejects.toThrow(plant ? /staging directory .* is not empty/ : /staging directory .*writable by other accounts/);
       expect(fs.readdirSync(path.dirname(directory))).toEqual([]);
     }
   });
 
-  it("simulated win32 refuses an existing requests directory without touching its DACL", async () => {
-    const directory = path.join(tempRoot(), "requests");
+  it.each(["requests", "processing"])("simulated win32 secures owned inherited Users/CREATOR OWNER grants before serving %s", async name => {
+    const directory = path.join(tempRoot(), name);
     fs.mkdirSync(directory);
-    let restricted = false;
-    await expect(prepareResidentRequestsDirectory(directory, "win32", {
-      readAcl: async () => parseWindowsAclReport(report(`ace Allow ${user} ${FULL}`, `ace Allow S-1-5-32-545 ${WRITE}`)),
-      restrict: async () => { restricted = true; },
-    })).rejects.toThrow(/writable by other accounts \(S-1-5-32-545\)/);
-    expect(restricted).toBe(false);
+    const inherited = parseWindowsAclReport(reportWith(`D:AI(A;OICIID;FA;;;${user})(A;OICIID;WD;;;BU)(A;OICIID;FA;;;CO)`,
+      `ace Allow ${user} ${FULL}`, `ace Allow S-1-5-32-545 ${WRITE}`, `ace Allow S-1-3-0 ${FULL}`));
+    const deps = createSimulatedWindowsRequestsAcl(() => inherited);
+    const restrict = vi.spyOn(deps, "restrict");
+    const guard = new WindowsRequestsGuard(directory, { platform: "win32", deps });
+    await guard.prepare();
+    await expect(guard.assertBeforeConsume()).resolves.toBeUndefined();
+    fs.writeFileSync(path.join(directory, "owned.json"), "{}");
+    await expect(guard.screenPending(["owned.json"])).resolves.toEqual(["owned.json"]);
+    expect(restrict.mock.calls.map(call => call[0])).toEqual([
+      path.dirname(path.dirname(directory)), path.dirname(directory), directory,
+    ]);
+    expect(await deps.readAcl(directory)).toEqual(parseWindowsAclReport(ownerOnly));
+    expect(guard.refusal).toBeUndefined();
+  });
+
+  it.each([
+    ["residency parent", 2], ["residency directory", 1], ["requests directory", 0], ["processing directory", 0],
+  ])("simulated win32 refuses foreign-owned %s without modifying its DACL", async (role, depth) => {
+    const directory = path.join(tempRoot(), role === "processing directory" ? "processing" : "requests");
+    fs.mkdirSync(directory);
+    const foreign = depth === 2 ? path.dirname(path.dirname(directory)) : depth === 1 ? path.dirname(directory) : directory;
+    const foreignAcl = parseWindowsAclReport(ownerOnly.replace(`owner ${user}`, `owner ${other}`));
+    const deps = createSimulatedWindowsRequestsAcl(target => target === foreign ? foreignAcl : parseWindowsAclReport(ownerOnly));
+    const restrict = vi.spyOn(deps, "restrict");
+    await expect(prepareResidentRequestsDirectory(directory, "win32", deps)).rejects.toThrow(`owned by another account (${other} (owner))`);
+    expect(restrict.mock.calls.map(call => call[0])).not.toContain(foreign);
+    expect(await deps.readAcl(foreign)).toEqual(foreignAcl);
+  });
+
+  it("simulated win32 refuses when owned-directory DACL hardening fails", async () => {
+    const directory = path.join(tempRoot(), "requests");
+    const deps = createSimulatedWindowsRequestsAcl();
+    vi.spyOn(deps, "restrict").mockRejectedValue(new Error("Set-Acl denied"));
+    await expect(prepareResidentRequestsDirectory(directory, "win32", deps)).rejects.toThrow(/cannot secure or verify the DACL .*Set-Acl denied/);
+    expect(fs.existsSync(directory)).toBe(false);
   });
 
   describe("simulated win32 request batch guard", () => {
@@ -578,8 +612,8 @@ describe("Windows resident requests DACL policy", () => {
   });
 });
 
-describe.skipIf(process.platform !== "win32")("Windows resident requests DACL (real icacls)", () => {
-  it("creates a private requests directory, then refuses once BUILTIN\\Users is granted write", async () => {
+describe.skipIf(process.platform !== "win32")("Windows resident requests DACL (real PowerShell and icacls)", () => {
+  it("creates a private directory, screens Users write, and secures owned grants again at startup", async () => {
     const directory = path.join(tempRoot(), "requests");
     await prepareResidentRequestsDirectory(directory);
     const acl = await readWindowsDirectoryAcl(directory);
@@ -588,8 +622,12 @@ describe.skipIf(process.platform !== "win32")("Windows resident requests DACL (r
     expect(acl.aces.every(ace => [acl.user, "S-1-5-18", "S-1-5-32-544"].includes(ace.sid))).toBe(true);
     // A second ACE for a well-known group with write, as another local account would need.
     await promisify(execFile)(windowsSystemExecutable("icacls.exe"), [directory, "/grant", "*S-1-5-32-545:(OI)(CI)(W)"], { windowsHide: true });
-    await expect(prepareResidentRequestsDirectory(directory))
+    await expect(assertWindowsRequestsDirectoryPrivate(directory))
       .rejects.toThrow(/Refusing to serve resident requests: .*writable by other accounts \(S-1-5-32-545\)/);
+    await expect(prepareResidentRequestsDirectory(directory)).resolves.toEqual(expect.any(String));
+    const secured = await readWindowsDirectoryAcl(directory);
+    expect(windowsRequestsAclViolations(secured)).toEqual([]);
+    expect(secured.aces.every(ace => [secured.user, "S-1-5-18", "S-1-5-32-544"].includes(ace.sid))).toBe(true);
   }, 60_000);
 
   it("quarantines a pending request file that grants BUILTIN\\Users write and keeps a private one", async () => {

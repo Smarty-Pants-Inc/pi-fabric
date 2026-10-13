@@ -293,15 +293,26 @@ export async function readWindowsDirectoryAcl(directory: string): Promise<Window
   return parseWindowsAclReport(stdout);
 }
 
-function privateGrants(userSid: string): string[] {
-  return [userSid, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID].map(sid => `*${sid}:(OI)(CI)F`);
-}
+const restrictDirectoryScript = [
+  "$sid = [System.Security.Principal.SecurityIdentifier]",
+  "$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+  "$owner = (Get-Acl -LiteralPath $env:FABRIC_ACL_PATH).GetOwner($sid)",
+  "if ($user.Value -ne $env:FABRIC_ACL_USER_SID -or $owner.Value -ne $user.Value) { throw 'Refusing to secure a directory not owned by the current user' }",
+  "$acl = [System.Security.AccessControl.DirectorySecurity]::new()",
+  "$acl.SetAccessRuleProtection($true, $false)",
+  `foreach ($principal in @($env:FABRIC_ACL_USER_SID, '${WINDOWS_SYSTEM_SID}', '${WINDOWS_ADMINISTRATORS_SID}')) { ` +
+    "$rule = [System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($principal), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'); " +
+    "$acl.AddAccessRule($rule) }",
+  "Set-Acl -LiteralPath $env:FABRIC_ACL_PATH -AclObject $acl",
+].join("; ");
 
-/** Replace inherited ACEs with explicit owner, SYSTEM and Administrators grants. */
+/** Replace the entire DACL, not just inherited ACEs, with three protected private grants. */
 export async function restrictWindowsDirectory(directory: string, userSid: string): Promise<void> {
   if (!sidPattern.test(userSid)) throw new Error(`malformed user SID: ${userSid}`);
-  await execFileAsync(windowsSystemExecutable("icacls.exe"), [directory, "/inheritance:r", "/grant:r", ...privateGrants(userSid)], {
+  const command = windowsSecurityPowerShell(restrictDirectoryScript);
+  await execFileAsync(command.file, command.args, {
     encoding: "utf8", windowsHide: true, timeout: 30_000,
+    env: { ...command.env, FABRIC_ACL_PATH: directory, FABRIC_ACL_USER_SID: userSid },
   });
 }
 
@@ -415,17 +426,34 @@ export async function assertWindowsRequestsDirectoryPrivate(directory: string,
     `is pending; the host recreates it with a private DACL.`);
 }
 
-/** Owner + SYSTEM + Administrators only; otherwise throw `Refusing to serve resident requests: ...`. */
-async function assertPrivateDirectory(directory: string, readAcl: WindowsRequestsAclDeps["readAcl"], role: string): Promise<WindowsDirectoryAcl> {
+/** Tighten only current-user-owned directories, then re-read and apply the unchanged writer policy. */
+async function preparePrivateDirectory(directory: string, deps: WindowsRequestsAclDeps, role: string): Promise<void> {
+  const identity = windowsDirectoryIdentity(directory);
   let acl: WindowsDirectoryAcl;
   try {
-    acl = await readAcl(directory);
+    acl = await deps.readAcl(directory);
   } catch (error) {
     throw new Error(`Refusing to serve resident requests: cannot verify the DACL of ${role} ${directory} ` +
       `(${error instanceof Error ? error.message : String(error)})`);
   }
+  // Ownership permits changing the DACL; never take over a directory owned by any other account.
+  if (acl.owner !== acl.user) {
+    throw new Error(`Refusing to serve resident requests: ${role} ${directory} is owned by another account (${acl.owner} (owner)); ` +
+      `only ${acl.user} may own it before its DACL is secured.`);
+  }
+  try {
+    await deps.restrict(directory, acl.user);
+    acl = await deps.readAcl(directory);
+  } catch (error) {
+    throw new Error(`Refusing to serve resident requests: cannot secure or verify the DACL of ${role} ${directory} ` +
+      `(${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (windowsDirectoryIdentity(directory) !== identity) {
+    throw new Error(`Refusing to serve resident requests: ${role} ${directory} was replaced while its DACL was secured`);
+  }
   const extra = windowsRequestsAclViolations(acl);
-  if (extra.length === 0) return acl;
+  if (extra.length === 0 && acl.owner === acl.user) return;
+  if (acl.owner !== acl.user && !extra.includes(`${acl.owner} (owner)`)) extra.push(`${acl.owner} (owner)`);
   throw new Error(`Refusing to serve resident requests: ${role} ${directory} is writable by other accounts (${extra.join(", ")}); ` +
     `only ${acl.user}, SYSTEM and Administrators may own or write it, because an account that can write it can plant ` +
     `or replace request files.`);
@@ -445,27 +473,27 @@ export function windowsDirectoryIdentity(directory: string): string {
 /**
  * Create the residency `requests` directory and, on Windows, prove that no other
  * account can plant a request in it before the host consumes any request file.
- * The residency directory and its parent are verified first: an account that can
- * write either could replace `requests` or plant files during creation. A new
- * `requests` directory is then created under a private staging name inside the
- * verified residency directory (so it inherits only private ACEs from its first
- * moment), restricted to explicit grants, verified private and empty, and only
- * then renamed into place. Returns the verified directory identity on Windows.
+ * Current-user-owned residency directories and their parent are secured and
+ * verified first: normal Windows temp/profile parents otherwise supply inherited
+ * writer ACEs. Foreign ownership is always refused without changing the DACL.
+ * A new directory is created under a private staging name inside the secured
+ * residency directory, secured again, verified private and empty, and only then
+ * renamed into place. Existing directories are also secured before verification;
+ * files planted before hardening still require the guard's per-file ACL screen.
+ * Also used for `processing`. Returns the verified directory identity on Windows.
  */
 export async function prepareResidentRequestsDirectory(directory: string, platform: NodeJS.Platform = process.platform,
   deps: WindowsRequestsAclDeps = windowsRequestsAclAdapters): Promise<string | undefined> {
   if (platform !== "win32") { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); return undefined; }
   const residency = path.dirname(directory);
   fs.mkdirSync(residency, { recursive: true, mode: 0o700 });
-  await assertPrivateDirectory(path.dirname(residency), deps.readAcl, "the residency parent");
-  await assertPrivateDirectory(residency, deps.readAcl, "the residency directory");
+  await preparePrivateDirectory(path.dirname(residency), deps, "the residency parent");
+  await preparePrivateDirectory(residency, deps, "the residency directory");
   if (!fs.existsSync(directory)) {
     const staging = `${directory}.create-${randomUUID()}`;
     fs.mkdirSync(staging, { mode: 0o700 });
     try {
-      const { user } = await deps.readAcl(staging);
-      await deps.restrict(staging, user);
-      await assertPrivateDirectory(staging, deps.readAcl, "the requests staging directory");
+      await preparePrivateDirectory(staging, deps, "the requests staging directory");
       if (fs.readdirSync(staging).length !== 0) {
         throw new Error(`Refusing to serve resident requests: the requests staging directory ${staging} is not empty`);
       }
@@ -477,7 +505,7 @@ export async function prepareResidentRequestsDirectory(directory: string, platfo
     }
   }
   const identity = windowsDirectoryIdentity(directory);
-  await assertWindowsRequestsDirectoryPrivate(directory, deps.readAcl);
+  await preparePrivateDirectory(directory, deps, "the requests directory");
   if (windowsDirectoryIdentity(directory) !== identity) {
     throw new Error(`Refusing to serve resident requests: ${directory} was replaced while its DACL was verified`);
   }

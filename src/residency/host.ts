@@ -84,7 +84,7 @@ import { completionRecipientFromRun, saveCompletion } from "../agents/completion
 import { projectOf } from "../topology/project-identity.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
 import { ResidentRequestRetention } from "./retention.js";
-import { WindowsRequestsGuard } from "./windows-acl.js";
+import { prepareResidentRequestsDirectory, WindowsRequestsGuard } from "./windows-acl.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { ResidentLegacyRunArchive } from "./legacy-run-archive.js";
 import { assertResidentRequestNotExpired, residentRequestGeneration, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -702,7 +702,7 @@ export class ResidentHost {
       // this user, SYSTEM and Administrators own or can write the directory, the
       // residency directory and its parent (which could otherwise replace it).
       await this.#requestsGuard.prepare();
-      fs.mkdirSync(this.#processingPath, { recursive: true, mode: 0o700 });
+      await prepareResidentRequestsDirectory(this.#processingPath);
       fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
       this.#recoverInterruptedRequests();

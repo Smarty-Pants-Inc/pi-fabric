@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { windowsOwnerSids } from "../src/actors-cli.js";
-import { encodeWindowsAclPath, readWindowsDirectoryAcl, readWindowsFileAcls } from "../src/residency/windows-acl.js";
+import { encodeWindowsAclPath, readWindowsDirectoryAcl, readWindowsFileAcls, restrictWindowsDirectory } from "../src/residency/windows-acl.js";
 import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
 
 const subprocess = vi.hoisted(() => ({ execFileAsync: vi.fn(), execFileSync: vi.fn() }));
@@ -29,7 +29,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); });
 
-function assertSecurityLaunch(call: unknown[], inputName: string, input: string): string {
+function assertSecurityLaunch(call: unknown[], inputName: string, input: string, extraInputs: NodeJS.ProcessEnv = {}): string {
   const [file, args, options] = call as [string, string[], { env: NodeJS.ProcessEnv }];
   expect(args).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", expect.any(String)]);
   const source = Buffer.from(args[4]!, "base64").toString("utf16le");
@@ -39,7 +39,7 @@ function assertSecurityLaunch(call: unknown[], inputName: string, input: string)
   expect(file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   expect(args).toEqual(command.args);
   expect(options).toMatchObject({ encoding: "utf8", windowsHide: true, timeout: 30_000 });
-  expect(options.env).toEqual({ ...command.env, [inputName]: input });
+  expect(options.env).toEqual({ ...command.env, [inputName]: input, ...extraInputs });
   expect(options.env.PSModulePath).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules");
   expect(Object.keys(options.env).filter(key => key.toLowerCase() === "psmodulepath")).toEqual(["PSModulePath"]);
   return source;
@@ -54,6 +54,29 @@ describe("resident ACL and owner PowerShell launches under a pwsh parent", () =>
     const source = assertSecurityLaunch(subprocess.execFileAsync.mock.calls[0]!, "FABRIC_ACL_PATH", directory);
     expect(source).toContain("Get-Acl -LiteralPath $env:FABRIC_ACL_PATH");
     expect(source).not.toContain(directory);
+  });
+
+  it("pins protected DACL replacement to Windows security PowerShell with environment-only inputs", async () => {
+    const directory = "R:\\resident\\quote'$;日本語";
+    subprocess.execFileAsync.mockResolvedValue({ stdout: "" });
+    await expect(restrictWindowsDirectory(directory, user)).resolves.toBeUndefined();
+    expect(subprocess.execFileAsync).toHaveBeenCalledTimes(1);
+    const source = assertSecurityLaunch(subprocess.execFileAsync.mock.calls[0]!, "FABRIC_ACL_PATH", directory,
+      { FABRIC_ACL_USER_SID: user });
+    expect(source).toContain("Get-Acl -LiteralPath $env:FABRIC_ACL_PATH");
+    expect(source).toContain("$owner.Value -ne $user.Value");
+    expect(source).toContain("[System.Security.AccessControl.DirectorySecurity]::new()");
+    expect(source).toContain("$acl.SetAccessRuleProtection($true, $false)");
+    expect(source).toContain("@($env:FABRIC_ACL_USER_SID, 'S-1-5-18', 'S-1-5-32-544')");
+    expect(source).toContain("'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'");
+    expect(source).toContain("Set-Acl -LiteralPath $env:FABRIC_ACL_PATH -AclObject $acl");
+    expect(source).not.toContain(directory);
+    expect(source).not.toContain(user);
+  });
+
+  it("rejects a malformed SID before launching a DACL replacement", async () => {
+    await expect(restrictWindowsDirectory("R:\\resident", "BUILTIN\\Users")).rejects.toThrow("malformed user SID");
+    expect(subprocess.execFileAsync).not.toHaveBeenCalled();
   });
 
   it("pins batch file ACL checks while preserving encoded paths in the environment", async () => {

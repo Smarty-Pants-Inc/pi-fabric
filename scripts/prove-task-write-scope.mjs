@@ -7,6 +7,7 @@ import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const option = name => {
   const index = process.argv.indexOf(name);
@@ -86,9 +87,43 @@ const cwdFile = path.join(workspace, `${path.basename(scratch)}-worktree-write.t
 assert(!fs.existsSync(cwdFile), "Use a fresh native worktree write target");
 const toolResults = [], childRequests = [], parentEvents = [];
 let child, server, parentExit, failure, rejectSettlement, nativePgid, nativeExitReceipt, nativeClose;
-// A per-launch, non-secret ownership marker survives detached groups and reparenting.
-const ownershipMarker = `TASK_WRITE_SCOPE_PROOF_OWNER=${crypto.randomUUID()}`;
 const ownedProcesses = new Map();
+const spawnRecords = path.join(scratch, "native-spawns.jsonl");
+fs.writeFileSync(spawnRecords, "");
+// Record child births synchronously, before a custodian can exit. This is the
+// stat-only fallback's custody receipt, not a scan of other processes' state.
+const spawnTracker = path.join(scratch, "record-native-spawns.mjs");
+fs.writeFileSync(spawnTracker, `import fs from 'node:fs'; import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
+const identity=pid=>{try{const f=fs.readFileSync('/proc/'+pid+'/stat','utf8').split(') ').at(-1).split(' ');return {pid:Number(pid),ppid:Number(f[1]),pgid:Number(f[2]),sid:Number(f[3]),state:f[0],started:f[19]}}catch(e){if(e.code==='ENOENT'||e.code==='ESRCH')return;throw e}};
+const original=cp.spawn;
+cp.spawn=function(...args){const parent=identity(process.pid), child=original.apply(this,args), birth=child.pid&&identity(child.pid);
+if(parent&&birth)fs.appendFileSync(${JSON.stringify(spawnRecords)},JSON.stringify({parent,child:birth})+'\\n');return child};
+syncBuiltinESMExports();`);
+let nativeCgroup;
+try {
+  const hierarchy = fs.readFileSync("/proc/self/cgroup", "utf8").split("\n").find(line => line.startsWith("0::"));
+  if (!hierarchy) throw new Error("cgroup v2 unavailable");
+  const directory = path.join("/sys/fs/cgroup", hierarchy.slice(3), `fabric-write-proof-${crypto.randomUUID()}`);
+  fs.mkdirSync(directory, { mode: 0o700 });
+  const stat = fs.statSync(directory);
+  nativeCgroup = { directory, dev: stat.dev, ino: stat.ino };
+} catch (error) {
+  console.error(`NATIVE_OWNERSHIP_FALLBACK: ${error.message}`);
+}
+const cgroupMembers = () => {
+  const stat = fs.lstatSync(nativeCgroup.directory);
+  assert(stat.isDirectory() && !stat.isSymbolicLink() && stat.dev === nativeCgroup.dev && stat.ino === nativeCgroup.ino, "Native cgroup identity changed");
+  const members = [];
+  const visit = directory => {
+    members.push(...fs.readFileSync(path.join(directory, "cgroup.procs"), "utf8").trim().split(/\s+/).filter(Boolean).map(Number));
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      assert(!entry.isSymbolicLink(), "Native cgroup must not contain links");
+      if (entry.isDirectory()) visit(path.join(directory, entry.name));
+    }
+  };
+  visit(nativeCgroup.directory);
+  return members;
+};
 const procIdentity = pid => {
   try {
     const fields = fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1).split(" ");
@@ -99,18 +134,24 @@ const procIdentity = pid => {
   }
 };
 const ownedAlive = () => {
-  const processes = [];
-  for (const pid of fs.readdirSync("/proc").filter(name => /^\d+$/.test(name))) {
-    try {
-      // Examine only this user's processes; never retain or report environment contents.
-      if (fs.statSync(`/proc/${pid}`).uid !== process.getuid()) continue;
-      const identity = procIdentity(pid);
-      if (!identity) continue;
-      processes.push(identity);
-      if (identity.sid === nativePgid || fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(ownershipMarker)) ownedProcesses.set(identity.pid, identity);
-    } catch (error) {
-      if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes(error.code)) throw error;
+  const processes = (nativeCgroup ? cgroupMembers() : fs.readdirSync("/proc").filter(name => /^\d+$/.test(name)))
+    .map(procIdentity).filter(Boolean);
+  // Private spawn receipts retain an owned parent birth even after reparenting.
+  const rows = fs.readFileSync(spawnRecords, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  let admitted;
+  do {
+    admitted = false;
+    for (const row of rows) if (ownedProcesses.get(row.parent.pid)?.started === row.parent.started) {
+      const current = procIdentity(row.child.pid);
+      if (current?.started === row.child.started && ownedProcesses.get(current.pid)?.started !== current.started) {
+        ownedProcesses.set(current.pid, current); admitted = true;
+      }
     }
+  } while (admitted);
+  const ownedSessions = new Set([...ownedProcesses.values()].filter(owned =>
+    owned.started === procIdentity(owned.pid)?.started).map(owned => owned.sid));
+  for (const identity of processes) if (nativeCgroup || ownedSessions.has(identity.sid)) {
+    ownedProcesses.set(identity.pid, identity);
   }
   // Also capture descendants which intentionally start with an empty environment.
   const liveIds = new Set([...ownedProcesses.values()].filter(identity =>
@@ -132,6 +173,15 @@ const signalOwned = signal => {
   const groups = new Set(live.map(identity => identity.pgid));
   // detached:true makes the root PID its process-group ID; descendants may own other groups.
   if (live.some(identity => identity.pid === nativePgid)) groups.add(nativePgid);
+  if (nativeCgroup) {
+    const pids = [];
+    for (const identity of live) {
+      const current = procIdentity(identity.pid);
+      if (current?.started !== identity.started) continue;
+      try { process.kill(identity.pid, signal); pids.push(identity.pid); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    }
+    return { signal, pids };
+  }
   for (const pgid of groups) {
     assert(pgid > 1 && pgid !== procIdentity(process.pid)?.pgid, "Refuse signalling the proof's own group");
     const members = live.filter(identity => identity.pgid === pgid);
@@ -163,7 +213,12 @@ const joinNative = async () => {
   await bounded(parentExit, "owned native close", 5000);
   const remaining = ownedAlive();
   assert.equal(remaining.length, 0, `Owned native descendants remain: ${JSON.stringify(remaining)}`);
-  nativeExitReceipt = { pgid: nativePgid, signals, identities: [...ownedProcesses.values()], remaining: [] };
+  if (nativeCgroup) {
+    assert.equal(cgroupMembers().length, 0, "Native cgroup is not empty");
+    assert(fs.readFileSync(path.join(nativeCgroup.directory, "cgroup.events"), "utf8").split("\n").includes("populated 0"), "Native cgroup has populated descendants");
+  }
+  nativeExitReceipt = { ownership: nativeCgroup ? "cgroup-v2" : "stat-and-spawn-receipts", cgroup: nativeCgroup?.directory,
+    pgid: nativePgid, signals, identities: [...ownedProcesses.values()], remaining: [] };
   console.error(`OWNED_NATIVE_EXIT: ${JSON.stringify(nativeExitReceipt)}`);
   return nativeExitReceipt;
 };
@@ -245,8 +300,16 @@ try {
   json(path.join(agent, "settings.json"), { enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false }, extensions: [], packages: [] });
   json(path.join(agent, "fabric.json"), { configVersion: 4, fullCodeMode: false, autoReload: false, executor: { kernel: "typescript", timeoutMs: guard, maxTimeoutMs: guard, resultFormat: "json", landlock: { mode: "off" } }, agents: { enabled: true, runner: "pi", transport: "process", timeoutMs: guard, maxDepth: 2, maxConcurrent: 2, extensions: false, retainRuns: true, sessionExport: false, notifyOnComplete: false, deniedModels: [], modelPolicy: { requireReason: [] } }, mesh: { enabled: true, root: path.join(scratch, "mesh"), announce: true, actorScope: "session" }, capture: { enabled: false }, mcp: { enabled: false }, jev: { enabled: false }, prewalk: { enabled: false }, ui: { enabled: false }, compaction: { engine: "pi" }, approvals: { read: "allow", write: "allow", execute: "allow", network: "allow", agent: "allow" } });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|SMARTY_|HERDR_|ORG_|OPENAI_|ANTHROPIC_|GOOGLE_|GEMINI_|OPENROUTER_|TYPESAFE_|AWS_|AZURE_|AI_GATEWAY_|OTEL_|SENTRY_)/.test(key)));
-  Object.assign(env, { TASK_WRITE_SCOPE_PROOF_OWNER: ownershipMarker.slice(ownershipMarker.indexOf("=") + 1), HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
-  child = spawn(process.execPath, [nativePi, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  Object.assign(env, { NODE_OPTIONS: `${env.NODE_OPTIONS ?? ""} --import=${JSON.stringify(pathToFileURL(spawnTracker).href)}`, HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
+  let launcher = nativePi;
+  if (nativeCgroup) {
+    launcher = path.join(scratch, "join-native-cgroup.mjs");
+    fs.writeFileSync(launcher, `import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(path.join(nativeCgroup.directory, "cgroup.procs"))},String(process.pid));
+process.argv[1]=${JSON.stringify(nativePi)};
+await import(${JSON.stringify(pathToFileURL(nativePi).href)});`);
+  }
+  child = spawn(process.execPath, [launcher, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
   nativePgid = child.pid;
   const rootIdentity = procIdentity(child.pid);
   if (rootIdentity) ownedProcesses.set(rootIdentity.pid, rootIdentity);

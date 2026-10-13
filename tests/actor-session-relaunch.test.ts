@@ -21,9 +21,9 @@ beforeAll(async () => {
   deadPid = child.pid!;
   await once(child, "exit");
 });
-// smarty-dev#8090, follow-up smarty-dev#11335: off Linux root actor tree deletion refuses (no Main publication fence); the
-// removal resolves with the named refusal pending and the tree kept. Linux assertions are unchanged.
-const OFF_LINUX_PENDING = new RegExp(`^removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root session:old actor tree is kept \\(a later remove or host start finishes it\\)$`);
+// smarty-dev#8090, follow-up smarty-dev#11335: Linux, Darwin and Windows support the Main publication fence.
+// Only unsupported platforms resolve removal with the named refusal pending and the tree kept.
+const UNSUPPORTED_PLATFORM_PENDING = new RegExp(`^removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root session:old actor tree is kept \\(a later remove or host start finishes it\\)$`);
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
@@ -101,13 +101,13 @@ describe("same-session restart of host-exit-stopped session actors (smarty-dev#9
     const second = start();
     expect(second.status(kept.id)).toMatchObject({ status: "stopped", stopReason: "explicit" });
     expect(() => second.tell(kept.id, "still stopped")).toThrow(/is stopped/);
-    if (process.platform === "linux") {
+    if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
       expect(await second.remove(kept.id)).toMatchObject({ removed: true });
     } else {
       const dir = path.join(actorRoot, kept.id);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n");
-      expect(await second.remove(kept.id)).toMatchObject({ removed: true, cleaned: false, pending: expect.stringMatching(OFF_LINUX_PENDING) });
+      expect(await second.remove(kept.id)).toMatchObject({ removed: true, cleaned: false, pending: expect.stringMatching(UNSUPPORTED_PLATFORM_PENDING) });
       expect(fs.readFileSync(path.join(dir, "kept-11335.txt"), "utf8")).toBe("history\n");
     }
     expect(store.records().map(record => record.id)).not.toContain(kept.id);

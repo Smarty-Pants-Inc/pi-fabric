@@ -222,6 +222,31 @@ function rootParticipantVerdict(config: ResidentHostConfig, mesh: Pick<MeshStore
     : "unknown: Main process identity unavailable (no root participant record; automatic proof for roots whose records are gone: smarty-dev#7956)"));
 }
 
+/** The live operator removal's final check of the root participant (smarty-dev#8090), file and state record: a fresh,
+ * reloading, unreadable or invalid record refuses. No record at all is allowed, as at acceptance. */
+export function assertRootParticipantQuiet(config: ResidentHostConfig, mesh: Pick<MeshStore, "get">): void {
+  const key = "topology/participants/" + createHash("sha256").update(config.rootId).digest("hex");
+  const deny = (reason: string): never => {
+    throw new ResidentActorAuthorizationError(`Root ${config.rootId} participant ${reason}; the actor tree is kept`);
+  };
+  let entries: MeshStateEntry[] = [];
+  try {
+    const file = readParticipantFile(config.meshRoot, key);
+    if (!file && participantFilePresent(config.meshRoot, key)) deny("record is unreadable");
+    const state = mesh.get(key, { fresh: true });
+    entries = [file, state].filter((entry): entry is MeshStateEntry => entry !== undefined);
+  } catch (error) {
+    if (error instanceof ResidentActorAuthorizationError) throw error;
+    deny(`record is unreadable (${error instanceof Error ? error.message : String(error)})`);
+  }
+  for (const entry of entries) {
+    const value = entry.value as { id?: unknown; status?: unknown } | null;
+    if (!value || typeof value !== "object" || value.id !== config.rootId || !Number.isFinite(entry.updatedAt)) deny("record is invalid");
+    if (value!.status === "reloading") deny("is reloading");
+    if (Date.now() - entry.updatedAt <= ROOT_PARTICIPANT_FRESH_MS) deny("is fresh: its Main is live");
+  }
+}
+
 export const MAIN_STOPPED_REQUIRED = "the root's Main may be running; confirm it is stopped and pass --main-stopped (automatic proof: smarty-dev#7956)";
 
 /** `mainStopped` undefined: the action needs no Main-stopped assertion (stop); false/true: it does (remove).

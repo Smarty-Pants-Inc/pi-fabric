@@ -53,6 +53,8 @@ const primaryEntryPoints = [
 const lazyEntryPoints = [
   // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
   "src/storage/verified-remove.ts",
+  // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
+  "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",

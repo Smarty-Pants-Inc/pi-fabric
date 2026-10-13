@@ -147,8 +147,10 @@ describe("terminal paths keep the write receipt (pi-fabric#1034 round 7)", () =>
     expect(result.writeReceipt?.truncated).toBe(true);
   }, 60_000);
 
-  it("an unparsable frame is persisted at once: the running checkpoint already shows truncated", async () => {
-    const { root, manager } = lifecycleManager("garbage");
+  // SECURITY c6153329726 P1 (a): the checkpoint (what crash recovery and the manager read) shows a pending write as
+  // truncated from its start, never as an empty complete receipt.
+  it.each(["garbage", "checkpoint-pending"])("%s: the running checkpoint already shows truncated", async (mode) => {
+    const { root, manager } = lifecycleManager(mode);
     const handle = await manager.spawn({ task: "cut frame then hang", runner: "pi", transport: "process", extensions: false });
     const statusFile = path.join(root, "runs", handle.id, "status.json");
     const until = Date.now() + 20_000;

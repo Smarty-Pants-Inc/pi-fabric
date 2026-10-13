@@ -58,6 +58,10 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     jsm = await jetstreamManager(nc);
   } catch (error) { throw redactNatsError(error); }
   const js = jetstream(nc);
+  // ponytail: nats-auth scoped roles subscribe only to their own _INBOX (roleTemplate), not to
+  // $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>. The leader event is therefore unusable with the configured
+  // credentials. Keep this 10s-bounded info wait until advisory access is explicitly granted (#1067 round 4 exception);
+  // do not widen auth permissions merely to replace the wait with an event.
   const waitForStreamLeader = async (stream: string, requiredReplicas: number, current?: Awaited<ReturnType<typeof jsm.streams.info>>) => {
     if (requiredReplicas === 1) return current;
     const deadline = Date.now() + STREAM_LEADER_TIMEOUT_MS;

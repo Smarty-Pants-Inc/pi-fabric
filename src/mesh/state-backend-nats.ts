@@ -1016,8 +1016,8 @@ export interface OpenNatsStateBackendOptions {
   acceptPeriodicSync?: boolean;
   /** Host-only: the client's TLS files (PEM paths), for a `tls://` server. */
   tls?: NatsTlsFiles;
-  /** The stream's replicas (positive integer; smarty-dev#11373). Omitted: the real client reads the global config's
-   * mesh.nats.replicas (default 1) at first use; an injected `port` decides for itself. */
+  /** The stream's replicas (positive integer; smarty-dev#11373). Omitted: the real client reads only the agent-layer
+   * fabric.json mesh.nats.replicas (default 1) at first use; an injected `port` decides for itself. */
   replicas?: number;
 }
 

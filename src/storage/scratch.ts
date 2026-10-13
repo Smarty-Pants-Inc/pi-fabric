@@ -167,6 +167,9 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       continue;
     }
     try {
+      // smarty-dev#7916: Linux loads the helper at its first eligible removal, BEFORE the final rechecks: the import is
+      // an async window, and nothing may await between the last recheck and the removal. Type-only edge otherwise.
+      const remover = process.platform === "linux" ? (await import("./verified-remove.js")).verifiedRemove : undefined;
       // Recheck identity, contents and liveness, not merely that a directory exists.
       if (!unchanged(candidate.root, ownedStat(candidate.directory))) continue;
       const names = await fs.promises.readdir(candidate.directory);
@@ -174,7 +177,27 @@ export const sweepScratch = async (options: ScratchSweepOptions): Promise<Scratc
       if ([...candidate.files].some(([name, stat]) => !unchanged(stat, ownedStat(path.join(candidate.directory, name))))) continue;
       if (candidate.owner.closedAt === undefined && processAlive(candidate.owner.pid)) continue;
       if (candidate.childPid !== undefined && processAlive(candidate.childPid)) continue;
-      await fs.promises.rm(candidate.directory, { recursive: true, force: true });
+      const directory = candidate.directory;
+      if (!remover) {
+        // pi-fabric#1014 SEC P2-2: off Linux, scratch only, main's (c0b67ef) removal after every recheck above, else
+        // scratch grows without bound there. Residual: a path-name removal, so a same-user swap between the last
+        // recheck and this call is not excluded (smarty-dev#7858 verified removal off Linux, #10678 fencing).
+        try { fs.rmSync(directory, { recursive: true, force: true }); }
+        catch (error) {
+          // A failed removal is counted (in an active report tally) and logged (without one), not silent; the helper
+          // module loads only on this failure.
+          const { countRefusal, reportRemovalSkip } = await import("./verified-remove.js");
+          const reason = `removal failed (main's path on this platform, ${(error as NodeJS.ErrnoException).code ?? "error"})`;
+          countRefusal("sweepScratch", reason, directory);
+          reportRemovalSkip("sweepScratch", reason, directory);
+          continue;
+        }
+      } else {
+        // smarty-dev#7916: only the judged root inode and snapshotted tree of our own entries; no getuid, no removal
+        // (the helper counts it and logs one batch warning). Loaded above at first removal: its tree verification stays
+        // out of registration and idle startup.
+        if (!remover(directory, candidate.root, { deleter: "sweepScratch" }).removed) continue;
+      }
       result.removed.push(candidate.directory);
       if (candidate.cache) { totalBytes -= candidate.bytes; totalItems--; }
     } catch { /* best effort */ }

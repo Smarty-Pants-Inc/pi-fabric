@@ -2,9 +2,11 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { senderHeaderHookPath } from "../src/guards/sender-headers.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
@@ -1690,7 +1692,7 @@ describe("AgentManager", () => {
   },
   30_000);
 
-  it("resumes a run whose worker was stopped mid-run and carries its progress forward", async () => {
+  it.each(["pi", "pi-durable"])("resumes a stopped %s worker and carries its progress forward", async (runner) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -1699,7 +1701,7 @@ describe("AgentManager", () => {
     });
     managers.push(manager);
 
-    const result = await manager.run({ task: "RESUME_AFTER_STOP", transport: "process" });
+    const result = await manager.run({ task: "RESUME_AFTER_STOP", runner, transport: "process" });
 
     expect(result.status).toBe("completed");
     expect(result.text).toBe("resumed attempt 2");
@@ -1709,8 +1711,10 @@ describe("AgentManager", () => {
     expect(result.toolCalls).toBe(4);
     expect(result.usage.input).toBe(110);
     expect(result.usage.cost).toBeCloseTo(0.011, 6);
-    // The resumed child is told what it is continuing, not handed a bare task.
-    expect(result.task).toContain("[Fabric continuation]");
+    // Native retries need a continuation note; durable retries retain the
+    // prompt identity of the journal they reopen.
+    if (runner === "pi-durable") expect(result.task).toBe("RESUME_AFTER_STOP");
+    else expect(result.task).toContain("[Fabric continuation]");
     const runDirectory = manager.runDirectory(result.id)!;
     expect(fs.readFileSync(path.join(runDirectory, "resume-attempts"), "utf8")).toBe("2");
   },
@@ -2317,7 +2321,7 @@ describe("AgentManager", () => {
     process.env.PI_FABRIC_TOOL_ALLOWLIST = allowlist;
     let manager: AgentManager;
     try {
-      manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: path.resolve("tests/fixtures/fake-pi-launch-probe.mjs"),
         runRoot: path.join(root, "runs"), fullCodeMode: true,
@@ -2350,7 +2354,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-launch-probe.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2383,11 +2387,13 @@ describe("AgentManager", () => {
     });
     expect(native.status).toBe("completed");
     // --no-extensions disables Fabric/discovery, not explicitly installed host helpers.
-    // Principal delivery and native session observation remain installed host helpers;
-    // neither widens the child's tools nor enables Fabric/discovery.
+    // Principal delivery, native session observation and the sender-header hook (smarty-dev#6207,
+    // every Pi-backed child) remain installed host helpers; none widens the child's tools nor
+    // enables Fabric/discovery. The hook path comes from the worker's own resolver.
     expect(JSON.parse(native.text).extensionPaths).toEqual([
       path.resolve("src/worker/principal-delivery.ts"),
       path.resolve("src/worker/session-id.ts"),
+      senderHeaderHookPath(pathToFileURL(path.resolve("src/worker.ts")).href),
     ]);
     expect(JSON.parse(native.text)).toMatchObject({
       extensions: false,
@@ -2403,7 +2409,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2441,7 +2447,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2523,7 +2529,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2548,7 +2554,7 @@ describe("AgentManager", () => {
     roots.push(root);
     const fakePi = path.resolve("tests/fixtures/fake-pi-rpc.mjs");
     fs.chmodSync(fakePi, 0o755);
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
       runRoot: root,
@@ -2873,7 +2879,7 @@ describe("AgentManager", () => {
     fs.chmodSync(fakePi, 0o755);
     // The fake pi emits one assistant turn with 7 tokens (input 3 + output 4);
     // a 5-token ceiling trips the guard after the first message_end.
-    const config = { ...DEFAULT_FABRIC_CONFIG.agents, maxTokensPerChild: 5 };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, maxTokensPerChild: 5 };
     const manager = new AgentManager(process.cwd(), config, {
       workerPath: path.resolve("src/worker.ts"),
       piBinary: fakePi,
@@ -2904,7 +2910,7 @@ describe("AgentManager multimodal prompts", () => {
     process.env.FAKE_PI_BEHAVIOR = "capture-prompt";
     process.env.FAKE_PI_PROMPT_LOG = promptLog;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: path.resolve("tests/fixtures/fake-pi.mjs"),
         runRoot: path.join(root, "runs"),
@@ -3205,7 +3211,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3246,7 +3252,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3277,7 +3283,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,
@@ -3377,7 +3383,7 @@ describe("AgentManager steering", () => {
     const received = path.join(root, "received.jsonl");
     process.env.FAKE_PI_STEER_LOG = received;
     try {
-      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
         workerPath: path.resolve("src/worker.ts"),
         piBinary: fakePiSteer,
         runRoot: root,

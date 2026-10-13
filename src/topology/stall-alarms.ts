@@ -1,9 +1,10 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { SessionReceiptManager } from "../core/session-receipts.js";
-import { confirmedMainInboxIds } from "./root-inbox.js";
+import { confirmedMainInboxIds } from "./root-inbox-shared.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
@@ -30,7 +31,7 @@ const names = (directory: string): string[] => {
 };
 interface InboxOwner {
   rootId: string; sessionId: string; sessionFile?: string | undefined;
-  ownerIdentityId: string; pid: number; processStartedAt?: string | undefined; retired?: true; activationId?: string;
+  ownerIdentityId: string; pid: number; host?: string; name?: string; processStartedAt?: string | undefined; retired?: true; activationId?: string;
 }
 interface InboxRoute { oldRoot: string; newRoot?: string; messageId: string; item?: HeldAgentMessage; done?: true }
 interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
@@ -41,14 +42,21 @@ interface Successor { oldRoot: string; newRoot?: string; activationId?: string }
 export const registerMainInbox = (meshRoot: string, identity: MeshIdentity, sessionId: string, sessionFile?: string): string => {
   const activationId = randomUUID();
   writeJsonAtomic(ownerFile(meshRoot, sessionId), { rootId: identity.id, sessionId, sessionFile, activationId,
-    ownerIdentityId: identity.id, pid: process.pid, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
+    ownerIdentityId: identity.id, pid: process.pid, host: os.hostname(), name: identity.name, processStartedAt: processStartTime(process.pid) } satisfies InboxOwner, { durable: true });
   writeJsonAtomic(successorFile(meshRoot, identity.id), { oldRoot: identity.id, activationId } satisfies Successor, { durable: true });
   return activationId;
 };
+/** smarty-dev#8881 F-01: optional activation liveness, checked inside the custody critical section
+ * before any write. Custody acquisition awaits; a session disposed in that wait must commit nothing. */
+const fenceActivation = (live?: () => boolean): void => {
+  if (live && !live()) throw new Error("Pi Fabric mesh activation lifecycle retired");
+};
 /** Called only after the old Main/control drainer has closed on an actual native session change. */
-export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string): Promise<void> => {
+export const recordMainSuccessor = async (mesh: MeshStore, oldRoot: string, oldSessionId: string, newRoot: string,
+  live?: () => boolean): Promise<void> => {
   if (oldRoot === newRoot) return;
   await mesh.custody(() => {
+    fenceActivation(live);
     const owner = read<InboxOwner>(ownerFile(mesh.root, oldSessionId));
     if (!owner || owner.rootId !== oldRoot || owner.pid !== process.pid) throw new Error("Cannot rotate an unowned Main inbox");
     const prior = read<Successor>(successorFile(mesh.root, oldRoot));
@@ -72,9 +80,11 @@ export const stageMainSuccessor = async (mesh: MeshStore, oldRoot: string, sessi
     writeJsonAtomic(file, { ...owner, retired: true }, { durable: true });
   });
 };
-export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string): Promise<boolean> => {
+export const confirmMainSuccessor = async (mesh: MeshStore, newRoot: string, sessionFile?: string,
+  live?: () => boolean): Promise<boolean> => {
   if (!sessionFile) return false;
   return mesh.custody(() => {
+    fenceActivation(live);
     const intentFile = path.join(mailbox(mesh.root), "rotations", `${hash(path.resolve(sessionFile))}.json`);
     const intent = read<{ oldRoot: string; sessionId: string; activationId?: string; targetSessionFile: string }>(intentFile);
     if (!intent) return false;
@@ -140,6 +150,85 @@ export const rootPresenceAlarms = async (mesh: MeshStore, identity: MeshIdentity
       data: { rootId, firstAbsentAt: since, byKind, byStatus } });
   }
 };
+
+/** Held messages one alarm lists by id; its heldCount still counts them all. */
+const PROVIDER_DEAD_LISTED_MESSAGES = 50;
+/** Alarms per mesh publishBatch call; the loop publishes batches until every address is covered. */
+const PROVIDER_DEAD_ALARM_BATCH = 50;
+
+/**
+ * smarty-dev#8742: a Main whose provider rejects every request as non-retryable reaches ops at
+ * once, on the inbox-age alarm's path: ops.owner, addressed to the Main's owner and to the sender
+ * of every held message (Main holds up to 200), one inbox.age.alarm per address however many of
+ * its messages are held. PR #841 review: no held message's sender is left for the age pass.
+ * An address's alarm reuses the age pass's dedupe key for its first held message, so it crosses
+ * the existing mesh bridge to remote senders and the age pass never repeats it; the age pass
+ * still reports that address's other messages if they stay unread past mesh.undeliveredAlarmMs.
+ */
+/**
+ * pi-fabric#939 P2-b: the one recipient of the agent-admission alarm. An owner alarm is never published without one,
+ * and never to a name ("org", "org-kate"): only an exact `session:<uuid>` address. The configured owner identity
+ * first, else this Main's own session id (the manager's owner); undefined means log locally and skip the publish.
+ */
+const SESSION_ADDRESS = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const admissionAlarmRecipient = (ownerIdentityId: string | undefined, identity: MeshIdentity | undefined): string | undefined =>
+  [ownerIdentityId?.trim(), identity?.kind === "main" ? identity.id : undefined]
+    .find((candidate): candidate is string => typeof candidate === "string" && SESSION_ADDRESS.test(candidate));
+
+export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {
+  const owners = [...new Set([identity.id, ...(ownerIdentityId ? [ownerIdentityId] : [])])];
+  const fields = providerDeadAlarmFields(event);
+  const reason = fields.kind === "unclassified" ? "provider-dead (unclassified)" : `provider-dead (non-retryable: ${fields.error})`;
+  for (const to of owners) await mesh.publish({
+    topic: "ops.owner", kind: "fabric.main.provider-dead", from: identity, to,
+    dedupeKey: `provider-dead:${rootId}:${event.since}:${to}`,
+    text: `Main ${rootId} ${reason}: ${fields.cause}; ${event.held.length} held message(s) unread`,
+    data: { rootId, ...fields, held: event.held.slice(0, PROVIDER_DEAD_LISTED_MESSAGES), heldCount: event.held.length } });
+  // Deduplicated per address: each sender once, listing its own held messages; owners list all.
+  const byAddress = new Map<string, Array<ProviderDeadAlarmEvent["held"][number]>>();
+  for (const item of event.held) {
+    for (const to of new Set([item.from, ...owners])) {
+      const items = byAddress.get(to);
+      if (items) items.push(item); else byAddress.set(to, [item]);
+    }
+  }
+  const alarms = [...byAddress].map(([to, items]) => {
+    const first = items[0]!;
+    return { topic: "ops.owner", kind: "inbox.age.alarm", from: identity, to, dedupeKey: `inbox-age:${first.id}:${to}`,
+      text: items.length === 1 ? `Undelivered Main message ${first.id} to ${rootId}: ${reason}`
+        : `${items.length} undelivered Main messages to ${rootId}, first ${first.id}: ${reason}`,
+      data: { messageId: first.id, rootId, sentAt: first.sentAt, reason: "provider-dead", error: fields.error,
+        messageIds: items.slice(0, PROVIDER_DEAD_LISTED_MESSAGES).map(item => item.id), heldCount: items.length } };
+  });
+  // A batch may commit only a prefix: continue from the first uncommitted alarm.
+  for (let next = 0; next < alarms.length;) {
+    const committed = await mesh.publishBatch(alarms.slice(next, next + PROVIDER_DEAD_ALARM_BATCH));
+    if (!committed.length) throw new Error("Provider-dead alarm batch committed nothing");
+    next += committed.length;
+  }
+};
+
+/** What a provider-dead alarm may carry: the shape of FabricMainProviderDeadEvent, nothing else. */
+export interface ProviderDeadAlarmEvent {
+  kind?: "non-retryable" | "unclassified";
+  error: string; status?: number; type?: string; code?: string; failures?: number;
+  since: string; cause: string;
+  held: ReadonlyArray<{ id: string; from: string; sentAt: number }>;
+}
+
+/**
+ * smarty-dev#8742 security review: alarm data is an explicit allowlist (status, known type, fixed
+ * code, Fabric's own cause), so a field an event happens to carry can never ride along to ops.owner,
+ * held messages' senders or the mesh bridge. Provider message text is never one of them.
+ */
+export const providerDeadAlarmFields = (event: Omit<ProviderDeadAlarmEvent, "held">) => ({
+  kind: event.kind ?? "non-retryable", error: event.error, since: event.since, cause: event.cause,
+  ...(event.status === undefined ? {} : { status: event.status }),
+  ...(event.type === undefined ? {} : { type: event.type }),
+  ...(event.code === undefined ? {} : { code: event.code }),
+  ...(event.failures === undefined ? {} : { failures: event.failures }),
+});
 
 export class MainInboxMaintenance {
   readonly #receipts = new Map<string, SessionReceiptManager>();

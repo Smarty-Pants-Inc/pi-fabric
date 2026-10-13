@@ -6,8 +6,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 
-// smarty-dev#6477 E1: the fsyncs of no-archive publish and recovery run after `.lock` is
-// released, and a publish still resolves only once its bytes are durable. Compaction stays under
+// smarty-dev#6477 E1: the live-log fsync of no-archive publish/recovery runs after `.lock`
+// is released. Receipt installation reacquires it for an intent-identity CAS (PR #755 round 3).
+// A publish still resolves only once its bytes are durable. Compaction stays under
 // the lock as on main (off-lock compaction: smarty-dev#7002). Adapted from pi-fabric#550's
 // tests/mesh-fsync-holds.test.ts.
 
@@ -84,7 +85,7 @@ const strandIntent = async (mesh: MeshStore, dedupeKey: string) => {
 
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
-describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
+describe("off-lock live barriers and locked receipt CAS (smarty-dev#6477 E1)", () => {
   it("publish: a durable unkeyed append fsyncs the live log only after release, before it resolves", async () => {
     const mesh = store();
     const image = durableImage(mesh.root);
@@ -94,6 +95,8 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(watcher.syncs.some(sync => sync.live)).toBe(true);
     expect(watcher.held()).toEqual([]);
     expect(image.get().toString("utf8")).toContain(`"id":"${event.id}"`);
+    expect(event.dedupeKey).toBeUndefined();
+    expect(fs.existsSync(path.join(mesh.root, "event-receipts"))).toBe(false);
   });
 
   it("publish: concurrent durable appends share one group barrier; a later append gets a fresh one", async () => {
@@ -123,13 +126,14 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(mesh.read().map(event => event.sequence)).toEqual([1, 2, 3, 4]);
   });
 
-  it("publish: a fresh no-archive keyed append keeps only its intent fence under the lock", async () => {
+  it("publish: a fresh no-archive keyed append keeps the live barrier off-lock and finalizes its receipt under CAS", async () => {
     const mesh = store();
     const watcher = watchBarriers(mesh.root);
     const packet = { topic: "mesh.fsync", from, dedupeKey: "fresh", text: "once" };
     const event = await mesh.publish(packet);
-    // The intent's durability precedes the live append (crash fence, held); nothing after it is held.
-    expect(watcher.syncs.filter(sync => sync.held && sync.afterAppend)).toEqual([]);
+    // The intent fence precedes append; the later receipt CAS holds the lock, not the live fsync.
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.syncs.some(sync => sync.held && sync.afterAppend)).toBe(true);
     expect(watcher.syncs.some(sync => sync.live && !sync.held)).toBe(true);
     expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey, ".pending.json"))).toBe(false);
     expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(event);
@@ -140,7 +144,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(mesh.read()).toEqual([event]);
   });
 
-  it("recovery: a same-key retry settles a committed live append with every barrier after release", async () => {
+  it("recovery: a same-key retry uses the off-lock live barrier and a locked receipt CAS", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "failed-live", text: "once" };
     const sync = fs.fsyncSync.bind(fs);
@@ -156,7 +160,8 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const committed = mesh.read()[0]!;
     const watcher = watchBarriers(mesh.root);
     expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
-    expect(watcher.held()).toEqual([]);
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.held().length).toBeGreaterThan(0);
     expect(watcher.syncs.some(sync => sync.live)).toBe(true);
     expect(JSON.parse(fs.readFileSync(receipt(mesh.root, packet.dedupeKey), "utf8"))).toEqual(committed);
     expect(fs.existsSync(receipt(mesh.root, packet.dedupeKey, ".pending.json"))).toBe(false);
@@ -216,7 +221,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(rebooted.read()).toEqual([returned, after]);
   });
 
-  it.skipIf(process.platform !== "linux")("no publish or recovery path fsyncs or syncs a directory while .lock exists, except a fresh intent's fence before its append", async () => {
+  it.skipIf(process.platform !== "linux")("publish/recovery holds barriers only for fresh intent fences or receipt identity CAS, never the live log", async () => {
     const mesh = store();
     const root = mesh.root;
     const lockOwner = path.join(root, ".lock", "owner");
@@ -225,7 +230,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     // (its file and namespace chain, from #preparePublish), in a hold before its live append.
     let hold = "", appendedInHold = false;
     const enter = () => { const now = holdOf(); if (now !== hold) { hold = now; appendedInHold = false; } };
-    const held: Array<{ path: string; fence: boolean; via: string }> = [];
+    const held: Array<{ path: string; fence: boolean; cas: boolean; via: string }> = [];
     const record = (fd: number) => {
       if (!fs.existsSync(path.join(root, ".lock"))) return;
       enter();
@@ -242,7 +247,8 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
       const writer = frames.findIndex(line => line.startsWith("at writeFileAtomic "));
       const fence = !appendedInHold && writer >= 0 && /^at (?:\S*src\/mesh\/event-log\.ts:\d+:\d+|append \(\S*src\/mesh\/event-log\.ts:\d+:\d+\))$/.test(frames[writer + 1] ?? "") &&
         !/settleDedupeIntent|removeDedupeIntent|finishLiveReceipt/.test(stack);
-      held.push({ path: fdPath(fd), fence, via });
+      const cas = !appendedInHold && /finalizeReceipt|cleanupReceiptIntent/.test(stack);
+      held.push({ path: fdPath(fd), fence, cas, via });
     };
     const append = fs.appendFileSync.bind(fs);
     vi.spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
@@ -284,12 +290,14 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const last = await mesh.publish({ topic: "mesh.fsync", from, durable: true, text: "after torn" });
     expect(mesh.read({ limit: 100 }).at(-1)).toEqual(last);
     expect(await mesh.publish({ topic: "mesh.fsync", from, dedupeKey: "retried", text: "retried" })).toEqual(retried);
-    // Every barrier held by `.lock` is a fresh intent's fence (fresh, stranded's original, retried); nothing else.
-    expect(held.filter(sync => !sync.fence)).toEqual([]);
+    // Only intent fences and receipt CAS hold barriers; the live barrier always follows release.
+    expect(held.filter(sync => !sync.fence && !sync.cas)).toEqual([]);
+    expect(held.filter(sync => sync.path === events(root))).toEqual([]);
     expect(held.some(sync => sync.fence)).toBe(true);
+    expect(held.some(sync => sync.cas)).toBe(true);
   });
 
-  it.skipIf(process.platform !== "linux")("power cut: a keyed publish cut before its off-lock receipt is durable recovers exactly once from the durable image and its intent", async () => {
+  it.skipIf(process.platform !== "linux")("power cut: a keyed publish cut during its locked receipt CAS recovers exactly once from the durable image and intent", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "power-cut", text: "once" };
     await mesh.publish({ topic: "mesh.fsync", from, text: "before", durable: true });
@@ -301,9 +309,9 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
       const file = fdPath(fd);
       if (held()) heldSyncs.push(file);
-      // Power fails as the off-lock receipt stage is about to become durable: the live barrier
+      // Power fails as the locked receipt CAS stage is about to become durable: the live barrier
       // has run, the receipt has not, the intent is still there.
-      if (!cut && !held() && /\/event-receipts\/[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(file)) {
+      if (!cut && held() && /\/event-receipts\/[a-f0-9]{64}\.json\.\d+\..+\.tmp$/.test(file)) {
         cut = true;
         throw new Error("power cut");
       }
@@ -313,8 +321,9 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     await expect(mesh.publish(packet)).rejects.toThrow("power cut");
     vi.restoreAllMocks();
     expect(cut).toBe(true);
-    // Under the lock only the intent fence: neither the live log nor the receipt was fsynced there.
-    expect(heldSyncs.filter(file => file.endsWith("/events.jsonl") || /[a-f0-9]{64}\.json\./.test(file))).toEqual([]);
+    // The live barrier already ran off-lock; receipt CAS runs under the lock and may fail safely.
+    expect(heldSyncs.filter(file => file.endsWith("/events.jsonl"))).toEqual([]);
+    expect(heldSyncs.some(file => /[a-f0-9]{64}\.json\./.test(file))).toBe(true);
     const committed = mesh.read().find(event => event.dedupeKey === packet.dedupeKey)!;
     // Only the fsynced image survives, plus a torn prefix; the unsynced receipt stage is gone.
     expect(image.get().toString("utf8")).toContain(`"id":"${committed.id}"`);
@@ -331,7 +340,7 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     expect(rebooted.read().filter(event => event.dedupeKey === packet.dedupeKey)).toEqual([committed]);
   });
 
-  it("recovery: a receipt the original publisher installs after the first lookup is confirmed and its intent unlinked after release", async () => {
+  it("recovery: a late receipt is confirmed off-lock and its intent is cleaned up under an identity CAS", async () => {
     const mesh = store();
     const packet = { topic: "mesh.fsync", from, dedupeKey: "late-receipt", text: "once" };
     const sync = fs.fsyncSync.bind(fs);
@@ -362,12 +371,195 @@ describe("no fsync under .lock (smarty-dev#6477 E1)", () => {
     const watcher = watchBarriers(mesh.root, fd => { if (sameFile(fd, receiptPath) && !held()) receiptSynced = true; });
     expect(await new MeshStore(mesh.root, 1024, 100).publish(packet)).toEqual(committed);
     expect(installed).toBe(true);
-    // No fsync (receipt, live log or namespace directory) while `.lock` is held ...
-    expect(watcher.held()).toEqual([]);
-    // ... yet the receipt is confirmed and the intent removed before the retry resolves.
+    // The first receipt confirmation stays off-lock; cleanup rechecks and confirms the
+    // still-matching receipt under CAS before unlinking the intent (portable file barrier).
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(watcher.held().length).toBeGreaterThan(0);
+    // The receipt is confirmed and the original intent removed before retry resolves.
     expect(receiptSynced).toBe(true);
     expect(fs.existsSync(intentPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each([false, true])("recovery: receipt cleanup has a file barrier without directory fsync (batch=%s)", async batch => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `portable-cleanup-${batch}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    // Exercise Windows' actual barrier branch on every CI host, not a directory-fsync
+    // assertion that passes on Linux but cannot observe any barrier on native Windows.
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    let offLockReceiptSynced = false, lockedReceiptSynced = false, directorySynced = false;
+    const watcher = watchBarriers(mesh.root, fd => {
+      if (fs.fstatSync(fd).isDirectory()) directorySynced = true;
+      if (sameFile(fd, receiptPath)) {
+        if (held()) lockedReceiptSynced = true;
+        else offLockReceiptSynced = true;
+      }
+    });
+    const result = batch ? (await mesh.publishBatch([packet]))[0] : await mesh.publish(packet);
+    expect(result).toEqual(committed);
+    expect(offLockReceiptSynced).toBe(true);
+    expect(lockedReceiptSynced).toBe(true);
+    expect(directorySynced).toBe(false);
+    expect(watcher.syncs.filter(sync => sync.held && sync.live)).toEqual([]);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+    platform.mockRestore();
+  });
+
+  it("recovery: a failed cleanup receipt barrier preserves the intent and retry never re-appends", async () => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, "cleanup-barrier-failure");
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const sync = fs.fsyncSync.bind(fs);
+    const fail = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"))) {
+        throw new Error("cleanup receipt barrier failed");
+      }
+      sync(fd);
+    });
+    await expect(mesh.publish(packet)).rejects.toThrow("cleanup receipt barrier failed");
+    fail.mockRestore();
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(fs.existsSync(intentPath)).toBe(false);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each(["replacement", "same-size rewrite", "size change"] as const)("recovery: %s between receipt check and fsync preserves the intent without syncing foreign bytes", async change => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `checked-receipt-${change}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreign = { ...committed, id: `${committed.id.slice(0, -1)}${committed.id.endsWith("a") ? "b" : "a"}`,
+      ...(change === "size change" ? { text: "different-sized foreign receipt" } : {}) };
+    const foreignText = JSON.stringify(foreign);
+    const held = () => fs.existsSync(path.join(mesh.root, ".lock"));
+    const read = fs.readFileSync.bind(fs) as (...args: unknown[]) => string | Buffer;
+    let cleanupStarted = false, changed = false, lockedOpens = 0, foreignSyncs = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      const text = read(...args);
+      if (args[0] === intentPath && held()) cleanupStarted = true;
+      const checkedReceipt = args[0] === receiptPath ||
+        (typeof args[0] === "number" && sameFile(args[0], receiptPath));
+      // Inject after the checked content was read, but before its cleanup file barrier.
+      // Support both pathname and descriptor readers so this also reproduces the old race.
+      if (!changed && cleanupStarted && held() && checkedReceipt) {
+        if (change === "replacement") fs.renameSync(receiptPath, `${receiptPath}.checked`);
+        fs.writeFileSync(receiptPath, foreignText);
+        changed = true;
+      }
+      return text;
+    }) as typeof fs.readFileSync);
+    const open = fs.openSync.bind(fs);
+    vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+      if (file === receiptPath && cleanupStarted && held()) lockedOpens++;
+      return open(file, flags, mode);
+    });
+    watchBarriers(mesh.root, fd => { if (changed && sameFile(fd, receiptPath)) foreignSyncs++; });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(lockedOpens).toBe(1);
+    expect(foreignSyncs).toBe(0);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(fs.readFileSync(receiptPath, "utf8")).toBe(foreignText);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it("recovery: replacing the receipt at fsync still syncs only the pinned inode and keeps the intent", async () => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, "receipt-swap-at-fsync");
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreignText = JSON.stringify({ ...committed, id: "foreign-at-fsync" });
+    const sync = fs.fsyncSync.bind(fs);
+    let changed = false, syncedPinned = false, foreignSyncs = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (!changed && sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"))) {
+        fs.renameSync(receiptPath, `${receiptPath}.checked`);
+        fs.writeFileSync(receiptPath, foreignText);
+        changed = true;
+        syncedPinned = sameFile(fd, `${receiptPath}.checked`);
+      }
+      if (changed && sameFile(fd, receiptPath)) foreignSyncs++;
+      sync(fd);
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(syncedPinned).toBe(true);
+    expect(foreignSyncs).toBe(0);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    expect(fs.readFileSync(receiptPath, "utf8")).toBe(foreignText);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each([false, true])("recovery: an intent replaced between check and unlink is not removed (identical bytes=%s)", async identical => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `intent-swap-before-unlink-${identical}`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const originalIdentity = fs.lstatSync(intentPath);
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const foreignText = identical ? intentBefore : JSON.stringify({ ...JSON.parse(intentBefore), eventId: "foreign-intent" });
+    const close = fs.closeSync.bind(fs);
+    const remove = fs.rmSync.bind(fs);
+    let changed = false, removedReplacement = false;
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+      const checkedReceipt = sameFile(fd, receiptPath) && fs.existsSync(path.join(mesh.root, ".lock"));
+      close(fd);
+      // The checked file barrier has completed; cleanup is about to unlink its intent.
+      if (!changed && checkedReceipt) {
+        fs.renameSync(intentPath, `${intentPath}.checked`);
+        fs.writeFileSync(intentPath, foreignText);
+        changed = true;
+      }
+    });
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (file === intentPath && changed) removedReplacement = true;
+      remove(file, options);
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(removedReplacement).toBe(false);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(foreignText);
+    const retained = fs.lstatSync(intentPath);
+    expect([retained.dev, retained.ino]).not.toEqual([originalIdentity.dev, originalIdentity.ino]);
+    expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(committed);
+    expect(mesh.read()).toEqual([committed]);
+  });
+
+  it.each(["missing", "replaced"] as const)("recovery: cleanup retains its intent if the confirmed receipt is %s before CAS", async change => {
+    const mesh = store();
+    const { packet, intentPath, committed } = await strandIntent(mesh, `receipt-${change}-before-cas`);
+    const receiptPath = receipt(mesh.root, packet.dedupeKey);
+    fs.writeFileSync(receiptPath, JSON.stringify(committed));
+    const intentBefore = fs.readFileSync(intentPath, "utf8");
+    const replacement = { ...committed, id: "replacement-receipt", sequence: committed.sequence + 1 };
+    const close = fs.closeSync.bind(fs);
+    let changed = false;
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+      const confirmedReceipt = sameFile(fd, receiptPath) && !fs.existsSync(path.join(mesh.root, ".lock"));
+      close(fd);
+      if (!changed && confirmedReceipt) {
+        changed = true;
+        if (change === "missing") fs.rmSync(receiptPath);
+        else fs.writeFileSync(receiptPath, JSON.stringify(replacement));
+      }
+    });
+    expect(await mesh.publish(packet)).toEqual(committed);
+    expect(changed).toBe(true);
+    expect(fs.readFileSync(intentPath, "utf8")).toBe(intentBefore);
+    if (change === "missing") expect(fs.existsSync(receiptPath)).toBe(false);
+    else expect(JSON.parse(fs.readFileSync(receiptPath, "utf8"))).toEqual(replacement);
     expect(mesh.read()).toEqual([committed]);
   });
 });

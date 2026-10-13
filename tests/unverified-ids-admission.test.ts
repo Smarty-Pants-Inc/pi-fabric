@@ -165,7 +165,7 @@ describe("round-1 admission invariance", () => {
       sender.start(() => ({ accepted: false }));
       owner.start((command, from, signal) => router.acceptControl(command, from, signal));
       const participant = { id: after.main.id, kind: "root", local: false, capabilities: ["followUp"],
-        ownerHostId: "owner-host", ownerIdentityId: ownerIdentity.id, controlProtocol: "v1" };
+        ownerHostId: "owner-host", ownerIdentityId: ownerIdentity.id, ownerIncarnation: owner.incarnation, controlProtocol: "v1" };
       const provider = new AgentsProvider({} as Ports[0], { identity } as Ports[1], {} as Ports[2],
         { matches: () => false } as unknown as Ports[3], { get: () => participant } as unknown as Ports[4], sender, {} as Ports[6]);
       expect(await provider.invoke("followUp", { id: after.main.id, message: text }, invocation(session())))
@@ -207,7 +207,9 @@ describe("round-1 native root inbox read provenance", () => {
       const manager = session();
       const own: MeshIdentity = { ...identity, id: `session:${manager.getSessionId()}` };
       const store = new MeshStore(root, 64 * 1024, 100);
-      const provider = new MeshProvider(store, own, {} as ConstructorParameters<typeof MeshProvider>[2]);
+      // An immediate addressed publish needs a known target (smarty-dev#5518); the self-publish targets own.id.
+      const participants = { get: (id: string) => id === own.id ? { id } : undefined, list: () => [] };
+      const provider = new MeshProvider(store, own, participants as unknown as ConstructorParameters<typeof MeshProvider>[2]);
       const inbox = new RootInbox(store, own, () => [own.id], { steerGraceMs: 0 });
       inbox.start();
       expect(await provider.invoke("publish", { topic: "fleet.report", to: own.id, text }, invocation(manager)))

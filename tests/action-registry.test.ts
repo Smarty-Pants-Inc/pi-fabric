@@ -12,6 +12,7 @@ import type {
   FabricInvocationContext,
   FabricProvider,
 } from "../src/protocol.js";
+import { residentProcessWorkPending } from "../src/residency/process-work.js";
 import { setActiveRepairCompiler } from "../src/repairs/active.js";
 import { RepairCompiler } from "../src/repairs/compiler.js";
 import { setActiveCompiledSurface } from "../src/entropy/active.js";
@@ -105,6 +106,32 @@ const attachCompiler = (): RepairCompiler => {
 };
 
 describe("ActionRegistry", () => {
+  it("invokes without ambient session access unless native mesh composition opts in", async () => {
+    const registry = new ActionRegistry();
+    registry.register(provider());
+    const extensionContext = { sessionManager: new Proxy({}, { get() { throw new Error("Ambient session access"); } }) } as unknown as ExtensionContext;
+    await expect(registry.invoke("demo.echo", { value: "hosted" }, { ...invokeContext(), extensionContext })).resolves.toBe("hosted");
+  });
+
+  it.each([false, true])("retains explicit native process custody until provider settlement (reject=%s)", async reject => {
+    const registry = new ActionRegistry();
+    const sessionId = `registry-custody-${reject}`;
+    registry.setResidentProcessWorkSession(sessionId);
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => { settle = resolve; });
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    registry.register({ ...provider(), async invoke() { entered(); await settled; if (reject) throw new Error("provider failed"); return "done"; } });
+    const invocation = registry.invoke("demo.echo", { value: "native" }, invokeContext()).then(value => ({ value }), error => ({ error }));
+    try {
+      await started;
+      expect(residentProcessWorkPending(sessionId)).toBe(true);
+    } finally { settle(); }
+    const result = await invocation;
+    if (reject) expect(result).toMatchObject({ error: { message: "provider failed" } });
+    else expect(result).toEqual({ value: "done" });
+    expect(residentProcessWorkPending(sessionId)).toBe(false);
+  });
   it("lists, searches, describes, and invokes providers", async () => {
     const registry = new ActionRegistry();
     registry.register(provider());

@@ -59,6 +59,48 @@ const freezeRegistryValue = <T>(value: T): T => {
   return value;
 };
 
+// Stores naming the same normalized path share one immutable decoded generation.
+// Read identity is taken from the open descriptor, so an atomic rename between
+// lookup and decoding cannot cache new bytes under the old inode (or vice versa).
+// Timestamps alone cannot prove identity: Windows fstat may report zero file IDs.
+// Such descriptors always miss rather than aliasing unrelated file generations.
+// Keep at most 64 normalized paths, least recently read first. Managers also
+// release their path on close; ad-hoc store readers remain bounded by this LRU.
+const REGISTRY_READ_CACHE_LIMIT = 64;
+const REGISTRY_READ_RACY_WINDOW_MS = 2_000;
+const registryReadCache = new Map<string, { generation: string; readTimeMs: number; value: unknown }>();
+// The racy-file age proof compares filesystem mtime with the client's clock.
+// Linux local filesystems share that clock; remote/unknown filesystems do not.
+// Probe the opened file: a remote file bind mount can sit under a local directory.
+// Node has no fstatfs; /proc/self/fd resolves the descriptor's backing filesystem.
+// Overlayfs is not proof that its backing layers share the host clock.
+// Key verdicts by descriptor dev/ino so remounts and replacements are rechecked.
+// Keep verdicts bounded too, and drop a path's retained identities on release.
+const REGISTRY_LOCAL_FILESYSTEM_TYPES = new Set([
+  0xEF53, // ext2/3/4
+  0x58465342, // XFS
+  0x9123683E, // btrfs
+  0x01021994, // tmpfs
+  0xF2F52010, // f2fs
+  0x2FC12FC1, // ZFS
+]);
+const registryLocalClockCache = new Map<string, { filePath: string; local: boolean }>();
+const registryHasLocalClock = (filePath: string, fd: number, stat: fs.BigIntStats): boolean => {
+  // Other platforms' statfs type values are not comparable to Linux magic values.
+  if (process.platform !== "linux" || stat.ino <= 0n) return false;
+  const identity = `${stat.dev}:${stat.ino}`;
+  const known = registryLocalClockCache.get(identity);
+  if (known !== undefined) return known.local;
+  let local = false;
+  try { local = REGISTRY_LOCAL_FILESYSTEM_TYPES.has(fs.statfsSync(`/proc/self/fd/${fd}`).type); }
+  catch { /* An unavailable filesystem identity cannot prove a host-local clock. */ }
+  registryLocalClockCache.set(identity, { filePath, local });
+  if (registryLocalClockCache.size > REGISTRY_READ_CACHE_LIMIT) {
+    registryLocalClockCache.delete(registryLocalClockCache.keys().next().value!);
+  }
+  return local;
+};
+
 const hasRemovalDecision = (actors: readonly unknown[]): boolean => actors.some((actor) =>
   typeof actor === "object" && actor !== null && "removal" in actor && actor.removal !== undefined,
 );
@@ -95,7 +137,7 @@ export class ActorRegistryStore {
     // reread it while holding the earlier fence. No work at module import.
     this.#ownProcessStart = processStartTime(process.pid);
     this.#actorRoot = actorRoot;
-    this.#registryPath = path.join(actorRoot, "actors.json");
+    this.#registryPath = path.resolve(actorRoot, "actors.json");
     this.#writer = new AtomicFileWriter(this.#registryPath);
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
@@ -127,8 +169,19 @@ export class ActorRegistryStore {
     const prior = new Map(snapshot.actors.map(row => [row.id, row]));
     const smallState = (row: Record<string, unknown>): string =>
       JSON.stringify(Object.keys(row).sort().map(key => [key, row[key]]));
-    const reusable = actors.map(row => {
-      const before = prior.get(String(row.id));
+    const reusable = actors.map(input => {
+      const before = prior.get(String(input.id));
+      // smarty-dev#6829: a loaded actor whose ring is exactly the one this process committed at
+      // the current head selects that head instead of re-reading and re-encoding its history
+      // (the dominant registry lock hold). Any append, reset or in-place change misses the digest.
+      // ponytail: one stringify+sha256 of the ring per save stays; tracking ring identity in the
+      // manager would remove it but must prove every in-place message mutation site.
+      const row: Record<string, unknown> = before && before.messageHistory !== undefined && input.messageHistory === undefined &&
+        input.registryMessageReset !== true && Array.isArray(input.messages) &&
+        !(Array.isArray(input.registryMessageAppend) && input.registryMessageAppend.length > 0) &&
+        this.#payloads.committedRing(String(input.id), before.messageHistory, input.messages)
+        ? (({ messages: _messages, ...rest }) => ({ ...rest, messageHistory: before.messageHistory }))(input)
+        : input;
       if (!before || row === before || row.registryMessageReset === true ||
         (Array.isArray(row.registryMessageAppend) && row.registryMessageAppend.length > 0)) return row;
       const { instructions, messages, registryMessageAppend: _append, registryMessageReset: _reset, ...small } = row;
@@ -175,23 +228,57 @@ export class ActorRegistryStore {
       throw error;
     }
     let renamed = false;
+    let barrierDue = false;
+    let committedGeneration: string | undefined;
+    const rollback = (): void => {
+      if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
+      else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
+    };
     return {
       valid: () => this.fingerprint() === snapshot.generation && payload.valid(),
-      commit: (): void => {
+      /**
+       * Under custody: the payload commit, the rename and (unless `deferBarrier`) the directory barrier.
+       * smarty-dev#6100: `deferBarrier` leaves the post-rename directory fsync chain to `barrier()`, which the
+       * caller runs AFTER releasing the fence and before acknowledging the write (update() does).
+       */
+      commit: (options: { deferBarrier?: boolean } = {}): void => {
         try {
           payload.commit();
           renameAtomic(temporary, this.#registryPath);
           renamed = true;
-          if (durable) syncDirectoryChain(this.#actorRoot);
+          if (durable && options.deferBarrier !== true) syncDirectoryChain(this.#actorRoot);
           this.#payloads.publishHeads(changedHeads);
-          this.#snapshot = { generation: this.fingerprint(), bytes: serialized, actors: accepted };
+          payload.accept(changedHeads, accepted);
+          committedGeneration = this.fingerprint();
+          barrierDue = durable && options.deferBarrier === true;
+          this.#snapshot = { generation: committedGeneration, bytes: serialized, actors: accepted };
         } catch (error) {
-          if (renamed) {
-            if (snapshot.bytes === undefined) fs.rmSync(this.#registryPath, { force: true });
-            else writeFileAtomic(this.#registryPath, snapshot.bytes, { durable: true });
-          }
+          if (renamed) rollback();
           this.#snapshot = undefined;
           throw error;
+        } finally {
+          registryReadCache.delete(this.#registryPath);
+        }
+      },
+      /**
+       * smarty-dev#6100: the deferred post-rename directory barrier, outside custody. The file's bytes and the
+       * pre-rename barriers were synced before the fence; only the directory entry remains. A writer that took the
+       * fence after this rename built its generation on ours under custody and runs its own barrier before it
+       * acknowledges, so syncing the entry late never exposes an acknowledged write to a power loss. On a failure
+       * the barrier is retried under custody with a generation re-check: still ours, the old contract holds (one
+       * more try, else roll back and throw); superseded, the error is thrown without touching the newer generation.
+       */
+      barrier: async (): Promise<void> => {
+        if (!barrierDue) return;
+        barrierDue = false;
+        try { syncDirectoryChain(this.#actorRoot); return; } catch (error) {
+          await this.withLock(() => {
+            if (this.fingerprint() !== committedGeneration) throw error;
+            try { syncDirectoryChain(this.#actorRoot); } catch (again) {
+              try { rollback(); } finally { this.#snapshot = undefined; registryReadCache.delete(this.#registryPath); }
+              throw again;
+            }
+          });
         }
       },
       dispose: () => fs.rmSync(temporary, { force: true }),
@@ -222,13 +309,18 @@ export class ActorRegistryStore {
     if (!mutation) return undefined;
     const prepared = this.prepare(mutation.actors, { durable: mutation.durable === true }, snapshot);
     try {
+      // smarty-dev#6100: custody covers only the generation check, the rename and the payload commit; the directory
+      // barrier runs after release, before the write is acknowledged.
       const committed = await locked(() => {
         if (!prepared.valid() || mutation.validate?.() === false) return false;
         live();
-        prepared.commit();
+        prepared.commit({ deferBarrier: true });
         return true;
       });
-      if (committed) return mutation.value;
+      if (committed) {
+        await prepared.barrier();
+        return mutation.value;
+      }
     } finally { prepared.dispose(); }
     vetoed = true;
     // One optimistic attempt keeps the uncontended fence cheap. After any race,
@@ -237,6 +329,7 @@ export class ActorRegistryStore {
     // Caller-local cancellation/ownership validation still vetoes publication. A veto
     // re-selects from a fresh snapshot; one that persists is never reported as
     // success: undefined means only that select() declined to write.
+    let barrier: (() => Promise<void>) | undefined;
     const attempt = (): T | undefined | typeof VETOED => {
       live();
       const current = this.snapshot();
@@ -247,7 +340,8 @@ export class ActorRegistryStore {
         live();
         if (prepared.valid() && selected.validate?.() !== false) {
           live();
-          prepared.commit();
+          prepared.commit({ deferBarrier: true });
+          barrier = prepared.barrier;
           return selected.value;
         }
       } finally { prepared.dispose(); }
@@ -269,6 +363,7 @@ export class ActorRegistryStore {
       // locked() rechecks the deadline after the backoff, before trying the fence.
       result = await locked(attempt);
     }
+    await barrier?.(); // smarty-dev#6100: the committed attempt's directory barrier, after release
     return result;
   }
 
@@ -300,6 +395,9 @@ export class ActorRegistryStore {
     return this.#payloads.messages(record, limit);
   }
 
+  /** Actor ids whose committed ring digest this store remembers (tests). */
+  committedRingIds(): string[] { return this.#payloads.committedRingIds(); }
+
   messageCount(record: Record<string, unknown>): number {
     return this.#payloads.count(record);
   }
@@ -327,6 +425,8 @@ export class ActorRegistryStore {
       catch (error) {
         writeFileAtomic(this.#registryPath, previous, { durable: true });
         throw error;
+      } finally {
+        registryReadCache.delete(this.#registryPath);
       }
       return actors.length;
     });
@@ -424,8 +524,65 @@ export class ActorRegistryStore {
     }
   }
 
+  /** Release shared decoded state when its manager closes or its root is removed. */
+  releaseReadCache(): void {
+    registryReadCache.delete(this.#registryPath);
+    for (const [identity, verdict] of registryLocalClockCache) {
+      if (verdict.filePath === this.#registryPath) registryLocalClockCache.delete(identity);
+    }
+    this.#snapshot = undefined;
+  }
+
+  /** One descriptor-bound identity check per call; callers receive a deeply frozen view. */
   read(): unknown {
-    return JSON.parse(fs.readFileSync(this.#registryPath, "utf8"));
+    // smarty-dev#7791: an unchanged registry is answered from one stat of the path, with no open. stat follows the
+    // path exactly as open does, so it names the inode the open would read; the hit rule is the open path's own
+    // (same generation, local clock already proven for that dev:ino, bytes older than the racy window). Anything
+    // else (changed, missing, unproven) takes the descriptor-bound path below.
+    const cached = registryReadCache.get(this.#registryPath);
+    if (cached) {
+      let stat: fs.BigIntStats | undefined;
+      try { stat = fs.statSync(this.#registryPath, { bigint: true }); } catch { stat = undefined; }
+      if (stat && cached.generation === `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
+        registryReadCache.delete(this.#registryPath);
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
+    }
+    let fd: number;
+    try { fd = fs.openSync(this.#registryPath, "r"); }
+    catch (error) { this.releaseReadCache(); throw error; }
+    try {
+      const readTimeMs = Date.now();
+      const stat = fs.fstatSync(fd, { bigint: true });
+      const generation = registryHasLocalClock(this.#registryPath, fd, stat) &&
+        stat.ino > 0n && stat.mtimeNs > 0n && stat.ctimeNs > 0n
+        ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+        : undefined;
+      const cached = registryReadCache.get(this.#registryPath);
+      // Delete/reinsert promotes both unchanged and replaced generations.
+      registryReadCache.delete(this.#registryPath);
+      // On host-local filesystems, coarse timestamps can hide same-size in-place
+      // writes within a 2 s quantum. Remote/unknown clocks never reach this hit path.
+      // Prove the bytes against their original read-start time, not the current
+      // clock: a racy entry must be re-read once settled, never merely age into a hit.
+      if (generation !== undefined && cached?.generation === generation &&
+        stat.mtimeNs < BigInt(cached.readTimeMs - REGISTRY_READ_RACY_WINDOW_MS) * 1_000_000n) {
+        registryReadCache.set(this.#registryPath, cached);
+        return cached.value;
+      }
+      const value: unknown = freezeRegistryValue(JSON.parse(fs.readFileSync(fd, "utf8")));
+      if (generation !== undefined) {
+        registryReadCache.set(this.#registryPath, { generation, readTimeMs, value });
+        if (registryReadCache.size > REGISTRY_READ_CACHE_LIMIT) {
+          registryReadCache.delete(registryReadCache.keys().next().value!);
+        }
+      }
+      return value;
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   /** Call within withLock for read-modify-write operations. Pending decisions and custody are durable. */
@@ -463,6 +620,8 @@ export class ActorRegistryStore {
       if (previous === undefined) fs.rmSync(this.#registryPath, { force: true });
       else writeFileAtomic(this.#registryPath, previous, { durable: true });
       throw error;
+    } finally {
+      registryReadCache.delete(this.#registryPath);
     }
   }
 }

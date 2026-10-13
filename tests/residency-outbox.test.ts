@@ -73,7 +73,7 @@ describe("resident producer durable outbox", () => {
       expect(fs.existsSync(path.join(f.outbox, outboxEntries(f.outbox)[0]!))).toBe(true);
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   });
-  it.skipIf(process.platform !== "linux")("F6 live watchdog recovers a sole completed task after locked idle exit exactly once without explicit restart", { timeout: 120_000 }, async () => {
+  it.skipIf(process.platform !== "linux")("keeps a completed task host awake while its reply is pending, then delivers once without restart", { timeout: 120_000 }, async () => {
     const f = setup();
     const launches = launchLog(f.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
@@ -108,24 +108,18 @@ describe("resident producer durable outbox", () => {
       const pending = JSON.parse(fs.readFileSync(path.join(f.outbox, entry), "utf8"));
       expect(pending.agentCompletionId).toBe(id);
       expect(completions).not.toHaveBeenCalled();
-      await wait(() => !same(originalHost), 75_000); // actual idle shutdown and process exit
-      // Inject a lock-release delay across the watchdog tick. It can observe the
-      // absent owner before this test observes process exit; an automatic ensureHost
-      // is legal while the mesh is still locked. Count recovery over the whole exit,
-      // not relative to our 25 ms polling loop's observation of it.
-      await wait(() => ensure.mock.calls.length > 0, 10_000);
-      await sleep(250);
-      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json")),
-        ["owner.json", "error.json", "launcher.log", "child-stderr.log"].map(file => { try { return `${file}: ${fs.readFileSync(path.join(f.config.residencyRoot, file), "utf8")}`; } catch { return `${file}: absent`; } }).join("\n")).toBe(false);
+      await sleep(31_000); // R-no-idle: pending response custody is NOT truly idle.
+      expect(same(originalHost)).toBe(true);
+      expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(true);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       for (const root of [f.config.actorRoot, f.config.sessionActorRoot!]) {
         const registry = path.join(root, "actors.json");
         expect(fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, "utf8")).actors : []).toEqual([]);
       }
       expect(completions).not.toHaveBeenCalled();
-      expect(ensure).toHaveBeenCalledOnce();
+      expect(ensure).not.toHaveBeenCalled();
       fs.rmSync(lock, { recursive: true });
-      // Only the live watchdog starts recovery: no explicit restart or new spawn.
+      // The current host keeps reply custody; unlocking lets it finish, with no restart.
       try {
         await wait(() => completions.mock.calls.length > 0, 45_000);
       } catch (error) {
@@ -138,17 +132,17 @@ describe("resident producer durable outbox", () => {
       await wait(() => fs.readdirSync(f.outbox).length === 0 &&
         f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true }).length === 0);
       expect(completions).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id, status: "completed", text: "live attempt 1 complete" }));
-      expect(ensure).toHaveBeenCalledOnce();
+      expect(ensure).not.toHaveBeenCalled();
       const metadata = JSON.parse(fs.readFileSync(path.join(f.config.residencyRoot, "agents", `${id}.json`), "utf8"));
       expect(metadata.completionConsumedAt).toEqual(expect.any(Number));
       // Multiple watchdog/poll cycles must neither redeliver nor relaunch the completed task.
       await sleep(5_100);
       expect(completions).toHaveBeenCalledOnce();
-      expect(ensure).toHaveBeenCalledOnce();
+      expect(ensure).not.toHaveBeenCalled();
       const workers = launches.owned().filter(({ argv }) => argv[0] === f.config.workerPath);
       expect(workers).toHaveLength(1);
       expect(workers[0]!.argv).toContain(id);
-      expect(launches.owned().filter(({ argv }) => argv[0] === client.options.hostPath)).toHaveLength(2);
+      expect(launches.owned().filter(({ argv }) => argv[0] === client.options.hostPath)).toHaveLength(1);
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
       await client.close();
@@ -159,7 +153,7 @@ describe("resident producer durable outbox", () => {
     }
   });
 
-  it("retains a completed durable task beyond idle exit and delivers once after host restart", { timeout: 100_000 }, async () => {
+  it("retains pending reply custody across explicit shutdown and delivers once after host restart", { timeout: 100_000 }, async () => {
     // Explicit same-process fixture adapter, never the real subprocess watchdog above.
     installInProcessResidentFence();
     const f = setup();
@@ -188,8 +182,10 @@ describe("resident producer durable outbox", () => {
       expect(pending.agentCompletionId).toBe(id);
       let exited = false;
       void running.then(() => { exited = true; });
-      await wait(() => exited, 75_000); // actual 30-second idle threshold plus close lock waits
-      await running;
+      await sleep(31_000);
+      expect(exited).toBe(false); // A pending reply prevents automatic idle exit.
+      controller.abort();
+      await running; // Explicit shutdown still preserves the outbox for recovery.
       expect(fs.existsSync(path.join(f.config.residencyRoot, "owner.json"))).toBe(false);
       expect(fs.existsSync(path.join(f.outbox, entry))).toBe(true);
       expect(f.mesh.listAll(residentDeliveryPrefix(f.config.rootId), { fresh: true })).toHaveLength(0);

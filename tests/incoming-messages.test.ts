@@ -15,7 +15,7 @@ const sender = { id: "session:peer", name: "Build & Test", kind: "main" as const
 const message = (body = "first\n  second\tthird & <safe>"): CustomMessage => ({
   role: "custom", customType: "pi-fabric-agent-message", display: true, timestamp: 123,
   content: `<fabric-agent-message from_name="Build &amp; Test" from_id="session:peer">\n${body.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}\n<data>{"internal":"not a preview"}</data>\n</fabric-agent-message>`,
-  details: { id: "native-1", from: sender, data: { key: "same-work" } },
+  details: { id: "native-1", from: sender, data: { key: "same-work", topic: "fleet.work" } },
 });
 const event = (id: string, text: string, data: unknown = { key: "same-work" }): MeshEvent => ({
   id, sequence: 1, topic: "fleet.work", kind: "work", from: sender, text, data, createdAt: 123,
@@ -199,11 +199,39 @@ describe("incoming Fabric display projection", () => {
     expect(h.render(inbox([event("shadow-1", "duplicate")]))).toEqual([]);
     const mixed = inbox([event("shadow-1", "duplicate"), event("unseen", "new work", { key: "different" })]);
     expect(plain(h.render(mixed)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
+    // Same sender and key on another topic is unrelated work (#852 security P1): shown.
+    expect(plain(h.render(inbox([{ ...event("other-topic", "other topic work"), topic: "fleet.alarm" }]))![0]!)).toContain("other topic work");
+    expect(plain(h.render(inbox([event("same-event", "first", {}), event("same-event", "duplicate second", {})]))![0]!))
+      .toBe(" ↳ Build & Test: [1 work] first");
     const delivery = { ...message(), details: { id: "native-2", from: sender, data: { deliveryId: "D1", key: "same-work" } } };
     h.setBranch([entry(message()), entry(delivery)]);
     expect(h.render(inbox([event("d1", "duplicate D1", { deliveryId: "D1" })]))).toEqual([]);
     expect(plain(h.render(inbox([event("d2", "new D2", { deliveryId: "D2", key: "same-work" })]))![0]!)).toContain("new D2");
     expect(h.render(mixed, true)).toBeUndefined();
+  });
+
+  it("dedupes an inbox event id repeated a minute later, without hiding the original or new rows", () => {
+    const h = harness();
+    const first = inbox([event("ca71cd8c", "first copy", {})]);
+    const second = { ...inbox([event("ca71cd8c", "REPEATED_COPY", {}), event("new", "new work", {})]), timestamp: first.timestamp + 60_000 };
+    h.setBranch([entry(first), entry(second)]);
+    expect(plain(h.render(first)![0]!)).toContain("first copy");
+    expect(plain(h.render(second)![0]!)).toBe(" ↳ Build & Test: [1 work] new work");
+    // Expanded: the native carrier minus the repeated row (upstream fullCarrier rendering).
+    initTheme("dark", false);
+    const shown = (expanded: boolean) => {
+      const component = new CustomMessageComponent(second, h.renderers.get(second.customType));
+      component.setExpanded(expanded);
+      return component.render(120).map(plain).join("\n");
+    };
+    expect(shown(true)).toContain("new work");
+    expect(shown(true)).not.toContain("REPEATED_COPY");
+    h.setMode("expanded");
+    expect(shown(false)).toContain("new work");
+    expect(shown(false)).not.toContain("REPEATED_COPY");
+    h.setMode("collapsed");
+    h.setBranch([entry(second)]);
+    expect(plain(h.render(second)![0]!)).toContain("REPEATED_COPY");
   });
 
   it.each([

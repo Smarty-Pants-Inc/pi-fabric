@@ -93,7 +93,8 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
     return { code: child.status, out: child.stdout, err: child.stderr };
   };
 
-  it("status, cutover and rollback as a subprocess: exit 0, the advisory census line, the result", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("status, cutover and rollback as a subprocess: exit 0, the advisory census line, the result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-bin-"));
     roots.push(root);
     const seed = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -103,7 +104,8 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
     const before = cli("status", "--root", root);
     expect(before, before.err).toMatchObject({ code: 0 });
     expect(before.out).toContain("census        advisory: 0 writers, 0 unknown");
-    const cutover = cli("cutover", "--root", root);
+    // The built command scans this host's real /proc and /proc/locks (smarty-dev#7936): no holder list.
+    const cutover = cli("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown");
     expect(cutover, cutover.err).toMatchObject({ code: 0 });
     expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
     expect(cutover.out).toMatch(/^cutover done: backend=sqlite epoch 1 \(from 0\), 1 entries/);
@@ -124,7 +126,8 @@ describe.skipIf(!hasBuiltCli)("the built fabric-mesh-backend command (W1, pi-fab
 });
 
 describe("fabric-mesh-backend with the writer census (W1)", () => {
-  it("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {
+  // ponytail: no cutover or import runs on Windows until reader proofs can be verified there (ACLs: smarty-dev#7548).
+  it.skipIf(process.platform === "win32")("advisory census -> cutover fenced on .lock and custody -> sqlite reads -> rollback -> file reads, no lost write", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-w1-"));
     roots.push(root);
     const operator = new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
@@ -147,7 +150,7 @@ describe("fabric-mesh-backend with the writer census (W1)", () => {
     writer.child.stdin.write("exit\n");
     await new Promise(resolve => writer.child.once("exit", resolve));
     expect(await run("census", "--root", root)).toMatchObject({ code: 0, out: "census        advisory: 0 writers, 0 unknown\n" });
-    const cutover = await run("cutover", "--root", root, "--json");
+    const cutover = await run("cutover", "--root", root, "--accept-unready", "factory,fabric@unknown", "--json");
     expect(cutover.code).toBe(0);
     expect(cutover.err).toContain("fabric-mesh-backend: advisory: 0 writers, 0 unknown");
     expect(JSON.parse(cutover.out)).toMatchObject({ command: "cutover", ok: true, backend: "sqlite", epoch: 1,

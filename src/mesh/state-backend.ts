@@ -17,26 +17,30 @@
  *   divergence checks. A SQLite failure never fails, delays past its own small budget, or changes
  *   the result of the caller; it is counted in `diagnostics()`.
  *
- * Selection: `mesh.stateBackend` in the Fabric config (`"file" | "shadow" | "sqlite"`, default
- * `"file"`); the environment variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a
- * non-local filesystem (R16) or a runtime without `node:sqlite` falls back to `"file"`.
+ * Selection: `mesh.stateBackend` in the Fabric config (`"file" | "shadow" | "sqlite" | "nats"`, default
+ * `"file"`); the environment variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. Each kind is a
+ * registered factory (`STATE_BACKEND_FACTORIES`, smarty-dev#7504, docs/mesh-backends.md). A root on a
+ * non-local filesystem (R16) or a runtime without `node:sqlite` falls back to `"file"` for sqlite and
+ * shadow. `"nats"` refuses with `MeshStateBackendNotBuiltError` until fabric-v2's store lands.
  *
  * This file was committed first as the interface milestone; lanes L3 (projector) and L4 (cutover)
  * build against these declarations. Changes after that commit are recorded in the lane's
  * `iface-changes.md`.
  */
 import path from "node:path";
-import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
+import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
+import { preparedNatsStateBackend } from "./state-backend-nats.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
-import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteStateStoreOptions } from "./state-sqlite.js";
+import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteDeltaKey, type SqliteStateDelta, type SqliteStateExport,
+  type SqliteStateStoreOptions } from "./state-sqlite.js";
 
 export type { MeshBatchOperation, MeshBatchResult, MeshBatchView, MeshReadOptions, MeshStateEntry };
 
-/** The configured state backend (`mesh.stateBackend`, env `PI_FABRIC_MESH_STATE_BACKEND`). */
-export type MeshStateBackendKind = "file" | "shadow" | "sqlite";
+export { isMeshStateBackendKind, type MeshStateBackendKind };
 
 /** The environment override of `mesh.stateBackend`. */
 export const MESH_STATE_BACKEND_ENV = "PI_FABRIC_MESH_STATE_BACKEND";
@@ -106,7 +110,8 @@ export interface MeshCommitEffects {
  * 5. Every operation applies with put()/delete() semantics and verified compare-and-swap:
  *    `ifVersion` mismatch with `onConflict: "abort"` (the default) throws `MeshBatchConflictError`
  *    and nothing is written; `"skip"` leaves that key. A thrown callback rolls everything back.
- * 6. COMMIT. A failed commit runs no callback below.
+ * 6. `beforeCommit()` validates external ownership synchronously at the durable commit boundary.
+ *    A throw rolls back all operations and runs no callback below. Then COMMIT.
  * 7. `afterCommit(view)` (legacy, synchronous, no store writers): file backend: under the `.lock`
  *    right after the commit (also for a write-free batch). sqlite backend: a write-free batch runs
  *    it inside its own write-free transaction on the exact snapshot; a changing batch runs it
@@ -122,6 +127,8 @@ export interface StateBackendBatchInput {
   ops: MeshBatchOperation[];
   prepare?: (view: MeshBatchView, fileRead?: unknown) => MeshBatchOperation[];
   afterCommit?: (view: MeshBatchView) => void;
+  /** Final external CAS, after operations and before the durable commit; a throw rolls back. */
+  beforeCommit?: () => void;
   /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
   lockClass?: "bridge";
   /** R11: file reads before the transaction, re-checked by stamp inside it. */
@@ -160,6 +167,10 @@ export interface StateBackendDiagnostics {
   divergentKeys?: string[];
   /** shadow/sqlite: the SQLite database file. */
   database?: string;
+  /** nats: the stream, the projector's applied and known sequences, the stream status, CAS retries. */
+  nats?: { stream: string; appliedSeq: number; knownSeq: number; status: string; casRetries: number;
+    /** The last complete snapshot's end sequence (0: none), snapshots this host took, purge gaps it reloaded from. */
+    snapshotSeq: number; snapshots: number; resyncs: number; resyncing: boolean; failure?: string };
 }
 
 /** One divergence: the key, and what each side holds (undefined: absent). */
@@ -236,29 +247,29 @@ export interface StateBackendOptions {
   busyTimeoutMs?: number;
   /** shadow: the budget of one shadow write (never the caller's). Default 250 ms. */
   shadowBudgetMs?: number;
+  /** sqlite: a writer-lock hold longer than this emits a `held` lock event. Default 1,000 ms; 0 disables. */
+  lockHeldEventMs?: number;
 }
 
 // ------------------------------------------------------------------ implementation (L2a)
 
 export { MeshStateFileReadChangedError };
 
-const KINDS: ReadonlySet<string> = new Set<MeshStateBackendKind>(["file", "shadow", "sqlite"]);
-
-export const isMeshStateBackendKind = (value: unknown): value is MeshStateBackendKind =>
-  typeof value === "string" && KINDS.has(value);
-
 /**
  * The effective kind: an explicit option wins, then a valid `PI_FABRIC_MESH_STATE_BACKEND`, then
- * `"file"`. An unknown environment value is ignored (fail safe to the file backend).
+ * `"file"`. An empty environment value counts as unset. An unknown non-empty one throws: ignoring it
+ * would open a different store than the operator chose, and split the mesh (pi-fabric#796).
  */
 export const resolveMeshStateBackend = (explicit?: MeshStateBackendKind,
   env: string | undefined = process.env[MESH_STATE_BACKEND_ENV]): MeshStateBackendKind => {
   if (explicit !== undefined) {
-    if (!isMeshStateBackendKind(explicit)) throw new Error("mesh.stateBackend must be file, shadow or sqlite");
+    if (!isMeshStateBackendKind(explicit)) throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
     return explicit;
   }
   const value = env?.trim().toLowerCase();
-  return isMeshStateBackendKind(value) ? value : "file";
+  if (!value) return "file";
+  if (isMeshStateBackendKind(value)) return value;
+  throw new Error(`${MESH_STATE_BACKEND_ENV} must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
 };
 
 /** A SQLite state write ran out of its busy budget (`MeshStateBusy`). */
@@ -277,12 +288,67 @@ export const isMeshStateBusy = (error: unknown): error is MeshStateBusy =>
 
 const SQLITE_BUSY = 5;
 const SQLITE_LOCKED = 6;
-const sqliteBusy = (error: unknown): boolean => {
+/** A raw driver SQLITE_BUSY / SQLITE_LOCKED ("database is locked"), any extended code. */
+export const isSqliteBusy = (error: unknown): boolean => {
   const code = (error as { errcode?: unknown } | null)?.errcode;
   return typeof code === "number" && ((code & 0xff) === SQLITE_BUSY || (code & 0xff) === SQLITE_LOCKED);
 };
+const sqliteBusy = isSqliteBusy;
 
-// Only for the first synchronous read of a process: one database open, bounded to ~50 ms.
+/** `MeshStateWalCapError` (state-sqlite.ts) by its code: a write refused while a pinned reader holds the WAL above the cap. */
+export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
+export const isMeshStateWalCap = (error: unknown): boolean =>
+  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+
+/**
+ * Lock contention a caller retries (smarty-dev#6477): a mesh lock timeout, `FABRIC_MESH_STATE_BUSY`, a
+ * raw SQLite busy error that escaped a path without its own mapping, or a WAL-cap refusal
+ * (`FABRIC_MESH_STATE_WAL_CAP`, pi-fabric#694 P1 2: the operator rolls back; writes resume once the reader
+ * lets go). Never fatal for a long-lived loop.
+ */
+export const isMeshRetryableBusy = (error: unknown): boolean => isMeshLockTimeout(error) || isSqliteBusy(error) || isMeshStateWalCap(error);
+
+/** Wraps a raw SQLite busy error as the retryable `MeshStateBusyError` (a `MeshLockTimeoutError`). */
+export const meshStateBusyFrom = (database: string, error: unknown, attempts = 1, waitedMs = 0, where = "read"): MeshStateBusyError => {
+  const timeout = new MeshLockTimeoutError(` (SQLite state ${database}, ${where})`, attempts, 0);
+  timeout.cause = error;
+  return new MeshStateBusyError(database, waitedMs, timeout);
+};
+
+// Synchronous reads: short retries within a wall-clock budget on the event loop, then the retryable busy
+// error. The budget includes SQLite's busy handler (busy_timeout, <= 5 ms per attempt), not only the
+// sleeps between attempts (pi-fabric#691 review P2): an attempt starts only if it ends inside it.
+const READ_BUSY_BUDGET_MS = 15;
+// Only for the first synchronous read of a process: one database open, bounded the same way.
+const OPEN_BUSY_BUDGET_MS = 40;
+const busyHandlerMs = (options: SqliteStateStoreOptions): number => Math.max(0, Math.min(5, Math.floor(options.busyTimeoutMs ?? 2)));
+// smarty-dev#9805: a bounded try of at least BOUNDED_WAIT_FLOOR_MS (the 2 s routing refresh before a send) waits for
+// the state write lock for at least BOUNDED_WAIT_MS, so one burst-long writer (2-3 s) no longer fails the caller.
+// Shorter tries (zero-wait, the 50 ms registry-fenced publication) still fail fast by design. ponytail: a longer
+// wait inside the same awaited acquisition, not a retry: the body runs at most once and the waiter keeps its FIFO place.
+const BOUNDED_WAIT_FLOOR_MS = 1_000;
+const BOUNDED_WAIT_MS = 6_000;
+const boundedWaitMs = (timeoutMs: number): number =>
+  timeoutMs >= BOUNDED_WAIT_FLOOR_MS ? Math.max(timeoutMs, BOUNDED_WAIT_MS) : timeoutMs;
+
+/**
+ * Retries a synchronous busy `attempt` until `budgetMs` of wall time (monotonic clock) would be exceeded.
+ * Each attempt may spend `handlerMs` in SQLite's busy handler, so none starts unless it ends in budget.
+ */
+const retrySyncBusy = <T>(attempt: () => T, budgetMs: number, handlerMs: number,
+  onSpent: (error: unknown, attempts: number, waitedMs: number) => Error): T => {
+  const started = performance.now();
+  const deadline = started + budgetMs;
+  for (let attempts = 1; ; attempts += 1) {
+    try { return attempt(); } catch (error) {
+      if (!sqliteBusy(error)) throw error;
+      const room = deadline - performance.now() - handlerMs - 1;
+      if (room <= 0) throw onSpent(error, attempts, performance.now() - started);
+      sleepSync(Math.min(attempts, room));
+    }
+  }
+};
+
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
 // A bounded wait for a shared open: rejects with BUDGET_SPENT when `ms` runs out first.
@@ -299,26 +365,94 @@ const sqliteUnavailable = (): string | undefined => {
 };
 
 export type CreateStateBackendOptions = StateBackendOptions & StateFileOptions & {
-  /** shadow: period of the automatic divergence check; 0 disables. Default 60 s. */
+  /** shadow: unref'd safety verifier, at most once per minute; 0 disables. Default 60 s. */
   shadowVerifyMs?: number;
 };
 
+/** One registered backend kind (smarty-dev#7504). */
+export interface StateBackendFactory {
+  /** Why this root or runtime cannot host the kind; the selector then falls back to `"file"`. */
+  unavailable?(context: MeshStoreContext): string | undefined;
+  /** Opens the backend; throws to refuse (no fallback). */
+  create(context: MeshStoreContext, options: CreateStateBackendOptions): StateBackend;
+}
+
+export const MESH_STATE_BACKEND_NOT_BUILT_CODE = "FABRIC_MESH_STATE_BACKEND_NOT_BUILT";
+
+/** The selected kind has no store in this build (`nats` until fabric-v2's store lands, smarty-dev#7504). */
+export class MeshStateBackendNotBuiltError extends Error {
+  readonly code = MESH_STATE_BACKEND_NOT_BUILT_CODE;
+  constructor(readonly kind: MeshStateBackendKind, detail: string) {
+    super(`${MESH_STATE_BACKEND_NOT_BUILT_CODE}: mesh state backend "${kind}" is not built: ${detail}. ` +
+      `Use mesh.stateBackend (or ${MESH_STATE_BACKEND_ENV}) file or sqlite; see docs/mesh-backends.md`);
+    this.name = "MeshStateBackendNotBuiltError";
+  }
+}
+
+const sqliteRefusal = (context: MeshStoreContext): string | undefined => filesystemRefusal(context.root) ?? sqliteUnavailable();
+
 /**
- * The backend for one MeshStore. `"file"` touches nothing new (no SQLite import side effect, no
+ * The registry the selector reads. `"file"` touches nothing new (no SQLite import side effect, no
  * file). `"sqlite"` and `"shadow"` fall back to `"file"` on a non-local filesystem (R16) or without
- * `node:sqlite` (R19); `diagnostics().fallback` says why.
+ * `node:sqlite` (R19). `"nats"` never falls back: a host that silently wrote local state while its
+ * peers wrote the shared stream would split the mesh, so it refuses until a store is registered.
+ */
+export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendFactory> = {
+  file: { create: (context, options) => new StateFile(context, options) },
+  sqlite: { unavailable: sqliteRefusal, create: (context, options) => new SqliteStateBackend(context, options) },
+  shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
+  // smarty-dev#7504: the factory is synchronous, the NATS connection and the stream replay are not. A host prepares
+  // the backend first (`openNatsStateBackend`); an unprepared root refuses, never falls back.
+  nats: { create: (context) => {
+    const backend = preparedNatsStateBackend(context.root);
+    if (!backend) throw new MeshStateBackendNotBuiltError("nats", `no NATS state backend is prepared for ${context.root} (openNatsStateBackend)`);
+    assertNoBridgeOnNats(context.root, backend);
+    return backend;
+  } },
+};
+
+/**
+ * Interim R20 fence decision (smarty-dev#7504 phase 2, docs/mesh-backends.md "Bridges"): on `nats`, the state write
+ * fence excludes no other writer, so a bridge's held-event ownership check (security F2) cannot hold. A root where a
+ * bridge holds events (a mirrored remote host record) refuses `nats`, and a bridge refuses a `nats` store, until the
+ * event log moves onto the stream (smarty-dev#9725) or a lease fences it.
+ */
+export class MeshStateNatsBridgeRefusedError extends Error {
+  readonly code = "FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED";
+  constructor(root: string, detail: string) {
+    super(`FABRIC_MESH_STATE_NATS_BRIDGE_REFUSED: ${root}: ${detail}; the nats backend has no R20 write fence for a bridge's `
+      + "held events until smarty-dev#9725 (docs/mesh-backends.md, Bridges)");
+    this.name = "MeshStateNatsBridgeRefusedError";
+  }
+}
+
+const assertNoBridgeOnNats = (root: string, backend: StateBackend): void => {
+  const bridged = backend.listAllShared("topology/hosts/").find(entry => {
+    const value = entry.value as { remoteHost?: unknown } | null;
+    return typeof value === "object" && value !== null && typeof value.remoteHost === "string";
+  });
+  if (bridged) throw new MeshStateNatsBridgeRefusedError(root, `a bridge holds events here (${bridged.key} is mirrored from ${String((bridged.value as { remoteHost: string }).remoteHost)})`);
+};
+
+/** A bridge side on a `nats` store refuses (the same interim decision). */
+export const assertBridgeStateBackend = (root: string, kind: string): void => {
+  if (kind === "nats") throw new MeshStateNatsBridgeRefusedError(root, "a bridge cannot run on a nats store");
+};
+
+/**
+ * The backend for one MeshStore: the registered factory of the resolved kind, or `"file"` with
+ * `diagnostics().fallback` saying why when that kind is unavailable on this root or runtime.
  */
 export const createStateBackend = (context: MeshStoreContext, options: CreateStateBackendOptions = {}): StateBackend => {
   const kind = resolveMeshStateBackend(options.stateBackend);
-  if (kind === "file") return new StateFile(context, options);
-  const refusal = filesystemRefusal(context.root) ?? sqliteUnavailable();
+  const factory = STATE_BACKEND_FACTORIES[kind];
+  const refusal = factory.unavailable?.(context);
   if (refusal) {
     const file = new StateFile(context, options);
     file.fallback = `${kind}: ${refusal}`;
     return file;
   }
-  if (kind === "sqlite") return new SqliteStateBackend(context, options);
-  return new ShadowStateBackend(context, options);
+  return factory.create(context, options);
 };
 
 const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = options.lockTimeoutMs): SqliteStateStoreOptions => ({
@@ -327,23 +461,133 @@ const sqliteOptions = (options: CreateStateBackendOptions, lockTimeoutMs = optio
   ...(lockTimeoutMs !== undefined ? { lockTimeoutMs } : {}),
   ...(options.busyTimeoutMs !== undefined ? { busyTimeoutMs: options.busyTimeoutMs } : {}),
   ...(options.writeSignal ? { writeSignal: options.writeSignal } : {}),
+  ...(options.lockHeldEventMs !== undefined ? { lockHeldEventMs: options.lockHeldEventMs } : {}),
 });
 
+/**
+ * One immutable state snapshot. Never mutated once built: a newer one shares the unchanged maps and
+ * entries (copy on write), so a pinned token and the process-shared copy stay exact.
+ */
 interface SqliteSnapshot {
   stamp: string;
-  entries: Map<string, MeshStateEntry>;
+  /** `<store>:<epoch>`: snapshots of one lineage are brought forward by its change feed. */
+  lineage: string;
+  commit: number;
+  entries: ReadonlyMap<string, Readonly<MeshStateEntry>>;
   /** Sorted by key (localeCompare), shared and frozen. */
   sorted: readonly Readonly<MeshStateEntry>[];
-  versions: Record<string, number>;
+  /** Every live version and retained tombstone version (exportState's `versions`). */
+  versions: ReadonlyMap<string, number>;
 }
 
 const freezeEntry = (entry: MeshStateEntry): Readonly<MeshStateEntry> => Object.freeze(entry);
+const byKey = (left: Readonly<MeshStateEntry>, right: Readonly<MeshStateEntry>): number => left.key.localeCompare(right.key);
+const lineageOf = (stamp: string): string => stamp.slice(0, stamp.lastIndexOf(":"));
+
+/** The full rebuild: every row, parsed, frozen and sorted (the only path before smarty-dev#6477). */
+const fullSnapshot = (stamp: string, state: SqliteStateExport): SqliteSnapshot => {
+  const entries = new Map<string, Readonly<MeshStateEntry>>();
+  for (const [key, entry] of Object.entries(state.entries)) entries.set(key, freezeEntry(entry));
+  const sorted = Object.freeze([...entries.values()].sort(byKey));
+  return { stamp, lineage: lineageOf(stamp), commit: state.commit, entries, sorted, versions: new Map(Object.entries(state.versions)) };
+};
+
+const isTombstone = (snapshot: SqliteSnapshot, key: string): boolean => snapshot.versions.has(key) && !snapshot.entries.has(key);
+
+/** The tombstone count `base` would hold after `changed` (evictions and imports write no change row). */
+const predictTombstones = (base: SqliteSnapshot, changed: readonly SqliteDeltaKey[]): number => {
+  let count = base.versions.size - base.entries.size;
+  for (const { key, entry, version } of changed) {
+    count += (entry === undefined && version > 0 ? 1 : 0) - (isTombstone(base, key) ? 1 : 0);
+  }
+  return count;
+};
+
+/** First index in `sorted` (from `from`) whose key does not sort before `key`. */
+const lowerBound = (sorted: readonly Readonly<MeshStateEntry>[], entry: Readonly<MeshStateEntry>, from: number): number => {
+  let low = from;
+  let high = sorted.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (byKey(sorted[middle]!, entry) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+};
+
+/**
+ * `base` brought forward by a complete delta (smarty-dev#6477): only the changed keys are parsed;
+ * the sorted list is the old one minus the changed keys plus their new entries, each placed by
+ * binary search, so it equals a full export's sort. Unchanged structures are shared.
+ */
+const applySqliteDelta = (base: SqliteSnapshot, delta: SqliteStateDelta): SqliteSnapshot => {
+  if (delta.changed.length === 0 && !delta.tombstones) {
+    return { ...base, stamp: delta.stamp, lineage: lineageOf(delta.stamp), commit: delta.commit };
+  }
+  const entries = new Map(base.entries);
+  const versions = new Map(base.versions);
+  const removed = new Set<string>();
+  const inserted: Readonly<MeshStateEntry>[] = [];
+  for (const { key, entry, version } of delta.changed) {
+    if (entries.has(key)) removed.add(key);
+    if (entry) {
+      const frozen = freezeEntry(entry);
+      entries.set(key, frozen);
+      inserted.push(frozen);
+    } else entries.delete(key);
+    if (version > 0) versions.set(key, version);
+    else versions.delete(key);
+  }
+  if (delta.tombstones) {
+    for (const key of [...versions.keys()]) if (!entries.has(key)) versions.delete(key);
+    for (const [key, version] of delta.tombstones) versions.set(key, version);
+  }
+  let sorted = base.sorted;
+  if (removed.size > 0 || inserted.length > 0) {
+    const kept = removed.size > 0 ? base.sorted.filter((entry) => !removed.has(entry.key)) : base.sorted;
+    inserted.sort(byKey);
+    const merged: Readonly<MeshStateEntry>[] = [];
+    let from = 0;
+    for (const entry of inserted) {
+      const at = lowerBound(kept, entry, from);
+      for (let index = from; index < at; index += 1) merged.push(kept[index]!);
+      merged.push(entry);
+      from = at;
+    }
+    for (let index = from; index < kept.length; index += 1) merged.push(kept[index]!);
+    sorted = Object.freeze(merged);
+  }
+  return { stamp: delta.stamp, lineage: lineageOf(delta.stamp), commit: delta.commit, entries, sorted, versions };
+};
+
+/** `base` (same lineage) brought forward, or a full export when the feed cannot (trimmed, re-epoched). */
+const refreshSnapshot = (store: SqliteStateStore, base: SqliteSnapshot | undefined): SqliteSnapshot => {
+  if (base) {
+    const delta = store.readDelta(base.commit, (changed) => predictTombstones(base, changed));
+    if (delta.complete && lineageOf(delta.stamp) === base.lineage) return applySqliteDelta(base, delta);
+  }
+  const { stamp, state } = store.exportLive();
+  return fullSnapshot(stamp, state);
+};
+
+// The newest snapshot per state.db in this process, as the file store's processReadSnapshots: several
+// MeshStores (and backends) on one root bring ONE snapshot forward per commit (smarty-dev#6477).
+const processSqliteSnapshots = new Map<string, WeakRef<SqliteSnapshot>>();
+const sharedSnapshot = (database: string): SqliteSnapshot | undefined => processSqliteSnapshots.get(database)?.deref();
+const shareSnapshot = (database: string, snapshot: SqliteSnapshot): void => {
+  const shared = sharedSnapshot(database);
+  if (shared && shared.lineage === snapshot.lineage && shared.commit > snapshot.commit) return;
+  if (processSqliteSnapshots.size >= 64 && !processSqliteSnapshots.has(database)) {
+    processSqliteSnapshots.delete(processSqliteSnapshots.keys().next().value!);
+  }
+  processSqliteSnapshots.set(database, new WeakRef(snapshot));
+};
 
 /** A read-only view over a captured snapshot (copies out). */
 const snapshotView = (snapshot: () => SqliteSnapshot): MeshBatchView => ({
   get: (key) => { const entry = snapshot().entries.get(key); return entry ? jsonClone(entry) : undefined; },
   listAll: (prefix) => snapshot().sorted.filter((entry) => entry.key.startsWith(prefix)).map((entry) => jsonClone(entry)),
-  version: (key) => snapshot().versions[key] ?? 0,
+  version: (key) => snapshot().versions.get(key) ?? 0,
 });
 
 /**
@@ -391,31 +635,35 @@ export class SqliteStateBackend implements StateBackend {
   get readCacheRemainingMs(): number { return 0; }
 
   get(key: string, options: MeshReadOptions = {}): MeshStateEntry | undefined {
-    const pinned = this.#pinned(options);
-    if (!pinned) return this.#open().get(key);
-    validateMeshStateKey(key);
-    const entry = pinned.entries.get(key);
-    return entry ? jsonClone(entry) : undefined;
+    return this.#read(() => {
+      const pinned = this.#pinned(options);
+      if (!pinned) return this.#open().get(key);
+      validateMeshStateKey(key);
+      const entry = pinned.entries.get(key);
+      return entry ? jsonClone(entry) : undefined;
+    });
   }
 
   list(prefix = "", limit = 100, options: MeshReadOptions = {}): MeshStateEntry[] {
     const bounded = Math.max(1, Math.min(Math.floor(limit), this.#context.maxReadEvents));
-    return this.#select(prefix, options).slice(0, bounded).map((entry) => jsonClone(entry));
+    return this.#read(() => this.#select(prefix, options).slice(0, bounded).map((entry) => jsonClone(entry)));
   }
 
   listAll(prefix = "", options: MeshReadOptions = {}): MeshStateEntry[] {
-    const pinned = this.#pinned(options);
-    if (!pinned) return this.#open().listAll(prefix);
-    return this.#select(prefix, options).map((entry) => jsonClone(entry));
+    return this.#read(() => {
+      const pinned = this.#pinned(options);
+      if (!pinned) return this.#open().listAll(prefix);
+      return this.#select(prefix, options).map((entry) => jsonClone(entry));
+    });
   }
 
   listAllShared(prefix = "", options: MeshReadOptions = {}): readonly Readonly<MeshStateEntry>[] {
-    return this.#select(prefix, options);
+    return this.#read(() => this.#select(prefix, options));
   }
 
   /** One consistent snapshot, reused while the commit stamp is unchanged. */
   stateToken(_options: MeshReadOptions = {}): object {
-    return this.#current();
+    return this.#read(() => this.#current());
   }
 
   stateStamp(): string | undefined {
@@ -424,6 +672,28 @@ export class SqliteStateBackend implements StateBackend {
 
   cachedStateStamp(_fresh = false, _revalidateGeneration = false): string | undefined {
     return this.stateStamp();
+  }
+
+  /**
+   * smarty-dev#10391: whether no key under `prefixes` changed in any commit after `stamp` (a `stateStamp()` of
+   * this database and epoch). One meta read, and the trimmed change feed only when a commit landed since; inside
+   * `withWriteFence` it reads that fence's snapshot. False whenever it cannot prove it (another epoch, a trimmed feed).
+   */
+  /** smarty-dev#10391: a read-only view of the committed state now and its stamp, for a plan made before a write. */
+  stateView(): { stamp: string; view: MeshBatchView } {
+    const snapshot = this.#read(() => this.#current());
+    return { stamp: snapshot.stamp, view: snapshotView(() => snapshot) };
+  }
+
+  unchangedSince(stamp: string, prefixes: readonly string[]): boolean {
+    const store = this.#read(() => this.#open());
+    const current = store.stateStamp();
+    if (current === stamp) return true;
+    const lineage = lineageOf(stamp);
+    const after = Number(stamp.slice(lineage.length + 1));
+    if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
+    const feed = this.#read(() => store.changesSince(after));
+    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)));
   }
 
   // ------------------------------------------------------------ writes
@@ -438,7 +708,7 @@ export class SqliteStateBackend implements StateBackend {
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
     for (const op of input.ops) validateMeshStateKey(op.key);
-    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox) return [];
+    if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
     const retries = Math.max(0, Math.floor(fileRead?.retries ?? 3));
     for (let attempt = 0; ; attempt += 1) {
@@ -455,6 +725,8 @@ export class SqliteStateBackend implements StateBackend {
           identity: input.identity, ops: input.ops,
           ...(prepare ? { prepare } : {}),
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
+          ...(input.beforeCommit ? { beforeCommit: input.beforeCommit } : {}),
+          ...(input.lockClass ? { lockClass: input.lockClass } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
@@ -470,7 +742,7 @@ export class SqliteStateBackend implements StateBackend {
           results: results.map((result) => ({ ...result })),
           changed: results.filter((result) => result.applied).map((result) => result.key),
           stamp: this.stateStamp(),
-          view: snapshotView(() => (captured ??= this.#current())),
+          view: snapshotView(() => (captured ??= this.#read(() => this.#current()))),
         });
       }
       return results;
@@ -482,7 +754,7 @@ export class SqliteStateBackend implements StateBackend {
   }
 
   withWriteFence<T>(operation: () => T): T {
-    const store = this.#open();
+    const store = this.#read(() => this.#open());
     let entered = false;
     try {
       return store.fenceSync(() => { entered = true; return operation(); });
@@ -511,6 +783,15 @@ export class SqliteStateBackend implements StateBackend {
 
   // ------------------------------------------------------------ internals
 
+  // smarty-dev#6477: a synchronous read (and the open under it) never throws a raw "database is locked":
+  // a busy read retries briefly, then throws the retryable MeshStateBusyError every caller already retries.
+  #read<T>(read: () => T): T {
+    return retrySyncBusy(read, READ_BUSY_BUDGET_MS, busyHandlerMs(this.#storeOptions), (error, attempts, waitedMs) => {
+      this.#busyTimeouts += 1;
+      return meshStateBusyFrom(this.database, error, attempts, waitedMs);
+    });
+  }
+
   #pinned(options: MeshReadOptions): SqliteSnapshot | undefined {
     const token = options.snapshot;
     if (token === undefined || options.fresh === true || !this.#tokens.has(token)) return undefined;
@@ -529,17 +810,25 @@ export class SqliteStateBackend implements StateBackend {
     const store = this.#open();
     // The stamp carries the database's CURRENT epoch and retirement (read from state.db), so a
     // retirement by any connection is a miss; a hit is a live, unchanged state (review round 3).
+    // Every read checks it: SQLite reads stay exact (no readCacheMs window), as before.
     const stamp = store.stateStamp();
-    if (this.#snapshot?.stamp === stamp) return this.#snapshot;
-    this.#snapshot = undefined;
-    // The stamp is read first: a commit in between makes the snapshot newer than its stamp, so
-    // the next call only rebuilds it once more. `live` checks retirement in the export's own read
-    // transaction: a retired database throws MeshStateRetiredError, exactly as get/listAll do.
-    const exported = store.exportState({ live: true });
-    const entries = new Map<string, MeshStateEntry>();
-    for (const [key, entry] of Object.entries(exported.entries)) entries.set(key, freezeEntry(entry));
-    const sorted = Object.freeze([...entries.values()].sort((left, right) => left.key.localeCompare(right.key)));
-    const snapshot: SqliteSnapshot = { stamp, entries, sorted, versions: exported.versions };
+    const own = this.#snapshot;
+    if (own?.stamp === stamp) return own;
+    const database = path.resolve(this.database);
+    const shared = sharedSnapshot(database);
+    let snapshot: SqliteSnapshot;
+    if (shared?.stamp === stamp) snapshot = shared;
+    else {
+      // smarty-dev#6477: a miss brings the newest snapshot of this lineage forward by the change feed
+      // (only the changed rows are read and parsed) instead of exporting every row. The delta and
+      // its stamp come from ONE read transaction; a retired database throws MeshStateRetiredError
+      // there, exactly as get/listAll do.
+      const lineage = lineageOf(stamp);
+      const bases = [own, shared].filter((candidate): candidate is SqliteSnapshot => candidate?.lineage === lineage);
+      const base = bases.sort((left, right) => right.commit - left.commit)[0];
+      snapshot = refreshSnapshot(store, base);
+      shareSnapshot(database, snapshot);
+    }
     this.#tokens.add(snapshot);
     this.#snapshot = snapshot;
     return snapshot;
@@ -550,15 +839,14 @@ export class SqliteStateBackend implements StateBackend {
     if (this.#closed) throw new Error("Fabric mesh SQLite state backend is closed");
     // A synchronous read needs the database now. Opening is busy only while another connection
     // initialises the schema or holds the write lock at our first BEGIN IMMEDIATE: retry briefly.
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        this.#store = SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions);
-        return this.#store;
-      } catch (error) {
-        if (!sqliteBusy(error) || attempt >= 25) throw error;
-        sleepSync(1 + attempt % 2);
-      }
-    }
+    // An open runs several statements, each of which may wait in the busy handler; the budget still bounds it.
+    this.#store = retrySyncBusy(
+      () => SqliteStateStore.openSync(this.root, this.#context.maxEventBytes, this.#context.maxReadEvents, this.#storeOptions),
+      OPEN_BUSY_BUDGET_MS, busyHandlerMs(this.#storeOptions), (error, attempts, waitedMs) => {
+        this.#busyTimeouts += 1;
+        return meshStateBusyFrom(this.database, error, attempts, waitedMs, "first open");
+      });
+    return this.#store;
   }
 
   /**
@@ -623,9 +911,10 @@ export class SqliteStateBackend implements StateBackend {
   async #write<T>(operation: (store: SqliteStateStore) => Promise<T>): Promise<T> {
     const started = performance.now();
     const scope = this.#context.lock.tryLockScope.getStore();
-    // A bounded try spends ONE budget on the whole write: first open included (review round 1).
+    // A bounded try spends ONE budget on the whole write: first open included (review round 1). A try of 1 s or
+    // more gets at least BOUNDED_WAIT_MS of it (smarty-dev#9805).
     const deadline = scope?.active
-      ? started + Math.max(0, Math.min(scope.timeoutMs, this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
+      ? started + Math.max(0, Math.min(boundedWaitMs(scope.timeoutMs), this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
       : undefined;
     let store: SqliteStateStore | undefined;
     try {
@@ -634,12 +923,17 @@ export class SqliteStateBackend implements StateBackend {
       const result = deadline !== undefined
         ? await ready.withTryLock(() => operation(ready), Math.max(0, deadline - performance.now()))
         : await operation(ready);
-      this.#snapshot = undefined;
+      // The kept snapshot is no longer current (its stamp moved), but it is the base the next read
+      // brings forward with this commit's change rows instead of a full export (smarty-dev#6477).
       return result;
     } catch (error) {
       if (error instanceof MeshLockTimeoutError && !(error instanceof MeshStateBusyError)) {
         this.#busyTimeouts += 1;
         throw new MeshStateBusyError(store?.file ?? this.database, performance.now() - started, error);
+      }
+      if (sqliteBusy(error)) {
+        this.#busyTimeouts += 1;
+        throw meshStateBusyFrom(store?.file ?? this.database, error, 1, performance.now() - started, "write");
       }
       throw error;
     }
@@ -712,9 +1006,18 @@ export class ShadowStateBackend implements StateBackend {
       ...sqliteOptions(shadowOptions, this.#budgetMs),
       // No maintainer runs for the shadow: keep its WAL small without one.
       emergencyCheckpointBytes: 8 * 1024 * 1024,
+      // A copy outside the mesh root, never the fence: it initialises itself (smarty-dev#6477).
+      initialize: "detached",
     });
-    const verifyMs = Math.max(0, Math.floor(options.shadowVerifyMs ?? 60_000));
+    const requestedVerifyMs = options.shadowVerifyMs ?? 60_000;
+    // Node treats an overflowing/NaN interval as 1 ms: do not turn a safety exception
+    // into an accidental high-frequency poll even for a malformed direct option.
+    const verifyMs = requestedVerifyMs <= 0 ? 0 : Number.isFinite(requestedVerifyMs)
+      ? Math.min(2_147_483_647, Math.max(60_000, Math.floor(requestedVerifyMs))) : 60_000;
     if (verifyMs > 0) {
+      // Named maintenance exception: shadow-divergence safety check. Unref'd, <= 1/minute,
+      // shadow only (never the normal file backend or an empty native bridge). Mirrors are
+      // already driven by commits; this checks out-of-process edits that bypass mirroring.
       // A failed reconcile is already counted by the mirror; only other verify failures count here.
       this.#timer = setInterval(() => {
         void this.verify().catch((error: unknown) => { if (!(error instanceof MeshShadowNotReconciledError)) this.#failures += 1; });

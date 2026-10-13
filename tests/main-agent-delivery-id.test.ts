@@ -68,6 +68,40 @@ const journalPath = () => {
   return path.join(dir, "main-followups", "root.json");
 };
 
+describe("Main delivery outcome evidence", () => {
+  const outcomes = (journal: string) => {
+    const directory = path.join(path.dirname(path.dirname(journal)), "delivery-outcomes");
+    return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+  };
+  it.each(["steer", "followUp"] as const)("records %s only after receiver consumption, never on ACK", delivery => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries, true);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 0, journal);
+    const send = { eventId: "send-1", to: main.id, from: actor.id, mode: delivery };
+    main.deliverAgent({ from: actor, message: "consume me", delivery, outcomeSend: send });
+    expect(outcomes(journal)).toEqual([]);
+    entries.push(persisted(h.sent[0]!));
+    h.emit("agent_settled", { outcome: "completed" }, context);
+    main.confirmInbox();
+    expect(outcomes(journal)).toEqual([{ ...send, outcome: "delivered", reason: "consumed by Main as itself", at: expect.any(Number) }]);
+    main.closeFollowUpDrain();
+  });
+  it("records replaced sends as superseded, not delivered via their carrier", () => {
+    const journal = journalPath(); const h = fakePi(); const entries: unknown[] = []; const context = busy(entries);
+    const main = new MainAgentController(h.pi, "session:root", true, "/tmp/project", "root");
+    main.attachFollowUpDrain(context, 60_000, journal);
+    for (const eventId of ["old", "new"]) main.deliverAgent({ from: actor, message: eventId, delivery: "followUp", data: { coalesceKey: "work" },
+      outcomeSend: { eventId, to: main.id, from: actor.id, mode: "followUp" } });
+    expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "superseded"]]);
+    h.emit("agent_before_settle", { outcome: "completed" }, context);
+    entries.push(persisted(h.sent[0]!));
+    main.confirmInbox();
+    expect(outcomes(journal).map(row => [row.eventId, row.outcome])).toEqual([["old", "superseded"], ["new", "delivered"]]);
+    main.closeFollowUpDrain();
+  });
+});
+
 describe("#169 round 3 receiver receipt durability", () => {
   it("keeps the journal until the session receipt file can be synced", () => {
     const journal = journalPath();

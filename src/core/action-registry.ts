@@ -1,5 +1,6 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
 import { snapshotFabricInvocation } from "../fabric-provenance.js";
+import { retainResidentProcessWork } from "../residency/process-work.js";
 import { CapabilityAuthority } from "../verified/authority.js";
 import { randomUUID } from "node:crypto";
 import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../components/effect-policy.js";
@@ -13,6 +14,7 @@ import {
   MAX_AUDIT_VALUE_CHARS,
   boundedPreviewValue,
   boundedResult,
+  strictDecisionResult,
   failedResultError,
   failedResultOutcome,
   previewArgs,
@@ -47,6 +49,7 @@ import {
   type FabricNamedActionTypeSource,
   type FabricProvider,
   type FabricProviderListRequest,
+  type FabricScope,
   type FabricScopedProviderResult,
 } from "../protocol.js";
 import {
@@ -166,6 +169,8 @@ export interface FabricRegistryInvocationContext extends FabricInvocationContext
 export const NESTED_TOOL_CALL_ID_PREFIX = FABRIC_NESTED_TOOL_CALL_ID_PREFIX;
 
 const providerNamePattern = /^[a-z][a-z0-9_-]*$/;
+/** Process-wide issuance record owned by src/scope.ts. */
+const SCOPE_HOLDER = Symbol.for("pi-fabric:scope:v1");
 
 /** structuredClone detaches ordinary nested references, but deliberately shares
  * SharedArrayBuffer backing memory. Such payloads cannot be approved as stable
@@ -307,14 +312,20 @@ export class ActionRegistry {
   #unavailableResolver: ((name: string) => string | undefined) | undefined;
   #speculation: FabricSpeculationRuntime | undefined;
   #speculationEligibility: ((action: ResolvedFabricAction) => boolean) | undefined;
+  #residentProcessWorkSessionId: string | undefined;
 
   constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
     this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
   }
 
+  /** Native mesh composition opts in; hosted registries never inspect ambient session APIs. */
+  setResidentProcessWorkSession(sessionId: string): void {
+    this.#residentProcessWorkSessionId = sessionId;
+  }
+
   /**
    * Attach the speculative-PTC runtime. Eligibility is re-checked against the
-   * resolved descriptor inside speculate(), so a config/captured-tool change
+   * resolved descriptor at launch and replay, so a config/captured-tool change
    * cannot sneak a side-effecting ref into the store after the fact.
    */
   setSpeculation(
@@ -323,6 +334,16 @@ export class ActionRegistry {
   ): void {
     this.#speculation = runtime;
     this.#speculationEligibility = eligibility;
+  }
+
+  #allowsSpeculation(action: ResolvedFabricAction): boolean {
+    const localRead = action.risk === "read" && action.effect?.kind === "none";
+    // MCP keeps its conservative network/effect classification. Only the live
+    // eligibility callback can attest an allowlisted read; explicit unsafe
+    // annotations still refuse even if a custom callback opts it in.
+    const mcpRead = action.provider === "mcp" && action.risk === "network" &&
+      action.annotations?.destructiveHint !== true && action.annotations?.readOnlyHint !== false;
+    return (localRead || mcpRead) && this.#speculationEligibility?.(structuredClone(action)) === true;
   }
 
   register(provider: FabricProvider, options: { overwrite?: boolean } = {}): void {
@@ -380,8 +401,11 @@ export class ActionRegistry {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  unregister(name: string): FabricProvider | undefined {
-    return this.#providerBindings.unregister(name);
+  unregister(
+    name: string,
+    options?: { provider?: FabricProvider; generation?: number | string; keepProviderOpen?: boolean },
+  ): FabricProvider | undefined {
+    return this.#providerBindings.unregister(name, options);
   }
 
   providers(context?: FabricInvocationContext): Array<{ name: string; description: string }> {
@@ -800,7 +824,7 @@ export class ActionRegistry {
         action.ref,
         effectiveSchema,
         provider.guardArguments
-          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args, context))
           : args,
       );
       const preparedArgs = provider.prepareArguments
@@ -854,6 +878,7 @@ export class ActionRegistry {
     const consumption = new ResultConsumption();
     const deferConsumption = context.deferResultConsumption;
     let endBindingInvocation: (() => Promise<void>) | undefined;
+    const releaseWork = retainResidentProcessWork(this.#residentProcessWorkSessionId);
     try {
       const { binding, provider, actionName, expectedDescriptorHash } = this.#parseRef(
         ref,
@@ -897,7 +922,7 @@ export class ActionRegistry {
         action.ref,
         effectiveSchema,
         provider.guardArguments
-          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args))
+          ? await this.#providerBindings.trackProvider(provider, () => provider.guardArguments!(providerActionName, args, context))
           : args,
       );
       const preparedArgs = provider.prepareArguments
@@ -1036,9 +1061,9 @@ export class ActionRegistry {
       let providerValue: unknown;
       let providerInvoked = false;
       try {
-      if (this.#speculation && action.risk === "read" && effect.kind === "none") {
+      if (this.#speculation && this.#allowsSpeculation(action)) {
         const served = await runAbortable(context.signal, () =>
-          this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null])));
+          this.#speculation!.tryServe(context.parentToolCallId, ref, snapshotArguments(catalog.args), JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null, context.scope?.digest ?? null, context.nativeToolResult === true])));
         if (served.hit) {
           providerValue = await runAbortable(context.signal, () => this.#runPlanned(binding, providerActionName, authority, "replay", catalog.args, context, served.value));
           throwIfExecutionExpired(context);
@@ -1141,7 +1166,9 @@ export class ActionRegistry {
           }))
         : providerValue;
       throwIfExecutionExpired(context);
-      const bounded = boundedResult(value, context.maxResultChars);
+      const bounded = action.ref === "jev.decide"
+        ? strictDecisionResult(value)
+        : boundedResult(value, context.maxResultChars);
       const resultError = failedResultError(value);
       const resultPreview = previewResult(bounded.value);
       const auditResult = boundedPreviewValue(resultPreview, MAX_AUDIT_VALUE_CHARS);
@@ -1195,6 +1222,7 @@ export class ActionRegistry {
     } finally {
       invocationActive = false;
       consumption.abandon();
+      releaseWork();
       if (audit) audit.endedAt ??= Date.now();
       void endBindingInvocation?.().catch(() => undefined);
     }
@@ -1246,7 +1274,7 @@ export class ActionRegistry {
         return undefined;
       }
       const authority = { ref: action.ref, descriptor: actionDescriptorHash(action) };
-      if (action.risk !== "read" || action.effect?.kind !== "none" || !this.#speculationEligibility(structuredClone(action))) return undefined;
+      if (!this.#allowsSpeculation(action)) return undefined;
       const effectiveSchema = effectiveInputSchema(
         action.ref,
         action.inputSchema,
@@ -1276,7 +1304,7 @@ export class ActionRegistry {
       }));
       return {
         get preparedArgs() { return snapshotArguments(repairedArgs); },
-        bindingToken: JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null]),
+        bindingToken: JSON.stringify([binding.id, authority.descriptor, context.capabilityView?.id ?? null, context.scope?.digest ?? null, context.nativeToolResult === true]),
         execute: async signal => {
           const combined = AbortSignal.any([context.signal!, ...(signal ? [signal] : [])]);
           const actual = execute(combined);
@@ -1564,7 +1592,13 @@ export class ActionRegistry {
     const view = context.capabilityView ? this.#requireView(context.capabilityView) : undefined;
     throwIfAborted(context.signal);
     if (this.#shutdown.signal.aborted) throw new FabricResolutionError("Fabric registry is closed");
-    return snapshotFabricInvocation({ ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) });
+    // Host-issued scope (src/scope.ts) replaces any caller value; failed issuance refuses every call.
+    const issued = (globalThis as Record<symbol, { scope?: FabricScope; error?: string } | undefined>)[SCOPE_HOLDER];
+    if (issued?.error) throw new FabricResolutionError(`Fabric scope issuance failed; provider calls are refused: ${issued.error}`);
+    const scoped = { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#shutdown.signal, ...(context.signal ? [context.signal] : []), ...(view ? [view] : [])]), context.signal) };
+    if (issued?.scope) scoped.scope = issued.scope;
+    else delete scoped.scope;
+    return snapshotFabricInvocation(scoped);
   }
 
   #bindingContext<T extends FabricInvocationContext>(binding: FabricProviderBinding, context: T): T {

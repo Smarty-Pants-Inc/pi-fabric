@@ -77,10 +77,22 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     const active = session.getActiveToolNames();
     expect(active).toContain("fabric_exec");
     expect(active).toContain("fabric_reply");
-    expect(active).not.toContain("bash");                         // Fabric does own the model's tools
+    // Pi 1.x: Fabric keeps tools active (native nested calls) and owns the model's
+    // declarations through the tool loadout, so check what the model is offered.
+    let declared: string[] | undefined;
 
     faux.setResponses([
-      fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })),
+      (context) => {
+        // Replay system messages in order: toolsAdded/toolsRemoved yield the declared set.
+        const tools = new Set<string>();
+        for (const message of context.messages as Array<{ role: string; toolsAdded?: Array<{ name: string }>; toolsRemoved?: Array<{ name: string }> }>) {
+          if (message.role !== "system") continue;
+          for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+          for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+        }
+        declared = [...tools];
+        return fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" }));
+      },
       fauxAssistantMessage(fauxToolCall("fabric_reply", { action: "message", message: "Look at #85." })),
     ]);
     const replyOrder: Array<{ role: string; replyExists: boolean }> = [];
@@ -94,6 +106,9 @@ describe.skipIf(!built)("fabric_reply in a real Pi session with Fabric", () => {
     });
     await session.prompt("an event");
     unsubscribe();
+    expect(declared).toContain("fabric_exec");
+    expect(declared).toContain("fabric_reply");
+    expect(declared).not.toContain("bash");                        // Fabric does own the model's tools
     expect(replyOrder).toEqual([
       { role: "assistant", replyExists: false },
       { role: "toolResult", replyExists: true },

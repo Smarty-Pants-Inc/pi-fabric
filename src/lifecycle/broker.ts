@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
-import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import {
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX,
@@ -31,7 +31,8 @@ const subscriptionKey = (id: string): string =>
   FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + id;
 
 export class LifecycleBroker {
-  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll");
+  readonly #backgroundPoll = new MeshBackgroundRetry("lifecycle cursor poll")
+    .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.identity })));
   readonly #backgroundPublish = new MeshBackgroundQueue("participant lifecycle event");
 
   publishBackground(request: FabricLifecyclePublishRequest): Promise<void> {
@@ -226,6 +227,9 @@ export class LifecycleBroker {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
     const listed = new Set<string>();
     let latestSequence: number | undefined;
+    // One directory rebuild serves every subscription in this cycle that still
+    // needs a target lookup (upstream ee2b27b85).
+    let directory: Map<string, FabricParticipantInfo> | undefined;
     for (const entry of entries) {
       if (this.options.canConsumeMesh?.() === false) return;
       const subscription = lifecycleSubscriptionFromValue(entry.value);
@@ -243,7 +247,10 @@ export class LifecycleBroker {
       if (this.participants.publishes?.(subscription.to) === false) continue;
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
-      const target = this.participants.get(subscription.to);
+      directory ??= new Map(
+        this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
+      );
+      const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
       if (!target || target.stale || !target.local) continue;
       await this.#drainSubscription(entry, subscription);
     }

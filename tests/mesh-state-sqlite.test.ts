@@ -81,7 +81,100 @@ const outcome = async <T>(run: () => Promise<T>): Promise<unknown> => {
 };
 
 describe("SqliteStateStore", () => {
-  it("opens WAL with synchronous=NORMAL, no client autocheckpoint, a clamped busy timeout and a 0600 file", async () => {
+  it.skipIf(process.platform !== "linux")("binds the connection to the validated state.db before any SQL: a swap put back before the check still fails closed, with other connections open (smarty-dev#7784)", async () => {
+    const root = tempRoot("pin");
+    const other = tempRoot("pin-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const db = path.join(root, "state.db");
+    // Other connections in this process hold the real file (and the foreign one) open throughout.
+    const held = [await open(root), openNodeSqlite(db), openNodeSqlite(path.join(other, "state.db"))];
+    let sql = 0;
+    // An ABA swap after assertPrivateStateFiles: state.db is replaced while SQLite opens it, then put back before
+    // openPinned looks, so the path names the validated inode again.
+    for (const swap of ["symlink", "rename"] as const) {
+      const swapping = (file: string): SqliteConnection => {
+        fs.renameSync(db, `${db}.aside`);
+        if (swap === "symlink") fs.symlinkSync(path.join(other, "state.db"), db);
+        else fs.copyFileSync(path.join(other, "state.db"), db);
+        const connection = openNodeSqlite(file);
+        fs.renameSync(`${db}.aside`, db); // put back: replaces the link or the copy
+        const prepare = connection.prepare.bind(connection);
+        connection.prepare = ((text: string) => { sql++; return prepare(text); }) as typeof connection.prepare;
+        return connection;
+      };
+      await expect(open(root, { open: swapping }), swap).rejects.toThrow(/refuses .*state\.db: the connection('s own descriptor on it is not proven \(0 new, [1-9]\d* other| opened a different file)/);
+      expect(sql, swap).toBe(0); // rejected before any statement ran on the swapped connection
+    }
+    expect((await open(root)).get("who/am")?.value).toBe("mine");
+    for (const connection of held) connection.close();
+  });
+
+  it.skipIf(process.platform !== "linux")("accepts SQLite's reuse of a descriptor parked on the validated inode, and refuses one parked on another database during a swap (smarty-dev#7784)", async () => {
+    const root = tempRoot("park");
+    const other = tempRoot("park-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const db = path.join(root, "state.db");
+    const fds = (file: string) => fs.readdirSync("/proc/self/fd").filter(fd => {
+      try { return fs.readlinkSync(`/proc/self/fd/${fd}`) === fs.realpathSync(file); } catch { return false; }
+    }).length;
+    // Park a descriptor on OUR inode: a second store closes while the first still has the file open.
+    const first = await open(root);
+    (await open(root)).close();
+    expect(fds(db)).toBe(2); // one live, one parked by SQLite
+    const reopened = await open(root); // SQLite reuses the parked descriptor: zero new, proven by the count
+    expect(fds(db)).toBe(2);
+    expect(reopened.get("who/am")?.value).toBe("mine");
+    reopened.close(); first.close();
+    // Park a descriptor on the OTHER database, then swap our path to it while SQLite opens (ABA, put back).
+    const foreign = path.join(other, "state.db");
+    const holder = await open(other);
+    (await open(other)).close();
+    expect(fds(foreign)).toBe(2);
+    const ours = await open(root); // our inode is open too, with nothing parked on it
+    let sql = 0;
+    const swapping = (file: string): SqliteConnection => {
+      fs.renameSync(db, `${db}.aside`);
+      fs.symlinkSync(foreign, db);
+      const connection = openNodeSqlite(file); // reuses the foreign parked descriptor: zero new
+      fs.renameSync(`${db}.aside`, db);
+      const prepare = connection.prepare.bind(connection);
+      connection.prepare = ((text: string) => { sql++; return prepare(text); }) as typeof connection.prepare;
+      return connection;
+    };
+    await expect(open(root, { open: swapping })).rejects.toThrow(/refuses .*state\.db: the connection's own descriptor on it is not proven \(0 new, 0 other, 0 parked here, parked elsewhere\)/);
+    expect(sql).toBe(0);
+    ours.close(); holder.close();
+    expect((await open(root)).get("who/am")?.value).toBe("mine");
+  });
+
+  // smarty-dev#7548: one process may hold two roots (the shadow-mode resident host: state-shadow/ and
+  // state-projector/). A descriptor parked on the other root must not fail this root's reuse closed.
+  it.skipIf(process.platform !== "linux")("accepts reuse on this root while another root held by this process has a parked descriptor (smarty-dev#7548)", async () => {
+    const root = tempRoot("park-two");
+    const other = tempRoot("park-two-other");
+    for (const [where, value] of [[root, "mine"], [other, "theirs"]] as const) {
+      const store = await open(where);
+      await store.put({ key: "who/am", value, identity });
+      store.close();
+    }
+    const holders = [await open(other), await open(root)];
+    (await open(other)).close(); // parks a descriptor on the other root
+    (await open(root)).close(); // and one on this root
+    const reopened = await open(root); // SQLite reuses this root's parked descriptor: zero new
+    expect(reopened.get("who/am")?.value).toBe("mine");
+    reopened.close();
+    for (const holder of holders) holder.close();
+  });
+
+  it("opens WAL with synchronous=NORMAL, SQLite's PASSIVE autocheckpoint (smarty-dev#6477), a clamped busy timeout and a 0600 file", async () => {
     const root = tempRoot("pragmas");
     const executed: string[] = [];
     const recording = (file: string): SqliteConnection => {
@@ -92,7 +185,7 @@ describe("SqliteStateStore", () => {
     const store = await open(root, { open: recording, busyTimeoutMs: 10_000 });
     await store.put({ key: "a/1", value: 1, identity });
     expect(executed).toEqual(expect.arrayContaining([
-      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 0", "BEGIN IMMEDIATE", "COMMIT",
+      "PRAGMA busy_timeout = 5", "PRAGMA synchronous = NORMAL", "PRAGMA wal_autocheckpoint = 1000", "BEGIN IMMEDIATE", "COMMIT",
     ]));
     const observer = raw(root);
     expect(observer.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
@@ -478,6 +571,22 @@ describe("SqliteStateStore", () => {
     const sampler = setInterval(() => { maxWal = Math.max(maxWal, maintainer.walBytes()); }, 10);
     fs.writeFileSync(go, "");
     const writerResults = await Promise.all(children.slice(0, writers).map(entry => entry.done));
+    const duringBurst = { ...maintainer.stats().checkpoints };
+    // smarty-dev#7651: the claim under test, with the readers still scanning back to back. A guarded TRUNCATE yields to
+    // every concurrent commit by design (smarty-dev#6100), so how many win DURING the write burst depends on host load
+    // (CI saw 0 at high load). Once the writers are done, constant readers alone must not keep it from winning.
+    // One more commit, so the WAL holds frames to reset even if a burst-time TRUNCATE already emptied it.
+    await maintainer.put({ key: "after/burst", value: 1, identity });
+    let underReaders = false;
+    const settleStarted = Date.now();
+    let settleCalls = 0;
+    while (!underReaders && Date.now() - settleStarted < 30_000) {
+      settleCalls += 1;
+      underReaders = (await maintainer.checkpointSettled(0)).truncated;
+      if (!underReaders) await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const settleMs = Date.now() - settleStarted;
+    const walAfterSettle = maintainer.walBytes();
     fs.writeFileSync(stop, "");
     const readerResults = await Promise.all(children.slice(writers).map(entry => entry.done));
     clearInterval(sampler);
@@ -487,11 +596,15 @@ describe("SqliteStateStore", () => {
     const stats = maintainer.stats();
     const walTraffic = writers * fills * 3_000;
     // Evidence for the PR: WAL bound versus the bytes written through it.
-    console.log(JSON.stringify({ maxWal, walTraffic, reads, checkpoints: stats.checkpoints }));
+    console.log(JSON.stringify({ maxWal, walTraffic, reads, duringBurst, checkpoints: stats.checkpoints, underReaders, settleMs, settleCalls }));
     expect(reads).toBeGreaterThan(readers);
+    expect(underReaders).toBe(true); // constant readers cannot starve the TRUNCATE
+    expect(walAfterSettle).toBe(0); // and it reset the WAL while they were still reading
     expect(stats.checkpoints.truncate).toBeGreaterThan(0);
-    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe).
-    expect(maxWal).toBeLessThan(Math.max(16 * 1024 * 1024, walTraffic / 2));
+    // Without TRUNCATE under constant readers, the WAL only grows (review-opus P2-1 probe). Under any load it stays
+    // below the store's emergency checkpoint bound (64 MiB): the guarantee a busy host keeps. On an idle host the
+    // burst-time TRUNCATEs keep it near 6 MiB (logged above), but that depends on quiet windows the load removes.
+    expect(maxWal).toBeLessThan(64 * 1024 * 1024);
     maintainer.checkpoint(0);
     expect(maintainer.walBytes()).toBe(0);
     await maintainer.sync();

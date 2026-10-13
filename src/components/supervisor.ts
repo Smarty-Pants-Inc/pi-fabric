@@ -1,5 +1,6 @@
 import { transitionCurrent, cleanupState as verifiedCleanupState } from "../verified/policy.js";
 import { validateComponentConfig } from "./validation.js";
+import { withFabricHostCaller } from "../fabric-provenance.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   type ActionRegistry,
@@ -1389,11 +1390,11 @@ export class FabricComponentSupervisor {
 
   #invocationContext(component: ManagedComponent): FabricInvocationContext {
     const base = this.options.invocationContext?.() ?? defaultInvocationContext();
-    return {
+    return withFabricHostCaller({
       ...base,
       parentToolCallId: `component:${component.entry.id}:${component.revision}`,
       nestedToolCallId: `component:${component.entry.id}:${component.revision}`,
-    };
+    }, component.entry.id);
   }
 
   #info(

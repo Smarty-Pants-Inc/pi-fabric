@@ -20,6 +20,7 @@ describe("AgentMessageRouter provider backoff receipts", () => {
       accepted: true, messageId: "held-message", triggered: false, reason, pendingFollowUps: 1,
     });
     expect(deliverAgent).toHaveBeenCalledExactlyOnceWith({ from, verification: "bridge", message: "resume",
-      delivery: operation, deliveryId: command.commandId, triggerTurn: true });
+      delivery: operation, deliveryId: command.commandId, triggerTurn: true,
+      outcomeSend: { eventId: command.commandId, to: command.targetId, from: from.id, mode: operation } });
   });
 });

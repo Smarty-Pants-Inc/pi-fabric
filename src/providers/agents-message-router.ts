@@ -1,13 +1,17 @@
+import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
+import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
-import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
+import { terminalRejectionFields } from "../agents/terminal-target.js";
+import { terminalAgentStatuses } from "../agents/lifecycle.js";
+import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
-import type { FabricAgentMessageResult, FabricMainAgentTarget } from "../main-agent.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import { controlActorBindingOptions, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
+import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { FabricAgentRunner } from "../config.js";
 import type { ResidencyClient } from "../residency/client.js";
@@ -99,6 +103,17 @@ export class FabricRouteAuthorityError extends Error {
   }
 }
 
+/** Known pre-publication routing refusals: nothing was published, so the attempt failed. */
+const PRE_PUBLICATION_REFUSALS = new Set([
+  "FABRIC_ROUTE_AUTHORITY_CHANGED", "FABRIC_CONTROL_INCARNATION_REQUIRED",
+  "FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FABRIC_PARTICIPANT_NON_INTERACTIVE",
+]);
+const prePublicationRefusal = (error: unknown, reason: string): string | undefined => {
+  const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+  if (code !== undefined && PRE_PUBLICATION_REFUSALS.has(code)) return `${code}: ${reason}`;
+  return reason.includes("this attempt was not published") ? reason : undefined;
+};
+
 /** Distinguishes a pre-publication lease wait from an uncertain published ACK. */
 class LeaseResolutionStale extends FabricParticipantStaleError {}
 
@@ -109,9 +124,12 @@ class LeaseResolutionRequired extends Error {
 
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
+  #legacyDeliveryCount = 0;
+  /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
+  readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "resolveRoutingLease" | "retainedRouteAllowed">>,
     readonly control: Pick<FabricControlPlane, "request"> | undefined,
@@ -119,12 +137,12 @@ export class AgentMessageRouter {
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
   ) {}
-  #get(id: string): FabricParticipantInfo | undefined {
-    // Discovery and admission share this directory/root. A cached negative may predate the
-    // bridge's first presence refresh: re-read its files + state before declaring it unknown.
-    // lastKnown also reads fresh, but deliberately discards newly live records (smarty-dev#2377).
-    const participant = this.#directoryRead(() =>
-      this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true }));
+  #get(id: string, fresh = false): FabricParticipantInfo | undefined {
+    // Discovery can use its cached view, but sender admission must refresh positive records
+    // too: a cached epoch cannot authorize control after a target reloads or downgrades.
+    const participant = this.#directoryRead(() => fresh
+      ? this.participants.get(id, undefined, { fresh: true })
+      : this.participants.get(id) ?? this.participants.get(id, undefined, { fresh: true }));
     const reason = !participant ? this.#directoryUnavailable() : undefined;
     if (reason) throw new FabricDirectoryUnavailableError(reason);
     return participant;
@@ -226,13 +244,11 @@ export class AgentMessageRouter {
 
   #rootRouteSnapshot(id: string): FabricParticipantInfo | undefined {
     const cached = this.#directoryRead(() => this.participants.get(id));
-    // Keep a mirrored root's original bridge for the control plane's fresh admission check.
-    if (cached?.kind === "root" && cached.remoteHost) return cached;
     const fresh = this.#directoryRead(() => this.participants.get(id, undefined, { fresh: true })) ?? this.#lapsedRoot(id);
     if (cached?.kind === "root") {
-      // Refresh native lifecycle state only under the same authority. A replacement mirror
-      // with the same id must never turn a private native delivery into bridge publication.
-      if (!fresh || fresh.kind !== "root" || fresh.remoteHost || fresh.id !== cached.id ||
+      // Refresh the epoch only under the same authority and link. A replacement mirror
+      // must never turn a native send into bridge publication, or redirect an existing link.
+      if (!fresh || fresh.kind !== "root" || fresh.remoteHost !== cached.remoteHost || fresh.id !== cached.id ||
         fresh.rootId !== cached.rootId || fresh.ownerHostId !== cached.ownerHostId ||
         fresh.ownerIdentityId !== cached.ownerIdentityId) throw new FabricRouteAuthorityError(id);
       return fresh;
@@ -303,7 +319,7 @@ export class AgentMessageRouter {
 
   /** Normalize late stop-route reads just like message-route reads. */
   resolveStopParticipant(id: string): FabricParticipantInfo | undefined {
-    return this.#get(id);
+    return this.#get(id, true);
   }
 
   #localMainNonInteractive(): boolean {
@@ -330,12 +346,15 @@ export class AgentMessageRouter {
     options: {
       principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
+      wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
     } = {},
   ): Promise<FabricAgentMessageResult> {
+    assertSteerPriority(options.priority, kind);
     // Resolve the child's bound target before recovery so retries retain the same
     // actor ownership/fence checks rather than trying to recover the alias itself.
     if (id === "spawner") {
@@ -344,7 +363,7 @@ export class AgentMessageRouter {
     }
     // Capture before routing yields; a queued incoming turn cannot change this send.
     if (context) context = snapshotFabricInvocation(context);
-    options = { ...options, idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
+    options = { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
@@ -355,6 +374,14 @@ export class AgentMessageRouter {
         : await this.#withDurableRecovery(id, recovering =>
           this.#withDirectory(() => this.#route(id, message, data, kind, context, options, false, !recovering), id, !recovering));
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+      // Only pre-publication/local definite refusals. Remote ACK outcomes belong to control.
+      const refusal = prePublicationRefusal(error, reason) ??
+        (/^(Unknown |Main's followUp queue is full|Fabric actor queue limit reached|Fabric participant .* is non-interactive)/.test(reason) ? reason : undefined);
+      if (root && !(error instanceof Error && "rejection" in error && error.rejection === "FABRIC_CONTROL_REJECTED") && refusal !== undefined) {
+        appendDeliveryOutcome(root, { eventId: options.idempotencyKey!, to: id, from: (options.from ?? this.actorManager.identity).id, mode: kind }, "failed", refusal);
+      }
       if (error instanceof FabricParticipantStaleError && !error.idempotencyKey) {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
@@ -449,7 +476,9 @@ export class AgentMessageRouter {
     options: {
       principal?: FabricPrincipal | undefined;
       from?: MeshIdentity;
+      wakeCause?: FabricWakeCause | undefined;
       triggerTurn?: boolean;
+      priority?: FabricSteerPriority;
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
@@ -488,17 +517,20 @@ export class AgentMessageRouter {
           kind: "agent",
           name: "Main",
         });
-        return this.mainAgent.deliverAgent({
+        return this.mainAgent.deliverAgent(copyFabricWakeAdmission(options, {
           from: options.from ?? this.actorManager.identity,
           verification: "mesh", // In-process registered producer, not a received command.
           principal: options.principal,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
+          outcomeSend: { eventId: options.idempotencyKey!, to: this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
+          ...(options.priority ? { priority: options.priority } : {}),
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
             : {}),
           ...(data === undefined ? {} : { data }),
-        });
+        }));
       }
       let participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id);
       if (!participant) {
@@ -514,19 +546,26 @@ export class AgentMessageRouter {
       }
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
-      if (!this.control || participant.controlProtocol === "legacy") {
+      const ownerIncarnation = controlOwnerIncarnation(participant);
+      if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+        if (options.priority) throw new Error("interrupt priority requires the Fabric Main control protocol");
+        warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
         return context?.signal || options.principal
           ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
           : this.actorManager.steerRemote(participant.id, message, kind, data);
       }
+      if (!this.control) throw new Error("Fabric control plane is unavailable");
       return this.control.request(
         participant.ownerHostId,
         participant.id,
         kind,
         {
           principal: options.principal,
+          ownerIncarnation,
+          ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           data,
+          ...(options.priority ? { priority: options.priority } : {}),
           // Carry the local Main default across runtime generations (#3015).
           ...(kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
@@ -542,6 +581,8 @@ export class AgentMessageRouter {
         },
       );
     }
+
+    if (options.priority) throw new Error("interrupt priority is supported only for a Main target");
 
     // Explicit Main addresses never reach task/actor resolution, even when absent.
     if (id.trim().startsWith("session:")) {
@@ -572,21 +613,37 @@ export class AgentMessageRouter {
 
     // An agent another host owns (a durable child in its spawner's resident host, or a peer's
     // task agent) takes steer and follow-up through its owner (smarty-dev#1323).
-    const remoteAgent = this.#get(id);
+    let remoteAgent = this.#get(id, true);
     if (remoteAgent?.kind === "agent" && !remoteAgent.local) {
-      if (!remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
+      if (terminalAgentStatuses.has(remoteAgent.status) && remoteAgent.stale) throw new FabricRouteAuthorityError(remoteAgent.id);
+      const nativeTerminalTask = remoteAgent.runner === "pi" && remoteAgent.transport === "process" &&
+        terminalAgentStatuses.has(remoteAgent.status) && Boolean(remoteAgent.finalAnswerReceiptId);
+      if (nativeTerminalTask) {
+        // Terminal tasks advertise no ingress capability. Their still-live exact
+        // owner must nevertheless answer with the typed final receipt refusal.
+        // Revalidate authority; stale/withdrawn/replaced owners never gain a route.
+        const fresh = this.#directoryRead(() => this.participants.get(remoteAgent!.id, undefined, { fresh: true }));
+        if (!fresh || fresh.stale || fresh.kind !== "agent" || fresh.runner !== "pi" || fresh.transport !== "process" ||
+            !terminalAgentStatuses.has(fresh.status) || fresh.finalAnswerReceiptId !== remoteAgent.finalAnswerReceiptId ||
+            fresh.startedAt !== remoteAgent.startedAt || fresh.ownerHostId !== remoteAgent.ownerHostId ||
+            fresh.ownerIdentityId !== remoteAgent.ownerIdentityId || fresh.rootId !== remoteAgent.rootId ||
+            fresh.remoteHost !== remoteAgent.remoteHost) throw new FabricRouteAuthorityError(remoteAgent.id);
+        remoteAgent = fresh;
+      }
+      if (!nativeTerminalTask && !remoteAgent.capabilities.includes(kind)) throw new Error(`Fabric participant ${remoteAgent.id} does not support ${kind}`);
+      // Capture the epoch from the final (possibly revalidated) record, never an earlier read.
+      const ownerIncarnation = controlOwnerIncarnation(remoteAgent);
       if (!this.control) throw new Error("Fabric control plane is unavailable");
       context?.activity?.({ type: "entity", id: remoteAgent.id, kind: "agent", name: remoteAgent.name });
       return this.control.request(
         remoteAgent.ownerHostId,
         remoteAgent.id,
         kind,
-        { message, data, principal: options.principal },
+        { message, data, principal: options.principal, ownerIncarnation },
         remoteAgent.ownerIdentityId,
         { idempotencyKey: options.idempotencyKey, routedRemoteHost: remoteAgent.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
       );
     }
-
     // Persistent actors consume both delivery modes through their serial mailbox.
     this.actorManager.validateDirectMessage(message, data);
     let target: { actor?: FabricActorInfo; participant?: FabricParticipantInfo };
@@ -608,12 +665,14 @@ export class AgentMessageRouter {
       context?.activity?.({ type: "entity", id: actor.id, kind: "actor", name: actor.name });
       const result = this.actorManager.tell(actor.id, message, data, {
         provenance,
+        outcomeSend: { eventId: options.idempotencyKey!, to: actor.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
         ...(binding ? { overrides: binding } : {}),
       });
       return { queued: true, messageId: result.messageId, routed: "local" };
     }
     if (!participant) throw new Error(`Fabric actor ${actor!.id} has no live execution owner`);
     if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
+    const ownerIncarnation = controlOwnerIncarnation(participant);
     const sessionBinding = actor?.binding;
     const ownRoot = participant.rootId === this.mainAgent.id;
     const resolvedBinding = ownRoot ? binding : actor
@@ -627,31 +686,83 @@ export class AgentMessageRouter {
     if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
       throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
     }
-    if (!this.control || participant.controlProtocol === "legacy") {
-      if (needsBinding) {
-        throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
-      }
+    if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
+      if (needsBinding) throw new Error(`Fabric actor owner ${participant.ownerHostId} has no binding control channel`);
+      warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
       return context?.signal || options.principal
-          ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
-          : this.actorManager.steerRemote(participant.id, message, kind, data);
+        ? this.actorManager.steerRemote(participant.id, message, kind, data, options.principal, context?.signal)
+        : this.actorManager.steerRemote(participant.id, message, kind, data);
     }
-    return this.control.request(
-      participant.ownerHostId,
-      participant.id,
-      kind,
-      {
-        principal: options.principal,
-        message,
-        data,
-        ...(typeof options.triggerTurn === "boolean"
-          ? { triggerTurn: options.triggerTurn }
-          : {}),
-        ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
-        ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
-      },
-      participant.ownerIdentityId,
-      { idempotencyKey: options.idempotencyKey, routedRemoteHost: participant.remoteHost ?? null, ...(context?.signal ? { signal: context.signal } : {}) },
-    );
+    if (!this.control) throw new Error("Fabric control plane is unavailable");
+    const control = this.control;
+    // The same idempotency key (one commandId) covers the one dormant-wake resend.
+    return this.sendAfterDormantWake(participant, owner => {
+      if (!owner.capabilities.includes(kind)) throw unsupported(owner, kind);
+      if (needsBinding && !owner.capabilities.includes("actor-bindings")) {
+        throw new Error(`Fabric actor owner ${owner.ownerHostId} does not support session bindings`);
+      }
+      return control.request(
+        owner.ownerHostId,
+        owner.id,
+        kind,
+        {
+          principal: options.principal,
+          ownerIncarnation: controlOwnerIncarnation(owner),
+          message,
+          data,
+          ...(typeof options.triggerTurn === "boolean"
+            ? { triggerTurn: options.triggerTurn }
+            : {}),
+          ...(needsBinding && resolvedBinding ? { binding: resolvedBinding } : {}),
+          ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+        },
+        owner.ownerIdentityId,
+        {
+          idempotencyKey: options.idempotencyKey, routedRemoteHost: owner.remoteHost ?? null,
+          // Retained dormant authority has no live-owner ACK window yet. Its committed
+          // command must include bounded cold startup, formerly waited out in preflight.
+          ...(owner.stale ? { timeoutMs: 90_000 } : {}),
+          ...(context?.signal ? { signal: context.signal } : {}),
+        },
+      );
+    });
+  }
+
+  /**
+   * Dormant wake re-resolve (#774 with the #709 fence). A message to a dormant actor addresses its
+   * retained wake route, which names the epoch of the activation that went dormant. Its committed
+   * command wakes the actor; the woken successor runs under its own fresh epoch, publishes it
+   * (participant record, then its rewritten wake route) and refuses the predecessor epoch with
+   * FABRIC_CONTROL_STALE_INCARNATION before any claim or handler. The refusal attests no run.
+   *
+   * ponytail: one re-read and one resend, never a loop. Only a target this router resolved from a
+   * retained dormant route qualifies. Re-read its participant once; only when the same owner and
+   * actor lineage now advertise a different epoch, resend once under the same idempotency key. The
+   * key keeps the commandId, so the owner's claim answers any duplicate with the one outcome. A
+   * second refusal, a refusal from a live (non-dormant) target and every other error reach the
+   * caller unchanged: re-resolving and deciding to send again stays the caller's decision (#709).
+   */
+  async sendAfterDormantWake<T>(
+    addressed: FabricParticipantInfo,
+    send: (owner: FabricParticipantInfo) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send(addressed);
+    } catch (error) {
+      if (!(error instanceof FabricControlStaleIncarnationError) || !this.#dormantRoutes.has(addressed)) throw error;
+      let current: FabricParticipantInfo | undefined;
+      let fresh: string | undefined;
+      try {
+        current = (await this.resolveActorMessageTarget(addressed.id)).participant;
+        fresh = current ? controlOwnerIncarnation(current) : undefined;
+      } catch { throw error; }
+      if (!current || fresh === undefined || fresh === controlOwnerIncarnation(addressed) ||
+          current.id !== addressed.id || current.kind !== "actor" || current.rootId !== addressed.rootId ||
+          current.ownerHostId !== addressed.ownerHostId || current.ownerIdentityId !== addressed.ownerIdentityId ||
+          current.actorOwnershipToken !== addressed.actorOwnershipToken ||
+          (current.remoteHost ?? null) !== (addressed.remoteHost ?? null)) throw error;
+      return send(current);
+    }
   }
 
   async acceptControl(
@@ -660,6 +771,12 @@ export class AgentMessageRouter {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    try {
+      assertSteerPriority(command.priority, command.operation);
+      if (command.priority && !(this.mainAgent.local && this.mainAgent.matches(command.targetId))) {
+        throw new Error("interrupt priority is supported only for a Main target");
+      }
+    } catch (error) { return { accepted: false, error: error instanceof Error ? error.message : String(error) }; }
     if (command.operation === "setModel" || command.operation === "setThinking") {
       return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
     }
@@ -712,7 +829,7 @@ export class AgentMessageRouter {
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId) },
+          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -728,21 +845,25 @@ export class AgentMessageRouter {
       }
       let result: FabricAgentMessageResult;
       try {
-        result = this.mainAgent.deliverAgent({
+        result = this.mainAgent.deliverAgent(copyFabricWakeAdmission(command, {
         from,
         ...(verification === undefined ? {} : { verification }),
         principal: provenance?.principal,
         message,
         delivery: command.operation,
+        ...(command.priority ? { priority: command.priority } : {}),
         deliveryId: command.commandId,
+        outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),
         ...(command.data === undefined ? {} : { data: command.data }),
-        });
+        }));
       } catch (error) {
-        // A full followUp queue, for example: the sender sees why.
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+        // Admission refusals retain their typed code across verified mesh/bridge ACKs.
+        const errorCode = interruptErrorCode(error);
+        return { accepted: false, error: error instanceof Error ? error.message : String(error),
+          ...(errorCode ? { errorCode, notRun: true } : {}) };
       }
       return {
         accepted: true,
@@ -765,7 +886,8 @@ export class AgentMessageRouter {
         ...(result.warning ? { warning: result.warning } : {}) };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) {
-        return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+        return { accepted: false, error: error instanceof Error ? error.message : String(error),
+          ...terminalRejectionFields(error) };
       }
     }
     try {
@@ -778,7 +900,7 @@ export class AgentMessageRouter {
       // Refuse inexact owner-side model selections before acknowledging a synchronous tell.
       // Validate without promoting the owner's current defaults into fixed per-call overrides.
       await this.actorManager.resolveActivationBinding(actor.id, options);
-      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options });
+      const result = this.actorManager.tell(actor.id, message, command.data, { provenance, ...options, sender: command.sender ?? null });
       return { accepted: true, messageId: result.messageId };
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) {
@@ -796,6 +918,21 @@ export class AgentMessageRouter {
 
   async #resolveActorMessageTarget(id: string, recoverLease = true): Promise<ReturnType<AgentMessageRouter["resolveActorTarget"]>> {
     if (id.trim().startsWith("session:")) throw this.#unknownParticipant(id, "Fabric Main participant");
+    const meshRoot = this.residency?.options.config.meshRoot ?? this.actorManager.mesh?.root;
+    const definition = this.resolveActorTarget(id, false);
+    if (meshRoot && definition.actor?.residency === "durable" &&
+        ["dormant", "failed", "failing-preparation"].includes(definition.actor.status) &&
+        !this.actorManager.owns?.(definition.actor.id) && !definition.participant) {
+      const { dormantActorRoute } = await import("../residency/wake.js");
+      const retained = dormantActorRoute(meshRoot, definition.actor);
+      // No wake effect here. The ordinary caller checks capability/binding/control;
+      // control then admits and commits a command. ONLY its post-commit hook wakes.
+      if (retained) {
+        if (!this.control) throw new Error(`Fabric actor owner ${retained.ownerHostId} has no acknowledged control channel`);
+        this.#dormantRoutes.add(retained); // see sendAfterDormantWake
+        return { actor: definition.actor, participant: retained };
+      }
+    }
     const target = this.resolveActorTarget(id, recoverLease);
     const { actor, participant } = target;
     if (this.residency && (actor?.residency ?? participant?.residency) === "durable" &&
@@ -837,7 +974,7 @@ export class AgentMessageRouter {
     } catch (error) {
       if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
     }
-    const participant = this.#get(actor?.id ?? id);
+    const participant = this.#get(actor?.id ?? id, true);
     if (!actor && (!participant || participant.kind !== "actor")) {
       throw this.#unknownParticipant(id, "Fabric actor");
     }

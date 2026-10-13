@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
+import { resolveFabricModelGuidance } from "../src/components/model-guidance.js";
 import { FabricState } from "../src/fabric-state.js";
 import type { FabricComponentDefinition, FabricProvider } from "../src/protocol.js";
 
@@ -30,6 +31,7 @@ const runtimeHarness = () => {
   class FakeRuntime {
     initialized = false;
     widgetDismissedAt = 0;
+    setDecisionProfile = vi.fn();
     initialize = vi.fn(async () => {
       if (blocked) await new Promise<void>((resolve) => { release = resolve; });
       this.initialized = true;
@@ -120,6 +122,40 @@ describe("FabricState lazy bootstrap", () => {
       expect(harness.loader).toHaveBeenCalledTimes(1);
     } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
   });
+  it("updates only decision defaults and forwards live changes without reactivation", async () => {
+    const profiles = { version: 1, defaultProfile: "fast", profiles: {
+      fast: { provider: "typesafe" }, vision: { provider: "openai" },
+    } };
+    const cwd = project({ jev: { decisionProfiles: profiles }, mesh: { enabled: false }, approvals: { execute: "deny" } });
+    const context = contextAt(cwd);
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(context);
+      state.setDecisionProfile(null);
+      expect(harness.loader).not.toHaveBeenCalled();
+      expect(state.config.jev.decisionProfile).toBeNull();
+      await state.ensure(context);
+      const runtime = harness.instances[0]!;
+      state.setDecisionProfile("vision");
+      expect(state.config.jev.decisionProfile).toBe("vision");
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith("vision");
+      state.setDecisionProfile(null);
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith(null);
+      state.setDecisionProfile(undefined);
+      expect(state.config.jev.decisionProfile).toBeUndefined();
+      expect(runtime.setDecisionProfile).toHaveBeenLastCalledWith(undefined);
+      for (const invalid of ["missing", "", "__proto__", "constructor", "prototype"]) {
+        expect(() => state.setDecisionProfile(invalid)).toThrow("Decision profile");
+      }
+      expect(runtime.setDecisionProfile).toHaveBeenCalledTimes(3);
+      expect(runtime.initialize).toHaveBeenCalledTimes(1);
+      expect(runtime.shutdown).not.toHaveBeenCalled();
+      expect(state.config.approvals.execute).toBe("deny");
+      expect(state.config.jev.decisionProfiles).toEqual(profiles);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it("loads normalized turn policy without importing or constructing the runtime", async () => {
     const cwd = project({
       fullCodeMode: false,
@@ -207,6 +243,58 @@ describe("FabricState lazy bootstrap", () => {
     } finally {
       await state.shutdown();
       fs.rmSync(cwd, { recursive: true, force: true }); fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("smarty-dev#8881: a runtime import that resolves after an SDK dispose never initializes the stale ctx", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    let releaseImport: (() => void) | undefined;
+    let gated = true;
+    const loader = vi.fn(async () => {
+      if (gated) await new Promise<void>((resolve) => { releaseImport = resolve; });
+      return (harness.loader as unknown as () => Promise<unknown>)();
+    }) as never;
+    const state = createState(loader);
+    // AgentSession.dispose() invalidates the ctx (every read throws) but emits no session_shutdown.
+    let stale = false;
+    const base = contextAt(cwd);
+    const disposed = new Proxy(base as object, {
+      get(object, key, receiver) {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return Reflect.get(object, key, receiver);
+      },
+    }) as ExtensionContext;
+    const hook = vi.fn();
+    state.setActivationHook(hook);
+    try {
+      await state.bootstrap(disposed);
+      const pending = state.ensure(disposed);
+      await vi.waitFor(() => expect(releaseImport).toBeTypeOf("function"));
+      stale = true;
+      gated = false;
+      releaseImport!();
+      await expect(pending).rejects.toThrow(/disposed/);
+      // No stale initialize, hook, or runtime left installed.
+      for (const instance of harness.instances) expect(instance.initialize).not.toHaveBeenCalled();
+      expect(hook).not.toHaveBeenCalled();
+      expect(state.initialized).toBe(false);
+
+      // A live successor session still activates normally.
+      const successor = contextAt(cwd, "session-2");
+      await state.bootstrap(successor);
+      const lease = await state.ensure(successor);
+      expect(lease.current()).toBe(true);
+      expect(state.initialized).toBe(true);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook).toHaveBeenCalledWith(successor);
+      const live = harness.instances.filter((instance) => instance.initialize.mock.calls.length > 0);
+      expect(live).toHaveLength(1);
+      expect((live[0]!.initialize.mock.calls[0] as unknown[])[0]).toBe(successor);
+    } finally {
+      gated = false; releaseImport?.();
+      await state.shutdown();
+      fs.rmSync(cwd, { recursive: true, force: true });
     }
   });
 
@@ -322,6 +410,44 @@ describe("FabricState lazy bootstrap", () => {
     }));
     expect(actorState.shouldEagerlyActivate(actorContext)).toBe(true);
     vi.unstubAllEnvs();
+  });
+
+  it("re-arms a published Main only in its cwd, not an unrelated damaged-config session on the same mesh", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, ui: { toolDisplay: "full" } });
+    const other = project();
+    const harness = runtimeHarness();
+    const first = createState(harness.loader);
+    const replacement = createState(harness.loader);
+    const unrelated = createState(harness.loader);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", path.join(cwd, "shared-mesh"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(cwd, "agent"));
+    try {
+      const context = contextAt(cwd, "published-main");
+      await first.bootstrap(context);
+      expect(first.shouldEagerlyActivate(context)).toBe(false);
+      await first.ensure(context);
+      await first.shutdown("reload");
+
+      // Both a reload and /new in the same cwd retain the published heartbeat.
+      for (const sessionId of ["published-main", "replacement-main"]) {
+        const next = contextAt(cwd, sessionId);
+        await replacement.bootstrap(next);
+        expect(replacement.shouldEagerlyActivate(next)).toBe(true);
+      }
+
+      // The same process and mesh do not make another cwd a published Main.
+      fs.writeFileSync(path.join(other, ".pi", "fabric.json"), "{ damaged config");
+      const next = contextAt(other, "unrelated-main");
+      await unrelated.bootstrap(next);
+      expect(unrelated.config.ui.toolDisplay).toBe("compact");
+      expect(unrelated.shouldEagerlyActivate(next)).toBe(false);
+      expect(harness.loader).toHaveBeenCalledTimes(1);
+    } finally {
+      await Promise.all([first.shutdown(), replacement.shutdown(), unrelated.shutdown()]);
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(other, { recursive: true, force: true });
+    }
   });
 
   it("announces a trusted Main at startup only when mesh.announce is set", async () => {
@@ -539,5 +665,40 @@ describe("FabricState lazy bootstrap", () => {
     await state.shutdown();
     expect(runtime.shutdown).toHaveBeenCalled();
     expect(state.initialized).toBe(false);
+  });
+});
+
+describe("FabricState built-in model guidance", () => {
+  // The Jev block must be part of the first system prompt. Registering it only
+  // when the runtime activates rewrites the prompt suffix mid-session and drops
+  // the provider prefix cache for the whole conversation.
+  it("resolves the Jev guidance before the runtime activates", async () => {
+    const cwd = project();
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    try {
+      await state.bootstrap(contextAt(cwd));
+      expect(harness.instances).toEqual([]);
+      const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+        model: "probe/probe", target: "main",
+      });
+      expect(resolved.appendText).toContain("Jev supplies typed Choice");
+      expect(resolved.sources.map((source) => source.label)).toEqual(["jev-programs"]);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("omits the Jev guidance when disabled or under Schema enforce", async () => {
+    for (const config of [{ jev: { enabled: false } }, { schema: { mode: "enforce" } }]) {
+      const cwd = project(config);
+      const harness = runtimeHarness();
+      const state = createState(harness.loader);
+      try {
+        await state.bootstrap(contextAt(cwd));
+        const resolved = resolveFabricModelGuidance(state.modelGuidance(), {
+          model: "probe/probe", target: "main",
+        });
+        expect(resolved.appendText ?? "").not.toContain("Jev supplies");
+      } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+    }
   });
 });

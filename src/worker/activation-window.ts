@@ -88,6 +88,15 @@ export class ActivationWindow {
   }
 }
 
+const RESPONSES = new Set(["openai-responses", "azure-openai-responses", "openai-codex-responses"]);
+// A qualified opaque reasoning item, keyed by identity plus ciphertext. The shared native Responses adapter
+// replays a thinkingSignature as this whole parsed item, its id unchanged, on all three RESPONSES APIs.
+const opaqueKey = (item: unknown): string | undefined => {
+  const r = item as Record<string, unknown> | null;
+  return r && typeof r === "object" && !Array.isArray(r) && r.type === "reasoning" &&
+    typeof r.id === "string" && typeof r.encrypted_content === "string" ? JSON.stringify([r.id, r.encrypted_content]) : undefined;
+};
+
 // ponytail: Pi catches extension exceptions and continues with the old context.
 // A synchronous exit of this disposable child is the fail-closed boundary, not
 // throw/abort/shutdown (which can leave a request or automatic retry runnable).
@@ -103,6 +112,23 @@ function failClosed(error: unknown): never {
   } finally {
     process.exit(78);
   }
+}
+
+// smarty-dev#3238 round 2: the worker types this refusal as CONTEXT_OVERFLOW from this frame,
+// bound to its run, nonce and hook like the readiness ACK, never from the stderr text below.
+function reportWindowRefusal(tokens: number, contextWindow: number): void {
+  try {
+    fs.writeSync(1, `${JSON.stringify({
+      type: "fabric_activation_window_refusal",
+      runId: process.env.PI_FABRIC_PARENT_RUN,
+      nonce: process.env.PI_FABRIC_ACTIVATION_NONCE,
+      protocol: 1,
+      hook: fs.realpathSync(fileURLToPath(import.meta.url)),
+      code: "context-overflow",
+      tokens,
+      contextWindow,
+    })}\n`);
+  } catch { /* the fail-closed exit below still stops the run, untyped */ }
 }
 
 /** Loaded only by an explicitly selected actor worker; adds no tools or trust. */
@@ -126,7 +152,10 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
     }
     // Bun source workers use native package imports (no Jiti root alias) and
     // do not yet implement findPackageJSON; Node hosts take the bound path above.
-    const { estimateTextTokens } = await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
+    const { calculateContextTokens, estimateMessageTokens, estimateTextTokens } =
+      await import(estimatorUrl) as typeof import("@earendil-works/pi-ai/utils/estimate");
+    const content = (messages: Parameters<typeof estimateMessageTokens>[0][]): number =>
+      messages.reduce((tokens, message) => message.role === "system" ? tokens : tokens + estimateMessageTokens(message), 0);
     pi.on("session_start", (_event, ctx) => {
       try {
         const hook = fs.realpathSync(fileURLToPath(import.meta.url));
@@ -177,14 +206,48 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
       for (const restore of guarded.values()) restore();
       guarded.clear();
     });
-    let lastPayload: { tokens: number; contextWindow: number; overheadTokens: number } | undefined;
+    // wireTokens: the admitted wire estimate (qualified opaque reasoning excluded). reportedTokens: the
+    // provider usage of exactly this dispatch, bound to its provider/model/api (not its window).
+    // inventory: opaque keys a trusted report covers, one per occurrence (this dispatch's input, then its output).
+    let lastPayload: { tokens: number; wireTokens: number; modelKey: string; reportedTokens?: number | undefined;
+      contextWindow: number; overheadTokens: number; inventory: string[] } | undefined;
+    let admissions = 0;
     pi.on("turn_end", async event => {
       try {
-        if (!window || !lastPayload || !event.toolResults.length) return;
-        // Measure the actual last dispatched payload plus this completed batch,
-        // not usage from before the tools or a carried journal's token count.
-        const completedBatch = convertToLlm([event.message, ...event.toolResults]);
-        const nextTokens = lastPayload.tokens + estimateTextTokens(JSON.stringify(completedBatch));
+        // A side request admitted in the same turn makes the response/dispatch pairing ambiguous.
+        const single = admissions === 1;
+        admissions = 0;
+        if (!window || !lastPayload) return;
+        const message = event.message;
+        if (single && message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted" &&
+            JSON.stringify([message.provider, message.model, message.api]) === lastPayload.modelKey) {
+          const { input, output, cacheRead, cacheWrite } = message.usage ?? {};
+          const parts = [input, output, cacheRead, cacheWrite];
+          const reported = parts.every(n => typeof n === "number" && Number.isFinite(n) && n >= 0)
+            ? Math.max(calculateContextTokens(message.usage), input! + output! + cacheRead! + cacheWrite!) : 0;
+          if (Number.isFinite(reported) && reported > 0) {
+            lastPayload.reportedTokens = reported;
+            // Usage includes this response's output: its reasoning items are covered. A malformed
+            // signature exempts nothing. Parts naming the same native item cover one occurrence.
+            const emitted = new Set<string>();
+            for (const block of Array.isArray(message.content) ? message.content : []) {
+              if (block?.type !== "thinking" || typeof block.thinkingSignature !== "string") continue;
+              try {
+                const key = opaqueKey(JSON.parse(block.thinkingSignature));
+                if (key !== undefined && !emitted.has(key)) {
+                  emitted.add(key);
+                  lastPayload.inventory.push(key);
+                }
+              } catch { /* not covered */ }
+            }
+          }
+        }
+        if (!event.toolResults.length) return;
+        // Usage already includes this response's output; otherwise the last admitted estimate plus
+        // its content. Wire content only: no signatures or tool details (never sent).
+        const nextTokens = lastPayload.reportedTokens !== undefined
+          ? lastPayload.reportedTokens + content(convertToLlm(event.toolResults))
+          : lastPayload.tokens + content(convertToLlm([event.message, ...event.toolResults]));
         if (nextTokens < lastPayload.contextWindow * 0.8) return;
         // Stable package-local first-use edge; idle activation registration stays cheap.
         const { compactActivationTools } = await import("./activation-compaction.js");
@@ -193,7 +256,7 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
         window.project(event.context.contextMessages.filter(message => !isSystem(message)));
         let plan = compactActivationTools(event);
         const retained = plan?.messages ?? event.context.contextMessages.filter(message => !isSystem(message));
-        const projectedTokens = lastPayload.overheadTokens + estimateTextTokens(JSON.stringify(convertToLlm(retained))) +
+        const projectedTokens = lastPayload.overheadTokens + content(convertToLlm(retained)) +
           estimateTextTokens(plan?.summary ?? "");
         // Prefer preserving the latest batch. Only compact it when the bounded
         // older history still cannot fit; keep every raw output in the journal.
@@ -269,8 +332,8 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
               data = parameters;
             }
             // Estimate all context-bearing data: system/messages, tool schemas,
-            // and API-specific fields, with no stale assistant-usage shortcut.
-            // JSON framing is conservative; unknown non-JSON data fails closed.
+            // and API-specific fields. JSON framing is conservative; unknown
+            // non-JSON data fails closed.
             const encoded = JSON.stringify(data, (_key, value: unknown) => {
               if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint" ||
                   (typeof value === "number" && !Number.isFinite(value)) ||
@@ -285,12 +348,46 @@ export default async function activationWindow(pi: ExtensionAPI): Promise<void> 
             if (!admitted || typeof admitted !== "object" || Array.isArray(admitted)) {
               throw new Error("Activation window requires a JSON provider request object");
             }
-            const tokens = estimateTextTokens(encoded);
+            // Estimate only; the admitted snapshot below still dispatches every byte. Qualified Responses
+            // APIs replay opaque reasoning as direct input[] items, billed by provider usage, not characters.
+            // Only a trustworthy same-model usage anchor may exclude it (wireTokens: the normalized growth
+            // baseline). No other field, even one named encrypted_content, is exempt.
+            const fullTokens = estimateTextTokens(encoded);
+            const input = RESPONSES.has(model.api) ? (admitted as { input?: unknown }).input : undefined;
+            const modelKey = JSON.stringify([model.provider, model.id, model.api]);
+            const anchor = lastPayload?.modelKey === modelKey ? lastPayload : undefined;
+            // smarty-dev#10560 R3: only ciphertext the trusted report covers is exempt, once per covered
+            // occurrence. Opaque data added, changed, re-identified or duplicated by any transform or the
+            // awaited callback is not covered, so it counts in full.
+            const covered = new Map<string, number>();
+            for (const key of anchor?.reportedTokens === undefined ? [] : anchor.inventory) {
+              covered.set(key, (covered.get(key) ?? 0) + 1);
+            }
+            const inventory: string[] = [];
+            const normalized = (exempt: (key: string) => boolean): number => !Array.isArray(input) ? fullTokens :
+              estimateTextTokens(JSON.stringify({ ...admitted, input: input.map((item: unknown) => {
+                const key = opaqueKey(item);
+                return key !== undefined && exempt(key) ? { ...(item as object), encrypted_content: "" } : item;
+              }) }));
+            // The next report covers this whole admitted input: its growth baseline excludes all of it.
+            const wireTokens = normalized(key => inventory.push(key) > 0);
+            const currentTokens = normalized(key => {
+              const count = covered.get(key) ?? 0;
+              covered.set(key, count - 1);
+              return count > 0;
+            });
+            // The last same-model report plus all growth since its dispatch (new content, callback or prefix
+            // expansions anywhere). Shrinks earn no credit. Without a valid, unambiguous same-model report
+            // (none, invalid, zero, error/aborted, foreign model, side request), the full encoded estimate.
+            const tokens = anchor?.reportedTokens === undefined ? fullTokens
+              : Math.max(currentTokens, anchor.reportedTokens + Math.max(0, currentTokens - anchor.wireTokens));
             if (tokens > model.contextWindow) {
+              reportWindowRefusal(tokens, model.contextWindow);
               failClosed(`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}`);
             }
-            const conversationTokens = estimateTextTokens(JSON.stringify(context.messages.filter(message => message.role !== "system")));
-            lastPayload = { tokens, contextWindow: model.contextWindow, overheadTokens: Math.max(0, tokens - conversationTokens) };
+            admissions++;
+            lastPayload = { tokens, wireTokens, modelKey, inventory, contextWindow: model.contextWindow,
+              overheadTokens: Math.max(0, wireTokens - content(context.messages)) };
             // Ordinary wire payloads dispatch the admitted JSON snapshot, not
             // stateful getters/toJSON that could change at the next serialization.
             if (!google) return admitted;

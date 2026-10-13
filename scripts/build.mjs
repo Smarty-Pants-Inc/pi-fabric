@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-import { build } from "esbuild";
+import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildLandlock } from "./build-landlock.mjs";
+import { buildLandlock, stripGroupOtherWrite } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
   "src/index.ts",
+  "src/extension-bootstrap.ts",
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
@@ -17,8 +18,17 @@ const primaryEntryPoints = [
   "src/mcp.ts",
   "src/agents.ts",
   "src/agents/worker-protocol.ts",
+  // Runner adapter registration; never reachable from the extension entry.
+  "src/runners.ts",
+  // Opt-in durable Pi adapter; never reachable from the extension entry.
+  "src/durable.ts",
   "src/jev.ts",
+  "src/assessment.ts",
+  // Public `pi-fabric/scope`; also the extension's first-use scope parser.
+  "src/scope.ts",
   "src/protocol.ts",
+  // Full Pi-compatible durable process host; never in extension registration.
+  "src/durable/worker.ts",
   "src/residency/host.ts",
   "src/residency/launcher.ts",
   "src/residency/pi-entry.ts",
@@ -33,13 +43,21 @@ const primaryEntryPoints = [
   "src/memory/worker-provider.ts",
   "src/providers/memory-provider.ts",
   "src/records/service-main.ts",
+  // Standalone `pi-fabric` bin; never reachable from the extension entry.
+  "src/cli/index.ts",
 ];
 
 // Every package-local dynamic import is also an entry point. Its stable output
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
+  "src/storage/verified-remove.ts",
   "src/residency/launcher-owner.ts",
+  "src/residency/wake.ts",
+  "src/residency/process-work.ts",
+  "src/agents/transports/process-utils.ts",
+  "src/core/pid-namespace.ts",
   "src/mesh/state-projector.ts",
   "src/judge/agent.ts",
   "src/core/landlock.ts",
@@ -47,22 +65,46 @@ const lazyEntryPoints = [
   "src/lifecycle/reload-target-profile.ts",
   "src/lifecycle/reload-slots.ts",
   "src/coordination/unverified-ids.ts",
+  "src/durable/worker-host.ts",
+  "src/type-error-guidance.ts",
+  "src/native-discovery.ts",
+  "src/native-tool-catalog.ts",
+  "src/native-image-artifacts.ts",
+  "src/memory/extractive-history.ts",
+  "src/cli/mesh.ts",
+  "src/cli/decisions.ts",
+  "src/thinking-control.ts",
+  "src/compaction/owner.ts",
+  "src/compaction/orphan-repair.ts",
+  "src/decisions/command.ts",
+  "src/programs/host.ts",
   "src/core/provider-operations.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/per-call-route.ts",
+  "src/agents/spawn-router.ts",
   "src/agents/claude-cli.ts",
   "src/agents/compact-control.ts",
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
+  // Also loaded by the worker as a Pi extension (-e) for confined children.
+  "src/agents/write-guard.ts",
   "src/fabric-runtime-state.ts",
+  "src/provider-error-class.ts",
+  "src/topology/root-inbox-context.ts",
   "src/components/configuration.ts",
   "src/providers/jev-provider.ts",
   "src/records/service.ts",
   "src/jev/client.ts",
   "src/jev/routes.ts",
   "src/jev/observation.ts",
+  "src/jev-fabric/client.ts",
+  "src/jev-fabric/registry.ts",
+  "src/jev-fabric/operations.ts",
+  "src/jev-fabric/resolve.ts",
+  "src/jev-fabric/serve.ts",
   "src/runtime/core-override-guest-types.ts",
   "src/runtime/dynamic-guest-types.ts",
   "src/runtime/guest-types.ts",
@@ -77,6 +119,7 @@ const lazyEntryPoints = [
   "src/speculation/python-scanner.ts",
   "src/ui/dashboard.ts",
   "src/ui/shell-tasks.ts",
+  "src/ui/image-overlays.ts",
   "src/ui/languages/bend.ts",
   "src/ui/conversation.ts",
   "src/ui/conversation-host.ts",
@@ -84,6 +127,8 @@ const lazyEntryPoints = [
   "src/ui/conversation-chrome.ts",
   "src/ui/conversation-native-reader.ts",
   "src/ui/model-picker.ts",
+  // First-use prewalk picker (/fabric prewalk); stable path keeps it out of startup.
+  "src/ui/fabric-model-selector.ts",
   "src/ui/settings.ts",
   "src/worker/event-projection.ts",
   "src/worker/activation-window.ts",
@@ -95,16 +140,33 @@ const lazyEntryPoints = [
   "src/worker/context-admission.ts",
   "src/worker/context-reseed.ts",
   "src/worker/options.ts",
+  "src/worker/questions.ts",
   "src/worker/recovery-watchdog.ts",
   "src/worker/retry-profile.ts",
+  "src/worker/profile-extensions.ts",
   "src/worker/task-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
+  "src/worker/result.ts",
   "src/worker/run-record.ts",
   "src/worker/session-export.ts",
+  // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
+  "src/mesh/state-backend-nats-client.ts",
 ];
 
-buildLandlock();
+// smarty-dev#7936: the native helpers' sha256 values become a constant of the bundle (reader-proof.ts).
+const nativeDigests = buildLandlock();
+const nativeDefine = { __FABRIC_NATIVE_DIGESTS__: JSON.stringify(JSON.stringify(nativeDigests)) };
+// Every bundle gets the digests merged into its own `define`: a second `define:` key in a call (another
+// change's constants) would otherwise silently replace them, and the gate then fails closed for every
+// operator ("no embedded digest in this build"; smarty-dev#7651). assert-build-artifacts checks the result.
+const build = (options) => esbuild({ ...options, define: { ...options.define, ...nativeDefine } });
+
+// The production authority path is a literal. Only Vitest may substitute a
+// private fixture path; there is no production rollout/requirement switch.
+const hostPolicyConstants = {
+  __FABRIC_HOST_POLICY_PATH__: JSON.stringify("/etc/smarty/fabric-policy.json"),
+};
 
 const result = await build({
   entryPoints: [...primaryEntryPoints, ...lazyEntryPoints],
@@ -127,6 +189,7 @@ const result = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   splitting: true,
   sourcemap: true,
   metafile: true,
@@ -158,6 +221,7 @@ const standalone = await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   sourcemap: true,
   metafile: true,
   logLevel: "info",
@@ -176,10 +240,25 @@ const standalone = await build({
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
 await build({
-  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts"],
+  entryPoints: ["src/guards/actor-bash-hook.ts", "src/guards/model-route-hook.ts", "src/guards/sender-headers.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  define: hostPolicyConstants,
+  sourcemap: true,
+  logLevel: "info",
+});
+
+// The bash tool_call envelope invokes a real file: the fleet guard refuses computed -e code.
+// Keep watchdog/group custody code out of the extension graph and out of inline shell operands.
+await build({
+  entryPoints: ["src/bash-idle-watchdog.ts"],
+  outfile: "dist/bash-idle-watchdog.js",
   bundle: true,
   packages: "external",
   platform: "node",
@@ -198,6 +277,7 @@ await build({
   platform: "node",
   format: "esm",
   target: "node24",
+  define: hostPolicyConstants,
   logLevel: "info",
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });
@@ -223,6 +303,29 @@ if (bundledPackages.length > 0) {
   throw new Error(`Package code was bundled unexpectedly:\n${bundledPackages.join("\n")}`);
 }
 
+// Only the standalone worker gets a private, stateless TypeBox validator.
+// Pi deliberately omits physical host peers; the extension graph above must
+// continue to use Pi's mapped TypeBox, never this isolated artifact.
+const workerResult = await build({
+  entryPoints: ["src/worker/result.ts"],
+  outfile: "dist/worker/result.js",
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  sourcemap: true,
+  metafile: true,
+  banner: { js: "// Worker-only TypeBox validator. MIT (c) 2017-2026 Haydn Paterson; see THIRD_PARTY_NOTICES.md." },
+});
+for (const input of Object.keys(workerResult.metafile.inputs)) {
+  if (input.includes("node_modules/") && !input.includes("node_modules/typebox/")) {
+    throw new Error(`Unexpected worker validator dependency: ${input}`);
+  }
+}
+if (Object.values(workerResult.metafile.outputs).some(output => output.imports.length > 0)) {
+  throw new Error("Worker validator must be self-contained");
+}
+
 const unstableLazyImports = Object.entries(result.metafile.outputs).flatMap(
   ([output, metadata]) =>
     metadata.imports
@@ -239,3 +342,6 @@ if (unstableLazyImports.length > 0) {
     `Package-local dynamic imports must use stable entry paths:\n${unstableLazyImports.join("\n")}`,
   );
 }
+
+// Last: nothing in dist/ may be writable by another user (smarty-dev#8145; assert-build-artifacts.mjs checks).
+stripGroupOtherWrite("dist");

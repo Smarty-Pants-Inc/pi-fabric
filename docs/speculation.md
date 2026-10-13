@@ -62,7 +62,7 @@ ActionRegistry.speculate()       src/core/action-registry.ts
   │  resolve → gate → prepareArguments → validate → provider.invoke
   ▼
 FabricSpeculationStore           src/speculation/store.ts
-  │  keyed by (parentToolCallId, ref, stableJsonHash(preparedArgs));
+  │  keyed by (parentToolCallId, ref, stableJsonHash(preparedArgs), bindingToken);
   │  per-entry AbortController, freshness checker, side-channel replay sink
   ▼
 ActionRegistry.invoke()          serve-or-reexecute at the real call site
@@ -74,7 +74,8 @@ ActionRegistry.invoke()          serve-or-reexecute at the real call site
    refs that are `risk: "read"` with `effect.kind: "none"`, never prompt for
    approval, and cost nothing when wasted (`pi.read`/`grep`/`find`/`ls`,
    `memory.recall`/`expand`/`sessions`, `state.get`/`history`/`complexity`,
-   `schema.status`, `compact.status`, `components.list`/`status`/`graph`).
+   `mesh.scheduled`, `schema.status`, `compact.status`/`pressure`, `thinking.status`, `decisions.list`,
+   `programs.list`/`get`, `components.list`/`status`/`graph`).
    The gate re-runs against the resolved descriptor at launch, so a provider
    or config change that reclassifies a ref closes speculation off.
 2. **Freshness, not staleness.** A stored promise is served only when both
@@ -113,6 +114,12 @@ Observable differences show up only in observability surfaces: audits record
 the speculative invoke (`attachMedia`, `updateArguments`, `attachPreview`) are
 replayed into the real audit.
 
+## Native codemode aliases
+
+Both `executor.codemodeProfile` values support literal native reads through `tools` and `nativeTools`. The scanner resolves core aliases and known Pi MCP registration identifiers to their canonical Fabric refs before eligibility checks. Unknown or ambiguous aliases skip speculation; the actual call still uses normal dispatch. Native facade aliasing/mutation conservatively taints that root.
+
+The binding token includes the result projection (`native` versus Fabric), alongside provider generation, descriptor, capability view and scope. Identical arguments can therefore warm both views without crossing their result or side-channel contracts. Native reads repeat the same live policy gates at launch and serve; model calls and writes do not become eligible through another spelling. Profile changes reset the cache and streaming state, like kernel/policy changes.
+
 ## Entropy compile interplay
 
 The compiled entropy surface participates at both ends of the pipeline. On
@@ -133,7 +140,10 @@ tool through config: `speculation.mcpAllowlist: ["exa.*", "github.get_file"]`
 (matched against the ref after the `mcp.` prefix). Cached MCP tool
 annotations, when the runtime surfaces them, override the allowlist in one
 direction only: `destructiveHint: true` or `readOnlyHint: false` refuses even
-an allowlisted tool. Networked results carry no freshness guarantee. The
+an allowlisted tool. The live allowlist and policy gate are checked at both
+launch and replay; removing an entry cannot serve an already-warmed result.
+MCP descriptors keep their conservative network/effect classification rather
+than being relabeled as local reads. Networked results carry no freshness guarantee. The
 epoch still covers in-program effects, yet the world can change behind a
 read; keep the allowlist to stable, idempotent reads.
 

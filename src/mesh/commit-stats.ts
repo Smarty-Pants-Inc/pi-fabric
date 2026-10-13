@@ -37,6 +37,9 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
     : key.startsWith("topology/hosts/") ? "host-lease"
     : key.startsWith("topology/participants/") ? "participant"
     : key.startsWith("topology/") ? "topology" : key.split("/")[0] || "state";
+  // Named maintenance exception: opt-in PI_FABRIC_COMMIT_STATS diagnostic sampler.
+  // Its unref'd minute boundary (including zero samples) is the public sink contract.
+  // Disabled by default, so normal file stores/bridges allocate no sampler timer.
   const timer = setInterval(() => {
     const at = Date.now();
     try {
@@ -71,7 +74,8 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 //
 // Every acquisition of a mesh root's `.lock` records who took it (the store entry point), how
 // long it waited and how long it held the lock. Wall-clock minutes are aggregated in memory and
-// written just after each minute (and at exit) to `<root>/lock-stats/<host>-<pid>.json`: one
+// written on the next acquisition after a minute boundary (and at exit/explicit flush) to
+// `<root>/lock-stats/<host>-<pid>.json`: one
 // small file per process, rewritten by an atomic rename, holding at most the last 60 complete
 // minutes plus the current one (the longest query window, see LOCK_STATS_RETAIN_MINUTES). No extra
 // lock, no fsync, and nothing at all before the first acquisition. `fabric-mesh-lock-stats`
@@ -119,6 +123,30 @@ export interface LockStatsBucket {
   holdHist: number[];
 }
 export interface LockStatsMinute { minute: number; classes: Partial<Record<MeshLockClass, LockStatsBucket>> }
+/**
+ * What kind of process wrote a stats file (smarty-dev#8305), captured once at the recorder's first
+ * acquisition and never re-derived: an exited writer stays attributable from its file alone. Each
+ * field is a separate source fact, present only when its source was set; nothing is inferred.
+ */
+export interface LockStatsWriter {
+  /** Basename of process.argv[1] (the script the runtime was started with). */
+  argv1?: string;
+  /** PI_FABRIC_AGENT_NAME. */
+  agentName?: string;
+  /** PI_FABRIC_ACTOR_ID. */
+  actorId?: string;
+  /** PI_FABRIC_ACTOR_NAME. */
+  actorName?: string;
+  /** PI_FABRIC_ROLE, verbatim. */
+  role?: string;
+  /** SMARTY_ROLE, verbatim (may carry an "@revision" suffix). */
+  smartyRole?: string;
+  /** process.ppid at capture. */
+  ppid?: number;
+}
+const WRITER_STRING_FIELDS = ["argv1", "agentName", "actorId", "actorName", "role", "smartyRole"] as const;
+/** Writer strings are truncated to this many UTF-16 units when captured; a reader rejects longer. */
+export const LOCK_STATS_WRITER_MAX_CHARS = 128;
 export interface LockStatsFile {
   version: 1;
   host: string;
@@ -126,6 +154,8 @@ export interface LockStatsFile {
   root: string;
   startedAt: number;
   updatedAt: number;
+  /** Optional in version 1: files written before smarty-dev#8305 have none. */
+  writer?: LockStatsWriter;
   minutes: LockStatsMinute[];
 }
 
@@ -194,6 +224,25 @@ const warnPrivately = (message: string): void => {
 const WRITE_FLAGS = process.platform === "win32" ? "wx"
   : fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0);
 
+/** The writer facts of this process, read once from its argv, environment and ppid. */
+export const captureLockStatsWriter = (env: NodeJS.ProcessEnv = process.env,
+  argv1: string | undefined = process.argv[1], ppid: number = process.ppid): LockStatsWriter => {
+  const bounded = (value: string | undefined): string | undefined => {
+    const text = value?.trim();
+    return text ? text.slice(0, LOCK_STATS_WRITER_MAX_CHARS) : undefined;
+  };
+  const facts: Record<string, string | number | undefined> = {
+    argv1: bounded(argv1 ? path.basename(argv1) : undefined),
+    agentName: bounded(env.PI_FABRIC_AGENT_NAME),
+    actorId: bounded(env.PI_FABRIC_ACTOR_ID),
+    actorName: bounded(env.PI_FABRIC_ACTOR_NAME),
+    role: bounded(env.PI_FABRIC_ROLE),
+    smartyRole: bounded(env.SMARTY_ROLE),
+    ppid: Number.isSafeInteger(ppid) && ppid >= 0 ? ppid : undefined,
+  };
+  return Object.freeze(Object.fromEntries(Object.entries(facts).filter(([, value]) => value !== undefined)) as LockStatsWriter);
+};
+
 /** Sanitized host label used in file names. */
 export const lockStatsHost = (): string => (os.hostname() || "host").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
 
@@ -212,27 +261,39 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
   const host = lockStatsHost();
   const startedAt = Date.now();
   const roots = new Map<string, RootLockStats>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let flushedMinute = Math.floor(startedAt / 60_000);
   let started = false;
+  // Captured once, at the first acquisition (with the exit hook): later env changes never alter it.
+  let writer: LockStatsWriter | undefined;
   const warn = options.warn ?? warnPrivately;
 
   // By age only, the own file included: a fresh own file is never stale, and a stale one (no
   // acquisition here for a day) is safe to delete because the next write recreates it by rename.
+  // ponytail: no sooner prune by pid liveness (smarty-dev#7826 review): pid reuse would race it, and
+  // the reader skips files outside its window before the cap, so stale files no longer hide live ones.
   const prune = (directory: string, now: number): void => {
     checkStatsDirectory(directory);
     for (const name of fs.readdirSync(directory)) {
-      if (!(name.endsWith(".json") || name.endsWith(".tmp"))) continue;
+      // A `.prune-<pid>` name is a pruner's graveyard; one left by a crash is pruned by age too.
+      if (!(name.endsWith(".json") || name.endsWith(".tmp") || /\.prune-\d+$/.test(name))) continue;
       const file = path.join(directory, name);
       try {
         const seen = fs.lstatSync(file);
         if (now - seen.mtimeMs <= LOCK_STATS_STALE_FILE_MS) continue;
-        // ponytail: re-lstat right before the unlink and skip a file its owner refreshed
-        // (rename = new inode, or a new mtime) since the age check. Best effort: a refresh
-        // between this lstat and the unlink still loses that file, until its owner's next
-        // write after an acquisition recreates it with the whole retained window.
-        const again = fs.lstatSync(file);
-        if (again.ino !== seen.ino || again.mtimeMs !== seen.mtimeMs) continue;
-        fs.unlinkSync(file);
+        // Temporaries and graveyards have unique names that no writer refreshes.
+        if (!name.endsWith(".json")) { fs.unlinkSync(file); continue; }
+        // Never unlink a stats file by name (smarty-dev#7879): its writer may refresh it by rename
+        // at any time. Move it aside atomically (readers skip non-.json names), then delete it only
+        // if it is still the aged file. Otherwise the writer's fresh file was moved: put it back with
+        // an atomic no-replace link (EEXIST when an even newer file holds the name: keep that one;
+        // works on NTFS too), then drop the graveyard name either way.
+        const grave = `${file}.prune-${process.pid}`;
+        fs.renameSync(file, grave);
+        const moved = fs.lstatSync(grave);
+        if (moved.dev !== seen.dev || moved.ino !== seen.ino || moved.mtimeMs !== seen.mtimeMs) {
+          try { fs.linkSync(grave, file); } catch { /* A newer file holds the name. */ }
+        }
+        fs.unlinkSync(grave);
       } catch { /* Raced with its owner or another pruner. */ }
     }
   };
@@ -248,6 +309,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
     const file = path.join(directory, name);
     const body: LockStatsFile = {
       version: 1, host, pid: process.pid, root: entry.root, startedAt, updatedAt: now,
+      ...writer ? { writer } : {},
       minutes: [...entry.minutes].sort(([a], [b]) => a - b).map(([minute, classes]) => ({ minute, classes })),
     };
     // Atomic for readers; deliberately not durable (diagnostics, no fsync). A unique temporary,
@@ -273,7 +335,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
           write(entry, now);
           entry.dirty = false;
         }
-        // Hourly and read-only, also for a quiet root: never creates the directory.
+        // At most hourly, during actual diagnostic work: never creates the directory.
         if (now - entry.prunedAt >= LOCK_STATS_PRUNE_EVERY_MS) {
           entry.prunedAt = now;
           prune(path.join(entry.root, LOCK_STATS_DIR), now);
@@ -290,14 +352,14 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       }
     }
   };
-  // Just after each wall-clock minute (spread by pid), so a reader sees every process's last
-  // complete minute within a few seconds.
-  const schedule = (): void => {
-    timer = setTimeout(() => {
-      flush();
-      schedule();
-    }, 60_000 - Date.now() % 60_000 + 500 + process.pid % 2_000);
-    timer.unref?.();
+  // A minute boundary alone is not work: even one startup sample must not wake an
+  // otherwise empty bridge 60 s later. Flush on the next real record in a newer minute
+  // (and at exit/explicit flush). Quiet roots are pruned only during that actual work.
+  const flushIfDue = (): void => {
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute <= flushedMinute) return;
+    flushedMinute = minute;
+    flush();
   };
   const onExit = (): void => flush();
   // One bucket per real root, whatever the spelling (relative, trailing slash, symlink, case on
@@ -324,7 +386,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       roots.set(key, entry);
       if (!started) {
         started = true;
-        schedule();
+        writer ??= captureLockStatsWriter();
         process.once("exit", onExit);
       }
     }
@@ -350,6 +412,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (holdMs > bucket.holdMaxMs) bucket.holdMaxMs = holdMs;
       bucket.waitHist[histogramIndex(waitMs)]!++;
       bucket.holdHist[histogramIndex(holdMs)]!++;
+      flushIfDue();
     },
     failed(root, lockClass, waitMs, tried) {
       const bucket = bucketOf(root, lockClass);
@@ -357,17 +420,299 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (tried) bucket.tries++;
       else bucket.timeouts++;
       bucket.failedWaitMs += waitMs;
+      flushIfDue();
     },
   };
   const dispose = (): void => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
     started = false;
     process.removeListener("exit", onExit);
   };
   lockGlobals[lockKey] = { version: 1, stats, flush, dispose };
   return stats;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Mesh-lock events at the source (smarty-dev#9290).
+//
+// The minute files above say how busy the lock was; they cannot say which hold made a waiter give
+// up, so commswatch sampled `.lock` every 50 ms to catch it. Instead the two parties report it
+// themselves, to `<root>/lock-stats/events.jsonl`: the holder when it releases after holding
+// longer than a threshold (`held`), the waiter when it gives up with the typed lock timeout
+// (`wait-timeout`, FABRIC_MESH_STATE_BUSY at the bridge), naming the holder it could identify.
+// It is a local append, never a mesh publish: publishing would need the very lock that is
+// contended. One O_APPEND write() per line, each line at most PIPE_BUF (4096) bytes, so concurrent
+// appenders never interleave. At 1 MiB the file is renamed to `events.jsonl.1` (one old file kept),
+// under a short O_EXCL rotation lock and only if the name still holds the oversized inode.
+// Windows: rotation is disabled (scope cut, smarty-dev#10191). Concurrent appenders across a forced
+// rotation lost ~46% of lines on Windows CI with no counted error, cause not found; there the file
+// only grows, and one warning per process says so once it passes the rotation size.
+// An I/O error never blocks or throws into the lock path: it is counted, and warned about at most
+// once a minute. Off with the minute files (PI_FABRIC_LOCK_STATS=0); `held` is also off with a
+// threshold of 0 (`lockHeldEventMs`). Bounded tries (registry-fenced or zero-wait callers and the
+// R20 write fence) fail by design while the lock is busy: they stay `tries` in the minute files.
+
+export type LockEventStore = "sqlite" | "mesh-lock";
+/** Who held the lock. A wait-timeout names the holder only as far as the lock's record shows it. */
+export interface LockEventHolder {
+  pid: number | null;
+  /** The process's short name (/proc/PID/comm), never its arguments, which may hold secrets. */
+  process: string | null;
+  /** The holder's caller class: known for `held` (the holder itself), null on `wait-timeout`. */
+  op: MeshLockClass | null;
+  /** Sanitized host label (both locks live on a local filesystem). */
+  host: string;
+}
+export interface LockEventWaiter { pid: number; process: string; op: MeshLockClass }
+export interface LockEvent {
+  v: 1;
+  /** Epoch ms of the release (`held`) or of giving up (`wait-timeout`). */
+  at: number;
+  kind: "held" | "wait-timeout";
+  store: LockEventStore;
+  class: MeshLockClass;
+  /** `held` only. */
+  heldMs?: number;
+  /** `wait-timeout` only. */
+  waitedMs?: number;
+  holder: LockEventHolder;
+  /** `wait-timeout` only. */
+  waiter?: LockEventWaiter;
+}
+export interface LockEvents {
+  /** A release after a hold longer than the caller's threshold (the caller compares). */
+  held(root: string, store: LockEventStore, lockClass: MeshLockClass, heldMs: number): void;
+  /** A full-budget acquisition that gave up; `holderPid` from the lock's owner record, if readable. */
+  waitTimeout(root: string, store: LockEventStore, lockClass: MeshLockClass, waitedMs: number,
+    holderPid: number | undefined): void;
+  /** Appends that failed (never thrown into the lock path). */
+  readonly errors: number;
+}
+
+export const LOCK_EVENTS_FILE = "events.jsonl";
+/** At this size the file is renamed to `events.jsonl.1`, replacing the older one. */
+export const LOCK_EVENTS_ROTATE_BYTES = 1024 * 1024;
+/** The follow-up issue that re-enables rotation on Windows, where it is disabled until then. */
+export const LOCK_EVENTS_WIN32_ROTATION_ISSUE = "smarty-dev#10191";
+/** Exclusive (O_EXCL) rotation lock beside the file: one rotator at a time across processes. */
+export const LOCK_EVENTS_ROTATE_LOCK = `${LOCK_EVENTS_FILE}.rotating`;
+/** A rotation lock older than this was left by a crashed rotator (a rotation takes microseconds). */
+export const LOCK_EVENTS_ROTATE_LOCK_STALE_MS = 10_000;
+/** PIPE_BUF: an O_APPEND write() of at most this many bytes never interleaves with another. */
+export const LOCK_EVENT_MAX_LINE_BYTES = 4096;
+/** Default `lockHeldEventMs`: a hold longer than this emits a `held` event; 0 disables them. */
+export const LOCK_HELD_EVENT_MS = 1_000;
+/** The effective `lockHeldEventMs`: undefined or not finite means the default; negative means 0 (off). */
+export const lockHeldEventThreshold = (value: number | undefined): number =>
+  value === undefined || !Number.isFinite(value) ? LOCK_HELD_EVENT_MS : Math.max(0, value);
+const LOCK_EVENTS_WARN_EVERY_MS = 60_000;
+const PROCESS_NAME_MAX_CHARS = LOCK_STATS_WRITER_MAX_CHARS;
+const APPEND_FLAGS = process.platform === "win32" ? "a"
+  : fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0);
+const ROTATE_LOCK_FLAGS = process.platform === "win32" ? "wx"
+  : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+/**
+ * Windows: a rename, open or lstat that races another process's handle on events.jsonl (or a name
+ * left delete-pending by a rename) fails transiently with one of these. Never a lost line: a refused
+ * rename skips the rotation, a refused append retries.
+ */
+const WIN32_TRANSIENT_CODES: ReadonlySet<unknown> = new Set(["EPERM", "EBUSY", "EACCES"]);
+/** Windows: tries per line against the current events.jsonl before the append counts as failed. */
+export const LOCK_EVENTS_APPEND_TRIES_WIN32 = 5;
+/** Windows: the backoff before retry N is N times this (10, 20, 30, 40 ms: at most 100 ms per line). */
+export const LOCK_EVENTS_APPEND_RETRY_MS = 10;
+/** A synchronous bounded sleep (the appender is synchronous inside the lock path). */
+const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+interface ProcessLockEvents {
+  /** Registry generation. Keep the event API and line shape stable; hand over before changing them. */
+  version: number;
+  events: LockEvents | undefined;
+  dispose(): void;
+}
+const eventsKey = Symbol.for("pi-fabric.mesh.lock-events");
+const eventsGlobals = globalThis as typeof globalThis & { [eventsKey]?: ProcessLockEvents };
+
+/** A process's short name: Linux /proc/PID/comm (never cmdline), else undefined. */
+export const lockEventProcessName = (pid: number): string | undefined => {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  try {
+    const name = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    return name ? name.slice(0, PROCESS_NAME_MAX_CHARS) : undefined;
+  } catch { return undefined; }
+};
+
+/** One JSONL line of at most LOCK_EVENT_MAX_LINE_BYTES: process names shrink until it fits. */
+export const lockEventLine = (event: LockEvent): string => {
+  let line = `${JSON.stringify(event)}\n`;
+  let room = PROCESS_NAME_MAX_CHARS;
+  while (Buffer.byteLength(line) > LOCK_EVENT_MAX_LINE_BYTES && room > 0) {
+    room = Math.floor(room / 2);
+    const holder = { ...event.holder, process: event.holder.process === null ? null : event.holder.process.slice(0, room) };
+    const waiter = event.waiter ? { waiter: { ...event.waiter, process: event.waiter.process.slice(0, room) } } : {};
+    line = `${JSON.stringify({ ...event, holder, ...waiter })}\n`;
+  }
+  return line;
+};
+
+/**
+ * The process's lock-event appender, captured once (including disabled) across module and release
+ * reloads like the recorder: on unless PI_FABRIC_LOCK_STATS=0. No timer, file or descriptor is held.
+ */
+export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
+  options: {
+    warn?: (message: string) => void;
+    rotateBytes?: number;
+    /** Tests: the platform whose rename/append semantics apply (default process.platform). */
+    platform?: NodeJS.Platform;
+    /** Tests: the synchronous backoff sleep (default Atomics.wait). */
+    sleep?: (ms: number) => void;
+  } = {}): LockEvents | undefined => {
+  const existing = eventsGlobals[eventsKey];
+  if (existing) return existing.events;
+  if (lockStatsDisabled(setting)) {
+    eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
+    return undefined;
+  }
+  const host = lockStatsHost();
+  const rotateBytes = Math.max(1, options.rotateBytes ?? LOCK_EVENTS_ROTATE_BYTES);
+  const warn = options.warn ?? warnPrivately;
+  const windows = (options.platform ?? process.platform) === "win32";
+  const sleep = options.sleep ?? sleepSync;
+  const transient = (error: unknown): boolean => windows && WIN32_TRANSIENT_CODES.has(errorCodeOf(error));
+  let errors = 0;
+  let unwarned = 0;
+  let warnedAt = Number.NEGATIVE_INFINITY;
+  let warnedUnrotated = false;
+  let ownName: string | undefined;
+  const self = (): string => ownName ??= lockEventProcessName(process.pid)
+    ?? (process.title.trim().slice(0, PROCESS_NAME_MAX_CHARS) || "unknown");
+  const failed = (error: unknown): void => {
+    errors++;
+    unwarned++;
+    const now = Date.now();
+    if (now - warnedAt < LOCK_EVENTS_WARN_EVERY_MS) return;
+    warnedAt = now;
+    const count = unwarned;
+    unwarned = 0;
+    try { warn(`mesh lock events: ${count} append error(s) since the last warning; last: ${error instanceof Error ? error.message : String(error)}`); }
+    catch { /* Diagnostics only. */ }
+  };
+  // BigInt stats: a Windows (NTFS) file id is 64 bits and above 2^53 once its sequence number
+  // passes 31, so as a Number two different files can compare equal (nodejs/node#12115).
+  const open = (file: string): { descriptor: number; stat: fs.BigIntStats } => {
+    const descriptor = fs.openSync(file, APPEND_FLAGS, 0o600);
+    try {
+      const stat = fs.fstatSync(descriptor, { bigint: true });
+      if (!stat.isFile()) throw new Error(`${file} is not a regular file`);
+      return { descriptor, stat };
+    } catch (error) { fs.closeSync(descriptor); throw error; }
+  };
+  const append = (root: string, event: LockEvent): void => {
+    try {
+      const directory = path.join(root, LOCK_STATS_DIR);
+      // Never recreate a removed mesh root: a missing parent fails with ENOENT (counted).
+      try { fs.mkdirSync(directory, { mode: 0o700 }); }
+      catch (error) { if (errorCodeOf(error) !== "EEXIST") throw error; }
+      checkStatsDirectory(directory);
+      const file = path.join(directory, LOCK_EVENTS_FILE);
+      const data = Buffer.from(lockEventLine(event));
+      // A concurrent rotation moved the name between our open and our rename check (ENOENT): append
+      // once more against the current events.jsonl (O_APPEND|O_CREAT). Windows: also EPERM/EBUSY/
+      // EACCES while another process holds or renames the file, up to LOCK_EVENTS_APPEND_TRIES_WIN32
+      // tries with a short growing backoff. The last failure is counted.
+      const tries = windows ? LOCK_EVENTS_APPEND_TRIES_WIN32 : 2;
+      for (let attempt = 1; attempt <= tries; attempt++) {
+        try { appendOnce(file, data); return; }
+        catch (error) {
+          if (attempt === tries || (errorCodeOf(error) !== "ENOENT" && !transient(error))) throw error;
+          if (windows) sleep(LOCK_EVENTS_APPEND_RETRY_MS * attempt);
+        }
+      }
+    } catch (error) { failed(error); }
+  };
+  /** Takes the rotation lock, breaking one a crashed rotator left; undefined when another holds it. */
+  const takeRotateLock = (lock: string): number | undefined => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { return fs.openSync(lock, ROTATE_LOCK_FLAGS, 0o600); }
+      catch (error) {
+        if (errorCodeOf(error) !== "EEXIST" || attempt > 0) return undefined;
+        try {
+          if (Date.now() - fs.lstatSync(lock).mtimeMs <= LOCK_EVENTS_ROTATE_LOCK_STALE_MS) return undefined;
+          fs.unlinkSync(lock);
+        } catch (stale) { if (errorCodeOf(stale) !== "ENOENT") return undefined; }
+      }
+    }
+    return undefined;
+  };
+  /**
+   * Renames the oversized file `seen` to `.1` under the rotation lock, only if the name still holds
+   * that inode: an appender holding a stale lstat can never rename a newer file over `.1`. Busy lock:
+   * skip (the holder rotates; this line lands in whichever file the name holds next). The inode is
+   * compared exactly (BigInt), and the name must still hold at least the bytes seen: a reused or
+   * colliding file id on a smaller, newer file never renames it over `.1`. Windows: a rename (or
+   * lstat) refused because another process holds the file skips this rotation; the file stays
+   * oversized until a later rotation succeeds.
+   */
+  const rotate = (file: string, seen: fs.BigIntStats): void => {
+    const lock = path.join(path.dirname(file), LOCK_EVENTS_ROTATE_LOCK);
+    const held = takeRotateLock(lock);
+    if (held === undefined) return;
+    try {
+      let current: fs.BigIntStats;
+      try { current = fs.lstatSync(file, { bigint: true }); }
+      catch (error) { if (errorCodeOf(error) === "ENOENT" || transient(error)) return; throw error; }
+      if (current.dev !== seen.dev || current.ino !== seen.ino || current.size < seen.size) return;
+      try { fs.renameSync(file, `${file}.1`); }
+      catch (error) { if (!transient(error)) throw error; }
+    } finally {
+      try { fs.closeSync(held); } catch { /* Closed either way. */ }
+      try { fs.unlinkSync(lock); } catch { /* A stale-lock breaker may have removed it. */ }
+    }
+  };
+  /** Windows: rotation is disabled; the first time the file passes the rotation size, warn once. */
+  const unrotated = (file: string): void => {
+    if (warnedUnrotated) return;
+    warnedUnrotated = true;
+    try {
+      warn(`mesh lock events: ${file} passed the ${rotateBytes}-byte rotation size; rotation is disabled on Windows `
+        + `until ${LOCK_EVENTS_WIN32_ROTATION_ISSUE}, so the file keeps growing`);
+    } catch { /* Diagnostics only. */ }
+  };
+  const appendOnce = (file: string, data: Buffer): void => {
+    let { descriptor, stat } = open(file);
+    try {
+      const oversized = stat.size > 0n && stat.size + BigInt(data.length) > BigInt(rotateBytes);
+      // Windows: append only (no rename, no rotation lock); see LOCK_EVENTS_WIN32_ROTATION_ISSUE.
+      if (oversized && windows) unrotated(file);
+      else if (oversized) {
+        // Closed first, so the rename also works on Windows.
+        fs.closeSync(descriptor);
+        descriptor = -1;
+        rotate(file, stat);
+        ({ descriptor, stat } = open(file));
+      }
+      // ONE write per line, appended atomically by O_APPEND.
+      const written = fs.writeSync(descriptor, data);
+      if (written !== data.length) throw new Error(`short append to ${file} (${written} of ${data.length} bytes)`);
+    } finally { if (descriptor >= 0) fs.closeSync(descriptor); }
+  };
+  const events: LockEvents = {
+    held(root, store, lockClass, heldMs) {
+      append(root, { v: 1, at: Date.now(), kind: "held", store, class: lockClass, heldMs: Math.round(heldMs),
+        holder: { pid: process.pid, process: self(), op: lockClass, host } });
+    },
+    waitTimeout(root, store, lockClass, waitedMs, holderPid) {
+      const pid = holderPid !== undefined && Number.isSafeInteger(holderPid) && holderPid > 0 ? holderPid : null;
+      const name = pid === null ? null : pid === process.pid ? self() : lockEventProcessName(pid) ?? null;
+      append(root, { v: 1, at: Date.now(), kind: "wait-timeout", store, class: lockClass, waitedMs: Math.round(waitedMs),
+        holder: { pid, process: name, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
+    },
+    get errors() { return errors; },
+  };
+  eventsGlobals[eventsKey] = { version: 1, events, dispose() {} };
+  return events;
+};
+
 
 // ---------------------------------------------------------------------------------------------
 // Reading and summarizing (fabric-mesh-lock-stats).
@@ -383,12 +728,29 @@ const isBucket = (value: unknown): value is LockStatsBucket => {
     [bucket.waitMs, bucket.waitMaxMs, bucket.holdMs, bucket.holdMaxMs, bucket.failedWaitMs].every(isDuration) &&
     isHistogram(bucket.waitHist) && isHistogram(bucket.holdHist);
 };
+/** A present writer must be an object of bounded strings and a pid; unknown keys are ignored. */
+const invalidWriter = (value: unknown): boolean => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return true;
+  const writer = value as Record<string, unknown>;
+  if (writer.ppid !== undefined && !isCount(writer.ppid)) return true;
+  return WRITER_STRING_FIELDS.some(field => writer[field] !== undefined &&
+    (typeof writer[field] !== "string" || (writer[field] as string).length > LOCK_STATS_WRITER_MAX_CHARS));
+};
+/** Only the known writer facts, so a summary never relays unknown keys from a file. */
+const knownWriter = (writer: LockStatsWriter | undefined): LockStatsWriter | undefined => {
+  if (!writer) return undefined;
+  const known: LockStatsWriter = {};
+  for (const field of WRITER_STRING_FIELDS) if (writer[field] !== undefined) known[field] = writer[field];
+  if (writer.ppid !== undefined) known.ppid = writer.ppid;
+  return known;
+};
 /** Why a parsed stats file is invalid, or undefined. A file is used whole or not at all. */
 const invalidLockStats = (value: unknown): string | undefined => {
   const file = value as Partial<LockStatsFile> | null;
   if (!file || typeof file !== "object" || file.version !== 1) return "not a version-1 stats file";
   if (typeof file.host !== "string" || !file.host || file.host.length > 256) return "bad host";
   if (!Number.isSafeInteger(file.pid) || file.pid! < 0) return "bad pid";
+  if (file.writer !== undefined && invalidWriter(file.writer)) return "bad writer";
   if (!Array.isArray(file.minutes) || file.minutes.length > LOCK_STATS_RETAIN_MINUTES + 1) return "bad minutes";
   for (const minute of file.minutes as unknown[]) {
     const { minute: at, classes } = (minute ?? {}) as Partial<LockStatsMinute>;
@@ -420,11 +782,36 @@ const readRegularFile = (file: string): string => {
   } finally { fs.closeSync(descriptor); }
 };
 
+/** Bytes of a stats file's tail that hold its newest minutes (two full minutes are under 4 KiB). */
+const LOCK_STATS_PEEK_BYTES = 8192;
 /**
- * Every process's file under `<root>/lock-stats`. Unreadable, oversized, foreign or invalid
- * files are skipped and named in `problems` (a gate must not pass on what it could not read).
+ * The newest minute before `current` in a stats file, from a bounded tail read: -1 when the file
+ * holds none, undefined when the tail cannot tell. `minutes` is the last key and sorted, and
+ * JSON escapes every quote inside a string, so these patterns match only the array itself.
  */
-export const readLockStats = (root: string, problems: string[] = []): LockStatsFile[] => {
+const peekNewestCompleteMinute = (file: string, current: number): number | undefined => {
+  try {
+    const descriptor = fs.openSync(file, READ_FLAGS);
+    try {
+      const { size } = fs.fstatSync(descriptor);
+      const buffer = Buffer.alloc(Math.min(size, LOCK_STATS_PEEK_BYTES));
+      const tail = buffer.toString("utf8", 0, fs.readSync(descriptor, buffer, 0, buffer.length, size - buffer.length));
+      let newest = -1;
+      for (const [, minute] of tail.matchAll(/\{"minute":(\d+),/g)) if (+minute! < current) newest = Math.max(newest, +minute!);
+      return newest >= 0 || tail.includes("\"minutes\":[") ? newest : undefined;
+    } finally { fs.closeSync(descriptor); }
+  } catch { return undefined; }
+};
+
+/** Start of a window of `span` complete minutes before `now`, the current minute included. */
+const lockStatsWindowStartMs = (now: number, span: number): number => (Math.floor(now / 60_000) - span) * 60_000;
+
+/**
+ * Every process's file under `<root>/lock-stats` that can hold a minute of the window. Unreadable, oversized,
+ * foreign or invalid files are skipped and named in `problems` (a gate must not pass on what it could not read).
+ */
+export const readLockStats = (root: string, problems: string[] = [],
+  options: { minutes?: number; now?: number | undefined } = {}): LockStatsFile[] => {
   const directory = path.join(root, LOCK_STATS_DIR);
   let names: string[];
   try {
@@ -434,13 +821,35 @@ export const readLockStats = (root: string, problems: string[] = []): LockStatsF
     }
     names = fs.readdirSync(directory);
   } catch (error) { if (errorCodeOf(error) === "ENOENT") return []; throw error; }
-  const candidates = names.filter(name => name.endsWith(".json")).sort();
+  // A file is written after each minute it holds, so one modified before the window starts
+  // holds no minute in it: skip it before the cap, and cap the newest (smarty-dev#7826). The
+  // window is summarizeLockStats's exactly: the `span` complete minutes before the current one.
+  const span = Math.max(1, Math.min(LOCK_STATS_RETAIN_MINUTES, Math.floor(options.minutes ?? LOCK_STATS_RETAIN_MINUTES)));
+  const since = lockStatsWindowStartMs(options.now ?? Date.now(), span);
+  let candidates: Array<{ name: string; mtimeMs: number; regular: boolean }> = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const stat = fs.lstatSync(path.join(directory, name));
+      if (stat.mtimeMs >= since) candidates.push({ name, mtimeMs: stat.mtimeMs, regular: stat.isFile() });
+    } catch (error) {
+      if (errorCodeOf(error) !== "ENOENT") problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Over the cap, a file that provably holds no complete minute of the window (only the current,
+  // incomplete one, say) takes no slot (smarty-dev#7894). Only then: the usual case reads no more.
   if (candidates.length > LOCK_STATS_MAX_FILES) {
-    problems.push(`${directory}: ${candidates.length} stats files, read only the first ${LOCK_STATS_MAX_FILES}`);
+    const current = Math.floor(since / 60_000) + span;
+    candidates = candidates.filter(({ name, regular }) =>
+      !regular || (peekNewestCompleteMinute(path.join(directory, name), current) ?? current) >= current - span);
+  }
+  if (candidates.length > LOCK_STATS_MAX_FILES) {
+    problems.push(`${directory}: ${candidates.length} stats files in the window, read only the newest ${LOCK_STATS_MAX_FILES}`);
     candidates.length = LOCK_STATS_MAX_FILES;
   }
   const files: LockStatsFile[] = [];
-  for (const name of candidates) {
+  for (const { name } of candidates) {
     try {
       const file = JSON.parse(readRegularFile(path.join(directory, name))) as unknown;
       const invalid = invalidLockStats(file);
@@ -478,7 +887,7 @@ export interface LockStatsSummary extends LockStatsTotals {
   processes: number;
   peakMinuteBusyPct: number;
   classes: Array<LockStatsTotals & { lockClass: MeshLockClass; holdSharePct: number }>;
-  pids: Array<LockStatsTotals & { host: string; pid: number; topClass: MeshLockClass | undefined }>;
+  pids: Array<LockStatsTotals & { host: string; pid: number; topClass: MeshLockClass | undefined; writer?: LockStatsWriter }>;
 }
 
 const mergeBucket = (into: LockStatsBucket, from: LockStatsBucket): void => {
@@ -530,9 +939,9 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   const all = emptyBucket();
   const byClass = new Map<MeshLockClass, LockStatsBucket>();
   const perMinuteHold = new Map<number, number>();
-  const byPid: Array<{ host: string; pid: number; bucket: LockStatsBucket; classes: Map<MeshLockClass, number> }> = [];
+  const byPid: Array<{ host: string; pid: number; writer: LockStatsWriter | undefined; bucket: LockStatsBucket; classes: Map<MeshLockClass, number> }> = [];
   for (const file of files) {
-    const own = { host: file.host, pid: file.pid, bucket: emptyBucket(), classes: new Map<MeshLockClass, number>() };
+    const own = { host: file.host, pid: file.pid, writer: knownWriter(file.writer), bucket: emptyBucket(), classes: new Map<MeshLockClass, number>() };
     for (const { minute, classes } of file.minutes) {
       if (minute < fromMinute || minute > toMinute) continue;
       for (const [lockClass, bucket] of Object.entries(classes) as Array<[MeshLockClass, LockStatsBucket]>) {
@@ -550,9 +959,10 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   const classes = [...byClass].map(([lockClass, bucket]) => ({
     lockClass, ...totalsOf(bucket, windowMs), holdSharePct: all.holdMs > 0 ? bucket.holdMs / all.holdMs * 100 : 0,
   })).sort((a, b) => b.holdMs - a.holdMs || b.n - a.n || a.lockClass.localeCompare(b.lockClass));
-  const pids = byPid.map(({ host, pid, bucket, classes: held }) => ({
+  const pids = byPid.map(({ host, pid, writer, bucket, classes: held }) => ({
     host, pid, ...totalsOf(bucket, windowMs),
     topClass: [...held].sort((a, b) => b[1] - a[1])[0]?.[0],
+    ...writer ? { writer } : {},
   })).sort((a, b) => b.holdMs - a.holdMs || b.n - a.n || a.pid - b.pid).slice(0, top);
   return {
     root, fromMinute, toMinute, minutes: span, processes: byPid.length, ...totalsOf(all, windowMs),

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from "./store.js";
 
 // State-domain helpers for lock call sites (smarty-dev#6477 L2b, plan R3 and R11).
@@ -26,7 +26,8 @@ export type StateFenceStore = Pick<MeshStore, "writeBatch" | "withTryLock">;
 /**
  * Runs `body` synchronously under the state write lock, on the committed state, and writes
  * nothing. `timeoutMs` bounds the whole fence (0: one zero-wait try); a bounded try whose prepared
- * snapshot moved is retried while the budget lasts. A body that throws is never retried.
+ * snapshot moved is retried while the budget lasts. A body that throws is never retried. On SQLite a
+ * `timeoutMs` of 1 s or more waits at least 6 s for the write lock (smarty-dev#9805, state-backend.ts).
  */
 export const withStateFence = async <T>(
   mesh: StateFenceStore, identity: MeshIdentity, body: (view: MeshBatchView) => T, timeoutMs?: number,
@@ -43,7 +44,7 @@ export const withStateFence = async <T>(
     try {
       await (deadline === undefined ? fence() : mesh.withTryLock(fence, Math.max(0, deadline - Date.now())));
     } catch (error) {
-      if (entered || deadline === undefined || !isMeshLockTimeout(error) || Date.now() >= deadline) throw error;
+      if (entered || deadline === undefined || !isMeshWriteDeferred(error) || Date.now() >= deadline) throw error;
       await new Promise((resolve) => setTimeout(resolve, 1));
       continue;
     }

@@ -22,8 +22,9 @@ Recommend the smallest sufficient path; do not invoke it. Core coding needs no a
 | Strict feature-spec compliance, audited until verified | `/skill:fabric-spec` |
 | One command that infers advisor versus supervisor | `/skill:fabric-ambient` |
 | Durable actor team with mailboxes and CAS tasks | `/skill:fabric-swarm` |
+| A step graph that must survive restarts or wait for human approval | `/skill:fabric-graph` |
 
-Prefer the smallest sufficient mechanism. Distinguish workflow/council/fusion by execution shape, RLM by context size, Jev by code-owned loops and event-driven Main-turn advisors with typed judgments instead of per-tick reasoning turns, Foreman by lifecycle-driven coding supervision with a fixed judgment/policy loop, ambient roles by persistent reasoning, and swarm by durable multi-actor coordination. Jev runs are session-owned, not restart-durable.
+Prefer the smallest sufficient mechanism. Distinguish workflow/council/fusion by execution shape, RLM by context size, Jev by code-owned loops and event-driven Main-turn advisors with typed judgments instead of per-tick reasoning turns, Foreman by lifecycle-driven coding supervision with a fixed judgment/policy loop, ambient roles by persistent reasoning, swarm by durable multi-actor coordination, and graph by one ordered step sequence that checkpoints each node and survives restarts. Jev runs are session-owned, not restart-durable.
 
 ## Completion criterion
 

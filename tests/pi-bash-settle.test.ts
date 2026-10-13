@@ -12,6 +12,7 @@ import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
 import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import { CapturedToolsProvider } from "../src/providers/captured-tools-provider.js";
+import { powerShellToolDefinitionFactory } from "../src/providers/pi-bash-cwd.js";
 
 type Patch = "none" | "prefix" | "suffix" | "replace" | "deny" | "recover";
 type ResultEvent = Parameters<ExtensionRunner["emitToolResult"]>[0];
@@ -67,7 +68,12 @@ async function run(
     sourceInfo: createSyntheticSourceInfo("/extensions/bash-override/index.ts", { source: "test" }),
   }] : [], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
   const registry = new ActionRegistry();
-  registry.register(new PiToolsProvider(cwd, options.noRunner ? undefined : catalog, new CapturedToolsProvider(catalog)));
+  // pi-fabric#925: pi.powershell is refused unless the host profile opts in. The providers read that
+  // opt-in per call through getPowerShellPolicy (production wires it to executor.powershell); this
+  // settle test exercises the opted-in path.
+  const getPowerShellPolicy = options.tool === "powershell" ? () => "allow" as const : undefined;
+  registry.register(new PiToolsProvider(cwd, options.noRunner ? undefined : catalog, new CapturedToolsProvider(catalog, { getPowerShellPolicy }),
+    { powerShellToolDefinitionFactory, allowUnhookedTools: options.noRunner === true, getPowerShellPolicy }));
   const config = structuredClone(DEFAULT_FABRIC_CONFIG);
   config.executor.runtime = runtime;
   config.approvals.execute = options.approvalDenied ? "deny" : "allow";

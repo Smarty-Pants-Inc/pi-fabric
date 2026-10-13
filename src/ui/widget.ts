@@ -3,6 +3,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FabricUiWidgetMode } from "../config.js";
 import { spinnerFrame } from "./spinner.js";
+import { FabricWidgetRetention, isRecentWidgetCompletion } from "./retention.js";
 import { FABRIC_CONVERSATION_HINT } from "./conversation-shortcut.js";
 import type {
   FabricActivityRun,
@@ -75,7 +76,6 @@ const totalCost = (
 const agentLines = (
   theme: Theme,
   agent: FabricUiAgent,
-  now: number,
 ): string[] => {
   const status = colorStatus(theme, agent.status, statusGlyph(agent.status));
   const activity =
@@ -90,8 +90,8 @@ const agentLines = (
   const metrics = [
     agent.toolCalls !== undefined ? `${agent.toolCalls} calls` : undefined,
     agent.usage ? `${formatTokens(agent.usage.input + agent.usage.output)} tok` : undefined,
-    agent.startedAt
-      ? formatDuration((agent.finishedAt ?? now) - agent.startedAt)
+    agent.startedAt !== undefined && agent.finishedAt !== undefined
+      ? formatDuration(agent.finishedAt - agent.startedAt)
       : undefined,
   ].filter((value): value is string => Boolean(value));
   const indent = "  ".repeat(1 + Math.max(0, agent.nestingDepth ?? 0));
@@ -110,11 +110,13 @@ export const isFabricWidgetStreaming = (snapshot: FabricDashboardSnapshot): bool
 export const shouldShowFabricWidget = (
   snapshot: FabricDashboardSnapshot,
   mode: FabricUiWidgetMode,
+  retention = new FabricWidgetRetention(),
 ): boolean => {
   if (mode === "hidden") return false;
   if (mode === "always") return true;
-  if (snapshot.shells?.some(job => job.finishedAt === undefined || snapshot.now - job.finishedAt < 30000)) return true;
-  if (ownAgents(snapshot).some((agent) => isActiveStatus(agent.status))) return true;
+  retention.sync(snapshot);
+  if (snapshot.shells?.some(job => job.finishedAt === undefined || isRecentWidgetCompletion(job.finishedAt, snapshot.now))) return true;
+  if (ownAgents(snapshot).some((agent) => retention.visible(agent, snapshot))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
   const run = snapshot.runs[0];
   if (!run) return false;
@@ -153,6 +155,7 @@ export class FabricWidget implements Component {
     // Controller-owned above-editor widgets reserve rows for streamed turns.
     // Standalone renderers keep the historical compact behavior.
     readonly stableWhileStreaming = false,
+    readonly retention = new FabricWidgetRetention(),
   ) {}
 
   #rowLimit(): number {
@@ -253,17 +256,19 @@ export class FabricWidget implements Component {
         candidateFinishedAt > (snapshot.widgetDismissedAt ?? 0))
         ? candidateRun
         : undefined;
+    this.retention.sync(snapshot);
     const orderedAgents = orderAgentsByCreation(ownAgents(snapshot));
     const activeAgents = orderedAgents.filter((agent) => isActiveStatus(agent.status));
     const activeAgentIds = new Set(activeAgents.map((agent) => agent.id));
-    const terminalAgents = run
-      ? orderedAgents.filter(
-          (agent) =>
-            agent.runId === run.id &&
-            !activeAgentIds.has(agent.id) &&
-            !isActiveStatus(agent.status),
-        )
-      : [];
+    // Keep settle-time rows stable, then retire each completion independently.
+    // Bound only current content: expiry must not leave a high-water blank row.
+    const terminalAgents = orderedAgents
+      .filter((agent) =>
+        !activeAgentIds.has(agent.id) &&
+        !isActiveStatus(agent.status) &&
+        this.retention.visible(agent, snapshot))
+      .sort((left, right) =>
+        this.retention.finishedAt(right, snapshot.now) - this.retention.finishedAt(left, snapshot.now));
     const visibleActors = snapshot.actors.filter((actor) => actor.status !== "stopped");
     const activeActorWorkers = visibleActors
       .filter((actor) => actor.worker && isActiveStatus(actor.worker.status))
@@ -276,7 +281,7 @@ export class FabricWidget implements Component {
     const title = run?.name ?? "Fabric session";
     const shells = snapshot.shells ?? [];
     const liveShells = shells.filter(job => job.finishedAt === undefined);
-    const recentShells = shells.filter(job => job.finishedAt !== undefined && snapshot.now - job.finishedAt < 30000);
+    const recentShells = shells.filter(job => job.finishedAt !== undefined && isRecentWidgetCompletion(job.finishedAt, snapshot.now));
     const headerStatus =
       run?.status ??
       (activeAgents.length > 0 || activeActorWorkers.length > 0 || liveShells.length > 0 ? "running" : "idle");
@@ -308,7 +313,9 @@ export class FabricWidget implements Component {
     if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
     const cost = totalCost(snapshot, run);
     if (cost > 0) parts.push(formatCost(cost));
-    const elapsed = run && formatDuration((run.finishedAt ?? snapshot.now) - run.startedAt);
+    // Live durations would imply a ticking clock. Only completed work gets a
+    // duration; progress and status redraw exclusively on observed events.
+    const elapsed = run?.finishedAt !== undefined && formatDuration(run.finishedAt - run.startedAt);
     if (elapsed) parts.push(elapsed);
 
     const glyph = colorStatus(this.theme, headerStatus, statusGlyph(headerStatus));
@@ -322,26 +329,26 @@ export class FabricWidget implements Component {
     const taskHeader = taskHint ? `${glyph} ${this.theme.fg("accent", "Fabric")}${taskHint}${parts.length ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}` : header;
     const lines = [hasActiveConversations ? `${taskHeader} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : taskHeader];
     for (const job of [...liveShells, ...recentShells].slice(0, 3)) {
-      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
+      const elapsed = job.finishedAt !== undefined ? formatDuration(job.finishedAt - job.startedAt) : "";
       const status = job.stopping ? "stopping" : job.status;
       const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
       const glyph = colorStatus(this.theme, status, statusGlyph(status));
       lines.push(
         `  ${glyph} ${this.theme.fg("muted", job.id.slice(0, 8))} ${this.theme.fg("muted", label)}` +
-        `${this.theme.fg("dim", ` · ${elapsed} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
+        `${this.theme.fg("dim", `${elapsed ? ` · ${elapsed}` : ""} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
       );
     }
     if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
 
     lines.push(
-      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...activeAgents.flatMap((agent) => agentLines(this.theme, agent)),
       ...activeActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
       ...terminalActorWorkers.flatMap((agent) =>
-        agentLines(this.theme, agent, snapshot.now),
+        agentLines(this.theme, agent),
       ),
-      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent, snapshot.now)),
+      ...terminalAgents.flatMap((agent) => agentLines(this.theme, agent)),
     );
     return lines;
   }

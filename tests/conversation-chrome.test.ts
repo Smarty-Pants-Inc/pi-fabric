@@ -74,7 +74,7 @@ describe("native conversation chrome", () => {
       send: vi.fn(), stop: vi.fn(), close: vi.fn(),
     });
     const lines = plain(view.render(120));
-    const rules = lines.map((line, index) => ({ line, index })).filter(({ line }) => /^─+$/.test(line));
+    const rules = lines.map((line, index) => ({ line, index })).filter(({ line }) => /^─/.test(line));
     expect(rules).toHaveLength(2);
     expect(rules.every(({ line }) => line.length === 120)).toBe(true);
     expect(lines.find((line) => line.includes("draft"))).toMatch(/^  draft/);
@@ -125,7 +125,7 @@ describe("native conversation chrome", () => {
     expect(conversationFooter(target, theme, 120)[0]).not.toContain("read-only");
   });
 
-  it("removes the redundant metadata header while retaining breadcrumbs and footer stats", () => {
+  it("removes the redundant metadata header while retaining a border badge and footer stats", () => {
     const readonly = { ...target, kind: "agent" as const, status: "completed",
       readOnlyReason: "Target finished (completed); one-shot runs are read-only" };
     const render = vi.spyOn(FabricConversationTranscriptRenderer.prototype, "render").mockReturnValue(["history starts here"]);
@@ -136,8 +136,9 @@ describe("native conversation chrome", () => {
     });
     try {
       const lines = plain(view.render(120));
-      expect(lines[0]).toBe("chat-test");
-      expect(lines[1]).toBe("history starts here");
+      expect(lines[0]).toBe("history starts here");
+      expect(lines.some((line) => /^─.* chat-test · read-only ──$/.test(line))).toBe(true);
+      expect(lines).not.toContain("chat-test");
       const footer = lines.findIndex((line) => line.includes("/repo/child (feature/chat)"));
       expect(lines[footer]).toBe("/repo/child (feature/chat) • chat-test • read-only");
       expect(lines[footer + 1]).toContain("completed run ↑1.2k");
@@ -146,17 +147,58 @@ describe("native conversation chrome", () => {
     } finally { view.dispose(); render.mockRestore(); }
   });
 
+  it.each(["regular", "fullscreen"])("places a themed nested target on the input border in %s mode, including resize", (mode) => {
+    const main = { ...target, id: "main", name: "Main", kind: "main" as const };
+    const parent = { ...target, id: "parent", name: "ancestor", parentId: main.id };
+    const child = { ...target, name: "研究👩‍💻é-active-target", parentId: parent.id };
+    let background = "44";
+    const bg = vi.fn((_color: string, text: string) => `\x1b[${background}m${text}\x1b[49m`);
+    const view = new FabricConversationView({ ...tui, mode, terminal: { ...tui.terminal, write: vi.fn() } } as TUI, { ...theme, bg } as unknown as Theme, {
+      state: new FabricConversationState(), targets: () => [main, parent, child], initialTargetId: child.id,
+      transcript: () => nativeTranscript(), loadOlder: () => false, loadNewer: () => false, loadLatest: () => false,
+      send: vi.fn(), stop: vi.fn(), close: vi.fn(),
+    });
+    try {
+      const wide = view.render(120);
+      const badge = wide.find((line) => line.includes("Main > ancestor >"))!;
+      expect(stripTerminalSequences(badge)).toMatch(/^─+ Main > ancestor > 研究👩‍💻é-active-target ──$/);
+      expect(visibleWidth(badge)).toBe(120);
+      expect(badge).toContain("\x1b[44m");
+      expect(wide.filter((line) => line.includes("Main > ancestor >"))).toHaveLength(1);
+      expect(bg).toHaveBeenCalledWith("selectedBg", expect.stringContaining(child.name));
+      for (const width of [1, 2, 5, 8, 16, 24, 40, 120]) {
+        const lines = view.render(width);
+        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+        if (width === 24) {
+          const border = plain(lines).find((line) => /^─.*研究/.test(line))!;
+          expect(border).toContain("研究");
+          expect(border).not.toContain("ancestor");
+        }
+      }
+      background = "45";
+      view.invalidate();
+      expect(view.render(120).find((line) => line.includes("Main > ancestor >"))).toContain("\x1b[45m");
+      Object.assign(child, { name: "active-" + "界".repeat(200), readOnlyReason: "Target finished" });
+      const readonly = view.render(40);
+      const readonlyBadge = plain(readonly).find((line) => /^─.*active-/.test(line))!;
+      expect(readonlyBadge).toContain(" · read-only ──");
+      expect(readonlyBadge).not.toContain("ancestor");
+      expect(readonlyBadge).toContain("…");
+      expect(visibleWidth(readonlyBadge)).toBe(40);
+    } finally { view.dispose(); }
+  });
+
   it("reads native padding and code settings only from trusted layers", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-chrome-"));
     const cwd = path.join(root, "project");
     const agentDir = path.join(root, "agent");
     fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
     fs.mkdirSync(agentDir);
-    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ editorPaddingX: 1, outputPad: 1, markdown: { codeBlockIndent: "  " } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ editorPaddingX: 3, outputPad: 0, markdown: { codeBlockIndent: "    " } }));
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ editorPaddingX: 1, outputPad: 1, markdown: { codeBlockIndent: "  " }, fullscreenScrollbar: "hidden" }));
+    fs.writeFileSync(path.join(cwd, ".pi", "settings.json"), JSON.stringify({ editorPaddingX: 3, outputPad: 0, markdown: { codeBlockIndent: "    " }, fullscreenScrollbar: "always" }));
     try {
-      expect(readConversationAppearance(cwd, agentDir, true)).toMatchObject({ editorPaddingX: 3, outputPad: 0, codeBlockIndent: "    " });
-      expect(readConversationAppearance(cwd, agentDir, false)).toMatchObject({ editorPaddingX: 1, outputPad: 1, codeBlockIndent: "  " });
+      expect(readConversationAppearance(cwd, agentDir, true)).toMatchObject({ editorPaddingX: 3, outputPad: 0, codeBlockIndent: "    ", scrollbar: "always" });
+      expect(readConversationAppearance(cwd, agentDir, false)).toMatchObject({ editorPaddingX: 1, outputPad: 1, codeBlockIndent: "  ", scrollbar: "hidden" });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

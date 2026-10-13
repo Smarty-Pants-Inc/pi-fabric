@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { CompletionJournal, completionRecipientFromRun, completionConsumed, consumeCompletion, legacyCompletionConsumed, saveCompletion, type CompletionRecipient, type CompletionSummary } from "../agents/completion-journal.js";
 import { newResidentRequestId, ResidentRequestExpiredError, RESIDENT_EXPIRING_COMMAND_FORMAT } from "./request-expiry.js";
@@ -10,11 +11,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readResidentIdleExit, residentIdleExitPath } from "./idle-exit.js";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
+import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -28,9 +31,9 @@ import { assertNoWatchdogCustody } from "./watchdog-custody.js";
 import { runTreeExitVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
-import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
-import { isMeshLockTimeout } from "../core/atomic-write.js";
+import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
   abandonResidentRequest,
@@ -177,7 +180,12 @@ export class ResidencyClient {
   #modelGuidanceJson: string | undefined;
   #deliveryPass: Promise<void> | undefined;
   #completionFault: string | undefined;
-  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup");
+  readonly #backgroundDelivery = new MeshBackgroundRetry("resident delivery cleanup")
+    .alarmsTo(meshOutageAlarmSink(() => {
+      const self = this.options.participants.self(); // this Main, as the client's other requests name it
+      return { mesh: this.options.mesh, from: { id: self.id, name: self.name, kind: "main",
+        ...(self.sessionId ? { sessionId: self.sessionId } : {}) } };
+    }));
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
   #startupLauncher: Awaited<ReturnType<typeof spawnDetached>> | undefined;
@@ -210,11 +218,12 @@ export class ResidencyClient {
         };
         if (options.onBackgroundComplete) options.onBackgroundComplete(result, acknowledge);
         else {
-          options.mainAgent.deliverAgent({ from: { id: result.id, name: result.name, kind: "agent" },
+          options.mainAgent.deliverAgent(withFabricWakeAdmission({ from: { id: result.id, name: result.name, kind: "agent" },
             verification: "mesh", message: `Fabric agent ${result.name} ${result.status}` +
               (result.completionDelivery?.redeliveredFrom ? ` [re-delivered from dead Main session ${result.completionDelivery.redeliveredFrom}]` : "") +
               `: ${result.error ?? result.text}`, delivery: "followUp", triggerTurn: true, data: result,
-            deliveryId: `agent-completion:${result.id}` });
+            deliveryId: `agent-completion:${result.id}` }, [fabricWakeCause(
+              { id: result.id, name: result.name, kind: "agent" }, "inbox", "agent-completion", result.id)]));
           acknowledge();
         }
       });
@@ -344,6 +353,8 @@ export class ResidencyClient {
     // destructive watchdog custody while we still saw its live owner.
     assertNoWatchdogCustody(this.options.config.residencyRoot);
     fs.rmSync(this.#errorPath, { force: true });
+    // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
+    fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
     const launcher = await spawnDetached(
       this.#hostPath,
@@ -467,6 +478,11 @@ export class ResidencyClient {
   async createActor(request: FabricActorCreateRequest, signal?: AbortSignal): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
     await this.ensureHost();
+    const self = this.options.participants.self();
+    const caller: ResidentActorCaller | undefined = this.options.mainAgent.local && self.kind === "root" &&
+      self.id === this.options.config.rootId && self.sessionId
+      ? { identity: { id: self.id, name: self.name, kind: "main", sessionId: self.sessionId }, hostId: self.ownerHostId }
+      : undefined;
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
@@ -474,6 +490,7 @@ export class ResidencyClient {
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
       request: creationRequest,
+      ...(caller ? { caller } : {}),
       createdAt: Date.now(),
     }, signal);
     if (!response.actor) throw new Error("Fabric resident host returned no actor");
@@ -545,6 +562,12 @@ export class ResidencyClient {
     const resolvedRequest = spawnRequest.cwd === undefined
       ? spawnRequest
       : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
+    // Registration is process-local: the resident host must import the runner too.
+    const runner = spawnRequest.runner ?? this.options.config.agents.runner;
+    const runnerModule = BUILT_IN_RUNNER_IDS.has(runner) ? undefined : requireAgentRunner(runner).residentModule;
+    if (!BUILT_IN_RUNNER_IDS.has(runner) && !runnerModule) {
+      throw new Error(`Fabric runner ${runner} declares no residentModule; durable residency needs one`);
+    }
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
     const tools = allowedTools === undefined ? undefined
@@ -563,6 +586,7 @@ export class ResidencyClient {
         rootId: this.options.config.rootId,
         request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
         caller,
+        ...(runnerModule ? { runnerModule } : {}),
         createdAt: Date.now(),
       },
       signal,
@@ -1052,6 +1076,8 @@ export class ResidencyClient {
       return;
     }
     if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) return;
+    // Intentional dead-root retirement is not a crash, even if retained delivery debt remains.
+    if (readResidentIdleExit(this.options.config.residencyRoot, this.options.config.rootId)) return;
     const work = this.#durableWork();
     if (!work) { this.#watchdogWork = undefined; this.#watchdogFailures = 0; return; }
     const noProgress = work === this.#watchdogWork;
@@ -1074,7 +1100,7 @@ export class ResidencyClient {
     for (const root of actorRoots) {
       const registry = readJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(root, "actors.json"));
       for (const actor of registry?.actors ?? []) {
-        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") {
+        if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped" && actor.status !== "dormant") {
           work.push(`actor:${root}:${actor.id}:${actor.status}`);
         }
       }
@@ -1161,7 +1187,7 @@ export class ResidencyClient {
         } catch (error) {
           // The record remains durable. Back off a locked mesh; retain ordinary failed senders
           // without blocking the other entries in this pass.
-          if (isMeshLockTimeout(error)) throw error;
+          if (isMeshWriteDeferred(error)) throw error;
           fault ??= error;
         }
       }
@@ -1169,7 +1195,7 @@ export class ResidencyClient {
       if (fault !== undefined) throw fault; // Legacy-import faults need the same deduplicated diagnostic.
       this.#completionFault = undefined;
     } catch (error) {
-      if (isMeshLockTimeout(error)) throw error; // Let the owned background retry back off the outage.
+      if (isMeshWriteDeferred(error)) throw error; // Let the owned background retry back off the outage.
       const diagnostic = `Fabric completion remains pending: ${String(error).slice(0, 1000)}`;
       if (diagnostic !== this.#completionFault) console.warn(diagnostic);
       this.#completionFault = diagnostic;
@@ -1220,7 +1246,14 @@ export class ResidencyClient {
     // until Main durably admitted it: deliverAgent journals it under the record's stable id before
     // it returns, keeps it until the session holds it, and admits one id once across restarts and
     // release reloads (review round 2 on pi-fabric#160). Only then is the record deleted.
-    this.options.mainAgent.deliverAgent({
+    // Ignore the resident payload's optional wakeCause. The owner-authenticated
+    // writer emits host notices; positively classified output delegates the actor
+    // identity under the existing resident admission policy. Topic/key are the
+    // receiving storage route and envelope key, never producer diagnostic fields.
+    const wakeCause = fabricWakeCause(value.source === "actor-output" ? value.from : entry.updatedBy,
+      value.source === "fabric-host" ? "host-event" : value.source === "actor-output" ? "actor" : value.delivery,
+      "fabric.resident.delivery", entry.key);
+    this.options.mainAgent.deliverAgent(withFabricWakeAdmission({
       from: value.from,
       source: value.source,
       // The authenticated resident writer alone does not prove actor authorship: older
@@ -1233,7 +1266,7 @@ export class ResidencyClient {
       triggerTurn: value.triggerTurn,
       ...(value.data === undefined ? {} : { data: value.data }),
       deliveryId: `resident:${this.options.config.rootId}:${value.id}`,
-    });
+    }, [wakeCause]));
     await this.options.mesh.delete({ key: entry.key, ifVersion: entry.version });
   }
 }

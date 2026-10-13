@@ -23,6 +23,7 @@ export const isRunReplyTool = (
 };
 
 export const ownsRunReplyTool = (
-  tools: ReadonlyArray<{ name: string; sourceInfo: { path: string } }>,
+  tools: ReadonlyArray<{ name: string; sourceInfo?: { path?: string } }>,
   env: NodeJS.ProcessEnv = process.env,
-): boolean => tools.some((tool) => isRunReplyTool(tool.name, tool.sourceInfo.path, env));
+  // A tool without source info cannot be the exact hook file's tool.
+): boolean => tools.some((tool) => isRunReplyTool(tool.name, tool.sourceInfo?.path, env));

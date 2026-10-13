@@ -1,10 +1,27 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { MAIN_STOPPED_AUDIT_REQUIRED, MAIN_STOPPED_EVIDENCE_MAX_BYTES, mainStoppedAudit, removeActorOffline } from "./actors/remove-offline.js";
 import { ResidentActorClient } from "./residency/actor-client.js";
 import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHostOwner } from "./residency/protocol.js";
 import { residentProcessAlive } from "./residency/process-identity.js";
+import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
+const help = `${usage}
+
+When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
+path is unchanged; smarty-dev#8090). The offline removal archives the actor by one rename of its directory into
+<residency>/archives/<id>.<time>.<rand>/ (same filesystem only) beside its registry row and audit record;
+deleting archives is left to retention (smarty-dev#7916). --main-stopped is an OPERATOR ATTESTATION, not a machine proof: the operator
+states that the root's Main process is gone. Chief-of-staff accepted it on 2026-10-09 for the operator of the
+dead Main's own fleet, or Light for the #7231 waves; nobody else uses it. The automatic proof is smarty-dev#7956.
+It needs --evidence <text> or --evidence-file <path> (read as text, capped at 64 KiB): the Herdr pane/agent
+listing and the process check for that Main's session, kept as operatorAttestation. The tool adds its own
+observation (every root participant record with its pid, host, release and last-seen time, a /proc check of each
+pid on this host, the owner lease state, and the time), and the operator ($USER, PI_FABRIC_AGENT_NAME or the
+session id), root id and time, in the removal archive and record. It never overrides a live root lease, a
+fresh, reloading or doubtful root participant, or a participant process alive on this host.`;
 
 /** Resolve exactly one resident under the configured residency directory, never the CWD. */
 export function resolveResidentDirectory(selector: string, meshRoot: string): string {
@@ -33,33 +50,115 @@ export function resolveResidentDirectory(selector: string, meshRoot: string): st
   return directory;
 }
 
+export interface ResidentChannelOwnerProbe {
+  platform: NodeJS.Platform;
+  getuid?: () => number;
+  /** win32 only: channel owner SIDs, current user SID and token Administrators membership. */
+  windowsOwnerSids?: (files: string[]) => { owners: string[]; user: string; isAdministrator: boolean };
+}
+
+const windowsSidScript = [
+  "$ErrorActionPreference = 'Stop'",
+  "$sid = [System.Security.Principal.SecurityIdentifier]",
+  // Paths are data, never interpolated into the script.
+  "$paths = $env:FABRIC_ACTORS_OWNER_PATHS -split [char]10",
+  "foreach ($p in $paths) { [Console]::Out.WriteLine((Get-Acl -LiteralPath $p).GetOwner($sid).Value) }",
+  "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+  "[Console]::Out.WriteLine($identity.User.Value)",
+  "[Console]::Out.WriteLine([System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator))",
+].join("; ");
+
+/** Query owner SIDs with a fixed argv; the paths travel in the environment, never the command line. */
+export function windowsOwnerSids(files: string[]): { owners: string[]; user: string; isAdministrator: boolean } {
+  if (files.some(file => /[\r\n]/.test(file))) throw new Error("path contains a line break");
+  const command = windowsSecurityPowerShell(windowsSidScript);
+  const output = execFileSync(command.file, command.args, {
+    encoding: "utf8", windowsHide: true, timeout: 30_000, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...command.env, FABRIC_ACTORS_OWNER_PATHS: files.join("\n") },
+  });
+  const lines = output.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const administrator = lines[files.length + 1];
+  if (lines.length !== files.length + 2 || (administrator !== "True" && administrator !== "False")) {
+    throw new Error("unexpected owner query output");
+  }
+  return { owners: lines.slice(0, files.length), user: lines[files.length]!, isAdministrator: administrator === "True" };
+}
+
+const defaultOwnerProbe = (): ResidentChannelOwnerProbe => ({ platform: process.platform,
+  ...(process.getuid ? { getuid: () => process.getuid!() } : {}), windowsOwnerSids });
+const sidPattern = /^S-1-\d+(-\d+)+$/;
+
+/** Fail closed unless every channel path is non-symlink and has an allowed OS owner. */
+export function assertResidentChannelOwned(files: string[], probe: ResidentChannelOwnerProbe = defaultOwnerProbe()): void {
+  const stats = files.map(file => {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`Resident channel is not owned by this OS user: ${file}`);
+    return stat;
+  });
+  if (probe.platform === "win32") {
+    // Node reports uid 0 on Windows, so stat cannot prove ownership; compare owner SIDs instead.
+    let result: { owners: string[]; user: string; isAdministrator: boolean };
+    try {
+      if (!probe.windowsOwnerSids) throw new Error("no owner SID query is available");
+      result = probe.windowsOwnerSids(files);
+    } catch (error) {
+      throw new Error(`Cannot verify that the resident channel is owned by this Windows user (${error instanceof Error ? error.message : String(error)}); refusing stop/remove`);
+    }
+    if (!sidPattern.test(result.user) || result.owners.length !== files.length || typeof result.isAdministrator !== "boolean") {
+      throw new Error("Cannot verify that the resident channel is owned by this Windows user (malformed SID query result); refusing stop/remove");
+    }
+    files.forEach((file, index) => {
+      const owner = result.owners[index]!;
+      // Windows StrictModes: Administrators-owned paths require an admin token; SYSTEM is trusted.
+      const allowed = owner === result.user || owner === "S-1-5-18" || (owner === "S-1-5-32-544" && result.isAdministrator);
+      if (!sidPattern.test(owner) || !allowed) throw new Error(`Resident channel is not owned by this OS user: ${file}`);
+    });
+    return;
+  }
+  if (!probe.getuid) throw new Error("Cannot verify that the resident channel is owned by this OS user (no uid available); refusing stop/remove");
+  const uid = probe.getuid();
+  files.forEach((file, index) => {
+    if (stats[index]!.uid !== uid) throw new Error(`Resident channel is not owned by this OS user: ${file}`);
+  });
+}
+
 export async function main(argv: string[], io: { out: (text: string) => void; err: (text: string) => void } = { out: (text: string) => process.stdout.write(text),
-  err: (text: string) => process.stderr.write(text) }): Promise<number> {
+  err: (text: string) => process.stderr.write(text) }, ownerProbe: ResidentChannelOwnerProbe = defaultOwnerProbe()): Promise<number> {
   try {
-    if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(usage + "\n"); return 0; }
+    if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) { io.out(help + "\n"); return 0; }
     const [action, ...rest] = argv;
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};
     let dryRun = false;
+    // remove: the operator asserts the root's Main process is gone (automatic proof: smarty-dev#7956).
+    let mainStopped = false;
     for (let index = 0; index < rest.length; index++) {
       const option = rest[index]!;
       if (option === "--dry-run") { dryRun = true; continue; }
-      if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root"].includes(option) || values[option] !== undefined ||
+      if (option === "--main-stopped" && !mainStopped) { mainStopped = true; continue; }
+      if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root", "--evidence", "--evidence-file"].includes(option) || values[option] !== undefined ||
           !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
       values[option] = rest[++index]!;
     }
     if (!values["--resident"] || !values["--actor"]) throw new Error(usage);
+    const evidenceGiven = values["--evidence"] !== undefined || values["--evidence-file"] !== undefined;
+    if ((values["--evidence"] !== undefined && values["--evidence-file"] !== undefined) || (evidenceGiven && !mainStopped) ||
+        (mainStopped && action !== "remove")) throw new Error(usage);
+    if (mainStopped && !evidenceGiven) throw new Error(MAIN_STOPPED_AUDIT_REQUIRED);
+    let evidence = values["--evidence"];
+    if (values["--evidence-file"] !== undefined) {
+      const fd = fs.openSync(values["--evidence-file"], "r");
+      try {
+        const buffer = Buffer.alloc(MAIN_STOPPED_EVIDENCE_MAX_BYTES);
+        evidence = buffer.subarray(0, fs.readSync(fd, buffer, 0, buffer.length, 0)).toString("utf8");
+      } finally { fs.closeSync(fd); }
+    }
     const meshRoot = path.resolve(values["--mesh-root"] ?? process.env.PI_FABRIC_MESH_ROOT ??
       path.join(process.env.PI_FABRIC_PROJECT_ROOT ?? process.cwd(), ".pi", "fabric", "mesh"));
     const directory = resolveResidentDirectory(values["--resident"], meshRoot);
     // Local OS user boundary, independent of the invoking Fabric session's root.
-    for (const file of [directory, path.join(directory, "config.json"), path.join(directory, "owner.json"),
-      path.join(directory, "requests"), path.join(directory, "responses")]) {
-      const stat = fs.lstatSync(file);
-      if (stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) {
-        throw new Error(`Resident channel is not owned by this OS user: ${file}`);
-      }
-    }
+    assertResidentChannelOwned([directory, path.join(directory, "config.json"), path.join(directory, "owner.json"),
+      path.join(directory, "requests"), path.join(directory, "responses")], ownerProbe);
     const config = JSON.parse(fs.readFileSync(path.join(directory, "config.json"), "utf8")) as ResidentHostConfig;
     const owner = JSON.parse(fs.readFileSync(path.join(directory, "owner.json"), "utf8")) as ResidentHostOwner;
     if (typeof config.rootId !== "string" || typeof config.meshRoot !== "string" ||
@@ -67,16 +166,28 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
         fs.realpathSync(config.residencyRoot) !== directory || fs.realpathSync(residentRoot(config.meshRoot, config.rootId)) !== directory) {
       throw new Error("Resident directory/config/owner identity mismatch");
     }
-    if (!residentProcessAlive(owner.pid, owner.processStartTime)) throw new Error("Root resident host is not live");
-    // The runtime exchange deliberately unrefs its polling timer. A standalone
-    // operator process must stay alive until the acknowledged response is printed.
-    const keepAlive = setInterval(() => {}, 30_000);
+    const confirmation = { ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}),
+      ...(mainStopped ? { mainStoppedAudit: mainStoppedAudit(config.rootId, evidence ?? "") } : {}) };
+    if (!residentProcessAlive(owner.pid, owner.processStartTime)) {
+      // smarty-dev#7817: a dead resident cannot carry out the removal; do it offline under its host.lock fence.
+      if (action !== "remove") throw new Error("Root resident host is not live");
+      const response = await removeActorOffline(directory, config, values["--actor"], { dryRun, ...confirmation });
+      io.out(JSON.stringify({ resident: directory, action, ...response }) + "\n");
+      return response.cleaned === false ? 1 : 0;
+    }
+    // The live resident's own remove path is unchanged here (smarty-dev#8090); the attestation is offline-only.
+    if (mainStopped) throw new Error("--main-stopped applies only to an offline removal (dead resident host); the live resident path is smarty-dev#8090");
+    // The runtime exchange deliberately unrefs its polling timer. A standalone operator process must
+    // stay alive until the acknowledged response is printed: one ref'd timer for the wait's own
+    // deadline, cleared when the wait settles. No periodic timer.
+    const client = new ResidentActorClient(config.meshRoot, config.rootId);
+    const keepAlive = setTimeout(() => {}, client.commandTimeoutMs + 1_000);
     try {
-      const response = await new ResidentActorClient(config.meshRoot, config.rootId).operatorActor(action,
-        values["--actor"], { dryRun, ...(values["--confirm-dead-root"] !== undefined ? { confirmDeadRoot: values["--confirm-dead-root"] } : {}) });
+      const response = await client.operatorActor(action,
+        values["--actor"], { dryRun, ...(confirmation.confirmDeadRoot !== undefined ? { confirmDeadRoot: confirmation.confirmDeadRoot } : {}) });
       io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;
-    } finally { clearInterval(keepAlive); }
+    } finally { clearTimeout(keepAlive); }
   } catch (error) {
     io.err(`fabric-actors: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

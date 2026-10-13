@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import { FabricModelDeniedError } from "../src/core/model-policy.js";
+import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError } from "../src/interrupt-authority.js";
+import { FabricControlStaleIncarnationError, STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import { classifyPiBashError } from "../src/core/pi-bash-error.js";
 import { MeshLockTimeoutError, MESH_LOCK_TIMEOUT_CODE } from "../src/core/atomic-write.js";
 import { transpileFabricCodeWithSourceMap } from "../src/runtime/type-checker.js";
@@ -35,6 +37,22 @@ catch (error) {
     expect(result.value).toEqual({ name: "MeshLockTimeoutError", code: MESH_LOCK_TIMEOUT_CODE,
       message: error.message, isError: true, extra: "undefined", continued: ["continued"] });
     expect(hostCall.mock.calls.map(([reference]) => reference)).toEqual(["mesh.put", "mesh.read"]);
+  });
+
+  it.each([new FabricInterruptNotAuthorizedError("sender", "target"), new FabricInterruptRateLimitedError("sender", "target")])
+    ("preserves the vetted interrupt refusal code in agents.send (%s)", async error => {
+      Object.assign(error, { secret: "host-only" });
+      const result = await new QuickJsRuntime().execute('try { await agents.send({ id: "main", message: "HOLD", priority: "interrupt" }); } catch (error) { return { name: error.name, code: error.code, extra: typeof error.secret }; }', async () => { throw error; }, options);
+      expect(result.error).toBeUndefined();
+      expect(result.value).toEqual({ name: error.name, code: error.code, extra: "undefined" });
+    });
+
+  it("preserves the vetted stale owner-incarnation refusal from a fenced control command", async () => {
+    const error = Object.assign(new FabricControlStaleIncarnationError("session:target"), { secret: "host-only" });
+    const result = await new QuickJsRuntime().execute('try { await agents.followUp({ id: "session:target", message: "hello" }); } catch (error) { return { name: error.name, code: error.code, message: error.message, extra: typeof error.secret, targetId: typeof error.targetId }; }', async () => { throw error; }, options);
+    expect(result.error).toBeUndefined();
+    expect(result.value).toEqual({ name: "FabricControlStaleIncarnationError", code: "FABRIC_CONTROL_STALE_INCARNATION",
+      message: STALE_INCARNATION_ERROR, extra: "undefined", targetId: "undefined" });
   });
 
   it("preserves a non-lock host Error name without transferring its arbitrary code", async () => {
@@ -264,6 +282,8 @@ catch (error) { return { name: error.name, code: typeof error.code, extra: typeo
   });
 
   it.each([
+    ["FABRIC_CONTROL_INCARNATION_REQUIRED", "FabricControlIncarnationRequiredError"],
+    ["FABRIC_CONTROL_STALE_INCARNATION", "FabricControlStaleIncarnationError"],
     ["FABRIC_PARTICIPANT_NOT_YET_MIRRORED", "FabricParticipantNotYetMirroredError"],
     ["FABRIC_PARTICIPANT_NON_INTERACTIVE", "FabricParticipantNonInteractiveError"],
     ["FABRIC_TASK_ESCALATION_TARGET_DENIED", "TaskEscalationTargetError"],
@@ -1134,7 +1154,7 @@ return "done";
     expect(request).toMatchObject({ task: "map", cwd: "target", worktree: true, runner: "pi", recursive: true });
   });
 
-  it("counts rlm.query usage and forces the Pi runner", async () => {
+  it("counts rlm.query usage and defaults to the Pi runner (fork default; pi-durable is opt-in)", async () => {
     let request: Record<string, unknown> | undefined;
     const result = await new QuickJsRuntime().execute(
       `await rlm.query({ task: "map" }); return budget.spent();`,
@@ -1150,6 +1170,17 @@ return "done";
     expect(result.error).toBeUndefined();
     expect(result.value).toBe(10);
     expect(request).toMatchObject({ task: "map", runner: "pi", recursive: true });
+  });
+
+  it("keeps explicit legacy Pi selection and rejects non-recursive runners for RLM", async () => {
+    const calls: Record<string, unknown>[] = [];
+    const result = await new QuickJsRuntime().execute(
+      `await rlm.query({ task: "map", runner: "pi" }); try { await rlm.query({ task: "map", runner: "claude" }); } catch (error) { return error.message; }`,
+      async (_ref, args) => { calls.push(args); return { status: "completed", text: "done" }; }, options,
+    );
+    expect(result.value).toContain("requires a Pi runner");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ runner: "pi", recursive: true });
   });
 
   it("preempts the council synthesizer when roles exhaust the token budget", async () => {

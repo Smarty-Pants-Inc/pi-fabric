@@ -53,7 +53,7 @@ export const collectAgentToolPreviewNodes = (
       id: record.id,
       name: record.actorName ?? record.name,
       status: record.status,
-      ...(record.runner === "pi" || record.runner === "claude" || record.runner === "veda"
+      ...(record.runner === "pi" || record.runner === "pi-durable" || record.runner === "claude" || record.runner === "veda"
         ? { runner: record.runner }
         : {}),
       owner: record.actorId ? "actor" : "agent",
@@ -194,8 +194,9 @@ export const waitWithProgress = async (
       );
       if (revision === lastPreviewRevision) return;
       lastPreviewRevision = revision;
-      const currentTool =
-        "currentTool" in status && status.currentTool ? ` · ${status.currentTool}` : "";
+      const currentTool = "blockedOn" in status && status.blockedOn
+        ? " · waiting_for_answer"
+        : "currentTool" in status && status.currentTool ? ` · ${status.currentTool}` : "";
       const displayName = status.actorName ?? status.name;
       context.update(`Agent ${displayName}: ${status.status}${currentTool}`);
       if ("usage" in status) {

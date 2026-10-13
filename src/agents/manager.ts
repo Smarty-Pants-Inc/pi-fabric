@@ -1,19 +1,31 @@
-import { copyFabricPrincipal, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
+import { childProcessEnvironment } from "../core/atomic-write.js";
+import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
 import { taskReturnAddressArguments, type TaskReturnAddress } from "./task-return-address.js";
 import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
+import { normalizeAgentRequires } from "./input-validation.js";
+import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
+import {
+  childThinkingBounds,
+  clampThinkingToBounds,
+  serializeThinkingBounds,
+  type FabricThinkingBounds,
+} from "../thinking.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
+import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
-import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
+import { readFileRetrying, syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
+import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -31,6 +43,21 @@ import {
   type ClaudeModelInfo,
 } from "./claude-cli.js";
 import { mapVedaTools, normalizeVedaModel } from "./veda-cli.js";
+import {
+  BUILT_IN_RUNNER_IDS,
+  isFabricRunnerId,
+  requireAgentRunner,
+  getAgentRunner,
+  type FabricHostedRunner,
+  type FabricRunnerAdapter,
+  type FabricRunnerLaunchContext,
+} from "./runner-registry.js";
+import {
+  HOSTED_STATE_FILE,
+  HostedRun,
+  readHostedRunState,
+  type HostedRunHooks,
+} from "./hosted-run.js";
 import { resolvePiBinary } from "./pi-binary.js";
 import {
   inheritedSessionPinsFromEnv,
@@ -50,8 +77,11 @@ import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import { resolveAgentSpawner } from "./spawner.js";
+import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import type {
   AgentSpawner,
+  AgentChildQuestionRequest,
+  AgentChildQuestionResponse,
   FabricBudgetSummary,
   FabricSteeringMode,
   FabricAgentLog,
@@ -67,12 +97,25 @@ import type {
   AgentTransportLaunch,
   AgentUsage,
 } from "./types.js";
-import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
+import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentAdmissionAlarm, type AgentFollowUpAlarm, type AgentFollowUpDelivery } from "./types.js";
 import { followUpFile, followUpState, settleFollowUp, releaseFollowUpPayload } from "./follow-up-delivery.js";
 import { createRunRouteMetadata } from "../worker/run-record.js";
+import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/terminal-answer.js";
+import { FabricTargetTerminalError, type AgentTerminalNotice } from "./terminal-target.js";
+import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlMatchesAdmission, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
-import { WorktreeManager } from "./worktree-manager.js";
-import { writeHandoffSession } from "./handoff.js";
+import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
+import { writeForkSession, writeHandoffSession } from "./handoff.js";
+import {
+  checkWritePolicyRequest,
+  readAgentLineage,
+  readWritePolicy,
+  requestsWritePolicy,
+  resolveChildWritePolicy,
+  type FabricAgentLineage,
+  type FabricWritePolicy,
+} from "./child-env.js";
+import { launchScope, normalizeScope } from "../scope.js";
 import type { FabricCompactionBudget } from "../compaction/hook.js";
 import {
   activeBudgetState,
@@ -140,10 +183,22 @@ import {
 } from "./constants.js";
 const NESTED_SNAPSHOT_POLL_MS = 500;
 const TRANSPORT_EXIT_GRACE_MS = 1_000;
+/** smarty-dev#9855: a standing held-permit alarm repeats this often. */
+const ADMISSION_REALARM_MS = 6 * 60 * 60 * 1_000;
+/** pi-fabric#939 round 4: a failed recovered-answer save retries after 1, 2, 4, 8 and 16 s (5 tries). */
+const RECOVERY_RETRY_MAX = 5;
+const RECOVERY_RETRY_BASE_MS = 1_000;
+/** The first call runs `release`; later calls do nothing (a permit is released at most once). */
+const once = (release: () => void): (() => void) => {
+  let done = false;
+  return () => { if (!done) { done = true; release(); } };
+};
 // These adapters conflate CLI/socket errors with absent sessions and have no
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
   transport.kind === "tmux" || transport.kind === "screen";
+// agents.childQuestionTimeoutMs default: routed child dialogs cancel after 10 minutes.
+const DEFAULT_CHILD_QUESTION_TIMEOUT_MS = 600_000;
 const MAX_NAME_LENGTH = 60;
 const MAX_UI_TEXT_CHARS = 16_000;
 const MAX_UI_ERROR_CHARS = 8_000;
@@ -303,8 +358,27 @@ export const awaitAgentCwd = async (
     await new Promise((resolve) => setTimeout(resolve, wait));
   }
 };
+/** pi-fabric#939 rounds 4-5: a held run's bounded save retry and its one owner alarm (managed or queued). */
+interface RecoveryRetry {
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
+}
+
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   runRoute: AgentRunRouteMetadata;
+  /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
+  /** pi-fabric#939: the worker pid and birth this manager recorded at launch; the only proof source for release. */
+  ownProcess?: OwnedProcess;
+  /** pi-fabric#939 round 2: its saved answer was delivered to the spawner after an unconfirmed exit (once). */
+  recoveredAnswer?: boolean;
+  /** Round 3: that delivery's save succeeded; only its completed mark is left. */
+  recoveredSaved?: boolean;
+  /** Round 4: the bounded save retry (one one-shot timer) and its one owner alarm. */
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
   id: string;
   name: string;
   task: string;
@@ -313,6 +387,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Host-only activation persistence fence, invoked before conflicting input is admitted. */
   onOutputPrincipalDowngrade: (() => void) | undefined;
   runner: FabricAgentRunner;
+  /** Capability facts frozen at launch; a later unregister does not change them. */
+  runnerAdapter: FabricRunnerAdapter;
+  /** Adapter-owned run: never relaunched or re-prompted by Fabric. */
+  hosted?: HostedRun;
   kernel?: FabricKernel;
   recursive: boolean;
   residency: "session" | "durable";
@@ -331,6 +409,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Set by an explicit stop — tool, dashboard, or session shutdown. A requested
    *  stop is terminal and must never be resumed behind the operator's back. */
   stopRequested: boolean;
+  finalAnswer?: FinalAnswerReceipt;
+  finalAnswerResult?: AgentRunResult;
+  finalAnswerCompletion?: Promise<void>;
+  terminalNoticeSeen?: Set<string>;
   /** Process teardown is an ownership obligation, even after logical settlement. */
   processStop?: Promise<void>;
   processStopPending?: boolean;
@@ -365,6 +447,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   routeOutcome?: (result: AgentRunResult) => void;
   /** Original authority for every attempt, never a prepared/observed replacement label. */
   routePin?: Readonly<NonNullable<AgentRunRequest["routeDecision"]>["pin"]>;
+  requestedThinking?: AgentRunRequest["thinking"];
   actorId?: string;
   actorName?: string;
   spawner?: AgentSpawner;
@@ -375,8 +458,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   fabricSessionId?: string;
   branch?: string;
   worktree?: string;
+  worktreeResult?: AgentWorktreeResult;
   nestedSnapshot?: AgentRunRecord[];
   nestedSnapshotAt?: number;
+  /** Routed child dialogs in flight; aborted at settlement. */
+  questions?: AbortController;
+  questionDecisionId?: string;
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
   /** Keep the full completion only while its terminal-result save needs retrying. */
@@ -398,6 +485,15 @@ interface QueuedAgent {
   routeOutcome?: (result: AgentRunResult) => void;
   /** Also guard cleanup if writing the persistent unresolved marker failed. */
   cleanupPending?: string;
+  /** smarty-dev#9855: the admission permit an unknown-outcome launch holds until it is proven gone (once-only). */
+  heldPermit?: () => void;
+  /** pi-fabric#939: the pid the launch obligation reported to this manager, with its birth when readable. */
+  ownProcess?: OwnedProcess;
+  /** Round 5: its recovered outcome was handed to the waiter (once). */
+  resolvedRecovered?: boolean;
+  recoveryTimer?: NodeJS.Timeout;
+  recoveryRetries?: number;
+  recoveryAlarmed?: boolean;
   info: AgentHandleInfo;
   task: string;
   enqueuedAt: number;
@@ -412,6 +508,13 @@ interface QueuedAgent {
 }
 
 const terminalStatuses = terminalAgentStatuses;
+
+// Hosted runs have no Fabric transport to relaunch through.
+const HOSTED_TRANSPORT: AgentTransportAdapter = {
+  kind: "process",
+  available: async () => false,
+  launch: () => Promise.reject(new Error("Fabric never relaunches a hosted run")),
+};
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -475,18 +578,10 @@ const safeName = (value: string): string =>
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const parsed: unknown = JSON.parse(readFileRetrying(filePath));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as AgentRunRecord;
-    return {
-      ...record,
-      runner:
-        record.runner === "claude"
-          ? "claude"
-          : record.runner === "veda"
-            ? "veda"
-            : "pi",
-    };
+    return { ...record, runner: isFabricRunnerId(record.runner) ? record.runner : "pi" };
   } catch {
     return undefined;
   }
@@ -530,6 +625,28 @@ const compactUiRecord = (record: AgentRunRecord): AgentRunRecord => {
       : {}),
   };
 };
+
+// A terminal owner no longer hosts its session children. Preserve genuine final
+// results, but do not present its last running snapshot as live execution. Durable
+// descendants have independent owners and must not inherit this terminal state.
+const reconcileNestedAgents = (records: AgentRunRecord[], owner: AgentRunRecord): AgentRunRecord[] =>
+  records.map((record) => {
+    let next = record;
+    if (terminalStatuses.has(owner.status) && !terminalStatuses.has(record.status) && record.residency !== "durable") {
+      const { currentTool: _currentTool, blockedOn: _blockedOn, ...rest } = record;
+      const finishedAt = owner.finishedAt ?? owner.updatedAt;
+      next = {
+        ...rest,
+        status: "failed",
+        error: `Nested agent owner ${owner.id} finished (${owner.status}) before a terminal result was retained`,
+        finishedAt,
+        updatedAt: Math.max(record.updatedAt, finishedAt),
+      };
+    }
+    return next.nestedAgents
+      ? { ...next, nestedAgents: reconcileNestedAgents(next.nestedAgents, next) }
+      : next;
+  });
 
 const readNestedAgents = (runDirectory: string, depth = 0): AgentRunRecord[] => {
   if (depth >= 8) return [];
@@ -623,7 +740,12 @@ const failedRecord = (
     finishedAt: now,
     turns: Math.max(progress.turns, previous?.turns ?? 0),
     toolCalls: Math.max(progress.toolCalls, previous?.toolCalls ?? 0),
-    text: "",
+    // A forced termination (Windows stop or SIGKILL) cannot publish a worker
+    // exit record. Its last atomic streaming checkpoint is still actual output;
+    // retain only prose, never a structured reply or a success/error verdict.
+    text: previous?.text ?? "",
+    ...(previous?.partialText !== undefined ? { partialText: previous.partialText } : {}),
+    ...(previous?.lastCompleteText !== undefined ? { lastCompleteText: previous.lastCompleteText } : {}),
     error,
     usage,
     ...(managed.model ? { model: managed.model } : {}),
@@ -639,6 +761,7 @@ const failedRecord = (
     ...(managed.transport.attachCommand ? { attachCommand: managed.transport.attachCommand } : {}),
     ...(managed.branch ? { branch: managed.branch } : {}),
     ...(managed.worktree ? { worktree: managed.worktree } : {}),
+    ...(managed.worktreeResult ? { worktreeResult: managed.worktreeResult } : {}),
   };
 };
 
@@ -679,6 +802,7 @@ export class AgentManager {
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
   readonly #managedTempRoot: boolean;
+  readonly #parentOwnedRunRoot: boolean;
   readonly #retention: FabricRetentionConfig;
   readonly #workerPath: string;
   readonly #sweepPath: string;
@@ -692,8 +816,16 @@ export class AgentManager {
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
   readonly #spawner: AgentSpawner | undefined;
+  readonly #spawnerName: () => string | undefined;
   readonly #fabricSessionId: string | undefined;
   readonly #meshRoot: string | undefined;
+  /** The Fabric-owned root below which our own group/other-writable containers are tightened on first use
+   * (pi-fabric#875 round 3): the mesh root when the run root lies in it (resident hosts), else the run root. */
+  #trustRoot(): string {
+    const runRoot = path.resolve(this.#runRoot);
+    const mesh = this.#meshRoot === undefined ? undefined : path.resolve(this.#meshRoot);
+    return mesh !== undefined && runRoot.startsWith(mesh + path.sep) ? mesh : runRoot;
+  }
   readonly #projectRoot: string;
   readonly #completionRecipient: CompletionRecipient | (() => CompletionRecipient) | undefined;
   readonly #hostId: string | undefined;
@@ -708,13 +840,23 @@ export class AgentManager {
   readonly #onSettled: ((result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void) | undefined;
   /** Results of runs a previous runtime of this session stopped at reload/shutdown. */
   readonly #previousRuns = new Map<string, AgentRunResult>();
+  #enodevRuns: string[] | undefined;
+  readonly #enodevCommits = new Map<string, { directory: string; actorId: string; activationId: string }>();
+  /** pi-fabric#939 round 3: runs THIS manager settled through #912's recovery (it removed their markers itself). */
+  readonly #enodevSettledHere = new Set<string>();
   readonly #foregroundPrepared = new Set<string>();
   readonly #pendingAbandonment = new Set<string>();
   readonly #foregroundDelivered = new Set<string>();
   readonly #onLifecycle: ((event: FabricLifecyclePublishRequest) => void) | undefined;
   readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
+  readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
+  #admissionAlarmAt: number | undefined;
+  readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
+  readonly #onChildQuestion:
+    | ((request: AgentChildQuestionRequest) => Promise<AgentChildQuestionResponse>)
+    | undefined;
   readonly #preparePiModel:
     | ((model: string | undefined, requiredPin?: boolean) => Promise<string | void>)
     | undefined;
@@ -723,6 +865,13 @@ export class AgentManager {
     | undefined;
   readonly #resolveParticipantGuidance: AgentParticipantGuidanceResolver | undefined;
   readonly #resolveInheritedSessionPins: (() => InheritedSessionPin[] | undefined) | undefined;
+  readonly #thinkingBounds: (() => FabricThinkingBounds) | undefined;
+  readonly #sessionId: (() => string | undefined) | undefined;
+  readonly #executorRuntime: (() => string | undefined) | undefined;
+  /** This process's own confinement; children may only narrow it. */
+  readonly #parentWritePolicy: FabricWritePolicy | undefined = readWritePolicy();
+  readonly #parentLineage: FabricAgentLineage | undefined = readAgentLineage();
+  #childIndex = 0;
   readonly #piModelPreparations = new Map<string, Promise<string | undefined>>();
   readonly #budget: BudgetLedgerState | undefined;
   readonly #budgetOwned: boolean;
@@ -778,6 +927,8 @@ export class AgentManager {
       identityId?: string;
       /** Immediate caller's Pi session, distinct from the inherited root Fabric session. */
       spawnerSessionId?: string;
+      /** This caller's sender name for its children's X-Smarty-Spawner (smarty-dev#6207). */
+      spawnerName?: () => string | undefined;
       retention?: FabricRetentionConfig;
       onBackgroundComplete?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onResultConsumed?: (id: string) => void;
@@ -790,16 +941,33 @@ export class AgentManager {
       onSettled?: (result: AgentRunResult, admittedRecipient?: CompletionRecipient) => void;
       onLifecycle?: (event: FabricLifecyclePublishRequest) => void;
       onFollowUpAlarm?: (alarm: AgentFollowUpAlarm) => void;
+      /** smarty-dev#9855: held permits reached half of maxConcurrent (again every 6 h while they stay there). */
+      onAdmissionAlarm?: (alarm: AgentAdmissionAlarm) => void;
+      onTerminalNotice?: (notice: AgentTerminalNotice) => Promise<void> | void;
       preparePiModel?: (model: string | undefined, requiredPin?: boolean) => Promise<string | void>;
+      /** agents.childQuestions "route": answer a child dialog via parent UI or a decision. */
+      onChildQuestion?: (request: AgentChildQuestionRequest) => Promise<AgentChildQuestionResponse>;
       resolveHandoffCompactionBudget?: (model: string | undefined, cwd: string) => Promise<FabricCompactionBudget>;
       resolveParticipantGuidance?: AgentParticipantGuidanceResolver;
       resolveInheritedSessionPins?: () => InheritedSessionPin[] | undefined;
+      /** Caller's effective thinking bounds (config narrowed by inherited env). */
+      thinkingBounds?: () => FabricThinkingBounds;
+      /** Caller Pi session id recorded as lineage parentSessionId. */
+      sessionId?: () => string | undefined;
+      /** Caller TypeScript executor runtime; native runtimes escape write confinement. */
+      executorRuntime?: () => string | undefined;
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
+    // Nested run artifacts belong to the enclosing run, not the short-lived Pi
+    // child. Its owner removes them on cleanup/retention/root shutdown.
+    this.#parentOwnedRunRoot = options.runRoot === undefined &&
+      this.#parentLineage?.worker === true && this.#parentLineage.depth > 0 &&
+      path.basename(this.#runRoot) === "nested" &&
+      path.basename(path.dirname(this.#runRoot)) === this.#parentLineage.runId;
     this.#retention = options.retention ?? DEFAULT_FABRIC_CONFIG.retention;
     this.#workerPath =
       options.workerPath ?? fileURLToPath(new URL("../worker.js", import.meta.url));
@@ -820,10 +988,16 @@ export class AgentManager {
     this.#onSettled = options.onSettled;
     this.#onLifecycle = options.onLifecycle;
     this.#onFollowUpAlarm = options.onFollowUpAlarm;
+    this.#onAdmissionAlarm = options.onAdmissionAlarm;
+    this.#terminalNoticeOutbox = new TerminalNoticeOutbox(options.onTerminalNotice);
+    this.#onChildQuestion = options.onChildQuestion;
     this.#preparePiModel = options.preparePiModel;
     this.#resolveHandoffCompactionBudget = options.resolveHandoffCompactionBudget;
     this.#resolveParticipantGuidance = options.resolveParticipantGuidance;
     this.#resolveInheritedSessionPins = options.resolveInheritedSessionPins;
+    this.#thinkingBounds = options.thinkingBounds;
+    this.#sessionId = options.sessionId;
+    this.#executorRuntime = options.executorRuntime;
     this.#currentDepth = Math.max(0, Number(process.env.PI_FABRIC_DEPTH ?? "0") || 0);
     this.#fullCodeMode = options.fullCodeMode ?? true;
     this.#kernel = options.kernel ?? (() => "typescript");
@@ -837,12 +1011,15 @@ export class AgentManager {
     this.#completionRecipient = options.completionRecipient;
     this.#hostId = options.hostId ?? process.env.PI_FABRIC_HOST_ID;
     this.#identityId = options.identityId ?? process.env.PI_FABRIC_IDENTITY_ID;
+    // Nested work returns to its immediate caller. This launch-only binding does
+    // not change the owning Main that an actor discovers or steers during its turn.
+    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
     this.#taskReturnAddressArguments = taskReturnAddressArguments(
-      this.#identityId ?? process.env.PI_FABRIC_ACTOR_ID ?? process.env.PI_FABRIC_PARENT_RUN,
+      this.#spawner?.id,
       options.spawnerSessionId ?? process.env.PI_SESSION_ID ?? this.#fabricSessionId,
       this.#mainAgentId,
     );
-    this.#spawner = resolveAgentSpawner(this.#identityId, this.#mainAgentId);
+    this.#spawnerName = options.spawnerName ?? (() => senderAgent());
     const inheritedBudget = activeBudgetState();
     this.#budget =
       inheritedBudget ??
@@ -914,7 +1091,8 @@ export class AgentManager {
     timeoutMs?: number,
   ): Promise<string | undefined> {
     this.assertModelAllowed(model, runner);
-    if (runner === "pi") {
+    // Upstream: the durable Pi worker resolves models through the same Pi registry.
+    if (runner === "pi" || runner === "pi-durable") {
       const prepared = await this.#prepareModel(model, requiredPin, signal, timeoutMs);
       this.assertModelAllowed(prepared, runner);
       return prepared;
@@ -1024,13 +1202,14 @@ export class AgentManager {
     if (choice !== undefined && choice !== "inherit" && choice !== "typescript" && choice !== "python") {
       throw new Error(`Invalid Fabric agent kernel: ${String(choice)}`);
     }
-    const runner = request.runner ?? this.config.runner;
-    if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
-      throw new Error(`Unsupported Fabric agent runner: ${String(runner)}`);
-    }
-    if (runner !== "pi" || !(request.extensions ?? this.config.extensions)) {
+    const runner = requireAgentRunner(request.runner ?? this.config.runner);
+    if (!runner.capabilities.kernels || !(request.extensions ?? this.config.extensions)) {
       if (choice === "typescript" || choice === "python") {
-        throw new Error("Explicit agent kernel requires the Pi runner with Fabric extensions enabled");
+        throw new Error(
+          BUILT_IN_RUNNER_IDS.has(runner.id)
+            ? "Explicit agent kernel requires the Pi runner with Fabric extensions enabled"
+            : `Explicit agent kernel requires a runner with the kernels capability; ${runner.label} does not declare it`,
+        );
       }
       return undefined;
     }
@@ -1056,10 +1235,29 @@ export class AgentManager {
    */
   spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
     if (this.#closing) return Promise.reject(new Error("Fabric agent manager is closing"));
+    // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
+    this.#releaseProvenGone();
+    // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.
+    this.#checkHeldPermits();
     const pending = this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, callerReturnAddress && structuredClone(callerReturnAddress));
     this.#spawns.add(pending);
     void pending.then(() => this.#spawns.delete(pending), () => this.#spawns.delete(pending));
     return pending;
+  }
+
+  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined; closed: boolean }>();
+
+  /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
+   * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
+   * contact not lost). Undefined: no live handle, or a transport without a local process. */
+  workerIdentity(runId: string): { pid: number; startTime: string | undefined; open: boolean } | undefined {
+    const managed = this.#runs.get(runId);
+    const identity = managed?.transport ? this.#workerIdentities.get(managed.transport) : undefined;
+    if (!managed || !identity) return undefined;
+    // A closed native handle is not open, even before the monitor marks executionExited (smarty-dev#10067 P2-1): its
+    // pid may already name another process. A handle with no close notification is indeterminate: not open.
+    const open = managed.transport.closed !== undefined && !identity.closed && !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
+    return { pid: identity.pid, startTime: identity.startTime, open };
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch): Promise<AgentTransportHandle> {
@@ -1071,10 +1269,24 @@ export class AgentManager {
       const transport = await pending;
       // Includes launches that race close, before a ManagedAgent can own them.
       this.#unregisteredTransports.add(transport);
+      // The launched worker's identity, from this host's own spawn (never the worker's status file): its pid and
+      // kernel start time, read now, while this process still holds the unreaped child (smarty-dev#9332).
+      const pid = transport.kind === "process" ? Number(transport.sessionId) : NaN;
+      if (Number.isSafeInteger(pid) && pid > 1) {
+        const identity = { pid, startTime: processStartTime(pid), closed: false };
+        this.#workerIdentities.set(transport, identity);
+        // Registered first, at launch: it runs before any monitor reaction to the close. A rejection proves nothing.
+        void transport.closed?.then(() => { identity.closed = true; }, () => undefined);
+      }
       return transport;
     } finally {
       this.#launches.delete(pending);
     }
+  }
+
+  /** Effective bounds for a child; requested bounds outside the caller's throw. */
+  childThinkingBounds(requested?: FabricThinkingBounds): FabricThinkingBounds {
+    return childThinkingBounds(this.#thinkingBounds?.() ?? {}, requested);
   }
 
   async #spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress): Promise<AgentHandleInfo> {
@@ -1083,8 +1295,15 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
-    if (request.needs !== undefined && (!Array.isArray(request.needs) || !request.needs.every(need => typeof need === "string" && !!need.trim()))) throw new Error("Invalid agent needs");
-    request = { ...request, ...(request.needs ? { needs: [...request.needs] } : {}) };
+    const needs = normalizeAgentCapabilityTokens(request.needs);
+    const requires = normalizeAgentRequires(request.requires);
+    // Session transports are disabled until they can retain execution custody.
+    // Refuse input declarations explicitly rather than silently skipping preflight.
+    const transport = request.transport ?? this.config.transport;
+    if (requires?.length && transport !== "auto" && transport !== "process") {
+      throw new AgentInputError("requires", `Agent requires cannot be honoured by disabled transport ${transport}; use process; no worker started`);
+    }
+    request = { ...request, ...(needs !== undefined ? { needs } : {}), ...(requires !== undefined ? { requires } : {}) };
     // Snapshot trusted classification inputs before asynchronous preparation/queueing.
     const explicitRouteClass = request.routeClass ?? request.routeDecision?.routeClass;
     const routeFacts = {
@@ -1120,9 +1339,9 @@ export class AgentManager {
       throw new Error(`Invalid Fabric agent residency: ${String(request.residency)}`);
     }
     const runner = request.runner ?? this.config.runner;
-    if (runner !== "pi" && runner !== "claude" && runner !== "veda") {
-      throw new Error(`Unsupported Fabric agent runner: ${String(runner)}`);
-    }
+    const runnerAdapter = requireAgentRunner(runner);
+    const capabilities = runnerAdapter.capabilities;
+    const hostedAdapter = runnerAdapter.kind === "hosted" ? runnerAdapter : undefined;
     if (request.inferenceContext !== undefined && request.inferenceContext !== "full-history" && request.inferenceContext !== "activation") {
       throw new Error("Invalid actor inference context");
     }
@@ -1133,33 +1352,87 @@ export class AgentManager {
     if (request.persona && runner !== "veda") {
       throw new Error(`The persona option is only supported by the Veda runner, not ${runner}`);
     }
-    if (runner === "claude" && request.recursive) {
+    if (request.persistSession === true && runner !== "claude") {
+      throw new Error("persistSession is only supported by the Claude runner");
+    }
+    if (request.recursive && !capabilities.recursiveFabric) {
       throw new Error(
-        "Claude runner does not support recursive Fabric. Use a Pi runner for recursive: true, or omit recursive for Claude Code tools.",
+        runner === "claude"
+          ? "Claude runner does not support recursive Fabric. Use a Pi runner for recursive: true, or omit recursive for Claude Code tools."
+          : runner === "veda"
+            ? "Veda runner does not support recursive Fabric. Use a Pi runner for recursive: true — Veda executes one headless prompt per invocation."
+            : `${runnerAdapter.label} runner does not declare the recursiveFabric capability; omit recursive: true`,
       );
     }
-    if (runner === "veda" && request.recursive) {
-      throw new Error(
-        "Veda runner does not support recursive Fabric. Use a Pi runner for recursive: true — Veda executes one headless prompt per invocation.",
-      );
+    if (request.images?.length && !capabilities.imageInput) {
+      throw new Error(`${runnerAdapter.label} runner does not declare the imageInput capability`);
     }
-    if (request.sessionSeed && runner !== "pi") {
-      throw new Error("Trajectory handoff sessions are only supported by the Pi runner");
+    if (request.sessionSeed && !capabilities.handoff) {
+      throw new Error(
+        BUILT_IN_RUNNER_IDS.has(runner)
+          ? "Trajectory handoff sessions are only supported by the Pi runner"
+          : `${runnerAdapter.label} runner does not declare the handoff capability`,
+      );
     }
     if (request.sessionSeed && request.sessionFile) {
       throw new Error("A agent request cannot combine sessionSeed with sessionFile");
     }
+    if (request.forkSeed && (!capabilities.handoff || request.sessionSeed || request.sessionFile)) {
+      throw new Error('seed: "branch" requires the Pi runner and no other session seed');
+    }
+    if (hostedAdapter && request.actorId) {
+      throw new Error(`${runnerAdapter.label} is a hosted runner; persistent actors need a worker runner`);
+    }
+    // Write confinement is enforced by the child (the Pi tool_call guard, or
+    // a runner that declares writePolicy and receives the policy at launch).
+    if (requestsWritePolicy(request)) checkWritePolicyRequest(request);
+    const confined = requestsWritePolicy(request) || this.#parentWritePolicy !== undefined;
+    if (confined && !capabilities.writePolicy) {
+      throw new Error(
+        BUILT_IN_RUNNER_IDS.has(runner)
+          ? `Write confinement (readOnly, writableRoots, shell) is enforced only by the Pi runner, not ${runner}`
+          : `Write confinement (readOnly, writableRoots, shell) needs the writePolicy capability; ${runnerAdapter.label} does not declare it`,
+      );
+    }
+    if (
+      confined &&
+      (request.shell ?? this.#parentWritePolicy?.shell ?? "deny") !== "unconfined" &&
+      ((kernel === "python" && pythonRuntime === "cpython") ||
+        (kernel === "typescript" && /^(node|bun)-process$/.test(this.#executorRuntime?.() ?? "")))
+    ) {
+      throw new Error(
+        'A confined agent cannot use a native Fabric executor (CPython, node-process, bun-process); use QuickJS/Monty or shell: "unconfined"',
+      );
+    }
+    const worktreeSetup = request.worktree ? request.worktreeSetup ?? this.config.worktree?.setup : undefined;
+    if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
+      throw new Error("worktreeSetup must be a shell command of at most 8192 characters");
+    }
+    // Fail closed before admission or budget side effects.
+    const scope = launchScope(request.scope, request.inheritedScope);
+    const thinkingBounds = this.childThinkingBounds(request.thinkingBounds);
     const requiresFabricKernel = kernel === "python" || request.kernel === "typescript";
-    const tools = this.#childTools(request, runner, requiresFabricKernel);
+    let tools = this.#childTools(request, runnerAdapter, requiresFabricKernel);
     if (runner === "claude") mapClaudeTools(tools);
     if (runner === "veda") mapVedaTools(tools);
     // Freeze the admitted finite selection for every retry/resume.
     let routePin = request.routeDecision ? Object.freeze({ ...(request.routeDecision.mode === "live"
       ? { model: request.routeDecision.model, effort: request.routeDecision.effort } : request.routeDecision.pin) }) : undefined;
-    let model = routePin?.model ?? (request.model?.trim() || this.defaultModel(runner));
+    let model = routePin?.model ?? (request.model?.trim() || this.defaultModel(runner) ||
+      (BUILT_IN_RUNNER_IDS.has(runner) ? undefined : runnerAdapter.defaultModel?.()));
+    if (!BUILT_IN_RUNNER_IDS.has(runner)) {
+      if (runnerAdapter.mapTools) {
+        const mapped = await runnerAdapter.mapTools(tools);
+        if (!Array.isArray(mapped) || mapped.some((tool) => typeof tool !== "string")) {
+          throw new Error(`The ${runnerAdapter.label} runner mapped tools to an invalid list`);
+        }
+        tools = [...mapped];
+      }
+      if (model && runnerAdapter.normalizeModel) model = await runnerAdapter.normalizeModel(model);
+    }
     this.assertModelAllowed(model, runner);
     // Alternate backend targets must be known before even accepting a queue receipt.
-    if (runner !== "pi" && this.config.deniedModels.length > 0) {
+    if (runner !== "pi" && runner !== "pi-durable" && this.config.deniedModels.length > 0) {
       model = await this.prepareModelForAdmission(model, runner);
     }
     if (this.#budget) {
@@ -1215,7 +1488,9 @@ export class AgentManager {
         throw error;
       }
       const runDirectory = path.join(this.#runRoot, id);
-      fs.mkdirSync(runDirectory, { recursive: true });
+      // 0700 whatever the umask (smarty-dev#9016): a login shell's umask 002 made run directories 0775, which
+      // verified retention refuses (group-writable). Only directories it creates are changed.
+      mkdirPrivate(runDirectory, this.#trustRoot());
       // Establish custody before a worker can produce its only full outcome. A
       // later disk failure cannot leave a terminal source collectible without a fence.
       if (this.#onSettled || this.#onStoppedAtClose || routeDispatch) {
@@ -1279,7 +1554,25 @@ export class AgentManager {
       }
 
       try {
-        const sessionFile = request.sessionSeed
+        if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
+        const writePolicy = capabilities.writePolicy
+          ? resolveChildWritePolicy(request, this.#parentWritePolicy, agentCwd)
+          : undefined;
+        const parentSessionId = this.#sessionId?.();
+        const parentRunId = this.#parentLineage?.runId ?? (this.#currentDepth > 0 ? process.env.PI_FABRIC_PARENT_RUN : undefined);
+        const lineage: FabricAgentLineage = {
+          version: 1,
+          rootSessionId: this.#parentLineage?.rootSessionId ?? this.#fabricSessionId ?? parentSessionId ?? "",
+          ...(parentSessionId ? { parentSessionId } : {}),
+          ...(parentRunId ? { parentRunId } : {}),
+          runId: id,
+          depth: this.#currentDepth + 1,
+          childIndex: this.#childIndex++,
+          worker: true,
+        };
+        const sessionFile = request.forkSeed
+          ? writeForkSession(request.forkSeed, agentCwd, path.join(runDirectory, "fork-session"), request.thinkingTransfer)
+          : request.sessionSeed
           ? writeHandoffSession(
               request.sessionSeed,
               agentCwd,
@@ -1295,11 +1588,17 @@ export class AgentManager {
           this.config.timeoutMs,
           request.timeoutMs,
         );
-        const thinking = routePin?.effort ?? request.thinking ?? this.config.thinking;
+        const requestedThinking = routePin?.effort ?? request.thinking ?? this.config.thinking;
+        // A route pin's effort is exact and admitted as such; thinking bounds clamp the rest.
+        const thinking = requestedThinking && !routePin
+          ? clampThinkingToBounds(requestedThinking, thinkingBounds)
+          : requestedThinking;
+        const clampedFrom = requestedThinking && thinking !== requestedThinking ? requestedThinking : undefined;
+        const serializedThinkingBounds = serializeThinkingBounds(thinkingBounds);
         const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
-        const recursive = runner === "pi" && request.recursive === true;
+        const recursive = capabilities.recursiveFabric && request.recursive === true;
         const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
-        const inheritedSessionPins = runner === "pi" && extensions
+        const inheritedSessionPins = (runner === "pi" || runner === "pi-durable") && extensions
           ? this.#inheritedSessionPins(request)
           : undefined;
         // In a full-code parent every extension-enabled Pi child runs Fabric
@@ -1308,18 +1607,54 @@ export class AgentManager {
         // surface, and a non-full-code parent keeps the historical behavior.
         // Recursive children additionally keep their recursive permission
         // surface (the "agent" granted risk) below.
-        const inheritedFullCodeMode = runner === "pi" && this.#fullCodeMode && extensions;
+        const inheritedFullCodeMode = capabilities.recursiveFabric && this.#fullCodeMode && extensions;
         const componentGuidance = recursive
           ? undefined
           : this.#resolveParticipantGuidance?.({ ...(model ? { model } : {}), runner })?.trim();
-        const spawnerGuidance = runner === "pi" && extensions && this.#spawner && this.#spawner.kind !== "main"
+        const spawnerGuidance = (runner === "pi" || runner === "pi-durable") && extensions && this.#spawner && this.#spawner.kind !== "main"
           ? `Your immediate Fabric spawner is ${this.#spawner.kind} ${this.#spawner.id}${this.#spawner.runId ? ` (run ${this.#spawner.runId})` : ""}. ` +
             "Your final result is returned to that spawner automatically. For addressed updates use agents.followUp({id:'spawner',message:'...'}); " +
-            "agents.spawner() discovers this binding. The 'main' target is the lineage root, NOT an actor spawner."
+            "agents.spawner() discovers this binding. In a process task child, agents.main() and 'main' use the spawn-bound return address; in an actor turn they still address the owning Main."
           : undefined;
         const systemPrompt = [request.systemPrompt?.trim(), componentGuidance, spawnerGuidance]
           .filter((section): section is string => Boolean(section))
           .join("\n\n") || undefined;
+        const launchContext: FabricRunnerLaunchContext = {
+          id,
+          name,
+          task: request.task,
+          cwd: agentCwd,
+          runDirectory,
+          residency,
+          deadlineAt: Date.now() + timeoutMs,
+          depth: this.#currentDepth + 1,
+          lineage,
+          tools,
+          ...(model ? { model } : {}),
+          ...(thinking ? { thinking } : {}),
+          ...(kernel ? { kernel } : {}),
+          ...(recursive ? { recursive } : {}),
+          ...(request.images?.length ? { images: request.images } : {}),
+          ...(request.schema ? { schema: request.schema } : {}),
+          ...(systemPrompt ? { systemPrompt } : {}),
+          ...(sessionFile ? { sessionFile } : {}),
+          ...(writePolicy ? { writePolicy } : {}),
+          ...(request.actorId ? { actorId: request.actorId } : {}),
+          ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(scope ? { scope } : {}),
+        };
+        if (hostedAdapter) {
+          return await this.#startHosted(hostedAdapter, launchContext, {
+            request,
+            release,
+            signal,
+            timeoutMs,
+            files: { statusFile, lifecycleFile, logFile },
+            ...(clampedFrom ? { requestedThinking: clampedFrom } : {}),
+            ...(branch ? { branch } : {}),
+            ...(worktree ? { worktree } : {}),
+          });
+        }
         const sessionExportDir = resolveSessionExportDir(this.config);
         const sessionExportFile = sessionExportDir
           ? sessionExportFileFor(sessionExportDir, agentCwd, id, new Date())
@@ -1364,6 +1699,7 @@ export class AgentManager {
           ...(this.#mainAgentId ? ["--main-agent-id", this.#mainAgentId] : []),
           ...(this.#spawner ? ["--spawner-id", this.#spawner.id, "--spawner-kind", this.#spawner.kind,
             ...(this.#spawner.runId ? ["--spawner-run", this.#spawner.runId] : [])] : []),
+          ...((name?: string) => name ? ["--spawner-name", name] : [])(senderHeaderValue(this.#spawnerName())),
           ...(this.#fabricSessionId ? ["--fabric-session-id", this.#fabricSessionId] : []),
           ...(adapter.kind === "process" && !request.actorId
             ? callerReturnAddress ? ["--task-return-address", JSON.stringify(callerReturnAddress)] : this.#taskReturnAddressArguments
@@ -1389,6 +1725,18 @@ export class AgentManager {
           ...(model ? ["--model", model] : []),
           ...(request.modelReason !== undefined ? ["--model-reason", request.modelReason] : []),
           ...(thinking ? ["--thinking", thinking] : []),
+          ...(serializedThinkingBounds ? ["--thinking-bounds", serializedThinkingBounds] : []),
+          "--persist-session",
+          String(request.persistSession === true),
+          "--model-admission",
+          this.config.modelAdmission ?? "strict",
+          ...(this.config.childQuestions === "route" && capabilities.questions
+            ? ["--child-questions", String(this.config.childQuestionTimeoutMs ?? DEFAULT_CHILD_QUESTION_TIMEOUT_MS)]
+            : []),
+          ...(writePolicy ? ["--write-policy", JSON.stringify(writePolicy)] : []),
+          ...(scope ? ["--scope", JSON.stringify(scope)] : []),
+          "--lineage",
+          JSON.stringify(lineage),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),
           ...(request.routeDecision?.mode === "judgment" ? ["--judgment", "true"] : []),
           ...(systemPrompt ? ["--system-prompt", systemPrompt] : []),
@@ -1401,6 +1749,7 @@ export class AgentManager {
           ...(request.actorId ? ["--actor-id", request.actorId] : []),
           ...(request.actorName ? ["--actor-name", request.actorName] : []),
           ...(request.bashTimeoutSeconds !== undefined ? ["--actor-bash-timeout", String(request.bashTimeoutSeconds)] : []),
+          ...(request.bashIdleSeconds !== undefined ? ["--bash-idle-seconds", String(request.bashIdleSeconds)] : []),
           ...(request.capabilityRequirements
             ? ["--capability-requirements", JSON.stringify(request.capabilityRequirements)]
             : []),
@@ -1426,13 +1775,38 @@ export class AgentManager {
           ...(branch ? ["--branch", branch] : []),
           ...(worktree ? ["--worktree", worktree] : []),
         ];
+        const runnerLaunch = runnerAdapter.kind === "worker"
+          ? await runnerAdapter.launch({
+              ...launchContext,
+              files: {
+                taskFile,
+                statusFile,
+                lifecycleFile,
+                logFile,
+                steerFile,
+                ...(schemaFile ? { schemaFile } : {}),
+                ...(imagesFile ? { imagesFile } : {}),
+              },
+              fabricWorker: { workerPath: this.#workerPath, workerArguments: [...workerArguments] },
+            })
+          : undefined;
+        if (
+          typeof runnerLaunch?.workerPath !== "string" ||
+          !runnerLaunch.workerPath.trim() ||
+          !Array.isArray(runnerLaunch.workerArguments) ||
+          runnerLaunch.workerArguments.length > 4_096 ||
+          runnerLaunch.workerArguments.some((argument) => typeof argument !== "string")
+        ) {
+          throw new Error(`The ${runnerAdapter.label} runner returned an invalid worker launch`);
+        }
         const launch: AgentTransportLaunch = {
           id,
           name,
           cwd: agentCwd,
-          workerPath: this.#workerPath,
-          workerArguments,
+          workerPath: runnerLaunch.workerPath,
+          workerArguments: [...runnerLaunch.workerArguments],
           ...(request.needs ? { needs: [...request.needs] } : {}),
+          ...(request.requires ? { requires: [...request.requires] } : {}),
           placementLocalReason: this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
             ? "not a Main task spawn"
             : request.actorId || request.actorName || request.sessionFile || request.sessionSeed || request.routeDecision || request.residentStartupProbe
@@ -1441,7 +1815,7 @@ export class AgentManager {
                 ? "inherited account pins require the local worker"
                 : !extensions
                   ? "extensions disabled require the local worker"
-                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
+                  : runner !== "pi" || kernel === "python" || request.recursive || request.worktree || request.tools || request.schema || imagesFile || request.systemPrompt || request.nice !== undefined || request.bashIdleSeconds !== undefined || residency === "durable" || !["low", "medium", "high", "xhigh", "max"].includes(thinking) || this.config.budgetUsd > 0 || this.config.maxTokensPerChild > 0
                     ? "requested worker features cannot be preserved by one-shot placement"
                     : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined,
           signal,
@@ -1481,11 +1855,14 @@ export class AgentManager {
           id,
           name,
           task: request.task,
+          // pi-fabric#939: the manager's own pid and birth record, read at launch from the transport handle.
+          ...((owned => owned ? { ownProcess: owned } : {})(transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined)),
           ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
           ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
           onOutputPrincipalDowngrade,
           runner,
+          runnerAdapter,
           ...(kernel ? { kernel } : {}),
           recursive,
           residency,
@@ -1511,6 +1888,7 @@ export class AgentManager {
           ...(model ? { model } : {}),
           ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
           ...(thinking ? { thinking } : {}),
+          ...(clampedFrom ? { requestedThinking: clampedFrom } : {}),
           ...(routeDispatch ? { routeOutcome: routeDispatch.outcome } : {}),
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
@@ -1587,6 +1965,9 @@ export class AgentManager {
             this.#queued.set(id, queued);
           }
           queued.cleanupPending = obligation.message;
+          queued.heldPermit ??= once(release);
+          const owned = obligation.transport === "process" ? ownedProcess(obligation.sessionId) : undefined;
+          if (owned) queued.ownProcess ??= owned;
           queued.info = { ...queued.info, ...(worktree ? { worktree } : {}), ...(branch ? { branch } : {}) };
           try {
             markUnresolvedWorker(runDirectory, obligation.message, {
@@ -1596,6 +1977,11 @@ export class AgentManager {
           } catch { /* best effort: the worktree is kept either way */ }
           // No exact handle means no safe retry or exit receipt. Preserve the
           // permit and actor/queue join rather than rejecting into another writer.
+          this.#checkHeldPermits();
+          queueMicrotask(() => this.#releaseProvenGone()); // already gone when the hold began: free it now
+          // pi-fabric#939 round 3: event-driven, no polling. The launched process's own close event re-checks the
+          // proof; a release wakes the admission waiters through the semaphore.
+          void (obligation as { closed?: Promise<unknown> }).closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
           return this.#queuedInfo(queued);
         }
         release();
@@ -1673,6 +2059,8 @@ export class AgentManager {
       } catch (error) {
         if (queued.cleanupPending || (error as { launchOutcome?: string } | undefined)?.launchOutcome === "unknown") {
           queued.cleanupPending ??= error instanceof Error ? error.message : String(error);
+          if (release) queued.heldPermit ??= once(release);
+          this.#checkHeldPermits();
           return;
         }
         release?.();
@@ -1688,8 +2076,167 @@ export class AgentManager {
 
   #queuedInfo(queued: QueuedAgent): AgentHandleInfo {
     const waiting = [...this.#queued.values()].filter((run) => !run.terminal && !run.preparing);
+    const held = this.heldPermits();
     return structuredClone({ ...queued.info,
-      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}) });
+      ...(!queued.preparing ? { queuePosition: waiting.indexOf(queued) + 1 } : {}),
+      // smarty-dev#9855: why a spawn waits: unknown-outcome launches still holding a permit.
+      ...(!queued.terminal && held > 0 ? { heldPermits: held } : {}) });
+  }
+
+  /** smarty-dev#9855: admission permits held by unknown-outcome or lost-contact launches not yet proven gone. */
+  heldPermits(): number {
+    return [...this.#queued.values()].filter(queued => queued.heldPermit).length +
+      [...this.#runs.values()].filter(managed => managed.heldPermit).length;
+  }
+
+  /**
+   * smarty-dev#9855 part A: a held permit whose run is now proven gone (ENODEV-unconfirmed exit, worker gone, pid-reuse
+   * safe; settleGoneEnodevLaunch) is released in the same step as the settle, exactly once (the permit is taken off the
+   * entry before it is called; the settle removes the marker, so a second pass finds nothing). Anything not proven
+   * gone keeps its permit. Evaluated where permits are acquired (spawn) and held; no timer.
+   */
+  #releaseProvenGone(): number {
+    if (process.platform !== "linux") return 0;
+    let released = 0;
+    for (const queued of this.#queued.values()) {
+      if (!queued.heldPermit) continue;
+      const directory = path.join(this.#runRoot, queued.info.id);
+      const settledHere = this.#enodevSettledHere.has(queued.info.id);
+      // pi-fabric#939 round 5: prove, save and route the outcome, and only then settle the marker and release. Until
+      // the save succeeds the marker, the custody and the permit stay (a crash or a failing save loses nothing).
+      const outcome = settledHere ? settleGoneEnodevLaunch(directory, queued.ownProcess, true)
+        : (record => record && goneEnodevOutcome(directory, record))(provenGoneEnodevLaunch(directory, queued.ownProcess));
+      if (!outcome) continue;
+      if (!queued.terminal || !queued.outcomeSaved) {
+        const pendingCleanup = queued.cleanupPending;
+        delete queued.cleanupPending; // the route save is fenced while it is set
+        queued.terminal ??= outcome;
+        let saved = false;
+        try { saved = this.#saveQueuedRouteOutcome(queued); } catch { saved = false; }
+        if (!saved) {
+          if (pendingCleanup !== undefined) queued.cleanupPending = pendingCleanup;
+          this.#retryRecoveredAnswer(queued.info.id, queued);
+          continue;
+        }
+        if (!queued.resolvedRecovered) {
+          queued.resolvedRecovered = true;
+          queued.resolve(queued.terminal);
+          this.#emitLifecycle(queued.info, `run.${queued.terminal.status}`, Date.now(), { status: queued.terminal.status });
+          this.#notifyQueuedComplete(queued);
+        }
+      }
+      // The marker is removed only now. A failure here keeps it and the permit; the saved outcome is not saved again.
+      let markerSettled = settledHere;
+      if (!markerSettled) { try { markerSettled = settleGoneEnodevLaunch(directory, queued.ownProcess) !== undefined; } catch { markerSettled = false; } }
+      if (!markerSettled) { this.#retryRecoveredAnswer(queued.info.id, queued); continue; }
+      delete queued.cleanupPending;
+      this.#stopRecoveryRetry(queued);
+      const permit = queued.heldPermit;
+      delete queued.heldPermit;
+      this.#retentionRevision++;
+      permit();
+      released++;
+    }
+    for (const managed of this.#runs.values()) {
+      if (!managed.heldPermit || !managed.settled) continue;
+      // pi-fabric#939 round 3: the record must be the CURRENT attempt's (a relaunch replaces it), and the exact gate
+      // (own pid gone, exact ENODEV marker, this process run) holds BEFORE anything is delivered or written.
+      if (!managed.ownProcess || String(managed.ownProcess.pid) !== managed.transport.sessionId) continue;
+      const record = provenGoneEnodevLaunch(managed.runDirectory, managed.ownProcess);
+      if (!record) continue;
+      // Then prove, save, mark completed, release: a saved answer the spawner never got goes through its completion
+      // path first (round 2), once; any failure keeps the permit and is retried.
+      if (!this.#deliverRecoveredAnswer(managed, record)) { this.#retryRecoveredAnswer(managed.id, managed); continue; }
+      if (!settleGoneEnodevLaunch(managed.runDirectory, managed.ownProcess)) continue;
+      this.#stopRecoveryRetry(managed);
+      const permit = managed.heldPermit;
+      delete managed.heldPermit;
+      delete managed.lostContact;
+      managed.executionExited = true;
+      this.#retentionRevision++;
+      permit();
+      released++;
+    }
+    if (released) this.#invalidateUiList();
+    if (this.heldPermits() * 2 < this.config.maxConcurrent) this.#admissionAlarmAt = undefined; // the episode ended
+    return released;
+  }
+
+  /**
+   * The worker saved an answer (settlement.json) but the run settled without it (its exit was unconfirmed): deliver
+   * the completed result through the spawner's completion path. True when there is nothing to deliver or it was
+   * delivered (now or before: managed.recoveredAnswer makes it once); false keeps the permit for a later retry.
+   */
+  #deliverRecoveredAnswer(managed: ManagedAgent, record: Record<string, unknown>): boolean {
+    if (managed.recoveredAnswer) return true;
+    // A pending save (of the original settlement or of this recovery) is checked BEFORE any fast path (SEC 2).
+    const pending = managed.settlementSaveFailure;
+    const text = savedEnodevAnswer(managed.runDirectory);
+    if (text === undefined || record.status === "completed") {
+      return pending ? this.#saveSettledResult(managed, pending.result) : true;
+    }
+    const { error: _error, ...rest } = record as unknown as AgentRunResult;
+    const recovered = { ...rest, status: "completed", text, enodevDelivered: true,
+      finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : Date.now(), updatedAt: Date.now() } as AgentRunResult;
+    // Save (deliver) first; only a saved delivery is marked completed. A failed save leaves the record unmarked, so
+    // the next pass retries the delivery; a failed mark after a save re-marks without saving again.
+    if (!managed.recoveredSaved) {
+      if (!this.#saveSettledResult(managed, recovered)) return false;
+      managed.recoveredSaved = true;
+    }
+    try { writeJsonAtomic(managed.statusFile, recovered, { durable: true }); } catch { return false; }
+    managed.recoveredAnswer = true;
+    managed.latestRecord = compactUiRecord(recovered);
+    managed.latestUiRecord = managed.latestRecord;
+    if (managed.background && !this.#closing && this.config.notifyOnComplete && this.#onBackgroundComplete) {
+      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
+    }
+    return true;
+  }
+
+  /**
+   * pi-fabric#939 round 4: a held run whose recovered answer could not be saved retries on its own, not only on a later
+   * spawn: one one-shot timer per held run, backoff 1, 2, 4, 8, 16 s, at most RECOVERY_RETRY_MAX tries (a reviewed
+   * bounded retry, not a poll). The FIRST failure sends one owner alarm naming the run, whatever the held count. After
+   * the last try the permit stays held (the next spawn or close event still re-checks).
+   */
+  #retryRecoveredAnswer(runId: string, managed: RecoveryRetry): void {
+    if (!managed.recoveryAlarmed) {
+      managed.recoveryAlarmed = true;
+      const alarm: AgentAdmissionAlarm = { kind: "recovered-answer-save-failed", runId,
+        heldPermits: this.heldPermits(), maxConcurrent: this.config.maxConcurrent, at: Date.now(),
+        message: `run ${runId}: its recovered answer could not be saved for its spawner; its admission permit stays held ` +
+          "while the save is retried (smarty-dev#9855)" };
+      console.warn(`[pi-fabric] ${alarm.message}`);
+      try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
+    }
+    const tries = managed.recoveryRetries ?? 0;
+    if (managed.recoveryTimer || tries >= RECOVERY_RETRY_MAX || this.#closing) return;
+    managed.recoveryRetries = tries + 1;
+    managed.recoveryTimer = setTimeout(() => {
+      delete managed.recoveryTimer;
+      if (!this.#closing) this.#releaseProvenGone();
+    }, RECOVERY_RETRY_BASE_MS * 2 ** tries);
+    managed.recoveryTimer.unref?.();
+  }
+
+  /** Round 5 P2: a success by any path, or close, clears the run's retry timer. */
+  #stopRecoveryRetry(entry: RecoveryRetry): void {
+    if (entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
+    delete entry.recoveryTimer;
+  }
+
+  /** One alarm when held permits reach half of maxConcurrent, again every 6 h while they stay there. */
+  #checkHeldPermits(now = Date.now()): void {
+    const held = this.heldPermits();
+    if (held * 2 < this.config.maxConcurrent) { this.#admissionAlarmAt = undefined; return; }
+    if (this.#admissionAlarmAt !== undefined && now - this.#admissionAlarmAt < ADMISSION_REALARM_MS) return;
+    this.#admissionAlarmAt = now;
+    const alarm: AgentAdmissionAlarm = { heldPermits: held, maxConcurrent: this.config.maxConcurrent, at: now,
+      message: `${held} of ${this.config.maxConcurrent} agent admission permits are held by launches whose exit is ` +
+        "unconfirmed; new spawns queue behind them (smarty-dev#9855)" };
+    console.warn(`[pi-fabric] ${alarm.message}`);
+    try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
   }
 
   #settleQueued(queued: QueuedAgent, status: "stopped" | "failed", error: unknown): void {
@@ -1765,6 +2312,238 @@ export class AgentManager {
     }
   }
 
+  /** prepare (locator persisted) → register → start; Fabric never re-submits. */
+  async #startHosted(
+    adapter: FabricHostedRunner,
+    context: FabricRunnerLaunchContext,
+    launch: {
+      request: AgentRunRequest;
+      release: () => void;
+      signal: AbortSignal | undefined;
+      timeoutMs: number;
+      files: { statusFile: string; lifecycleFile: string; logFile: string };
+      requestedThinking?: AgentRunRequest["thinking"];
+      branch?: string;
+      worktree?: string;
+    },
+  ): Promise<AgentHandleInfo> {
+    const now = Date.now();
+    const record: AgentRunRecord = {
+      id: context.id,
+      name: context.name,
+      task: context.task,
+      status: "running",
+      runner: adapter.id,
+      transport: "hosted",
+      cwd: context.cwd,
+      ...(context.model ? { model: context.model, requestedModel: context.model } : {}),
+      ...(context.thinking ? { thinking: context.thinking } : {}),
+      ...(launch.requestedThinking ? { requestedThinking: launch.requestedThinking } : {}),
+      ...(context.residency === "durable" ? { residency: "durable" as const } : {}),
+      startedAt: now,
+      updatedAt: now,
+      turns: 0,
+      toolCalls: 0,
+      text: "",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      logFile: launch.files.logFile,
+      ...(launch.branch ? { branch: launch.branch } : {}),
+      ...(launch.worktree ? { worktree: launch.worktree } : {}),
+    };
+    let managed: ManagedAgent | undefined;
+    const hosted = await HostedRun.prepare(
+      adapter,
+      { ...context, idempotencyKey: context.id },
+      { ...launch.files, stateFile: path.join(context.runDirectory, HOSTED_STATE_FILE) },
+      record,
+      this.#hostedHooks(() => managed),
+    );
+    if (launch.signal?.aborted || this.#closing) {
+      hosted.abandon("Agent launch aborted before the hosted run was submitted");
+      throw new Error("Agent launch aborted");
+    }
+    managed = this.#adoptHosted(hosted, {
+      release: launch.release,
+      signal: launch.signal,
+      recovered: false,
+      ...(launch.requestedThinking ? { requestedThinking: launch.requestedThinking } : {}),
+    });
+    await hosted.start();
+    void this.#monitor(managed, launch.timeoutMs);
+    return this.#handleInfo(managed, "running");
+  }
+
+  #hostedHooks(managed: () => ManagedAgent | undefined): HostedRunHooks {
+    return {
+      questionTimeoutMs: this.config.childQuestionTimeoutMs ?? DEFAULT_CHILD_QUESTION_TIMEOUT_MS,
+      ...(this.config.childQuestions === "route" && this.#onChildQuestion
+        ? {
+            ask: (question: Record<string, unknown>) => {
+              const run = managed();
+              return run ? this.#askParent(run, question) : Promise.resolve({ cancelled: true as const });
+            },
+          }
+        : {}),
+    };
+  }
+
+  #adoptHosted(
+    hosted: HostedRun,
+    options: {
+      release: () => void;
+      signal?: AbortSignal | undefined;
+      /** Re-attached after a restart: background completion, usage already ledgered. */
+      recovered: boolean;
+      requestedThinking?: AgentRunRequest["thinking"];
+    },
+  ): ManagedAgent {
+    const record = hosted.record;
+    const recovered = options.recovered;
+    const managed: ManagedAgent = {
+      // Route classification has no hosted transport; a hosted run classifies like a process task.
+      runRoute: createRunRouteMetadata({
+        runner: record.runner,
+        transport: "process",
+        ...(hosted.context.actorId ? { actorId: hosted.context.actorId } : {}),
+        ...(hosted.context.actorName ? { actorName: hosted.context.actorName } : {}),
+      }),
+      // Hosted runs carry no captured mailbox principal; automatic outputs stay unattributed.
+      outputPrincipal: undefined,
+      onOutputPrincipalDowngrade: undefined,
+      id: record.id,
+      name: record.name,
+      task: record.task,
+      runner: record.runner,
+      runnerAdapter: hosted.adapter,
+      hosted,
+      ...(hosted.context.kernel ? { kernel: hosted.context.kernel } : {}),
+      recursive: false,
+      residency: hosted.context.residency,
+      cwd: record.cwd,
+      statusFile: hosted.files.statusFile,
+      lifecycleFile: hosted.files.lifecycleFile,
+      lifecycleOffset: 0,
+      lifecycleRemainder: Buffer.alloc(0),
+      runDirectory: hosted.context.runDirectory,
+      transport: hosted.handle,
+      adapter: HOSTED_TRANSPORT,
+      launch: { id: record.id, name: record.name, cwd: record.cwd, workerPath: "", workerArguments: [] },
+      startupAttempts: 1,
+      ...createAgentLifecycle<AgentRunResult>(options.release),
+      abortSignal: options.signal,
+      abortHandler: undefined,
+      ...(record.model ? { model: record.model } : {}),
+      ...(record.thinking ? { thinking: record.thinking } : {}),
+      ...(options.requestedThinking ? { requestedThinking: options.requestedThinking } : {}),
+      ...(record.branch ? { branch: record.branch } : {}),
+      ...(record.worktree ? { worktree: record.worktree } : {}),
+      settled: false,
+      background: recovered,
+      lastLivenessCheckAt: 0,
+      resumeAttempts: 0,
+      stopRequested: false,
+      observedProgress: { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } },
+      // A recovered run's earlier usage reached the ledger before the restart.
+      usageEmitted: recovered ? { ...record.usage } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    if (options.signal) {
+      managed.abortHandler = () => this.#handleCallerAbort(managed.id);
+      options.signal.addEventListener("abort", managed.abortHandler, { once: true });
+    }
+    this.#runs.set(managed.id, managed);
+    this.#invalidateUiList();
+    return managed;
+  }
+
+  /**
+   * Re-attach hosted runs persisted under this run root, as after a resident
+   * host restart. Recovery calls `attach`, never `start`: a run the adapter
+   * cannot vouch for settles failed with outcome "indeterminate".
+   */
+  async recoverHostedRuns(): Promise<string[]> {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.#runRoot);
+    } catch {
+      return [];
+    }
+    const recovered: string[] = [];
+    for (const entry of entries) {
+      if (this.#closing || this.#runs.has(entry) || !/^[0-9a-f]{32}$/.test(entry)) continue;
+      const runDirectory = path.join(this.#runRoot, entry);
+      const statusFile = path.join(runDirectory, "status.json");
+      const record = readRecord(statusFile);
+      const state = readHostedRunState(path.join(runDirectory, HOSTED_STATE_FILE));
+      if (
+        !record?.hosted ||
+        !state ||
+        record.id !== entry ||
+        state.context.id !== entry ||
+        terminalStatuses.has(record.status)
+      ) {
+        continue;
+      }
+      const adapter = getAgentRunner(state.runner);
+      let refusal = adapter?.kind !== "hosted"
+        ? `Hosted runner ${state.runner} is not registered in this process; the run outcome is indeterminate`
+        : undefined;
+      // The persisted launch scope is re-validated; a damaged one never re-attaches unscoped.
+      if (!refusal && state.context.scope !== undefined) {
+        try {
+          state.context = { ...state.context, scope: normalizeScope(state.context.scope) };
+        } catch (error) {
+          refusal = `Hosted run scope is invalid (${error instanceof Error ? error.message : String(error)}); the run outcome is indeterminate`;
+        }
+      }
+      if (refusal || adapter?.kind !== "hosted") {
+        const now = Date.now();
+        const { currentTool: _tool, blockedOn: _blocked, sleeping: _sleeping, ...rest } = record;
+        writeRecord(statusFile, {
+          ...rest,
+          status: "failed",
+          error: refusal!,
+          outcome: "indeterminate",
+          finishedAt: now,
+          updatedAt: now,
+        });
+        continue;
+      }
+      let managed: ManagedAgent | undefined;
+      const hosted = HostedRun.recover(
+        adapter,
+        state,
+        {
+          statusFile,
+          lifecycleFile: path.join(runDirectory, "lifecycle.jsonl"),
+          logFile: path.join(runDirectory, "events.jsonl"),
+          stateFile: path.join(runDirectory, HOSTED_STATE_FILE),
+        },
+        record,
+        this.#hostedHooks(() => managed),
+      );
+      managed = this.#adoptHosted(hosted, { release: () => {}, recovered: true });
+      await hosted.attach();
+      void this.#monitor(managed, Math.max(0, state.context.deadlineAt - Date.now()));
+      recovered.push(entry);
+    }
+    return recovered;
+  }
+
+  /** Park or resume a hosted run whose runner declares `sleep`. */
+  async sleep(id: string): Promise<void> {
+    await this.#requireHosted(id, "sleep").park("sleep");
+  }
+
+  async wake(id: string): Promise<void> {
+    await this.#requireHosted(id, "sleep").park("wake");
+  }
+
+  #requireHosted(id: string, capability: "sleep"): HostedRun {
+    const managed = this.#requireRun(id);
+    if (!managed.hosted) throw new Error(`The ${managed.runnerAdapter.label} runner does not support ${capability}`);
+    return managed.hosted;
+  }
+
   async run(
     request: AgentRunRequest,
     signal?: AbortSignal,
@@ -1774,6 +2553,8 @@ export class AgentManager {
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
   ): Promise<AgentRunResult> {
+    const recovered = this.#recoverEnodevRun(request, signal, authorize);
+    if (recovered) return recovered;
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
@@ -1838,7 +2619,7 @@ export class AgentManager {
   /** A lost worker may keep writing status; it cannot replace the supervisor failure. */
   #settledRecord(managed: ManagedAgent): AgentRunRecord | undefined {
     return readRecord(path.join(managed.runDirectory, "custody-failure.json")) ??
-      readRecord(managed.statusFile) ?? managed.latestRecord;
+      managed.finalAnswerResult ?? readRecord(managed.statusFile) ?? managed.latestRecord;
   }
 
   /** Observe a settled outcome, independently of foreground consumption receipts. */
@@ -2010,11 +2791,15 @@ export class AgentManager {
     const queued = this.#queued.get(id);
     if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
     const previous = this.#previousRuns.get(id);
-    if (previous && !this.#runs.has(id)) return structuredClone(previous);
+    if (previous && !this.#runs.has(id)) {
+      this.#terminalNoticeOutbox.recover(path.join(this.#runRoot, previous.id));
+      return structuredClone(previous);
+    }
     const managed = this.#requireRun(id);
-    const record = managed.settled
-      ? this.#settledRecord(managed)
-      : managed.latestRecord ?? readRecord(managed.statusFile);
+    this.#observeFinalAnswer(managed);
+    this.#routeTerminalNotices(managed);
+    const record = managed.settled ? this.#settledRecord(managed)
+      : managed.finalAnswerResult ?? managed.latestRecord ?? readRecord(managed.statusFile);
     if (!record) {
       const info = this.#handleInfo(managed, "running");
       const deliveries = this.#checkFollowUps(managed);
@@ -2361,6 +3146,84 @@ export class AgentManager {
       [...this.#queued.values()].filter((queued) => !queued.terminal).length;
   }
 
+  /**
+   * smarty-dev#8935: a restored actor activation whose earlier run completed, but was left "execution exit
+   * unconfirmed" by the pre-pi-fabric#849 ENODEV scope observation, gets that run's saved answer instead of a rerun.
+   * The run root is scanned once per manager; each run settles at most once (settleEnodevRun).
+   */
+  // pi-fabric#912 round 3: the shortcut runs only for an authorized, unaborted request (the same gate spawn applies;
+  // otherwise spawn refuses it and the marker is untouched), and it settles nothing: the actor commits after it
+  // delivered the answer (commitEnodevRecovery). An uncommitted recovery keeps the marker and the answer.
+  #recoverEnodevRun(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean): AgentRunResult | undefined {
+    if (!request.actorId || !request.activationId || process.platform !== "linux") return undefined;
+    if (signal?.aborted || (authorize && !authorize())) return undefined;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const result = peekEnodevRun(directory, request.actorId, request.activationId);
+      if (!result) continue;
+      this.#enodevCommits.set(result.id, { directory, actorId: request.actorId, activationId: request.activationId });
+      // A receipt means a delivery may already have happened (a crash before the queue ack): replay it idempotently.
+      const replay = enodevDelivered(directory, result.id, request.activationId);
+      return { ...result, enodevRecovered: true, ...(replay ? { enodevReplay: true } : {}) };
+    }
+    return undefined;
+  }
+
+  /** The actor delivered a recovered answer: its durable receipt, written before the actor acks its queue. */
+  noteEnodevDelivered(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    noteEnodevDelivered(pending.directory, runId, pending.activationId);
+    return true;
+  }
+
+  /** The actor acked the delivered activation in its queue: settle its run (terminal record, archive, marker last). */
+  commitEnodevRecovery(runId: string): boolean {
+    const pending = this.#enodevCommits.get(runId);
+    if (!pending) return false;
+    this.#enodevCommits.delete(runId);
+    const result = settleEnodevRun(pending.directory, pending.actorId, pending.activationId);
+    if (result) this.#enodevSettledHere.add(runId);
+    if (!result) return false;
+    this.#enodevRuns = (this.#enodevRuns ?? []).filter(other => other !== pending.directory);
+    this.#previousRuns.set(result.id, structuredClone(result));
+    this.#retentionRevision++;
+    this.#releaseProvenGone(); // smarty-dev#9855: same step as the settle
+    return true;
+  }
+
+  /**
+   * smarty-dev#8935: an ENODEV-unconfirmed run of `actorId` whose activation is not in `pending` (the actor's
+   * restored queue) will never be claimed by a run request: settle it as lost once its worker is proven gone, so
+   * retention can collect it. One log line per run.
+   */
+  settleLostEnodevRuns(actorId: string, pending: ReadonlySet<string>): void {
+    if (process.platform !== "linux") return;
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    for (const directory of this.#enodevRuns) {
+      const activationId = settleLostEnodevRun(directory, actorId, pending);
+      if (activationId === undefined) continue;
+      this.#enodevSettledHere.add(path.basename(directory));
+      this.#enodevRuns = this.#enodevRuns.filter(other => other !== directory);
+      this.#retentionRevision++;
+      if (enodevDelivered(directory, path.basename(directory), activationId)) {
+        console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as delivered: its activation ` +
+          `${activationId} was delivered and acknowledged before a restart (ENODEV, smarty-dev#8935)`);
+        continue;
+      }
+      console.warn(`[pi-fabric] actor ${actorId}: run ${path.basename(directory)} settled as lost: its activation ${activationId} ` +
+        "is no longer pending and its worker exit was unconfirmed (ENODEV, smarty-dev#8935)");
+    }
+    this.#releaseProvenGone(); // smarty-dev#9855: a run this settle proved gone frees its held permit in the same step
+  }
+
+  /** pi-fabric#912: counts consecutive starts whose queue state for `actorId` was unknown in its ENODEV markers. */
+  countUnknownEnodevStarts(actorId: string, unknown: boolean): { starts: number; alarm: boolean } {
+    if (process.platform !== "linux") return { starts: 0, alarm: false };
+    this.#enodevRuns ??= enodevUnresolvedRuns(this.#runRoot);
+    return countUnknownEnodevStarts(this.#enodevRuns, actorId, unknown);
+  }
+
   #previousRun(id: string): AgentRunResult | undefined {
     const previous = this.#runs.has(id) ? undefined : this.#previousRuns.get(id);
     if (!previous) return undefined;
@@ -2396,6 +3259,9 @@ export class AgentManager {
     // exit cannot settle/release this run while that new execution is in flight.
     await managed.relaunchPending;
     const existing = readRecord(managed.statusFile);
+    // A stop cannot race past the immutable answer fence and destroy the native
+    // frame before its associated validated status/refusal journal is published.
+    if (this.#observeFinalAnswer(managed)) await managed.finalAnswerCompletion;
     // Even a settled/terminal run may still own a detached execution group.
     // Only an exact native deadline receipt permits logical completion with
     // retained debt. Platform or process kind alone is never such a receipt.
@@ -2420,6 +3286,7 @@ export class AgentManager {
         ? (this.#withTransportMetadata(terminal, managed) as AgentRunResult)
         : failedRecord(managed, "stopped", "Agent stopped");
     if (!terminal || !terminalStatuses.has(terminal.status)) writeRecord(managed.statusFile, record);
+    await this.#captureWorktree(managed);
     this.#settle(managed, record);
     if (!managed.settled) throw new Error(`Agent ${id} execution exit unconfirmed; custody retained`);
     return record;
@@ -2507,13 +3374,16 @@ export class AgentManager {
   }
 
   steer(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance): AgentSteerResult {
+    // Hosted runs take messages through their adapter (upstream runner contract).
+    if (this.#runs.get(id)?.hosted) return this.#deliverMessage(id, "steer", message, data);
     this.#requireSteerable(id);
     return this.#appendSteer(id, { type: "steer", message, data, provenance });
   }
 
   followUp(id: string, message: string, data?: unknown, provenance?: FabricTurnProvenance,
     options?: { deadlineMs: number }): AgentSteerResult {
-    this.#requireSteerable(id);
+    if (this.#runs.get(id)?.hosted && !options) return this.#deliverMessage(id, "followUp", message, data);
+    this.#requireSteerable(id, "followUp");
     if (!options) return this.#appendSteer(id, { type: "follow_up", message, data, provenance });
     const managed = this.#requireRun(id);
     if (managed.runner !== "pi") throw new Error("Delivery deadlines require a local Pi task agent");
@@ -2522,7 +3392,7 @@ export class AgentManager {
     const deadlineAt = Date.now() + options.deadlineMs;
     if (!Number.isSafeInteger(deadlineAt)) throw new Error("deadlineMs exceeds the safe timestamp range");
     const file = followUpFile(managed.runDirectory, messageId);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    mkdirPrivate(path.dirname(file), this.#trustRoot());
     fs.writeFileSync(file, JSON.stringify({ messageId, deadlineAt }), { mode: 0o600 });
     let receipt: AgentSteerResult;
     try { receipt = this.#appendSteer(id, { type: "follow_up", message, data, provenance, followUpId: messageId, deadlineAt }); }
@@ -2588,20 +3458,57 @@ export class AgentManager {
   // Veda children run one headless prompt per invocation; there is no stdin
   // turn channel to steer into. Reject steer/follow-up here so callers learn
   // at call time instead of the command being silently dropped by the worker.
-  #requireSteerable(id: string): void {
-    if (this.#requireRun(id).runner === "veda") {
+  #requireSteerable(id: string, kind: "steer" | "followUp" = "steer"): void {
+    const previous = this.#previousRun(id);
+    if (previous?.runner === "pi" && previous.finalAnswerReceipt && !previous.actorId) throw new FabricTargetTerminalError(previous.id, previous.finalAnswerReceipt.id);
+    const managed = this.#requireRun(id);
+    this.#observeFinalAnswer(managed);
+    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
+    if (!managed.runnerAdapter.capabilities[kind]) {
       throw new Error(
-        "The Veda runner does not support steering or follow-ups: Veda executes one headless prompt per invocation. Start a new run instead.",
+        managed.runner === "veda"
+          ? "The Veda runner does not support steering or follow-ups: Veda executes one headless prompt per invocation. Start a new run instead."
+          : `The ${managed.runnerAdapter.label} runner does not support ${kind === "steer" ? "steering" : "follow-ups"}`,
       );
     }
   }
 
+  // Runners without a turn channel (Veda runs one headless prompt per
+  // invocation) reject here so callers learn at call time instead of the
+  // command being silently dropped. Hosted runs are delivered by the adapter.
+  #deliverMessage(id: string, kind: "steer" | "followUp", message: string, data?: unknown): AgentSteerResult {
+    const managed = this.#requireRun(id);
+    if (!managed.runnerAdapter.capabilities[kind]) {
+      throw new Error(
+        managed.runner === "veda"
+          ? "The Veda runner does not support steering or follow-ups: Veda executes one headless prompt per invocation. Start a new run instead."
+          : `The ${managed.runnerAdapter.label} runner does not support ${kind === "steer" ? "steering" : "follow-ups"}`,
+      );
+    }
+    if (!managed.hosted) {
+      return this.#appendSteer(id, { type: kind === "steer" ? "steer" : "follow_up", message, data });
+    }
+    if (managed.settled || managed.hosted.terminal) {
+      throw new Error(`Fabric agent ${id} already finished; steering has no target`);
+    }
+    return { queued: true, messageId: managed.hosted.deliver(kind, message, data) };
+  }
+
   setSteeringMode(id: string, mode: FabricSteeringMode): AgentSteerResult {
+    this.#requireSteerFile(id);
     return this.#appendSteer(id, { type: "set_steering_mode", mode });
   }
 
   setFollowUpMode(id: string, mode: FabricSteeringMode): AgentSteerResult {
+    this.#requireSteerFile(id);
     return this.#appendSteer(id, { type: "set_follow_up_mode", mode });
+  }
+
+  #requireSteerFile(id: string): void {
+    const managed = this.#requireRun(id);
+    if (managed.hosted) {
+      throw new Error(`The ${managed.runnerAdapter.label} runner is hosted; it has no queue modes`);
+    }
   }
 
   // Request an advisory compaction of a running Pi-runner child's context.
@@ -2612,9 +3519,11 @@ export class AgentManager {
   // RPC; a fresh run is the only way to reset a Claude child's context.
   compact(id: string, instructions?: string): AgentSteerResult {
     const managed = this.#requireRun(id);
-    if (managed.runner === "claude" || managed.runner === "veda") {
+    if (!managed.runnerAdapter.capabilities.compaction) {
       throw new Error(
-        "Fabric agent compaction is only supported for Pi-runner children; Claude Code and Veda sessions cannot be compacted through Fabric.",
+        BUILT_IN_RUNNER_IDS.has(managed.runner)
+          ? "Fabric agent compaction is only supported for Pi-runner children; Claude Code and Veda sessions cannot be compacted through Fabric."
+          : `The ${managed.runnerAdapter.label} runner does not declare the compaction capability`,
       );
     }
     return this.#appendSteer(id, {
@@ -2625,6 +3534,8 @@ export class AgentManager {
 
   #appendSteer(id: string, entry: Omit<AgentSteerEntry, "id" | "ts">): AgentSteerResult {
     const managed = this.#requireRun(id);
+    this.#observeFinalAnswer(managed);
+    if (managed.finalAnswer) throw new FabricTargetTerminalError(managed.id, managed.finalAnswer.id);
     if (managed.transport.controls === false) throw new Error("Remote placement has no steering, follow-up, or compaction channel; start a new task");
     const record = readRecord(managed.statusFile);
     if (record && (terminalStatuses.has(record.status) || record.status === "finishing")) {
@@ -2721,6 +3632,7 @@ export class AgentManager {
     this.#archiveRecovery.clear();
     for (const timer of this.#followUpTimers.values()) clearTimeout(timer);
     this.#followUpTimers.clear();
+    for (const entry of [...this.#runs.values(), ...this.#queued.values()]) this.#stopRecoveryRetry(entry);
     this.#closeAbort.abort(new Error("Fabric agent manager is closing"));
     return this.#closePromise ??= this.#close().catch(error => {
       this.#closePromise = undefined; // retain exact custody for a later close retry
@@ -2735,7 +3647,14 @@ export class AgentManager {
     this.#retentionTimer = undefined;
     await this.#retentionSweep?.catch(() => undefined);
     for (const id of this.#pendingAbandonment) this.#retryAbandonment(id);
-    const tracked = [...this.#runs.values()];
+    // A durable hosted run outlives this host: detach it and keep its locator
+    // on disk so the next resident host re-attaches instead of stopping it.
+    const detached = [...this.#runs.values()].filter(
+      (managed) => !managed.settled && managed.hosted && managed.residency === "durable",
+    );
+    for (const managed of detached) managed.hosted!.detach();
+    const tracked = [...this.#runs.values()].filter((managed) => !detached.includes(managed));
+    for (const managed of tracked) if (!managed.settled) managed.hosted?.markShutdown();
     const running = tracked.filter((managed) => !managed.settled);
     const lastEventAt = new Map(running.map((managed) => [managed.id, lastEventTime(managed)]));
     const stopped = await Promise.allSettled([
@@ -2787,16 +3706,18 @@ export class AgentManager {
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // An unrelated retained tree fences shared budget/root deletion, not an
     // independently joined tracked run with its full outcome durably archived.
-    if (!this.config.retainRuns) {
+    // Nested run artifacts belong to the enclosing run (upstream lineage): its
+    // owner removes them on cleanup/retention/root shutdown, not this child.
+    if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
         .map(managed => removeTree(managed.runDirectory).catch(() => undefined)));
     }
     // A failed stop is not authority to delete a child's working files.
-    if (!alive.some(Boolean) && !unresolved) {
+    if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
       if (!this.config.retainRuns) {
-        if (storageSafe) {
+        if (storageSafe && !this.#parentOwnedRunRoot) {
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all([...this.#queued.values()]
@@ -2821,7 +3742,8 @@ export class AgentManager {
     // other handle (including custom process handles on Windows) stays strict.
     if (transports.some((transport, index) => alive[index] &&
           !all.some(managed => managed.transport === transport && this.#hasNativeStopDebt(managed))) ||
-        all.some((managed) => !managed.executionExited && !this.#hasNativeStopDebt(managed)) ||
+        // Hosted runs have no local execution: their adapter owns stop/detach (upstream runner contract).
+        all.some((managed) => !managed.executionExited && !managed.hosted && !this.#hasNativeStopDebt(managed)) ||
         [...this.#queued.values()].some(queued => queued.cleanupPending)) {
       throw new Error("Agent manager close incomplete: execution exit unconfirmed; custody and files retained");
     }
@@ -2848,7 +3770,7 @@ export class AgentManager {
       const [runtime, ...args] = await scriptSpawnArgs(this.#sweepPath, [JSON.stringify(request)]);
       if (!claimTempRunSweep(request.tempRoot, RETENTION_SWEEP_INTERVAL_MS)) return;
       const child = spawn(runtime!, args, {
-        detached: true, stdio: "ignore", windowsHide: true,
+        env: childProcessEnvironment(), detached: true, stdio: "ignore", windowsHide: true,
       });
       child.on("error", () => undefined);
       if (child.pid) {
@@ -2869,6 +3791,7 @@ export class AgentManager {
   }
 
   async #runRetentionSweep(now = Date.now()): Promise<void> {
+    for (const managed of this.#runs.values()) this.#routeTerminalNotices(managed);
     if (this.#managedTempRoot) {
       heartbeatRunRoot(this.#runRoot, now);
       await this.#startTempRunSweep();
@@ -2893,6 +3816,15 @@ export class AgentManager {
     }
   }
 
+  /** A custom worker runner's own stop hook, before the transport kills the process. */
+  async #stopWorkerRunner(managed: ManagedAgent): Promise<void> {
+    const runner = managed.runnerAdapter;
+    if (runner.kind !== "worker" || !runner.stop) return;
+    await Promise.resolve()
+      .then(() => runner.stop!({ id: managed.id, runDirectory: managed.runDirectory }))
+      .catch(() => undefined);
+  }
+
   /** A cancelled launch has no ManagedAgent yet. Bound stop AND liveness calls,
    * including hung RPCs; false/lost-contact and failed probes are not proven exits. */
   async #stopUnregisteredTransport(transport: AgentTransportHandle): Promise<boolean> {
@@ -2914,11 +3846,15 @@ export class AgentManager {
     if (uncheckedExternalExit(transport)) return false;
     try {
       if (transport.closed) await bounded(() => transport.closed!);
+      if (transport.treeClosed) {
+        await bounded(() => transport.treeClosed!);
+        return transport.lostContact?.() === undefined;
+      }
       while (Date.now() < deadline) {
         const alive = await bounded(() => transport.isAlive());
         if (transport.lostContact?.() !== undefined) return false;
         if (!alive) return true;
-        if (stopFailed) return false; // a fresh exact receipt may discharge this on retry
+        if (transport.kind === "process" || stopFailed) return false; // a fresh exact receipt may discharge this on retry
         await delay(Math.min(transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS, deadline - Date.now()));
       }
     } catch { /* failed or hung liveness never authorizes deletion */ }
@@ -2975,10 +3911,10 @@ export class AgentManager {
 
   // After a stop: a worker whose exit is not confirmed (lost contact, or still reported
   // alive) may keep using its files, so the run is marked unresolved (never cleaned up).
-  async #noteUnconfirmedExit(managed: ManagedAgent): Promise<void> {
+  async #noteUnconfirmedExit(managed: ManagedAgent, exitObserved = false): Promise<void> {
     const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
     const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
-    const alive = lost === undefined && await this.#transportAliveUntil(managed.transport, deadline).catch(() => true);
+    const alive = lost === undefined && !exitObserved && await this.#transportAliveUntil(managed.transport, deadline).catch(() => true);
     const nativeClosed = lost === undefined && !alive && await this.#transportClosedUntil(managed.transport, deadline);
     if (lost === undefined && !alive && nativeClosed) {
       managed.executionExited = true;
@@ -3068,9 +4004,51 @@ export class AgentManager {
   }
 
   async #waitForTransportExit(managed: ManagedAgent, outerDeadline = Infinity): Promise<void> {
-    // Never issue a potentially hung query that cannot supply exit proof.
-    if (uncheckedExternalExit(managed.transport)) return;
-    const deadline = Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
+    // Native notifications drive finishing. The existing bounded grace is the
+    // only safety timer; a worker close alone never certifies a scoped tree.
+    if (managed.executionExited || uncheckedExternalExit(managed.transport)) return;
+    const transport = managed.transport;
+    const deadline = transport.kind === "process" && transport.closed && Number.isFinite(outerDeadline)
+      ? outerDeadline : Math.min(outerDeadline, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7);
+    if (transport.kind === "process" && transport.closed) {
+      const receipt = transport.treeClosed
+        ? Promise.all([transport.closed, transport.treeClosed]).then(() => undefined)
+        : transport.closed;
+      if (!await this.#transportClosedUntil({ ...transport, closed: receipt }, deadline)) return;
+      if (transport.treeClosed) {
+        if (transport.lostContact?.() !== undefined || managed.processStopPending) return;
+        managed.executionExited = true;
+        this.#retentionRevision++;
+        delete managed.lostContact;
+        fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
+        managed.executionRelease?.();
+        delete managed.executionRelease;
+      } else {
+        // Legacy close has no descendant notification. Inspect once on close,
+        // then once at the existing absolute grace if a descendant remains.
+        // No recurring membership/status timer runs between these checks.
+        const alive = await this.#transportAliveUntil(transport, deadline).catch(() => true);
+        if (alive && transport.lostContact?.() === undefined && Date.now() < deadline) {
+          await delay(deadline - Date.now());
+          await this.#noteUnconfirmedExit(managed);
+        } else {
+          await this.#noteUnconfirmedExit(managed, !alive);
+        }
+      }
+      return;
+    }
+    if (transport.kind === "process") {
+      // Older/placed adapters lack native notifications. Preserve their checked
+      // exit contract with one existing grace deadline, never a finishing poll.
+      const alive = await this.#transportAliveUntil(transport, deadline).catch(() => true);
+      if (alive && transport.lostContact?.() === undefined && Date.now() < deadline) {
+        await delay(deadline - Date.now());
+        await this.#noteUnconfirmedExit(managed);
+      } else {
+        await this.#noteUnconfirmedExit(managed, !alive);
+      }
+      return;
+    }
     const pollIntervalMs = managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS;
     try {
       while (Date.now() < deadline && await this.#transportAliveUntil(managed.transport, deadline)) {
@@ -3089,6 +4067,9 @@ export class AgentManager {
     if (
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
+      managed.hosted ||
+      // A custom worker that already made progress is never re-run blind.
+      (!BUILT_IN_RUNNER_IDS.has(managed.runner) && this.#observedWork(managed)) ||
       managed.startupAttempts >= AGENT_STARTUP_MAX_ATTEMPTS ||
       managed.settled ||
       this.#closing ||
@@ -3097,9 +4078,10 @@ export class AgentManager {
       record.status !== "failed" ||
       // Window admission is terminal even when stderr also contains an auth
       // miss or transport-death diagnostic. Never launch a second Pi for it.
-      /Context exceeds window:/i.test(record.error ?? "") ||
+      // (Text here only suppresses a relaunch: a false match fails safe.)
+      record.errorCode === "CONTEXT_OVERFLOW" || /Context exceeds window:/i.test(record.error ?? "") ||
       !(
-        (managed.runner === "pi" && retryablePiStartupError(record.error)) ||
+        ((managed.runner === "pi" || managed.runner === "pi-durable") && retryablePiStartupError(record.error)) ||
         transportExitedWithoutResult(record.error)
       ) ||
       record.turns !== 0 ||
@@ -3137,13 +4119,17 @@ export class AgentManager {
     if (
       managed.launch.workerArguments.includes("--judgment") ||
       managed.transport.relaunchable === false ||
+      // Fabric never re-prompts a hosted run, and only its own worker
+      // understands the continuation task and --carry-over prefix.
+      managed.hosted ||
+      !BUILT_IN_RUNNER_IDS.has(managed.runner) ||
       managed.settled ||
       this.#closing ||
       managed.stopRequested ||
       managed.abandoned ||
       managed.resumeAttempts >= AGENT_RESUME_MAX_ATTEMPTS ||
       !this.#observedWork(managed) ||
-      /Context exceeds window:/i.test(record.error ?? "") ||
+      record.errorCode === "CONTEXT_OVERFLOW" || /Context exceeds window:/i.test(record.error ?? "") ||
       !recoverableStop(record)
     ) {
       return false;
@@ -3156,7 +4142,11 @@ export class AgentManager {
     managed.resumeAttempts += 1;
     const { turns, toolCalls, usage } = managed.observedProgress;
     return this.#relaunch(managed, record, {
-      task: resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
+      // Durable recovery reopens the same journal, not a fresh conversation.
+      // Changing its prompt breaks recorded-result identity after completion.
+      task: managed.runner === "pi-durable"
+        ? managed.task
+        : resumeTask(managed.task, record, { turns, toolCalls }, managed.runDirectory),
       carryOver: { turns, toolCalls, usage: { ...usage } },
     });
   }
@@ -3185,7 +4175,7 @@ export class AgentManager {
     resume?: { task: string; carryOver: AgentRunCarryOver },
   ): Promise<boolean> {
     try {
-      if (managed.runner === "pi") {
+      if (managed.runner === "pi" || managed.runner === "pi-durable") {
         const model = await this.prepareModelForAdmission(managed.routePin?.model ?? managed.model, managed.runner, undefined, Boolean(managed.routePin));
         if (managed.routePin) setWorkerArgument(managed.launch.workerArguments, "thinking", managed.routePin.effort);
         const modelIndex = managed.launch.workerArguments.indexOf("--model");
@@ -3265,10 +4255,15 @@ export class AgentManager {
 
       fs.rmSync(managed.statusFile, { force: true });
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) return false;
+      // pi-fabric#939 round 3: the old attempt's pid proves nothing about the replacement. No attempt's pid is known
+      // until the launch resolves, so nothing can be proven gone in between (or ever, if the launch is unknown).
+      delete managed.ownProcess;
       const transport = await this.#launchTransport(managed.adapter, managed.launch);
       // Stop receipts belong to one transport attempt, not the run id. Install
       // the replacement and its fresh custody together, after launch resolves.
       managed.transport = transport;
+      const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
+      if (owned) managed.ownProcess = owned;
       managed.executionExited = false;
       delete managed.processStop;
       delete managed.processStopPending;
@@ -3329,6 +4324,152 @@ export class AgentManager {
     }
   }
 
+  /** Read the immutable worker boundary, never infer finality from streamed prose. */
+  #observeFinalAnswer(managed: ManagedAgent): boolean {
+    if (managed.actorId || managed.runner !== "pi" || managed.transport.kind !== "process") return false;
+    if (managed.finalAnswer) return true;
+    const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
+    if (!receipt) return false;
+    managed.finalAnswer = receipt; // Fence synchronous ingress before any validation yields.
+    managed.finalAnswerCompletion = (async () => {
+      let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
+      {
+        // The native receipt is the input fence; its associated validated worker
+        // snapshot is the result boundary for ALL tasks, not native process exit.
+        // Draining sooner can kill the receipt frame before queued refusals land.
+        const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
+        while ((!snapshot || snapshot.id !== managed.id || !terminalStatuses.has(snapshot.status) || snapshot.finalAnswerReceipt?.id !== receipt.id) && Date.now() < deadline) {
+          if (snapshot?.status === "finishing" && snapshot.finalAnswerReceipt?.id === receipt.id) {
+            await this.#waitForTransportExit(managed, deadline);
+            snapshot = readRecord(managed.statusFile);
+            break;
+          }
+          await delay(AGENT_STATUS_POLL_INTERVAL_MS);
+          snapshot = readRecord(managed.statusFile);
+        }
+        if (!snapshot || snapshot.id !== managed.id || !terminalStatuses.has(snapshot.status) || snapshot.finalAnswerReceipt?.id !== receipt.id) {
+          snapshot = failedRecord(managed, "failed", "Final answer has no associated validated worker status");
+        }
+      }
+      const record = { ...(snapshot ?? failedRecord(managed, "failed", "Final answer has no worker status")),
+        finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt },
+        finishedAt: receipt.recordedAt,
+      } as AgentRunResult;
+      if (record.status === "completed") record.text = receipt.text;
+      const schemaIndex = managed.launch.workerArguments.indexOf("--schema-file");
+      if (schemaIndex >= 0 && record.status === "completed") {
+        if (managed.launch.workerArguments.includes("--reply-tool") &&
+            (record.replyVia !== "tool" || record.value === undefined)) {
+          record.status = "failed";
+          record.error = "Structured agent output was invalid: missing fabric_reply tool result";
+        } else {
+          const schema = JSON.parse(fs.readFileSync(managed.launch.workerArguments[schemaIndex + 1]!, "utf8"));
+          const { validateAgentResult } = await import("./result.js");
+          validateAgentResult(record, schema);
+        }
+      }
+      // The receipt freezes the validated answer and rejects late controls.
+      // Public terminal publication still joins captured execution-tree exit.
+      if (record.status === "completed") record.exitCode = 0;
+      managed.finalAnswerResult = record;
+      this.#invalidateUiList();
+      // The receipt closes input now, not result custody. Route admitted sender
+      // refusals without waiting for the execution tree to empty.
+      this.#drainLifecycle(managed);
+      this.#refuseUnreadTerminalControls(managed);
+      this.#routeTerminalNotices(managed);
+      await this.#waitForTransportExit(managed, Date.now() + (managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS) * 2);
+      await this.#drainExecution(managed);
+      // Cleanup may append diagnostics after the answer snapshot was sealed.
+      // Only the same receipt's worker record can supplement its warnings.
+      const drained = readRecord(managed.statusFile);
+      if (drained?.finalAnswerReceipt?.id === receipt.id && drained.warnings) {
+        record.warnings = [...new Set([...(record.warnings ?? []), ...drained.warnings])];
+      }
+      await this.#captureWorktree(managed);
+      this.#settle(managed, record);
+    })().catch(error => {
+      const record = { ...failedRecord(managed, "failed", `Final answer validation failed: ${String(error)}`),
+        finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } };
+      this.#markLost(managed, String(error));
+      managed.finalAnswerResult = record;
+      this.#settle(managed, record);
+    });
+    // Observation from status/late ingress can settle outside the monitor. It
+    // still owns this exact transport until checked native/tree close.
+    void managed.finalAnswerCompletion.then(async () => {
+      await this.#drainExecution(managed);
+      this.#drainLifecycle(managed);
+      this.#refuseUnreadTerminalControls(managed);
+      this.#routeTerminalNotices(managed);
+    }).catch(error => this.#markLost(managed, String(error)));
+    return true;
+  }
+
+  #retainTerminalNotice(managed: ManagedAgent, value: unknown): void {
+    if (!value || typeof value !== "object" || managed.actorId) return;
+    const notice = value as AgentTerminalNotice;
+    const receipt = managed.finalAnswer ?? readFinalAnswerReceipt(managed.runDirectory, managed.id);
+    if (notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== managed.id ||
+        !receipt || notice.finalAnswerReceiptId !== receipt.id || typeof notice.messageId !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,200}$/.test(notice.messageId) || !["steer", "followUp"].includes(notice.delivery)) return;
+    if (managed.terminalNoticeSeen?.has(notice.messageId)) return;
+    const admission = readTerminalAdmission(managed.runDirectory, notice.messageId);
+    if (!admission || admission.delivery !== notice.delivery) return;
+    try {
+      const control = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${notice.messageId}.json`), "utf8"));
+      if (control?.state === "delivered" && terminalControlMatchesAdmission(control, admission)) return;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    // Worker event fields cannot select the recipient. Verify supplied attribution
+    // against the original trusted admission, then route only that admitted sender.
+    if (notice.sender !== undefined && !terminalSenderMatches(notice.sender, admission.sender)) return;
+    const attributed: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: managed.id,
+      finalAnswerReceiptId: receipt.id, messageId: notice.messageId, delivery: admission.delivery,
+      ...(admission.sender ? { sender: admission.sender } : {}) };
+    // Save BEFORE routing: a failed sender route cannot erase the refusal.
+    this.#terminalNoticeOutbox.retain(managed.runDirectory, attributed);
+    if (admission.delivery === "followUp" && /^[0-9a-f-]{36}$/.test(notice.messageId)) {
+      const file = followUpFile(managed.runDirectory, notice.messageId);
+      if (fs.existsSync(file)) {
+        const state = settleFollowUp(file, "cancelled");
+        releaseFollowUpPayload(file);
+        const delivery = this.#followUps.get(managed.id)?.get(notice.messageId);
+        if (delivery) delivery.state = state;
+        this.#clearFollowUpTimer(notice.messageId);
+      }
+    }
+    (managed.terminalNoticeSeen ??= new Set()).add(notice.messageId);
+  }
+
+  #refuseUnreadTerminalControls(managed: ManagedAgent): void {
+    if (!managed.finalAnswer || managed.actorId) return;
+    let lines: string[];
+    try { lines = fs.readFileSync(path.join(managed.runDirectory, "steer.jsonl"), "utf8").split("\n"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const entry = JSON.parse(line) as AgentSteerEntry;
+      if ((entry.type !== "steer" && entry.type !== "follow_up") || !/^[a-zA-Z0-9_-]{1,200}$/.test(entry.id)) continue;
+      const admission = readTerminalAdmission(managed.runDirectory, entry.id);
+      if (!admission) continue;
+      let state: { state?: string } | undefined;
+      try { state = JSON.parse(fs.readFileSync(path.join(managed.runDirectory, "terminal-controls", `${entry.id}.json`), "utf8")); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (state?.state === "delivered" && terminalControlMatchesAdmission(state, admission)) continue;
+      // Refused registry entries may already have emitted a worker notice. The
+      // original admission id deduplicates both paths, including an unread tail.
+      this.#retainTerminalNotice(managed, {
+        code: "FABRIC_TARGET_TERMINAL", targetId: managed.id, messageId: entry.id,
+        delivery: admission.delivery,
+        finalAnswerReceiptId: managed.finalAnswer.id, ...(admission.sender ? { sender: admission.sender } : {}),
+      });
+    }
+  }
+
+  #routeTerminalNotices(managed: ManagedAgent): void {
+    this.#terminalNoticeOutbox.route(managed.runDirectory);
+  }
+
   async #monitor(managed: ManagedAgent, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS;
     let firstObservedDeadAt: number | undefined;
@@ -3337,6 +4478,8 @@ export class AgentManager {
     let nativeClosePending = false;
     let wake: (() => void) | undefined;
     while (!managed.settled) {
+      // A detached durable hosted run is re-attached by the next host.
+      if (managed.hosted?.detached) return;
       if (managed.transport !== watchedTransport) {
         const transport = watchedTransport = managed.transport;
         nativeClosePending = false;
@@ -3347,6 +4490,16 @@ export class AgentManager {
         }, () => { /* notification is not exit proof */ });
       }
       this.#drainLifecycle(managed);
+      if (this.#observeFinalAnswer(managed)) {
+        // Result observers release now. Native admission/files remain fenced by
+        // executionRelease until the existing owned-tree drain proves close.
+        await managed.finalAnswerCompletion;
+        await this.#drainExecution(managed);
+        this.#drainLifecycle(managed);
+        this.#refuseUnreadTerminalControls(managed);
+        this.#routeTerminalNotices(managed);
+        return;
+      }
       const record = readRecord(managed.statusFile);
       this.#checkFollowUps(managed, record);
       if (record) {
@@ -3390,11 +4543,23 @@ export class AgentManager {
           await this.#noteUnconfirmedExit(managed);
         }
         await this.#drainExecution(managed);
+        await this.#captureWorktree(managed);
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;
       }
-      // Native settlement has its own finite cleanup budget, not an exemption
-      // from deadlines. Anchor it once; later status writes cannot extend it.
+      // Do not run the monitor's periodic status/liveness timer in finishing.
+      // Worker close (plus the verified tree receipt when available) wakes us;
+      // the existing finite cleanup grace is the sole safety check.
+      if (record?.status === "finishing" && managed.transport.kind === "process") {
+        finishingDeadline ??= Date.now() + (managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS) * 2;
+        await this.#waitForTransportExit(managed, finishingDeadline);
+        const candidate = readRecord(managed.statusFile);
+        if (candidate && terminalStatuses.has(candidate.status)) continue;
+        this.#markLost(managed, "finishing ended without a terminal worker outcome and execution-tree exit proof");
+        this.#settle(managed, { ...record, status: "failed" });
+        await this.#drainExecution(managed).catch(() => undefined);
+        return;
+      }
       if (record?.status === "finishing") {
         finishingDeadline ??= Date.now() + (managed.transport.finishingGraceMs ?? TRANSPORT_EXIT_GRACE_MS) * 2;
       }
@@ -3408,6 +4573,7 @@ export class AgentManager {
           return;
         }
         managed.stopRequested = true;
+        await this.#stopWorkerRunner(managed);
         await this.#stopManagedTransport(managed);
         await this.#waitForTransportExit(managed);
         await this.#noteUnconfirmedExit(managed);
@@ -3417,6 +4583,7 @@ export class AgentManager {
           terminalStatuses.has(completed.status) &&
           completed.status !== "stopped"
         ) {
+          await this.#captureWorktree(managed);
           this.#settle(
             managed,
             this.#withTransportMetadata(completed, managed) as AgentRunResult,
@@ -3426,6 +4593,7 @@ export class AgentManager {
         if (managed.lastRetriedTransportFailure) {
           // The deadline fired mid-retry: the root cause is the dead transport
           // we were recovering from, not runaway wall time. Report that failure.
+          await this.#captureWorktree(managed);
           this.#settle(
             managed,
             this.#withTransportMetadata(
@@ -3441,6 +4609,7 @@ export class AgentManager {
           `Agent timed out after ${timeoutMs}ms`,
         );
         writeRecord(managed.statusFile, timedOut);
+        await this.#captureWorktree(managed);
         this.#settle(managed, timedOut);
         return;
       }
@@ -3453,6 +4622,14 @@ export class AgentManager {
         if (!alive) {
           firstObservedDeadAt ??= livenessCheckedAt;
           if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {
+            if (managed.hosted) {
+              if (managed.hosted.detached) return;
+              const lost = managed.hosted.settleLost();
+              this.#drainLifecycle(managed);
+              await this.#captureWorktree(managed);
+              this.#settle(managed, this.#withTransportMetadata(lost, managed) as AgentRunResult);
+              return;
+            }
             // Worker exit can precede the tree-helper/native-close join. The
             // explicit stop owns the no-result terminal status; joining it is
             // still mandatory, but absence during teardown is not run failure.
@@ -3474,11 +4651,14 @@ export class AgentManager {
               return;
             }
             const logSummary = summarizeRunLog(managed.runDirectory, 8);
+            const stderr = managed.transport.readStderr?.().trim();
+            const diagnostic = [logSummary ? `last run log: ${logSummary}` : undefined, stderr ? `worker stderr: ${stderr}` : undefined]
+              .filter(Boolean).join("; ");
             const failed = failedRecord(
               managed,
               "failed",
-              logSummary
-                ? `Agent transport exited without a result; last run log: ${logSummary}`
+              diagnostic
+                ? `Agent transport exited without a result; ${diagnostic}`
                 : "Agent transport exited without a result",
             );
             if (await this.#resumeStopped(managed, failed, deadline)) continue;
@@ -3489,6 +4669,7 @@ export class AgentManager {
             await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
             writeRecord(managed.statusFile, settled);
+            await this.#captureWorktree(managed);
             this.#settle(managed, settled);
             return;
           }
@@ -3504,8 +4685,21 @@ export class AgentManager {
     }
   }
 
+  /** Bounded worktree diff, captured once before settlement. */
+  async #captureWorktree(managed: ManagedAgent): Promise<void> {
+    if (!managed.worktree || managed.worktreeResult || managed.settled) return;
+    // summarize() reports git failures as diffError; anything else leaves the result unset.
+    const summary = await this.#worktrees.summarize(managed.id).catch(() => undefined);
+    if (summary) managed.worktreeResult = summary;
+  }
+
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
     if (managed.settled) return;
+    if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
+    // Every terminal path (including explicit stop and lost transport) gets a
+    // final unthrottled read before freezing the nested status tree.
+    const nested = this.#nestedAgents(managed, true);
+    if (nested.length > 0) result.nestedAgents = reconcileNestedAgents(nested, result);
     this.#retentionRevision++;
     // A successful native result requires tree-exit proof. Unconfirmed custody
     // is a TERMINAL failure, not an indefinitely pending result. release() keeps
@@ -3543,7 +4737,21 @@ export class AgentManager {
       // that inspect the current status directly. It is not an exit receipt.
       writeRecord(managed.statusFile, result);
     }
+    if (managed.transport.kind === "process" && managed.lostContact) {
+      // Reporting a terminal result is allowed; releasing native admission is not.
+      // An uncertain Windows tree can still contain untracked native descendants.
+      // smarty-dev#9855: the permit is held, not lost: a later proof of exit releases it once.
+      managed.heldPermit ??= once(managed.release);
+      managed.release = () => {};
+      this.#checkHeldPermits();
+      queueMicrotask(() => this.#releaseProvenGone()); // after settlement completes below: deliver, then release
+      // Event-driven (round 3): the current attempt's own close event re-checks; its pid record matches this transport.
+      const transport = managed.transport;
+      void transport.closed?.then(() => this.#releaseProvenGone(), () => this.#releaseProvenGone());
+    }
     if (!beginAgentSettlement(managed)) return;
+    managed.questions?.abort(new Error("Agent run settled"));
+    managed.hosted?.close();
     // Images are transport inputs, not retained run artifacts. Startup retries
     // have finished by settlement, so remove the owner-only handoff file for
     // every terminal outcome even when retainRuns keeps the rest of the run.
@@ -3566,10 +4774,8 @@ export class AgentManager {
     const compactResult = compactUiRecord(result);
     managed.latestRecord = compactResult;
     managed.latestUiRecord = compactResult;
-    if (managed.nestedSnapshot) {
-      managed.nestedSnapshot = managed.nestedSnapshot.map((record) =>
-        compactUiRecord(record),
-      );
+    if (result.nestedAgents) {
+      managed.nestedSnapshot = result.nestedAgents.map((record) => compactUiRecord(record));
     }
     this.#saveSettledResult(managed, result);
     this.#pruneRetainedUiRecords();
@@ -3620,6 +4826,7 @@ export class AgentManager {
     let recovered = 0;
     const visit = (directory: string, depth: number): void => {
       if (depth > 32 || !ownedStat(directory)?.isDirectory()) return;
+      this.#terminalNoticeOutbox.recover(directory);
       const file = path.join(directory, ARCHIVE_PENDING_FILE);
       const ageReference = ownedStat(directory);
       if (ownedStat(file)?.isFile()) {
@@ -3668,6 +4875,7 @@ export class AgentManager {
       finally { try { cursor?.closeSync(); } catch { /* retry next sweep */ } }
     }
     function* recover(directory: string): Generator<number> {
+      manager.#terminalNoticeOutbox.recover(directory);
       const file = path.join(directory, ARCHIVE_PENDING_FILE);
       const ageReference = ownedStat(directory), pending = ownedStat(file);
       if (pending?.isFile()) {
@@ -3754,7 +4962,7 @@ export class AgentManager {
 
   #canCollect(managed: ManagedAgent): boolean {
     if (!managed.executionExited || managed.processStopPending ||
-        managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
+        this.#terminalNoticeOutbox.hasPending(managed.runDirectory) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
     if (uncheckedExternalExit(managed.transport)) return false;
     // Retry the durable full archive before asking its pending-marker collection veto.
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
@@ -3805,6 +5013,14 @@ export class AgentManager {
       try {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         if (parsed.version !== 1 || typeof parsed.occurredAt !== "number") continue;
+        if (parsed.event === "message.refused") {
+          this.#retainTerminalNotice(managed, parsed.data);
+          continue;
+        }
+        if (parsed.event === "question") {
+          this.#routeChildQuestion(managed, parsed.data);
+          continue;
+        }
         if (parsed.event === "tokens.usage") {
           if (!Object.prototype.hasOwnProperty.call(parsed, "data")) continue;
           const usage = tokenUsagePayloadFromValue(parsed.data);
@@ -3825,6 +5041,52 @@ export class AgentManager {
         // Ignore malformed worker lifecycle records; status monitoring remains authoritative.
       }
     }
+  }
+
+  // Answer one routed child dialog through the steer channel. Without a router
+  // (or on any router failure) the child gets a cancelled response.
+  #routeChildQuestion(managed: ManagedAgent, data: unknown): void {
+    if (typeof data !== "object" || data === null || typeof (data as { requestId?: unknown }).requestId !== "string") return;
+    const question = data as Record<string, unknown>;
+    const respond = (response: AgentChildQuestionResponse): void => {
+      try {
+        fs.appendFileSync(
+          path.join(managed.runDirectory, "steer.jsonl"),
+          `${JSON.stringify({ type: "ui_response", requestId: question.requestId, ...response, id: randomUUID(), ts: Date.now() })}\n`,
+          { encoding: "utf8", mode: 0o600 },
+        );
+      } catch {
+        // The worker's own deadline cancels the dialog if this write is lost.
+      }
+    };
+    if (!managed.runnerAdapter.capabilities.questions) {
+      respond({ cancelled: true });
+      return;
+    }
+    void this.#askParent(managed, question).then((response) => {
+      if (!managed.settled) respond(response);
+    });
+  }
+
+  /** One routed dialog for a worker or hosted run; any failure cancels it. */
+  #askParent(managed: ManagedAgent, question: Record<string, unknown>): Promise<AgentChildQuestionResponse> {
+    if (!this.#onChildQuestion || managed.settled) return Promise.resolve({ cancelled: true });
+    managed.questions ??= new AbortController();
+    return this.#onChildQuestion({
+      runId: managed.id,
+      name: managed.actorName ?? managed.name,
+      ...(managed.actorId ? { actorId: managed.actorId } : {}),
+      question,
+      signal: managed.questions.signal,
+      onDecision: (decisionId) => {
+        managed.questionDecisionId = decisionId;
+        this.#invalidateUiList();
+      },
+    }).catch((): AgentChildQuestionResponse => ({ cancelled: true })).then((response) => {
+      delete managed.questionDecisionId;
+      this.#invalidateUiList();
+      return response;
+    });
   }
 
   #appendAttributedBudgetLedger(
@@ -3905,7 +5167,7 @@ export class AgentManager {
 
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
 
-  #childTools(request: AgentRunRequest, runner: FabricAgentRunner, requiresFabricKernel = false): string[] {
+  #childTools(request: AgentRunRequest, runner: FabricRunnerAdapter, requiresFabricKernel = false): string[] {
     const tools = [...(request.tools ?? this.config.defaultTools)].filter(
       (tool) => tool !== "fabric_exec" &&
         (this.#inheritedToolAllowlist === undefined || this.#inheritedToolAllowlist.has(tool)),
@@ -3913,7 +5175,10 @@ export class AgentManager {
     const extensions = request.recursive === true
       ? true
       : (request.extensions ?? this.config.extensions);
-    if (runner === "pi" && (request.recursive || ((this.#fullCodeMode || requiresFabricKernel) && extensions))) {
+    if (
+      runner.capabilities.recursiveFabric &&
+      (request.recursive || ((this.#fullCodeMode || requiresFabricKernel) && extensions))
+    ) {
       tools.push("fabric_exec");
     }
     return [...new Set(tools)];
@@ -4016,6 +5281,7 @@ export class AgentManager {
       ...(model ? { model } : {}),
       ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
+      ...(managed.requestedThinking ? { requestedThinking: managed.requestedThinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
       ...(managed.spawner ? { spawner: managed.spawner } : {}),
@@ -4034,9 +5300,8 @@ export class AgentManager {
     };
   }
 
-  // Recursive child processes remove their nested run directories on shutdown.
-  // Preserve the last bounded status tree so completed leaves remain visible
-  // in the parent run until that parent is explicitly cleaned up.
+  // Retain a bounded tree even when legacy workers removed their nested run
+  // directories. Terminal-owner reconciliation prevents cached active ghosts.
   #nestedAgents(managed: ManagedAgent, force = false): AgentRunRecord[] {
     const now = Date.now();
     const needsInitialDiscovery =
@@ -4067,10 +5332,10 @@ export class AgentManager {
   }
 
   #withTransportMetadata(record: AgentRunRecord, managed: ManagedAgent, includeSaveFailure = true): AgentRunRecord {
-    const nestedAgents = this.#nestedAgents(
+    const nestedAgents = reconcileNestedAgents(this.#nestedAgents(
       managed,
       terminalStatuses.has(record.status) && !managed.settled,
-    );
+    ), record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
     const model = record.model ?? managed.model;
@@ -4078,6 +5343,13 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
+      ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
+      ...(managed.finalAnswerResult && record.errorCode !== "CUSTODY_UNCONFIRMED" ? {
+        status: managed.finalAnswerResult.status, text: managed.finalAnswerResult.text,
+        finishedAt: managed.finalAnswerResult.finishedAt, finalAnswerReceipt: managed.finalAnswerResult.finalAnswerReceipt,
+        value: managed.finalAnswerResult.value, error: managed.finalAnswerResult.error,
+        exitCode: managed.finalAnswerResult.exitCode,
+      } : {}),
       ...managed.runRoute,
       ...(includeSaveFailure && managed.settlementSaveFailure
         ? { warnings: [...(record.warnings ?? []), managed.settlementSaveFailure.warning] }
@@ -4093,6 +5365,7 @@ export class AgentManager {
       ...(model ? { model } : {}),
       ...(managed.modelReason !== undefined ? { modelReason: managed.modelReason } : {}),
       ...(thinking ? { thinking } : {}),
+      ...(managed.requestedThinking ? { requestedThinking: managed.requestedThinking } : {}),
       ...(managed.actorId ? { actorId: managed.actorId } : {}),
       ...(managed.actorName ? { actorName: managed.actorName } : {}),
       ...(managed.spawner ? { spawner: managed.spawner } : {}),
@@ -4110,6 +5383,10 @@ export class AgentManager {
         : {}),
       ...(managed.branch ? { branch: managed.branch } : {}),
       ...(managed.worktree ? { worktree: managed.worktree } : {}),
+      ...(managed.worktreeResult ? { worktreeResult: managed.worktreeResult } : {}),
+      ...(record.blockedOn && managed.questionDecisionId
+        ? { blockedOn: { ...record.blockedOn, decisionId: managed.questionDecisionId } }
+        : {}),
     };
   }
 }

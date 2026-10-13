@@ -17,18 +17,91 @@ const executionCgroupEvents = (pid: number): string | undefined => {
     return fs.existsSync(events) ? events : undefined;
   } catch { return undefined; }
 };
+/** Background observation cadence for a live execution group. Each tick walks
+ * only the child's own descendants; signal() and exited() refresh on demand, so
+ * cleanup never relies on this timer having fired recently (#10009). */
+export const EXECUTION_GROUP_OBSERVE_MS = 2_000;
+/** Upper bound on processes visited by one descendant walk. */
+const WALK_LIMIT = 4_096;
 
 type Member = { pid: number; group: number; started: string; state: string };
+const gone = (error: unknown): boolean => ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "");
 const member = (pid: number): Member | undefined => {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
     return { pid, group: Number(fields[2]), started: fields[19]!, state: fields[0]! };
   } catch (error) {
-    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+    if (gone(error)) return undefined;
     throw error;
   }
 };
+
+let childrenAvailable: boolean | undefined;
+/** /proc/<pid>/task/<tid>/children needs CONFIG_PROC_CHILDREN (Linux >= 3.5).
+ * Probe once per process, on first use, and log the fallback once. */
+const descendantWalkAvailable = (): boolean => {
+  if (childrenAvailable !== undefined) return childrenAvailable;
+  childrenAvailable = fs.existsSync(`/proc/${process.pid}/task/${process.pid}/children`);
+  if (!childrenAvailable) {
+    process.stderr.write("[pi-fabric] /proc/<pid>/task/<tid>/children unavailable; execution-group custody falls back to a full /proc scan\n");
+  }
+  return childrenAvailable;
+};
+
+/** Direct children of pid across all of its threads. vanished is true when pid
+ * (or one of its threads) disappeared during the read: its children may then
+ * have been re-parented out of the tree, so the list is not complete. */
+const childrenOf = (pid: number): { pids: number[]; vanished: boolean } => {
+  let threads: string[];
+  try { threads = fs.readdirSync(`/proc/${pid}/task`); }
+  catch (error) { if (gone(error)) return { pids: [], vanished: true }; throw error; }
+  let vanished = false;
+  const pids = threads.flatMap(thread => {
+    try {
+      return fs.readFileSync(`/proc/${pid}/task/${thread}/children`, "utf8").split(" ").filter(Boolean).map(Number);
+    } catch (error) {
+      if (gone(error)) { vanished = true; return []; }
+      throw error;
+    }
+  });
+  return { pids, vanished };
+};
+
+/** Every live process reachable from roots by parent links (roots included).
+ * incomplete is true when members is a partial view that must never be trusted:
+ * WALK_LIMIT stopped the walk with unvisited pids still queued, a non-leader
+ * node vanished (ENOENT/ESRCH) before its stat was read, or any node's task or
+ * task/<tid>/children read vanished (the leader included: a thread that exited
+ * mid-read may have held children), so children were re-parented away from the
+ * walked tree (to init or a subreaper). Only a leader whose own stat is gone
+ * keeps its existing handling: the exit handler adopts. */
+const descendants = (leader: number, roots: Iterable<number>): { members: Member[]; incomplete: boolean } => {
+  const seen = new Set<number>();
+  const found: Member[] = [];
+  const queue = [...roots];
+  let vanished = false;
+  while (queue.length && seen.size < WALK_LIMIT) {
+    const pid = queue.shift()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const value = member(pid);
+    if (!value) { if (pid !== leader) vanished = true; continue; }
+    found.push(value);
+    const children = childrenOf(pid);
+    if (children.vanished) vanished = true;
+    queue.push(...children.pids);
+  }
+  return { members: found, incomplete: vanished || queue.some(pid => !seen.has(pid)) };
+};
+
+/** The legacy host-wide scan: every process on the host. Only used as the
+ * fallback, and to confirm emptiness or adopt reparented orphans after churn. */
+const everyProcess = (): Member[] => fs.readdirSync("/proc").flatMap(entry => {
+  if (!/^\d+$/.test(entry)) return [];
+  const value = member(Number(entry));
+  return value ? [value] : [];
+});
 
 /** A group number is never ownership. Keep same-birth anchors while the native
  * leader lives, then retain surviving anchors until the entire group is empty.
@@ -40,6 +113,7 @@ export const executionGroup = (child: ChildProcess) => {
   const pid = child.pid;
   const owned = new Map<number, string>();
   const forcedDescendants = new Set<string>();
+  let previous = new Set<number>();
   let empty = false;
   let closed = false;
   child.once("close", () => { closed = true; });
@@ -49,13 +123,39 @@ export const executionGroup = (child: ChildProcess) => {
       if (leader) owned.set(pid, leader.started);
     } catch { /* Retain an unresolved obligation; never escape after spawn. */ }
   }
+  const inGroup = (values: Member[]): Member[] =>
+    values.filter(value => value.group === pid && !["Z", "X"].includes(value.state));
+  // The leader is this process's own child, so "exit" fires only after we reap
+  // it. Every process still in group <pid> then is ours: Linux keeps a pid number
+  // allocated while any process uses it as a process-group id, so it cannot have
+  // been recycled. Adopt them now, once; with a 2 s observer a short-lived leader
+  // can exit before any tick saw descendants that are now reparented out of its
+  // tree (the old 100 ms full scan only narrowed that window).
+  if (process.platform === "linux" && pid) child.once("exit", () => {
+    if (empty) return;
+    try {
+      const current = inGroup(everyProcess());
+      for (const value of current) if (!owned.has(value.pid)) owned.set(value.pid, value.started);
+      previous = new Set(current.map(value => value.pid));
+    } catch { /* Unreadable identity stays an unresolved obligation. */ }
+  });
   const members = (): Member[] => {
     if (empty || !pid) return [];
-    const current = fs.readdirSync("/proc").flatMap(entry => {
-      if (!/^\d+$/.test(entry)) return [];
-      const value = member(Number(entry));
-      return value && value.group === pid && !["Z", "X"].includes(value.state) ? [value] : [];
-    });
+    let current: Member[];
+    if (!descendantWalkAvailable()) current = inGroup(everyProcess());
+    else {
+      // Walk the leader's tree plus every member seen last time, so an orphan
+      // already recorded stays tracked after reparenting out of that tree.
+      const walk = descendants(pid, [pid, ...previous]);
+      current = inGroup(walk.members);
+      // A vanished member may have orphaned unrecorded children, an empty walk
+      // is about to latch, and an incomplete walk (cut off at WALK_LIMIT, or a
+      // node or thread vanished mid-walk) omitted members: only then confirm
+      // with one host-wide scan. Never trust a partial walk.
+      const now = new Set(current.map(value => value.pid));
+      if (walk.incomplete || !current.length || [...previous].some(value => !now.has(value))) current = inGroup(everyProcess());
+    }
+    previous = new Set(current.map(value => value.pid));
     if (!current.length) { empty = true; return []; }
     if (!current.some(value => {
       const now = member(value.pid);
@@ -71,6 +171,8 @@ export const executionGroup = (child: ChildProcess) => {
     observe(): void { if (process.platform === "linux") members(); },
     /** Count every birth-checked descendant signalled, including closeChild escalation. */
     forcedCleanupCount: (): number => forcedDescendants.size,
+    /** Current live member pids (Linux); [] elsewhere. */
+    members(): number[] { return process.platform === "linux" ? members().map(value => value.pid) : []; },
     exited(): boolean {
       if (!pid) return closed;
       if (process.platform === "linux") return members().length === 0;
@@ -102,4 +204,11 @@ export const executionGroup = (child: ChildProcess) => {
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     },
   };
+};
+
+/** Unref'd background observer: adopts births between on-demand refreshes. */
+export const observeExecutionGroup = (group: { observe(): void }): ReturnType<typeof setInterval> => {
+  const timer = setInterval(() => { try { group.observe(); } catch { /* cleanup fails closed */ } }, EXECUTION_GROUP_OBSERVE_MS);
+  timer.unref();
+  return timer;
 };

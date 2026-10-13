@@ -4,7 +4,8 @@
  * A leaf module: state-file.ts calls `assertFileStateWritable` on its real commit path, under the
  * mesh `.lock`, right before the state.json rename, and backend-migration.ts (which imports
  * state-file.ts) re-exports it with `MeshBackendFenceError`. It therefore imports nothing from
- * state-file.ts, store.ts or state-sqlite.ts at runtime (only types), and opens SQLite at first use.
+ * state-file.ts, store.ts or state-sqlite.ts at runtime (only types), and opens SQLite at first use,
+ * through the leaf state-gate.ts like every other state.db connection (smarty-dev#7548).
  *
  * Cost: one `fs.statSync` of `<root>/state.db` per write. A root without state.db (every legacy
  * file root) writes as before without opening SQLite; the reader rule (`meshStateSourceOf`) still
@@ -17,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { storageRevision } from "../verified/storage.js";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
+import { openPrivateStateDb } from "./state-gate.js";
 
 export interface MeshBackendAlarm {
   code: "FABRIC_MESH_BACKEND_FENCE" | "FABRIC_MESH_BACKEND_LATE_WRITER";
@@ -103,16 +105,58 @@ export interface MeshStateMovedMarker {
   at: string;
 }
 
-export const isMeshStateMovedMarker = (value: unknown): value is MeshStateMovedMarker => {
+/** The fields every release since pi-fabric#627 (main c58cec72) refuses as "state moved", on strict and tolerant reads. */
+const hasMovedMarkerShape = (value: unknown): value is Record<string, unknown> => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const marker = value as Record<string, unknown>;
   return marker.format === "sqlite" && marker.movedTo === STATE_DB && marker.backend === "sqlite"
     && typeof marker.epoch === "number" && Number.isSafeInteger(marker.epoch) && marker.epoch >= 1;
 };
 
+/** The SQLite moved marker: the shape without `natsStream` (that one is the NATS marker, below). */
+export const isMeshStateMovedMarker = (value: unknown): value is MeshStateMovedMarker =>
+  hasMovedMarkerShape(value) && !Object.hasOwn(value, "natsStream");
+
 /** The marker's exact bytes (field order fixed; no release reads `format: "sqlite"` as state). */
 export const encodeMeshStateMovedMarker = (epoch: number, at = new Date().toISOString()): string =>
   JSON.stringify({ format: "sqlite", movedTo: STATE_DB, backend: "sqlite", epoch: storageRevision(epoch), at } satisfies MeshStateMovedMarker);
+
+/**
+ * The NATS moved marker (smarty-dev#7504, docs/mesh-backends.md §Migration step 3): the migration to the `nats`
+ * backend installs it over state.json (epoch E+1) before it publishes `import-commit`.
+ *
+ * pi-fabric#917 security P1: it keeps the SQLite marker's exact top-level shape (`format: "sqlite"`, `movedTo:
+ * "state.db"`, `backend: "sqlite"`, `epoch`) and adds `natsStream`. Every release since pi-fabric#627 (main
+ * c58cec72, 2026-10-08) then refuses it on BOTH its strict and its tolerant read ("moved to state.db"); in sqlite
+ * mode it finds no state.db and refuses too ("state.db is missing"). A different `format` would be damage to those
+ * releases' tolerant read, which returns an EMPTY mesh. This release tells the two apart by `natsStream`, so no
+ * SQLite path opens state.db for it.
+ * ponytail: releases before c58cec72 know no marker at all; their tolerant read sees any marker as an empty mesh. The
+ * SQLite cutover accepted the same gap (the operator stops old processes first); the NATS switch inherits it.
+ */
+export interface MeshStateNatsMarker {
+  format: "sqlite";
+  movedTo: "state.db";
+  backend: "sqlite";
+  epoch: number;
+  at: string;
+  natsStream: string;
+}
+
+export const isMeshStateNatsMarker = (value: unknown): value is MeshStateNatsMarker =>
+  hasMovedMarkerShape(value) && typeof value.natsStream === "string" && /^[A-Za-z0-9_-]{1,255}$/.test(value.natsStream);
+
+/** The NATS marker's exact bytes (field order fixed: the SQLite marker's fields first). */
+export const encodeMeshStateNatsMarker = (stream: string, epoch: number, at = new Date().toISOString()): string => {
+  const marker = { format: "sqlite", movedTo: STATE_DB, backend: "sqlite", epoch: storageRevision(epoch), at, natsStream: stream } satisfies MeshStateNatsMarker;
+  if (!isMeshStateNatsMarker(marker)) throw new Error(`Invalid NATS stream name for the moved marker: ${JSON.stringify(stream)}`);
+  return JSON.stringify(marker);
+};
+
+/** A state.json that is the NATS marker: file and sqlite mode fail closed, never an empty or damaged state. */
+export const meshStateMovedToNatsError = (file: string, marker: MeshStateNatsMarker): MeshBackendFenceError =>
+  new MeshBackendFenceError(`Fabric mesh state.json was moved to NATS stream ${marker.natsStream} (backend=nats at epoch ${marker.epoch}, `
+    + `${marker.at}): ${file} is not state; this release must run in nats mode`);
 
 /** A state.json that is the moved marker: fail closed, never an empty or damaged state. */
 export const meshStateMovedError = (file: string, marker: MeshStateMovedMarker): MeshBackendFenceError =>
@@ -142,6 +186,16 @@ const readStateHead = (file: string): { head: string; complete: boolean } | unde
 export const readMeshStateMovedMarker = (root: string): MeshStateMovedMarker | undefined => {
   const head = readStateHead(path.join(path.resolve(root), STATE_JSON));
   return head?.complete ? parseMovedMarker(head.head) : undefined;
+};
+
+/** The NATS marker at `<root>/state.json` (a bounded read), or undefined (absent, state, damage, the SQLite marker). */
+export const readMeshStateNatsMarker = (root: string): MeshStateNatsMarker | undefined => {
+  const head = readStateHead(path.join(path.resolve(root), STATE_JSON));
+  if (!head?.complete) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(head.head);
+    return isMeshStateNatsMarker(parsed) ? parsed : undefined;
+  } catch { return undefined; }
 };
 
 /** The epoch recorded in state.json (the marker's epoch for a moved marker) and whether it is that marker. */
@@ -174,6 +228,13 @@ export const readStateFileEpoch = (root: string, options: Pick<MeshBackendFenceO
  * its very last step, after backend=file committed.
  */
 export const meshStateSourceOf = (root: string, backend: string, epoch: number, options: MeshBackendFenceOptions = {}): MeshStateSource => {
+  // smarty-dev#7504: state moved to a NATS stream (the marker over state.json, or backend=nats in state.db) is
+  // neither file nor sqlite state: file and sqlite readers and writers fail closed and name the stream.
+  const nats = readMeshStateNatsMarker(root);
+  if (nats) throw meshFenceAlarm(options, root, meshStateMovedToNatsError(path.join(path.resolve(root), STATE_JSON), nats).message, { backend, epoch, fileEpoch: nats.epoch });
+  if (backend === "nats") {
+    throw meshFenceAlarm(options, root, `Fabric mesh state.db says backend=nats at epoch ${epoch}: the state is on a NATS stream; this release must run in nats mode`, { backend, epoch });
+  }
   let fileEpoch: number;
   let moved = false;
   try { ({ epoch: fileEpoch, moved } = readStateFileMark(root, options)); }
@@ -209,7 +270,7 @@ export const meshStateSourceOf = (root: string, backend: string, epoch: number, 
 };
 
 /** node:sqlite at first use (AGENTS.md startup budget); the subset the guard needs. */
-const openDefault = (file: string): Pick<SqliteConnection, "exec" | "prepare" | "close"> => {
+const openDefault = (file: string): SqliteConnection => {
   const sqlite = process.getBuiltinModule?.("node:sqlite") as typeof import("node:sqlite") | undefined;
   if (!sqlite?.DatabaseSync) throw new Error("node:sqlite is unavailable in this runtime (Node >= 22.13 required)");
   const database = new sqlite.DatabaseSync(file, { timeout: 0 });
@@ -220,12 +281,13 @@ const openDefault = (file: string): Pick<SqliteConnection, "exec" | "prepare" | 
       return { run: (...params) => statement.run(...params), get: (...params) => statement.get(...params), all: (...params) => statement.all(...params) };
     },
     close: () => { database.close(); },
+    get isTransaction() { return database.isTransaction; },
   };
 };
 
 /** meta.backend and meta.epoch of an existing state.db (undefined when uninitialised), on a short-lived connection. */
 const readFenceMeta = (root: string, options: MeshBackendFenceOptions): { backend: string; epoch: number } | undefined => {
-  const db = (options.open ?? openDefault)(path.join(root, STATE_DB));
+  const db = openPrivateStateDb(path.join(root, STATE_DB), options.open ?? openDefault); // the one gate (smarty-dev#7548)
   try {
     db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
     db.exec("PRAGMA trusted_schema = OFF");

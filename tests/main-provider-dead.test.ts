@@ -414,3 +414,159 @@ describe.each([120_000, 0])("Main provider-dead hardening (flushMs=%s, PR #841 r
     h.main.closeFollowUpDrain();
   });
 });
+
+// smarty-dev#8881: AgentSession.dispose() and session replacement invalidate the ctx a delayed
+// provider-dead step captured, without session_shutdown. Pi's stale ctx throws on every getter.
+const staleCtx = (compactions: CompactOptions[], notify: ReturnType<typeof vi.fn>, state: { idle: boolean }) => {
+  const life = { live: true };
+  const guard = <T>(value: T): T => { if (!life.live) throw new Error("This extension ctx is stale after session replacement or reload."); return value; };
+  const ctx = Object.defineProperties({}, {
+    isIdle: { get: () => guard(() => state.idle) },
+    hasPendingMessages: { get: () => guard(() => false) },
+    signal: { get: () => guard({ aborted: false }) },
+    hasUI: { get: () => guard(true) },
+    ui: { get: () => guard({ notify }) },
+    compact: { get: () => guard(vi.fn((options: CompactOptions) => { compactions.push(options); })) },
+    sessionManager: { get: () => guard(undefined) },
+  }) as unknown as ExtensionContext;
+  return { ctx, dispose: () => { life.live = false; } };
+};
+
+const setupDisposable = (flushMs: number) => {
+  const handlers = new Map<string, Handler[]>();
+  const sent: unknown[] = [];
+  const pi = {
+    on: (name: string, fn: Handler) => {
+      handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+      return () => handlers.set(name, (handlers.get(name) ?? []).filter((h) => h !== fn));
+    },
+    sendMessage: vi.fn((message, options) => { sent.push({ message, options }); }),
+    sendUserMessage: vi.fn(),
+    getThinkingLevel: () => "off",
+  } as unknown as ExtensionAPI;
+  const state = { idle: false };
+  const compactions: CompactOptions[] = [];
+  const notify = vi.fn();
+  const original = staleCtx(compactions, notify, state);
+  const alarms: FabricMainProviderDeadEvent[] = [];
+  const main = new MainAgentController(pi, "session:root", true, "/tmp/project", "root", true,
+    () => {}, {}, (event) => { alarms.push(event); });
+  main.attachFollowUpDrain(original.ctx, flushMs);
+  const emit = (name: string, event: unknown, ctx: ExtensionContext = original.ctx) => {
+    for (const handler of handlers.get(name) ?? []) handler(event, ctx);
+  };
+  const settleError = (ctx?: ExtensionContext) => {
+    state.idle = true;
+    emit("agent_before_settle", { outcome: "error" }, ctx);
+    emit("agent_settled", { outcome: "error" }, ctx);
+  };
+  return { main, sent, state, compactions, notify, alarms, original, emit, settleError };
+};
+
+describe.each([120_000, 0])("Main provider-dead delayed work after dispose (flushMs=%s, smarty-dev#8881)", (flushMs) => {
+  it("retires a pending zero-delay recovery tick when the session is disposed", () => {
+    const h = setupDisposable(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.main.deliverAgent({ from: from("lead"), message: "held", delivery: "followUp" });
+    h.settleError();                                    // arms the zero-delay recovery tick
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    h.original.dispose();
+    expect(() => vi.advanceTimersByTime(0)).not.toThrow();
+    expect(h.compactions).toHaveLength(0);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.sent).toHaveLength(0);
+    expect(h.main.providerDeadState?.phase).toBe("recovering");
+    expect(h.main.ownsProviderRecovery()).toBe(false);
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.compactions).toHaveLength(0);
+    expect(h.alarms).toHaveLength(0);
+  });
+
+  it.each(["onError", "onComplete"] as const)("ignores a recovery compaction %s delivered after dispose", (callback) => {
+    const h = setupDisposable(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.main.deliverAgent({ from: from("lead"), message: "held", delivery: "followUp" });
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    h.original.dispose();
+    h.notify.mockClear();
+    if (callback === "onError") h.compactions[0]!.onError?.(new Error("Compaction failed: disposed"));
+    else h.compactions[0]!.onComplete?.({});
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    expect(h.compactions).toHaveLength(1);
+    expect(h.sent).toHaveLength(0);
+    expect(h.main.ownsProviderRecovery()).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["onError", "onComplete"] as const)("keeps a live successor's state when the replaced ctx's compaction %s arrives late", (callback) => {
+    const h = setupDisposable(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.main.deliverAgent({ from: from("lead"), message: "held", delivery: "followUp" });
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    // Session replacement: the old ctx goes stale and a live successor ctx reaches the same Main.
+    h.original.dispose();
+    const successor = staleCtx(h.compactions, h.notify, h.state);
+    h.state.idle = false;
+    h.emit("tool_execution_start", { toolCallId: "t1" }, successor.ctx);
+    h.emit("tool_execution_end", { toolCallId: "t1" }, successor.ctx);
+    h.state.idle = true;
+    h.notify.mockClear();
+    if (callback === "onError") h.compactions[0]!.onError?.(new Error("Compaction failed: replaced"));
+    else h.compactions[0]!.onComplete?.({});
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    expect(h.compactions).toHaveLength(1);
+    expect(h.sent).toHaveLength(0);
+    // The stale callback never retires the live successor.
+    expect(h.main.ownsProviderRecovery()).toBe(true);
+    h.main.closeFollowUpDrain();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("ignores the old incident's late callbacks after a live successor drain attaches, and its own recovery runs once", () => {
+    const h = setupDisposable(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(1);
+    h.original.dispose();
+    const successor = staleCtx(h.compactions, h.notify, h.state);
+    h.state.idle = false;
+    h.main.attachFollowUpDrain(successor.ctx, flushMs);
+    expect(h.main.providerDeadState).toBeUndefined();
+    h.emit("turn_end", errorTurn(affinity), successor.ctx);
+    h.main.deliverAgent({ from: from("lead"), message: "successor work", delivery: "followUp" });
+    h.settleError(successor.ctx);
+    vi.advanceTimersByTime(0);
+    expect(h.compactions).toHaveLength(2);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    h.compactions[0]!.onError?.(new Error("Compaction failed: stale"));
+    h.compactions[0]!.onComplete?.({});
+    vi.advanceTimersByTime(25);
+    expect(h.alarms).toHaveLength(0);
+    expect(h.main.providerDeadState?.phase).toBe("compacting");
+    expect(h.sent).toHaveLength(0);
+    // The successor's own recovery compaction still earns exactly one attempt.
+    h.emit("session_before_compact", { reason: "manual", signal: new AbortController().signal }, successor.ctx);
+    h.emit("session_compact", { reason: "manual" }, successor.ctx);
+    h.compactions[1]!.onComplete?.({});
+    vi.advanceTimersByTime(25);
+    expect(h.sent).toHaveLength(1);
+    expect(h.main.providerDeadState?.phase).toBe("probation");
+    expect(h.compactions).toHaveLength(2);
+    expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

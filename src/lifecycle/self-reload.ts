@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activeFabricRoot, loadedFabricRoot, releaseLabel, resolveAgentDir, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 import type { ResourceBinding } from "./reload-target-profile.js";
+import { extensionContextLive } from "../session-liveness.js";
 // Preserve the self-reload module's public selector API for callers and tests.
 export { activeFabricRoot, loadedFabricRoot, releaseLabel, SELF_RELOAD_COMMAND } from "../core/agent-dir.js";
 
@@ -322,6 +323,11 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
     } catch { return reply(request, false, "profile-validation-unavailable"); }
     // Native reload/session replacement can invalidate an in-flight first-use import.
     if (receivedGeneration !== generation || context !== contextNow) return reply(request, false, "session-changed");
+    // smarty-dev#8881: AgentSession.dispose() emits no session_shutdown; retire the dead binding.
+    if (!extensionContextLive(context)) {
+      stopRetry(); contextNow = undefined;
+      return reply(request, false, "session-changed");
+    }
     for (const field of [request.resource, request.loaded, request.configured]) {
       if (!fs.existsSync(field)) return reply(request, false, "missing-path");
       if (!helpers.canonicalEntrypoint(field)) return reply(request, false, "noncanonical-path");
@@ -435,9 +441,13 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
   const armRetry = (context: ExtensionContext): void => {
     stopRetry();
     const id = sessionId;
+    const bound = contextNow;
     retry = setInterval(() => {
       try {
-        if (id !== sessionId || !contextNow || !context.isIdle()) return stopRetry();
+        // smarty-dev#8881: same session binding, and a ctx Pi has not disposed, before any getter.
+        if (id !== sessionId || !bound || bound !== contextNow || !extensionContextLive(bound)
+          || !extensionContextLive(context)) return stopRetry();
+        if (!context.isIdle()) return stopRetry();
         if (!hostIdle(context)) return;
         if (request(context)) stopRetry();
       } catch { stopRetry(); }
@@ -497,7 +507,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
           try { slots = await (slotsLoad ??= import("./reload-slots.js")); }
           catch { slotsLoad = undefined; return; } // leave pending; ordinary idle retry tries again
           // A first-use import is an async boundary: recheck session and every safety hold.
-          if (generation !== commandGeneration || id !== sessionId || userHalted()
+          if (generation !== commandGeneration || id !== sessionId || !extensionContextLive(context) || userHalted()
             || autoReloadOptedOut(deps.autoReloadConfigured()) || !safe(context, candidate) || !recheck(candidate)) return;
           try { releaseSlot = slots.tryAcquireReloadSlot(concurrency(), deps.reloadSlotsDirectory); }
           catch { return; } // inaccessible host state fails closed, without consuming the target
@@ -532,7 +542,7 @@ export const installSelfReload = (pi: ExtensionAPI, deps: SelfReloadDeps) => {
         // full capacity or a transient safety hold), but never revive a stale or halted
         // session, a changed target, or an attempt already handed to native reload.
         if (auto && !handoff && generation === commandGeneration && id === sessionId && contextNow
-          && !userHalted() && !autoReloadOptedOut(deps.autoReloadConfigured())
+          && extensionContextLive(context) && !userHalted() && !autoReloadOptedOut(deps.autoReloadConfigured())
           && !attempted(id, candidate) && recheck(candidate)) armRetry(context);
       }
     },

@@ -616,8 +616,10 @@ export interface ParticipantDirectoryOptions {
   preparePublicationFence?: () => () => boolean;
   /** Explicit legacy list observation TTL, without a floor. Authority must request fresh. */
   listReadCacheMs?: number;
-  /** Registry -> mesh/key order for shared publication. Accepted actor file copies
-   * may follow outside custody with exact token validation under their key lock. */
+  /** Registry -> mesh/key order for shared publication. An exact empty actor set
+   * proves no actor effects; undefined retains the conservative all-registry fence.
+   * Accepted actor file copies may follow outside custody with exact token validation
+   * under their key lock. */
   withPublicationFence?: <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>) => Promise<T>;
   /** Wait for mesh admission WITHOUT registry custody, then retry under a fresh fence.
    * Resident hosts supply a bounded FIFO wait; no snapshot/commit receipt crosses it. */
@@ -2528,8 +2530,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return committedAt;
     };
     // smarty-dev#8526: the actors this round can write, so the fence locks only their registries.
-    // undefined (every registry, as before) when the round also writes a root/legacy record,
-    // removes an own record, or carries a batch op not attributed to an actor id.
+    // An exact empty set means no actor effects; undefined keeps every registry, as before,
+    // when the round also writes a root/legacy record, removes an own record, or carries
+    // a batch op not attributed to an actor id. Later additions in commitPrepared are
+    // host/session-only; actor removals and migration/copy writes are covered here.
     const fencedActors = ((): ReadonlySet<string> | undefined => {
       const ids = new Set(publication?.actorIds ?? []);
       if (publication && publication.ops.length > 0 && publication.actorIds === undefined) return undefined;
@@ -2541,7 +2545,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (record.kind !== "actor") return undefined;
         ids.add(record.id);
       }
-      return ids.size > 0 ? ids : undefined;
+      return ids;
     })();
     // smarty-dev#8880: a publication retry waits for its admission here, after selection, so only the
     // registry fences stand between the free mesh window and the 50 ms try. The decision stays under the

@@ -498,7 +498,7 @@ export const removeActorOffline = async (directory: string, config: ResidentHost
         const current = store.snapshot().actors;
         if (!current.some(actor => actor.id === id)) return;
         store.write(current.filter(actor => actor.id !== id), { durable: true });
-      });
+      }, undefined, "remove-offline");
       if (store.snapshot().actors.some(actor => actor.id === id)) throw new Error(`Fabric actor ${id}: registry revocation did not commit`);
       await offlineRemovalHooks.afterStep?.("revoke");
       await check();

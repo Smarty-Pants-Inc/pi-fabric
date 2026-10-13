@@ -438,7 +438,7 @@ const sweep = async (meshRoot: string, options: {
       for (const rootId of rootIds) await fenced(rootId, residents.get(rootId)!, async veto => {
         try {
           if (!absent(path.join(registryRoot, "actors.json.lock"))) throw new Error("actor registry has a holder or uncertain lock");
-          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto));
+          if (dryRun) prune(rootId, veto); else await new ActorRegistryStore(registryRoot).withLock(() => prune(rootId, veto), undefined, "retention");
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }
       });
     }

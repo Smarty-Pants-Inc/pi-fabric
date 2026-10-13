@@ -378,10 +378,11 @@ export class ResidentHost {
     // smarty-dev#8526: lock only the registries holding the rows of the actors this round writes.
     // The project registry is ONE lock shared by every resident host of the project; a round that
     // publishes none of its rows no longer serializes behind (or blocks) other hosts on it.
-    // Any id held by no registry, or a round without an exact actor set, locks every registry.
-    // validPublication still checks every registry's generation under the fence.
+    // An exact empty set proves no actor effects and needs no registry. Any id held by no
+    // registry, or a round without an exact actor set, still locks every registry.
+    // validPublication still checks every registry's generation before committing.
     const publishFenced = <T>(publish: () => Promise<T>, actorIds?: ReadonlySet<string>): Promise<T> => {
-      let scoped: ActorRegistryStore[] | undefined;
+      let scoped: ActorRegistryStore[] | undefined = actorIds?.size === 0 ? [] : undefined;
       if (actorIds && actorIds.size > 0) {
         // ponytail: an unreadable snapshot only loses the scoping; the full fence (and its own reads) decide.
         try {
@@ -389,7 +390,7 @@ export class ResidentHost {
           if (holders.every(store => store !== undefined)) scoped = registries.filter(store => holders.includes(store));
         } catch { scoped = undefined; }
       }
-      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50));
+      return ActorRegistryStore.withLocks(scoped ?? registries, () => this.mesh.withTryLock(publish, 50), "presence-fence");
     };
     const knownRegistries = registries.map(store => ({ store, snapshot: store.snapshot(), byId: new Map(store.snapshot().actors.map(row => [row.id, row])) }));
     const current = (known: typeof knownRegistries[number]): typeof knownRegistries[number] => {

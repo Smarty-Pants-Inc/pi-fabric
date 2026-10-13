@@ -13,6 +13,15 @@ if (process.platform !== "win32") process.umask(0o022);
 // GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
 const ci = process.env.CI === "true";
 
+// smarty-dev#4664/#11145: suites that run real product deletes are excluded before collection outside hosted CI.
+const realDeleteSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
+  "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
+  "tests/scratch-platform-retention.test.ts"];
+const localRealDeleteSuites = process.env.GITHUB_ACTIONS === "true" ? [] : realDeleteSuites;
+if (localRealDeleteSuites.length > 0) {
+  console.warn(`smarty-dev#4664: local run skips real-delete suites: ${localRealDeleteSuites.join(", ")}`);
+}
+
 // Separate policy projects avoid writing a fixture read by unrelated config tests.
 const policyConstants = (name: string) => ({
   __FABRIC_HOST_POLICY_PATH__: JSON.stringify(join(temp.TMPDIR, `host-policy-${name}`, "fabric-policy.json")),
@@ -23,6 +32,7 @@ const sharedTests = {
   env: { ...temp, ...fleet },
   setupFiles: ["./tests/fleet-isolation-setup.ts"],
   include: ["tests/**/*.test.ts"],
+  ...(localRealDeleteSuites.length > 0 ? { exclude: localRealDeleteSuites } : {}),
   // Real worker processes and cold TypeScript compilers share this suite.
   // Behavioral timeouts and performance budgets remain asserted by tests.
   testTimeout: 15_000,
@@ -43,7 +53,8 @@ export default {
     projects: [
       {
         define: policyConstants("missing"),
-        test: { ...sharedTests, name: "default", exclude: ["tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
+        test: { ...sharedTests, name: "default", exclude: [...localRealDeleteSuites,
+          "tests/session-entry-retention.test.ts", "tests/host-policy.test.ts",
           "tests/process-slice-scope-e2e.test.ts"] },
       },
       {

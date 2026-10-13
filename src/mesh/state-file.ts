@@ -8,7 +8,7 @@ import path from "node:path";
 import childProcess from "node:child_process";
 import { readFileRetrying, writeFileAtomic, renameAtomic, MeshLockTimeoutError, trackTemporary } from "../core/atomic-write.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
-import { delay, describeLockHolder, errorCode, lockStats, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { delay, errorCode, lockStats, MeshLockSnapshotNotReadyError, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
@@ -908,6 +908,9 @@ export class StateFile implements StateBackend {
     if (this.#lock.lockProtocol >= 2 && !this.#lock.ownIncarnationReady && !scope?.active) {
       await this.#lock.ownIncarnation;
     }
+    // Honest counts for a snapshot refusal: optimistic preparations, and real .lock admissions (each found it stale).
+    let preparations = 0;
+    let lockAdmissions = 0;
     for (;;) {
       this.#lock.writeAbortSignal?.throwIfAborted();
       const identity = this.#stateWriteIdentity();
@@ -920,9 +923,11 @@ export class StateFile implements StateBackend {
       let admitted = false;
       let prepared: P | undefined;
       try {
+        preparations += 1;
         prepared = prepare(this.#readStateForWrite());
         if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
         return await this.#lock.withLock(() => {
+          lockAdmissions += 1;
           if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
           admitted = true;
           return commit(prepared!);
@@ -936,8 +941,12 @@ export class StateFile implements StateBackend {
         // Never retry inside an actor registry fence: its caller releases custody and
         // retries the whole admission step, just as for a busy mesh.
         if (scope?.active || Date.now() >= deadline) {
-          if (!(error instanceof MeshLockTimeoutError)) lockStats?.failed(this.root, lockClass, 0, Boolean(scope?.active));
-          throw new MeshLockTimeoutError(describeLockHolder(path.join(this.#lock.lockPath, "owner")), 0, 0);
+          // A real lock refusal (contention, or a cold-identity pre-lock refusal) was already counted by #withLock
+          // and carries its true attempts: surface it unchanged, never as a fabricated 0-attempt timeout.
+          if (error instanceof MeshLockTimeoutError) throw error;
+          lockStats?.failed(this.root, lockClass, 0, Boolean(scope?.active));
+          throw new MeshLockSnapshotNotReadyError(this.#statePath, preparations, lockAdmissions, Boolean(scope?.active),
+            error === WRITE_SNAPSHOT_CHANGED ? undefined : { cause: error });
         }
         await delay(0, this.#lock.writeAbortSignal);
       } finally {

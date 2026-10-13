@@ -126,6 +126,66 @@ describe("LifecycleBroker wakes", () => {
     expect(delivered.map((event) => event.occurredAt)).toEqual([3, 4]);
   });
 
+  it("exhausted lifecycle watches still deliver external events on the minute tick, then stop scans after recovery", async () => {
+    const fake = fakeWatch();
+    const healthyWatch = fake.spy.getMockImplementation()!;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(() => warn.mockRestore());
+    fake.spy.mockImplementation(() => { throw Object.assign(new Error("ENOSPC: watcher limit"), { code: "ENOSPC" }); });
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup((event) => { delivered.push(event); });
+    const reads = vi.spyOn(mesh, "listAll");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    broker.start();
+    await vi.advanceTimersByTimeAsync(63_000);
+    await flush();
+    expect(broker.observationHealth()).toEqual(["observation-degraded:lifecycle"]);
+    expect(vi.getTimerCount()).toBe(1);
+    await settle(8); // another writer's only durable event, no local publish wake
+    await vi.advanceTimersByTimeAsync(59_999);
+    await flush();
+    expect(delivered).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(delivered.map((event) => event.occurredAt)).toEqual([8]);
+    expect(warn).toHaveBeenCalledTimes(2);
+    fake.spy.mockImplementation(healthyWatch);
+    await settle(9);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+    expect(delivered.map((event) => event.occurredAt)).toEqual([8, 9]);
+    expect(broker.observationHealth()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(3);
+    const recoveredReads = reads.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    await flush();
+    expect(reads).toHaveBeenCalledTimes(recoveredReads);
+    await settle(10);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered.map((event) => event.occurredAt)).toEqual([8, 9, 10]);
+    await broker.close();
+    expect(vi.getTimerCount()).toBe(0);
+    // Supported same-instance start must reopen the carrier, not inherit a
+    // closed helper that silently abandons a second exhaustion episode.
+    fake.spy.mockImplementation(() => { throw Object.assign(new Error("ENOSPC: watcher limit"), { code: "ENOSPC" }); });
+    broker.start();
+    await vi.advanceTimersByTimeAsync(63_000);
+    await flush();
+    expect(broker.observationHealth()).toEqual(["observation-degraded:lifecycle"]);
+    expect(vi.getTimerCount()).toBe(1);
+    await broker.close(); // close while degraded disposes the carrier too
+    const closedReads = reads.mock.calls.length;
+    await settle(11);
+    await vi.advanceTimersByTimeAsync(300_000);
+    await flush();
+    expect(reads).toHaveBeenCalledTimes(closedReads);
+    expect(delivered.map((event) => event.occurredAt)).toEqual([8, 9, 10]);
+    expect(broker.observationHealth()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("retries a failed delivery on a one-shot backoff without another notification", async () => {
     fakeWatch();
     let failures = 1;

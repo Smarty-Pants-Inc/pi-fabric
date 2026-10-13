@@ -33,6 +33,7 @@ import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
 import { MeshBackgroundRetry } from "../core/atomic-write.js";
+import { DegradedObservation } from "../core/observation-watch.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import {
@@ -208,7 +209,16 @@ export class ResidencyClient {
   #watchRearm: NodeJS.Timeout | undefined;
   #watchRearmAttempts = 0;
   #watchWarned = false;
-  #watchGaveUp = false;
+  readonly #observation = new DegradedObservation("residency", () => {
+    this.#wakeDelivery();
+    this.#wakeWatchdog();
+  }, () => {
+    this.#armWatches();
+    if (!this.#watchers.size) return false;
+    this.#watchRearmAttempts = 0;
+    return true;
+  });
+  observationHealth(): string[] { return this.#observation.health ? [this.#observation.health] : []; }
   #ownedLauncher: { launcher: Awaited<ReturnType<typeof spawnDetached>>; token: string } | undefined;
   #watchdogDeadline: number | undefined;
   #watchdogAgain = false;
@@ -295,6 +305,7 @@ export class ResidencyClient {
       } catch (error) { this.#deferRelease(error); }
     }
     this.#releaseAbort.abort();
+    this.#observation.close();
     this.#stopStateChanges?.();
     this.#stopStateChanges = undefined;
     if (this.#deliveryEventTimer) clearTimeout(this.#deliveryEventTimer);
@@ -1298,7 +1309,7 @@ export class ResidencyClient {
 
   /** Bind directory watches that exist now; missing ones bind on a later event/settlement. */
   #armWatches(): void {
-    if (this.#closed || !this.#started || this.#watchRearm || this.#watchGaveUp) return;
+    if (this.#closed || !this.#started || this.#watchRearm) return;
     const meshRoot = this.options.config.meshRoot;
     const completions = path.join(meshRoot, "agent-completions");
     const residency = this.options.config.residencyRoot;
@@ -1339,10 +1350,10 @@ export class ResidencyClient {
     this.#armRootAncestor();
   }
 
-  /** Watcher error: close all, rescan once, then a bounded one-shot re-arm (never a poll). */
+  /** Close all, rescan and re-arm; exhaustion keeps the shared degraded-only minute carrier. */
   #watchFailed(error: unknown): void {
     this.#closeWatches();
-    if (this.#closed) return;
+    if (this.#closed || this.#observation.degraded) return;
     const attempt = this.#watchRearmAttempts++;
     const giveUp = attempt >= WATCH_REARM_ATTEMPTS;
     if (!this.#watchWarned) {
@@ -1351,12 +1362,12 @@ export class ResidencyClient {
         ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
         : error instanceof Error ? error.message : String(error);
       console.warn(`[pi-fabric] resident delivery: filesystem notifications failed for ${this.options.config.residencyRoot} (${cause}); ` +
-        `rescanned now and re-arming at most ${WATCH_REARM_ATTEMPTS} times with backoff. Until re-armed, delivery waits for ` +
-        `local enqueue/response events and recovery for its owner exit event or the ${ADOPTED_OWNER_DEADLINE_MS / 1000} s owner deadline.`);
+        `rescanned now and re-arming at most ${WATCH_REARM_ATTEMPTS} times with backoff. Normal operation has no polling; ` +
+        "exhausted watches scan and re-arm once per minute.");
     }
     this.#wakeDelivery();
     this.#wakeWatchdog();
-    if (giveUp) { this.#watchGaveUp = true; return; }
+    if (giveUp) { this.#observation.enter(); return; }
     this.#watchRearm = setTimeout(() => {
       this.#watchRearm = undefined;
       this.#armWatches();

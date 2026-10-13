@@ -375,6 +375,7 @@ export class FabricState {
   async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
     return this.#current()?.nextRecordsInboxMessage(entries);
   }
+  observationHealth(): string[] { return this.#current()?.observationHealth() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }
   participantsConfirmedAt(): number | undefined { return this.#current()?.participantsConfirmedAt(); }
   componentGraph(): FabricComponentGraph {

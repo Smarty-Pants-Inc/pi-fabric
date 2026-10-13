@@ -263,7 +263,7 @@ export class FabricRuntimeState {
   #componentLoader: FabricComponentLoader | undefined;
   #componentControl: FabricComponentControl | undefined;
   #componentConfiguration: FabricComponentConfiguration | undefined;
-  #stopComponentWatch: (() => void) | undefined;
+  #stopComponentWatch: ReturnType<typeof watchComponentConfiguration> | undefined;
   readonly #componentTransitionSignatures = new Map<string, string>();
   readonly #componentTransitionPublications = new Set<Promise<void>>();
   #sessionCapabilityLease: FabricCapabilityViewLease | undefined;
@@ -446,6 +446,16 @@ export class FabricRuntimeState {
   /** Why peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled(): Error | undefined {
     return this.#participants?.writeStalled();
+  }
+
+  /** Per-instance observation faults, separate from mesh-write/peer-visibility health. */
+  observationHealth(): string[] {
+    return [
+      ...(this.#stopComponentWatch?.observationHealth() ?? []),
+      ...(this.#lifecycle?.observationHealth() ?? []),
+      ...(this.#control?.observationHealth() ?? []),
+      ...(this.#residency?.observationHealth() ?? []),
+    ];
   }
 
   /** When this host last committed its mesh heartbeat, if it has a directory. */

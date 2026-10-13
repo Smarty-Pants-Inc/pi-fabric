@@ -32,6 +32,7 @@ const runtimeHarness = () => {
     initialized = false;
     widgetDismissedAt = 0;
     setDecisionProfile = vi.fn();
+    observationHealth = vi.fn((): string[] => []);
     initialize = vi.fn(async () => {
       if (blocked) await new Promise<void>((resolve) => { release = resolve; });
       this.initialized = true;
@@ -66,6 +67,27 @@ const createState = (loader: never): FabricState => new FabricState(
 );
 
 describe("FabricState lazy bootstrap", () => {
+  it("reports only the active instance's observation health without activating an idle facade", async () => {
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: false } });
+    const harness = runtimeHarness();
+    const state = createState(harness.loader);
+    const context = contextAt(cwd);
+    try {
+      await state.bootstrap(context);
+      expect(state.observationHealth()).toEqual([]);
+      expect(harness.loader).not.toHaveBeenCalled();
+      await state.ensure(context);
+      const first = harness.instances[0]!;
+      first.observationHealth.mockReturnValue(["observation-degraded:configuration", "observation-degraded:control-plane"]);
+      expect(state.observationHealth()).toEqual(["observation-degraded:configuration", "observation-degraded:control-plane"]);
+      await state.shutdown("reload");
+      expect(state.observationHealth()).toEqual([]);
+      await state.bootstrap(context);
+      await state.ensure(context);
+      expect(state.observationHealth()).toEqual([]); // old-instance faults are not inherited
+      expect(harness.instances).toHaveLength(2);
+    } finally { await state.shutdown(); fs.rmSync(cwd, { recursive: true, force: true }); }
+  });
   it.each(["reload", "initialize", "session-switch"] as const)(
     "stops activation timers before %s invalidates the runtime", async (boundary) => {
       vi.useFakeTimers();

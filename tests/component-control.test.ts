@@ -426,23 +426,51 @@ describe("live component control", () => {
     } finally { vi.useRealTimers(); watch.mockRestore(); warn.mockRestore(); }
   });
 
-  it("stops re-arming after a bounded number of failed attempts", () => {
+  it("exhausted configuration watches scan once per minute, report health, and return to a quiet event path", () => {
     const dir = tempDir();
     const file = path.join(dir, "fabric.json");
+    fs.writeFileSync(file, "{}");
+    let exhausted = true;
+    const callbacks: Array<{ directory: string; notify: (event: string, name: string) => void }> = [];
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const watch = vi.spyOn(fs, "watch").mockImplementation((() => {
-      throw Object.assign(new Error("ENOSPC: System limit for number of file watchers reached"), { code: "ENOSPC", syscall: "watch" });
+    const watch = vi.spyOn(fs, "watch").mockImplementation(((directory: string, notify: (event: string, name: string) => void) => {
+      if (exhausted) throw Object.assign(new Error("ENOSPC: System limit for number of file watchers reached"), { code: "ENOSPC", syscall: "watch" });
+      callbacks.push({ directory, notify });
+      return Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
     }) as unknown as typeof fs.watch);
+    const stat = vi.spyOn(fs, "statSync");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const changed = vi.fn();
+    const stop = watchComponentConfiguration([file], changed);
     try {
-      const stop = watchComponentConfiguration([file], vi.fn());
+      expect(stop.observationHealth()).toEqual([]);
+      vi.advanceTimersByTime(63_000); // initial arm plus six bounded re-arms
+      expect(watch).toHaveBeenCalledTimes(7);
+      expect(stop.observationHealth()).toEqual(["observation-degraded:configuration"]);
       expect(vi.getTimerCount()).toBe(1);
-      vi.advanceTimersByTime(10 * 60_000);
-      expect(watch).toHaveBeenCalledTimes(7);              // the first arm plus six one-shot re-arms
+      expect(warn).toHaveBeenCalledTimes(2); // initial fault, then one degraded transition
+      replace(file, { external: true });
+      vi.advanceTimersByTime(59_999);
+      expect(changed).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(changed).toHaveBeenCalledOnce(); // no extra debounce past the degraded tick
+      expect(stop.observationHealth()).toEqual(["observation-degraded:configuration"]);
+      expect(warn).toHaveBeenCalledTimes(2); // no per-tick warning
+      exhausted = false;
+      replace(file, { recovered: true });
+      vi.advanceTimersByTime(60_000);
+      expect(changed).toHaveBeenCalledTimes(2); // recovery catch-up
+      expect(stop.observationHealth()).toEqual([]);
       expect(vi.getTimerCount()).toBe(0);
-      expect(warn).toHaveBeenCalledOnce();                 // logged once per watcher instance
-      expect(String(warn.mock.calls[0]?.[0])).toMatch(/inotify watch limit, not disk space/);
-      stop();
-    } finally { vi.useRealTimers(); watch.mockRestore(); warn.mockRestore(); }
+      expect(warn).toHaveBeenCalledTimes(3); // one restored transition
+      stat.mockClear();
+      vi.advanceTimersByTime(300_000);
+      expect(stat).not.toHaveBeenCalled(); // no scans in normal operation
+      replace(file, { event: true });
+      callbacks.find((entry) => entry.directory === dir)!.notify("rename", "fabric.json");
+      vi.advanceTimersByTime(50);
+      expect(changed).toHaveBeenCalledTimes(3); // restored event carrier
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { stop(); vi.useRealTimers(); stat.mockRestore(); watch.mockRestore(); warn.mockRestore(); }
   });
 });

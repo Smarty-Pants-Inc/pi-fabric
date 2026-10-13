@@ -3,6 +3,7 @@ import path from "node:path";
 import { writeJsonAtomic } from "../config.js";
 import { stableJsonHash } from "../core/stable-hash.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
+import { DegradedObservation } from "../core/observation-watch.js";
 import type { FabricComponentEntry } from "./types.js";
 import { componentEntries } from "./validation.js";
 
@@ -96,13 +97,13 @@ const WATCH_REARM_BASE_MS = 1_000;
 const WATCH_REARM_MAX_MS = 60_000;
 const WATCH_REARM_ATTEMPTS = 6;
 
-/** Truthful recovery line: one rescan plus bounded one-shot re-arms; nothing polls. */
+/** Truthful recovery line: bounded re-arms, then the named degraded-only carrier. */
 function watchRecoveryMessage(target: string, error: unknown, delayMs: number): string {
   const cause = isWatchLimitError(error)
     ? "ENOSPC: inotify watch limit, not disk space (raise fs.inotify.max_user_watches)"
     : error instanceof Error ? error.message : String(error);
   return `[pi-fabric] component configuration: fs.watch(${target}) failed (${cause}); rescanned once, re-arming in ` +
-    `${delayMs} ms with bounded retries. There is no polling: changes made while unarmed are seen only at a re-arm.`;
+    `${delayMs} ms with bounded retries. Normal operation has no polling; exhausted watches scan and re-arm once per minute.`;
 }
 
 /**
@@ -110,9 +111,10 @@ function watchRecoveryMessage(target: string, error: unknown, delayMs: number): 
  * see a missing file or missing `.pi` directory being created (the nearest existing ancestor is
  * watched for the next path component), and follow a symlinked file to its target's directory.
  * Notifications are hints; a stat signature decides whether anything changed. Idle costs no
- * timer. A watcher error is one rescan plus a bounded one-shot re-arm, never a standing poll.
+ * timer. Exhausted recovery keeps a degraded-only minute scan and re-arm carrier.
  */
-export function watchComponentConfiguration(paths: readonly string[], changed: () => void): () => void {
+export type ComponentConfigurationWatch = (() => void) & { observationHealth(): string[] };
+export function watchComponentConfiguration(paths: readonly string[], changed: () => void): ComponentConfigurationWatch {
   // The baseline is taken now, when watching starts (smarty-dev#883), and compared again once
   // the watchers are armed, so a write between the caller's reconcile and arming is reported.
   const signature = (file: string): string => {
@@ -174,7 +176,12 @@ export function watchComponentConfiguration(paths: readonly string[], changed: (
     watchers.clear();
   };
 
-  const check = (): void => {
+  const observation = new DegradedObservation("configuration", () => check(true), () => {
+    try { arm(); attempts = 0; return true; }
+    catch (error) { fail(error); return false; }
+  });
+
+  const check = (immediate = false): void => {
     if (closed) return;
     let differs = false;
     for (const file of paths) {
@@ -186,20 +193,22 @@ export function watchComponentConfiguration(paths: readonly string[], changed: (
     }
     if (!differs) return;
     clearTimeout(timer);
+    if (immediate) { timer = undefined; changed(); return; }
     timer = setTimeout(() => { timer = undefined; if (!closed) changed(); }, 50);
     timer.unref?.();
   };
 
   const fail = (error: unknown): void => {
     closeWatchers();
-    if (closed) return;
+    if (closed || observation.degraded) return;
     const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** attempts);
     if (!warned) {
       warned = true;
       try { console.warn(watchRecoveryMessage(paths.join(", "), error, delay)); } catch {}
     }
     check(); // one rescan
-    if (rearmTimer || attempts >= WATCH_REARM_ATTEMPTS) return;
+    if (rearmTimer) return;
+    if (attempts >= WATCH_REARM_ATTEMPTS) { observation.enter(); return; }
     attempts++;
     rearmTimer = setTimeout(() => {
       rearmTimer = undefined;
@@ -253,10 +262,11 @@ export function watchComponentConfiguration(paths: readonly string[], changed: (
 
   try { arm(); } catch (error) { fail(error); }
   check();
-  return () => {
+  return Object.assign(() => {
     closed = true;
+    observation.close();
     clearTimeout(timer);
     clearTimeout(rearmTimer);
     closeWatchers();
-  };
+  }, { observationHealth: () => observation.health ? [observation.health] : [] });
 }

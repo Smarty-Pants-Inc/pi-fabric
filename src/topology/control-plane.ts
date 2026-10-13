@@ -15,6 +15,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.j
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "./mesh-consumption.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
+import { DegradedObservation } from "../core/observation-watch.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import type { FabricMessageSender } from "../protocol.js";
 
@@ -26,7 +27,7 @@ const HOST_PREFIX = "topology/hosts/";
 const DEFAULT_POLL_MS = 100;
 /** Retained-work retry ceiling: a failed/deferred/gated drain re-arms one-shot timers, never an interval. */
 const DRAIN_RETRY_MAX_MS = 30_000;
-/** Watcher re-arm after a watch failure: one-shot, bounded attempts, then notifications stay off. */
+/** Watcher re-arm: bounded attempts, then a degraded-only minute carrier. */
 const WATCH_REARM_BASE_MS = 1_000;
 const WATCH_REARM_MAX_MS = 60_000;
 const WATCH_REARM_ATTEMPTS = 6;
@@ -458,13 +459,21 @@ export class FabricControlPlane {
   // Drains run at start, on mesh event-log notifications and after this process's own
   // publishes. Idle has no timer: #retryTimer exists only for retained work (a failed or
   // deferred drain's backoff, a gated drain, a retained owned outcome, or a shared claim's
-  // real expiry), #rearmTimer only for a failed watcher's bounded re-arm.
+  // real expiry), #rearmTimer only for a failed watcher's bounded re-arm. The shared
+  // observation carrier owns the sole degraded-only minute scan when re-arms exhaust.
   #started = false;
   #stopWatch: (() => void) | undefined;
   #stopStateChanges: (() => void) | undefined;
   #rearmTimer: NodeJS.Timeout | undefined;
   #rearmAttempts = 0;
   #watchWarned = false;
+  readonly #observation = new DegradedObservation("control-plane", () => this.#wake(), () => {
+    this.#armWatch();
+    if (!this.#stopWatch) return false;
+    this.#rearmAttempts = 0;
+    return true;
+  });
+  observationHealth(): string[] { return this.#observation.health ? [this.#observation.health] : []; }
   #retryTimer: NodeJS.Timeout | undefined;
   #retryDelay = 0;
   /** A wake no completed drain has served yet; a wake during a drain makes the loop run again. */
@@ -528,6 +537,7 @@ export class FabricControlPlane {
     this.#started = true;
     this.#closed = false;
     this.#paused = false;
+    this.#observation.open();
     this.#armWatch();
     this.#subscribeStateChanges();
     this.#wake(); // a microtask: a synchronous pause() right after start() still gates it
@@ -1063,6 +1073,7 @@ export class FabricControlPlane {
     this.#closed = true;
     for (const cancel of this.#resendWaits) cancel();
     this.#started = false;
+    this.#observation.close();
     this.#stopWatch?.();
     this.#stopWatch = undefined;
     try { this.#stopStateChanges?.(); } catch {}
@@ -1139,11 +1150,11 @@ export class FabricControlPlane {
     }
   }
 
-  // A watcher error is one rescan plus a bounded one-shot re-arm, never a standing poll.
+  // One rescan plus bounded re-arms; exhaustion retains the shared degraded-only carrier.
   #watchFailed(error: unknown): void {
     this.#stopWatch?.();
     this.#stopWatch = undefined;
-    if (this.#closed) return;
+    if (this.#closed || this.#observation.degraded) return;
     const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** this.#rearmAttempts);
     if (!this.#watchWarned) {
       this.#watchWarned = true;
@@ -1152,13 +1163,13 @@ export class FabricControlPlane {
         : error instanceof Error ? error.message : String(error);
       try {
         console.warn(`[pi-fabric] control plane: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
-          `rescanned once, re-arming in ${delay} ms with bounded retries. There is no polling: ` +
-          "commands and ACKs arriving while unarmed are drained at a re-arm, after this process's next publish, " +
-          "or by a pending-work retry; a sender's own ACK deadline still settles its request.");
+          `rescanned once, re-arming in ${delay} ms with bounded retries. Normal operation has no polling; ` +
+          "exhausted watches scan and re-arm once per minute; a sender's own ACK deadline still settles its request.");
       } catch {}
     }
     this.#wake();
-    if (this.#rearmTimer || this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) return;
+    if (this.#rearmTimer) return;
+    if (this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) { this.#observation.enter(); return; }
     this.#rearmAttempts++;
     this.#rearmTimer = setTimeout(() => {
       this.#rearmTimer = undefined;

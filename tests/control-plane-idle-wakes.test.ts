@@ -118,7 +118,7 @@ describe("control plane idle wakes", () => {
     const lines = warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("control plane: mesh notifications failed"));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("inotify watch limit, not disk space");
-    expect(lines[0]).toContain("There is no polling");
+    expect(lines[0]).toContain("Normal operation has no polling");
     expect(lines.join("\n")).not.toMatch(/falling back to polling/i);
   });
 
@@ -140,6 +140,55 @@ describe("control plane idle wakes", () => {
     await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "late" });
     expect(handler).toHaveBeenCalledOnce();
   }, 15_000);
+
+  it("exhausted control watches still accept external commands on the minute tick, then stop degraded scans", async () => {
+    const callbacks: Array<(event: string, name: string) => void> = [];
+    const healthyWatch = ((_directory: string, callback: (event: string, name: string) => void) => {
+      callbacks.push(callback);
+      return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
+    }) as unknown as typeof fs.watch;
+    const watch = vi.spyOn(fs, "watch").mockImplementation(healthyWatch);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const root = meshRoot();
+    const sender = plane(root, "host:sender", { acknowledgementTimeoutMs: 500_000 });
+    sender.start(() => ({ accepted: false }));
+    watch.mockImplementation(() => { throw watchLimit(); });
+    const owner = plane(root, "host:owner", { acknowledgementTimeoutMs: 500_000 });
+    const handler = vi.fn(() => ({ accepted: true, messageId: "degraded" }));
+    const tail = vi.spyOn(owner.mesh, "tail");
+    vi.useFakeTimers();
+    owner.start(handler);
+    await vi.advanceTimersByTimeAsync(63_000);
+    expect(owner.observationHealth()).toEqual(["observation-degraded:control-plane"]);
+    const outcome = sender.request("host:owner", "agent:target", "followUp", { message: "external", ownerIncarnation: owner.incarnation });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(commands(sender)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(handler).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(handler).toHaveBeenCalledOnce();
+    callbacks[0]!("change", "events.jsonl"); // healthy sender receives the ACK
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(outcome).resolves.toMatchObject({ acknowledged: true, messageId: "degraded" });
+    expect(warn).toHaveBeenCalledTimes(2);
+    watch.mockImplementation(healthyWatch);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(owner.observationHealth()).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(3);
+    const recoveredReads = tail.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(tail).toHaveBeenCalledTimes(recoveredReads); // retained deadlines are later, no degraded scan
+    const next = sender.request("host:owner", "agent:next", "followUp", { message: "event", ownerIncarnation: owner.incarnation });
+    await vi.advanceTimersByTimeAsync(0);
+    for (const callback of callbacks) callback("change", "events.jsonl");
+    await vi.advanceTimersByTimeAsync(0);
+    callbacks[0]!("change", "events.jsonl");
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(next).resolves.toMatchObject({ acknowledged: true, messageId: "degraded" });
+    expect(handler).toHaveBeenCalledTimes(2);
+    await owner.close(); await sender.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it("retries a deferred drain with bounded backoff without a new event, and keeps the command", async () => {
     const root = meshRoot();

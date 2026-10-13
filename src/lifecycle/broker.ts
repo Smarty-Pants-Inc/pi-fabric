@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { MeshBackgroundQueue, MeshBackgroundRetry } from "../core/atomic-write.js";
 import { rethrowMeshLockTimeout } from "../core/atomic-write.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
+import { DegradedObservation } from "../core/observation-watch.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { MeshStore, meshOutageAlarmSink, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
@@ -34,7 +35,7 @@ const subscriptionKey = (id: string): string =>
 
 /** Failed-drain retry ceiling: unresolved work is retried by one-shot timers, never an interval. */
 const DRAIN_RETRY_MAX_MS = 30_000;
-/** Watcher re-arm backoff after a watch failure: one-shot, bounded attempts, then give up. */
+/** Watcher re-arm backoff: bounded attempts, then a degraded-only minute carrier. */
 const WATCH_REARM_BASE_MS = 1_000;
 const WATCH_REARM_MAX_MS = 60_000;
 const WATCH_REARM_ATTEMPTS = 6;
@@ -56,6 +57,13 @@ export class LifecycleBroker {
   #rearmTimer: NodeJS.Timeout | undefined;
   #rearmAttempts = 0;
   #watchWarned = false;
+  readonly #observation = new DegradedObservation("lifecycle", () => this.#wake(), () => {
+    this.#armWatch();
+    if (!this.#stopWatch) return false;
+    this.#rearmAttempts = 0;
+    return true;
+  });
+  observationHealth(): string[] { return this.#observation.health ? [this.#observation.health] : []; }
   #retryTimer: NodeJS.Timeout | undefined;
   #retryDelay = 0;
   #polling: Promise<void> | undefined;
@@ -85,12 +93,13 @@ export class LifecycleBroker {
     this.#maxReadEvents = Math.max(1, options.maxReadEvents);
   }
 
-  /** Drains at once, then on mesh directory notifications. Idle costs no timer: a one-shot timer
-   * exists only for a failed drain's backoff or a failed watcher's bounded re-arm. */
+  /** Drains at once, then on mesh notifications. Healthy idle has no timer;
+   * failed work retries, and exhausted watches use the degraded-only minute carrier. */
   start(): void {
     if (!this.options.enabled || this.#started) return;
     this.#started = true;
     this.#closed = false;
+    this.#observation.open();
     this.#armWatch();
     // A subscription may become visible here only when the state projector catches up, after its event's
     // file wake was already drained against the stale view: that projection wakes a fresh drain.
@@ -110,11 +119,11 @@ export class LifecycleBroker {
     }
   }
 
-  // A watcher error is one rescan plus a bounded one-shot re-arm, never a standing poll.
+  // One rescan plus bounded re-arms; exhaustion retains the shared degraded-only carrier.
   #watchFailed(error: unknown): void {
     this.#stopWatch?.();
     this.#stopWatch = undefined;
-    if (this.#closed) return;
+    if (this.#closed || this.#observation.degraded) return;
     const delay = Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_BASE_MS * 2 ** this.#rearmAttempts);
     if (!this.#watchWarned) {
       this.#watchWarned = true;
@@ -123,12 +132,13 @@ export class LifecycleBroker {
         : error instanceof Error ? error.message : String(error);
       try {
         console.warn(`[pi-fabric] lifecycle broker: mesh notifications failed for ${this.mesh.root} (${cause}); ` +
-          `rescanned once, re-arming in ${delay} ms with bounded retries. There is no polling: ` +
-          "events arriving while unarmed are drained at a re-arm or by the next local publish.");
+          `rescanned once, re-arming in ${delay} ms with bounded retries. Normal operation has no polling; ` +
+          "exhausted watches scan and re-arm once per minute.");
       } catch {}
     }
     this.#wake();
-    if (this.#rearmTimer || this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) return;
+    if (this.#rearmTimer) return;
+    if (this.#rearmAttempts >= WATCH_REARM_ATTEMPTS) { this.#observation.enter(); return; }
     this.#rearmAttempts++;
     this.#rearmTimer = setTimeout(() => {
       this.#rearmTimer = undefined;
@@ -265,6 +275,7 @@ export class LifecycleBroker {
     if (this.#closed) return;
     this.#closed = true;
     this.#started = false;
+    this.#observation.close();
     this.#stopWatch?.();
     this.#stopWatch = undefined;
     this.#stopStateChanges?.();

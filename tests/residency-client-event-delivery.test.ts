@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/mesh.js";
-import { CompletionJournal } from "../src/agents/completion-journal.js";
+import { CompletionJournal, saveCompletion } from "../src/agents/completion-journal.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { closeNatsStateBackend, NatsStateBackend, openNatsStateBackend } from "../src/mesh/state-backend-nats.js";
@@ -226,6 +226,83 @@ describe("resident client event-driven delivery", () => {
       await realSleep(200);
       expect(drains()).toBe(2);
     } finally { await client.close(); drain.mockRestore(); cleanup(); }
+  });
+
+  it("exhausted resident watches still see external deliveries and completions on one minute tick, then return to events", async () => {
+    const { config, mesh, cleanup, landCompletion } = fixture();
+    const delivered = vi.fn();
+    const completion = vi.fn(); // no ACK: do not execute journal/source retirement locally
+    const client = new ResidencyClient({ config, mesh, participants: {} as FabricParticipantSource,
+      mainAgent: { local: true, deliverAgent: delivered } as unknown as FabricMainAgentTarget,
+      onBackgroundComplete: completion });
+    const callbacks: Array<{ directory: string; notify: (event: string, name: string) => void }> = [];
+    let exhausted = true;
+    const watch = vi.spyOn(fs, "watch").mockImplementation(((directory: string, notify: (event: string, name: string) => void) => {
+      if (exhausted) throw Object.assign(new Error("ENOSPC: watcher limit"), { code: "ENOSPC" });
+      callbacks.push({ directory, notify });
+      return Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher;
+    }) as unknown as typeof fs.watch);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Record intended source retirement and hide only its state-view result.
+    const retired = new Set<string>();
+    const list = MeshStore.prototype.listAll.bind(mesh);
+    const reads = vi.spyOn(mesh, "listAll").mockImplementation((...args) => list(...args).filter((entry) => !retired.has(entry.key)));
+    const deletion = vi.spyOn(mesh, "delete").mockImplementation(async ({ key }) => { retired.add(key); return { deleted: true }; });
+    const journal = vi.spyOn(CompletionJournal.prototype, "drain");
+    const drains = () => reads.mock.calls.filter(([prefix]) => prefix === "residency/deliveries/").length;
+    vi.useFakeTimers();
+    try {
+      client.start();
+      await vi.advanceTimersByTimeAsync(63_000);
+      await realSleep(50); // let the bounded re-arm rescans' real IO settle
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.observationHealth()).toEqual(["observation-degraded:residency"]);
+      const key = residentDeliveryPrefix(config.rootId) + "degraded";
+      await mesh.put({ key, identity: { id: client.hostId, name: "resident", kind: "actor" }, value: {
+        format: RESIDENT_HOST_FORMAT, id: "degraded", rootId: config.rootId,
+        from: { id: "actor:producer", name: "producer", kind: "actor" }, source: "actor-output",
+        message: "external delivery", delivery: "followUp", triggerTurn: true,
+      } });
+      saveCompletion(config.meshRoot, { rootId: config.rootId, sessionId: config.sessionId,
+        cwd: config.cwd, projectRoot: config.projectRoot, name: "main", startedAt: 0 }, {
+        id: "d".repeat(32), name: "external completion", task: "task", status: "completed",
+        runner: "pi", transport: "process", cwd: config.cwd, text: "completed externally",
+        startedAt: 1, updatedAt: 2, finishedAt: 2, turns: 1, toolCalls: 0,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      });
+      const before = drains();
+      const journalBefore = journal.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(drains()).toBe(before);
+      expect(delivered).not.toHaveBeenCalled();
+      expect(completion).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await realSleep(100); // the minute tick's coalesced pass includes real journal IO
+      await Promise.all(journal.mock.results.map((result) => result.value));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(drains()).toBeGreaterThan(before);
+      expect(delivered).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: "external delivery", delivery: "followUp" }));
+      expect(deletion).toHaveBeenCalledOnce();
+      expect(completion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "d".repeat(32), text: "completed externally" }), expect.any(Function));
+      expect(journal.mock.calls.length).toBeGreaterThan(journalBefore);
+      expect(warn).toHaveBeenCalledTimes(2);
+      exhausted = false;
+      await vi.advanceTimersByTimeAsync(60_000);
+      await Promise.all(journal.mock.results.map((result) => result.value));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.observationHealth()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(3);
+      const recovered = drains();
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(drains()).toBe(recovered);
+      landCompletion("event-completion");
+      callbacks.find((entry) => entry.directory === path.join(config.meshRoot, "agent-completions"))!.notify("rename", "event-completion.json");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(drains()).toBe(recovered + 1);
+      await client.close();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { await client.close(); vi.useRealTimers(); journal.mockRestore(); watch.mockRestore(); warn.mockRestore(); cleanup(); }
   });
 
   it("watcher error rescans, warns once, and re-arms on a bounded one-shot", async () => {

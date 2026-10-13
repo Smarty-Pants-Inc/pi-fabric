@@ -4,13 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG, RESIDENT_IDLE_EXIT_MS } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { AgentManager } from "../src/agents/manager.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { readResidentIdleExit, residentIdleExitPath } from "../src/residency/idle-exit.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { MAIN_RELOAD_LEASE_MS, ParticipantDirectory } from "../src/topology/participant-directory.js";
-import { captureSafetyTick } from "./helpers/resident-safety-tick.js";
 
 // Windows runs the legacy retention path (retentionV2Enabled() is false on win32), which applies
 // config.json policy edits only at its 60 s request-retention sample. Tests that depend on that
@@ -44,23 +42,11 @@ async function fixture(idleExitMs = RESIDENT_IDLE_EXIT_MS) {
   vi.spyOn(Date, "now").mockImplementation(() => now);
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const host = new ResidentHost(config, () => { exited++; });
-  // smarty-dev#11107: samples come from the host's one-shot deadline timers (captured; fired only
-  // once their datetime arrives on the mocked clock), no poll and no safety tick.
-  const safety = captureSafetyTick();
-  // Agent status changes reach the host as AgentManager UI events; tests that mock listForUi
-  // emit that same event when the mocked status changes.
-  const agentListeners: Array<() => void> = [];
-  const subscribeUi = AgentManager.prototype.subscribeUi;
-  vi.spyOn(AgentManager.prototype, "subscribeUi").mockImplementation(function (this: AgentManager, listener) {
-    agentListeners.push(listener); return subscribeUi.call(this, listener);
-  });
-  cleanups.push(async () => { safety.restore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { await host.close(); fs.rmSync(root, { recursive: true, force: true }); });
   await host.start();
-  // Kept installed: deadlines re-arm after each sample. A deadline fires only when due.
-  await sleep(150); await safety.tick(); // Deterministic host clock.
+  await sleep(150); // Actual request ticks, deterministic host clock.
   return { root, config, configPath, host, log, exited: () => exited, now: () => now,
-    agentsChanged: () => { for (const listener of agentListeners) listener(); },
-    advance: async (ms: number) => { now += ms; await sleep(150); await safety.tick(); } };
+    advance: async (ms: number) => { now += ms; await sleep(150); } };
 }
 
 function rootLease(f: Awaited<ReturnType<typeof fixture>>, expiresAt: number) {
@@ -97,8 +83,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(5_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(hostLeasePath(f.config.meshRoot, f.config.rootId));
-    // smarty-dev#11107: the watched lease removal opens the window at once (no later sample).
-    await f.advance(0); // deliver the native event on the unchanged clock
+    await f.advance(1_000); // first absent-root sample
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     rootLease(f, f.now() + 10_000); // before final fresh exit validation
@@ -161,8 +146,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     fs.rmSync(file);
-    // smarty-dev#11107: the watched removal itself starts the new full window.
-    await f.advance(0); // deliver the native event on the unchanged clock
+    await f.advance(1_000);
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     await f.advance(1);
@@ -192,8 +176,7 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
       fs.renameSync(f.configPath + ".tmp", f.configPath);
     };
     replacePolicy(2_000);
-    // smarty-dev#11107: the watched config.json edit applies at once and opens the window.
-    await f.advance(0); // deliver the native event on the unchanged clock
+    await f.advance(1_000);
     await f.advance(1_999);
     expect(f.exited()).toBe(0);
     replacePolicy(0);
@@ -214,7 +197,6 @@ describe("resident dead-root idle retirement (smarty-dev#6086)", () => {
     await f.advance(10_000);
     expect(f.exited()).toBe(0);
     agents.mockRestore();
-    f.agentsChanged();
     await f.advance(1_000);
     await f.advance(2_000);
     expect(f.exited()).toBe(1);

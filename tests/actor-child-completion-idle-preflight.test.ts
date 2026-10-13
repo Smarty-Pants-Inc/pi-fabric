@@ -39,7 +39,7 @@ it("does not claim an empty spool and re-reads a completion on a subsequent call
 // Integration wake proof: a real owner finishes an EMPTY preflight, then a writer in
 // another process publishes an envelope. Only the spool watch can wake the owner here:
 // the mesh safety net and retention cadence are set far beyond the test deadline.
-it("wakes a real idle owner and claims a cross-process completion written after the empty preflight", async () => {
+it.each([false, true])("wakes a real idle owner and retries a failed durable queue write (persist failure: %s)", async (persistFailure) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-idle-wake-"));
   const rootId = "session:root-main";
   const meshRoot = path.join(root, "mesh");
@@ -63,9 +63,20 @@ it("wakes a real idle owner and claims a cross-process completion written after 
   const owner = new ActorManager("root-main", { id: rootId, name: "owner", kind: "main", sessionId: "root-main" },
     mesh, meshConfig, agents, vi.fn(), {
       persistent: true, actorRoot: path.join(meshRoot, "actors", "root-main"), claimResidency: "session", rootId,
-      resolvePiModel: async (model: string) => model, retentionSweepMs: 600_000,
+      resolvePiModel: async (model: string) => model, retentionSweepMs: 600_000, preparationRetryMs: 50,
     });
   const mkdir = vi.spyOn(fs, "mkdirSync");
+  let denyQueueWrite = false;
+  let refusedWrites = 0;
+  const rename = fs.renameSync;
+  vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+    if (denyQueueWrite && path.basename(String(target)).startsWith("queue-") && String(target).endsWith(".json")) {
+      refusedWrites++;
+      // EIO exercises the owner's retry, not writeJsonAtomic's eight inline EBUSY retries.
+      throw Object.assign(new Error("recorded transient queue write refusal"), { code: "EIO" });
+    }
+    return rename(source, target);
+  });
   try {
     const actor = await owner.create({ name: "wake", instructions: "Read child outcomes.", residency: "session",
       delivery: "mailbox", transport: "process", model: "fixture/wake" });
@@ -82,6 +93,7 @@ it("wakes a real idle owner and claims a cross-process completion written after 
     schedule.mockClear();
     mkdir.mockClear();
 
+    denyQueueWrite = persistFailure;
     const id = "d".repeat(32);
     const result = { id, name: "child", status: "completed", text: "late child result", startedAt: Date.now(), finishedAt: Date.now() };
     const script = `
@@ -93,6 +105,15 @@ it("wakes a real idle owner and claims a cross-process completion written after 
       error => error ? reject(error) : resolve()));
     const written = Date.now();
     expect(fs.existsSync(path.join(spool, `${id}.json`)) || fs.existsSync(path.join(spool, `${id}.receipt`))).toBe(true);
+    if (persistFailure) {
+      await vi.waitFor(() => expect(refusedWrites).toBeGreaterThan(0), { timeout: 2000 });
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(fs.existsSync(path.join(spool, `${id}.json`))).toBe(true);
+      expect(fs.existsSync(path.join(spool, `${id}.receipt`))).toBe(false);
+      expect(run).not.toHaveBeenCalled();
+      expect(refusedWrites).toBeLessThan(20);
+      denyQueueWrite = false;
+    }
 
     // Claimed through the existing lock and handed to the mailbox, far below any timer cadence.
     await vi.waitFor(() => {
@@ -123,6 +144,7 @@ it("wakes a real idle owner and claims a cross-process completion written after 
     await new Promise(resolve => setTimeout(resolve, 200));
     expect(schedule).not.toHaveBeenCalled();
   } finally {
+    denyQueueWrite = false;
     mkdir.mockRestore();
     release();
     await owner.close();
@@ -132,9 +154,9 @@ it("wakes a real idle owner and claims a cross-process completion written after 
   }
 }, 30_000);
 
-// Child spool watch failure contract: one rescan + one one-shot re-arm per error, bounded
-// backoff with no attempt cap, healthy events reset it, no interval, no hot loop, and close
-// joins the native close or a bounded grace when an errored handle never reports it.
+// Child spool watch failure contract: one immediate rescan/re-arm, then finite
+// 60/120/240/300 s one-shots. Only delivered events reset the budget. Exhaustion
+// exposes unavailable and warns once; close joins native close or a bounded grace.
 type FakeWatcher = EventEmitter & { close: ReturnType<typeof vi.fn>; listener: fs.WatchListener<string> };
 const fakeWatchers = (fail: () => boolean = () => false) => {
   const made: FakeWatcher[] = [];
@@ -147,7 +169,7 @@ const fakeWatchers = (fail: () => boolean = () => false) => {
   return { made, watch };
 };
 
-it("child watch: an error rescans once and re-arms on one bounded one-shot backoff, reset by healthy events, with no interval", async () => {
+it("child watch: one immediate recovery then minute-scale backoff, reset only by delivered events, with no interval", async () => {
   vi.useFakeTimers();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-"));
   const interval = vi.spyOn(globalThis, "setInterval");
@@ -164,37 +186,32 @@ it("child watch: an error rescans once and re-arms on one bounded one-shot backo
     expect(wake).not.toHaveBeenCalled();
     made[0]!.listener("rename", `${"a".repeat(32)}.json`);
     expect(wake).toHaveBeenCalledTimes(1);
-    // Error: one immediate rescan, the old handle closed, exactly one one-shot re-arm deadline.
+    // First failure rescans and re-arms immediately, without a retry timer.
     made[0]!.emit("error", new Error("watch failed"));
-    expect(wake).toHaveBeenCalledTimes(2);
     expect(made[0]!.close).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(2); // the re-arm deadline + the errored handle's close grace
-    await vi.advanceTimersByTimeAsync(499);
-    expect(watch).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(1);
     expect(watch).toHaveBeenCalledTimes(2);
-    expect(wake).toHaveBeenCalledTimes(3); // rescan after a successful re-arm
-    // A late event or error from the replaced handle is ignored (no double re-arm, no hot loop).
+    expect(wake).toHaveBeenCalledTimes(3); // immediate rescan + successful re-arm rescan
+    // A late event or error from the replaced handle is ignored.
     made[0]!.emit("error", new Error("late"));
     made[0]!.listener("rename", `${"b".repeat(32)}.json`);
     expect(wake).toHaveBeenCalledTimes(3);
-    // Consecutive errors with no delivered event double the deadline, capped at 30 s, never exhausted.
-    const deadlines: number[] = [];
-    for (let attempt = 1; attempt <= 12; attempt++) {
+    // Arming alone does not reset the budget: each later failure waits its deadline.
+    for (const delay of [60_000, 120_000, 240_000]) {
       made.at(-1)!.emit("error", new Error("again"));
       const before = watch.mock.calls.length;
-      let waited = 0;
-      while (watch.mock.calls.length === before) { await vi.advanceTimersByTimeAsync(100); waited += 100; }
-      deadlines.push(waited);
+      const wakes = wake.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(watch.mock.calls.length).toBe(before);
+      expect(wake.mock.calls.length).toBe(wakes);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(watch.mock.calls.length).toBe(before + 1);
     }
-    expect(deadlines.slice(0, 5)).toEqual([1_000, 2_000, 4_000, 8_000, 16_000]);
-    expect(deadlines.slice(5).every(ms => ms === 30_000)).toBe(true);
-    // A delivered event resets the backoff to the first deadline.
+    // A delivered event resets the budget to the single immediate recovery.
     made.at(-1)!.listener("change", `${"c".repeat(32)}.abandon`);
-    made.at(-1)!.emit("error", new Error("after healthy"));
     const before = watch.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(500);
+    made.at(-1)!.emit("error", new Error("after healthy"));
     expect(watch.mock.calls.length).toBe(before + 1);
+    expect(spool.unavailable).toBe(false);
     expect(interval).not.toHaveBeenCalled();
   } finally {
     const closing = spool.close();
@@ -207,24 +224,32 @@ it("child watch: an error rescans once and re-arms on one bounded one-shot backo
   }
 });
 
-it("child watch: an arm failure rescans and retries on one one-shot deadline", async () => {
+it("child watch: persistent arm failure retries no faster than once per minute and stops with one warning and health flag", async () => {
   vi.useFakeTimers();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-arm-"));
-  let fail = true;
-  const { watch } = fakeWatchers(() => fail);
+  const { watch } = fakeWatchers(() => true);
+  const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
   const wake = vi.fn();
   const spool = new ActorChildCompletionWatch(path.join(root, "child-completions"), wake);
   try {
+    expect(watch).toHaveBeenCalledTimes(2); // initial arm + sole immediate recovery
     expect(wake).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(1);
-    await vi.advanceTimersByTimeAsync(500);
-    expect(watch).toHaveBeenCalledTimes(2);
-    expect(wake).toHaveBeenCalledTimes(2);
-    fail = false;
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(watch).toHaveBeenCalledTimes(3);
-    expect(wake).toHaveBeenCalledTimes(3); // successful re-arm rescans once
+    for (const delay of [60_000, 120_000, 240_000, 300_000]) {
+      const before = watch.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(watch.mock.calls.length).toBe(before);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(watch.mock.calls.length).toBe(before + 1);
+    }
+    expect(watch).toHaveBeenCalledTimes(6);
+    expect(wake).toHaveBeenCalledOnce(); // retry attempts never poll the spool
+    expect(spool.unavailable).toBe(true);
+    expect(warning).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(watch).toHaveBeenCalledTimes(6);
+    expect(warning).toHaveBeenCalledOnce();
   } finally {
     const closing = spool.close();
     await vi.advanceTimersByTimeAsync(1_000);
@@ -239,6 +264,9 @@ it("child watch: close joins a normal native close, and an errored handle that n
   vi.useFakeTimers();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-child-watch-close-"));
   const { made } = fakeWatchers();
+  // Immediate recovery creates a healthy replacement. Make its close observable,
+  // while the original errored handle deliberately never reports native close.
+  const closeReplacement = () => made.at(-1)!.close.mockImplementation(() => made.at(-1)!.emit("close"));
   try {
     // Normal close: resolves on the native close event, not before.
     const healthy = new ActorChildCompletionWatch(path.join(root, "a"), vi.fn());
@@ -254,6 +282,7 @@ it("child watch: close joins a normal native close, and an errored handle that n
     // and must not resolve before the bounded grace, so a late close is still joined.
     const errored = new ActorChildCompletionWatch(path.join(root, "b"), vi.fn());
     made[1]!.emit("error", new Error("native closed"));
+    closeReplacement();
     let released = false;
     const late = errored.close().then(() => { released = true; });
     await vi.advanceTimersByTimeAsync(999);
@@ -265,6 +294,7 @@ it("child watch: close joins a normal native close, and an errored handle that n
     const lateClose = new ActorChildCompletionWatch(path.join(root, "c"), vi.fn());
     const third = made.length - 1;
     made[third]!.emit("error", new Error("closing"));
+    closeReplacement();
     let early = false;
     const pending = lateClose.close().then(() => { early = true; });
     await vi.advanceTimersByTimeAsync(100);

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ActorMeshMonitor, resetMeshMonitorWatchWarnings } from "../src/actors/mesh-monitor.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { isWatchLimitError, resetWatchFallbackWarnings, watchFallbackMessage } from "../src/core/watch-fallback.js";
 import { MeshStore, type MeshEvent, type MeshTailResult } from "../src/mesh/store.js";
 
@@ -23,7 +23,6 @@ const monitors: ActorMeshMonitor[] = [];
 let warn: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   resetWatchFallbackWarnings();
-  resetMeshMonitorWatchWarnings();
   warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(() => {
@@ -82,10 +81,7 @@ describe("watch ENOSPC (smarty-dev#5247)", () => {
     expect(warnings()).toHaveLength(1);
     expect(warnings()[0]).toContain(CAUSE);
     expect(warnings()[0]).toContain(root);
-    // #11172: the monitor re-arms on one-shot deadlines; the warning must not claim a fallback poll.
-    expect(warnings()[0]).toContain("no standing poll");
-    expect(warnings()[0]).toContain("first retry in 50 ms");
-    expect(warnings()[0]).not.toMatch(/polling every|falling back to polling/i);
+    expect(warnings()[0]).toContain("polling every 50 ms");
     // A restarted monitor (actor manager reload) does not repeat the warning.
     const again = fakeMonitor(tempRoot());
     again.monitor.start();
@@ -104,18 +100,12 @@ describe("watch ENOSPC (smarty-dev#5247)", () => {
     await flush();
     expect(warnings()).toHaveLength(0);
     expect(() => watcher.emit("error", watchLimit(root))).not.toThrow();
-    // The mock returns the same emitter on re-arm, so the second error hits the re-armed
-    // watch (a real fs.watch returns a fresh handle): two closes, then one bounded deadline.
     watcher.emit("error", watchLimit(root));
-    expect(watcher.close).toHaveBeenCalledTimes(2);
-    expect(fs.watch).toHaveBeenCalledTimes(2);
+    expect(watcher.close).toHaveBeenCalledOnce();
     const count = s.mesh.tail.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(100);
-    expect(fs.watch).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(50);
     expect(s.mesh.tail.mock.calls.length).toBeGreaterThan(count);
-    expect(vi.getTimerCount()).toBe(0);
     expect(warnings()).toEqual([expect.stringContaining(CAUSE)]);
-    expect(warnings()[0]).not.toMatch(/polling every/i);
   });
 
   it.skipIf(process.platform === "win32")("keeps every mesh write and still delivers it by polling when the watch limit is hit", async () => {

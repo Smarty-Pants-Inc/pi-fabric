@@ -20,8 +20,9 @@ const STORED_FILE = /^([a-f0-9]{32})(?:\.result\.json|\.json|\.receipt|\.live-re
 
 // Writer-visible pending work: an envelope, cancellation intent or archive source.
 const WAKE_FILE = /^[a-f0-9]{32}\.(?:json|abandon|source)$/;
-const WATCH_REARM_MS = 500;
-const WATCH_REARM_MAX_MS = 30_000;
+const WATCH_REARM_MS = 60_000;
+const WATCH_REARM_MAX_MS = 5 * 60_000;
+const WATCH_FAILURE_LIMIT = 6;
 // A closed native handle normally reports `close`; an errored one may never do so.
 const WATCH_CLOSE_GRACE_MS = 1_000;
 
@@ -29,30 +30,33 @@ const WATCH_CLOSE_GRACE_MS = 1_000;
  * Edge-only wake for completion writers in other processes. It carries no authority:
  * the callback only schedules the owner's existing fresh ownership/claim reconcile.
  * Arm it BEFORE the first empty preflight so a later write cannot fall between them.
- * A failed watch triggers exactly one rescan and one re-arm on a single one-shot timer
- * (500 ms doubling, capped at 30 s). There is no standing poll and no attempt cap: a
- * delivered event proves the watch healthy and resets the backoff, so failures never
- * accumulate over the owner's lifetime into permanent loss of the wake.
+ * A failed watch gets one immediate rescan/re-arm, then 60/120/240/300 s one-shots.
+ * Six consecutive failures stop re-arming, expose unavailable and warn once. Only a
+ * delivered event resets this budget. Existing owner events still reconcile the spool.
  */
 export class ActorChildCompletionWatch {
   #watcher: FSWatcher | undefined;
   #timer: NodeJS.Timeout | undefined;
   #failures = 0;
+  #unavailable = false;
   #closed = false;
   // Watchers closed after an error whose native close may still be in flight.
   readonly #closing = new Set<Promise<void>>();
   constructor(readonly directory: string, readonly wake: () => void) { this.#arm(); }
 
+  /** Exhausted native-watch recovery; existing actor events remain available. */
+  get unavailable(): boolean { return this.#unavailable; }
+
   #arm(): void {
     this.#timer = undefined;
-    if (this.#closed || this.#watcher) return;
+    if (this.#closed || this.#unavailable || this.#watcher) return;
     try {
       // Create the empty spool once (never recursively: a removed actor stays removed).
       try { fs.mkdirSync(this.directory, { mode: 0o700 }); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
       const watcher = fs.watch(this.directory, { persistent: false }, (_event, filename) => {
         if (this.#closed || this.#watcher !== watcher) return;
-        this.#failures = 0; // A delivering watch is healthy: the backoff never exhausts over a lifetime.
+        this.#failures = 0; // Only a delivered event, never arming, resets the failure budget.
         const name = filename == null ? undefined : path.basename(filename.toString());
         // A nameless event is a wake, not evidence that nothing changed.
         if (name === undefined || WAKE_FILE.test(name)) this.wake();
@@ -70,9 +74,19 @@ export class ActorChildCompletionWatch {
       this.#watcher = undefined;
       this.#closing.add(this.#closeHandle(watcher));
     }
-    this.wake(); // Exactly one rescan per failure.
-    if (this.#timer) return; // One one-shot re-arm at a time.
-    this.#timer = setTimeout(() => this.#arm(), Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_MS * 2 ** Math.min(this.#failures++, 16)));
+    if (this.#timer || this.#unavailable) return;
+    this.#failures++;
+    if (this.#failures === 1) {
+      this.wake();
+      this.#arm(); // Single immediate rescan/re-arm, not a fast retry timer.
+      return;
+    }
+    if (this.#failures >= WATCH_FAILURE_LIMIT) {
+      this.#unavailable = true;
+      console.warn(`[pi-fabric] child completion watch unavailable after ${this.#failures} failures for ${this.directory}; re-arm stopped, actor events still reconcile pending work`);
+      return;
+    }
+    this.#timer = setTimeout(() => this.#arm(), Math.min(WATCH_REARM_MAX_MS, WATCH_REARM_MS * 2 ** (this.#failures - 2)));
     this.#timer.unref();
   }
 

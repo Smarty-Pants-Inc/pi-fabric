@@ -718,6 +718,7 @@ export class ActorManager {
   readonly #pendingRunArchives = new Map<string, Set<string>>();
   readonly #childCompletionStores = new Map<string, ActorChildCompletionStore>();
   readonly #childCompletionWatches = new Map<string, ActorChildCompletionWatch>();
+  readonly #childCompletionRetries = new Map<string, { failures: number; timer?: NodeJS.Timeout | undefined }>();
   readonly #acquireCapabilityView:
     | ((
         requirements: readonly FabricCapabilityRequirement[],
@@ -3012,8 +3013,6 @@ export class ActorManager {
 
   /** Reversible activation gate. It never aborts a worker or consumes mesh input. */
   pauseForRelease(): void { this.#releasePaused = true; }
-  /** Neutral wake: re-run the mesh monitor pass only. Changes no custody/gate state. */
-  scheduleMeshWake(): void { this.#meshMonitor.schedule(); }
   resumeAfterRelease(): void {
     this.#releasePaused = false;
     this.#settledRestoreReady = true;
@@ -3077,6 +3076,8 @@ export class ActorManager {
     const watches = [...this.#childCompletionWatches.values()];
     this.#childCompletionWatches.clear();
     await Promise.all(watches.map(watch => watch.close()));
+    for (const retry of this.#childCompletionRetries.values()) if (retry.timer) clearTimeout(retry.timer);
+    this.#childCompletionRetries.clear();
     if (this.#registrySaveTimer) clearTimeout(this.#registrySaveTimer);
     this.#registrySaveTimer = undefined;
     await this.#registrySavePending;
@@ -3215,12 +3216,17 @@ export class ActorManager {
     for (const actor of completed ? [completed] : this.#actors.values()) {
       if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id)) continue;
       this.#flushHandoffConsumption(actor);
+      // A failed durable handoff already owes a retry deadline. Coalesced native spool
+      // events must not bypass its backoff and repeatedly attempt the same failed write.
+      if (this.#childCompletionRetries.get(actor.id)?.timer) continue;
       const store = this.#childCompletionStore(actor);
       // Arm before the preflight; a cross-process write then reuses the monitor's gated poll.
       if (!this.#childCompletionWatches.has(store.directory)) {
         this.#childCompletionWatches.set(store.directory, new ActorChildCompletionWatch(store.directory, () => this.#meshMonitor.schedule()));
       }
-      for (const { spawner, result } of store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) })) {
+      let retryPending = false;
+      const pending = store.pending({ actorId: actor.id, ...(actor.inFlightRun ? { inFlightRunId: actor.inFlightRun.id } : {}) });
+      for (const { spawner, result } of pending) {
         try {
           const id = result.id;
           const existing = [this.#inFlight.get(actor.id), ...actor.queue,
@@ -3238,15 +3244,36 @@ export class ActorManager {
           if (this.#persistQueue(actor.id, true)) {
             store.acknowledge(id, { handoff: true });
             this.#ensureDrain(actor);
-          }
+          } else retryPending = true;
         } catch (error) {
           if (error instanceof ChildCompletionClaimLostError) {
             this.#forgetClaimedChild(actor, result.id);
             this.#ensureDrain(actor);
-          } // Other I/O failures leave the actor-addressed envelope pending for retry.
+          } else retryPending = true; // The exact actor-addressed envelope remains pending.
         }
       }
+      if (retryPending) this.#retryChildCompletions(actor.id);
+      else if (pending.length) {
+        const retry = this.#childCompletionRetries.get(actor.id);
+        if (retry?.timer) clearTimeout(retry.timer);
+        this.#childCompletionRetries.delete(actor.id);
+      }
     }
+  }
+
+  /** Failed pending work owes one bounded retry, not an idle poll. Every retry re-enters
+   * the monitor's ownership/admission gates before its fresh claim and durable queue write. */
+  #retryChildCompletions(actorId: string): void {
+    if (this.#closing) return;
+    const retry = this.#childCompletionRetries.get(actorId) ?? { failures: 0 };
+    if (retry.timer) return;
+    retry.failures++;
+    retry.timer = setTimeout(() => {
+      retry.timer = undefined;
+      if (!this.#closing) this.#meshMonitor.schedule();
+    }, Math.min(300_000, this.#preparationRetryMs * 2 ** Math.min(retry.failures - 1, 10)));
+    retry.timer.unref();
+    this.#childCompletionRetries.set(actorId, retry);
   }
 
   #forgetClaimedChild(actor: ManagedActor, id: string): void {
@@ -4335,34 +4362,6 @@ export class ActorManager {
     // Safety net: an episode whose activation is no longer preparing is closed.
     for (const id of this.#stuckPreparing.keys()) if (!this.#draining.get(id)?.preparing) this.#stuckPreparing.delete(id);
     return sent;
-  }
-
-  /**
-   * smarty-dev#6337: the earliest time at which reportStuckPreparing(thresholdMs) would notice
-   * an episode, from the same eligibility and the same accrued active clock (pre-wait time
-   * kept, admission-permit waits excluded). Returns `now` for an episode already due,
-   * undefined when none can become due without an actor event first: no actor preparing, only
-   * permit waits, every episode already noticed, a paused clock, or not managed here. Every
-   * transition that can change the answer (activation start, waiting, permit admission,
-   * launch, settlement) emits a subscribe() change, so a caller re-arms its one-shot there.
-   * Read-only: it never notifies, closes an episode or advances a clock.
-   */
-  nextStuckPreparingAt(thresholdMs: number, now = Date.now()): number | undefined {
-    if (this.#halted || this.#closing || !(thresholdMs > 0)) return undefined;
-    let earliest: number | undefined;
-    for (const actor of this.#draining.values()) {
-      const preparing = actor.preparing;
-      const episode = this.#stuckPreparing.get(actor.id);
-      // The same eligibility as reportStuckPreparing, so a returned deadline is actionable.
-      if (!preparing || !episode || preparing.phase === "waiting" || actor.status === "stopped" || actor.removal) continue;
-      if (episode.notified || episode.itemId !== this.#inFlight.get(actor.id)?.id || !this.#canManageCached(actor.id)) continue;
-      const remaining = thresholdMs - this.#preparationActiveMs(episode, now);
-      // A paused clock below the threshold cannot become due until it resumes (an event).
-      if (remaining > 0 && episode.activeSince === undefined) continue;
-      const at = remaining > 0 ? now + remaining : now;
-      if (earliest === undefined || at < earliest) earliest = at;
-    }
-    return earliest;
   }
 
   /** smarty-dev#6337 review P2: one activation's preparation clock; a permit wait pauses it. */

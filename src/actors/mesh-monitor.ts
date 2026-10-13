@@ -2,43 +2,13 @@ import fs, { type FSWatcher } from "node:fs";
 import { MeshBackgroundRetry, type MeshOutageAlarm } from "../core/atomic-write.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import { isWatchLimitError } from "../core/watch-fallback.js";
+import { warnWatchFallback } from "../core/watch-fallback.js";
 import type { FabricMeshConfig } from "../config.js";
 import { meshCursorAtStart, meshCursorGeneration, type MeshEvent, type MeshStore } from "../mesh/store.js";
 
-// No standing poll (#11172): a watch error rescans and re-arms; an unsupported
-// watch retries the re-arm on a bounded one-shot deadline; a failed drain
-// retries on a bounded one-shot backoff. A healthy idle monitor owns no timer.
-const WATCH_REARM_MAX_MS = 5_000;
-const FAILED_DRAIN_MIN_MS = 100;
-const FAILED_DRAIN_MAX_MS = 5_000;
+// Missed watch notifications, unsupported watches and recovery maintenance only.
+const MESH_MONITOR_SAFETY_NET_MS = 5_000;
 const CURSOR_CHECKPOINT_MS = 10_000;
-const watchWarnings = new Set<string>();
-
-/** One line naming the real cause and the degraded mode; there is no fallback poll. */
-export function meshMonitorWatchMessage(target: string, error: unknown, retryMs: number): string {
-  const first = retryMs <= 0 ? "first retry at once" : `first retry in ${Math.max(1, Math.round(retryMs))} ms`;
-  const retry = `${first}, backing off to at most ${WATCH_REARM_MAX_MS} ms`;
-  const mode = `Rescanning once and re-arming the watch on a bounded one-shot deadline (${retry}); there is no standing poll`;
-  if (isWatchLimitError(error)) {
-    return `[pi-fabric] actor mesh monitor: fs.watch(${target}) failed with ENOSPC: inotify watch limit, not disk space ` +
-      `(fs.inotify.max_user_watches is exhausted for this user). ${mode}. To restore instant wakeups, raise the limit, e.g. ` +
-      `\`sudo sysctl fs.inotify.max_user_watches=524288\` (persist it under /etc/sysctl.d).`;
-  }
-  const detail = error instanceof Error ? error.message : String(error);
-  return `[pi-fabric] actor mesh monitor: fs.watch(${target}) failed (${detail}). ${mode}.`;
-}
-
-/** Warn once per process and cause; never throws. */
-function warnMeshWatch(target: string, error: unknown, retryMs: number): void {
-  const key = isWatchLimitError(error) ? "limit" : "other";
-  if (watchWarnings.has(key)) return;
-  watchWarnings.add(key);
-  try { console.warn(meshMonitorWatchMessage(target, error, retryMs)); } catch {}
-}
-
-/** Test seam: forget which monitor watch warnings were printed. */
-export function resetMeshMonitorWatchWarnings(): void { watchWarnings.clear(); }
 type MonitorCursor = { cursor: number; last?: { sequence: number; id: string } };
 /**
  * Work topics (smarty-dev#754 §3.2 step 3): agent-to-agent acks, asks, handoffs. They are
@@ -52,11 +22,7 @@ export class ActorMeshMonitor {
   // The monitor has no identity or publish of its own: its owner supplies the outage sink (smarty-dev#8825).
   readonly #backgroundPoll = new MeshBackgroundRetry("actor mesh monitor")
     .alarmsTo((alarm) => this.callbacks.outageAlarm?.(alarm));
-  #retryTimer: NodeJS.Timeout | undefined;
-  #rearmTimer: NodeJS.Timeout | undefined;
-  #checkpointTimer: NodeJS.Timeout | undefined;
-  #rearmFailures = 0;
-  #failedDelay = 0;
+  #safetyNetTimer: NodeJS.Timeout | undefined;
   #dueTimer: NodeJS.Timeout | undefined;
   #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
@@ -128,52 +94,26 @@ export class ActorMeshMonitor {
   start(): void {
     if (this.#started || this.#closed || !this.config.enabled) return;
     this.#started = true;
-    this.#armWatch();
-    this.schedule();
-  }
-
-  #armWatch(): void {
-    if (this.#closed || this.#watcher) return;
     try {
       // Watch the existing parent directory, not files replaced by atomic rename.
       // Non-recursive directory watches work on Windows too; a nameless rename
       // is a wake, not evidence that nothing changed. The stamp filters duplicates.
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
-        if (this.#watcher !== watcher) return;
-        this.#rearmFailures = 0; // a delivering watch is healthy again
         const name = filename == null ? undefined : path.basename(filename.toString());
         // schedules.json re-arms the due timer when another process schedules.
         if (name !== undefined && name !== "events.jsonl" && name !== "generation" && name !== "schedules.json") return;
         this.#schedule();
       });
       this.#watcher = watcher;
-      watcher.on("error", (error) => this.#watchFailed(watcher, error));
+      watcher.on("error", (error) => this.#fallback(watcher, error));
     } catch (error) {
-      // An unsupported watch (including a missing directory) retries the re-arm on a
-      // bounded one-shot deadline, rescanning each attempt; never a standing interval.
-      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: say so
-      // once, so nobody hunts for free space and the session never crashes.
-      this.#rearmFailures++;
-      warnMeshWatch(this.mesh.root, error, this.#rearmDelay());
-      this.#armRearm();
+      // An unsupported watch (including a missing directory) takes the fallback.
+      // ENOSPC here is the inotify watch limit (smarty-dev#5247), not a full disk: poll instead
+      // and say so once, so nobody hunts for free space and the session never crashes.
+      warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     }
-  }
-
-  #rearmDelay(): number {
-    const base = Math.max(1, this.config.actorPollMs);
-    return Math.min(base * 2 ** Math.max(0, this.#rearmFailures - 1), Math.max(base, WATCH_REARM_MAX_MS));
-  }
-
-  #armRearm(): void {
-    if (this.#closed || this.#watcher || this.#rearmTimer) return;
-    this.#rearmTimer = setTimeout(() => {
-      this.#rearmTimer = undefined;
-      if (this.#closed || this.#watcher) return;
-      this.#armWatch();
-      // Rescan after (re-)arming so nothing published before the watch is missed.
-      this.schedule();
-    }, this.#rearmDelay());
-    this.#rearmTimer.unref();
+    this.#startSafetyNet();
+    this.schedule();
   }
 
   caughtUp(): boolean {
@@ -191,8 +131,8 @@ export class ActorMeshMonitor {
 
   close(): void {
     this.#closed = true;
-    for (const timer of [this.#retryTimer, this.#rearmTimer, this.#checkpointTimer]) if (timer) clearTimeout(timer);
-    this.#retryTimer = this.#rearmTimer = this.#checkpointTimer = undefined;
+    if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
+    this.#safetyNetTimer = undefined;
     if (this.#dueTimer) clearTimeout(this.#dueTimer);
     this.#dueTimer = undefined;
     this.#watcher?.close();
@@ -215,7 +155,7 @@ export class ActorMeshMonitor {
       const maintain = this.#maintenanceWake;
       this.#wakePending = this.#explicitWake = this.#maintenanceWake = false;
       try {
-        if (!this.#closed) this.#afterRun(await this.#backgroundPoll.run(() => this.#poll(force, maintain)));
+        if (!this.#closed) await this.#backgroundPoll.run(() => this.#poll(force, maintain));
       } finally {
         this.#scheduled = false;
         // A callback can free a receiver slot or append another page while dispatching.
@@ -225,38 +165,12 @@ export class ActorMeshMonitor {
     });
   }
 
-  // A failed or backed-off drain owes one bounded retry; a successful one owes none.
-  #afterRun(result: "done" | "retry" | "failed" | "skipped"): void {
-    if (this.#closed) return;
-    if (result === "done") {
-      this.#failedDelay = 0;
-      if (this.#retryTimer) clearTimeout(this.#retryTimer);
-      this.#retryTimer = undefined;
-      return;
-    }
-    let delay = this.#backgroundPoll.waitMs;
-    if (result === "failed") {
-      this.#failedDelay = Math.min(FAILED_DRAIN_MAX_MS, Math.max(FAILED_DRAIN_MIN_MS, this.#failedDelay * 2));
-      delay = Math.max(delay, this.#failedDelay);
-    } else if (result === "skipped" && delay <= 0) return;
-    if (this.#retryTimer) return;
-    this.#retryTimer = setTimeout(() => {
-      this.#retryTimer = undefined;
-      this.schedule();
-    }, Math.max(1, delay));
-    this.#retryTimer.unref();
-  }
-
-  #watchFailed(watcher: FSWatcher, error: unknown): void {
+  #fallback(watcher: FSWatcher, error: unknown): void {
     if (this.#closed || this.#watcher !== watcher) return;
-    warnMeshWatch(this.mesh.root, error, this.#rearmFailures === 0 ? 0 : this.#rearmDelay());
+    warnWatchFallback("actor mesh monitor", this.mesh.root, error, this.config.actorPollMs);
     watcher.close();
     this.#watcher = undefined;
-    // The first error re-arms at once; consecutive errors without a delivered
-    // notification back off on one bounded one-shot deadline, never a hot loop.
-    if (this.#rearmFailures++ === 0) this.#armWatch();
-    else this.#armRearm();
-    // One rescan covers notifications the failed watch may have missed.
+    this.#startSafetyNet();
     this.schedule();
   }
 
@@ -276,6 +190,15 @@ export class ActorMeshMonitor {
     this.#dueTimer.unref();
   }
 
+  #startSafetyNet(): void {
+    if (this.#safetyNetTimer) clearInterval(this.#safetyNetTimer);
+    // ponytail: keep one bounded timer, not a watcher-retry subsystem. Healthy
+    // watches use slow, stamp-gated recovery; ONLY a failed/unsupported watch
+    // restores the pre-event-driven actorPollMs polling contract.
+    const delay = this.#watcher ? Math.max(MESH_MONITOR_SAFETY_NET_MS, this.config.actorPollMs) : this.config.actorPollMs;
+    this.#safetyNetTimer = setInterval(() => this.#schedule(this.#watcher === undefined, true), delay);
+    this.#safetyNetTimer.unref();
+  }
 
   #meshStamp(): string | undefined {
     try {
@@ -294,8 +217,8 @@ export class ActorMeshMonitor {
     const stamp = this.#meshStamp();
     const unchanged = !this.#needsPoll && stamp !== undefined && stamp === this.#stamp;
     if (!explicit && !maintenance && unchanged) return;
-    // A maintenance (deferred-checkpoint) wake still runs the manager's registry/ownership/
-    // filter/child-result recovery obligations, even with a quiet log. It does not reread it.
+    // The safety net also retains the manager's registry/ownership/filter/child-result
+    // recovery obligations, even with a quiet log. It does not reread that log.
     if (!this.callbacks.beforePoll() || this.callbacks.canConsumeMesh?.() === false) {
       this.#needsPoll = true;
       return;
@@ -485,18 +408,7 @@ export class ActorMeshMonitor {
     // Seed once; never batch away the first actual sequence anchor. Later ignored-only
     // progress can wait ten seconds because restart already has a safe archive boundary.
     const firstAnchor = !this.#persistedEventAnchor && (this.#safeCursor.last?.sequence ?? 0) > 0;
-    if (!immediate && !firstAnchor && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) {
-      // Deferred ignored-only progress owes one checkpoint; a one-shot maintenance
-      // wake replays it through the same beforePoll/canConsumeMesh gates.
-      if (!this.#checkpointTimer && !this.#closed) {
-        this.#checkpointTimer = setTimeout(() => {
-          this.#checkpointTimer = undefined;
-          this.#schedule(false, true);
-        }, Math.max(1, CURSOR_CHECKPOINT_MS - (Date.now() - this.#lastCheckpointAt)));
-        this.#checkpointTimer.unref();
-      }
-      return;
-    }
+    if (!immediate && !firstAnchor && this.#persistedCursor !== undefined && Date.now() - this.#lastCheckpointAt < CURSOR_CHECKPOINT_MS) return;
     try {
       writeJsonAtomic(this.callbacks.cursorPath, { format: 1, ...this.#safeCursor }, { space: 2 });
       this.#persistedCursor = serialized;

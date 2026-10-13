@@ -59,7 +59,6 @@ import {
   residentHostId,
   residentHostStateNote,
   residentResultPath,
-  residentRequestNudgePath,
   residentRoot,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
@@ -861,10 +860,6 @@ export class ResidencyClient {
     const responsePath = path.join(this.#responsesPath, `${command.requestId}.json`);
     try {
       atomicWrite(path.join(this.#requestsPath, `${command.requestId}.json`), command);
-      // Second wake path (smarty-dev#11107): a best-effort nudge the host watches independently of
-      // requests/. The request file above stays the only admitted input.
-      try { atomicWrite(residentRequestNudgePath(this.options.config.residencyRoot), { requestId: command.requestId }); }
-      catch { /* the requests/ watch remains the primary path */ }
       const deadline = Date.now() + (this.options.commandTimeoutMs ?? COMMAND_TIMEOUT_MS);
       while (Date.now() < deadline) {
         if (signal?.aborted) throw new Error("Fabric residency request was aborted");

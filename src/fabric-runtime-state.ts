@@ -846,9 +846,6 @@ export class FabricRuntimeState {
         }
         await initializeMeshActivation();
       },
-      // Committed-refresh readiness edge: wake only THIS activation's actors (never a
-      // replacement this.#actors), only while this activation is live and ready.
-      onCommittedReady: () => { if (meshActivationReady && live.current()) activationActors?.scheduleMeshWake(); },
       presencePass: async () => {
         await rootPresenceAlarms(this.#mesh!, identity, hostId,
           this.#participants!.list({ scope: "project", includeStale: true, fresh: true }), this.#config!.mesh.rootPresenceAlarmMs);
@@ -886,7 +883,6 @@ export class FabricRuntimeState {
     const meshConfig = this.#config.mesh;
     const sessionFile = context.sessionManager.getSessionFile?.();
     let meshActivationReady = false;
-    let activationActors: ActorDirectory | undefined;
     this.#meshActivationReady = () => meshActivationReady && live.current();
     const initializeMeshActivation = async (): Promise<void> => {
       if (meshActivationReady) return;
@@ -920,8 +916,6 @@ export class FabricRuntimeState {
       // Custody admission and succession succeeded: only now open inbox reads/drains.
       rootInbox?.start();
       meshActivationReady = true;
-      // Readiness edge; actors may not exist yet (then their construction schedules once).
-      activationActors?.scheduleMeshWake();
       mainAgent.attachFollowUpDrain(
         activationContext,
         followUpDrainSupported() ? meshConfig.followUpFlushMs : 0,
@@ -1212,7 +1206,6 @@ export class FabricRuntimeState {
       const participant = this.#participants?.get(actorId, undefined, { fresh });
       return participant ? participant.ownerHostId === hostId : undefined;
     };
-    // fv2-11107: a poll (fresh=false, managed ids) may reuse its validated previous map; fresh is exact.
     const snapshotActorOwnership = (fresh = true, actorIds?: readonly string[]): ReadonlyMap<string, boolean> =>
       this.#participants?.actorOwnership(hostId, { fresh, ...(fresh ? {} : { actorIds }) }) ?? new Map();
     // Capture this generation's directory: replacement/quiesce must veto old
@@ -1305,8 +1298,6 @@ export class FabricRuntimeState {
             acquireCapabilityView: acquireActorCapabilityView,
           },
     ], actorRoots, this.#config.mesh.actorScope);
-    activationActors = this.#actors;
-    if (meshActivationReady && live.current()) activationActors.scheduleMeshWake();
     // A removal this Main accepted behind a run that its restart ended (a same-name create) is
     // finished here, as a resident host does at start; ownership limits it to this Main's actors.
     if (ownsPersistentActorRegistry) void this.#actors.finishPendingRemovals().catch(() => undefined);

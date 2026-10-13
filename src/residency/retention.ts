@@ -77,7 +77,7 @@ export const sweepResidentRuns = (
 };
 
 
-export const SAMPLE_INTERVAL_MS = 60_000;
+const SAMPLE_INTERVAL_MS = 60_000;
 const directories = ["acknowledgements", "decisions", "responses", "runs"] as const;
 const time = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const absent = (file: string): boolean => {

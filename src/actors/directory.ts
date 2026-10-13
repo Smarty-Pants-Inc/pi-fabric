@@ -94,7 +94,6 @@ export class ActorDirectory extends ActorManager {
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
-  override scheduleMeshWake(): void { super.scheduleMeshWake(); this.#secondary.scheduleMeshWake(); }
   override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
     return super.hasDormantIdleActor(protectedIds) || this.#secondary.hasDormantIdleActor(protectedIds);
   }
@@ -197,11 +196,6 @@ export class ActorDirectory extends ActorManager {
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
   override reportStuckPreparing(...args: Parameters<ActorManager["reportStuckPreparing"]>): number { return super.reportStuckPreparing(...args) + this.#secondary.reportStuckPreparing(...args); }
-  // smarty-dev#6337: the earliest stuck-preparing deadline across both scopes (undefined = nothing to arm).
-  override nextStuckPreparingAt(thresholdMs: number, now = Date.now()): number | undefined {
-    const first = super.nextStuckPreparingAt(thresholdMs, now), second = this.#secondary.nextStuckPreparingAt(thresholdMs, now);
-    return first === undefined ? second : second === undefined ? first : Math.min(first, second);
-  }
   override inFlightCount(): number { return super.inFlightCount() + this.#secondary.inFlightCount(); }
   override haltAll(): { halted: number } {
     return { halted: haltEvery([() => super.haltAll().halted, () => this.#secondary.haltAll().halted]) };

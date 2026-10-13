@@ -36,6 +36,13 @@ Unknown projects remain untrusted unless an existing policy or trusted bootstrap
 extension grants trust. Extension-load errors fail closed; a permission guard is
 never silently omitted.
 
+With `extensions: false`, neither Pi runner loads user extension modules, even to
+resolve an extension-registered provider. Built-in and `models.json` models remain
+available. To use an extension-only provider, explicitly enable extensions and
+keep Pi's normal project-trust checks. Fabric does not inject a provider bridge
+into disabled-extension or restricted judgment workers. Unknown models fail
+before task submission without loading discovery code or selecting a fallback.
+
 ## Recovery boundaries
 
 Private per-run JSONL stores flush payloads and commit markers. An OS-held SQLite

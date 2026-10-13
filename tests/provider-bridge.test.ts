@@ -4,9 +4,8 @@ import path from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import fabricProviderBridge, {
-  fabricExtensionEntries,
-  orderProviderCandidates,
   parseModelKey,
+  ProviderNotFoundError,
   PROVIDER_BRIDGE_MODEL_ENV,
   resolveExtensionProviders,
 } from "../src/agents/provider-bridge.js";
@@ -15,11 +14,12 @@ const roots: string[] = [];
 afterAll(() => {
   for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
 });
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 /** An extension that records its own load and registers one config provider. */
 const extensionSource = (marker: string, provider?: string) => `
 import fs from "node:fs";
+fs.appendFileSync(${JSON.stringify(marker + ".module")}, "evaluated\\n");
 export default function (pi) {
   fs.appendFileSync(${JSON.stringify(marker)}, "loaded\\n");
   pi.registerTool({ name: "leaked_tool", label: "Leaked", description: "must not bind", parameters: { type: "object", properties: {} },
@@ -59,7 +59,8 @@ function fixture(options: {
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ extensions: globalPaths, ...options.settings }));
   if (options.models) fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify(options.models));
   const loads = (dir: string) => fs.existsSync(markers[dir]!) ? fs.readFileSync(markers[dir]!, "utf8").trim().split("\n") : [];
-  return { root, cwd, agentDir, markers, loads };
+  const moduleLoaded = (dir: string) => fs.existsSync(markers[dir]! + ".module");
+  return { root, cwd, agentDir, markers, loads, moduleLoaded };
 }
 
 describe("extension provider bridge", () => {
@@ -71,47 +72,31 @@ describe("extension provider bridge", () => {
     expect(parseModelKey("provider/")).toBeUndefined();
   });
 
-  it("probes extensions whose own path names the provider first", () => {
-    const ordered = orderProviderCandidates([
-      "/home/u/.pi/agent/npm/node_modules/pi-better-openai/index.ts",
-      "/home/u/.pi/agent/npm/node_modules/pi-coralbricks-provider/index.ts",
-      "/home/u/coralbricks-fan/work/node_modules/unrelated/dist/index.js",
-      "/home/u/.pi/agent/extensions/CoralBricks.ts",
-    ], "coralbricks");
-    expect(ordered.named).toEqual([
-      "/home/u/.pi/agent/npm/node_modules/pi-coralbricks-provider/index.ts",
-      "/home/u/.pi/agent/extensions/CoralBricks.ts",
-    ]);
-    expect(ordered.rest).toHaveLength(2);
-  });
-
-  it("excludes Fabric's own manifest entries from probing", () => {
-    // The fork keeps index.js as its extension entry; upstream advertises the
-    // bootstrap entry. Exclude the actual installed manifest, not either default.
-    const manifest = JSON.parse(fs.readFileSync("package.json", "utf8")) as { main: string; pi: { extensions: string[] } };
-    expect(fabricExtensionEntries()).toEqual([manifest.main, ...manifest.pi.extensions].map(entry => path.resolve(entry)));
-  });
-
-  it("registers only the named extension's provider and runs no other extension", async () => {
-    const { cwd, agentDir, loads } = fixture({ extensions: [
+  it("does not infer registration authority from an extension's provider-matching path", async () => {
+    const { cwd, agentDir, loads, moduleLoaded } = fixture({ extensions: [
       { dir: "pi-unrelated" },
       { dir: "pi-acme-provider", provider: "acme" },
     ] });
-    const found = await resolveExtensionProviders({ model: "acme/m1", cwd, agentDir });
-    expect(found?.configs.map(({ name, config }) => [name, config.apiKey])).toEqual([["acme", "$FIXTURE_PROVIDER_KEY"]]);
-    expect(found?.natives).toEqual([]);
-    expect(loads("pi-acme-provider")).toEqual(["loaded"]);
-    expect(loads("pi-unrelated")).toEqual([]);
+    await expect(resolveExtensionProviders({ model: "acme/m1", cwd, agentDir })).rejects.toMatchObject({
+      name: "ProviderNotFoundError", code: "PROVIDER_NOT_FOUND", model: "acme/m1", provider: "acme",
+    });
+    for (const dir of ["pi-acme-provider", "pi-unrelated"]) {
+      expect(loads(dir)).toEqual([]);
+      expect(moduleLoaded(dir)).toBe(false);
+    }
   });
 
-  it("falls back to the other installed extensions when no path names the provider", async () => {
-    const { cwd, agentDir, loads } = fixture({ extensions: [
+  it("does not execute provider-named misses or unrelated extensions when extensions are disabled", async () => {
+    const { cwd, agentDir, loads, moduleLoaded } = fixture({ extensions: [
+      { dir: "pi-zeta-provider", provider: "wrong" },
       { dir: "pi-unrelated" },
       { dir: "pi-misc-tools", provider: "zeta" },
     ] });
-    const found = await resolveExtensionProviders({ model: "zeta/m1", cwd, agentDir });
-    expect(found?.configs.map(({ name }) => name)).toEqual(["zeta"]);
-    expect(loads("pi-misc-tools")).toEqual(["loaded"]);
+    await expect(resolveExtensionProviders({ model: "zeta/m1", cwd, agentDir })).rejects.toBeInstanceOf(ProviderNotFoundError);
+    for (const dir of ["pi-zeta-provider", "pi-unrelated", "pi-misc-tools"]) {
+      expect(loads(dir)).toEqual([]);
+      expect(moduleLoaded(dir)).toBe(false);
+    }
   });
 
   it("leaves models Pi already knows untouched and loads no extension", async () => {
@@ -127,31 +112,26 @@ describe("extension provider bridge", () => {
     expect(loads("pi-local-provider")).toEqual([]);
   });
 
-  it("fails closed with an actionable error when nothing registers the provider", async () => {
+  it("fails closed with a typed actionable error when no declarative model exists", async () => {
     const { cwd, agentDir } = fixture({ extensions: [{ dir: "pi-acme-provider", provider: "acme" }] });
     await expect(resolveExtensionProviders({ model: "absent/m1", cwd, agentDir }))
-      .rejects.toThrow(/needs provider "absent"[\s\S]*extensions: true/);
-    const excluded = path.join(path.dirname(agentDir), "packages", "pi-acme-provider", "index.ts");
-    await expect(resolveExtensionProviders({ model: "acme/m1", cwd, agentDir, exclude: [excluded] }))
-      .rejects.toThrow(/needs provider "acme"/);
+      .rejects.toThrow(/needs provider "absent"[\s\S]*models\.json[\s\S]*extensions: true/);
+    await expect(resolveExtensionProviders({ model: "absent/m1", cwd, agentDir }))
+      .rejects.toMatchObject({ code: "PROVIDER_NOT_FOUND", provider: "absent" });
   });
 
-  it.each([
-    ["ask", false],
-    ["always", true],
-  ] as const)("applies project trust %s to project-local provider extensions", async (defaultProjectTrust, trusted) => {
-    const { cwd, agentDir, loads } = fixture({
+  it.each(["ask", "always", "never"])("keeps disabled project provider modules disabled even with project trust %s", async defaultProjectTrust => {
+    const { cwd, agentDir, loads, moduleLoaded } = fixture({
       extensions: [{ dir: "pi-proj-provider", provider: "proj", project: true }],
       settings: { defaultProjectTrust },
     });
-    const pending = resolveExtensionProviders({ model: "proj/m1", cwd, agentDir });
-    if (trusted) await expect(pending).resolves.toMatchObject({ configs: [{ name: "proj" }] });
-    else await expect(pending).rejects.toThrow(/needs provider "proj"/);
-    expect(loads("pi-proj-provider")).toEqual(trusted ? ["loaded"] : []);
+    await expect(resolveExtensionProviders({ model: "proj/m1", cwd, agentDir })).rejects.toBeInstanceOf(ProviderNotFoundError);
+    expect(loads("pi-proj-provider")).toEqual([]);
+    expect(moduleLoaded("pi-proj-provider")).toBe(false);
   });
 
-  it("registers the provider through the bridge's own Pi API only when asked", async () => {
-    const { cwd, agentDir } = fixture({ extensions: [{ dir: "pi-acme-provider", provider: "acme" }] });
+  it("keeps the legacy explicit bridge entry fail-closed instead of executing registration", async () => {
+    const { cwd, agentDir, loads, moduleLoaded } = fixture({ extensions: [{ dir: "pi-acme-provider", provider: "acme" }] });
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
     vi.spyOn(process, "cwd").mockReturnValue(cwd);
     const registerProvider = vi.fn();
@@ -160,9 +140,9 @@ describe("extension provider bridge", () => {
     await fabricProviderBridge(pi);
     expect(registerProvider).not.toHaveBeenCalled();
     vi.stubEnv(PROVIDER_BRIDGE_MODEL_ENV, "acme/m1");
-    await fabricProviderBridge(pi);
-    expect(registerProvider).toHaveBeenCalledOnce();
-    expect(registerProvider.mock.calls[0]![0]).toBe("acme");
-    expect(registerProvider.mock.calls[0]![1]).toMatchObject({ api: "openai-completions", apiKey: "$FIXTURE_PROVIDER_KEY" });
+    await expect(fabricProviderBridge(pi)).rejects.toBeInstanceOf(ProviderNotFoundError);
+    expect(registerProvider).not.toHaveBeenCalled();
+    expect(loads("pi-acme-provider")).toEqual([]);
+    expect(moduleLoaded("pi-acme-provider")).toBe(false);
   });
 });

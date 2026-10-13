@@ -957,7 +957,10 @@ describe.runIf(process.env.CI === "true" && process.platform === "linux")("hoste
 // file this run creates must stay held by its own open fd through the database close, until owned.close() closes each
 // exactly once. Ownership compares the HELD fd's fstat against the name's lstat (dev/ino and size/birthtime): a recycled
 // dev/ino with other bytes, a dead held fd or an fstat failure fails closed and keeps every file, logged once.
-describe("emulated held-file ownership", () => {
+// Linux only: physical cleanup needs a /proc/self/fd traversal of the held root (src/mesh/owned-import-files.ts:30
+// PROC_FD, the pin probe at :83-89). Without it pinImportRoot stays unpinned and keeps every file (:143-153), so this
+// held-descriptor and quarantine model proves physical cleanup on Linux only.
+describe.runIf(process.platform === "linux")("emulated held-file ownership", () => {
   type Node = { dev: number; ino: number; size: number; birth: number; dir: boolean };
   const ROOT = "/emulated-11466-root";
   const WAL = "state.db-wal";
@@ -985,7 +988,9 @@ describe("emulated held-file ownership", () => {
     const at = (name: string): Node | undefined => name === "" ? rootNode : names.get(name);
     const statOf = (n: Node): fs.Stats => ({ dev: n.dev, ino: n.ino, size: n.size, birthtimeMs: n.birth, birthtime: new Date(n.birth),
       uid: process.getuid?.(), mode: n.dir ? 0o40700 : 0o100600, isFile: () => !n.dir, isDirectory: () => n.dir, isSymbolicLink: () => false }) as unknown as fs.Stats;
-    const real = { openSync: fs.openSync, fstatSync: fs.fstatSync, closeSync: fs.closeSync, lstatSync: fs.lstatSync, statSync: fs.statSync };
+    // No real-fs fallback anywhere: an unmapped path or descriptor throws. The one path outside ROOT is "/", ROOT's
+    // sole ancestor (assertPrivateAncestors), modeled as a private directory of this uid.
+    const sysRoot: Node = { dev: 7, ino: 2, size: 0, birth: 0, dir: true };
     // Removal recorders never delegate: any call is recorded and dropped.
     const record = (api: string) => (target: unknown): void => { m.removals.push(`${api}:${String(target)}`); };
     vi.spyOn(fs, "unlinkSync").mockImplementation(record("unlinkSync"));
@@ -994,18 +999,23 @@ describe("emulated held-file ownership", () => {
     vi.spyOn(fs.promises, "unlink").mockImplementation(async (target) => record("promises.unlink")(target));
     vi.spyOn(fs.promises, "rm").mockImplementation(async (target) => record("promises.rm")(target));
     vi.spyOn(fs.promises, "rmdir").mockImplementation(async (target) => record("promises.rmdir")(target));
-    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, flags?: number | string, mode?: number) => {
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, flags?: number | string) => {
       const name = rel(target);
-      if (name === undefined) return real.openSync(target, flags as never, mode);
+      if (name === undefined) throw errno("EACCES");
       let n = at(name);
       if (n && name !== "" && typeof flags === "number" && (flags & fs.constants.O_EXCL)) throw errno("EEXIST");
-      if (!n) { n = node(); names.set(name, n); }
+      if (!n) {
+        // Only a create flag makes a missing name, and only in an existing modeled directory.
+        const creates = typeof flags === "number" ? (flags & fs.constants.O_CREAT) !== 0 : /[wa]/.test(String(flags ?? "r"));
+        const slash = name.lastIndexOf("/");
+        if (!creates || !(slash < 0 ? rootNode : at(name.slice(0, slash)))?.dir) throw errno("ENOENT");
+        n = node(); names.set(name, n);
+      }
       const fd = nextFd++;
       fds.set(fd, n);
       return fd;
     }) as typeof fs.openSync);
-    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: never) => {
-      if (fd < FD0) return real.fstatSync(fd, options);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number) => {
       const n = fds.get(fd);
       if (!n) throw errno("EBADF");
       const failure = n.dir ? undefined : m.fstatFail?.(n);
@@ -1013,20 +1023,25 @@ describe("emulated held-file ownership", () => {
       return statOf(n);
     }) as typeof fs.fstatSync);
     vi.spyOn(fs, "closeSync").mockImplementation((fd: number) => {
-      if (fd < FD0) { real.closeSync(fd); return; }
+      if (fd < FD0 || fd >= nextFd) throw errno("EBADF"); // never issued by the model: no real descriptor is touched
       closes.set(fd, (closes.get(fd) ?? 0) + 1);
       if (!fds.delete(fd)) throw errno("EBADF");
     });
-    const lookup = (fallback: typeof fs.lstatSync) => ((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+    const lookup = ((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      if (String(target) === "/") return statOf(sysRoot);
       const name = rel(target);
-      if (name === undefined) return fallback(target, options);
+      if (name === undefined) throw errno("EACCES"); // fails closed even with throwIfNoEntry: false
       const n = at(name);
       if (n) return statOf(n);
       if (options?.throwIfNoEntry === false) return undefined;
       throw errno("ENOENT");
     }) as typeof fs.lstatSync;
-    vi.spyOn(fs, "lstatSync").mockImplementation(lookup(real.lstatSync));
-    vi.spyOn(fs, "statSync").mockImplementation(lookup(real.statSync as typeof fs.lstatSync) as typeof fs.statSync);
+    vi.spyOn(fs, "lstatSync").mockImplementation(lookup);
+    vi.spyOn(fs, "statSync").mockImplementation(lookup as unknown as typeof fs.statSync);
+    vi.spyOn(fs, "realpathSync").mockImplementation(((target: fs.PathLike) => {
+      if (String(target) === ROOT) return ROOT;
+      throw errno("EACCES");
+    }) as typeof fs.realpathSync);
     vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
       const name = rel(prefix);
       if (name === undefined) throw errno("EACCES");
@@ -1192,8 +1207,6 @@ describe("emulated held-file ownership", () => {
     const m = emulate();
     const { owned, db, wal, shm } = created(m);
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-    const realpath = fs.realpathSync;
-    vi.spyOn(fs, "realpathSync").mockImplementation(((p: fs.PathLike) => String(p) === ROOT ? ROOT : realpath(p)) as typeof fs.realpathSync);
     Object.defineProperty(process, "platform", { value: "darwin" }); // the post-open lstat path, not a platform claim
     const gate = (closeThrows: boolean): unknown => {
       const closeError = errno("EIO");
@@ -1247,5 +1260,27 @@ describe("emulated held-file ownership", () => {
     expect(owned.removeAfterRefusal()).toEqual({ cleanupWarnings: [], retained: [] });
     expect(m.renames).toEqual([]);
     finish(m, owned);
+  });
+
+  it("the model fails closed: unmapped paths and descriptors throw, and nothing is created, moved or removed", () => {
+    const m = emulate();
+    const before = [...m.names.keys()];
+    // Unmapped requests must fail without reaching the host filesystem or any real descriptor.
+    expect(() => fs.openSync("/tmp", fs.constants.O_RDONLY)).toThrow(/EACCES: emulated/);
+    expect(() => fs.openSync(`${ROOT}/absent`, fs.constants.O_RDONLY)).toThrow(/ENOENT: emulated/);
+    expect(() => fs.openSync(`${ROOT}/no-dir/state.db`, "wx", 0o600)).toThrow(/ENOENT: emulated/);
+    expect(() => fs.fstatSync(0)).toThrow(/EBADF: emulated/);
+    expect(() => fs.closeSync(FD0 - 1)).toThrow(/EBADF: emulated/);
+    expect(() => fs.lstatSync("/tmp", { throwIfNoEntry: false })).toThrow(/EACCES: emulated/);
+    expect(() => fs.statSync("/proc/self/fd/0/.", { throwIfNoEntry: false })).toThrow(/EACCES: emulated/);
+    expect(() => fs.realpathSync("/tmp")).toThrow(/EACCES: emulated/);
+    expect(fs.lstatSync(`${ROOT}/absent`, { throwIfNoEntry: false })).toBeUndefined();
+    expect(() => fs.lstatSync(`${ROOT}/absent`)).toThrow(/ENOENT: emulated/);
+    expect([...m.names.keys()], "nothing created").toEqual(before);
+    expect(m.fds.size).toBe(0);
+    expect(m.closes.size).toBe(0);
+    expect(m.renames).toEqual([]);
+    expect(m.mkdtemps).toBe(0);
+    expect(m.removals).toEqual([]);
   });
 });

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -530,6 +531,69 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       expect(sweeps.calls()).toBe(calls);
       vi.advanceTimersByTime(keptAt - Date.now());
       await settle(() => retired(root).includes("kept"));
+      expect(archive.health.error).toBe("");
+    } finally { await archive.close(); }
+  });
+
+  it("disabled policy at a >256 due batch arms only the slow fallback (never 0ms); re-enable drains all", async () => {
+    fakeTimers();
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const root = temporary(), ageMs = 10 * LEGACY_ARCHIVE_DEADLINE_MS, dueAt = Date.now() + LEGACY_ARCHIVE_DEADLINE_MS;
+    const ids = Array.from({ length: 300 }, (_, i) => `young${i}`);
+    for (const id of ids) tree(path.join(root, "runs", id), { finishedAt: dueAt - ageMs });
+    const policy: { legacyRunArchiveEnabled?: boolean; legacyRunArchiveAgeMs: number } = { legacyRunArchiveAgeMs: ageMs };
+    const archive = new ResidentLegacyRunArchive(root, policy, { isRetained: () => false });
+    const sweeps = track(archive);
+    try {
+      archive.start();
+      await settle(() => archive.health.checked >= 300 && vi.getTimerCount() === 1, 50_000);
+      expect(Date.now() + Number(timeout.mock.calls.at(-1)![1])).toBe(dueAt);
+      policy.legacyRunArchiveEnabled = false;
+      const calls = sweeps.calls();
+      vi.advanceTimersByTime(dueAt - Date.now());
+      await settle(() => sweeps.done() > calls && vi.getTimerCount() === 1);
+      await turns(200);
+      expect(Number(timeout.mock.calls.at(-1)![1])).toBe(LEGACY_ARCHIVE_DEADLINE_MS);
+      expect(retired(root)).toEqual([]);
+      // Bounded across a fake minute: the overdue batch never wins at 0ms.
+      await advance(LEGACY_ARCHIVE_DEADLINE_MS - 1, 10);
+      expect(sweeps.calls()).toBeLessThanOrEqual(calls + 1);
+      policy.legacyRunArchiveEnabled = true;
+      await advance(LEGACY_ARCHIVE_DEADLINE_MS, 10);
+      await settle(() => retired(root).length === 300, 100_000);
+      expect(new Set(retired(root))).toEqual(new Set(ids));
+      expect(archive.health.error).toBe("");
+    } finally { await archive.close(); }
+  });
+
+  it("EACCES on the due-time queued lstat retains a slow 60s retry; once permitted, it archives once", async () => {
+    fakeTimers();
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const root = temporary(), ageMs = 10 * LEGACY_ARCHIVE_DEADLINE_MS, dueAt = Date.now() + LEGACY_ARCHIVE_DEADLINE_MS;
+    const run = path.join(root, "runs", "kept");
+    tree(run, { finishedAt: dueAt - ageMs });
+    const archive = new ResidentLegacyRunArchive(root, { legacyRunArchiveAgeMs: ageMs }, { isRetained: () => false });
+    const sweeps = track(archive);
+    try {
+      archive.start();
+      await settle(() => sweeps.done() >= 1 && vi.getTimerCount() === 1);
+      const original = fsp.lstat.bind(fsp);
+      const lstat = vi.spyOn(fsp, "lstat").mockImplementation((async (...args: Parameters<typeof fsp.lstat>) => {
+        if (args[0] === run) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return original(...args);
+      }) as typeof fsp.lstat);
+      const calls = sweeps.calls();
+      vi.advanceTimersByTime(dueAt - Date.now());
+      await settle(() => sweeps.done() > calls && vi.getTimerCount() === 1);
+      await turns(200);
+      expect(lstat.mock.calls.some(call => call[0] === run)).toBe(true);
+      expect(Number(timeout.mock.calls.at(-1)![1])).toBe(LEGACY_ARCHIVE_DEADLINE_MS);
+      expect(sweeps.calls()).toBe(calls + 1);
+      expect(retired(root)).toEqual([]);
+      lstat.mockRestore();
+      vi.advanceTimersByTime(LEGACY_ARCHIVE_DEADLINE_MS);
+      await settle(() => retired(root).includes("kept"));
+      expect(retired(root)).toEqual(["kept"]);
       expect(archive.health.error).toBe("");
     } finally { await archive.close(); }
   });

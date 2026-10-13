@@ -246,8 +246,11 @@ export class ResidentLegacyRunArchive {
     const now = Date.now();
     const full = this.#fallback();
     let at = full ? now + LEGACY_ARCHIVE_DEADLINE_MS : Number.POSITIVE_INFINITY;
-    if (this.#rescanAt !== undefined) at = Math.min(at, this.#rescanAt);
-    for (const due of this.#due.values()) at = Math.min(at, due);
+    // Disabled: due/rescan obligations cannot drain; only the slow fallback may arm.
+    if (this.#enabled()) {
+      if (this.#rescanAt !== undefined) at = Math.min(at, this.#rescanAt);
+      for (const due of this.#due.values()) at = Math.min(at, due);
+    }
     if (at === Number.POSITIVE_INFINITY) return;
     this.#deadline = setTimeout(() => {
       this.#deadline = undefined;
@@ -390,7 +393,7 @@ export class ResidentLegacyRunArchive {
       try {
         const directory = await fsp.opendir(runs);
         try { this.#disabledHeld = !!await directory.read(); } finally { await directory.close(); }
-      } catch { this.#disabledHeld = false; }
+      } catch (error) { this.#disabledHeld = !gone(error); } // Unknown error is not confirmed absence.
       return;
     }
     if (now < this.#nextScan && !this.#pending.size) return;
@@ -416,7 +419,7 @@ export class ResidentLegacyRunArchive {
             // Confirmed absence cancels the due obligation; an unknown error
             // (EACCES, ...) is no negative evidence: keep it, and keep the pass from pruning it.
             if (gone(error) || (error as NodeJS.ErrnoException).code === "ENOTDIR") this.#due.delete(id);
-            else this.#scanMissing?.delete(id);
+            else this.#hold(id, Math.max(this.#due.get(id) ?? 0, Date.now() + LEGACY_ARCHIVE_DEADLINE_MS));
             continue;
           }
           this.#scanMissing?.delete(id);

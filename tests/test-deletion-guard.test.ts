@@ -288,11 +288,21 @@ it("keeps native Windows deletion hosted-only without invoking its test callback
   }
 });
 
-// smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. Own list, not the config's.
-const realDeleteSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
+// smarty-dev#11145 / #4664: product suites that delete real paths run only hosted. The config derives them by
+// scanning test sources for its exported markers; this file keeps the original six plus every actor-remove suite
+// as an independent floor. No marker text appears in this source, so the scanner cannot select this file.
+const originalSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
   "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
   "tests/scratch-platform-retention.test.ts"];
-// Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs.
+const testsDir = new URL("./", import.meta.url);
+const actorRemoveSuites = (fs.readdirSync(testsDir, { recursive: true }) as string[])
+  .map((name) => String(name).split(sep).join("/"))
+  .filter((name) => /(^|\/)actor-remove-[^/]*\.test\.ts$/.test(name))
+  .map((name) => `tests/${name}`).sort();
+const ownSuite = "tests/test-deletion-guard.test.ts";
+// Imports only the real vitest.config.ts (type-only Vitest edge erased); no test file or callback runs. The child
+// also writes a pseudo tests root under the private TMPDIR whose nested suite carries the config's first marker
+// (taken from the config at runtime) and asks the scanner.
 const configChild = `
 import fs from "node:fs";
 import { registerHooks } from "node:module";
@@ -303,9 +313,26 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   }
   return nextResolve(specifier, context);
 }});
-const config = (await import(process.argv[2])).default;
+const [configUrl, fixtureRoot] = process.argv.slice(2);
+const mod = await import(configUrl);
+const config = mod.default;
 const project = config.test.projects.find((entry) => entry.test.name === "default");
-console.log("CONFIG:" + JSON.stringify({ include: project.test.include, exclude: project.test.exclude ?? [] }));
+const out = { include: project.test.include, exclude: project.test.exclude ?? [], rootExclude: config.test.exclude ?? [],
+  exported: typeof mod.productDeletionSuites === "function" && Array.isArray(mod.productDeletionMarkers)
+    && mod.productDeletionMarkers.length > 0 };
+if (out.exported) {
+  const text = mod.productDeletionMarkers[0];
+  out.markerFound = typeof text === "string" && text.length > 0;
+  if (out.markerFound) {
+    fs.mkdirSync(fixtureRoot + "/nested", { recursive: true });
+    fs.writeFileSync(fixtureRoot + "/nested/marker.test.ts", "/* fixture */\\n" + text + "\\n");
+    fs.writeFileSync(fixtureRoot + "/nested/helper.ts", "/* fixture */\\n" + text + "\\n");
+    fs.writeFileSync(fixtureRoot + "/neutral.test.ts", "export const neutral = 1;\\n");
+    out.fixture = mod.productDeletionSuites(fixtureRoot);
+  }
+  out.suites = mod.productDeletionSuites();
+}
+console.log("CONFIG:" + JSON.stringify(out));
 `;
 
 it.each([[undefined, false], ["false", false], ["true", true]] as const)(
@@ -313,13 +340,32 @@ it.each([[undefined, false], ["false", false], ["true", true]] as const)(
     const env: NodeJS.ProcessEnv = { ...process.env, GITHUB_ACTIONS: value,
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --experimental-transform-types` };
     if (value === undefined) delete env.GITHUB_ACTIONS;
+    const fixtureRoot = mkdtempSync(join(fixtures, "pseudo-tests-"));
+    expect(inside(privateTemp, fixtureRoot)).toBe(true);
     const result = runChild(`config-child-${value}.mjs`, configChild,
-      [new URL("../vitest.config.ts", import.meta.url).href], env);
+      [new URL("../vitest.config.ts", import.meta.url).href, fixtureRoot], env);
     const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith("CONFIG:"));
     expect(line, result.stdout + result.stderr).toBeDefined();
-    const { include, exclude } = JSON.parse(line!.slice("CONFIG:".length)) as { include: string[]; exclude: string[] };
-    expect(include).toEqual(["tests/**/*.test.ts"]);
-    expect(realDeleteSuites.filter((suite) => exclude.includes(suite))).toEqual(selected ? [] : realDeleteSuites);
+    const output = JSON.parse(line!.slice("CONFIG:".length)) as { include: string[]; exclude: string[];
+      rootExclude: string[]; exported: boolean; markerFound?: boolean; fixture?: string[]; suites?: string[] };
+    expect(output.include).toEqual(["tests/**/*.test.ts"]);
+    expect(output.exported, "vitest.config.ts must export productDeletionSuites() and non-empty productDeletionMarkers")
+      .toBe(true);
+    expect(output.markerFound, "first deletion marker must be usable as fixture source").toBe(true);
+    expect(actorRemoveSuites).toContain("tests/actor-remove-dead-root.test.ts");
+    const required = [...originalSuites, ...actorRemoveSuites];
+    if (selected) {
+      expect(output.suites).toEqual([]);
+      expect(output.fixture).toEqual([]);
+      expect(required.filter((suite) => output.exclude.includes(suite) || output.rootExclude.includes(suite))).toEqual([]);
+    } else {
+      const suites = output.suites!;
+      expect(suites).toEqual(expect.arrayContaining(required));
+      expect(suites).not.toContain(ownSuite);
+      for (const suite of suites) expect(suite).toMatch(/^tests\/(?:[^/\\]+\/)*[^/\\]+\.test\.ts$/);
+      expect(suites.filter((suite) => !output.exclude.includes(suite))).toEqual([]);
+      expect(output.fixture).toEqual(["tests/nested/marker.test.ts"]);
+    }
   });
 
 describe("deletion guard in child processes", () => {

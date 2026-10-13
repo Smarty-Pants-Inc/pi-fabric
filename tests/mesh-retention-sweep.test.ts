@@ -427,20 +427,25 @@ describe("final pre-delete check fences", () => {
     expect(applied.removedRuns).not.toContain(mesh.latest);
   });
 
-  // A re-walk meets an entry that vanished between the listing and its lstat (skipped: it references nothing now, and
-  // the next check walks again), or a hard-linked file (uncertain: kept, while it lasts).
-  it("plans an expired unreferenced run when a re-walk meets an entry that vanishes during the re-walk", async () => {
+  // An incomplete walk keeps this candidate; a later independent check recovers after the transient entry is gone.
+  it("keeps the current candidate after a vanished walk entry and plans the next stable candidate", async () => {
     const mesh = deadRootMesh();
     const session = path.join(mesh.root, "actors", "01a118ab-new-session");
     const injected = onStatusRead(mesh.old, () => write(path.join(session, "actors.json"), JSON.stringify({ actors: [] })));
     const list = fs.readdirSync;
+    let vanished = false;
     vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
       const names = (list as (...args: unknown[]) => unknown)(target, ...rest);
-      return target === session && Array.isArray(names) && names.every(name => typeof name === "string") ? [...names, "actors.json.4242.tmp"] : names;
+      if (!vanished && target === session && Array.isArray(names) && names.every(name => typeof name === "string")) {
+        vanished = true;
+        return [...names, "actors.json.4242.tmp"];
+      }
+      return names;
     }) as typeof fs.readdirSync);
     const applied = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
-    expect(injected()).toBe(true);
-    expect(applied.removedRuns).toContain(mesh.old);
+    expect([injected(), vanished]).toEqual([true, true]);
+    expect(applied.removedRuns).not.toContain(mesh.old);
+    expect(applied.removedRuns).toContain(mesh.orphan);
   });
 
   it.each(["a hard-linked file"])("keeps the run while a re-walk meets %s", async kind => {
@@ -577,7 +582,7 @@ describe("final pre-delete check fences", () => {
     expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
   });
 
-  it("plans an expired unreferenced run when a listed non-registry directory gains an unrelated actors.json after the probe (race 2)", async () => {
+  it("keeps the overlapped candidate and plans the next after an unrelated actors.json appears after the probe (race 2)", async () => {
     const mesh = deadRootMesh();
     const session = path.join(mesh.root, "actors", "01a118ab-new-session");
     fs.mkdirSync(session, { recursive: true }); // listed, watched, no registry yet
@@ -600,7 +605,8 @@ describe("final pre-delete check fences", () => {
     }) as typeof fs.lstatSync);
     const plan = await sweepMeshRetention(mesh.root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
     expect([injected(), done]).toEqual([true, true]);
-    expect(plan.removedRuns).toContain(mesh.old);
+    expect(plan.removedRuns).not.toContain(mesh.old);
+    expect(plan.removedRuns).toContain(mesh.orphan);
     expect(plan.removedRuns).not.toContain(mesh.latest);
     expect(fs.readFileSync(path.join(mesh.old, "reply.json"), "utf8")).toBe('{"text":"done"}');
   });

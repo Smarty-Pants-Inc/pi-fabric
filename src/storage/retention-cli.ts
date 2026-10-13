@@ -232,8 +232,9 @@ const sweep = async (meshRoot: string, options: {
   const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
   // #10635: a listed entry gone at its lstat (ENOENT) re-lists, at most 3 listings per call. Gone and staying gone is a
   // benign removal. Every identity seen within this call is kept and compared with all later reads: a different one is
-  // a replacement (undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
+  // a replacement (sticky `stop`, then undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
   // against the sweep's first-ever identities. Any other error, or a third listing with a vanished entry, is unknown.
+  let stop: string | undefined; // sticky: set only by a replacement
   const entries = (): Map<string, string> | undefined => {
     const seen = new Map<string, string>();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -249,7 +250,7 @@ const sweep = async (meshRoot: string, options: {
             vanished = true; continue;
           }
           const identity = `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
-          if (seen.has(name) && seen.get(name) !== identity) return undefined;
+          if (seen.has(name) && seen.get(name) !== identity) { stop ??= "an actors entry changed type or identity"; return undefined; }
           seen.set(name, identity); current.set(name, identity);
         }
         if (!vanished) return current;
@@ -260,8 +261,10 @@ const sweep = async (meshRoot: string, options: {
   // smarty-dev#9058: every candidate is decided at its own final check, `checkedFresh` below, which surrounds the actual
   // refs.fresh() read. Only a replaced entry or a replaced/moved actors/ is sticky (#9160, #10635); any other change or
   // uncertainty keeps only the candidate whose check it overlaps, and the next check re-walks and recovers.
-  // Registries live at actors/actors.json or actors/<session>/actors.json (fabric-runtime-state.ts `actorRoots`), so an
-  // observation is: actors/'s own identity, every direct entry's type/dev/ino, and an exact lstat stamp (or absence) of
+  // Canonical runtime registry roots are actors/actors.json and actors/<session>/actors.json (fabric-runtime-state.ts
+  // `actorRoots`). This is not an exhaustive ownership claim: registries under supported non-canonical config/run-root
+  // overrides are not attributed here, which stays unresolved under smarty-dev#10678 (this dry run frees nothing; apply
+  // is refused). Over the canonical roots an observation is: actors/'s own identity, every direct entry's type/dev/ino, and an exact lstat stamp (or absence) of
   // actors.json in actors/ and in EVERY current direct directory. Directory timestamps are not used (a coarse tick hides a
   // create). It never stats the ~10k actor homes below (smarty-dev#7916); only a changed name or presence re-walks.
   const rootIdentity = (): string | undefined => {
@@ -282,7 +285,6 @@ const sweep = async (meshRoot: string, options: {
     const stat = fs.lstatSync(file, { throwIfNoEntry: false });
     return stat && `${entryKind(stat)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.nlink}:${stat.uid}`;
   };
-  let stop: string | undefined; // sticky: set only by a replacement
   /** The observation, or why it is unknown (with `stop` set when that is a replacement). */
   const observe = (): { key: string; full: string; current: Map<string, string> } | string => {
     const root = rootIdentity();

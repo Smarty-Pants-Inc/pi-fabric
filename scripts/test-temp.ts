@@ -1,6 +1,6 @@
 import fs, { lstatSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 // Only call immediately after mkdtemp: path ownership is not ownership of a replacement.
 const ownedRootCleanup = (directory: string): (() => void) => {
@@ -32,7 +32,11 @@ const ownedRootCleanup = (directory: string): (() => void) => {
 const stableRoot = (prefix: string): string | undefined => {
   const runnerTemp = process.env.RUNNER_TEMP;
   if (process.platform !== "win32" || !runnerTemp) return;
-  const directory = join(resolve(tmpdir()), `${prefix}job`);
+  // Idempotent: vitest.config exports this directory as TMPDIR, so a later call in that process or an inheriting
+  // child (a config probe, a worker) already stands in it and must not nest a second `<prefix>job` below it.
+  const base = resolve(tmpdir());
+  const name = `${prefix}job`;
+  const directory = basename(base) === name ? base : join(base, name);
   mkdirSync(directory, { recursive: true });
   if (!lstatSync(directory).isDirectory()) {
     throw new Error(`Windows job temp must be a real directory inside caller TMPDIR: ${directory}`);

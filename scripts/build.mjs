@@ -51,6 +51,8 @@ const primaryEntryPoints = [
 // path lets a session that loaded the previous index resolve delayed modules
 // after the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
+  "src/storage/verified-remove.ts",
   "src/residency/launcher-owner.ts",
   "src/residency/wake.ts",
   "src/residency/process-work.ts",

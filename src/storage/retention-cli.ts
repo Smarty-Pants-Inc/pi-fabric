@@ -122,10 +122,24 @@ export const MESH_RETENTION_APPLY_DISABLED = "retention --apply is disabled for 
 export interface MeshRetentionSummary {
   /** Per deleter: removed (dry run: would remove), bytes, refusals by reason (with up to 3 example paths). */
   deleters: Record<string, DeleterTally>;
-  /** Why --apply would refuse now (hold, epoch, state.json doubt, platform), or undefined. */
+  /** Underlying custody-gate doubt (hold, epoch, state.json, platform), or undefined. This is a preview diagnostic,
+   * not apply permission: the exported boundary and CLI still unconditionally refuse apply until #10678. */
   applyRefusal?: string;
   /** Actor registries read by this sweep: count, total parses, the most parses of one registry (1 unless it changed). */
   registries: { count: number; parses: number; maxParsesPerRegistry: number; rootRewalks: number };
+}
+/** Stable code of {@link MeshRetentionApplyDisabledError}. */
+export const MESH_RETENTION_APPLY_DISABLED_CODE = "ERR_MESH_RETENTION_APPLY_DISABLED";
+/** sweepMeshRetention(meshRoot, { dryRun: false }) rejects with this, before it reads the mesh or arms any deleter:
+ * apply stays disabled for every in-process caller (not only the CLI) until smarty-dev#10678 (owner-attributed
+ * callback fencing) lands. There is no bypass; a dry run (the default) still previews. */
+export class MeshRetentionApplyDisabledError extends Error {
+  readonly code = MESH_RETENTION_APPLY_DISABLED_CODE;
+  readonly issue = "smarty-dev#10678";
+  constructor() {
+    super("sweepMeshRetention: apply (dryRun: false) is disabled until smarty-dev#10678 (owner-attributed callback fencing) lands; nothing was read or changed. Use a dry run.");
+    this.name = "MeshRetentionApplyDisabledError";
+  }
 }
 // The last sweep's registry parse counts and root re-walks, for its summary (the sweep has many early returns).
 let registryParses: ReadonlyMap<string, number> = new Map();
@@ -137,12 +151,15 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
   /** Removal age of a proven-dead resident root's runs (default: the live host's 24 h). */
   residentRunRetentionMs?: number;
 } = {}) => {
+  // smarty-dev#10678 (pi-fabric#1014 SEC P2-1): refuse at the first statement. The private sweep pins every callback
+  // to a literal dry run, so later reads of a caller-owned getter cannot enable an apply.
+  if (options.dryRun === false) throw new MeshRetentionApplyDisabledError();
   const tally = startRemovalTally();
   registryParses = new Map(); registryRewalks = 0;
   // The operator's sweep removes through the Windows helper (smarty-dev#7858); in-process sweeps do not.
   setWindowsVerifiedRemoval(true);
   try {
-    const result = await sweep(meshRoot, options);
+    const result = await sweep(meshRoot, options, true);
     const parses = [...registryParses.values()];
     const summary: MeshRetentionSummary = { deleters: tally, registries: {
       count: parses.length, parses: parses.reduce((sum, count) => sum + count, 0), maxParsesPerRegistry: Math.max(0, ...parses),
@@ -169,10 +186,10 @@ export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): st
   lines.push(`${dryRun ? "WOULD_FREE_GIB" : "FREED_GIB"}=${(bytes / 1024 ** 3).toFixed(3)}`);
   return lines;
 };
+// dryRun is the literal true until smarty-dev#10678: the apply branches below are kept for that protocol, unreachable.
 const sweep = async (meshRoot: string, options: {
   dryRun?: boolean; now?: number; runRetentionMs?: number; residentRunRetentionMs?: number;
-}) => {
-  const dryRun = options.dryRun !== false;
+}, dryRun: true) => {
   const now = options.now ?? Date.now();
   const removedRuns: string[] = [];
   const changes: Array<{ path: string; beforeBytes: number; afterBytes: number }> = [];
@@ -208,14 +225,32 @@ const sweep = async (meshRoot: string, options: {
   // #9160: each direct actors/ entry's lstat type, dev and ino (never mtime: actor activity must not stop the sweep),
   // taken before discovery so a swap during or after the walk differs. undefined: unknown listing or stat (fail closed).
   const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
+  // #10635: a listed entry gone at its lstat (ENOENT) re-lists, at most 3 listings per call. Gone and staying gone is a
+  // benign removal. Every identity seen within this call is kept and compared with all later reads: a different one is
+  // a replacement (undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
+  // against the sweep's first-ever identities. Any other error, or a third listing with a vanished entry, is unknown.
   const entries = (): Map<string, string> | undefined => {
-    try {
-      if (absent(actorsRoot)) return new Map();
-      return new Map(fs.readdirSync(actorsRoot).map(name => {
-        const stat = fs.lstatSync(path.join(actorsRoot, name));
-        return [name, `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`] as const;
-      }));
-    } catch { return undefined; }
+    const seen = new Map<string, string>();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (absent(actorsRoot)) return new Map();
+        const current = new Map<string, string>();
+        let vanished = false;
+        for (const name of fs.readdirSync(actorsRoot)) {
+          let stat: fs.Stats;
+          try { stat = fs.lstatSync(path.join(actorsRoot, name)); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+            vanished = true; continue;
+          }
+          const identity = `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
+          if (seen.has(name) && seen.get(name) !== identity) return undefined;
+          seen.set(name, identity); current.set(name, identity);
+        }
+        if (!vanished) return current;
+      } catch { return undefined; }
+    }
+    return undefined;
   };
   let listing = entries();
   if (!listing) throw new Error(`Actor references are uncertain: ${actorsRoot}`);
@@ -467,14 +502,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const report = take("--report");
   const value = take("--runs-older-than");
   const [root, mode = "--dry-run"] = args;
-  // --apply is refused until every destructive callback acts through a held directory fd: the identity checks here
-  // are still path-based, so a same-UID swap after them could redirect a removal (smarty-dev#7916 PR-b).
+  // Helper verification alone does not prove every callback's owner/reference fence. --apply stays refused until
+  // the wider protocol in smarty-dev#10678 lands (scope cut from smarty-dev#7916 PR-b).
   const runRetentionMs = value === undefined ? undefined : Number(value);
   if (!root || !["--dry-run", "--apply"].includes(mode) || args.length > 2 || report === "" ||
       (runRetentionMs !== undefined && (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 60 * 60 * 1_000))) {
     console.error("Usage: node dist/storage/retention-cli.js <mesh-root> [--dry-run] [--runs-older-than <ms, >= 1 h>] [--report <file>]"); process.exitCode = 2;
   } else if (mode === "--apply") {
-    console.error("retention-cli: --apply is disabled until smarty-dev#7916 PR-b (verified dirfd removal) lands; nothing was changed. Use --dry-run.");
+    console.error("retention-cli: --apply is disabled until smarty-dev#10678 (owner-attributed callback fencing) lands; nothing was changed. Use --dry-run.");
     process.exitCode = 2;
   } else {
     try {

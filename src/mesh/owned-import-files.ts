@@ -9,6 +9,9 @@
  * platform-name gate and no `/dev/fd` fallback (fabric-store, #9501; macOS residual smarty-dev#11066, Windows
  * smarty-dev#7858). Without it nothing is removed: the run reports what it kept (reason `no-held-dir-fd`), never a
  * path-based unlink.
+ * Pinned removal first renames a name into a fresh mkdtemp (0700) `.import-quarantine-*` directory of the held root and
+ * checks the moved entry's dev/ino there: only this run's inode is unlinked; anything else is linked back (never over a
+ * newer name) or kept in quarantine and reported. Nothing is ever removed recursively.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -24,6 +27,7 @@ const PROC_FD = "/proc/self/fd";
  * names the inode this run created, or existed before it).
  */
 export type RetainReason = "no-held-dir-fd" | "close-failed" | "cleanup-failed" | "not-this-runs-file";
+/** `retained` names are root-relative: a state.db name, or `.import-quarantine-*` (and `/<name>`) left in quarantine. */
 export interface RefusalCleanupReport { cleanupWarnings: string[]; retained: string[]; reason?: RetainReason }
 
 export interface OwnedImportFiles {
@@ -119,18 +123,54 @@ export const pinImportRoot = (root: string): OwnedImportFiles => {
         catch (error) { failed = true; retained.push(name); cleanupWarnings.push(`could not check ${root}/${name}: ${messageOf(error)}`); return; }
         if (!found) return; // SQLite's own close removes its sidecars
         const mine = owned.get(name);
-        if (!mine || !found.isFile() || found.dev !== mine.dev || found.ino !== mine.ino) {
+        const isMine = (stat: fs.Stats): boolean => !!mine && stat.isFile() && stat.dev === mine.dev && stat.ino === mine.ino;
+        if (!isMine(found)) {
           retained.push(name);
           cleanupWarnings.push(`kept ${root}/${name}: it is not the file this run created (${mine ? "replaced" : "it existed before"})`);
           return;
         }
-        try { fs.unlinkSync(at); }
-        catch (error) { failed = true; retained.push(name); cleanupWarnings.push(`could not remove ${root}/${name}: ${messageOf(error)}`); }
+        const keep = (kept: string, warning: string): void => { failed = true; retained.push(kept); cleanupWarnings.push(warning); };
+        // ponytail: the name may change between that lstat and a removal, so move it into a fresh private slot first and
+        // judge the moved entry. A same-UID process can still find and race inside the slot (accepted residual, #11066).
+        let slot: string;
+        try { slot = path.basename(fs.mkdtempSync(path.join(pinnedDir!, ".import-quarantine-"))); }
+        catch (error) { keep(name, `could not make a quarantine directory in ${root} for ${name}: ${messageOf(error)}`); return; }
+        const dir = path.join(pinnedDir!, slot);
+        const moved = path.join(dir, name);
+        const qname = `${slot}/${name}`;
+        const rmdir = (): void => {
+          try { fs.rmdirSync(dir); }
+          catch (error) { keep(slot, `could not remove the empty quarantine directory ${root}/${slot}: ${messageOf(error)}`); }
+        };
+        try { fs.renameSync(at, moved); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") keep(name, `could not move ${root}/${name} to quarantine: ${messageOf(error)}`);
+          rmdir(); // ENOENT: already gone, nothing to remove
+          return;
+        }
+        let inSlot: fs.Stats;
+        try { inSlot = fs.lstatSync(moved); }
+        catch (error) { keep(qname, `could not check ${root}/${qname} (moved from ${name}): ${messageOf(error)}`); return; }
+        if (!isMine(inSlot)) {
+          // Not this run's file: link it back under its name (never over a newer one), then drop the quarantine alias.
+          try { fs.linkSync(moved, at); }
+          catch (error) {
+            keep(qname, `kept ${root}/${qname}: it replaced ${name} before the move and could not be put back: ${messageOf(error)}`);
+            try { if (fs.lstatSync(at, { throwIfNoEntry: false })) retained.push(name); }
+            catch { retained.push(name); }
+            return;
+          }
+          retained.push(name);
+          cleanupWarnings.push(`kept ${root}/${name}: it is not the file this run created (replaced)`);
+        }
+        try { fs.unlinkSync(moved); }
+        catch (error) { keep(qname, `could not remove ${root}/${qname} (moved from ${name}): ${messageOf(error)}`); return; }
+        rmdir();
       };
       for (const name of SIDECARS) removeOne(name);
       if (retained.length > 0) {
         retained.push(STATE_DB);
-        cleanupWarnings.push(`kept ${root}/${STATE_DB}: its ${SIDECARS.filter(name => retained.includes(name)).join(" and ")} stayed`);
+        cleanupWarnings.push(`kept ${root}/${STATE_DB}: ${retained.join(" and ")} stayed`);
       } else removeOne(STATE_DB);
       if (retained.length === 0) return { cleanupWarnings, retained };
       return { cleanupWarnings, retained, reason: failed ? "cleanup-failed" : "not-this-runs-file" };

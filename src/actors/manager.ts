@@ -4146,27 +4146,32 @@ export class ActorManager {
           // actor sent to and received from its model, even after a successful
           // run cleans up the in-memory handle and tmp run directory. Failed
           // runs stay in the agent registry for agents.status(lastRunId).
-          let archived = false;
-          if (runId) {
-            archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
+          // smarty-dev#11105: an ended run is never left recorded, even when this cleanup throws; otherwise a
+          // finisher's join would stop the ended run and wait there.
+          try {
+            let archived = false;
+            if (runId) {
+              archived = await this.#retainRunLog(actor, runId).then(() => true, () => false);
+            }
+            // Release the in-memory handle and tmp run dir for completed runs;
+            // failed runs are retained for agents.status(actor.lastRunId).
+            const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
+              ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+            if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
+            for (const priorRunId of priorArchives) {
+              if (priorRunId === runId) continue;
+              const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
+              if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
+            }
+            if (runId && runCompleted && archived) {
+              await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
+            }
+          } finally {
+            delete actor.abortController;
+            delete actor.preparing;
+            this.#endPreparationClock(actor.id, item.id);
+            delete actor.inFlightRun;
           }
-          // Release the in-memory handle and tmp run dir for completed runs;
-          // failed runs are retained for agents.status(actor.lastRunId).
-          const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
-            ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
-          if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
-          for (const priorRunId of priorArchives) {
-            if (priorRunId === runId) continue;
-            const priorArchived = await this.#retainRunLog(actor, priorRunId).then(() => true, () => false);
-            if (priorArchived) await this.agents.cleanup(priorRunId).catch(() => ({ cleaned: false }));
-          }
-          if (runId && runCompleted && archived) {
-            await this.agents.cleanup(runId).catch(() => ({ cleaned: false }));
-          }
-          delete actor.abortController;
-          delete actor.preparing;
-          this.#endPreparationClock(actor.id, item.id);
-          delete actor.inFlightRun;
           actor.updatedAt = Date.now();
           if (actor.status !== "stopped") actor.status = actor.queue.length > 0 ? "queued" : "idle";
           // Failed handoffs wait as context; never obstruct the next runnable item.

@@ -241,7 +241,8 @@ export const createToolOwnershipReassertion = (options: {
 // tools remain hidden: Fabric only adds fabric_exec to the active set and must
 // not undo an extension's setActiveTools removal (PR #567 review P2).
 // Pi 1.1 also calls registered `codemode`/`deferred` tools while inactive, but
-// never calls `hidden` or `model-only` tools (AgentSession._getCallableTools).
+// never calls `hidden` tools (AgentSession._getCallableTools). Preserve the
+// existing active model-only capture route (e.g. native tool_search).
 // pi.getAllTools() metadata is already filtered by --tools/--exclude-tools:
 // add registered codemode/deferred tools and remove non-callable exposures.
 // Tools without reported exposure (older hosts, or no getAllTools) keep the
@@ -258,7 +259,7 @@ export const hostToolVisibility = (
   const registered: readonly HostToolInfo[] =
     typeof host.getAllTools === "function" ? host.getAllTools() : [];
   for (const tool of registered) {
-    if (tool.exposure === "hidden" || tool.exposure === "model-only") offered.delete(tool.name);
+    if (tool.exposure === "hidden") offered.delete(tool.name);
     else if (tool.exposure === "codemode" || tool.exposure === "deferred") offered.add(tool.name);
   }
   return (name) => offered.has(name);

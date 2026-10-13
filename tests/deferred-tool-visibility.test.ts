@@ -30,7 +30,8 @@ const tool = (name: string, exposure: Exposure) => defineTool({
   },
 });
 const runner = {
-  createContext: () => ({ cwd: process.cwd() }), emit: async () => undefined, emitToolCall: async () => undefined,
+  createContext: () => ({ cwd: process.cwd() }), getActiveTools: () => [],
+  emit: async () => undefined, emitToolCall: async () => undefined,
   emitToolResult: async () => undefined, hasHandlers: () => false,
 } as unknown as ExtensionRunner;
 
@@ -40,7 +41,7 @@ const INITIAL: Record<string, Exposure> = {
 
 const setup = (opts: { metadata?: boolean } = {}) => {
   let exposures: Record<string, Exposure> = { ...INITIAL };
-  let active: string[] = ["hidden", "modelOnly"]; // non-callable exposures, even if active
+  let active: string[] = ["hidden", "modelOnly"]; // active model-only capture remains supported
   let fail: Error | undefined;
   const host: { getActiveTools(): string[]; getAllTools?(): Meta[] } = { getActiveTools: () => [...active] };
   if (opts.metadata !== false) host.getAllTools = () => {
@@ -70,22 +71,22 @@ const denied = (catalog: CapturedToolCatalog, name: string) => {
 afterEach(() => { vi.restoreAllMocks(); executed.length = 0; });
 
 describe("deferred/codemode tool visibility from host getAllTools metadata", () => {
-  it("inactive deferred and codemode tools are callable; inactive direct and non-callable exposures are denied", async () => {
+  it("inactive deferred/codemode stay callable, hidden/direct-inactive stay denied, and active model-only capture stays", async () => {
     const { catalog } = setup();
-    expect(names(catalog)).toEqual(["codemode", "deferred"]);
+    expect(names(catalog)).toEqual(["codemode", "deferred", "modelOnly"]);
     for (const name of ["deferred", "codemode"]) {
       expect(catalog.get(name)?.name).toBe(name);
       expect(catalog.require(name).name).toBe(name);
     }
     denied(catalog, "direct");
     denied(catalog, "hidden");
-    denied(catalog, "modelOnly");
+    expect(catalog.require("modelOnly").name).toBe("modelOnly");
     const provider = new CapturedToolsProvider(catalog);
     await provider.invoke("deferred", {}, context);
     await expect(provider.invoke("direct", {}, context)).rejects.toThrow();
     await expect(provider.invoke("hidden", {}, context)).rejects.toThrow();
-    await expect(provider.invoke("modelOnly", {}, context)).rejects.toThrow();
-    expect(executed).toEqual(["deferred"]);
+    await provider.invoke("modelOnly", {}, context);
+    expect(executed).toEqual(["deferred", "modelOnly"]);
   });
 
   it("a legacy host without getAllTools stays active-set only", () => {
@@ -101,21 +102,21 @@ describe("deferred/codemode tool visibility from host getAllTools metadata", () 
   it("metadata withdrawal or re-registration as hidden removes visibility", () => {
     const { catalog, replace, setExposure } = setup();
     setExposure("deferred", "direct"); // withdrawn to direct while inactive
-    expect(names(catalog)).toEqual(["codemode"]);
+    expect(names(catalog)).toEqual(["codemode", "modelOnly"]);
     denied(catalog, "deferred");
     setExposure("codemode", "hidden"); // re-registered hidden
     replace();
-    expect(names(catalog)).toEqual([]);
+    expect(names(catalog)).toEqual(["modelOnly"]);
     denied(catalog, "codemode");
   });
 
   it("fails closed to last-good visibility without leaking host detail, then recovers fresh metadata", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { catalog, setExposure, setFail } = setup();
-    expect(names(catalog)).toEqual(["codemode", "deferred"]);
+    expect(names(catalog)).toEqual(["codemode", "deferred", "modelOnly"]);
     setFail(new Error("SECRET /home/host/token=abc123"));
     setExposure("direct", "deferred"); // unseen while failing
-    expect(names(catalog)).toEqual(["codemode", "deferred"]);
+    expect(names(catalog)).toEqual(["codemode", "deferred", "modelOnly"]);
     denied(catalog, "direct");
     denied(catalog, "hidden");
     let message = "";
@@ -126,7 +127,7 @@ describe("deferred/codemode tool visibility from host getAllTools metadata", () 
     }
     setFail(undefined);
     setExposure("deferred", "direct");
-    expect(names(catalog)).toEqual(["codemode", "direct"]);
+    expect(names(catalog)).toEqual(["codemode", "direct", "modelOnly"]);
     denied(catalog, "deferred");
   });
 });

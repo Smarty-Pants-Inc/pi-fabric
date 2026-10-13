@@ -118,6 +118,7 @@ import { encodeMeshStateMovedMarker, isMeshStateMovedMarker, isMeshStateNatsMark
 import { holdMeshFence, holdMeshFenceSync } from "./fence-lock.js";
 import { MeshLockTicket, meshLockQueueBusy, meshLockQueueDirectory } from "./lock-queue.js";
 import { processStartTime, residentProcessAlive } from "../residency/process-identity.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 // From the domain modules, not the store.ts facade: store.ts loads this module through state-backend.ts (L2a).
 import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, type MeshBatchView,
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
@@ -326,18 +327,26 @@ const ensureMovedMarker = (root: string, epoch: number): void => {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
+      // smarty-dev#8907: the claimed inode's stat BEFORE it is judged empty; only that unchanged inode is removed (a
+      // write into it, or a swap, after the judgment keeps the aside). Off Linux: main's rmSync (smarty-dev#7858).
+      const judged = fs.lstatSync(aside, { throwIfNoEntry: false });
       const claimed = classifyStateFile(aside);
+      const removeEmptyAside = (): void => {
+        verifiedRemove(aside, judged, { deleter: "mesh-sqlite-create-aside", fallback: () => { fs.rmSync(aside, { force: true }); return true; } });
+      };
       if (claimed === "empty") {
         try { fs.linkSync(temp, file); } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+            // ponytail: linked back to state.json just before, so this drops only our unique unpublished aside name
+            // (pid+uuid); the claimed inode itself stays at state.json, whatever it holds.
             try { fs.linkSync(aside, file); fs.rmSync(aside, { force: true }); } catch { /* the aside keeps it */ }
             throw error;
           }
-          fs.rmSync(aside, { force: true }); // it held nothing; the name is a newer writer's now
+          removeEmptyAside(); // it held nothing; the name is a newer writer's now
           if (classifyStateFile(file) === "marker") return;
           throw raced(root, "state.json was written during the marker write");
         }
-        fs.rmSync(aside, { force: true });
+        removeEmptyAside();
         return;
       }
       // Populated (or a marker) arrived between the re-check and the claim: put the same inode back.
@@ -347,11 +356,15 @@ const ensureMovedMarker = (root: string, epoch: number): void => {
         }
         throw error;
       }
+      // ponytail: linked back to state.json just above (EEXIST throws first), so this drops only our unique unpublished
+      // aside name (pid+uuid); the claimed inode stays at state.json.
       fs.rmSync(aside, { force: true });
       if (claimed === "marker") return;
       throw raced(root, "state.json was populated before the marker write");
     }
     throw raced(root, "state.json kept changing during the marker write");
+  // ponytail: our own unpublished temp (wx, pid+uuid name), never judged; once linked as state.json this drops only
+  // the temp name, never the published marker inode.
   } finally { fs.rmSync(temp, { force: true }); }
 };
 
@@ -1976,7 +1989,9 @@ export const tryLockFile = (file: string, staleMs: number, token: string, hooks:
         try { currentRecord = fs.readFileSync(file, "utf8"); } catch { /* gone: already reclaimed */ }
         if (current === undefined || current.ino !== stat.ino || current.dev !== stat.dev || current.mtimeMs !== stat.mtimeMs
           || currentRecord !== record) return false; // already reclaimed, and maybe held by a successor: never touch it
-        try { fs.unlinkSync(file); } catch { return false; }
+        // smarty-dev#8907: removes only the inode judged dead above (`stat`, taken before the record and the verdict); a
+        // replacement after the re-check is refused and this reclaim fails (false). Off Linux: main's unlink.
+        if (!verifiedRemove(file, stat, { deleter: "mesh-sqlite-lock-reclaim", fallback: () => { fs.unlinkSync(file); return true; } }).removed) return false;
       } finally { removeOwnedFile(claim, token); }
     }
   }
@@ -2011,6 +2026,8 @@ export const raiseCheckpointFlag = (root: string, token: string): string => {
 };
 
 export const lowerCheckpointFlag = (flag: string): void => {
+  // ponytail: no judgment; the flag is named by this request's own token (pid, start ticks, uuid) and only it writes
+  // that name; a reclaimer removes it only after this holder is proven dead (removeDeadFlag).
   if (flag) try { fs.rmSync(flag, { force: true }); } catch { /* stale after CHECKPOINT_FLAG_STALE_MS */ }
 };
 
@@ -2021,6 +2038,7 @@ export const checkpointFlagRaised = (root: string): boolean => {
   const now = Date.now();
   let raised = false;
   for (const name of names) {
+    if (name.startsWith(".retention-graveyard-")) continue; // verifiedRemove's transient graveyard is not a flag
     const flag = path.join(dir, name);
     const stat = fs.lstatSync(flag, { throwIfNoEntry: false });
     if (!stat) continue;
@@ -2044,7 +2062,11 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
   try {
     const flag = path.join(dir, name);
     const current = fs.lstatSync(flag, { throwIfNoEntry: false });
-    if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) fs.unlinkSync(flag);
+    // smarty-dev#8907: removes only the flag inode judged stale and dead (`stat`, from before the age judgment); a refusal
+    // keeps it (ignored as stale). Off Linux: main's unlink, behind the re-check above.
+    if (current?.ino === stat.ino && current.dev === stat.dev && current.mtimeMs === stat.mtimeMs) {
+      verifiedRemove(flag, stat, { deleter: "mesh-sqlite-checkpoint-flag", fallback: () => { fs.unlinkSync(flag); return true; } });
+    }
   } catch { /* already gone */ } finally { removeOwnedFile(claim, token); }
 };
 
@@ -2053,6 +2075,8 @@ const removeDeadFlag = (dir: string, name: string, stat: fs.Stats): void => {
 // file checked here is still ours at the unlink.
 export const removeOwnedFile = (file: string, token: string): void => {
   if (!ownsFile(file, token)) return; // plainly not ours: never displace it
+  // ponytail: the held object: this live owner's own token-named lock; no reclaimer vacates it while we live (it needs a
+  // dead holder, or an unreadable record for the age rule), so the inode checked here is the one unlinked.
   try { fs.unlinkSync(file); } catch { /* already gone */ }
 };
 

@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
@@ -114,6 +115,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       const code = errorCode(error);
       if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
     } finally {
+      // ponytail: no judgment precedes this. `staging` is this attempt's own unpublished mkdtemp name (random suffix,
+      // never published under it, never a recovery or rename target); after a successful publish the name is empty
+      // and `force` makes this a no-op. smarty-dev#8907 inventory.
       fs.rmSync(staging, { recursive: true, force: true });
     }
     try {
@@ -142,11 +146,17 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // Main's release by name. Non-Linux keeps it; the stalled-holder race there is tracked in smarty-dev#9569.
   const releaseByName = (): void => {
     try {
+      // smarty-dev#8907: the stat captured before the owner judgment; only that inode is removed (detached into
+      // verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
+      const judged = fs.lstatSync(lock);
       if (readOwner() !== record) return;
-      // Detach before removal: never recursively delete through the canonical name.
-      const released = `${lock}.released.${pathToken}`;
-      fs.renameSync(lock, released);
-      fs.rmSync(released, { recursive: true, force: true });
+      verifiedRemove(lock, judged, { deleter: "meshCustodyLockRelease", fallback: () => {
+        // Off Linux, main's release. Detach before removal: never recursively delete through the canonical name.
+        const released = `${lock}.released.${pathToken}`;
+        fs.renameSync(lock, released);
+        fs.rmSync(released, { recursive: true, force: true });
+        return true;
+      } });
     } catch {
       // Already recovered or replaced: never delete a successor.
     }

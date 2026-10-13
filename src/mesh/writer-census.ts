@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { meshLockQueueDirectory } from "./lock-queue.js";
+import { verifiedRemove } from "../storage/verified-remove.js";
 import { censusHostSlug, censusRecordAlive, censusRecordPrunable } from "./store.js";
 import {
   validWriterHost, validWriterLockProtocol, validWriterPid, validWriterReleaseSha, validWriterStartedAt,
@@ -208,13 +209,30 @@ export function censusSync(root: string): WriterCensusReport {
       // A record is renamed into place whole: a temporary of this host's dead pid is a torn write.
       // Anything else (a live writer's write in flight, a renamed record) hides a writer: unknown.
       const temporary = name.startsWith(ownPrefix) ? /^(\d+)-\d+\.json\.[0-9a-f]+\.tmp$/.exec(name.slice(ownPrefix.length)) : null;
-      if (temporary && !processAlive(Number(temporary[1]))) {
-        try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      // smarty-dev#8907: the inode seen before the liveness judgment is the only one removed; off Linux main's removal.
+      const file = path.join(directory, name);
+      let judged: fs.Stats | undefined, lstatError: string | undefined;
+      if (temporary) try { judged = fs.lstatSync(file); } catch (error) { lstatError = errno(error); /* nothing judged; refused on Linux */ }
+      // Files only (main's non-recursive rm). A `.retention-graveyard-*` directory (a refused removal may hold a
+      // writer's record) never matches `temporary`: it is reported unknown below, never removed.
+      if (temporary && judged?.isFile() !== false && !processAlive(Number(temporary[1]))) {
+        const result = verifiedRemove(file, judged, { deleter: "censusTornWrite", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+        // A refusal keeps the file (or holds it in a graveyard): unknown, never absent. Only a target already gone
+        // (ENOENT before any move, no graveyard) is omitted, as a record removed since the listing is.
+        if (!result.removed && (result.graveyard !== undefined || !(/\(ENOENT\)$/.test(result.reason) ||
+          (judged === undefined && lstatError === "ENOENT")))) {
+          add({ source: "process-record", name,
+            reason: `${file}: removal refused: ${result.reason}${result.graveyard !== undefined ? ` (at ${result.graveyard})` : ""}` });
+        }
       } else add({ source: "process-record", name, reason: `${path.join(directory, name)}: not a census record` });
       continue;
     }
-    let text: string;
-    try { text = fs.readFileSync(path.join(directory, name), "utf8"); }
+    // smarty-dev#8907: the stat and the judged content come from one fd: a prunable record removes only that inode.
+    let text: string, judged: fs.Stats;
+    try {
+      const fd = fs.openSync(path.join(directory, name), "r");
+      try { judged = fs.fstatSync(fd); text = fs.readFileSync(fd, "utf8"); } finally { fs.closeSync(fd); }
+    }
     catch (error) {
       // Removed since the listing (its writer exited): gone. Any other read failure is unknown.
       if (errno(error) !== "ENOENT") {
@@ -232,7 +250,13 @@ export function censusSync(root: string): WriterCensusReport {
       continue;
     }
     if (censusRecordPrunable(fields, host)) {
-      try { fs.rmSync(path.join(directory, name), { force: true }); } catch { /* best effort */ }
+      const file = path.join(directory, name);
+      const result = verifiedRemove(file, judged, { deleter: "censusRecordPrune", fallback: () => { fs.rmSync(file, { force: true }); return true; } });
+      // As a torn write above: a refused (kept or graveyard-held) record is unknown; one already gone is omitted.
+      if (!result.removed && (result.graveyard !== undefined || !/\(ENOENT\)$/.test(result.reason))) {
+        add({ source: "process-record", name,
+          reason: `${file}: removal refused: ${result.reason}${result.graveyard !== undefined ? ` (at ${result.graveyard})` : ""}` });
+      }
       continue;
     }
     const record = fields as unknown as MeshWriterRecord;

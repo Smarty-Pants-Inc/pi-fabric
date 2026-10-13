@@ -442,6 +442,10 @@ export const watchStateDbLeases = async (root: string, probe: LeaseProbeOptions 
   let child: ReturnType<typeof spawn> | undefined;
   const stop = (): void => {
     try { child?.kill("SIGKILL"); } catch { /* gone */ }
+    // ponytail: smarty-dev#8907: no expiry judgment here, so no verifiedRemove. `scratch` is this call's own fresh
+    // mkdtemp (0700, a unique random name); its path is never returned or published, and only this process (control/,
+    // go<n>) and the helper it spawned (output, via an inherited fd) write in it. The delete is by name, not fd-relative:
+    // a different uid can swap the name only if TMPDIR's parent lets it (unchecked here; a sticky /tmp does not).
     fs.rmSync(scratch, { recursive: true, force: true });
   };
   try {
@@ -670,7 +674,13 @@ const provedRead = async (root: string, backend: ReaderBackend): Promise<number>
     const count = read(scratch);
     if (count !== imported.entries) throw new Error(`read ${count} entries from the migrated copy, imported ${imported.entries}`);
     return count;
-  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+  } finally {
+    // ponytail: smarty-dev#8907: no expiry judgment here, so no verifiedRemove. `scratch` is this call's own fresh
+    // mkdtemp (0700, a unique random name), never returned or published: only this call's copy, MeshStore and import
+    // write in it. The delete is by name, not fd-relative: a different uid can swap the name only if TMPDIR's parent
+    // lets it (unchecked here; a sticky /tmp does not). No mesh lock is claimed to guard it.
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
 };
 
 /**

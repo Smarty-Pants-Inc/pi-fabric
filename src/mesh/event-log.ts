@@ -432,10 +432,11 @@ export class EventLog {
     if (!judged) return undefined;
     // The exact bytes of an archive restore's rewrite below, once this hold replaces the judged intent.
     let restored: string | undefined;
-    let text: string;
-    try { text = fs.readFileSync(file, "utf8"); }
+    // The ORIGINAL raw bytes (pi-fabric#1036 r4): a decoded string can hide a changed invalid-UTF-8 byte.
+    let originalBytes: Buffer;
+    try { originalBytes = fs.readFileSync(file); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
-    const intent = JSON.parse(text) as MeshDedupeIntent;
+    const intent = JSON.parse(originalBytes.toString("utf8")) as MeshDedupeIntent;
     if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
         (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
         !Number.isSafeInteger(intent.reservedSequence) || intent.reservedSequence < 1 ||
@@ -495,20 +496,25 @@ export class EventLog {
           restored = JSON.stringify({ ...intent, liveOffset });
           writeFileAtomic(file, restored, { durable: true, beforeRename: () => {
             // pi-fabric#1036 r4: this rewrite replaces the ORIGINAL judged intent (pre-read inode `judged`, exact bytes
-            // `text`), not bytes this hold wrote: those are proven later by #removeWrittenIntent. Before each rename,
-            // lstat, reread, lstat again: both must be the judged regular-file inode and the bytes unchanged, else a
-            // missing, successor or in-place-refreshed intent is kept. Plain rename leaves a check-to-rename window.
-            // size/mtimeMs/ctimeMs (not atime) catch an in-place write during the reread or a refreshed original.
+            // `originalBytes`), not bytes this hold wrote: those are proven later by #removeWrittenIntent. Before each
+            // rename, lstat (refusing a missing or successor name before any read), reread the raw bytes, lstat again:
+            // both must be the judged regular-file inode and the bytes exactly equal, else the intent is kept. Plain
+            // rename leaves a check-to-rename window. size/mtimeMs/ctimeMs (not atime) catch an in-place write.
             const unchanged = (stat: fs.Stats | undefined): boolean => !!stat?.isFile() && stat.dev === judged.dev &&
               stat.ino === judged.ino && stat.size === judged.size && stat.mtimeMs === judged.mtimeMs && stat.ctimeMs === judged.ctimeMs;
-            const named = fs.lstatSync(file, { throwIfNoEntry: false });
-            let current: string | undefined;
-            try { if (named?.isFile()) current = fs.readFileSync(file, "utf8"); }
-            catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
-            const reread = fs.lstatSync(file, { throwIfNoEntry: false });
-            if (current !== text || !unchanged(named) || !unchanged(reread)) {
-              throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
-            }
+            const changed = () => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
+            const unreadable = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent is unreadable or changed and is kept`, { cause });
+            let named: fs.Stats | undefined;
+            try { named = fs.lstatSync(file, { throwIfNoEntry: false }); }
+            catch (error) { throw unreadable(error); }
+            if (!unchanged(named)) throw changed();
+            let current: Buffer;
+            try { current = fs.readFileSync(file); }
+            catch (error) { throw unreadable(error); }
+            let reread: fs.Stats | undefined;
+            try { reread = fs.lstatSync(file, { throwIfNoEntry: false }); }
+            catch (error) { throw unreadable(error); }
+            if (!current.equals(originalBytes) || !unchanged(reread)) throw changed();
           } });
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);

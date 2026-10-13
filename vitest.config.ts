@@ -1,4 +1,6 @@
-import { join } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ViteUserConfig as UserConfig } from "vitest/config";
 import { isolatedTestTemp, isolateTestFleetEnvironment } from "./scripts/test-temp.js";
 
@@ -13,13 +15,44 @@ if (process.platform !== "win32") process.umask(0o022);
 // GitHub Actions sets CI=true; a local CI=0 or CI=false must not enable retries (review c6081609482).
 const ci = process.env.CI === "true";
 
-// smarty-dev#4664/#11145: suites that run real product deletes are excluded before collection outside hosted CI.
-const realDeleteSuites = ["tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
-  "tests/verified-remove-windows.test.ts", "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts",
-  "tests/scratch-platform-retention.test.ts"];
-const localRealDeleteSuites = process.env.GITHUB_ACTIONS === "true" ? [] : realDeleteSuites;
+// smarty-dev#4664/#11145: suites whose source references a product-deletion entrypoint are excluded before collection
+// outside hosted CI. A broad, conservative text heuristic (comments and quoted strings count), not a proof.
+// Substrings: actor removal (actors-cli, ActorManager.remove, remove-offline), storage removers (verifiedRemove,
+// retention/retention-cli --apply, scratch), mesh store cleanup (MeshStore, StoreBridgeSide), native Windows helper.
+export const productDeletionMarkers: readonly string[] = ["actors-cli", "fabric-actors", "actors/manager", "ActorManager",
+  "actors/remove-offline", "removeActorOffline", ".actors.remove(", "manager.remove(", "verifiedRemove",
+  "storage/verified-remove", "storage/retention", "storage/scratch", "removeEmptyRunRoot", "sweepTempRunRoots",
+  "removeUnreferencedRun", "compactTerminalRunEvents", "pruneActorRunArchives", "pruneActorSessionBackups",
+  "sweepScratch", "closeScratch", "deleteRootActorTree", "MeshStore", "StoreBridgeSide", "pruneDeadCensusRecords",
+  "mesh/store", "mesh/bridge", "mesh/event-log", "fabric-win-remove"];
+
+/** Sorted `tests/<relative>` paths of `.test.ts` files under testRoot that mention a marker; [] on GitHub Actions. */
+export function productDeletionSuites(testRoot = fileURLToPath(new URL("./tests", import.meta.url))): string[] {
+  if (process.env.GITHUB_ACTIONS === "true") return [];
+  const found: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) { // Dirent types never follow symlinks
+      const path = join(dir, entry.name);
+      if (entry.isSymbolicLink() && statSync(path).isDirectory()) {
+        throw new Error(`smarty-dev#4664: cannot scan symlinked test directory: ${path}`);
+      }
+      if (entry.isDirectory()) walk(path);
+      else if (entry.name.endsWith(".test.ts") && (entry.isFile() || entry.isSymbolicLink())) {
+        const source = readFileSync(path, "utf8"); // Unreadable sources stop config evaluation, not bypass the scan.
+        if (productDeletionMarkers.some((marker) => source.includes(marker))
+          || (source.includes("retention") && source.includes("--apply"))) {
+          found.push(`tests/${relative(testRoot, path).split(sep).join("/")}`);
+        }
+      }
+    }
+  };
+  walk(testRoot);
+  return found.sort();
+}
+
+const localRealDeleteSuites = productDeletionSuites();
 if (localRealDeleteSuites.length > 0) {
-  console.warn(`smarty-dev#4664: local run skips real-delete suites: ${localRealDeleteSuites.join(", ")}`);
+  console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} product-deletion suites`);
 }
 
 // Separate policy projects avoid writing a fixture read by unrelated config tests.

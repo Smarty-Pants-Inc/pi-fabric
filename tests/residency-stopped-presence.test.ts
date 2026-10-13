@@ -122,10 +122,26 @@ describe("resident heartbeat with stopped actors (smarty-dev#6729)", () => {
     await host.participants.refresh();
     expect(host.mesh.get(presenceKey(live), { fresh: true })?.value).toMatchObject({ status: "stopped" });
     expect(observer.get(live, undefined, { fresh: true })).toMatchObject({ status: "stopped", stale: false });
-    await host.actors.remove(removed);
+    const removedPresence = host.mesh.get(presenceKey(removed), { fresh: true })!;
+    const removedDir = path.join(config.actorRoot, removed);
+    const sentinel = path.join(removedDir, "kept-11335.txt");
+    if (process.platform !== "linux") {
+      fs.mkdirSync(removedDir, { recursive: true });
+      fs.writeFileSync(sentinel, "history\n");
+    }
+    const removal = await host.actors.remove(removed);
     now += PERIOD_MS;
     await host.participants.refresh();
-    expect(host.mesh.get(presenceKey(removed), { fresh: true })).toBeUndefined();
+    if (process.platform === "linux") {
+      expect(host.mesh.get(presenceKey(removed), { fresh: true })).toBeUndefined();
+    } else {
+      // smarty-dev#8090 / follow-up smarty-dev#11335: legacy presence deletion follows the guarded tree delete;
+      // participant publication is independently withdrawn from the revoked actor list.
+      expect(removal).toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${config.rootId} actor tree is kept (a later remove or host start finishes it)` });
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("history\n");
+      expect(host.mesh.get(presenceKey(removed), { fresh: true })).toEqual(removedPresence);
+    }
     expect(host.mesh.get(participantKey(removed), { fresh: true })).toBeUndefined();
     expect(observer.get(removed, undefined, { fresh: true })).toBeUndefined();
 

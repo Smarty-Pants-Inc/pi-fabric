@@ -628,6 +628,10 @@ const preparationTimedOut = (error: unknown): boolean => {
   return false;
 };
 
+/** smarty-dev#5919: the steps of a release for adoption, tracked so a retry resumes every incomplete one. */
+export type AdoptionReleaseStep = "ceded" | "stopped" | "queueSaved" | "historySaved" | "presenceWithdrawn";
+const ADOPTION_RELEASE_STEPS: readonly AdoptionReleaseStep[] = ["ceded", "stopped", "queueSaved", "historySaved", "presenceWithdrawn"];
+
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
@@ -723,6 +727,10 @@ export class ActorManager {
     | undefined;
   readonly #locallyCreated = new Set<string>();
   readonly #ceded = new Set<string>();
+  /** smarty-dev#5919: the completed steps of each release for adoption (a retry resumes the rest). */
+  readonly #adoptionRelease = new Map<string, Set<AdoptionReleaseStep>>();
+  // smarty-dev#5919: presence this host withdraws once, after releasing an actor for adoption.
+  readonly #withdrawnPresence = new Set<string>();
   readonly #ownership = new Map<string, boolean>();
   // Lineage rootIds as last read from / written to the registry on disk.
   // Adoption compares against this snapshot so two racing adopters cannot
@@ -1280,6 +1288,12 @@ export class ActorManager {
       const now = Date.now();
       const written = new Map<string, string | undefined>();
       const ops: MeshBatchOperation[] = [];
+      const withdrawn = [...this.#withdrawnPresence];
+      for (const id of withdrawn) ids.delete(id);
+      for (const id of withdrawn) {
+        ops.push({ kind: "delete", key: this.#presenceKey(id) });
+        written.set(id, undefined);
+      }
       for (const id of ids) {
         const actor = this.#actors.get(id);
         if (actor) {
@@ -1301,6 +1315,7 @@ export class ActorManager {
         }
       }
       return { ops, actorIds: [...written.keys()], committed: () => {
+        for (const id of withdrawn) this.#withdrawnPresence.delete(id);
         for (const [id, serialized] of written) {
           if (serialized === undefined) this.#publishedPresence.delete(id);
           else this.#publishedPresence.set(id, serialized);
@@ -1343,6 +1358,118 @@ export class ActorManager {
       `Fabric actor ${actor.name} (${actor.id}) residency transferred to another host`);
     if (actor.status !== "stopped") actor.status = "idle";
     actor.updatedAt = Date.now();
+    this.#emitChange();
+    return this.#publicInfo(actor);
+  }
+
+  /**
+   * smarty-dev#5919: a dead root's resident host releases one durable actor for operator
+   * adoption by another root. Its in-flight run is ownership-aborted and ended (the item
+   * parks for retry), queued mesh/host work parks in this lineage's queue file (which the
+   * adopter takes over through adoptedFrom), and this host withdraws its presence once and
+   * never republishes it. The registry row is not edited here: the adopter moves custody.
+   */
+  async releaseForAdoption(id: string, beforeCommit?: (id: string) => void,
+    options: { fault?: (step: AdoptionReleaseStep) => void } = {}): Promise<FabricActorInfo> {
+    // A release that a failed step interrupted is resumed, not restarted: the actor is
+    // already ceded (so no longer owned), and every incomplete step runs again.
+    const progress = this.#releasing(id) ? this.#adoptionRelease.get(id) : undefined;
+    const actor = progress ? this.#requireActor(id) : this.#requireOwnedActor(id);
+    if (actor.residency !== "durable") throw new Error(`Fabric actor ${actor.id} is not durable`);
+    beforeCommit?.(actor.id);
+    const done = progress ?? new Set<AdoptionReleaseStep>();
+    const step = async (name: AdoptionReleaseStep, run: () => unknown): Promise<void> => {
+      if (done.has(name)) return;
+      options.fault?.(name);
+      await run();
+      done.add(name);
+    };
+    await step("ceded", () => {
+      this.#ceded.add(actor.id);
+      this.#ownership.set(actor.id, false);
+      this.#adoptionRelease.set(actor.id, done);
+    });
+    await step("stopped", async () => {
+      const running = this.#runningActor(actor.id);
+      for (const target of new Set([actor, ...(running ? [running] : [])])) {
+        this.#markOwnershipAbort(target);
+        target.abortController?.abort();
+      }
+      if (running?.inFlightRun) await this.agents.stop(running.inFlightRun.id).catch(() => undefined);
+      await running?.drain?.catch(() => undefined);
+    });
+    await step("queueSaved", () => {
+      this.#park(actor, this.#takeQueued(actor), `Fabric actor ${actor.name} (${actor.id}) was released for adoption by another root`);
+      if (!this.#persistQueue(actor.id, true) && this.#persistent) {
+        throw new Error(`Fabric actor ${actor.id} queue could not be saved for adoption`);
+      }
+      if (actor.status !== "stopped") actor.status = "idle";
+      actor.updatedAt = Date.now();
+    });
+    // The adopter moves the committed row: flush this lineage's final history first.
+    await step("historySaved", async () => {
+      const live = this.#actors.get(actor.id) ?? actor;
+      await this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: live, releasing: live });
+    });
+    await step("presenceWithdrawn", async () => {
+      this.#withdrawnPresence.add(actor.id);
+      if (this.#presencePublisher) {
+        await this.#presencePublisher.refresh();
+        if (this.#withdrawnPresence.has(actor.id)) throw new Error(`Fabric actor ${actor.id} presence withdrawal is pending; retry`);
+      } else {
+        await this.mesh.delete({ key: this.#presenceKey(actor.id) });
+        this.#withdrawnPresence.delete(actor.id);
+      }
+    });
+    this.#emitChange();
+    return this.#publicInfo(actor);
+  }
+
+  /** smarty-dev#5919: this process completed every release step for adoption (a retry is idempotent). */
+  releasedForAdoption(id: string): boolean {
+    const done = this.#adoptionRelease.get(id);
+    return this.#releasing(id) && done !== undefined && ADOPTION_RELEASE_STEPS.every(step => done.has(step));
+  }
+
+  /** smarty-dev#5919: a release for adoption started here (possibly incomplete; a retry resumes it). */
+  releasingForAdoption(id: string): boolean {
+    return this.#releasing(id);
+  }
+
+  #releasing(id: string): boolean {
+    return this.#ceded.has(id) && this.#actors.has(id) && this.#adoptionRelease.has(id);
+  }
+
+  /**
+   * smarty-dev#5919: load an actor whose registry row an operator adoption just moved to
+   * this root (under the registry fence). The fresh claim regains a displaced lineage,
+   * takes over the predecessors' queue files and publishes this host's presence.
+   */
+  acceptAdoption(id: string): FabricActorInfo {
+    const record = this.#registry.records().find((row) => row.id === id);
+    if (!record || record.rootId !== this.#rootId) throw new Error(`Fabric actor ${id} is not adopted by this root`);
+    this.#displacedLineages.delete(id);
+    this.#ceded.delete(id);
+    this.#adoptionRelease.delete(id);
+    const stale = this.#actors.get(id);
+    if (stale) {
+      this.#markOwnershipAbort(stale);
+      stale.abortController?.abort();
+      this.#actors.delete(id);
+      this.#ownership.delete(id);
+      this.#locallyCreated.delete(id);
+    }
+    this.#registryFingerprint = undefined;
+    this.#syncActorsFromRegistry();
+    const actor = this.#actors.get(id);
+    if (!actor || actor.rootId !== this.#rootId) throw new Error(`Fabric actor ${id} could not be loaded after adoption`);
+    this.#displacedLineages.delete(id);
+    this.#rememberLineages([record]);
+    this.#takeOverPredecessors(actor);
+    this.#ownership.set(id, this.#ownershipDecision(id));
+    this.#pendingPresence.add(id);
+    this.#schedulePresenceRetry();
+    this.#scheduleRestoreParked();
     this.#emitChange();
     return this.#publicInfo(actor);
   }
@@ -5830,6 +5957,8 @@ export class ActorManager {
 
   #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+    /** smarty-dev#5919: the final row of an actor this host just released for adoption. */
+    releasing?: ManagedActor;
   }): Promise<void> {
     ++this.#registrySaveRevision;
     // Serialization is process-local and OUTSIDE custody. A later preparation
@@ -5856,6 +5985,7 @@ export class ActorManager {
 
   async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
+    releasing?: ManagedActor;
   }, signal?: AbortSignal): Promise<void> {
     if (!this.#persistent || !this.meshConfig.enabled) return;
     if (this.#registrySaveDurable) options = { ...options, durable: true };
@@ -5877,7 +6007,8 @@ export class ActorManager {
         // generation AND the ownership observation after acquisition, or retries.
         this.#rememberLineages(current);
         const owned = [...this.#actors.values()].filter(actor =>
-          !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id));
+          !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) &&
+          (this.#ownershipDecision(actor.id) || actor === options?.releasing));
         if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
         const rows = owned.map(actor => this.#serializedActor(actor));
         if (this.#deferSoftRegistrySave(rows, removedIds.size > 0 || options?.durable === true ||
@@ -5901,7 +6032,8 @@ export class ActorManager {
         return { actors, durable: removedIds.size > 0 || options?.durable === true || this.#registrySaveDurable,
           validate: () => !signal?.aborted && revision === this.#registrySaveRevision && ownership.unchanged() &&
             states.every(({ actor, updatedAt, status, append, count }) => this.#actors.get(actor.id) === actor &&
-              actor.updatedAt === updatedAt && actor.status === status && !this.#ceded.has(actor.id) &&
+              actor.updatedAt === updatedAt && actor.status === status &&
+              (!this.#ceded.has(actor.id) || actor === options?.releasing) &&
               !this.#finishCalls.has(actor.id) && append === this.#unarchivedMessages.get(actor) && append?.length === count),
           value: { owned, revoked, actors, saved, revision,
             appends: new Map(owned.map(actor => [actor, [...(this.#unarchivedMessages.get(actor) ?? [])]])) } };

@@ -458,6 +458,25 @@ describe("registered extension tool capture", () => {
     }
   });
 
+  it("captures the pinned durable worker SDK through the same validated host registration", async () => {
+    const { ExtensionRunner: WorkerRunner } = await import("pi-fabric-worker-sdk");
+    const registry = globalThis as Record<PropertyKey, unknown>;
+    Object.defineProperty(registry, HOST_EXTENSION_RUNNER_SYMBOL, { value: WorkerRunner, configurable: true });
+    try {
+      const fabricTool = tool("fabric_exec");
+      const catalog = new CapturedToolCatalog();
+      controllers.push(await installRegisteredToolCapture({ anchorDefinition: fabricTool, catalog }));
+      const runner = Object.create(WorkerRunner.prototype) as ExtensionRunner;
+      (runner as unknown as { extensions: Array<{ tools: Map<string, RegisteredTool> }> }).extensions = [{ tools: new Map([
+        ["fabric_exec", registered(fabricTool, "/extensions/pi-fabric/index.ts")],
+        ["box_list", registered(tool("box_list"), "/extensions/pi-box/index.ts")],
+      ]) }];
+      runner.getAllRegisteredTools();
+      expect(catalog.runner).toBe(runner);
+      expect(catalog.list().map(entry => entry.name)).toEqual(["box_list"]);
+    } finally { delete registry[HOST_EXTENSION_RUNNER_SYMBOL]; }
+  });
+
   it.each([
     ["a plain object", { getAllRegisteredTools() { return []; } }, /not a constructor/],
     ["a class without the emit methods", class { getAllRegisteredTools() { return []; } },

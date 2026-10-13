@@ -535,6 +535,13 @@ const main = async (): Promise<void> => {
     appendLog(`${JSON.stringify({ type: "fabric_profile_extensions", names: profile.names, loadedCount: profile.names.length, skippedCount: profile.warnings.length })}\n`);
     writeRunRecord(options.statusFile, record);
   }
+  // Extension-registered model providers still resolve without the rest of
+  // their extensions: the bridge registers only the requested provider.
+  const providerBridge = isPi && !options.extensions && Boolean(options.model?.includes("/"));
+  if (providerBridge) {
+    const bridge = import.meta.url.endsWith(".ts") ? "./agents/provider-bridge.ts" : "./agents/provider-bridge.js";
+    piArguments.push("-e", fileURLToPath(new URL(bridge, import.meta.url)));
+  }
   if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
@@ -782,6 +789,8 @@ const main = async (): Promise<void> => {
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
+      // Read by the provider bridge; undefined drops an inherited value.
+      PI_FABRIC_EXTENSION_MODEL: providerBridge ? options.model : undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });

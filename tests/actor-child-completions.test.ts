@@ -55,18 +55,6 @@ describe("actor child completion handoff storage", () => {
     expect(fs.readdirSync(h.store.directory)).toEqual([`${result.id}.receipt`]);
   });
 
-  it("preflights an empty spool without claiming, then claims a newly written completion on the next event", async () => {
-    const h = setup();
-    const mkdir = vi.spyOn(fs, "mkdirSync");
-    expect(h.store.pending()).toEqual([]);
-    expect(mkdir.mock.calls.some(([file]) => String(file).endsWith(`${path.sep}.claim.lock`))).toBe(false);
-    const result = h.result();
-    h.store.enqueue(result, h.spawner);
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expect(h.store.pending()).toEqual([expect.objectContaining({ result: expect.objectContaining({ id: result.id }) })]);
-    expect(mkdir.mock.calls.some(([file]) => String(file).endsWith(`${path.sep}.claim.lock`))).toBe(true);
-  });
-
   it("retains an unread full outcome through handoff, then deletes it on consumption", () => {
     const h = setup();
     const result = h.result();

@@ -144,3 +144,39 @@ C1-C9 above are unchanged.
 Still open, as pre-enable gates (not results): O-1 (smarty-dev#11373 implementation and clustered CI), O-2 (custody
 and liveness mapping, CAS writer role, allow entries), O-5 (one-node revoke after a stop, not measured), O-6 (phase
 of G-9/T14, lead decides), O-7 (scope of the named security pass, lead decides).
+
+## Round 2 (10-13, #958): Amendment B answers and limits
+
+The records above are unchanged. Basis: the full texts of two #958 reviews (staged copy) and the lead's decisions on
+them, which match all four findings: Astra,
+https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182 (P1), and security,
+https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625 (`SECURITY_REVIEW: FAIL`; P1, P1,
+P2). This record adds no finding and claims no review pass. Design note: "Round 2 answers" and section 10.
+
+- **B1 ADOPT (Astra P1).** Normal maintainer `STREAM.UPDATE` could add an expiry to `<CUS>`, and an open engine
+  would continue. Now every normal role denies `STREAM.CREATE` and `STREAM.UPDATE` on `<CUS>` and `<LIVE>` (the
+  purge and delete deny stays); a separate 1 h break-glass user, minted only by an explicit
+  `fabric nats mint --break-glass` after approval, makes such changes; the runbook stops the engines first (#8639),
+  rechecks, restarts; engines recheck `<CUS>` on every reconnect and refuse a mismatch. T2, T14.
+- **B2 ACCEPTED as security gap smarty-dev#TBD-UID (security P1, same UID).** One UID on one host is one trust
+  domain; per-launch creds are network authentication, org isolation and root binding, not same-host isolation.
+  Fixes: per-host broker under a separate UID, or per-lane Unix users. `ptrace_scope` and `PR_SET_DUMPABLE=0` are
+  to be measured first, not implemented, not a fix. C8's guards stay.
+- **B3 ADOPT (security P1, restart with an old JWT).** `revoke` writes the account JWT durably into each node's
+  resolver dir; every node start (`init --local` and each of 3 nodes) accepts no clients until its JWT hash matches
+  the issuer's latest. Effect on C7: `partial` still names a node that cannot confirm, but a stopped node no longer
+  accepts the revoked user after a restart. O-5 resolved by design, not measured. T4, T16.
+- **B4 ADOPT (security P2, rotation).** Per-key rotation; the retiring key stays until the longest credential it
+  signed expires (principal 90 days), or its users are reissued and revoked first. T15.
+- **B5 (lead clarification, not a review finding).** A SYS-only user (1 h, publish only
+  `$SYS.REQ.CLAIMS.UPDATE`, own inbox, never in a launch environment); org users get no resolver or admin
+  `$SYS.REQ` beyond `$SYS.REQ.USER.INFO`; D4 decided (own encoder over `@nats-io/nkeys` 2.0.3); finite quotas
+  and `<CUS>`/`<LIVE>` configuration are required caller inputs. Every configured server ID must acknowledge
+  the exact broadcast JWT for `complete`; missing or error acknowledgements yield `partial` (T4), and the start
+  gate covers a node that was down. Source-confirmed nats-server v2.14.7 has no per-server JWT read-back;
+  the lead accepts this known limit. No LOOKUP grant or new read-back mechanism. O-10 resolved (10.5).
+
+Limits: docs only; nothing implemented, tested or measured; the mint later follows Amendment B. Still open: O-1, O-2,
+O-6, O-7, and new O-8 (break-glass approver and audit record), O-9 (fleet location of the latest-JWT record), and the
+smarty-dev#TBD-UID number. A delta design review and security review of the frozen text come next; neither is
+claimed here.

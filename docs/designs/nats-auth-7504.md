@@ -2,7 +2,7 @@ DESIGN (design-pair, challenge record: docs/designs/nats-auth-7504-challenge-r1.
 
 # NATS authentication: one login per issued launch and principal, one account per org
 
-smarty-dev#7504 / #8031 R1 (goals G1, G2). Owner: fabric-store. Status: DESIGN DRAFT, revision 1 with Amendment A (10-13, section 9); implementation and named security approval remain pending. Section 9 is docs only, not implemented or measured.
+smarty-dev#7504 / #8031 R1 (goals G1, G2). Owner: fabric-store. Status: DESIGN DRAFT, revision 1 with Amendment A (10-13, section 9) and Amendment B (10-13, section 10); implementation and named security approval remain pending. Sections 9 and 10 are docs only, not implemented or measured.
 Code read: main `fs-main-44da` (this tree) and `feat/sd-9690-reader-proof` @6fadd911 (`../fs-nats2`, cited as `b:`).
 Measured: the challenger's local nats-server 2.14.7 ACL probe (static password, not JWT; challenge record, "ACL call-path").
 
@@ -33,6 +33,42 @@ Measured: the challenger's local nats-server 2.14.7 ACL probe (static password, 
 - **C9 (major) ADOPT-PARTLY.** All prior-art and license claims now say `unverified:`; pin and inspect is gate G-7.
   A host-level user is not equal to per-launch revocation (Section 8). The encoder choice stays open (D4).
 
+## Round 2 answers (Amendment B, 10-13, #958)
+
+Basis: the full texts of two #958 reviews (staged copy read by this writer) and the lead's decisions on them:
+Astra, https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182 (one P1), and security,
+https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625 (`SECURITY_REVIEW: FAIL`; P1, P1, P2).
+The lead's decisions match all four findings; no extra finding is claimed. B5 is a lead clarification, not a review
+finding. Section 10 has the detail. Docs only: nothing is implemented, tested or measured.
+
+- **B1 (Astra P1, c6152830182) ADOPT.** No normal role (agent, principal, maintainer) can change the configuration
+  of `<CUS>` or `<LIVE>`: each normal scoped signing key denies `STREAM.CREATE` and `STREAM.UPDATE` on them, besides
+  the existing `PURGE`/`DELETE` deny. A separate break-glass user, minted only by an explicit
+  `fabric nats mint --break-glass`, expires after 1 h and may only create or update `<CUS>`/`<LIVE>`; its mint logs
+  public metadata only. The runbook stops the engines that use them first (#8639 confirmed stop), changes, rechecks,
+  restarts; engines recheck `<CUS>` on every reconnect and refuse a mismatch, so no already-open engine continues under
+  a changed `<CUS>` configuration (the review's point). T14 adds the refusal. Sections 1, 1.4,
+  2.1, 4, 5, 6, 9.1, 9.2, 10.1.
+- **B2 (security P1, c6152848625) ACCEPTED as a security gap, smarty-dev#TBD-UID.** Fleet agents under one UID on
+  one host are one trust domain. Per-launch creds give network authentication, org isolation and root binding, not
+  same-host isolation. Fixes: a per-host broker under a separate UID, or per-lane Unix users. Measure first:
+  `ptrace_scope` and `PR_SET_DUMPABLE=0` (not implemented, not a fix). C8's FD and core guards stay. Sections 1.1,
+  2.2, 2.3, 10.2.
+- **B3 (security P1, c6152848625) ADOPT.** `revoke` writes the new account JWT durably (write, fsync, rename,
+  parent-dir fsync) into
+  each node's local resolver dir, also when its server is down. Every node start, for `init --local` and for each
+  node of a 3-node configuration, accepts no clients until its resolver account JWT has the SHA-256 of the latest
+  account JWT the issuer signed. Closes O-5 by design (not measured). T16. Sections 2.4, 3, 4, 5, 6, 9.4, 10.3.
+- **B4 (security P2, c6152848625) ADOPT.** Rotation is per signing key: a retiring key stays in the account JWT until
+  the longest credential it signed expires (principal 90 days, agent 7 days, maintainer 2 h, break-glass 1 h), or
+  until every user it signed is reissued and revoked. T15. Sections 2.1, 5, 6, 10.4.
+- **B5 (lead clarification, 10-13) ADOPT.** A separate SYS-only user, signed by the `SYS` account identity, never by
+  an org role key, publishes only `$SYS.REQ.CLAIMS.UPDATE` (no lookup or wildcard publish) and subscribes only to
+  its own inbox; 1 h; only for an explicit operator `revoke` or `--sys` use, never in a
+  launch environment. Org users cannot publish resolver or admin `$SYS.REQ` subjects (`$SYS.REQ.USER.INFO` stays).
+  Encoder D4 decided; quotas and `<CUS>`/`<LIVE>` configuration are required caller inputs. Sections 1, 1.4, 2.1,
+  6, D4, 10.5, 10.6.
+
 ## 1. Decision and identity model
 
 We use NATS decentralized auth. One operator signs one account per org. Each issued launch and each principal device
@@ -45,10 +81,10 @@ Self-hosting runs the same code; only key custody differs (Section 3).
 |---|---|---|---|
 | operator | `smarty-fleet` | identity key: 1Password only (offline use) | operator JWT (in each server config) |
 | operator signing key | - | 1Password; used on Ryzen 1 | account JWTs (create, limits, revocations) |
-| system account | `SYS` | 1Password; its user runs on Ryzen 1 only | - |
+| system account | `SYS` | identity key: 1Password; in memory on Ryzen 1 only | the SYS-only user (10.5), never an org user |
 | org account | `smarty-pants` (first), `playful` (later) | identity key: 1Password (recovery) | - |
-| scoped signing keys | per account: `agent`, `principal`, `maintainer` | 1Password; in memory on Ryzen 1 only | user JWTs of that role only |
-| user | one per issued launch, principal device, or maintainer job | process memory (principal: 1Password) | - |
+| scoped signing keys | per account: `agent`, `principal`, `maintainer`, `break-glass` (10.1) | 1Password; in memory on Ryzen 1 only | user JWTs of that role only |
+| user | one per issued launch, principal device, maintainer job, or break-glass change (10.1) | process memory (principal: 1Password) | - |
 
 ### 1.1 Identities
 
@@ -57,11 +93,13 @@ Self-hosting runs the same code; only key custody differs (Section 3).
   `natsStreamName`, `b:src/mesh/state-backend-nats.ts:1057-1063`), and `parent:<session-id>` for a remote task.
   The user public key (`U…`) is the identity in server logs and `connz?auth=1`.
 - **Principal:** `principal/<person>/<device>`. **Maintainer:** `maintainer/<org>/<job>/<run-id>`, Ryzen 1 only.
+  **Break-glass:** `break-glass/<org>/<person>/<run-id>`, Ryzen 1 only, 1 h (10.1).
 - **Per-org isolation** is the account boundary: no exports or imports; account JetStream limits (disk, streams,
   consumers), so one org cannot fill a node.
 - **What it does NOT give.** All writers of one root share one stream, and any writer can forge a self-consistent
   snapshot (docs/mesh-backends.md, "Snapshot integrity"). A child shares its parent's user (2.2), so NATS logs name
-  the parent launch, not the child.
+  the parent launch, not the child. Nor does it give same-host isolation: one UID on one host is one trust domain
+  (accepted security gap smarty-dev#TBD-UID, 10.2).
 
 ### 1.2 Finding: the documented ACL does not match anything
 
@@ -91,15 +129,32 @@ exact names behind `<CUS>` and `<LIVE>` are open item O-2; this note does not in
 | `agent` | `<B>.state`, `<B>.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.<B>`, `$JS.API.STREAM.MSG.GET.<B>`, `$JS.API.CONSUMER.{CREATE,MSG.NEXT,DELETE,INFO}.<B>.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `principal` | `$JS.API.INFO`, `$JS.API.STREAM.INFO.*`, `$JS.API.STREAM.MSG.GET.*`, the 4 consumer verbs `.*.>`, `$JS.API.STREAM.NAMES`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `maintainer` | `*.state`, `*.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.{INFO,MSG.GET,CREATE,UPDATE,DELETE,PURGE}.*`, `$JS.API.STREAM.NAMES`, the 4 consumer verbs `.*.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
+| `break-glass` (10.1; not a normal role) | `$JS.API.INFO`, `$JS.API.STREAM.{INFO,CREATE,UPDATE}.<CUS>`, `$JS.API.STREAM.{INFO,CREATE,UPDATE}.<LIVE>`, `$SYS.REQ.USER.INFO`; nothing else (no `MSG.GET`, no mesh root, no state subject) | `_INBOX.{{subject()}}.>` |
 
-Explicit publish **deny** (in each scoped signing key; deny wins over every allow above, so it also overrides the
-maintainer's `PURGE.*`):
+The SYS-only user is separate from this org-role table, signed by the SYS account identity (10.5):
+
+| account / user | publish allow | subscribe allow |
+|---|---|---|
+| `SYS` / explicit operator user, 1 h | `$SYS.REQ.CLAIMS.UPDATE` only; no lookup, wildcard or other admin subject | `_INBOX.<own U key>.>` |
+
+Explicit publish **deny**. An org user's permissions come only from the scoped signing key that signed it. A deny wins over
+every allow **of the same user**, so it overrides the maintainer's `PURGE.*`, `DELETE.*`, `CREATE.*` and `UPDATE.*`
+for `<CUS>` and `<LIVE>`. A deny in a normal role's key does not reach a break-glass user: that user has its own key
+with its own allow and deny lists (10.1). So the normal-role deny and the break-glass allow do not contradict.
 
 | role | publish deny |
 |---|---|
-| every role (agent, principal, maintainer) | `$JS.API.DIRECT.GET.<CUS>`, `$JS.API.DIRECT.GET.<CUS>.>` (9.2) |
-| every role (agent, principal, maintainer) | `$JS.API.STREAM.PURGE.<CUS>`, `$JS.API.STREAM.PURGE.<LIVE>` (9.2, amendment review F1) |
-| every role (agent, principal, maintainer) | `$JS.API.STREAM.DELETE.<CUS>`, `$JS.API.STREAM.DELETE.<LIVE>` (same record-erasure boundary) |
+| every role (agent, principal, maintainer, break-glass) | `$JS.API.DIRECT.GET.<CUS>`, `$JS.API.DIRECT.GET.<CUS>.>` (9.2) |
+| every role (agent, principal, maintainer, break-glass) | `$JS.API.STREAM.PURGE.<CUS>`, `$JS.API.STREAM.PURGE.<LIVE>` (9.2, amendment review F1) |
+| every role (agent, principal, maintainer, break-glass) | `$JS.API.STREAM.DELETE.<CUS>`, `$JS.API.STREAM.DELETE.<LIVE>` (same record-erasure boundary) |
+| every normal role (agent, principal, maintainer) | `$JS.API.STREAM.CREATE.<CUS>`, `$JS.API.STREAM.CREATE.<LIVE>`, `$JS.API.STREAM.UPDATE.<CUS>`, `$JS.API.STREAM.UPDATE.<LIVE>` (10.1, Astra P1) |
+
+- **Normal role boundaries (10.1).** Agents use their bound roots; principals read; the maintainer runs mesh-root
+  `<B>` lifecycle (create, update, delete, purge) and compaction. No normal role changes custody or liveness storage.
+  The configuration-changing verbs on `<CUS>`/`<LIVE>` are `CREATE`, `UPDATE` and `DELETE` (`PURGE` erases records).
+  Only the maintainer's `.*` allow reaches them today; the deny is in every normal key anyway, so a later allow cannot
+  reopen it. Other `$JS.API.STREAM.*` verbs (for example `RESTORE`) are in no allow list, break-glass included, and
+  stay denied.
 
 - **Root binding (C4).** Stream names are one token, so a prefix rule is impossible; the tag gives exact names. An
   agent that opens a root it was not minted for gets `Permissions Violation`; Fabric maps it to a clear error.
@@ -110,8 +165,9 @@ maintainer's `PURGE.*`):
   `$JS.API.ACCOUNT.>`, other `$SYS.>` (no explicit deny: deny wins and would block USER.INFO), `$JS.ACK`/`$JS.FC`
   (pull consumers need neither), and subscribe outside the own inbox. No allow list holds `$JS.API.DIRECT.GET`;
   on `<CUS>` the explicit deny (table) also keeps a later allow from opening it. Purge and stream deletion on `<CUS>`
-  and `<LIVE>` are explicitly denied to every role; maintainer mesh-root operations stay allowed; agents purge nothing. No role holds debug-attach
-  subjects (9.3).
+  and `<LIVE>` are explicitly denied to every role, break-glass included; create and update on them are denied to
+  every normal role; maintainer mesh-root operations stay allowed; agents purge nothing. No role, break-glass
+  included, holds debug-attach subjects (9.3).
 - **Private inbox.** The client sets `inboxPrefix: "_INBOX.<own U key>"` (gate G-3).
 - **Compaction (gate G-2, C1).** Agent `compact()` publishes the snapshot and does not purge. One maintainer job per
   org on Ryzen 1 (hourly timer) mints a 1 h maintainer user, reads each root's latest snapshot, checks it as a
@@ -121,7 +177,8 @@ maintainer's `PURGE.*`):
   (`origin/feat/nats-kv-leases`) each need their own bound allow entries. Custody and liveness storage (9.2) have the
   explicit deny above; their allow entries are open item O-2.
 - **Expiry.** Agent `exp` = 7 days; Fabric's own cutoff at `exp − 1 h` (C6). Maintainer: 2 h migration, 1 h
-  compaction. Principal: 90 days. `iat` 60 s in the past; no `nbf`. `SYS` serves only the resolver and the tools.
+  compaction. Principal: 90 days. Break-glass: 1 h (10.1). `iat` 60 s in the past; no `nbf`. `SYS` serves only the resolver and the tools, through the SYS-only user
+  (10.5): 1 h.
 
 ## 2. Issuance, launch graph, delivery, revocation
 
@@ -129,9 +186,14 @@ maintainer's `PURGE.*`):
 
 - The issuer runs `fabric nats mint --role agent --org <org> --mesh <hex>…` under `smarty-credentials run --cache
   nats-mint-<org>` (agent signing key only): a fresh nkey pair and user JWT in memory (`@nats-io/nkeys`, encoder D4).
-  Maintainer jobs use `nats-maint-<org>`; revoke and account push use `nats-admin`. No daemon; keys only on Ryzen 1.
-- Users are not rotated: a new launch gets a new user. A signing key rotates: add the new key to the account JWT,
-  mint with it, remove the old key after the longest live user expires (7 days).
+  Maintainer jobs use `nats-maint-<org>`; revoke and account push use `nats-admin` and a 1 h SYS-only user (10.5). A break-glass user comes only
+  from an explicit `fabric nats mint --break-glass --org <org>` under `nats-breakglass-<org>` (no cache, as Q4),
+  after explicit prior approval and the 10.1 runbook; no launcher, job, timer or deployment mints it. No daemon; keys
+  only on Ryzen 1.
+- Users are not rotated: a new launch gets a new user. **Signing keys rotate one key at a time (10.4):** add the new
+  key to the account JWT and mint with it; remove the retiring key only after the longest credential **that key**
+  signed expires (agent 7 days, principal 90 days, maintainer 2 h, break-glass 1 h), or after every user it signed
+  was reissued with the new key and revoked. There is no single 7-day rule for all keys. T15.
 
 ### 2.2 Launch graph (C2)
 
@@ -158,7 +220,8 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 | principal device (m5) | `op run` with the principal creds item | own | T2 |
 
 - Inherited means: NATS logs show the parent; revoking the parent cuts its children; a child has the parent's
-  cutoff. The seed is in more processes, but on one host and one UID, already one trust boundary (docs/agents.md).
+  cutoff. The seed is in more processes, but on one host and one UID, already one trust domain (docs/agents.md):
+  an accepted security gap, not isolation (10.2, smarty-dev#TBD-UID).
 - The resident host keeps the user of the Main that started it. At its cutoff, or on revocation, it closes its NATS
   roots and exits as on host exit; the next durable request from a Main with valid creds starts a new one, which
   resumes the suspended actors (T11h).
@@ -171,23 +234,33 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
   it. It keeps the bytes in one process-global slot and gives them only to `credsAuthenticator` and child pipes.
 - The wrapper sets `ulimit -c 0` before it starts Pi. T10 reads `/proc/<pid>/limits`, `core_pattern` and the FD list
   of Pi and of a child. It reads no credential bytes and prints none.
-- **Same-UID boundary.** All code in the Pi process can read the seed. A same-UID process can read its memory where
-  `ptrace_scope` allows. This is the same exposure as the lane-host model-gateway key in that process. We accept it.
+- **Same-UID boundary (accepted security gap, smarty-dev#TBD-UID, 10.2).** All code in the Pi process can read the
+  seed. A same-UID process can read its memory where `ptrace_scope` allows. This is the same exposure as the
+  lane-host model-gateway key in that process. The lead accepts it as a recorded security gap, not as isolation; the
+  FD and core guards above stay. Measuring `ptrace_scope` and `PR_SET_DUMPABLE=0` comes first (10.2); neither is
+  implemented here, and neither removes same-process or every same-UID path.
 
 ### 2.4 Revocation (C7)
 
 - `fabric nats revoke <U key | session:<id> | host:<h> | *>` on Ryzen 1 adds the keys to `revocations`, re-signs
-  the account JWT, sends it on `$SYS.REQ.CLAIMS.UPDATE`, then asks each configured server for the JWT it holds.
-- Output `complete` only when every server holds the new JWT. Else `partial`, the stale servers, exit 2.
+  the account JWT, records it as the latest (10.3), writes it durably into each configured node's local resolver dir
+  (write, fsync, rename, parent-dir fsync; also when that node's server is down; 10.3), broadcasts that exact JWT on
+  `$SYS.REQ.CLAIMS.UPDATE`, then collects the per-server update acknowledgements on its own reply inbox.
+- Output `complete` only when every configured server ID acknowledges the exact broadcast JWT successfully.
+  Correlate replies to that push's unique inbox and require every configured ID; an error, missing or unknown
+  acknowledgement cannot satisfy it. Else `partial`, naming unconfirmed servers, exit 2. The server saves the
+  broadcast claim before acknowledging it (10.5). This is not a per-server hash or bytes read-back: that is a known
+  limit of the standard v2.14.7 API, accepted by the lead (10.5).
 - **Stale window.** Up node: target 5 s (T4; `unverified:` that the server closes live connections on the update).
-  Stopped node: it starts with its old resolver dir, so it accepts the revoked user until it syncs, at most
-  `interval` (2 min) after it joins the cluster. Partitioned but client-reachable node: no bound while the
+  Stopped node: *amended (10.3)*: its start accepts no clients until its resolver account JWT matches the latest,
+  so it never accepts the revoked user after a restart; nothing relies on peer sync. It still cannot confirm, so
+  `revoke` stays `partial` for it (C7). Partitioned but client-reachable node: no bound while the
   partition lasts. Response: put that node in lame-duck mode over ssh. With R3 streams (Q6) a minority node has no
   stream quorum, so the revoked user cannot read or write mesh state there; with R1 streams it can.
   *Amended (9.1):* R3 is the fleet configuration. One-machine configuration (`nodes: 1`): only the up-node case
-  applies while the node runs. A node stopped during `revoke` restarts with its old resolver dir and has no peer to
-  sync from, so it accepts the revoked user until `revoke` is re-run against it (`partial`, exit 2, until then; O-5).
-  Not measured.
+  applies while the node runs. *Amended (10.3):* a node stopped during `revoke` gets the new account JWT in its local
+  resolver dir from `revoke` itself, and its start accepts no clients until that file matches the latest, so it
+  never accepts the revoked user after a restart (O-5 resolved by design, T16). Not measured.
 - A session that ends normally needs no revocation: its seed dies with its process tree.
 
 ## 3. Fleet and self-hosted custody (C3)
@@ -205,7 +278,7 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 - `init --local` refuses when the Fabric setting `nats.custody` is `fleet` (fleet enrollment sets it). The fleet
   launcher refuses a local operator.
 - `init --local` writes the server config (`operator`, `system_account`, `resolver: { type: full }`,
-  `resolver_preload` of `SYS`). Embedded: Fabric starts `nats-server` as a child, bound to `127.0.0.1` unless the
+  `resolver_preload` of `SYS`). Embedded: Fabric starts `nats-server` as a child (only after the 10.3 start check), bound to `127.0.0.1` unless the
   user sets a listen address. One node, no external service. It renders `bus: {nodes: 1, replicas: 1}` with the fleet's adapter,
   accounts, users and creds (9.1). No-auth loopback stays only in unit tests.
 
@@ -215,34 +288,40 @@ with a new error `FABRIC_MESH_STATE_NATS_NO_CREDS`.
 - **G-2** Agent compaction without purge, plus the maintainer compaction job (C1). T13.
 - **G-4** docs/mesh-backends.md "Required nats-server configuration (pi-fabric#907)" is replaced by the role matrix
   of 1.4 in the same PR. The new rule: only agent users bound to that root, and maintainers, publish to its state
-  subjects; only maintainers purge or delete mesh-root streams (never `<CUS>` or `<LIVE>`, 9.2), create or update.
+  subjects; only maintainers purge, delete, create or update mesh-root streams; nobody purges or deletes `<CUS>` or
+  `<LIVE>` (9.2), and only the break-glass user creates or updates them (10.1).
   T2 on the deployed cluster is the deploy check.
 - **G-5** T2 proves root binding, or fabric-store decides D2. **G-6** Q6 (replicas 3) is done. *Amended (9.1):* the
   fleet configuration selects replicas 3, the adapter takes replicas from the configuration and checks existing
   streams and buckets against it (smarty-dev#11373); a one-machine install selects 1.
 - **G-7** Prior art pinned and inspected, encoder chosen (D4), security pass passed. **G-8** All T11 cases pass.
 - **G-9** (9.2, before any engine keeps `owner.<agent>` in NATS) `<CUS>` has `allow_direct: false`, no expiry and the
-  configured replicas, checked at open; a mismatch is a hard open failure (no ownership decision and no owner write
-  until a maintainer corrects it; replicas are never lowered automatically); liveness storage `<LIVE>` is separate
-  and its replicas are checked the same way; purge and stream deletion on `<CUS>` and `<LIVE>` are denied to every role (1.4); the engine
-  mapping (O-2) is written; T14 passes.
+  configured replicas, checked at open and, for `<CUS>`, again on every reconnect; a mismatch is a hard open failure
+  (no ownership decision and no owner write until it is corrected through the break-glass runbook, 10.1; replicas are
+  never lowered automatically); liveness storage `<LIVE>` is separate and its replicas are checked the same way;
+  purge and stream deletion on `<CUS>` and `<LIVE>` are denied to every role, and create and update to every normal
+  role (1.4); the engine mapping (O-2) is written; T14 passes.
+- **G-10** (10.3, 10.4) Every configured node start runs the resolver start check (T16); `revoke` writes resolver
+  dirs durably; signing-key rotation follows 10.4 (T15).
 
 ## 5. Failure modes
 
 | failure | effect | response |
 |---|---|---|
-| resolver dir or account JWT lost | that node (or all) rejects the org's users; data intact | peer sync within `interval`; re-push from 1Password |
+| resolver dir or account JWT lost, or older than the latest | that node's start accepts no clients (10.3); data intact | write the issuer's latest account JWT into its resolver dir (re-run `revoke` or push), then start |
 | leaked seed | holder acts as that launch, in its roots, until `exp` | revoke the U key; 2.4 windows |
 | lane host compromised | its live users, writes in their bound roots | revoke `host:<h>`; no signing key on the host |
 | NATS node compromised | that node's traffic and JetStream data; cannot mint | remove from the cluster; rotate its TLS cert |
 | Ryzen 1 compromised | attacker mints any user, re-signs accounts | rotate all signing keys; operator identity key re-issues |
-| signing key leaked | account key: users of that role; operator key: forged accounts | remove the key and relaunch; or new operator JWT, reload |
+| signing key leaked | account key: users of that role; operator key: forged accounts | remove the key at once (this cuts every user it signed; reissue principals, 10.4) and relaunch; or new operator JWT, reload |
 | compaction job stopped | streams grow to the account limit, then writes fail | alert on job age; run the job by hand |
-| revoke `partial` | stale node accepts the user (2.4) | lame duck the node; re-run revoke |
+| revoke `partial` | an unconfirmed live node may still accept the user (2.4); a stopped node's start gate refuses stale claims (10.3) | lame duck an unconfirmed live node; re-run revoke |
 | credential cutoff reached | the process and its children lose NATS | relaunch through the launcher |
 | liveness key lapses (9.2) | ownership does not change | a successor starts only after the #8639 confirmed-termination handoff |
-| stream or bucket differs from configured replicas, or `<CUS>` from `allow_direct: false` or no expiry | open fails with an error naming the field; no ownership decision and no write to it; never lowered automatically | a maintainer corrects the stream, then the open is retried |
+| stream or bucket differs from configured replicas, or `<CUS>` from `allow_direct: false` or no expiry | open fails with an error naming the field; no ownership decision and no write to it; never lowered automatically | a maintainer corrects a mesh-root stream or bucket; `<CUS>`/`<LIVE>` only through the break-glass runbook (10.1); then the open is retried |
 | a maintainer job sends `STREAM.PURGE` or `STREAM.DELETE` for `<CUS>` or `<LIVE>` | `Permissions Violation` (explicit deny, 1.4); owner records and history intact | none; mesh-root operations are unaffected |
+| a normal role sends `STREAM.CREATE` or `STREAM.UPDATE` for `<CUS>` or `<LIVE>` | `Permissions Violation` (explicit deny, 1.4) | none; a needed change goes through the break-glass runbook (10.1) |
+| `<CUS>` changed while an engine was disconnected | the engine's reconnect recheck fails; no ownership decision and no write | stop, correct and restart per 10.1 |
 
 ## 6. Test plan
 
@@ -252,9 +331,9 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 | test | checks |
 |---|---|
 | T1 `nats-auth-cluster-form` | fleet configuration `{nodes: 3, replicas: 3}`: 3 nodes route in operator mode; `/varz` cluster size 3; `/accountz` shows `SYS` and the org; streams and buckets the adapter opens report replicas 3; T3: no creds, connect refused |
-| T2 `nats-auth-role-matrix` | per role, every verb of 1.3-1.4 passes or gets `Permissions Violation`; agent: other root refused, purge refused, 2 `mesh:` tags both work; every role: `DIRECT.GET` on `<CUS>` refused, `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused (maintainer included), no attach subjects (9.2, 9.3); control: maintainer purge and deletion of a mesh-root `<B>` pass |
-| T4 `nats-auth-revoke-propagation` | live connections on all nodes close and reconnect fails within 5 s; stopped node; partitioned node gives `partial` |
-| T5 `nats-auth-expiry-skew` | a live connection past `exp`; reconnect after `exp` refused; Fabric cutoff at `exp − 1 h`; +30 s skew connects |
+| T2 `nats-auth-role-matrix` | per role, every verb of 1.3-1.4 passes or gets `Permissions Violation`; agent: other root refused, purge refused, 2 `mesh:` tags both work; every role: `DIRECT.GET` on `<CUS>` refused, `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused (maintainer included), no attach subjects (9.2, 9.3); control: maintainer purge and deletion of a mesh-root `<B>` pass; every normal role: `STREAM.CREATE` and `STREAM.UPDATE` on `<CUS>` and `<LIVE>` refused; break-glass: `STREAM.INFO`, `CREATE` and `UPDATE` on `<CUS>`/`<LIVE>` pass, everything else refused (`DIRECT.GET`, `MSG.GET`, purge, delete, mesh roots, state subjects, attach) (10.1); every org-account user: resolver and admin `$SYS.REQ` subjects refused while `$SYS.REQ.USER.INFO` passes; SYS-only user: its exact subjects pass, other `$SYS.REQ` subjects and any non-own inbox subscribe refused (10.5) |
+| T4 `nats-auth-revoke-propagation` | every configured server ID must acknowledge the exact broadcast JWT before `complete`; a missing or error acknowledgement yields `partial`; live connections on all nodes close and reconnect fails within 5 s; stopped node: `partial`, its resolver file written, refused after restart (T16); partitioned node gives `partial` |
+| T5 `nats-auth-expiry-skew` | a live connection past `exp`; reconnect after `exp` refused; Fabric cutoff at `exp − 1 h`; +30 s skew connects; a break-glass user's `exp` is 1 h after its mint (10.1) |
 | T6 `nats-auth-org-isolation` | a `playful-test` user sees no Smarty stream in `STREAM.NAMES` and cannot get its messages |
 | T7 `nats-auth-reader-proof-bind` | a proof signed by reader A is refused as reader B's proof |
 | T8 `nats-auth-single-node` (CI) | `init --local` renders `{nodes: 1, replicas: 1}`; one loopback `nats-server`; the same adapter and the conformance suite over creds; a stream or bucket whose replicas differ from the configuration fails to open, gets no write and is not lowered. Not in CI today (9.1) |
@@ -263,7 +342,9 @@ prerequisite"); monitoring from Ryzen 1 on 8222. No test server binds a non-loop
 | T11 `nats-auth-launch-graph` | cases a-l of 2.2: each gets its stated user or refuses with `FABRIC_MESH_STATE_NATS_NO_CREDS` |
 | T12 `nats-auth-root-lifecycle` | new root (provision, then agent open), migrated root, migration rerun; agent open of a missing stream refuses |
 | T13 `nats-auth-compaction` | agent compaction publishes without purge; the job purges below the snapshot |
-| T14 `nats-auth-custody-leader` | `<CUS>` info: `allow_direct: false`, no expiry, configured replicas; ownership reads use `STREAM.MSG.GET`; a CAS write on a stale revision fails; a lapsed liveness key leaves `owner.<agent>` unchanged; maintainer `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); a `<CUS>` whose replicas, `allow_direct` or expiry differ from the configuration fails to open, no ownership read decides and no owner write is sent, and nothing is lowered (needs O-2) |
+| T14 `nats-auth-custody-leader` | `<CUS>` info: `allow_direct: false`, no expiry, configured replicas; ownership reads use `STREAM.MSG.GET`; a CAS write on a stale revision fails; a lapsed liveness key leaves `owner.<agent>` unchanged; maintainer `STREAM.PURGE` and `STREAM.DELETE` on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); a `<CUS>` whose replicas, `allow_direct` or expiry differ from the configuration fails to open, no ownership read decides and no owner write is sent, and nothing is lowered; normal maintainer `STREAM.UPDATE` (and `CREATE`) on `<CUS>` and on `<LIVE>` refused while maintainer mesh-root operations pass (control); after a `<CUS>` change made while an engine is disconnected, its reconnect recheck refuses (10.1) (needs O-2) |
+| T15 `nats-auth-key-rotation` | for each scoped key (agent, principal, maintainer, break-glass): add a new key and mint with it; a user signed by the retiring key still connects until its own `exp` (principal 90 days, run with a short test `exp`); the key is removed only after that, or after its users were reissued and revoked; after removal a user signed by the old key is refused and new-key users are unaffected (10.4) |
+| T16 `nats-auth-revoke-restart` | one node (`{nodes: 1}`): stop, `revoke` a user, start: the node accepts no client until its resolver account JWT hash matches the latest, and the revoked user's connect is refused before any mesh request; a stale or missing resolver JWT keeps the node from accepting clients; fleet configuration: the same check on each of the 3 node starts (10.3) |
 
 ## 7. The reader-proof gap (smarty-dev#9834)
 
@@ -326,8 +407,10 @@ chart (nats-io/k8s) and NACK (nats-io/nack), same config shape and creds split. 
   `NATS — operator signing key (smarty fleet)`, `NATS — system account user (smarty fleet)`,
   `NATS — account identity key (org smarty-pants)`, `NATS — agent signing key (org smarty-pants)`,
   `NATS — principal signing key (org smarty-pants)`, `NATS — maintainer signing key (org smarty-pants)`,
-  `NATS — principal user paul-m5 (org smarty-pants)`. Later, vault Playful Development: the same four account items
-  for `org playful`. Profiles (Ryzen 1 only): `nats-mint-smarty-pants`, `nats-maint-smarty-pants`, `nats-admin`.
+  `NATS — break-glass signing key (org smarty-pants)` (10.1),
+  `NATS — principal user paul-m5 (org smarty-pants)`. Later, vault Playful Development: the same five account items
+  for `org playful`. Profiles (Ryzen 1 only): `nats-mint-smarty-pants`, `nats-maint-smarty-pants`, `nats-admin`,
+  `nats-breakglass-smarty-pants` (no cache).
 - **Security pass `nats-auth-7504-security`**, by a reviewer who is not the designer or the challenger, before any
   fleet root switches: this note, the encoder, the permission templates, the #907 text change (G-4), and the
   T2, T4, T5, T10 and T11 results.
@@ -340,6 +423,9 @@ The design is accepted as the R1 basis. A named security pass on this note runs 
 - **D2 accepted.** If T2 can't bind exact streams: block the fleet switch, try the whole-name tag, and only then take the org-wide trust trade-off to Paul.
 - **D3 accepted.** Self-hosted keys on the user's own disk, as a documented product mode (S1, approver fabric-store; Paul's own words: "scale all the way down to a single machine"). It is never a fleet file class.
 - **D4: the encoder is decided at G-7, leaning toward the recommendation.** The own encoder (~80 lines over `@nats-io/nkeys`) wins only if its output matches `nsc describe` and nats-server accepts it, in a test. The `ponytail:` comment says why `@nats-io/jwt` (pre-1.0) is not used. If G-7 finds `@nats-io/jwt` sound and maintained, it is used instead.
+  *Amended 10-13 (Amendment B, 10.6, lead):* decided: a small own encoder over `@nats-io/nkeys` 2.0.3, no
+  `@nats-io/jwt`; the oracle is a nats-server we host in the test accepting its output; an `nsc` cross-check is
+  unconfirmed.
 - **D5 accepted.** mesh-bridge carries no NATS root in R1.
 - **D6 accepted.** A hard 7-day cutoff, the lame-duck runbook, and replicas 3 (Q6). Renewal moves to phase C.
   *Amended 10-13 (9.1):* replicas 3 is the fleet's configuration; a one-machine install is `{nodes: 1, replicas: 1}`.
@@ -378,7 +464,8 @@ attach is its own authentication, not NATS.
 - No code branches on host count at runtime. Rendering the server config from `bus` is fine.
 - Replicas are never lowered at runtime. The adapter checks each existing stream and bucket against the configured
   replicas; a mismatch is a hard open failure, not an automatic change: nothing is written to that stream or bucket
-  until it is corrected. Agents hold no `STREAM.UPDATE` (1.4); a correction is a maintainer step (O-3, resolved).
+  until it is corrected. Agents hold no `STREAM.UPDATE` (1.4); a correction is a maintainer step for mesh-root
+  streams and buckets, and a break-glass step for `<CUS>` and `<LIVE>` (O-3, resolved; 10.1).
   Replicas are never reduced automatically.
 - Replicas 3 (Q6, G-6, D6) is the fleet's selected configuration, not an unconditional barrier. It does not block a
   one-machine install (section 3). Its part in the 2.4 stale-window bound applies to the fleet configuration.
@@ -402,13 +489,15 @@ attach is its own authentication, not NATS.
   default, per the prior read). So
   `<CUS>` sets `allow_direct: false` explicitly and the adapter checks it in `STREAM.INFO` at open, as for
   replicas. A mismatch in replicas, `allow_direct` or expiry is a hard open failure: no ownership read decides and
-  no `owner.<agent>` write goes out until a maintainer corrects `<CUS>`; nothing is changed automatically. Which request a nats.js 3.4.0 KV `get` sends: not measured.
+  no `owner.<agent>` write goes out until `<CUS>` is corrected through the break-glass runbook (10.1); the engine
+  repeats the check on every reconnect; nothing is changed automatically. Which request a nats.js 3.4.0 KV `get` sends: not measured.
 - `<CUS>` and liveness storage are not a mesh root's state stream `<B>`. The root binding, compaction and purge rules
   for `<B>` do not cover them. `<LIVE>` (1.4) names the liveness storage's stream. Agents hold no purge anywhere.
   The maintainer purges mesh-root streams `<B>` (G-2), but every role, maintainer included, has an explicit deny on
   `$JS.API.STREAM.PURGE.<CUS>` and `$JS.API.STREAM.PURGE.<LIVE>` (1.4). The same explicit deny covers
   `$JS.API.STREAM.DELETE.<CUS>` and `$JS.API.STREAM.DELETE.<LIVE>`: deleting the stream would erase the same
-  owner records and CAS history. Mesh-root stream lifecycle authority is unchanged.
+  owner records and CAS history. Mesh-root stream lifecycle authority is unchanged. *Amended (10.1):* no normal role
+  creates or updates `<CUS>` or `<LIVE>` either; only the break-glass user does.
 - **Not fixed here:** the engine's exact bucket or stream names, subjects, and which role writes `owner.<agent>`.
   The #8031 addendum does not give that mapping and this note does not invent it: O-2, gate G-9, test T14.
 
@@ -428,12 +517,16 @@ attach is its own authentication, not NATS.
   it, including subject-space isolation from the maintainer's `*.state` / `*.snapshot` mesh grants. Gate G-9.
 - **O-3 resolved** (amendment review F2): a replicas, `allow_direct` or expiry mismatch is a hard open failure, with
   no ownership decision or write until a maintainer corrects it; never lowered automatically (9.1, 9.2, G-9, T8, T14).
+  *Amended (10.1):* for `<CUS>` and `<LIVE>` the correction is the break-glass runbook.
 - **O-4 resolved** (amendment review F1): purge and stream deletion on `<CUS>` and `<LIVE>` are explicitly denied
   to every role, maintainer included; mesh-root lifecycle operations stay allowed (1.4, G-4, T2, T14).
-- **O-5** One-node revoke after a stop (2.4): re-run `revoke`; not measured.
-- **O-6** The phase of G-9 and T14 relative to the phase 1 / phase 2 split above.
-- **O-7** This amendment is not a security pass. Whether `nats-auth-7504-security` also covers section 9: lead
-  decides.
+- **O-5 resolved by design** (Amendment B, 10.3): `revoke` writes the account JWT durably into each node's local
+  resolver dir, and every node start accepts no clients until it matches the latest; T16. A design decision, not a
+  measurement; nothing is measured.
+- **O-6** The phase of G-9 and T14 relative to the phase 1 / phase 2 split above; also the phase of G-10, T15, T16
+  and the break-glass mint (section 10).
+- **O-7** Neither amendment is a security pass. Whether `nats-auth-7504-security` also covers sections 9 and 10:
+  lead decides.
 
 ### 9.5 Prior art
 
@@ -448,3 +541,134 @@ attach is its own authentication, not NATS.
   the owner record free of any TTL and treat the TTL key as a signal, because a successor needs confirmed
   termination (#8639). `unverified:` fencing-token write-ups such as Kleppmann's "How to do distributed locking"
   (not fetched).
+
+## 10. Amendment B (10-13, #958 round 2): update deny, break-glass, same-UID gap, durable revoke, per-key rotation, SYS-only user
+
+Docs only: nothing in this section is implemented, tested or measured. Basis: the full Astra review
+(https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182) and security review
+(https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625), and the lead's decisions on them;
+10.5 and 10.6 are a lead clarification. No finding beyond those is claimed. It does not change the auth model, the
+key custody model, the credential cutoff (C6) or the revocation policy, except as stated. A delta design review and
+security review of the frozen text follow; this note does not claim them.
+
+### 10.1 Custody and liveness configuration: normal roles deny, break-glass changes (Astra P1)
+
+- Problem: the maintainer's `$JS.API.STREAM.UPDATE.*` (and `CREATE.*`) reached `<CUS>` and `<LIVE>`. An update could
+  add a max age or TTL and expire owner CAS history; the open-time check (G-9) did not stop an already-open engine.
+- Normal roles: every normal scoped signing key (agent, principal, maintainer) denies `STREAM.CREATE` and
+  `STREAM.UPDATE` on `<CUS>` and `<LIVE>`, besides the kept `PURGE`, `DELETE` and `DIRECT.GET` denies (1.4).
+  `CREATE` is denied too, so no normal role can choose the configuration of a missing `<CUS>`/`<LIVE>`. Maintainer
+  mesh-root `<B>` lifecycle and compaction are unchanged.
+- Break-glass role: a fourth scoped signing key per account, `break-glass`, in the existing org signing custody
+  (1Password item, in memory on Ryzen 1 only; no new key file). Allow: `STREAM.INFO`, `STREAM.CREATE` and
+  `STREAM.UPDATE` on `<CUS>` and `<LIVE>`, `$JS.API.INFO`, `$SYS.REQ.USER.INFO`, its own inbox. It keeps the
+  every-role denies: no `DIRECT.GET` on `<CUS>`, no purge or delete of `<CUS>`/`<LIVE>`. No `MSG.GET`, no mesh
+  root, no state subject, no attach (9.3), no agent grant. 1.4 says why the normal-role deny does not block it.
+- Mint: only an explicit `fabric nats mint --break-glass --org <org>` run by a person after explicit prior approval
+  of that change; never a launcher, job, timer or deployment. `exp` 1 h. The mint logs public metadata only (user
+  public key, name, org, signing key public key, `iat`, `exp`, the user JWT's SHA-256, approval reference); never the
+  seed or the user JWT. The stop-first runbook below is what covers engines that are already open.
+  Creds are held as in 2.3 (memory, no file).
+- Minimum runbook for any `<CUS>`/`<LIVE>` configuration change, first creation included:
+  1. Get the approval.
+  2. Stop every engine that uses that `<CUS>`/`<LIVE>` before the change, and verify the stop with the existing
+     #8639 confirmed-termination handoff. No new protocol.
+  3. Mint the break-glass user and make the change.
+  4. Recheck the configuration with `STREAM.INFO` against the configured values (9.1, 9.2, G-9).
+  5. Restart the engines; the break-glass user expires within 1 h.
+- Engines check `<CUS>` (`allow_direct: false`, no expiry, configured replicas) at open and again on every
+  reconnect, and refuse a mismatch: no ownership decision, no owner write (9.2).
+- Tests: T2, T5, T14.
+
+### 10.2 Same-UID seed exposure: accepted security gap (security P1)
+
+- Lead decision: ACCEPTED as a security gap, smarty-dev#TBD-UID (number pending). All fleet agents under one UID on
+  one host are one trust domain. That is already true for the file mesh, registries and session files.
+- Per-launch creds give network authentication, org isolation and root binding (1.1, 1.4). They do not isolate a
+  launch from another same-UID process on the same host, and this note no longer treats them as that.
+- Fixes, not designed here: a per-host broker under a separate UID that keeps the seeds; or per-lane Unix users.
+- Measure first, cheap: `ptrace_scope` on the fleet hosts and `PR_SET_DUMPABLE=0` in the credential-bearing
+  process. To be measured and evaluated; not implemented and not claimed. Neither removes the gap: code in the same
+  process still reads the seed, and other same-UID paths remain.
+- Unchanged: FD 3 closed before tools, `ulimit -c 0`, no creds in argv, environment, files or logs (2.3, C8, T10).
+  Accepting the gap does not remove these guards.
+
+### 10.3 Revocation survives a stopped node (security P1; resolves O-5 by design)
+
+- The latest record: every mint or `revoke` that signs a new account JWT records that signed JWT and its SHA-256 as
+  the org's current account claim. Only this issuer record is authoritative. A hash cached on a node, from a peer or
+  from an earlier start is not: it could match an old resolver file.
+- Persisting: the record and each resolver file are written to a temporary file, fsynced, renamed over the target,
+  and the parent directory is fsynced.
+- `revoke` writes the new account JWT this way into the local resolver dir of every configured node, also when that
+  node's server is down (fleet: over the existing ssh path from Ryzen 1; self-hosted: the local dir). Then the
+  `$SYS.REQ.CLAIMS.UPDATE` push and confirmation of 2.4.
+- Start check, the same code for `init --local` and for each node of the 3-node configuration: before
+  `nats-server` accepts any client, the start wrapper compares the SHA-256 of each org account JWT in the node's
+  resolver dir with the issuer's current record. Missing, different or unreadable file, or a latest record that is
+  unknown or cannot be obtained: the node accepts no clients (fails closed). Hash, not `iat`: it names exactly one
+  JWT; two re-signs in the same second share `iat`.
+- No new daemon or transport: the existing issuer, its control files and the runbook supply the record. The exact
+  path and how a node start binds to it are an unimplemented gate (O-9).
+- No claim rests on peer sync after a restart.
+- C7 still holds: `complete` only when every configured server ID acknowledges the exact broadcast JWT; a down
+  node, error or missing acknowledgement makes it `partial`, with that node named, and the output also says whether
+  its resolver file was written. The change: after a restart that node accepts no stale clients. A host down during `revoke` gets no
+  write; its start check fails until the latest JWT is written to it (re-run `revoke` or push).
+- Unchanged: the credential cutoff (C6), the revocation policy, the partitioned-node case (2.4, lame duck).
+- Not fixed here: the exact path of the issuer's record and the node-start binding to it (when the start cannot get
+  it, it fails closed): O-9, an implementation gate. `unverified:` the resolver dir layout (one file per account public key); T16 checks.
+- Test T16; T4 adds the stopped-node result.
+
+### 10.4 Rotation per signing key (security P2)
+
+- Each scoped signing key rotates on its own: agent, principal, maintainer, break-glass. Add the new key to the
+  account JWT and mint with it; remove the retiring key only after the longest credential it signed expires: agent
+  7 days, principal 90 days, maintainer 2 h, break-glass 1 h.
+- Alternative: reissue every user the retiring key signed with the new key, revoke the old users, then remove the key.
+- Removing a key early cuts every user it signed: that is the leaked-key response (section 5), not a rotation.
+- Test T15. This replaces the single 7-day rule in 2.1.
+
+### 10.5 SYS-only user (lead clarification)
+
+- A separate SYS-only user does resolver push and revocation. The `SYS` account identity signs it (1Password, in
+  memory on Ryzen 1; self-hosted: the S1 directory). No org role key ever signs it, and the encoder never signs a
+  `SYS` user with an org key. No new credential file class.
+- Publish allow: **only `$SYS.REQ.CLAIMS.UPDATE`**; no lookup, no `$SYS.REQ.>` or any wildcard publish grant.
+  The full resolver validates and saves the exact broadcast JWT, then returns a response naming its server.
+  `revoke` correlates successful update acknowledgements to that push and every configured server ID (2.4).
+- Source checked 10-13 19:16Z: nats-server v2.14.7
+  [update handler](https://github.com/nats-io/nats-server/blob/v2.14.7/server/accounts.go#L4547-L4564) and
+  [response](https://github.com/nats-io/nats-server/blob/v2.14.7/server/accounts.go#L4284-L4340).
+  The [raw account lookup](https://github.com/nats-io/nats-server/blob/v2.14.7/server/accounts.go#L4566-L4590)
+  returns JWT bytes without a server identity. A per-server `CLAIMS.LOOKUP` is not a registered
+  [server service](https://github.com/nats-io/nats-server/blob/v2.14.7/server/events.go#L1267-L1352).
+  **Known limit, accepted by the lead:** update acknowledgement, not per-server JWT hash or bytes read-back.
+  No new read-back mechanism is designed or required here; O-10 is resolved.
+- Subscribe allow: only `_INBOX.<own U key>.>`.
+- `exp` 1 h. Minted only for an explicit operator `fabric nats revoke`, account push, or `--sys` use; never put in
+  a launch environment, never given to Pi, an agent or a job.
+- Org users (every role, break-glass included) publish no resolver or admin `$SYS.REQ` subject; the existing
+  `$SYS.REQ.USER.INFO` allow stays. T2.
+
+### 10.6 Encoder and required caller inputs (lead clarification)
+
+- D4 decided: a small own encoder over `@nats-io/nkeys` 2.0.3; no `@nats-io/jwt`. Oracle: a nats-server we host in
+  the test accepting its output; an `nsc` cross-check is unconfirmed.
+- Org account JetStream limits (disk, streams, consumers) are required, caller-configured, finite values; no
+  unlimited default.
+- `<CUS>` and `<LIVE>` names and configuration are required caller configuration; the names are distinct from each
+  other and from every bound mesh stream `<B>`; nothing defaults them. The 1.4 denies are written with those
+  configured literal names. This does not resolve O-2: the engine mapping stays open.
+
+### 10.7 Open items after Amendment B
+
+- **O-5 resolved by design** (10.3), not measured.
+- Still open: O-1, O-2 (engine mapping and its allow subjects), O-6 (phase, including section 10), O-7
+  (security pass scope, including section 10).
+- **O-8** Who approves a break-glass mint and where its public audit record is kept. Not invented here.
+- **O-9** Exact path of the issuer's current account-JWT record (not a secret) and how each node start binds to it,
+  through the existing issuer, control files and runbook. Implementation gate; no new daemon or transport.
+- **O-10 resolved** (10.5): SYS publish allow is only `$SYS.REQ.CLAIMS.UPDATE`. Every configured server ID must
+  acknowledge the exact broadcast JWT for `complete`; there is no per-server read-back, a known accepted limit.
+- smarty-dev#TBD-UID: the lead replaces the issue number.

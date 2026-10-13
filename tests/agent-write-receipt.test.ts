@@ -7,7 +7,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { WriteReceiptRecorder, WRITE_RECEIPT_MAX_COMMAND_CHARS, WRITE_RECEIPT_MAX_PATHS } from "../src/agents/write-receipt.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
 const roots: string[] = [];
@@ -43,7 +42,9 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(fs.readFileSync(path.join(root, "b.txt"), "utf8")).toBe("B");
   }, 30_000);
 
-  it("bounds the receipt: a capped number of paths, cut command text, and truncated marked; no contents", () => {
+  it("bounds the receipt: a capped number of paths, cut command text, and truncated marked; no contents", async () => {
+    // Imported here, so the other cases still run (and fail) on a tree without the module.
+    const { WriteReceiptRecorder, WRITE_RECEIPT_MAX_COMMAND_CHARS, WRITE_RECEIPT_MAX_PATHS } = await import("../src/agents/write-receipt.js");
     const recorder = new WriteReceiptRecorder("/work");
     for (let n = 0; n < WRITE_RECEIPT_MAX_PATHS + 5; n++) {
       recorder.start({ toolCallId: `w${n}`, toolName: "write", args: { path: `f${n}.txt`, content: "secret contents" } });

@@ -107,11 +107,8 @@ import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
-  checkDenyCommands,
   checkWritePolicyRequest,
   readAgentLineage,
-  readDenyCommands,
-  resolveChildDenyCommands,
   readWritePolicy,
   requestsWritePolicy,
   resolveChildWritePolicy,
@@ -1409,17 +1406,6 @@ export class AgentManager {
         'A confined agent cannot use a native Fabric executor (CPython, node-process, bun-process); use QuickJS/Monty or shell: "unconfined"',
       );
     }
-    // smarty-dev#8758 item 3: carried to the child (PI_FABRIC_DENY_COMMANDS) by the worker; a confined caller's own
-    // list can be neither dropped nor shortened (resolveChildDenyCommands). A hosted runner has no worker to carry it.
-    checkDenyCommands(request.denyCommands);
-    const denyCommands = resolveChildDenyCommands(request.denyCommands, readDenyCommands());
-    if (denyCommands.length && hostedAdapter) throw new Error(`denyCommands needs a worker runner; ${runnerAdapter.label} is hosted`);
-    // pi-fabric#1034 security P1: the bash guard that enforces the list is a Pi extension. A child without extensions
-    // (extensions: false, so --no-extensions) or on another runner would carry the list but never enforce it: refuse.
-    if (denyCommands.length && (runner !== "pi" || !(request.recursive === true || (request.extensions ?? this.config.extensions)))) {
-      throw new Error(`denyCommands (${denyCommands.join(", ")}) needs a Pi child with extensions enabled: the bash guard that ` +
-        `enforces it is a Pi extension, so ${runner !== "pi" ? `the ${runner} runner` : "extensions: false"} would leave the list unenforced`);
-    }
     const worktreeSetup = request.worktree ? request.worktreeSetup ?? this.config.worktree?.setup : undefined;
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
       throw new Error("worktreeSetup must be a shell command of at most 8192 characters");
@@ -1751,7 +1737,6 @@ export class AgentManager {
             : []),
           ...(writePolicy ? ["--write-policy", JSON.stringify(writePolicy)] : []),
           ...(scope ? ["--scope", JSON.stringify(scope)] : []),
-          ...(denyCommands.length ? ["--deny-commands", JSON.stringify(denyCommands)] : []),
           "--lineage",
           JSON.stringify(lineage),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),

@@ -305,7 +305,6 @@ switch (behavior) {
         content: JSON.stringify({
           lineage: process.env.PI_FABRIC_LINEAGE ?? null,
           writePolicy: process.env.PI_FABRIC_WRITE_POLICY ?? null,
-          denyCommands: process.env.PI_FABRIC_DENY_COMMANDS ?? null,
           scope: process.env.PI_FABRIC_SCOPE ?? null,
           scopeFile: process.env.PI_FABRIC_SCOPE_FILE ?? null,
           args: process.argv.slice(2),

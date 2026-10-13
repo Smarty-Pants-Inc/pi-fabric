@@ -122,11 +122,6 @@ export interface AgentRunRequest {
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";
-  /**
-   * smarty-dev#8758: command names the child's bash guard refuses; carried as PI_FABRIC_DENY_COMMANDS (child-env.ts).
-   * Omitted inherits the caller's list; a confined caller's list cannot be dropped or shortened.
-   */
-  denyCommands?: string[];
   /** Narrow the host-issued scope for the child; omitted inherits it unchanged. See src/scope.ts. */
   scope?: { grants: FabricScopeGrant[] };
   /**
@@ -450,8 +445,6 @@ export interface AgentWorkerOptions {
   carryOver?: AgentRunCarryOver;
   /** Serialized PI_FABRIC_WRITE_POLICY; Pi children also load the write guard. */
   writePolicy?: string;
-  /** Serialized PI_FABRIC_DENY_COMMANDS (smarty-dev#8758): set in the child's environment as is. */
-  denyCommands?: string;
   /** Serialized PI_FABRIC_LINEAGE. */
   lineage?: string;
   /** Serialized PI_FABRIC_SCOPE; absent clears any inherited scope variables. */

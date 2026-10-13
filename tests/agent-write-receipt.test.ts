@@ -1,7 +1,6 @@
-// smarty-dev#8758: (2) a process task agent's final envelope carries a tool-generated receipt of the paths its
-// write/edit tools changed and the shell commands it ran, so the spawning lane trusts the receipt, not the prose;
-// (3) agents.spawn carries a denyCommands list to the child as PI_FABRIC_DENY_COMMANDS, which a confined caller can
-// neither drop nor shorten (enforcement is the bash guard's, smarty-dev#2754).
+// smarty-dev#8758 item 2: a process task agent's final envelope carries a tool-generated receipt of the paths its
+// write/edit tools changed and the shell commands it ran, so the spawning lane trusts the receipt, not the prose.
+// (Item 3, denyCommands, is split to smarty-dev#11186.)
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,12 +10,11 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
-const saved = { behavior: process.env.FAKE_PI_BEHAVIOR, deny: process.env.PI_FABRIC_DENY_COMMANDS };
+const saved = { behavior: process.env.FAKE_PI_BEHAVIOR };
 afterEach(async () => {
   for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   if (saved.behavior === undefined) delete process.env.FAKE_PI_BEHAVIOR; else process.env.FAKE_PI_BEHAVIOR = saved.behavior;
-  if (saved.deny === undefined) delete process.env.PI_FABRIC_DENY_COMMANDS; else process.env.PI_FABRIC_DENY_COMMANDS = saved.deny;
 });
 const managerIn = (behavior: string) => {
   process.env.FAKE_PI_BEHAVIOR = behavior;
@@ -66,66 +64,5 @@ describe("agent write receipt (smarty-dev#8758 item 2)", () => {
     expect(receipt.commands).toEqual(["x".repeat(WRITE_RECEIPT_MAX_COMMAND_CHARS)]);
     expect(receipt.truncated).toBe(true);
     expect(JSON.stringify(receipt)).not.toContain("secret contents");
-  });
-});
-
-// A child that loads extensions (the bash guard is one): the shape every denyCommands launch must have.
-const EXT = { task: "report", runner: "pi", transport: "process", extensions: true } as const;
-
-describe("denyCommands carried to the child (smarty-dev#8758 item 3)", () => {
-  const report = (text: string) => JSON.parse(text) as { denyCommands: string | null };
-  it("a child spawned with denyCommands sees PI_FABRIC_DENY_COMMANDS; one spawned without it sees none", async () => {
-    const { manager } = managerIn("child-contract");
-    const denied = await manager.run({ ...EXT, denyCommands: ["sed -i", "git"] });
-    expect(denied.status).toBe("completed");
-    expect(JSON.parse(report(denied.text).denyCommands!)).toEqual(["git", "sed -i"]);
-    const plain = await manager.run({ ...EXT });
-    expect(report(plain.text).denyCommands).toBeNull();
-  }, 30_000);
-
-  // pi-fabric#1034 security P1: the bash guard that enforces the list is a Pi extension; without extensions the list
-  // would be carried but never enforced, so the launch is refused (fail closed), asked or inherited.
-  it("refuses a deny list with extensions: false before launch, asked or inherited", async () => {
-    const { root, manager } = managerIn("child-contract");
-    await expect(manager.run({ ...EXT, extensions: false, denyCommands: ["git"] }))
-      .rejects.toThrow("denyCommands (git) needs a Pi child with extensions enabled");
-    process.env.PI_FABRIC_DENY_COMMANDS = JSON.stringify(["git"]);
-    await expect(manager.run({ ...EXT, extensions: false })).rejects.toThrow("would leave the list unenforced");
-    // Nothing was launched: no run directory exists.
-    expect(fs.existsSync(path.join(root, "runs")) ? fs.readdirSync(path.join(root, "runs")).filter(name => /^[a-f0-9]{32}$/.test(name)) : []).toEqual([]);
-    // Without a list, extensions: false still launches.
-    delete process.env.PI_FABRIC_DENY_COMMANDS;
-    expect((await manager.run({ ...EXT, extensions: false })).status).toBe("completed");
-  }, 30_000);
-
-  // pi-fabric#1034 (both reviews): only an unset variable means no list; a present empty one is malformed.
-  it("a present but empty PI_FABRIC_DENY_COMMANDS is refused, not read as no list", async () => {
-    process.env.PI_FABRIC_DENY_COMMANDS = "";
-    const { manager } = managerIn("child-contract");
-    await expect(manager.run({ ...EXT })).rejects.toThrow("PI_FABRIC_DENY_COMMANDS is present but empty");
-    await expect(manager.run({ ...EXT, denyCommands: ["git"] })).rejects.toThrow("present but empty");
-    // A present serialized empty list is malformed too: the worker never sets one (round 2 P2).
-    process.env.PI_FABRIC_DENY_COMMANDS = "[]";
-    await expect(manager.run({ ...EXT })).rejects.toThrow("PI_FABRIC_DENY_COMMANDS is present but lists no command");
-  }, 30_000);
-
-  it("a confined caller cannot drop or shorten its list; omitting it inherits, and adding to it is allowed", async () => {
-    process.env.PI_FABRIC_DENY_COMMANDS = JSON.stringify(["git"]);
-    const { manager } = managerIn("child-contract");
-    await expect(manager.run({ ...EXT, denyCommands: [] }))
-      .rejects.toThrow("cannot launch a child without its denied commands: git");
-    await expect(manager.run({ ...EXT, denyCommands: ["rm"] }))
-      .rejects.toThrow("cannot launch a child without its denied commands: git");
-    const inherited = await manager.run({ ...EXT });
-    expect(JSON.parse(report(inherited.text).denyCommands!)).toEqual(["git"]);
-    const widened = await manager.run({ ...EXT, denyCommands: ["git", "rm"] });
-    expect(JSON.parse(report(widened.text).denyCommands!)).toEqual(["git", "rm"]);
-  }, 30_000);
-
-  it("refuses a malformed list before launch", async () => {
-    const { manager } = managerIn("child-contract");
-    await expect(manager.run({ task: "report", runner: "pi", transport: "process", denyCommands: [""] })).rejects.toThrow("denyCommands must be");
-    await expect(manager.run({ task: "report", runner: "pi", transport: "process", denyCommands: Array.from({ length: 33 }, (_, n) => `c${n}`) }))
-      .rejects.toThrow("denyCommands must be");
   });
 });

@@ -923,8 +923,6 @@ The child Pi process enforces the policy. The worker passes it as `PI_FABRIC_WRI
 
 Confinement is inherited and only narrows. A confined agent's own children inherit its policy when they request none; an explicit request must keep `readOnly`, cannot switch to `shell: "unconfined"`, and must name roots inside the caller's roots. Claude and Veda runners fail before launch under any policy because Fabric cannot enforce it there. A confined agent cannot start durable agents or actors, since the shared resident host does not inherit its confinement.
 
-`denyCommands?: string[]` (at most 32 command names, for example `["git", "sed -i"]`) is carried to the child as `PI_FABRIC_DENY_COMMANDS`. Fabric only carries it: the bash guard refuses the commands. Omitting it inherits the caller's list. A child can never drop or shorten an inherited list: a request that leaves out an inherited command fails before launch. A hosted runner has no worker to carry it and refuses a non-empty list.
-
 ### Write receipt
 
 The result of a Pi process child carries `writeReceipt: { paths, commands, truncated? }`. Fabric records it from the child's own tool events, not from the child's report:
@@ -950,7 +948,6 @@ Fabric children may read these environment variables. They are stable and versio
 | --- | --- |
 | `PI_FABRIC_LINEAGE` | JSON `{ version: 1, rootSessionId, parentSessionId?, parentRunId?, runId, depth, childIndex, worker: true }`. `childIndex` is the launch ordinal within the parent process. `agents.self()` adds the same object as `lineage` inside a child. |
 | `PI_FABRIC_WRITE_POLICY` | JSON `{ readOnly, writableRoots, shell }` with canonical absolute roots. Present only for confined children. Malformed values fail closed to read-only with shell denied. |
-| `PI_FABRIC_DENY_COMMANDS` | JSON array of command names the child's bash guard refuses (`denyCommands`), sorted and deduplicated. Present only when the list is not empty, and it always includes every inherited command. |
 | `PI_FABRIC_THINKING_BOUNDS` | JSON `{ min?, max? }` thinking bounds; see [thinking](thinking.md). |
 | `PI_FABRIC_SCOPE` | JSON `FabricScope` `{ version: 1, principal, grants, digest, parentDigest? }`. Present only when the parent is scoped: the inherited or narrowed scope. The worker always clears `PI_FABRIC_SCOPE_FILE`. A child Fabric reads it as its root scope and fails closed when it is malformed. See [principal and scope](providers.md#principal-and-scope). |
 | `PI_FABRIC_DEPTH` | Recursion depth of the child (the root is 0). |

@@ -127,7 +127,6 @@ export const normalizeAgentRunRequest = (
     ...(args.readOnly !== undefined ? { readOnly: args.readOnly as boolean } : {}),
     ...(args.writableRoots !== undefined ? { writableRoots: args.writableRoots as string[] } : {}),
     ...(args.shell !== undefined ? { shell: args.shell as "deny" | "unconfined" } : {}),
-    ...(args.denyCommands !== undefined ? { denyCommands: args.denyCommands as string[] } : {}),
     ...(args.scope !== undefined ? { scope: args.scope as NonNullable<AgentRunRequest["scope"]> } : {}),
     ...(args.residency === "session" || args.residency === "durable"
       ? { residency: args.residency }

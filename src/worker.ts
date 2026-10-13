@@ -780,8 +780,6 @@ const main = async (): Promise<void> => {
       // Supported child contract (docs/agents.md "Child environment contract").
       ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
       ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
-      // smarty-dev#8758: exactly the manager's resolved list (it already includes every inherited command).
-      PI_FABRIC_DENY_COMMANDS: options.denyCommands,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,

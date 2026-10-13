@@ -91,6 +91,9 @@ const lazyEntryPoints = [
   "src/agents/transports/placement.ts",
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
+  // Also loaded by the worker (-e) so extensions: false children keep
+  // extension-registered model providers.
+  "src/agents/provider-bridge.ts",
   "src/fabric-runtime-state.ts",
   "src/provider-error-class.ts",
   "src/topology/root-inbox-context.ts",

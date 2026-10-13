@@ -787,6 +787,9 @@ const main = async (): Promise<void> => {
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
+      // Disabled extensions must not regain ambient authority via provider discovery.
+      // Also drop an inherited target for an explicitly loaded bridge.
+      PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
   });

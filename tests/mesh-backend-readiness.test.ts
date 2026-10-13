@@ -18,7 +18,13 @@ const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
 const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c943";
 const dirs: string[] = [];
 const savedRelease = process.env.PI_FABRIC_RELEASE_SHA;
-beforeEach(() => { process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a"; });
+beforeEach(() => {
+  process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a";
+  // Hermetic alarm recipient (smarty-dev#9436): a launcher's SMARTY_LEAD_SESSION or PI_FABRIC_MESH_ALARM_TO must not
+  // leak in. Tests whose accepted-unready switch is expected to succeed set PI_FABRIC_MESH_ALARM_TO themselves.
+  vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", undefined);
+  vi.stubEnv("SMARTY_LEAD_SESSION", undefined);
+});
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
@@ -209,6 +215,9 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
   });
 
   it("reports a missing override alarm recipient as post-commit failure, never as a broadcast", async () => {
+    // No recipient at all (beforeEach unset both); an empty value counts as unset too.
+    expect(process.env.PI_FABRIC_MESH_ALARM_TO).toBeUndefined();
+    expect(process.env.SMARTY_LEAD_SESSION).toBeUndefined();
     vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
     vi.stubEnv("SMARTY_LEAD_SESSION", "");
     const root = await crashedImport();
@@ -247,6 +256,7 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
   });
 
   it("refuses a live Fabric writer on a release with no proof, and one without a release", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     expect((await run(["reader-proof", "--root", root, "--backend", "sqlite"])).code).toBe(0); // fabric-rel-a
     const old = await run(["cutover", "--root", root], { writers: [{ pid: 7, release: "fabric-rel-old", mode: "file" }] });
@@ -599,6 +609,8 @@ sys.stdin.readline()`;
   }, 60_000);
 
   it.skipIf(binSkip !== "")(`end to end through the operator's bin: a lock-free holder refuses, without it the switch is ready${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     // The operator's entry point (package bin -> dist), as a child; the real census, fd scan, /proc/locks and lease probe.
     const cli = (...argv: string[]) => spawnSync(process.execPath, [BIN, ...argv], { encoding: "utf8", timeout: 60_000,
@@ -745,6 +757,8 @@ for (let i = 0; ; i++) {
   // pi-fabric#880 review round 3 (SEC P1): a swapped-in bundle drops any check it carries, so the operator's shim checks
   // the chain BEFORE it imports the bundle. The fake bundle leaves a marker if any of its code runs.
   it.skipIf(binSkip !== "")(`the operator's bin refuses before loading a bundle under a group-writable parent${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     const parent = tempDir("shim");
     const pkg = path.join(parent, "pkg");
@@ -772,6 +786,8 @@ for (let i = 0; ; i++) {
 
   // pi-fabric#880 review round 4 (CODE P1): a symlink at or below the package root could be swapped after the check.
   it.skipIf(binSkip !== "")(`the operator's bin refuses a symlinked bundle or bundle directory inside the package${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     const pkg = path.join(tempDir("links"), "pkg");
     fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
@@ -844,6 +860,8 @@ for (let i = 0; ; i++) {
   });
 
   it.skipIf(binSkip !== "")(`end to end: a group-writable directory of the gate's own bundle refuses the switch${binSkip ? ` (skipped: ${binSkip})` : ""}`, async () => {
+    // The host's real inventory may hold an unready installed reader (factory): its accepted override then alarms.
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     const pkg = tempDir("bundle");
     fs.cpSync(path.resolve("dist"), path.join(pkg, "dist"), { recursive: true });
@@ -1206,6 +1224,7 @@ exec sleep 30
   // ponytail: the remaining fail-closed branches (not Linux, leases-enable=0, a missing helper) cannot run end to
   // end on a Linux CI host with leases enabled and the helper built, so they are injected here.
   it.skipIf(process.platform !== "linux")("fails closed when the lease probe cannot run: a missing helper, leases disabled, not Linux", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await crashedImport();
     const missing = await run(["cutover", "--root", root], { procScan: { listPids: () => [] }, leaseProbe: { helper: path.join(root, "no-helper") } });
     expect(missing.code).toBe(3);
@@ -1229,6 +1248,7 @@ exec sleep 30
   // ponytail: the holder scan reads /proc and /proc/locks, Linux only (smarty-dev#7936); off Linux it
   // fails closed, covered by "fails closed off Linux" below.
   it.skipIf(process.platform !== "linux")("fails closed when /proc/locks is unreadable: an unreadable /proc/<pid>/fd is then ambiguous", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     const other = process.ppid;
     const procScan: ProcScanOptions = { listPids: () => [other], readFdDir: denied(other),
@@ -1261,6 +1281,7 @@ exec sleep 30
   });
 
   it("fails closed off Linux: state.db evidence stays fabric@unknown and only the override passes", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
     const root = await fileRoot();
     const unknown = [{ pid: 0, release: "unknown", mode: `unknown state-database ${root}/state.db-wal` }];
     const refused = await run(["cutover", "--root", root], { unknown, procScan: { platform: "darwin" } });

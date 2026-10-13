@@ -29,6 +29,10 @@ const nativePi = option("--pi-binary");
 const extension = path.join(fabricRoot, "dist/index.js");
 for (const file of [nativePi, extension, path.join(fabricRoot, "dist/worker.js")]) assert(fs.statSync(file).isFile(), `Missing ${file}`);
 assert(process.env.TMPDIR, "Private TMPDIR required");
+if (process.platform !== "linux") {
+  console.log(JSON.stringify({ passed: false, unsupported: true, reason: "Native process-tree proof requires Linux /proc exit verification", platform: process.platform }));
+  process.exit(0);
+}
 assert(!fs.existsSync(evidence), "Use a fresh evidence directory");
 fs.mkdirSync(evidence);
 assert.equal(fs.realpathSync(evidence), evidence, "Evidence directory must remain canonical");
@@ -81,7 +85,90 @@ const shellOutside = path.join(scratch, "native-shell-outside-task.txt");
 const cwdFile = path.join(workspace, `${path.basename(scratch)}-worktree-write.txt`);
 assert(!fs.existsSync(cwdFile), "Use a fresh native worktree write target");
 const toolResults = [], childRequests = [], parentEvents = [];
-let child, server, parentExit, failure, rejectSettlement;
+let child, server, parentExit, failure, rejectSettlement, nativePgid, nativeExitReceipt, nativeClose;
+// A per-launch, non-secret ownership marker survives detached groups and reparenting.
+const ownershipMarker = `TASK_WRITE_SCOPE_PROOF_OWNER=${crypto.randomUUID()}`;
+const ownedProcesses = new Map();
+const procIdentity = pid => {
+  try {
+    const fields = fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1).split(" ");
+    return { pid: Number(pid), ppid: Number(fields[1]), pgid: Number(fields[2]), sid: Number(fields[3]), state: fields[0], started: fields[19] };
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ESRCH") return undefined;
+    throw error;
+  }
+};
+const ownedAlive = () => {
+  const processes = [];
+  for (const pid of fs.readdirSync("/proc").filter(name => /^\d+$/.test(name))) {
+    try {
+      // Examine only this user's processes; never retain or report environment contents.
+      if (fs.statSync(`/proc/${pid}`).uid !== process.getuid()) continue;
+      const identity = procIdentity(pid);
+      if (!identity) continue;
+      processes.push(identity);
+      if (identity.sid === nativePgid || fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(ownershipMarker)) ownedProcesses.set(identity.pid, identity);
+    } catch (error) {
+      if (!["ENOENT", "ESRCH", "EACCES", "EPERM"].includes(error.code)) throw error;
+    }
+  }
+  // Also capture descendants which intentionally start with an empty environment.
+  const liveIds = new Set([...ownedProcesses.values()].filter(identity =>
+    processes.some(current => current.pid === identity.pid && current.started === identity.started)).map(identity => identity.pid));
+  let previous;
+  do {
+    previous = liveIds.size;
+    for (const identity of processes) if (liveIds.has(identity.ppid)) {
+      liveIds.add(identity.pid); ownedProcesses.set(identity.pid, identity);
+    }
+  } while (liveIds.size !== previous);
+  return [...ownedProcesses.values()].filter(identity => {
+    const current = procIdentity(identity.pid);
+    return current && current.started === identity.started && !["Z", "X"].includes(current.state);
+  });
+};
+const signalOwned = signal => {
+  const live = ownedAlive();
+  const groups = new Set(live.map(identity => identity.pgid));
+  // detached:true makes the root PID its process-group ID; descendants may own other groups.
+  if (live.some(identity => identity.pid === nativePgid)) groups.add(nativePgid);
+  for (const pgid of groups) {
+    assert(pgid > 1 && pgid !== procIdentity(process.pid)?.pgid, "Refuse signalling the proof's own group");
+    const members = live.filter(identity => identity.pgid === pgid);
+    if (!members.some(identity => {
+      const current = procIdentity(identity.pid);
+      return current?.started === identity.started && current.pgid === pgid;
+    })) continue;
+    try { process.kill(-pgid, signal); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  return { signal, groups: [...groups] };
+};
+const joinNative = async () => {
+  if (nativeExitReceipt || !child) return nativeExitReceipt;
+  const signals = [];
+  child.stdin.end();
+  if (ownedAlive().length) {
+    signals.push(signalOwned("SIGTERM"));
+    // One bounded grace interval, not a recurring process census or retry loop.
+    const termAt = Date.now();
+    await bounded(parentExit, "owned native TERM close", 5000).catch(() => {});
+    if (ownedAlive().length) await new Promise(resolve => setTimeout(resolve, Math.max(0, 5000 - (Date.now() - termAt))));
+    if (ownedAlive().length) {
+      signals.push(signalOwned("SIGKILL"));
+      await bounded(parentExit, "owned native KILL close", 5000);
+      // Reparented detached children have no ChildProcess close event here.
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  await bounded(parentExit, "owned native close", 5000);
+  const remaining = ownedAlive();
+  assert.equal(remaining.length, 0, `Owned native descendants remain: ${JSON.stringify(remaining)}`);
+  nativeExitReceipt = { pgid: nativePgid, signals, identities: [...ownedProcesses.values()], remaining: [] };
+  console.error(`OWNED_NATIVE_EXIT: ${JSON.stringify(nativeExitReceipt)}`);
+  return nativeExitReceipt;
+};
+// A failed join is not retried in finally: the whole cleanup remains finitely bounded.
+const closeNative = () => nativeClose ??= joinNative();
 const protectedRecords = [];
 let tail = "", parentCalls = 0;
 const guard = 180_000;
@@ -158,14 +245,19 @@ try {
   json(path.join(agent, "settings.json"), { enableInstallTelemetry: false, compaction: { enabled: false }, retry: { enabled: false }, extensions: [], packages: [] });
   json(path.join(agent, "fabric.json"), { configVersion: 4, fullCodeMode: false, autoReload: false, executor: { kernel: "typescript", timeoutMs: guard, maxTimeoutMs: guard, resultFormat: "json", landlock: { mode: "off" } }, agents: { enabled: true, runner: "pi", transport: "process", timeoutMs: guard, maxDepth: 2, maxConcurrent: 2, extensions: false, retainRuns: true, sessionExport: false, notifyOnComplete: false, deniedModels: [], modelPolicy: { requireReason: [] } }, mesh: { enabled: true, root: path.join(scratch, "mesh"), announce: true, actorScope: "session" }, capture: { enabled: false }, mcp: { enabled: false }, jev: { enabled: false }, prewalk: { enabled: false }, ui: { enabled: false }, compaction: { engine: "pi" }, approvals: { read: "allow", write: "allow", execute: "allow", network: "allow", agent: "allow" } });
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PI_|SMARTY_|HERDR_|ORG_|OPENAI_|ANTHROPIC_|GOOGLE_|GEMINI_|OPENROUTER_|TYPESAFE_|AWS_|AZURE_|AI_GATEWAY_|OTEL_|SENTRY_)/.test(key)));
-  Object.assign(env, { HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
-  child = spawn(process.execPath, [nativePi, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  Object.assign(env, { TASK_WRITE_SCOPE_PROOF_OWNER: ownershipMarker.slice(ownershipMarker.indexOf("=") + 1), HOME: path.join(scratch, "home"), XDG_CONFIG_HOME: path.join(scratch, "home/.config"), XDG_DATA_HOME: path.join(scratch, "home/.local/share"), XDG_CACHE_HOME: path.join(scratch, "home/.cache"), TMPDIR: path.join(scratch, "tmp"), TASK_WRITE_SCOPE_SHELL_OUTSIDE: shellOutside, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_FABRIC_PI_BINARY: nativePi, PI_FABRIC_PROJECT_ROOT: rootCwd, PI_FABRIC_MESH_ROOT: path.join(scratch, "mesh"), PI_FABRIC_RUN_ROOT: runs, PI_FABRIC_AGENT_DIR: path.join(scratch, "exports") });
+  child = spawn(process.execPath, [nativePi, "--mode", "rpc", "--no-session", "--provider", "task-write-proof", "--model", "parent", "--thinking", "off", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-extensions", "--extension", extension, "--approve"], { cwd: rootCwd, env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  nativePgid = child.pid;
+  const rootIdentity = procIdentity(child.pid);
+  if (rootIdentity) ownedProcesses.set(rootIdentity.pid, rootIdentity);
   parentExit = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));
+  json(path.join(evidence, "native-launch.json"), { pid: child.pid, pgid: nativePgid, identity: rootIdentity });
   const settled = new Promise((resolve, reject) => {
     rejectSettlement = reject;
     child.once("error", reject);
     child.stdout.on("data", chunk => {
       try {
+        ownedAlive();
         writeEvidence("parent-events.jsonl", chunk, true);
         tail += chunk;
         while (tail.includes("\n")) {
@@ -176,7 +268,7 @@ try {
       } catch (error) { reject(error); }
     });
     child.stderr.on("data", chunk => {
-      try { writeEvidence("parent-stderr.log", chunk, true); } catch (error) { reject(error); }
+      try { ownedAlive(); writeEvidence("parent-stderr.log", chunk, true); } catch (error) { reject(error); }
     });
   });
   child.stdin.write(`${JSON.stringify({ id: "proof", type: "prompt", message: "Run the exact keyless native task write-scope proof." })}\n`);
@@ -218,8 +310,8 @@ try {
   json(path.join(evidence, "tool-results.json"), toolResults);
   child.stdin.end();
   assert.deepEqual(await bounded(parentExit, "root native EXITED", 15000), { code: 0, signal: null });
-  child = undefined;
-  const summary = { passed: true, route: "real native Pi RPC root -> public Fabric agents.spawn/wait -> compiled process worker -> real native Pi write/edit/bash", workspace, fabricRoot, nativePi, scratch,
+  await closeNative();
+  const summary = { passed: true, nativeExitReceipt, route: "real native Pi RPC root -> public Fabric agents.spawn/wait -> compiled process worker -> real native Pi write/edit/bash", workspace, fabricRoot, nativePi, scratch,
     refused: forbidden, worktreeWriteAndEdit: "allowed", childScratchWrite: "allowed", hostRecordWriteAndEdit: "refused (completion-recipient.json, status.json, events.jsonl)", explicitReadOnly: "refused", unrestrictedOutsideWrite: "allowed in proof-owned scratch", optOutLogCount: 1,
     nativeBashGap: "allowed outside child roots, but inside proof-owned scratch; Landlock deliberately off", parentNativeExit: 0,
     artifacts: Object.fromEntries([extension, path.join(fabricRoot, "dist/worker.js")].map(file => [file, crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")])),
@@ -233,12 +325,18 @@ try {
   console.error(failure.stack);
   process.exitCode = 1;
 } finally {
-  if (child) {
-    child.stdin.end();
-    try { await bounded(parentExit, "failed proof native close", 15000); }
-    catch { child.kill("SIGTERM"); await bounded(parentExit, "owned root TERM close", 15000); }
+  try { await closeNative(); }
+  catch (error) {
+    console.error(error.stack);
+    try { console.error(`OWNED_NATIVE_EXIT_FAILED: ${JSON.stringify({ pgid: nativePgid, remaining: ownedAlive() })}`); }
+    catch (inspectionError) { console.error(inspectionError.stack); }
+    // Even an uninterruptible child must not keep a failed proof alive via its pipes.
+    child?.stdin.destroy(); child?.stdout.destroy(); child?.stderr.destroy(); child?.unref();
+    process.exitCode = 1;
   }
-  if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
-  if (evidenceFd !== undefined) fs.closeSync(evidenceFd);
+  finally {
+    if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+    if (evidenceFd !== undefined) fs.closeSync(evidenceFd);
+  }
   // Retain proof-owned scratch. The allocating Main decides cleanup after reading evidence.
 }

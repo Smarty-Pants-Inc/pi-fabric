@@ -54,7 +54,9 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     fs.writeFileSync(path.join(profile, "settings.json"), JSON.stringify({ packages: [installed] }));
     vi.stubEnv("PI_CODING_AGENT_DIR", profile);
     vi.stubEnv("FAKE_PI_BEHAVIOR", "success");
-    const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000 }, {
+    const cwd = path.join(root, "cwd");
+    fs.mkdirSync(cwd);
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000 }, {
       workerPath, piBinary, fullCodeMode: true, runRoot: path.join(root, "runs"),
     });
     managers.push(manager);

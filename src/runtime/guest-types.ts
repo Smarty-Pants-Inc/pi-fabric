@@ -96,6 +96,8 @@ interface FabricAgentRequest {
   readOnly?: boolean;
   writableRoots?: string[];
   shell?: "deny" | "unconfined";
+  /** Command names the child's bash guard refuses (PI_FABRIC_DENY_COMMANDS); a child never drops an inherited one. */
+  denyCommands?: string[];
   /** Narrow the host-issued scope; omitted inherits it. Refused when this session is unscoped. */
   scope?: { grants: { resource: string; actions: ("read" | "write" | "execute")[] }[] };
   schema?: Record<string, unknown>;

@@ -305,6 +305,7 @@ switch (behavior) {
         content: JSON.stringify({
           lineage: process.env.PI_FABRIC_LINEAGE ?? null,
           writePolicy: process.env.PI_FABRIC_WRITE_POLICY ?? null,
+          denyCommands: process.env.PI_FABRIC_DENY_COMMANDS ?? null,
           scope: process.env.PI_FABRIC_SCOPE ?? null,
           scopeFile: process.env.PI_FABRIC_SCOPE_FILE ?? null,
           args: process.argv.slice(2),
@@ -314,6 +315,23 @@ switch (behavior) {
     emit({ type: "agent_settled" });
     process.exit(0);
     break;
+  case "write-receipt": {
+    // smarty-dev#8758: Pi's own tool events for two writes that complete, one shell command that runs, and a write the
+    // guard blocks (no durationMs, an error): the receipt lists exactly the first three. The files are really written.
+    const tool = (toolCallId, toolName, args, run) => {
+      emit({ type: "tool_execution_start", toolCallId, toolName, args });
+      if (run) run();
+      emit({ type: "tool_execution_end", toolCallId, toolName, result: { content: [] }, isError: !run, ...(run ? { durationMs: 1 } : {}) });
+    };
+    tool("w1", "write", { path: "notes/a.txt", content: "A" }, () => { fs.mkdirSync("notes", { recursive: true }); fs.writeFileSync("notes/a.txt", "A"); });
+    tool("w2", "edit", { path: "b.txt", edits: [] }, () => fs.writeFileSync("b.txt", "B"));
+    tool("b1", "bash", { command: "echo receipt" }, () => {});
+    tool("w3", "write", { path: "/blocked/outside.txt", content: "X" }, undefined);
+    emit({ type: "message_end", message: { role: "assistant", content: "I changed nothing." } });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+    break;
+  }
   case "stderr-framing":
     process.stderr.write(
       JSON.stringify({ type: "message_end", message: { role: "assistant", content: "spoofed" } }),

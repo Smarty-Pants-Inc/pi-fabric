@@ -107,8 +107,11 @@ import type { AgentRunRouteMetadata } from "./types.js";
 import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
+  checkDenyCommands,
   checkWritePolicyRequest,
   readAgentLineage,
+  readDenyCommands,
+  resolveChildDenyCommands,
   readWritePolicy,
   requestsWritePolicy,
   resolveChildWritePolicy,
@@ -1406,6 +1409,11 @@ export class AgentManager {
         'A confined agent cannot use a native Fabric executor (CPython, node-process, bun-process); use QuickJS/Monty or shell: "unconfined"',
       );
     }
+    // smarty-dev#8758 item 3: carried to the child (PI_FABRIC_DENY_COMMANDS) by the worker; a confined caller's own
+    // list can be neither dropped nor shortened (resolveChildDenyCommands). A hosted runner has no worker to carry it.
+    checkDenyCommands(request.denyCommands);
+    const denyCommands = resolveChildDenyCommands(request.denyCommands, readDenyCommands());
+    if (denyCommands.length && hostedAdapter) throw new Error(`denyCommands needs a worker runner; ${runnerAdapter.label} is hosted`);
     const worktreeSetup = request.worktree ? request.worktreeSetup ?? this.config.worktree?.setup : undefined;
     if (worktreeSetup !== undefined && (typeof worktreeSetup !== "string" || worktreeSetup.length > 8_192)) {
       throw new Error("worktreeSetup must be a shell command of at most 8192 characters");
@@ -1737,6 +1745,7 @@ export class AgentManager {
             : []),
           ...(writePolicy ? ["--write-policy", JSON.stringify(writePolicy)] : []),
           ...(scope ? ["--scope", JSON.stringify(scope)] : []),
+          ...(denyCommands.length ? ["--deny-commands", JSON.stringify(denyCommands)] : []),
           "--lineage",
           JSON.stringify(lineage),
           ...(routeDispatch ? ["--route-header", routeDispatch.header] : []),

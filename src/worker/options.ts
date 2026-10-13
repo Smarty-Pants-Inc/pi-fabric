@@ -131,6 +131,7 @@ export const parseWorkerOptions = (
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
   const writePolicy = optional(args, "write-policy");
+  const denyCommands = optional(args, "deny-commands");
   const scope = optional(args, "scope");
   const lineage = optional(args, "lineage");
   const maxTokens = optional(args, "max-tokens");
@@ -281,6 +282,7 @@ export const parseWorkerOptions = (
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
     ...(writePolicy ? { writePolicy } : {}),
+    ...(denyCommands ? { denyCommands } : {}),
     ...(scope ? { scope } : {}),
     ...(lineage ? { lineage } : {}),
     ...(maxTokens ? { maxTokens: Number(maxTokens) } : {}),

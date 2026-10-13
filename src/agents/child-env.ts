@@ -33,6 +33,45 @@ export const readAgentLineage = (
   }
 };
 
+/**
+ * smarty-dev#8758 item 3: commands the child's bash guard must refuse (the guard enforces it, smarty-dev#2754; Fabric
+ * only carries the list). JSON array of command names in the child's environment.
+ */
+export const DENY_COMMANDS_ENV = "PI_FABRIC_DENY_COMMANDS";
+const MAX_DENY_COMMANDS = 32;
+const MAX_DENY_COMMAND_CHARS = 256;
+const denyCommandText = (value: unknown): value is string =>
+  typeof value === "string" && value.trim() !== "" && value.length <= MAX_DENY_COMMAND_CHARS && !value.includes("\0");
+
+/** Shape check before admission: at most 32 non-empty command names of at most 256 characters. */
+export const checkDenyCommands = (value: unknown): void => {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > MAX_DENY_COMMANDS || !value.every(denyCommandText)) {
+    throw new Error(`denyCommands must be at most ${MAX_DENY_COMMANDS} non-empty command names of at most ${MAX_DENY_COMMAND_CHARS} characters`);
+  }
+};
+
+/** This process's inherited list; unreadable text fails closed to an error, never to "no denies". */
+export const readDenyCommands = (raw = process.env[DENY_COMMANDS_ENV]): string[] => {
+  if (raw === undefined || raw === "") return [];
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error(`${DENY_COMMANDS_ENV} is not valid JSON`); }
+  checkDenyCommands(value);
+  return (value as string[]).map((command) => command.trim());
+};
+
+/**
+ * The child's list: the request, or the caller's own list when omitted. Like readOnly, a confined caller cannot drop
+ * or shorten it: a request that leaves out any inherited command is refused. Sorted and deduplicated.
+ */
+export const resolveChildDenyCommands = (request: string[] | undefined, parent: readonly string[]): string[] => {
+  checkDenyCommands(request);
+  const child = new Set((request ?? parent).map((command) => command.trim()));
+  const dropped = parent.filter((command) => !child.has(command));
+  if (dropped.length) throw new Error(`A command-denied agent cannot launch a child without its denied commands: ${dropped.join(", ")}`);
+  return [...child].sort();
+};
+
 export interface AgentWritePolicyRequest {
   readOnly?: boolean;
   writableRoots?: string[];

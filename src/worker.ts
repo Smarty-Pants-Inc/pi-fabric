@@ -55,6 +55,7 @@ import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } f
 import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
+import { WriteReceiptRecorder } from "./agents/write-receipt.js";
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -779,6 +780,8 @@ const main = async (): Promise<void> => {
       // Supported child contract (docs/agents.md "Child environment contract").
       ...(options.lineage ? { PI_FABRIC_LINEAGE: options.lineage } : {}),
       ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      // smarty-dev#8758: exactly the manager's resolved list (it already includes every inherited command).
+      PI_FABRIC_DENY_COMMANDS: options.denyCommands,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
@@ -873,6 +876,8 @@ const main = async (): Promise<void> => {
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
   const unresolvedToolCalls = new Set<string>();
+  // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
+  const writeReceipt = new WriteReceiptRecorder(options.cwd);
 
   // Only ordinary tasks with real, completed tool work and retained prose can
   // expose an interrupted report without claiming success. Never suppress
@@ -1907,6 +1912,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_start") {
+      writeReceipt.start(event);
       unresolvedToolCalls.add(stringField(event.toolCallId) ?? "unknown-tool-call");
       record.inferenceStarted = true;
       record.toolCalls++;
@@ -1919,6 +1925,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      if (writeReceipt.end(event)) record.writeReceipt = writeReceipt.receipt;
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
       if (event.isError === true) {

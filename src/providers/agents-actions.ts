@@ -131,6 +131,12 @@ const runProperties = {
     enum: ["deny", "unconfined"],
     description: "With a write policy, bash is refused by default; unconfined allows it and is not a sandbox",
   },
+  denyCommands: {
+    type: "array",
+    items: { type: "string", minLength: 1, maxLength: 256 },
+    maxItems: 32,
+    description: "Command names the child's bash guard refuses (for example git); set as PI_FABRIC_DENY_COMMANDS in the child. Omitted inherits this session's list, which a child can never drop.",
+  },
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
   systemPrompt: {
     type: "string",

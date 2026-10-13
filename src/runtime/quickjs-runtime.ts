@@ -53,6 +53,7 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
+    reason: error.reason, runState: error.runState,
   };
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;

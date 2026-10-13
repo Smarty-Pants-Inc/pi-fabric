@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
-import type { AgentTerminalNotice } from "./terminal-target.js";
+import type { AgentTerminalNotice, AgentUndeliveredMessage } from "./terminal-target.js";
 import { followUpFile, releaseFollowUpPayload, settleFollowUp } from "./follow-up-delivery.js";
 import { copyFabricProvenance, type FabricTurnProvenance } from "../fabric-provenance.js";
 
@@ -53,6 +53,29 @@ export const readTerminalAdmission = (directory: string, id: string): TerminalAd
     }
   } catch { /* Missing/malformed admission never grants a notification recipient. */ }
   return undefined;
+};
+
+/** Surface validated retained refusals (pending or routed) as sender-visible receipts; no new queue. */
+export const readUndeliveredMessages = (directory: string): AgentUndeliveredMessage[] => {
+  const receipt = readFinalAnswerReceipt(directory, path.basename(directory));
+  if (!receipt) return [];
+  let entries: string[];
+  try { entries = fs.readdirSync(path.join(directory, "terminal-notices")).sort(); } catch { return []; }
+  const seen = new Set<string>();
+  const result: AgentUndeliveredMessage[] = [];
+  for (const entry of entries) {
+    const match = /^([a-zA-Z0-9_-]{1,200})\.json(\.delivered)?$/.exec(entry);
+    if (!match || seen.has(match[1]!)) continue;
+    let notice: AgentTerminalNotice;
+    try { notice = JSON.parse(fs.readFileSync(path.join(directory, "terminal-notices", entry), "utf8")); } catch { continue; }
+    const admission = readTerminalAdmission(directory, match[1]!);
+    if (!notice || notice.code !== "FABRIC_TARGET_TERMINAL" || notice.targetId !== receipt.runId || notice.finalAnswerReceiptId !== receipt.id ||
+        notice.messageId !== match[1] || admission?.delivery !== notice.delivery || !terminalSenderMatches(notice.sender, admission.sender)) continue;
+    seen.add(notice.messageId);
+    result.push({ code: "FABRIC_TARGET_TERMINAL", reason: "run-ended", messageId: notice.messageId, delivery: admission.delivery,
+      finalAnswerReceiptId: receipt.id, ...(admission.sender ? { sender: admission.sender } : {}) });
+  }
+  return result;
 };
 
 /** Durable sender outbox. Failed routes retry on ordinary status/recovery/sweep wakes. */

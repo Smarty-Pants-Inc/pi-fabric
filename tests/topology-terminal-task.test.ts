@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { FabricTargetTerminalError } from "../src/agents/terminal-target.js";
+import { FabricTargetTerminalError, terminalRejectionFields } from "../src/agents/terminal-target.js";
 import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import { agentParticipantRecords } from "../src/topology/records.js";
@@ -38,7 +38,8 @@ describe("terminal task topology", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-topology-")); roots.push(root);
     const targetId = "task-target", receiptId = "answer-receipt";
     const ownerIdentity = identity("session:owner"), senderIdentity = identity("session:sender");
-    const terminalError = new FabricTargetTerminalError(targetId, receiptId);
+    const runState = delivery === "steer" ? "final-answer-pending" : "completed";
+    const terminalError = new FabricTargetTerminalError(targetId, receiptId, runState);
     const ingress = vi.fn((_id: string, _message: string, _data?: unknown, _provenance?: unknown) => { throw terminalError; });
     const manager = { status: () => ({ id: targetId, name: targetId, status: "completed" }), steer: ingress, followUp: ingress, stop: vi.fn() } as unknown as Ports[0];
     const ownerRouter = router(manager, ownerIdentity);
@@ -56,12 +57,13 @@ describe("terminal task topology", () => {
     const senderRouter = router(unknown, senderIdentity, [participant], sender);
     await expect(senderRouter.routeMessage(targetId, "stale instruction", undefined, delivery)).rejects.toMatchObject({
       name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL", targetId, finalAnswerReceiptId: receiptId,
+      reason: "run-ended", runState,
     });
     expect(ingress).toHaveBeenCalledOnce();
     const provenance = ingress.mock.calls[0]![3] as { sender: { id: string } };
     expect(provenance.sender.id).toBe(senderIdentity.id);
     const ack = sender.mesh.read({ topic: "fabric.control.ack", limit: 10 })[0]!.data;
-    expect(ack).toMatchObject({ accepted: false, code: "FABRIC_TARGET_TERMINAL", targetId, finalAnswerReceiptId: receiptId });
+    expect(ack).toMatchObject({ accepted: false, code: "FABRIC_TARGET_TERMINAL", targetId, finalAnswerReceiptId: receiptId, reason: "run-ended", runState });
   });
 
   it("does not publish to a stale terminal owner", async () => {
@@ -75,10 +77,15 @@ describe("terminal task topology", () => {
   });
 
   it("exposes only branded terminal fields to a real QuickJS guest catch", async () => {
-    const error = Object.assign(new FabricTargetTerminalError("target", "receipt"), { secret: "private" });
+    const error = Object.assign(new FabricTargetTerminalError("target", "receipt", "completed"), { secret: "private" });
     const result = await new QuickJsRuntime().execute(`try { await agents.steer({ id: "target", message: "late" }); }
-      catch (error) { return { name: error.name, code: error.code, targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId, secret: error.secret }; }`,
+      catch (error) { return { name: error.name, code: error.code, targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId, reason: error.reason, runState: error.runState, secret: error.secret }; }`,
       async () => { throw error; }, { timeoutMs: 5000, memoryLimitBytes: 64 * 1024 * 1024 });
-    expect(result.value).toEqual({ name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL", targetId: "target", finalAnswerReceiptId: "receipt" });
+    expect(result.value).toEqual({ name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL", targetId: "target", finalAnswerReceiptId: "receipt", reason: "run-ended", runState: "completed" });
+  });
+
+  it("never bridges an unrecognized run state, reason or arbitrary ACK field", () => {
+    expect(terminalRejectionFields({ code: "FABRIC_TARGET_TERMINAL", targetId: "target", finalAnswerReceiptId: "receipt",
+      reason: "resume-me", runState: "running", secret: "private" })).toEqual({ code: "FABRIC_TARGET_TERMINAL", targetId: "target", finalAnswerReceiptId: "receipt" });
   });
 });

@@ -52,7 +52,7 @@ import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
 import { finalAssistantText, readFinalAnswerReceipt, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
-import { queuedTerminalControls, settleTerminalControl, trackTerminalControl } from "./worker/terminal-controls.js";
+import { queuedTerminalControls, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
 
@@ -1565,6 +1565,21 @@ const main = async (): Promise<void> => {
       }
     }
   };
+  // Unlike progress telemetry, refusal emission must precede its registry
+  // transition. The manager's validated-status scan is the publication fence.
+  const refuseTerminalControl = (control: TerminalControl, receiptId: string, reason: "run-ended" = "run-ended"): void => {
+    const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
+      delivery: control.delivery, finalAnswerReceiptId: receiptId, ...(reason ? { reason } : {}),
+      ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
+    const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
+    try {
+      fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
+        runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    syncPathNamespace(options.lifecycleFile);
+    settleTerminalControl(path.dirname(options.statusFile), control.id, "refused", reason);
+  };
   const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
     if (finalAnswerReceipt || !persistentPiTask) return;
     finalAnswerReceipt = receipt;
@@ -1586,21 +1601,9 @@ const main = async (): Promise<void> => {
       emitLifecycle("pi.turn_end", { terminalAnswer: true });
     }
     record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
-    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) {
-      const data = { code: "FABRIC_TARGET_TERMINAL", targetId: options.id, messageId: control.id,
-        delivery: control.delivery, finalAnswerReceiptId: receipt.id,
-        ...(control.provenance?.sender ? { sender: control.provenance.sender } : {}) };
-      // Unlike progress telemetry, refusal emission must precede its registry
-      // transition. The manager's validated-status scan is the publication fence.
-      const descriptor = fs.openSync(options.lifecycleFile, "a", 0o600);
-      try {
-        fs.appendFileSync(descriptor, JSON.stringify({ version: 1, event: "message.refused",
-          runId: options.id, occurredAt: Date.now(), data }) + "\n", "utf8");
-        fs.fsyncSync(descriptor);
-      } finally { fs.closeSync(descriptor); }
-      syncPathNamespace(options.lifecycleFile);
-      settleTerminalControl(path.dirname(options.statusFile), control.id, "refused");
-    }
+    for (const control of queuedTerminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
+    // Lines the worker never read are refused now, not at manager native close.
+    pollSteer();
     // Preserve any earlier admission/limit/stop failure; the receipt never blesses
     // invalid structured output. Publish before closing the owned execution tree.
     record.status = terminalStatus ?? "completed";
@@ -2134,8 +2137,16 @@ const main = async (): Promise<void> => {
   let steerRemainder = Buffer.alloc(0);
   let skippingOversizedSteerLine = false;
   const pollSteer = (): void => {
-    if (!options.steerFile || finalAnswerReceipt || terminalStatus || (isPi &&
-        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))) return;
+    // The native receipt can precede its IPC frame. Reuse this bounded file
+    // reader to record unread input, but never inject it after that boundary.
+    let endedReceipt = finalAnswerReceipt;
+    if (options.steerFile && persistentPiTask && piRetrySdk && !endedReceipt) {
+      let size = -1;
+      try { size = fs.statSync(options.steerFile).size; } catch { /* no steer input yet */ }
+      if (size >= 0 && size !== steerOffset) endedReceipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
+    }
+    if (!options.steerFile || (!endedReceipt && (terminalStatus || (isPi &&
+        (!piControlLive || childExited || !modelControl.ready || !child.stdin?.writable || child.stdin.writableEnded || child.stdin.destroyed))))) return;
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(options.steerFile, "r");
@@ -2192,6 +2203,15 @@ const main = async (): Promise<void> => {
           continue;
         }
         try {
+          if (endedReceipt) {
+            if ((command.type === "steer" || command.type === "follow_up") && typeof command.id === "string" && /^[0-9a-f-]{36}$/.test(command.id)) {
+              const directory = path.dirname(options.statusFile);
+              trackTerminalControl(directory, { id: command.id, delivery: command.type === "steer" ? "steer" : "followUp", provenance: copyFabricProvenance(command.provenance) });
+              const control = readTerminalControl(directory, command.id);
+              if (control?.state === "queued") refuseTerminalControl(control, endedReceipt.id);
+            }
+            continue;
+          }
           if (options.runner === "claude") {
             if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
             claudeCloseTimer = undefined;
@@ -2242,8 +2262,9 @@ const main = async (): Promise<void> => {
           } else if (command.type === "ui_response") {
             questionRelay?.respond(command);
           }
-        } catch {
-          /* stdin closed (settled/stopped child); a late steer is dropped */
+        } catch (error) {
+          if (endedReceipt) appendLog(`${JSON.stringify({ type: "fabric_run_end_fence_failed", message: String(error) })}\n`);
+          /* Closed stdin or failed refusal persistence: manager scans durable admissions. */
         }
       }
     } finally {
@@ -2540,6 +2561,7 @@ const main = async (): Promise<void> => {
 
   if (crash.pending) return; // finishCrash owns result publication after the drain.
   if (steerTimer) clearInterval(steerTimer);
+  if (finalAnswerReceipt) pollSteer(); // Last worker-side run-end fence pass.
   clearTimeout(recordedResultTimer);
   if (recordedResultPending && !terminalStatus) {
     terminalStatus = "failed";

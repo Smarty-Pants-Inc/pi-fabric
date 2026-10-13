@@ -71,7 +71,7 @@ const setup = () => {
   vi.stubEnv("PI_CODING_AGENT_DIR", agentDir); vi.stubEnv("PI_OFFLINE", "1"); vi.stubEnv("TERMINAL_PROOF_ROOT", root);
   const notices: unknown[] = [];
   const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 30000, nice: 19 }, {
-    workerPath: path.resolve("src/worker.ts"), piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+    workerPath: path.resolve(process.env.FABRIC_TERMINAL_TASK_WORKER ?? "src/worker.ts"), piBinary: path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
     runRoot: path.join(root, "runs"), fullCodeMode: false, onTerminalNotice: notice => { notices.push(notice); },
   }); managers.push(manager);
   return { root, manager, notices };

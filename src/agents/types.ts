@@ -13,6 +13,8 @@ import type { FabricThinking, FabricThinkingBounds } from "../thinking.js";
 import type { FabricParticipantResidency } from "../topology/types.js";
 import type { InheritedSessionPin } from "./session-pins.js";
 import type { AgentWorktreeResult } from "./worktree-manager.js";
+import type { AgentUndeliveredMessage } from "./terminal-target.js";
+export type { AgentUndeliveredMessage } from "./terminal-target.js";
 
 /** Fabric run transports plus adapter-owned ("hosted") runs. */
 export type AgentRunTransport = FabricAgentTransport | "hosted";
@@ -237,6 +239,8 @@ export interface AgentRunRecord {
   currentTool?: string;
   currentToolStartedAt?: number;
   followUpDeliveries?: AgentFollowUpDelivery[];
+  /** Ordinary Pi task: admitted steer/followUp input the ended run refused (validated retained notices). */
+  undeliveredMessages?: AgentUndeliveredMessage[];
   turns: number;
   /** Actual model output/tool execution, not worker startup or an error-only turn. */
   inferenceStarted?: boolean;
@@ -326,6 +330,7 @@ export interface AgentHandleInfo {
   /** Canonical Fabric package root selected for the process worker at spawn time. */
   fabricRelease?: string;
   followUpDeliveries?: AgentFollowUpDelivery[];
+  undeliveredMessages?: AgentUndeliveredMessage[];
   routeClass?: string;
   routeClassSource?: AgentRunRouteMetadata["routeClassSource"];
   protected?: boolean;
@@ -640,4 +645,6 @@ export interface AgentSteerResult {
   warning?: AgentFollowUpRunningWarning;
   queued: true;
   messageId: string;
+  /** The run recorded its final answer while this input was being appended; it will not be consumed. */
+  undelivered?: AgentUndeliveredMessage;
 }

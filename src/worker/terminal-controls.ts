@@ -8,6 +8,8 @@ export interface TerminalControl {
   delivery: "steer" | "followUp";
   provenance?: FabricTurnProvenance | undefined;
   state: "queued" | "delivered" | "refused";
+  /** Refused rows only: the line was never read/injected because the run had ended. */
+  reason?: "run-ended" | undefined;
 }
 const validId = (id: string): boolean => /^[0-9a-f-]{36}$/.test(id);
 const controlFile = (directory: string, id: string): string => {
@@ -23,14 +25,16 @@ export const readTerminalControl = (directory: string, id: string): TerminalCont
   try {
     const item = JSON.parse(fs.readFileSync(controlFile(directory, id), "utf8"));
     if (item.id === id && ["steer", "followUp"].includes(item.delivery) && ["queued", "delivered", "refused"].includes(item.state)) {
-      return { id, delivery: item.delivery, state: item.state, provenance: copyFabricProvenance(item.provenance) };
+      return { id, delivery: item.delivery, state: item.state, provenance: copyFabricProvenance(item.provenance),
+        ...(item.state === "refused" && item.reason === "run-ended" ? { reason: "run-ended" as const } : {}) };
     }
   } catch { /* No invented consumption or identity from uncertain files. */ }
   return undefined;
 };
-export const settleTerminalControl = (directory: string, id: string, state: "delivered" | "refused"): void => {
+export const settleTerminalControl = (directory: string, id: string, state: "delivered" | "refused", reason?: "run-ended"): void => {
   const item = readTerminalControl(directory, id);
-  if (item?.state === "queued") writeFileAtomic(controlFile(directory, id), JSON.stringify({ ...item, state }), { durable: true });
+  if (item?.state === "queued") writeFileAtomic(controlFile(directory, id),
+    JSON.stringify({ ...item, state, ...(state === "refused" && reason ? { reason } : {}) }), { durable: true });
 };
 export const queuedTerminalControls = (directory: string): TerminalControl[] => {
   const root = path.join(directory, "terminal-controls");

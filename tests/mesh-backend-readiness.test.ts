@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { meshBackendStatus, type MeshBackendOptions } from "../src/mesh/backend-migration.js";
-import { main } from "../src/mesh/mesh-backend-cli.js";
+import { MESH_SWITCH_OVERRIDE_ALARM_TOPIC, main } from "../src/mesh/mesh-backend-cli.js";
 import { openNodeSqlite } from "../src/mesh/state-sqlite.js";
 import { leaseHelperPath, unsafeChain, probeStateDbLeases, proveFabricReader, procLocksKey, readerReadiness, requiredReaders, type InstalledReader, type LeaseProbeOptions, type ProcScanOptions, type ReaderProof } from "../src/mesh/reader-proof.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -15,10 +15,13 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 // built-in installed readers, --require-reader) proved it can read sqlite.
 
 const identity: MeshIdentity = { id: "tester", name: "tester", kind: "agent" };
+const SWITCH_OWNER = "session:0a1b2c3d-0000-4000-8000-00000000c943";
 const dirs: string[] = [];
 const savedRelease = process.env.PI_FABRIC_RELEASE_SHA;
 beforeEach(() => { process.env.PI_FABRIC_RELEASE_SHA = "fabric-rel-a"; });
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   if (savedRelease === undefined) delete process.env.PI_FABRIC_RELEASE_SHA; else process.env.PI_FABRIC_RELEASE_SHA = savedRelease;
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -87,6 +90,11 @@ const records = (root: string): Array<Record<string, unknown>> => {
   return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>) : [];
 };
 const backendOf = async (root: string): Promise<string> => (await meshBackendStatus(root)).backend;
+const switchOverrideAlarms = (root: string) => {
+  const store = new MeshStore(root, 256 * 1024, 500, { stateBackend: "file" });
+  try { return store.read({ topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC }); }
+  finally { store.closeState(); }
+};
 
 // ponytail: these tests need proofs, which fail closed without POSIX owners (Windows ACLs: smarty-dev#7548);
 // the fail-closed behaviour itself is covered below on every platform.
@@ -105,6 +113,93 @@ describe.skipIf(process.platform === "win32")("fabric-mesh-backend readiness gat
     expect(records(root)).toEqual([]);
     // Not installed on this host: not required.
     expect(requiredReaders([], [], [{ name: "factory", installRoot: path.join(root, "absent") }], [])).toEqual([]);
+  });
+
+  it("publishes one addressed override alarm after a committed switch, and none when no reader is overridden", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const accepted = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(accepted.code, accepted.err).toBe(0);
+    const json = JSON.parse(accepted.out) as { readers: { switchId: string; acceptedUnready: Array<{ name: string; reason: string }> } };
+    expect(new Set(json.readers.acceptedUnready.map(reader => reader.name))).toEqual(new Set(["holder@lease-probe"]));
+    const alarms = switchOverrideAlarms(root);
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0]).toMatchObject({ topic: MESH_SWITCH_OVERRIDE_ALARM_TOPIC, kind: "mesh-switch-override", to: SWITCH_OWNER,
+      data: { switchId: json.readers.switchId, acceptedUnready: [{ name: "holder@lease-probe", reason: expect.stringContaining("not Linux") }] } });
+    expect(alarms[0]!.text).toContain(json.readers.switchId);
+
+    const readyRoot = await fileRoot();
+    const ready = await run(["cutover", "--root", readyRoot, "--json"]);
+    expect(ready.code, ready.err).toBe(0);
+    expect(switchOverrideAlarms(readyRoot)).toEqual([]);
+  });
+
+  it("alarms an override accepted at the importing commit even when the reader is ready by the sqlite commit, once across both commits and not on a verified rerun", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await fileRoot();
+    const builtins = [{ name: "factory", installRoot: installRoot("r1") }];
+    expect(await proveFactory(root)).toBe(0);
+    const proof = path.join(root, "readers", "factory.json");
+    const switched = await run(["cutover", "--root", root, "--json", "--accept-unready", "factory"], { builtins,
+      options: { beforeCommit: commit => {
+        fs.writeFileSync(proof, JSON.stringify(factoryProof({ backends: commit.phase === "importing" ? ["file"] : ["file", "sqlite"] })));
+      } } });
+    expect(switched.code, switched.err).toBe(0);
+    const json = JSON.parse(switched.out);
+    expect(json.readers).toMatchObject({ acceptedUnready: [], checkedUnderFence: ["importing", "sqlite"] });
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+    expect(switchOverrideAlarms(root)[0]).toMatchObject({ data: { switchId: json.readers.switchId,
+      acceptedUnready: [{ name: "factory", reason: "missing sqlite (has file)" }] } });
+    const rerun = await run(["cutover", "--root", root, "--json", "--accept-unready", "factory"], { builtins });
+    expect(rerun.code, rerun.err).toBe(0);
+    expect(switchOverrideAlarms(root)).toHaveLength(1);
+  });
+
+  it("returns non-zero when the post-commit override alarm fails, without changing the committed switch record", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", SWITCH_OWNER);
+    const root = await crashedImport();
+    const originalPublish = MeshStore.prototype.publish;
+    let committedRecord = "";
+    let committedMarker = "";
+    const publish = vi.spyOn(MeshStore.prototype, "publish").mockImplementation(async function (this: MeshStore, input) {
+      if (input.topic === MESH_SWITCH_OVERRIDE_ALARM_TOPIC) {
+        committedRecord = fs.readFileSync(path.join(root, "backend-switches.jsonl"), "utf8");
+        committedMarker = fs.readFileSync(path.join(root, "state.json"), "utf8");
+        throw new Error("event log unwritable");
+      }
+      return await originalPublish.call(this, input);
+    });
+    const failed = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(failed.code).toBe(1);
+    expect(failed.err).toContain(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed after committed switch`);
+    expect(failed.err).toContain("accepted readers: holder@lease-probe");
+    expect(failed.err.split("\n").filter(line => line.includes(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed`))).toHaveLength(1);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(JSON.parse(failed.out)).toMatchObject({ ok: false, committed: true, error: "event log unwritable" });
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(fs.readFileSync(path.join(root, "backend-switches.jsonl"), "utf8")).toBe(committedRecord);
+    expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(committedMarker);
+    const [intent, outcome] = records(root).slice(-2);
+    expect(outcome).toMatchObject({ phase: "outcome", ok: true, switchId: intent!.switchId });
+    expect((outcome!.acceptedUnready as Array<{ name: string }>).some(reader => reader.name === "holder@lease-probe")).toBe(true);
+    expect(switchOverrideAlarms(root)).toEqual([]);
+  });
+
+  it("reports a missing override alarm recipient as post-commit failure, never as a broadcast", async () => {
+    vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", "");
+    vi.stubEnv("SMARTY_LEAD_SESSION", "");
+    const root = await crashedImport();
+    const publish = vi.spyOn(MeshStore.prototype, "publish");
+    const failed = await run(["cutover", "--root", root, "--json", "--accept-unready", "holder@lease-probe"], { leaseProbe: { platform: "darwin" } });
+    expect(failed.code).toBe(1);
+    expect(failed.err).toContain("no owning-lead alarm recipient");
+    expect(failed.err).toContain("accepted readers: holder@lease-probe");
+    expect(failed.err.split("\n").filter(line => line.includes(`${MESH_SWITCH_OVERRIDE_ALARM_TOPIC} publish failed`))).toHaveLength(1);
+    expect(JSON.parse(failed.out)).toMatchObject({ ok: false, committed: true });
+    expect(await backendOf(root)).toBe("sqlite");
+    expect(records(root).at(-1)).toMatchObject({ ok: true, phase: "outcome" });
+    expect(publish).not.toHaveBeenCalled();
+    expect(switchOverrideAlarms(root)).toEqual([]);
   });
 
   it("passes when every required reader proved sqlite, re-checks before both commits, and records intent and outcome", async () => {

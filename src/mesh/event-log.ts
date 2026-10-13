@@ -3,7 +3,7 @@ import type { FabricMessageSender } from "../protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
+import { writeFileAtomic, syncPathNamespace, syncDirectoryChain, trackTemporary } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
 import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
@@ -404,6 +404,91 @@ export class EventLog {
     return !fs.lstatSync(file, { throwIfNoEntry: false });
   }
 
+  /** pi-fabric#1036 r5: replace the ORIGINAL judged intent (pre-read inode `judged`, raw bytes `original`) with
+   * `restored`, never a successor, even one a legacy or off-lock writer renames in after the last check. Not a plain
+   * rename after a check (r4 left that window): claim-aside plus a no-replace link. (1) Stage and fsync. (2) Refuse a
+   * changed name by its stat before any read, then by raw bytes. (3) Rename the name to the in-flight claim
+   * `<file>.claim`. (4) The claim must be the judged inode with the original raw bytes; otherwise it is linked back
+   * (no-replace) and refused. (5) link(staged, file) never replaces: EEXIST is a successor that arrived after the claim,
+   * and it is kept. Every refusal is a retryable MeshDedupeRecoveryError; no step ever replaces the intent name.
+   * ponytail: there is no native compare-and-swap rename to use instead. Node exposes neither renameat2's
+   * RENAME_NOREPLACE/RENAME_EXCHANGE nor a Windows equivalent, so rename-to-claim (take the name and learn what it
+   * held) plus link(2) (install only if absent, the Maildir delivery primitive) is the portable form. NTFS supports
+   * hard links (EEXIST included). A failed link (EPERM, EXDEV, ENOTSUP: no hard links on that volume) refuses and
+   * links the claim back, never a replacing rename. The name is absent between (3) and (5): a crash there leaves only
+   * `<file>.claim`, which #reinstateIntentClaim links back under the next hold before this key is judged. */
+  #replaceJudgedIntent(file: string, judged: fs.Stats, original: Buffer, restored: string, key: string): void {
+    const changed = () => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent was replaced or refreshed and is kept`);
+    const unreadable = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${key}: the judged intent is unreadable or changed and is kept`, { cause });
+    // The judged regular-file inode, then its raw bytes, then the same inode again. size/mtime(/ctime) catch an in-place
+    // write; a rename changes ctime, so the claimed name skips it (its raw bytes are still compared).
+    const isOriginal = (target: string, ctime: boolean): boolean => {
+      const same = (stat: fs.Stats | undefined) => !!stat?.isFile() && stat.dev === judged.dev && stat.ino === judged.ino &&
+        stat.size === judged.size && stat.mtimeMs === judged.mtimeMs && (!ctime || stat.ctimeMs === judged.ctimeMs);
+      try {
+        if (!same(fs.lstatSync(target, { throwIfNoEntry: false }))) return false; // never read a changed name
+        return fs.readFileSync(target).equals(original) && same(fs.lstatSync(target, { throwIfNoEntry: false }));
+      } catch (error) { throw unreadable(error); }
+    };
+    const claim = `${file}.claim`;
+    const staged = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    const release = trackTemporary(staged);
+    let claimed = false;
+    let installed = false;
+    try {
+      const fd = fs.openSync(staged, "wx", 0o600);
+      try { fs.writeFileSync(fd, restored, { encoding: "utf8" }); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      if (!isOriginal(file, true)) throw changed();
+      // Only this hold uses the in-flight name. #reinstateIntentClaim already linked any crash leftover back before the
+      // judgment, so a claim still here only duplicates a name (its unlink failed): it moves to evidence, never over.
+      if (fs.lstatSync(claim, { throwIfNoEntry: false })) this.#keepIntentClaim(claim);
+      if (fs.lstatSync(claim, { throwIfNoEntry: false })) throw changed();
+      try { fs.renameSync(file, claim); }
+      catch (error) { throw errorCode(error) === "ENOENT" ? changed() : unreadable(error); }
+      claimed = true;
+      if (!isOriginal(claim, false)) throw changed();
+      try { fs.linkSync(staged, file); }
+      catch (error) { throw errorCode(error) === "EEXIST" ? changed() : unreadable(error); }
+      installed = true;
+      syncDirectoryChain(path.dirname(file)); // the restored name is durable before the claim goes
+    } finally {
+      try {
+        if (installed) {
+          // ponytail: plain unlink of private names. The claim is the original, proven above and superseded by this
+          // hold's restore; the staged name is this process's temporary (the same inode is now named by `file`).
+          try { fs.unlinkSync(claim); } catch { this.#keepIntentClaim(claim); }
+        } else if (claimed) {
+          try { this.#reinstateIntentClaim(file); } catch { /* the claim stays for the next hold; this refusal stands */ }
+        }
+      } finally {
+        try { fs.rmSync(staged, { force: true }); } catch { /* a tracked temporary: removed at exit */ } finally { release(); }
+      }
+    }
+  }
+
+  /** An in-flight claim (#replaceJudgedIntent) the name no longer needs: moved to a unique evidence name, never removed
+   * and never reinstated later (only the exact `<file>.claim` name is). */
+  #keepIntentClaim(claim: string): void {
+    try { fs.renameSync(claim, `${claim}-${randomUUID()}`); } catch { /* the next hold retries */ }
+  }
+
+  /** Under the lock, before an intent name is judged: a `<file>.claim` left by a refused or interrupted restore. With the
+   * name absent, link it back (no-replace) and drop the claim name. EEXIST means a newer intent holds the name: that
+   * one is kept and the claim moves to evidence. Any other failure keeps the claim and refuses, so the key stays fenced
+   * (never treated as unreserved). */
+  #reinstateIntentClaim(file: string): void {
+    const claim = `${file}.claim`;
+    if (!fs.lstatSync(claim, { throwIfNoEntry: false })) return;
+    try { fs.linkSync(claim, file); }
+    catch (error) {
+      if (errorCode(error) === "EEXIST") { this.#keepIntentClaim(claim); return; }
+      throw new MeshDedupeRecoveryError(`Cannot recover dedupe intent claim ${path.basename(claim)}: it cannot be reinstated and is kept`, { cause: error });
+    }
+    syncDirectoryChain(path.dirname(file)); // the reinstated name is durable before the claim name goes
+    // ponytail: plain unlink of a private name whose inode `file` now also names.
+    try { fs.unlinkSync(claim); } catch { this.#keepIntentClaim(claim); }
+  }
+
   /** Read the exact live line named by an intent; archive fallback is a separate direct lookup. */
   #readEventAtIntent(intent: MeshDedupeIntent): MeshEvent | undefined {
     let descriptor: number | undefined;
@@ -494,28 +579,7 @@ export class EventLog {
           try { liveOffset = fs.statSync(this.#eventsPath).size; }
           catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
           restored = JSON.stringify({ ...intent, liveOffset });
-          writeFileAtomic(file, restored, { durable: true, beforeRename: () => {
-            // pi-fabric#1036 r4: this rewrite replaces the ORIGINAL judged intent (pre-read inode `judged`, exact bytes
-            // `originalBytes`), not bytes this hold wrote: those are proven later by #removeWrittenIntent. Before each
-            // rename, lstat (refusing a missing or successor name before any read), reread the raw bytes, lstat again:
-            // both must be the judged regular-file inode and the bytes exactly equal, else the intent is kept. Plain
-            // rename leaves a check-to-rename window. size/mtimeMs/ctimeMs (not atime) catch an in-place write.
-            const unchanged = (stat: fs.Stats | undefined): boolean => !!stat?.isFile() && stat.dev === judged.dev &&
-              stat.ino === judged.ino && stat.size === judged.size && stat.mtimeMs === judged.mtimeMs && stat.ctimeMs === judged.ctimeMs;
-            const changed = () => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent was replaced or refreshed and is kept`);
-            const unreadable = (cause: unknown) => new MeshDedupeRecoveryError(`Cannot recover dedupe intent ${intent.dedupeKey}: the judged intent is unreadable or changed and is kept`, { cause });
-            let named: fs.Stats | undefined;
-            try { named = fs.lstatSync(file, { throwIfNoEntry: false }); }
-            catch (error) { throw unreadable(error); }
-            if (!unchanged(named)) throw changed();
-            let current: Buffer;
-            try { current = fs.readFileSync(file); }
-            catch (error) { throw unreadable(error); }
-            let reread: fs.Stats | undefined;
-            try { reread = fs.lstatSync(file, { throwIfNoEntry: false }); }
-            catch (error) { throw unreadable(error); }
-            if (!current.equals(originalBytes) || !unchanged(reread)) throw changed();
-          } });
+          this.#replaceJudgedIntent(file, judged, originalBytes, restored, intent.dedupeKey);
           fs.appendFileSync(this.#eventsPath, `${entry.line}\n`, { encoding: "utf8", mode: 0o600 });
           this.#confirmEventFile(this.#eventsPath);
         }
@@ -578,7 +642,13 @@ export class EventLog {
     let names: string[];
     try { names = fs.readdirSync(directory); }
     catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
-    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry))) {
+    const intents = new Set(names.filter(entry => /^[a-f0-9]{64}\.pending\.json$/.test(entry)));
+    for (const name of names.filter(entry => /^[a-f0-9]{64}\.pending\.json\.claim$/.test(entry))) {
+      const intent = name.slice(0, -".claim".length);
+      this.#reinstateIntentClaim(path.join(directory, intent));
+      intents.add(intent);
+    }
+    for (const name of intents) {
       this.#settleDedupeIntent(path.join(directory, name), undefined, archive);
     }
   }
@@ -691,6 +761,8 @@ export class EventLog {
       // In the same boot, defer ordinary pending cutback until the exact retry has settled.
       // New keys still take only the normal recovery path, with no event-history lookup.
       if (input.dedupeKey) {
+        // pi-fabric#1036 r5: a restore interrupted between its claim and its link leaves only `<intent>.claim`.
+        this.#reinstateIntentClaim(intentPath!);
         if (archive && fs.existsSync(intentPath!)) {
           try { this.#recoverArchive(archive, true, prepared, liveCatchUp); }
           catch (error) {

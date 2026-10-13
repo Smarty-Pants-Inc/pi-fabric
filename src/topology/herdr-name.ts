@@ -10,8 +10,11 @@ export const herdrPaneId = (environment: NodeJS.ProcessEnv = process.env): strin
   return pane && HERDR_PANE_PATTERN.test(pane) ? pane : undefined;
 };
 
-/** One-shot retry offsets from start (smarty-dev#11172); the last pre-minute try is at 55 s. */
-export const HERDR_NAME_RETRY_MS: readonly number[] = [5_000, 10_000, 20_000, 35_000, 55_000, 300_000];
+/**
+ * Two bounded one-shot retry offsets from start, at 60 s and 5 min (smarty-dev#11172). No retry
+ * fires sooner than a minute after start: R-no-polling forbids faster-than-minute retries.
+ */
+export const HERDR_NAME_RETRY_MS: readonly number[] = [60_000, 300_000];
 
 /**
  * Bounded, single-flight Herdr name lookup. `start()` performs the initial read and arms the

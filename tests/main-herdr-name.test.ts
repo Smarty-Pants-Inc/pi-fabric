@@ -97,7 +97,7 @@ describe("herdrNameLookup bounded retry", () => {
   // smarty-dev#11077: one-shot timers at absolute offsets after start (not refresh pokes).
   // Fake both Date and setTimeout so offsets are exact and pending timers are countable.
   const START = 1_000;
-  const OFFSETS = [5_000, 10_000, 20_000, 35_000, 55_000, 300_000];
+  const OFFSETS = [60_000, 300_000];
   beforeEach(() => { vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: START }); });
   afterEach(() => { vi.useRealTimers(); });
   /** A Herdr that names the pane only from `availableAt` ms after start (never when undefined). */
@@ -119,11 +119,13 @@ describe("herdrNameLookup bounded retry", () => {
       setEligible: (value: boolean) => { eligible = value; } };
   };
 
-  it("retries at absolute offsets 5, 10, 20, 35, 55s and 5min after start, then leaves no timer", async () => {
+  it("retries only at absolute offsets 60s and 5min after start (at most 3 reads), then leaves no timer", async () => {
     expect(HERDR_NAME_RETRY_MS).toEqual(OFFSETS);
     const h = harness();
     h.lookup.start();
     await h.advance(0);
+    expect(h.readAt).toEqual([0]);
+    await h.advance(59_999); // smarty-dev#11172 R-no-polling: no retry before a minute
     expect(h.readAt).toEqual([0]);
     for (const offset of OFFSETS) {
       await h.advance(offset - 1 - (Date.now() - START));
@@ -131,20 +133,23 @@ describe("herdrNameLookup bounded retry", () => {
       await h.advance(1);
       expect(h.read).toHaveBeenCalledTimes(before + 1);
     }
-    expect(h.readAt).toEqual([0, ...OFFSETS]);
+    expect(h.readAt).toEqual([0, 60_000, 300_000]);
     expect(vi.getTimerCount()).toBe(0);
     await h.advance(24 * 3_600_000);
-    expect(h.read).toHaveBeenCalledTimes(OFFSETS.length + 1);
+    expect(h.read).toHaveBeenCalledTimes(3);
     expect(h.names).toEqual([]);
   });
 
   it.each([
-    [25_000, 35_000],
-    [50_000, 55_000],
-  ])("publishes a name available at %ims at the %ims retry, before 60s, then stops", async (availableAt, publishedAt) => {
+    [50_000, 60_000],
+    [120_000, 300_000],
+  ])("publishes a name available at %ims at the %ims retry, not earlier, then stops", async (availableAt, publishedAt) => {
     const h = harness(availableAt);
     h.lookup.start();
-    await h.advance(59_999);
+    await h.advance(publishedAt - 1);
+    expect(h.names).toEqual([]);
+    expect(h.readAt).toEqual([0, ...OFFSETS.filter(offset => offset < publishedAt)]);
+    await h.advance(1);
     expect(h.names).toEqual([["lane-late", publishedAt]]);
     expect(h.readAt).toEqual([0, ...OFFSETS.filter(offset => offset <= publishedAt)]);
     expect(vi.getTimerCount()).toBe(0);
@@ -189,7 +194,7 @@ describe("herdrNameLookup bounded retry", () => {
     const lookup = herdrNameLookup({ read, live: () => true, eligible: () => true, onName });
     lookup.start();
     lookup.start();
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(60_000); // the 60s retry fires while the initial read waits
     expect(read).toHaveBeenCalledTimes(1); // no overlapping reads while the initial lookup waits
     lookup.stop();
     expect(vi.getTimerCount()).toBe(0);
@@ -200,13 +205,13 @@ describe("herdrNameLookup bounded retry", () => {
   });
 
   it("stops reading and leaves no timer after retirement before, during or between reads", async () => {
-    const between = harness(25_000);
+    const between = harness(120_000);
     between.lookup.start();
-    await between.advance(12_000);
-    expect(between.readAt).toEqual([0, 5_000, 10_000]);
+    await between.advance(60_001); // just after the 60s retry, before the 5min one
+    expect(between.readAt).toEqual([0, 60_000]);
     between.retire();
     await between.advance(24 * 3_600_000);
-    expect(between.read).toHaveBeenCalledTimes(3);
+    expect(between.read).toHaveBeenCalledTimes(2);
     expect(between.names).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
 
@@ -355,7 +360,7 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
 
   it("retries the Herdr read with the pane and binary captured at start, not the current process env", async () => {
     // smarty-dev#11077: root A's first read fails; another root later changes the process's
-    // HERDR_PANE_ID/HERDR_BIN_PATH. A's 5s one-shot retry must still ask about A's own pane.
+    // HERDR_PANE_ID/HERDR_BIN_PATH. A's 60s one-shot retry must still ask about A's own pane.
     // Before initialize, so the lookup's timer is faked; shouldAdvanceTime keeps the runtime's
     // other timers moving with real time.
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: Date.now(), shouldAdvanceTime: true });
@@ -390,7 +395,7 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       // The process env now belongs to another root (B).
       vi.stubEnv("HERDR_PANE_ID", "w2:p1");
       vi.stubEnv("HERDR_BIN_PATH", binB);
-      await vi.advanceTimersByTimeAsync(5_000); // the 5s one-shot retry fires
+      await vi.advanceTimersByTimeAsync(60_000); // the 60s one-shot retry fires
       await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: a.id, name: "lane-a", herdrPane: "w1:p1" }),
       ])), { timeout: 8000, interval: 100 });

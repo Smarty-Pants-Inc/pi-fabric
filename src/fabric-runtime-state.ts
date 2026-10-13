@@ -795,8 +795,8 @@ export class FabricRuntimeState {
       meshRoot,
     );
     this.#mainAgent = mainAgent;
-    // SMARTY_AGENT is the primary launcher path (smarty-dev#11146). An unnamed interactive
-    // Main falls back to Herdr with bounded one-shot retries inside the first minute and at 5 min
+    // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls
+    // back to Herdr with one-shot re-reads at 60 s and 5 min after start, best effort
     // (smarty-dev#11172). Print/JSON roots and children
     // inherit HERDR_PANE_ID and SMARTY_AGENT but are not the pane's agent, so they never use them.
     const namedMain = identity.kind === "main" && mainAgent.local && mainAgent.interactive;

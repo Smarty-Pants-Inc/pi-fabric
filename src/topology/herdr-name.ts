@@ -10,47 +10,66 @@ export const herdrPaneId = (environment: NodeJS.ProcessEnv = process.env): strin
   return pane && HERDR_PANE_PATTERN.test(pane) ? pane : undefined;
 };
 
-/** Backoffs after a failed Herdr lookup (smarty-dev#11077); after the last one the Main stays "main". */
-export const HERDR_NAME_RETRY_MS: readonly number[] = [5_000, 15_000, 60_000, 300_000];
+/** One-shot retry offsets from start (smarty-dev#11172); the last pre-minute try is at 55 s. */
+export const HERDR_NAME_RETRY_MS: readonly number[] = [5_000, 10_000, 20_000, 35_000, 55_000, 300_000];
 
 /**
- * Bounded, single-flight Herdr name lookup. `start()` runs the initial read; `poke()` is called
- * from an existing participant refresh (no own timer or poll) and re-reads only once the next
- * backoff is due and `eligible()` (the Main is still unnamed) holds. `live()` is checked before
- * and after every read; a retired lifecycle or a found name stops all further reads.
+ * Bounded, single-flight Herdr name lookup. `start()` performs the initial read and arms the
+ * fixed one-shot retry schedule. Each retry checks that the Main is still unnamed and live;
+ * finding a name, retirement, or an explicit name clears every remaining timer.
  */
 export const herdrNameLookup = (options: {
   read: () => Promise<string | undefined>;
   live: () => boolean;
   eligible: () => boolean;
   onName: (name: string) => void;
-}): { start(): void; poke(): void; readonly pending: boolean } => {
-  let failures = 0;
-  let nextAt: number | undefined;
+}): { start(): void; stop(): void; readonly pending: boolean } => {
   let busy = false;
   let done = false;
+  let started = false;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  const stop = (): void => {
+    if (done) return;
+    done = true;
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
+  };
   const run = (): void => {
     if (done || busy) return;
-    if (!options.live()) { done = true; return; }
+    if (!options.live()) { stop(); return; }
     busy = true;
-    nextAt = undefined;
     void options.read().catch(() => undefined).then((name) => {
       busy = false;
-      if (!options.live()) { done = true; return; }
-      if (name) { done = true; options.onName(name); return; }
-      const delay = HERDR_NAME_RETRY_MS[failures++];
-      if (delay === undefined) done = true;
-      else nextAt = Date.now() + delay;
+      if (done) return;
+      if (!options.live() || !options.eligible()) { stop(); return; }
+      if (name) {
+        stop();
+        options.onName(name);
+      } else if (timers.size === 0) stop();
     });
   };
+  const arm = (): void => {
+    for (const delay of HERDR_NAME_RETRY_MS) {
+      let timer: ReturnType<typeof setTimeout>;
+      timer = setTimeout(() => {
+        timers.delete(timer);
+        if (done) return;
+        if (!options.live() || !options.eligible()) { stop(); return; }
+        run();
+      }, delay);
+      timer.unref?.();
+      timers.add(timer);
+    }
+  };
   return {
-    start: run,
-    poke: () => {
-      if (done || busy || nextAt === undefined || Date.now() < nextAt) return;
-      if (!options.live()) { done = true; return; }
-      if (!options.eligible()) return;
+    start: () => {
+      if (started || done) return;
+      started = true;
+      if (!options.live()) { stop(); return; }
+      arm();
       run();
     },
+    stop,
     get pending() { return !done; },
   };
 };

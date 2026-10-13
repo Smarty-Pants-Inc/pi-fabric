@@ -297,6 +297,7 @@ export class FabricRuntimeState {
   #epoch = 0;
   /** The initialize() epoch that built #participants. */
   #participantsEpoch = -1;
+  #stopHerdrLookup: (() => void) | undefined;
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -794,9 +795,9 @@ export class FabricRuntimeState {
       meshRoot,
     );
     this.#mainAgent = mainAgent;
-    // smarty-dev#6758: an unnamed interactive Main publishes its Herdr agent name. One lookup per
-    // start or reload; a failure is retried only on the existing participant refresh with bounded
-    // backoff while the Main is still "main" (smarty-dev#11077). Print/JSON roots and children
+    // SMARTY_AGENT is the primary launcher path (smarty-dev#11146). An unnamed interactive
+    // Main falls back to Herdr with bounded one-shot retries inside the first minute and at 5 min
+    // (smarty-dev#11172). Print/JSON roots and children
     // inherit HERDR_PANE_ID and SMARTY_AGENT but are not the pane's agent, so they never use them.
     const namedMain = identity.kind === "main" && mainAgent.local && mainAgent.interactive;
     const smartyAgent = namedMain ? process.env.SMARTY_AGENT : undefined;
@@ -812,6 +813,7 @@ export class FabricRuntimeState {
         this.#participants?.scheduleRefresh();
       },
     }) : undefined;
+    this.#stopHerdrLookup = herdrLookup?.stop;
     herdrLookup?.start();
     this.#backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
     this.#disposableMeshWrites = identity.kind === "actor" || identity.kind === "agent"
@@ -845,7 +847,6 @@ export class FabricRuntimeState {
     this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       beforePublication: async () => {
-        herdrLookup?.poke();
         // Hand the early acquisition failure to start() once, without another inline
         // timeout. Its existing warning/heartbeat path owns recovery from here.
         if (initialMeshError !== undefined) {
@@ -2063,6 +2064,8 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    this.#stopHerdrLookup?.();
+    this.#stopHerdrLookup = undefined;
     this.#meshActivationReady = () => false;
     // The session lifecycle retired: stop the background heartbeat before any teardown await.
     this.#participants?.suspend();
@@ -2253,6 +2256,8 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    this.#stopHerdrLookup?.();
+    this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating
     // Main's lineage. Preserve its mailbox/address even if replacement fails.
     this.#mainAgent?.prepareReload();

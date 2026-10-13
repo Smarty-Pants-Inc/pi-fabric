@@ -94,91 +94,136 @@ describe("rootParticipantName", () => {
 });
 
 describe("herdrNameLookup bounded retry", () => {
-  // Real Vitest fake timers; the helper owns no timers, so faking Date is sufficient.
-  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"], now: 1_000 }); });
+  // smarty-dev#11077: one-shot timers at absolute offsets after start (not refresh pokes).
+  // Fake both Date and setTimeout so offsets are exact and pending timers are countable.
+  const START = 1_000;
+  const OFFSETS = [5_000, 10_000, 20_000, 35_000, 55_000, 300_000];
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: START }); });
   afterEach(() => { vi.useRealTimers(); });
-  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
-  const harness = (answers: Array<string | undefined>) => {
+  /** A Herdr that names the pane only from `availableAt` ms after start (never when undefined). */
+  const harness = (availableAt?: number) => {
     let alive = true;
     let eligible = true;
-    const names: string[] = [];
-    const pending: Array<(name: string | undefined) => void> = [];
-    const read = vi.fn(() => new Promise<string | undefined>((resolve) => { pending.push(resolve); }));
+    const names: Array<[string, number]> = [];
+    const readAt: number[] = [];
+    const read = vi.fn(async () => {
+      const elapsed = Date.now() - START;
+      readAt.push(elapsed);
+      return availableAt !== undefined && elapsed >= availableAt ? "lane-late" : undefined;
+    });
     const lookup = herdrNameLookup({ read, live: () => alive, eligible: () => eligible,
-      onName: (name) => { names.push(name); } }); // default clock: the faked Date.now
-    const answer = async () => { pending.shift()!(answers.shift()); await flush(); };
-    return { lookup, read, names, answer,
-      advance: (ms: number) => { vi.advanceTimersByTime(ms); },
+      onName: (name) => { names.push([name, Date.now() - START]); } });
+    return { lookup, read, readAt, names,
+      advance: (ms: number) => vi.advanceTimersByTimeAsync(ms),
       retire: () => { alive = false; },
       setEligible: (value: boolean) => { eligible = value; } };
   };
 
-  it("retries a failed read only on refresh pokes after 5s, 15s, 60s and 5min, then stops", async () => {
-    const h = harness([undefined, undefined, undefined, undefined, undefined]);
+  it("retries at absolute offsets 5, 10, 20, 35, 55s and 5min after start, then leaves no timer", async () => {
+    expect(HERDR_NAME_RETRY_MS).toEqual(OFFSETS);
+    const h = harness();
     h.lookup.start();
-    h.lookup.start(); // single-flight
-    expect(h.read).toHaveBeenCalledTimes(1);
-    await h.answer();
-    for (const delay of HERDR_NAME_RETRY_MS) {
-      h.advance(delay - 1);
-      h.lookup.poke();
+    await h.advance(0);
+    expect(h.readAt).toEqual([0]);
+    for (const offset of OFFSETS) {
+      await h.advance(offset - 1 - (Date.now() - START));
       const before = h.read.mock.calls.length;
-      expect(before).toBe(HERDR_NAME_RETRY_MS.indexOf(delay) + 1);
-      h.advance(1);
-      h.lookup.poke();
-      h.lookup.poke(); // single-flight while in flight
+      await h.advance(1);
       expect(h.read).toHaveBeenCalledTimes(before + 1);
-      await h.answer();
     }
-    expect(HERDR_NAME_RETRY_MS).toEqual([5_000, 15_000, 60_000, 300_000]);
-    expect(h.lookup.pending).toBe(false);
-    h.advance(24 * 3_600_000);
-    h.lookup.poke();
-    expect(h.read).toHaveBeenCalledTimes(5);
+    expect(h.readAt).toEqual([0, ...OFFSETS]);
+    expect(vi.getTimerCount()).toBe(0);
+    await h.advance(24 * 3_600_000);
+    expect(h.read).toHaveBeenCalledTimes(OFFSETS.length + 1);
     expect(h.names).toEqual([]);
   });
 
-  it("publishes a recovered name once and stops reading after success", async () => {
-    const h = harness([undefined, "lane-late"]);
+  it.each([
+    [25_000, 35_000],
+    [50_000, 55_000],
+  ])("publishes a name available at %ims at the %ims retry, before 60s, then stops", async (availableAt, publishedAt) => {
+    const h = harness(availableAt);
     h.lookup.start();
-    await h.answer();
-    h.advance(5_000);
-    h.lookup.poke();
-    await h.answer();
-    expect(h.names).toEqual(["lane-late"]);
-    expect(h.lookup.pending).toBe(false);
-    h.advance(3_600_000);
-    h.lookup.poke();
-    expect(h.read).toHaveBeenCalledTimes(2);
+    await h.advance(59_999);
+    expect(h.names).toEqual([["lane-late", publishedAt]]);
+    expect(h.readAt).toEqual([0, ...OFFSETS.filter(offset => offset <= publishedAt)]);
+    expect(vi.getTimerCount()).toBe(0);
+    await h.advance(24 * 3_600_000);
+    expect(h.read).toHaveBeenCalledTimes(h.readAt.length);
+    expect(h.names).toHaveLength(1);
   });
 
-  it("skips retries while the Main is named and stops on retirement before or after a read", async () => {
-    const h = harness([undefined, undefined]);
+  it("does not recover a name that appears only after the final 5min retry", async () => {
+    const h = harness(300_001);
     h.lookup.start();
-    await h.answer();
-    h.advance(5_000);
-    h.setEligible(false);
-    h.lookup.poke();
-    expect(h.read).toHaveBeenCalledTimes(1);
-    h.setEligible(true);
-    h.lookup.poke();
-    expect(h.read).toHaveBeenCalledTimes(2);
-    h.retire(); // retired while the read is in flight: its result is dropped
-    await h.answer();
-    expect(h.lookup.pending).toBe(false);
-    h.advance(3_600_000);
-    h.lookup.poke();
-    expect(h.read).toHaveBeenCalledTimes(2);
+    await h.advance(24 * 3_600_000);
+    expect(h.readAt).toEqual([0, ...OFFSETS]);
+    expect(h.names).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
-    const late = harness(["lane-x"]);
-    late.lookup.start();
-    late.retire();
-    await late.answer();
-    expect(late.names).toEqual([]);
-    const dead = harness([]);
+  it("publishes an initial name once without arming a timer", async () => {
+    const h = harness(0);
+    h.lookup.start();
+    await h.advance(0);
+    expect(h.names).toEqual([["lane-late", 0]]);
+    expect(vi.getTimerCount()).toBe(0);
+    await h.advance(3_600_000);
+    expect(h.read).toHaveBeenCalledTimes(1);
+  });
+
+  it("never reads while the Main is otherwise named", async () => {
+    const named = harness(25_000);
+    named.lookup.start();
+    await named.advance(0);
+    named.setEligible(false); // e.g. a Pi session name arrived
+    await named.advance(24 * 3_600_000);
+    expect(named.read).toHaveBeenCalledTimes(1);
+    expect(named.names).toEqual([]);
+  });
+
+  it("cancels every one-shot on stop and drops an in-flight result even while the lease is live", async () => {
+    let resolve!: (name: string) => void;
+    const onName = vi.fn();
+    const read = vi.fn(() => new Promise<string>(answer => { resolve = answer; }));
+    const lookup = herdrNameLookup({ read, live: () => true, eligible: () => true, onName });
+    lookup.start();
+    lookup.start();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(read).toHaveBeenCalledTimes(1); // no overlapping reads while the initial lookup waits
+    lookup.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    resolve("late-name");
+    await vi.advanceTimersByTimeAsync(24 * 3_600_000);
+    expect(onName).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops reading and leaves no timer after retirement before, during or between reads", async () => {
+    const between = harness(25_000);
+    between.lookup.start();
+    await between.advance(12_000);
+    expect(between.readAt).toEqual([0, 5_000, 10_000]);
+    between.retire();
+    await between.advance(24 * 3_600_000);
+    expect(between.read).toHaveBeenCalledTimes(3);
+    expect(between.names).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const during = harness(0);
+    during.lookup.start(); // read in flight
+    during.retire();
+    await during.advance(24 * 3_600_000);
+    expect(during.names).toEqual([]);
+    expect(during.read).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const dead = harness(0);
     dead.retire();
     dead.lookup.start();
+    await dead.advance(24 * 3_600_000);
     expect(dead.read).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -310,8 +355,10 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
 
   it("retries the Herdr read with the pane and binary captured at start, not the current process env", async () => {
     // smarty-dev#11077: root A's first read fails; another root later changes the process's
-    // HERDR_PANE_ID/HERDR_BIN_PATH. A's heartbeat retry must still ask about A's own pane.
-    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() }); // before initialize: the lookup captures Date.now
+    // HERDR_PANE_ID/HERDR_BIN_PATH. A's 5s one-shot retry must still ask about A's own pane.
+    // Before initialize, so the lookup's timer is faked; shouldAdvanceTime keeps the runtime's
+    // other timers moving with real time.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], now: Date.now(), shouldAdvanceTime: true });
     const root = temp();
     const dirA = path.join(root, "a");
     const dirB = path.join(root, "b");
@@ -343,7 +390,7 @@ describe.skipIf(process.platform === "win32")("Mains named by Herdr", () => {
       // The process env now belongs to another root (B).
       vi.stubEnv("HERDR_PANE_ID", "w2:p1");
       vi.stubEnv("HERDR_BIN_PATH", binB);
-      vi.advanceTimersByTime(5_000); // the first backoff is due; the next real heartbeat retries
+      await vi.advanceTimersByTimeAsync(5_000); // the 5s one-shot retry fires
       await vi.waitFor(async () => expect(await a.invoke("agents.sessions")).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: a.id, name: "lane-a", herdrPane: "w1:p1" }),
       ])), { timeout: 8000, interval: 100 });

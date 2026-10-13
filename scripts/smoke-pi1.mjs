@@ -65,7 +65,8 @@ try {
           async execute(_id, args) { overrides++; return { content: [{ type: "text", text: `override:${args.path}` }], details: {} }; },
         });
         pi.registerTool({
-          name: "fixture_prepare", label: "Prepared", description: "Prepare exactly once", parameters: Type.Object({ value: Type.String() }),
+          // Fabric-only tools use Pi's native callable-while-inactive exposure.
+          name: "fixture_prepare", label: "Prepared", description: "Prepare exactly once", exposure: "codemode", parameters: Type.Object({ value: Type.String() }),
           prepareArguments(args) { preparations++; return { value: `${args.value}!` }; },
           async execute(_id, args, _signal, _update, ctx) {
             assert.equal(typeof ctx.executeTool, "function");
@@ -148,8 +149,13 @@ try {
         assert.ok(toolContext.tools.some((t) => t.name === "fixture_echo"));
         assert.ok(events.some((e) => e.toolName === "fixture_echo" && e.parentToolCallId?.startsWith("outer-")));
         assert.ok(result.nestedCalls?.calls?.length >= 3, JSON.stringify(result.nestedCalls));
+        assert.equal(api.getAllTools().find((tool) => tool.name === "fixture_prepare")?.exposure, "codemode");
+        // tool_search can also load this fixture via the shared "fixture" term.
+        api.setActiveTools(api.getActiveTools().filter((name) => name !== "fixture_prepare"));
+        assert.ok(!api.getActiveTools().includes("fixture_prepare"), "Fabric-only prepared tool stays inactive");
         nextCode = 'return await extensions.fixture_prepare({value:"once"});';
         await session.prompt("Prepare captured arguments once, before approval and execution.");
+        assert.equal(session.messages.findLast((m) => m.role === "toolResult")?.isError, false);
         assert.equal(preparations, 1);
         assert.match(JSON.stringify(session.messages.findLast((m) => m.role === "toolResult")?.content), /once!/);
         nextCode = 'return await pi.bash({command:"printf shell-output; exit 7",settle:true});';
@@ -173,6 +179,11 @@ try {
         await session.prompt("Reassert ownership after a mid-turn setActiveTools removes Fabric.");
         assert.equal(calls, 3);
         assert.equal(session.messages.findLast((m) => m.role === "toolResult")?.isError, false);
+        assert.ok(!api.getActiveTools().includes("fixture_echo"), "removed direct tool stays disabled");
+        nextCode = 'return await extensions.fixture_echo({value:"disabled"});';
+        await session.prompt("A direct tool removed from the active set must stay unreachable.");
+        assert.equal(session.messages.findLast((m) => m.role === "toolResult")?.isError, true);
+        assert.equal(calls, 3, "disabled direct tool did not execute");
       }
       if (nativeMcp) {
         const discovery = profile === "native" ? "fabric.tools" : "tools";
@@ -238,7 +249,8 @@ try {
   }
   await writeFile(path.join(scratch, "fabric.json"), JSON.stringify({ fullCodeMode: true, approvals: { read: "allow", write: "allow", execute: "allow" }, mcp: { enabled: false }, mesh: { enabled: false }, memory: { enabled: false }, agents: { enabled: false }, entropy: { compile: false }, ui: { enabled: false } }));
   const cli = path.resolve(path.dirname(hostEntry), "..", hostManifest.bin.pi);
-  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi1-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "-e", "builtin:mcp", "--tools", "read,bash,fabric_exec,codemode,tool_search,fixture_cli_start,mcp__fixture__echo", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
+  // --tools also filters registration: explicitly admit the Fabric-only CLI fixture.
+  const cliRun = promisify(execFile)(process.execPath, [cli, "--mode", "json", "--no-session", "--no-extensions", "-e", path.join(root, "dist/index.js"), "-e", path.join(root, "tests/fixtures/pi1-cli-extension.mjs"), "-e", "builtin:codemode", "-e", "builtin:tool-search", "-e", "builtin:mcp", "--tools", "read,bash,fabric_exec,codemode,tool_search,fixture_cli,fixture_cli_start,mcp__fixture__echo", "--provider", "offline-cli", "--model", "fixture", "-p", "Offline smoke"], { cwd: scratch, timeout: 30_000, maxBuffer: 4_000_000, env: process.env });
   // Print mode reads piped stdin before starting; close it (no fixture input).
   cliRun.child.stdin.end();
   const { stdout, stderr } = await cliRun;

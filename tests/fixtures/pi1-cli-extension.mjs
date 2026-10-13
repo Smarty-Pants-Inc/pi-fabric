@@ -6,7 +6,7 @@ export default function (pi) {
   pi.registerMcpServer("fixture", { command: process.execPath, args: [fileURLToPath(new URL("./pi1-mcp.mjs", import.meta.url))], exposure: "direct" });
   pi.on("session_start", () => pi.registerTool({ name: "fixture_cli_start", label: "Late", description: "Late CLI tool", parameters: Type.Object({}), async execute() { return { content: [{ type: "text", text: "late-cli-ok" }], details: {} }; } }));
   pi.registerTool({
-    name: "fixture_cli", label: "Fixture", description: "CLI captured tool", parameters: Type.Object({}),
+    name: "fixture_cli", label: "Fixture", description: "CLI captured tool", exposure: "codemode", parameters: Type.Object({}),
     async execute(_id, _args, _signal, _update, ctx) {
       assert.equal(typeof ctx.executeTool, "function");
       pi.setActiveTools(["codemode", "tool_search", "fixture_cli_start", "mcp__fixture__echo"]);

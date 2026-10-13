@@ -92,6 +92,7 @@ import { assertFileStateWritable, encodeMeshStateMovedMarker, encodeMeshStateNat
 import type { MeshIdentity } from "./event-log.js";
 import { holdMeshFence } from "./fence-lock.js";
 import type { MeshLock } from "./mesh-lock.js";
+import { pinImportRoot, type OwnedImportFiles, type RefusalCleanupReport } from "./owned-import-files.js";
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
@@ -392,13 +393,16 @@ const metaOf = (rows: SqliteRow[]): DbMeta => {
 };
 
 class FenceDb {
+  /** smarty-dev#9501: set as the importing transaction's body ends, right before its COMMIT; from then on a refusal keeps the files. */
+  importCommitting = false;
+  #closed = false;
   private constructor(readonly file: string, readonly db: SqliteConnection) {}
 
   /**
    * Opens `<root>/state.db` on the tool's own connection. `create` creates and seeds a missing or
    * uninitialised database at backend=file, epoch 0; otherwise such a database reads as absent.
    */
-  static open(root: string, options: MeshBackendOptions, intent: "read" | "write", create = false): FenceDb | undefined {
+  static open(root: string, options: MeshBackendOptions, intent: "read" | "write", create = false, owned?: OwnedImportFiles): FenceDb | undefined {
     const file = path.join(root, STATE_DB);
     const exists = fs.statSync(file, { throwIfNoEntry: false }) !== undefined;
     if (!exists && !create) return undefined;
@@ -412,8 +416,12 @@ class FenceDb {
         fs.mkdirSync(root, { recursive: true, mode: 0o700 });
         assertPrivateStateRoot(root); // before the create: a refused root gets no state.db (#846 SEC P2)
         // O_EXCL: when this succeeds no connection in this process has the file open.
-        try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        // smarty-dev#9501: an import records what it creates (fstat of that descriptor, through the held root fd).
+        if (owned) owned.create(STATE_DB);
+        else {
+          try { fs.closeSync(fs.openSync(file, "wx", 0o600)); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        }
       }
       db = openPrivateStateDb(file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
     } catch (error) {
@@ -432,6 +440,8 @@ class FenceDb {
         // The fence transactions run at FULL (plan section 5, steps 2 and 5).
         db.exec("PRAGMA synchronous = FULL");
         db.exec("PRAGMA wal_autocheckpoint = 0");
+        // smarty-dev#9501: the sidecars of a state.db this run created, before the first page access opens them.
+        owned?.createSidecars();
       }
       const fence = new FenceDb(file, db);
       if (!fence.#initialised()) {
@@ -563,6 +573,8 @@ class FenceDb {
   }
 
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
     try { if (this.db.isTransaction) this.db.exec("ROLLBACK"); } catch { /* closing anyway */ }
     this.db.close();
   }
@@ -782,6 +794,7 @@ const importUnderLock = (root: string, options: MeshBackendOptions, fence: Fence
     // Reconcile right before COMMIT: a state.json that moved since G0 keeps the flag where it was.
     assertFileUnchanged(root, options, { generation, digest }, "before the flag commit", "import aborted, the backend flag is unchanged");
     options.beforeCommit?.({ phase: "importing", fromEpoch: previous, toEpoch: next });
+    fence.importCommitting = true;
     return { epoch: next, previousEpoch: previous };
   });
   options.onStep?.("import-commit");
@@ -816,7 +829,24 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
   return holdFence(root, options, async (lock) => {
     await options.beforeOpen?.();
     const census = await adviseCensus(options);
-    const fence = FenceDb.open(root, options, "write", true)!;
+    const owned = pinImportRoot(root);
+    try { return await cutoverWithFence(root, options, lock, census, owned); }
+    finally { owned.close(); }
+  });
+};
+
+/**
+ * smarty-dev#9501: a refusal (MeshBackendRefusedError, MeshBackendFenceError: exit 3) BEFORE the importing commit
+ * leaves the root as it was. The state.db, -wal and -shm this run created are removed, still under the fence, after
+ * the connection is closed. The removal runs only through the held root fd and only while each name still names the
+ * inode this run created. Kept files are reported on the error (cleanupWarnings, retained, reason); the refusal
+ * itself is rethrown unchanged. Ordinary errors and crashes keep every file (a rerun converges), and so does any
+ * refusal from the importing commit on (the database then holds the import, later the authority).
+ */
+const cutoverWithFence = (root: string, options: MeshBackendOptions, lock: MeshLock, census: MeshCensusAdvisory | undefined,
+  owned: OwnedImportFiles): MeshCutoverResult => {
+  const fence = FenceDb.open(root, options, "write", true, owned)!;
+  try {
     try {
       // G0, import, flag at E+1 and verification; a state.json that moved before COMMIT aborts it.
       const imported = importUnderLock(root, options, fence, lock);
@@ -854,8 +884,25 @@ const fencedCutover = async (root: string, options: MeshBackendOptions): Promise
       }
       throw new MeshCutoverFailedError(`Fabric mesh cutover failed: ${reason}; rolled back to backend=file at epoch ${rollback.epoch}`
         + (conflictFile ? `; the conflicting state.json is kept at ${conflictFile}` : ""), rollback, conflictFile);
-    } finally { fence.close(); }
-  });
+    } catch (error) {
+      if (owned.createdDb && !fence.importCommitting && (error instanceof MeshBackendRefusedError || error instanceof MeshBackendFenceError)) {
+        // Nothing here masks the refusal: a cleanup that cannot run keeps the files and says so.
+        // First the close: SQLite's own close may checkpoint and remove its sidecars. A close that throws fails closed:
+        // the connection may still hold the files, so nothing is unlinked, and the close is not retried (FenceDb.close
+        // marks itself closed before it calls db.close, so the outer finally is a no-op and cannot mask the refusal).
+        let report: RefusalCleanupReport | undefined;
+        try { fence.close(); }
+        catch (closeError) { report = owned.keepAfterFailure("close-failed", closeError); }
+        if (!report) {
+          try { report = owned.removeAfterRefusal(); }
+          catch (cleanup) { report = owned.keepAfterFailure("cleanup-failed", cleanup); }
+        }
+        const { cleanupWarnings, retained, reason } = report;
+        if (cleanupWarnings.length > 0) Object.assign(error, { cleanupWarnings, ...(retained.length > 0 ? { retained } : {}), ...(reason ? { reason } : {}) });
+      }
+      throw error;
+    }
+  } finally { fence.close(); }
 };
 
 /**

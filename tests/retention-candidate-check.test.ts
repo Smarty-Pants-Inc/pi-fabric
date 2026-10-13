@@ -379,3 +379,82 @@ describe("smarty-dev#9058 design corrections (dry run)", () => {
     fs.closeSync(await lockFile(path.join(host, "host.lock"), 0));
   });
 });
+
+// CODE-P1 (.local/9058-final-audit.md): the default project registry actors/actors.json is saved by ActorRegistryStore:
+// prepare() stages `actors.json.<pid>.<uuid>.prepared` in actors/, and the synchronous commit() publishes it with
+// renameAtomic, so every normal save is a new inode generation. Such a save must not sticky-stop later candidates.
+// The REAL store prepare/commit runs on this test's private temp mesh only (prepared before any fs spy); no product
+// path, no retention delete, dry runs only.
+describe("smarty-dev#9058 project registry atomic save (dry run)", () => {
+  const projectStore = async (m: ReturnType<typeof mesh>) => {
+    const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
+    const store = new ActorRegistryStore(m.actors);
+    store.prepare([{ id: "project-actor", status: "idle", lastRunId: "its-own-run" }]).commit();
+    return store;
+  };
+  const ino = (file: string) => fs.lstatSync(file).ino;
+
+  it("keeps old when a normal store save overlaps its final check, then plans the stable orphan", async () => {
+    const m = mesh();
+    const project = path.join(m.actors, "actors.json"), own = path.join(m.registry, "actors.json");
+    const store = await projectStore(m);
+    const prepared = store.prepare([{ id: "project-actor", status: "idle", lastRunId: "another-run" }]);
+    const inoBefore = ino(project);
+    let armed = false, committed = false;
+    // Overlap: commit at old's ownerBefore lstat (the pre-observation already stamped the project file; the read follows).
+    const fake = fakeFs({ candidate: m.old, onStatusRead: () => { armed = true; },
+      onLstat: (file, real) => {
+        if (armed && !committed && file === own && !(new Error().stack ?? "").includes("observe")) { committed = true; prepared.commit(); }
+        return real();
+      } });
+    const plan = await sweep(m.root);
+    vi.restoreAllMocks();
+    expect(fake.statusRead()).toBe(true);
+    expect(committed).toBe(true);
+    expect(ino(project)).not.toBe(inoBefore);
+    expect(plan.removedRuns).not.toContain(m.old);
+    expect(plan.removedRuns).toEqual([m.orphan]);
+    expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
+  });
+
+  it("keeps old referenced by a cross-root store save and plans the orphan", async () => {
+    const m = mesh();
+    const project = path.join(m.actors, "actors.json");
+    const store = await projectStore(m);
+    const prepared = store.prepare([{ id: "adopter", status: "idle", lastRunId: "old" }]);
+    const inoBefore = ino(project);
+    const fake = fakeFs({ candidate: m.old, onStatusRead: () => prepared.commit() });
+    const plan = await sweep(m.root);
+    vi.restoreAllMocks();
+    expect(fake.statusRead()).toBe(true);
+    expect(ino(project)).not.toBe(inoBefore);
+    expect(plan.removedRuns).toEqual([m.orphan]);
+  });
+
+  it.each(["directory", "symlink", "hardlink", "foreign-uid", "writable-by-others"] as const)("project actors.json becoming %s permanently keeps both", async kind => {
+    const m = mesh();
+    const project = path.join(m.actors, "actors.json");
+    await projectStore(m);
+    let flipped = false;
+    const fake = fakeFs({ candidate: m.old,
+      onStatusRead: () => {
+        flipped = true;
+        if (kind === "foreign-uid") return;
+        if (kind === "writable-by-others") { fs.chmodSync(project, 0o666); return; }
+        const saved = path.join(tmp("fabric-9058-project-"), "actors.json");
+        if (kind === "hardlink") { fs.linkSync(project, saved); return; }
+        fs.renameSync(project, saved);
+        if (kind === "directory") fs.mkdirSync(project); else fs.symlinkSync(saved, project);
+      },
+      onLstat: (file, real) => {
+        const stat = real();
+        if (kind === "foreign-uid" && flipped && file === project && stat) return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: (stat as fs.Stats).uid + 1 });
+        return stat;
+      } });
+    const outcome = await sweep(m.root).catch((error: unknown) => ({ removedRuns: [] as string[], error }));
+    expect(fake.statusRead()).toBe(true);
+    expect(outcome.removedRuns).toEqual([]);
+    expect(fs.existsSync(path.join(m.old, "reply.json"))).toBe(true);
+    expect(fs.existsSync(path.join(m.orphan, "reply.json"))).toBe(true);
+  });
+});

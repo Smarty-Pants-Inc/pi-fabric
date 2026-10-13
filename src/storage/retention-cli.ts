@@ -230,6 +230,16 @@ const sweep = async (meshRoot: string, options: {
   // #9160: each direct actors/ entry's lstat type, dev and ino (never mtime: actor activity must not stop the sweep),
   // taken before discovery so a swap during or after the walk differs. undefined: unknown listing or stat (fail closed).
   const entryKind = (stat: fs.Stats): string => stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : "other";
+  // CODE-P1 (smarty-dev#9058): the project registry actors/actors.json is saved by ActorRegistryStore's renameAtomic, so a
+  // normal save is a new inode. While it is a regular, single-link file owned by this uid, not writable by others, its identity is kind+dev+uid
+  // (not the inode): such a generation is not a replacement. This proves no writer provenance; it accepts a safe regular
+  // generation per the registry's own contract, and the stamp in every final check still vetoes an overlapping save. Any
+  // other kind, owner or link count (or no getuid) keeps the exact inode identity, so that flip is a sticky replacement.
+  const entryIdentity = (name: string, stat: fs.Stats): string =>
+    name === "actors.json" && stat.isFile() && stat.nlink === 1 && (stat.mode & 0o022) === 0 &&
+      typeof process.getuid === "function" && stat.uid === process.getuid()
+      ? `file\0${stat.dev}\0uid:${stat.uid}\0project-registry`
+      : `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
   // #10635: a listed entry gone at its lstat (ENOENT) re-lists, at most 3 listings per call. Gone and staying gone is a
   // benign removal. Every identity seen within this call is kept and compared with all later reads: a different one is
   // a replacement (sticky `stop`, then undefined). A name that vanished before any identity was seen and comes back is judged by `replaced`
@@ -249,7 +259,7 @@ const sweep = async (meshRoot: string, options: {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
             vanished = true; continue;
           }
-          const identity = `${entryKind(stat)}\0${stat.dev}\0${stat.ino}`;
+          const identity = entryIdentity(name, stat);
           if (seen.has(name) && seen.get(name) !== identity) { stop ??= "an actors entry changed type or identity"; return undefined; }
           seen.set(name, identity); current.set(name, identity);
         }
@@ -430,8 +440,8 @@ const sweep = async (meshRoot: string, options: {
       // The dead host's own startup sweep, under its flock fence: the same exit, tree,
       // preserved-result and latest-run fences as a live host's removal (smarty-dev#3252).
       if (options.runRetentionMs !== undefined) {
-        // Same final pre-delete check as the actor-run pass below: every discovered registry is
-        // re-read uncached before each delete; a vanished or unreadable one vetoes (review round 2).
+        // Same final pre-delete check as the actor-run pass below: before each delete every discovered registry's
+        // stamp is re-validated against the cached references and a changed registry is re-parsed; a vanished or unreadable one vetoes (review round 2).
         // A dry run takes the same selection and fences without mutating, so its preview lists
         // the runs --apply deletes (review round 3). Sizes are taken before the final check, which also
         // re-discovers the registry roots, and the check and delete run back to back (review round 4).
@@ -480,7 +490,7 @@ const sweep = async (meshRoot: string, options: {
       // Mesh-wide, independent of any owner being alive (smarty-dev#3252, #5652): the owning
       // manager's own pruneRuns rule (terminal, safe exit-proven tree, not the latest run),
       // plus every registry's latest, in-flight, preparing and pending-removal runs, re-read when a
-      // registry changes. The final pre-delete check re-reads every discovered registry uncached;
+      // registry changes. The final pre-delete check stamp-validates the cached references and re-parses changed registries;
       // an unreadable or vanished registry is a wildcard veto (pi-fabric#645 review round 1).
       // Early skips judge only from the first read's ids; the final pre-delete check is referencedNow with this registry
       // as the candidate's own (smarty-dev#7916, #9058).

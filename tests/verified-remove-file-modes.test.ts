@@ -10,7 +10,7 @@ import { platformRemovalSkips, startRemovalTally, stopRemovalTally, verifiedRemo
 // and again at each recheck and right before its unlink; a refusal is counted, nothing is chmod-healed. A symbolic link
 // in the tree is exempt (owner decision: its 0777 mode means nothing on Linux and only the link is unlinked, never
 // followed); a symbolic link as the target is still refused. Writable-entry refusals at any step are visible without a
-// tally (platformRemovalSkips + one coalesced warning).
+// tally (platformRemovalSkips + a synchronous warning on each key's first count).
 // (This refuses an entry writable NOW or made writable later; it does not prove no descriptor was opened while a past
 // mode allowed it: chmod does not revoke an open descriptor. That last-check window is #10678's design cut.)
 // Recorder-only: every unlink/rmdir/rm is captured and never executed; the helper's graveyard rename is real but stays
@@ -192,7 +192,7 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     expect(fs.readFileSync(outside, "utf8")).toBe("outside");
   });
 
-  it("no tally: a child chmod 0644 -> 0664 during proceed() is refused after the move and visible (platformRemovalSkips +1, one warning x1); nothing in the tree deleted", async () => {
+  it("no tally: a child chmod 0644 -> 0664 during proceed() is refused after the move and visible (platformRemovalSkips +1, one warning x1); nothing in the tree deleted", () => {
     const root = sandbox();
     const { target } = tree(root);
     const deleter = `modes-late-${process.pid}-${Date.now()}`;
@@ -212,7 +212,6 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     expect(fs.readFileSync(path.join(grave, "a.txt"), "utf8")).toBe("a");
     expect(fs.readFileSync(path.join(grave, "sub", "b.txt"), "utf8")).toBe("b");
     expect(platformRemovalSkips()[key]).toBe(skipsBefore + 1);
-    await new Promise<void>(resolve => setTimeout(resolve, 1_100));
     const mine = warn.mock.calls.filter(args => String(args[0]).includes(deleter));
     expect(mine).toEqual([[expect.stringContaining(`${key} x1 (e.g. ${target})`)]]);
   });
@@ -234,7 +233,7 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
   };
   const UNRESOLVED = `${FILE} (changed during removal; left in the graveyard); graveyard location unresolved`;
 
-  it("no tally: late child chmod 0664 with an unresolvable graveyard location is visible (platformRemovalSkips +1, one warning x1); nothing in the tree deleted", async () => {
+  it("no tally: late child chmod 0664 with an unresolvable graveyard location is visible (platformRemovalSkips +1, one warning x1); nothing in the tree deleted", () => {
     const root = sandbox();
     const deleter = `modes-unresolved-${process.pid}-${Date.now()}`;
     const key = `${deleter}: ${UNRESOLVED}`;
@@ -250,7 +249,6 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     expect(fs.readFileSync(path.join(moved, "a.txt"), "utf8")).toBe("a");
     expect(fs.readFileSync(path.join(moved, "sub", "b.txt"), "utf8")).toBe("b");
     expect(platformRemovalSkips()[key]).toBe(skipsBefore + 1);
-    await new Promise<void>(resolve => setTimeout(resolve, 1_100));
     const mine = warn.mock.calls.filter(args => String(args[0]).includes(deleter));
     expect(mine).toEqual([[expect.stringContaining(`${key} x1 (e.g. ${target})`)]]);
   });
@@ -267,7 +265,7 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     noDeletes(ops);
   });
 
-  it("no tally: a 0664 file is refused and visible (platformRemovalSkips +1, one coalesced warning x1); a 0644 file is still removed", async () => {
+  it("no tally: a 0664 file is refused and visible (platformRemovalSkips +1, one warning x1); a 0644 file is still removed", () => {
     const root = sandbox();
     const deleter = `modes-${process.pid}-${Date.now()}`;
     const key = `${deleter}: ${FILE}`;
@@ -291,7 +289,6 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     expect(ops.filter(op => !op.startsWith("unlink"))).toEqual([`rmdir ${GRAVE}`]); // the container cleanup, recorded
     expect(renames).toHaveLength(1); // the controlled graveyard move inside this root
     expect(platformRemovalSkips()[key]).toBe(skipsBefore + 1);
-    await new Promise<void>(resolve => setTimeout(resolve, 1_100));
     const mine = warn.mock.calls.filter(args => String(args[0]).includes(deleter));
     expect(mine).toEqual([[expect.stringContaining(`${key} x1 (e.g. ${writable})`)]]);
   });

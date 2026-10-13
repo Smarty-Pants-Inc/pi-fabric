@@ -8,8 +8,8 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 // pi-fabric#1014 SEC P2-2: off Linux, managed scratch keeps main's (c0b67ef) path-based removal after every candidate
-// recheck; the verified helper's platform/no-uid refusal stays for every other deleter, now counted and logged in one
-// coalesced warning per batch.
+// recheck; the verified helper's platform/no-uid refusal stays for every other deleter, now counted and logged with a
+// synchronous warning on each key's 1st, 10th, 100th and 1000th skip.
 // Recorder-only: fs.rmSync, fs.unlinkSync and fs.rmdirSync (and fs.renameSync off Linux) capture each call and never
 // execute it, so no product deletion runs here. A forced process.platform is not native Darwin or Windows evidence:
 // it proves which removal sweepScratch dispatches, with which target and options, and what it reports.
@@ -129,12 +129,10 @@ describe("off Linux, scratch keeps main's removal after every candidate recheck 
   });
 });
 
-/** The coalesced skip warning flushes after its 1 s batch window. */
-const flushed = () => new Promise<void>(resolve => setTimeout(resolve, 1_100));
 const skipCount = (prefix: string): number => Object.entries(platformRemovalSkips())
   .filter(([name]) => name.startsWith(prefix)).reduce((sum, [, count]) => sum + count, 0);
 
-describe("remaining platform refusals and failed removals are counted and logged as one batch warning, not silent", () => {
+describe("remaining platform refusals and failed removals are counted and warned synchronously, not silent", () => {
   it("darwin: a failed main removal is not reported removed; counted and warned", async () => {
     const tempRoot = sandbox();
     const old = fixture(tempRoot, { closedAt: 1 });
@@ -150,7 +148,6 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(await sweepScratch({ tempRoot, now: 100 * HOUR })).toMatchObject({ eligible: [old], removed: [] });
     expect(calls).toEqual([old]);
     expect(skipCount(prefix) - start).toBe(1);
-    await flushed();
     expect(warn.mock.calls.map(args => String(args[0])).filter(line => line.includes(prefix))).toEqual([
       expect.stringContaining(`${prefix} x1 (e.g. ${old})`)]);
   });
@@ -174,7 +171,6 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(calls).toEqual([old]);
     expect(tally).toEqual({ sweepScratch: { removed: 0, bytes: 0, refused: { [reason]: 1 }, refusedBytes: {}, examples: { [reason]: [old] } } });
     expect(skipCount(`sweepScratch: ${reason}`) - start).toBe(0);
-    await flushed();
     expect(warn.mock.calls.filter(args => String(args[0]).includes(reason))).toEqual([]);
   });
 
@@ -191,7 +187,7 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(child.stderr).toContain("probe: directory-relative removal needs Linux /proc/self/fd; nothing is deleted x1 (e.g. /nonexistent/scratch-probe)");
   });
 
-  it("Linux without getuid: scratch is not removed by any path; the skips are counted, one batch warning", async () => {
+  it("Linux without getuid: scratch is not removed by any path; the skips are counted, one warning (first count)", async () => {
     const tempRoot = sandbox();
     const first = fixture(tempRoot, { closedAt: 1 });
     const second = fixture(tempRoot, { closedAt: 2 });
@@ -209,13 +205,13 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(calls).toEqual([]);
     expect(shape(tempRoot)).toEqual(before);
     expect(skipCount(prefix) - start).toBe(2);
-    await flushed();
-    // One warning for the whole sweep (not one per root), with its count.
+    // One warning for the whole sweep (the first count; the second is suppressed), naming one example root.
     const warned = warn.mock.calls.map(args => String(args[0])).filter(line => line.includes(prefix));
-    expect(warned).toEqual([expect.stringMatching(/sweepScratch: file ownership cannot be proven .* x2 \(e\.g\. /)]);
+    expect(warned).toHaveLength(1);
+    expect([first, second].some(root => warned[0]!.includes(` x1 (e.g. ${root})`))).toBe(true);
   });
 
-  it("another deleter off Linux without a fallback refuses; counted, one batch warning", async () => {
+  it("another deleter off Linux without a fallback refuses; counted, one warning (first count)", () => {
     const parent = sandbox();
     const target = path.join(parent, "target");
     fs.mkdirSync(target);
@@ -235,8 +231,7 @@ describe("remaining platform refusals and failed removals are counted and logged
     expect(shape(parent)).toEqual(before);
     const skips = Object.entries(platformRemovalSkips()).filter(([name]) => name.startsWith(`${deleter}:`));
     expect(skips.map(([, count]) => count)).toEqual([3]);
-    await flushed();
-    expect(warn.mock.calls.filter(args => String(args[0]).includes(deleter))).toEqual([[expect.stringContaining(`${deleter}: directory-relative removal needs Linux /proc/self/fd; nothing is deleted x3`)]]);
+    expect(warn.mock.calls.filter(args => String(args[0]).includes(deleter))).toEqual([[expect.stringContaining(`${deleter}: directory-relative removal needs Linux /proc/self/fd; nothing is deleted x1 (e.g. ${target})`)]]);
   });
 });
 
@@ -251,7 +246,6 @@ describe.skipIf(process.platform !== "linux" || typeof process.getuid !== "funct
     const names = calls.map(call => `${call.op}:${path.basename(call.file).replace(/\.[0-9a-f-]{36}$/, "")}`);
     expect(names.filter(name => name.startsWith("unlink:")).sort()).toEqual([`unlink:${SCRATCH_OWNER_FILE}`, "unlink:output.txt"]);
     expect(names.filter(name => name.startsWith("rmdir:"))).toEqual([`rmdir:${path.basename(old)}`, `rmdir:.retention-graveyard-${process.pid}`]);
-    await flushed();
     expect(warn).not.toHaveBeenCalled();
   });
 });

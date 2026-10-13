@@ -86,30 +86,17 @@ export const countRefusal = (deleter: string, reason: string, target?: string, b
  * or others (for example a 0664 file created under umask 002, which this helper now refuses and never chmod-heals) is
  * not silent where no report tally is on (in-process sweeps). `platformRemovalSkips` keeps its name for compatibility
  * and now includes those writable-entry reasons. Cumulative counts by
- * `deleter: reason` (fixed categories, so bounded), and one coalesced console warning per batch (a 1 s window, not per
- * target) with each key's count and up to 3 example targets. Under a tally the report carries it instead (the caller
- * counts it with countRefusal). The 1 s timer is referenced on purpose, so a short process that exits inside the window
- * still emits the warning: at most a 1 s exit delay, and only after a skip (no timer at import, idle or startup). */
+ * `deleter: reason` (fixed categories, so bounded), and a synchronous console warning (no timer) the first time each
+ * key is skipped and again only at counts 10, 100, 1000, ..., each line with the count and the current example target.
+ * Under a tally the report carries it instead (the caller counts it with countRefusal). */
 const skipCounts: Record<string, number> = {};
-let pendingSkips: Map<string, { count: number; examples: string[] }> | undefined;
 export const platformRemovalSkips = (): Record<string, number> => ({ ...skipCounts });
 export const reportRemovalSkip = (deleter: string, reason: string, target: string): void => {
   if (tally) return;
   const key = `${deleter}: ${reason}`;
-  skipCounts[key] = (skipCounts[key] ?? 0) + 1;
-  if (!pendingSkips) {
-    pendingSkips = new Map();
-    setTimeout(() => {
-      const batch = pendingSkips!;
-      pendingSkips = undefined;
-      console.warn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${[...batch].map(([name, { count, examples }]) =>
-        `${name} x${count} (e.g. ${examples.join(", ")})`).join("; ")}`);
-    }, 1_000);
-  }
-  const item = pendingSkips.get(key) ?? { count: 0, examples: [] };
-  item.count++;
-  if (item.examples.length < 3) item.examples.push(target);
-  pendingSkips.set(key, item);
+  const count = skipCounts[key] = (skipCounts[key] ?? 0) + 1;
+  // ponytail: log only at exact powers of ten (1, 10, 100, ...), so a key warns O(log n) times.
+  if (count === 10 ** Math.floor(Math.log10(count))) console.warn(`[pi-fabric] cleanup skipped (smarty-dev#7858): ${key} x${count} (e.g. ${target})`);
 };
 
 /** Test seam: runs after the judgment, right before the first open (a swap between judgment and delete). */

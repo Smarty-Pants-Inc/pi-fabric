@@ -12,12 +12,14 @@ const fake = vi.hoisted(() => {
     constructor(readonly errCode: number) { super(`fake JetStream API error ${errCode}`); this.name = "JetStreamApiError"; }
     apiError() { return { code: 404, err_code: this.errCode, description: "stream not found" }; }
   }
-  type StreamInfo = { config: Record<string, unknown> & { name: string; subjects?: string[] }; state: { last_seq: number; first_seq: number } };
+  type StreamInfo = { config: Record<string, unknown> & { name: string; subjects?: string[] }; state: { last_seq: number; first_seq: number }; cluster?: { leader?: string } };
   return {
     FakeJetStreamApiError,
     streams: new Map<string, StreamInfo>(),
     log: [] as { op: string; args: unknown[] }[],
     addStop: false,
+    createdWithoutLeader: false,
+    leaderPolls: 0,
     /** mesh.nats.replicas returned by the fake agent-only reader; reset to 1 before every case. */
     configuredReplicas: 1 as unknown,
     /** Guards that NATS replica lookup never enters the global config / policy path. */
@@ -50,12 +52,20 @@ vi.mock("@nats-io/jetstream", () => ({
         fake.log.push({ op: "info", args: [name] });
         const stream = fake.streams.get(name);
         if (!stream) throw new fake.FakeJetStreamApiError(10059);
-        return structuredClone(stream);
+        const result = structuredClone(stream);
+        if (fake.leaderPolls > 0) {
+          fake.leaderPolls--;
+          delete result.cluster;
+        } else if (result.cluster && !result.cluster.leader) {
+          result.cluster.leader = "n1";
+        }
+        return result;
       },
       add: async (config: Record<string, unknown> & { name: string }) => {
         fake.log.push({ op: "add", args: [structuredClone(config)] });
         if (fake.addStop) throw new Error("fake: add recorded, stop");
-        const created = { config: { ...config }, state: { last_seq: 0, first_seq: 0 } };
+        const created = { config: { ...config }, state: { last_seq: 0, first_seq: 0 },
+          cluster: fake.createdWithoutLeader ? {} : { leader: "n1" } };
         fake.streams.set(config.name, created);
         return structuredClone(created);
       },
@@ -73,7 +83,7 @@ vi.mock("@nats-io/jetstream", () => ({
 }));
 
 const { connectJetStream } = await import("../src/mesh/state-backend-nats-client.js");
-const { MeshStateNatsRefusedError, connectNatsEndpoint, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
+const { MeshStateNatsBusyError, MeshStateNatsRefusedError, connectNatsEndpoint, natsStreamName, openNatsStateBackend } = await import("../src/mesh/state-backend-nats.js");
 const { normalizeFabricConfig } = await import("../src/config.js");
 
 const STREAM = "FABRIC_MESH_REPLICAS_TEST";
@@ -90,6 +100,7 @@ const seedStream = (name: string, numReplicas: number, subjects: string[]) => {
   fake.streams.set(name, {
     config: { name, subjects: [...subjects], storage: "file", num_replicas: numReplicas, max_msg_size: 1024 * 1024 },
     state: { last_seq: 7, first_seq: 1 },
+    cluster: { leader: "n1" },
   });
 };
 
@@ -123,6 +134,8 @@ beforeEach(() => {
   fake.streams.clear();
   fake.log.length = 0;
   fake.addStop = false;
+  fake.createdWithoutLeader = false;
+  fake.leaderPolls = 0;
   fake.configuredReplicas = 1;
   fake.loadGlobal.mockReset();
   fake.loadGlobal.mockImplementation(() => normalizeFabricConfig({ mesh: { nats: { replicas: fake.configuredReplicas } } }));
@@ -158,6 +171,47 @@ describe("NATS stream replicas: real client ensureStream (pure fakes)", () => {
     const port = await connectJetStream(SERVERS, withReplicas(3));
     await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).resolves.toEqual({ lastSeq: 7, maxMsgSize: 1024 * 1024 });
     expect(mutations()).toEqual([]);
+  });
+
+  it("waits for a replicated stream leader before returning from ensureStream", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = 2;
+    const port = await connectJetStream(SERVERS, withReplicas(3));
+    await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).resolves.toEqual({ lastSeq: 7, maxMsgSize: 1024 * 1024 });
+    expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(3);
+  });
+
+  it("waits for a leader after creating a replicated stream", async () => {
+    fake.createdWithoutLeader = true;
+    fake.leaderPolls = 2;
+    const port = await connectJetStream(SERVERS, withReplicas(3));
+    await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).resolves.toEqual({ lastSeq: 0, maxMsgSize: 1024 * 1024 });
+    expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(4); // absent check + three bounded polls
+  });
+
+  it("does not poll a single-node stream for a cluster leader", async () => {
+    seedStream(STREAM, 1, SUBJECTS);
+    fake.leaderPolls = 2;
+    const port = await connectJetStream(SERVERS, withReplicas(1));
+    await expect(port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 })).resolves.toEqual({ lastSeq: 7, maxMsgSize: 1024 * 1024 });
+    expect(fake.log.filter(entry => entry.op === "info")).toHaveLength(1); // the initial lookup only
+  });
+
+  it("fails with a bounded busy error when a replicated stream never elects a leader", async () => {
+    seedStream(STREAM, 3, SUBJECTS);
+    fake.leaderPolls = Number.MAX_SAFE_INTEGER;
+    vi.useFakeTimers();
+    try {
+      const port = await connectJetStream(SERVERS, withReplicas(3));
+      const result = port.ensureStream(STREAM, SUBJECTS, { maxMsgSize: 1024 * 1024 }).then(() => undefined, error => error);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const error = await result;
+      expect(error).toBeInstanceOf(MeshStateNatsBusyError);
+      expect((error as Error).message).toContain(`stream ${STREAM} had no elected leader after 10000ms`);
+      expect((error as Error).message).not.toContain("fake");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("control: a matching 3-replica stream missing a subject gets only that subject, never a replicas change", async () => {

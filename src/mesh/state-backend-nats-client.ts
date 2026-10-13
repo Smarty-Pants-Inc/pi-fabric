@@ -6,7 +6,7 @@ import {
   DeliverPolicy, JetStreamApiError, StorageType, jetstream, jetstreamManager,
 } from "@nats-io/jetstream";
 import {
-  assertNatsReplicas, guardNatsPort, MeshStateNatsRefusedError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
+  assertNatsReplicas, guardNatsPort, MeshStateNatsBusyError, MeshStateNatsRefusedError, natsConnectOptions, NatsWrongLastSequenceError, redactNatsError,
   type JetStreamPort, type NatsStreamMessage, type NatsTlsFiles,
 } from "./state-backend-nats.js";
 
@@ -14,9 +14,16 @@ import {
 const WRONG_LAST_SEQUENCE = 10071;
 const STREAM_NOT_FOUND = 10059;
 const TRANSIENT = new Set(["TimeoutError", "NoRespondersError", "ConnectionError", "RequestError", "ClosedConnectionError"]);
+const STREAM_LEADER_TIMEOUT_MS = 10_000;
+const STREAM_LEADER_POLL_MS = 100;
 const apiCode = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }
+};
+const isTransientReadError = (error: unknown): boolean => {
+  if (error instanceof Error && TRANSIENT.has(error.name)) return true;
+  if (!(error instanceof JetStreamApiError)) return false;
+  try { return error.apiError().code === 503; } catch { return false; }
 };
 
 export interface ConnectJetStreamOptions {
@@ -51,6 +58,25 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
     jsm = await jetstreamManager(nc);
   } catch (error) { throw redactNatsError(error); }
   const js = jetstream(nc);
+  const waitForStreamLeader = async (stream: string, requiredReplicas: number, current?: Awaited<ReturnType<typeof jsm.streams.info>>) => {
+    if (requiredReplicas === 1) return current;
+    const deadline = Date.now() + STREAM_LEADER_TIMEOUT_MS;
+    let info = current;
+    if (info?.cluster?.leader) return info;
+    for (;;) {
+      try {
+        info = await jsm.streams.info(stream);
+        if (info.cluster?.leader) return info;
+      } catch (error) {
+        if (!isTransientReadError(error)) throw error;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new MeshStateNatsBusyError(`stream ${stream} had no elected leader after ${STREAM_LEADER_TIMEOUT_MS}ms`);
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, Math.min(STREAM_LEADER_POLL_MS, remaining)));
+    }
+  };
   return guardNatsPort({
     server: async () => {
       let syncAlways: boolean | undefined;
@@ -74,7 +100,8 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       if (!info) {
         // The stream itself refuses a larger message (pi-fabric#907): the server enforces the cap, not only the client.
         const created = await jsm.streams.add({ name: stream, subjects, storage: StorageType.File, num_replicas: configured, max_msg_size: maxMsgSize });
-        return { lastSeq: created.state.last_seq, maxMsgSize: created.config.max_msg_size };
+        const ready = await waitForStreamLeader(stream, configured, created);
+        return { lastSeq: ready?.state.last_seq ?? created.state.last_seq, maxMsgSize: ready?.config.max_msg_size ?? created.config.max_msg_size };
       }
       // smarty-dev#11373: an existing stream with other replicas is refused BEFORE any update (or a later publish or
       // purge): never lowered, never raised automatically. The operator changes the stream or the configuration.
@@ -85,7 +112,8 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       }
       const missing = subjects.filter(subject => !(info.config.subjects ?? []).includes(subject));
       if (missing.length > 0) await jsm.streams.update(stream, { subjects: [...(info.config.subjects ?? []), ...missing] });
-      return { lastSeq: info.state.last_seq, maxMsgSize: info.config.max_msg_size };
+      const ready = await waitForStreamLeader(stream, configured, info);
+      return { lastSeq: ready?.state.last_seq ?? info.state.last_seq, maxMsgSize: ready?.config.max_msg_size ?? info.config.max_msg_size };
     },
     streamExists: async (stream) => {
       try { await jsm.streams.info(stream); return true; }

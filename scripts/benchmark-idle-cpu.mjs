@@ -10,10 +10,10 @@
 // Each runs under scripts/idle-wake-preload.cjs, which counts Timeout and Immediate callback runs and
 // fs.watchFile polls (StatWatcher, 1000/interval per second while watched) per
 // creation callsite. After the warm-up it measures --seconds and FAILS (exit 1) when either rule breaks:
-//   (1) non-allowlisted timer (Timeout and StatWatcher) wakes > --budget per second (default 1.0) in total;
+//   (1) non-allowlisted timer (Timeout, Immediate and StatWatcher) wakes > --budget per second (default 1.0) in total;
 //   (2) one non-allowlisted callsite fires more than once a minute (more than 5 in 300 s).
 // Allowlist: scripts/idle-wake-allowlist.json, [{callsite: "file function", reason, issue}].
-// Immediate runs and the Main's voluntary context switches are reported, not gated.
+// The Main's voluntary context switches are reported, not gated.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -161,7 +161,7 @@ try {
   for (let i = 0; i < 200 && !fs.existsSync(wakeOut); i++) await sleep(50);
   const report = JSON.parse(fs.readFileSync(wakeOut, "utf8"));
   const allowed = row => allowlist.some(entry => entry.callsite === row.callsite.replace(/:\d+ /, " "));
-  const gated = report.rows.filter(row => row.type !== "Immediate" && !allowed(row));
+  const gated = report.rows.filter(row => !allowed(row));
   const timerWakesPerSecond = gated.reduce((sum, row) => sum + row.perSecond, 0);
   const perCallsiteMax = Math.floor(report.seconds / 60);
   const pollers = gated.filter(row => row.wakes > perCallsiteMax);

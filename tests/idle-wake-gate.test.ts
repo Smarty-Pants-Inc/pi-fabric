@@ -42,6 +42,14 @@ describe.runIf(process.platform === "linux")("idle wake gate self-test (smarty-d
     expect(code).toBe(0);
   }, 30_000);
 
+  it.concurrent("fails a re-arming setImmediate loop, which no Timeout shows", async () => {
+    const { code, result } = await check("function spin() { setImmediate(spin); }\nspin();\n", 2);
+    expect(result.top[0]).toMatchObject({ type: "Immediate", callsite: expect.stringMatching(/child\.mjs:1 .*\bspin\b/) });
+    expect(result.timerWakesPerSecond).toBeGreaterThan(100);
+    expect(result.pollers).toBe(1);
+    expect(code).toBe(1);
+  }, 30_000);
+
   it.concurrent("counts an fs.watchFile 1 s stat poll, which no Timeout shows, and fails", async () => {
     const { code, result } = await check("import fs from 'node:fs';\nfs.watchFile(process.argv[1], { interval: 1000 }, () => {});\n", 3);
     expect(result.top[0]).toMatchObject({ type: "StatWatcher", callsite: expect.stringMatching(/child\.mjs:2 <anonymous>$/) });

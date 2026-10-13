@@ -25,14 +25,19 @@ as a cross-check.
 does, so another repository can gate its own extension (for example smarty-inbox). pi-fabric CI runs
 Fabric only.
 
-The gate FAILS (exit 1, top 10 callsites printed) when either rule breaks, for timer (`Timeout` and
-`StatWatcher`) wakes outside the allowlist:
+The gate FAILS (exit 1, top 10 callsites printed) when either rule breaks, for timer (`Timeout`,
+`Immediate` and `StatWatcher`) wakes outside the allowlist:
 
 1. more than `--budget` (1.0) wakes per second in total;
 2. one callsite fires more than once a minute (more than 5 times in 300 s).
 
-`Immediate` runs and the process's voluntary context switches per second (`/proc`) are reported
-only. Exit 2 means the gate itself broke.
+A re-arming `setImmediate` loop counts like a timer. An `Immediate` scheduled from a gated timer's
+callback runs in the same loop turn, so it adds to a callsite that already fails.
+
+**Not measured:** Promise jobs, I/O callbacks (sockets, pipes, child processes, `fs.watch` inotify
+events) and native threads. Those run only when a real event arrives, so they are not polling. The
+process's voluntary context switches per second (`/proc`) are reported, not gated, as the cross-check
+for wakes outside this scope. Exit 2 means the gate itself broke.
 
 ## Allowlist
 

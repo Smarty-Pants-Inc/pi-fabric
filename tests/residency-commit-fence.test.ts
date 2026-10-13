@@ -879,7 +879,7 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
     ["handled expiry", "in-place", true], ["handled expiry", "in-place", false],
     ["collected expiry", "in-place", true],
   ] as const;
-  it.each(cases)("preserves %s through %s boundary (switch=%s) in persisted and next model context", async (ending, mode, switchSucceeds) => {
+  const runCase = async (ending: (typeof cases)[number][0], mode: (typeof cases)[number][1], switchSucceeds: (typeof cases)[number][2]) => {
     const state = await harness(false, undefined, ending === "handled uncertainty" || ending === "handled expiry" ? 250 : 10_000);
     const main = mainProvider(state);
     main.registry.register(new PiToolsProvider(state.root, undefined, undefined, { powerShellToolDefinitionFactory, allowUnhookedTools: true }));
@@ -1060,7 +1060,10 @@ describe("round 7 resident receipts at actual Pi message_end", { timeout: 30_000
         if (mode === "in-place" && switchSucceeds) expect(nextModelText).toBe(text);
       }
     } finally { vi.restoreAllMocks(); await session?.abort(); session?.dispose(); await main.close(); await state.close(); }
-  });
+  };
+  it.each(cases.filter(([ending]) => ending !== "collected expiry"))("preserves %s through %s boundary (switch=%s) in persisted and next model context", runCase);
+  // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+  it.skipIf(process.platform !== "linux").each(cases.filter(([ending]) => ending === "collected expiry"))("preserves %s through %s boundary (switch=%s) in persisted and next model context", runCase);
 });
 
 describe("expiry receipt ledger through real Main and nested clients", { timeout: 25_000 }, () => {
@@ -1124,7 +1127,9 @@ describe("expiry receipt ledger through real Main and nested clients", { timeout
 
 describe("host-originated expired replies use the real resident receipt ledger", { timeout: 25_000 }, () => {
   for (const caller of ["main", "nested"] as const) for (const collected of [false, true]) {
-    it(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
+    const test = collected ? it.skipIf(process.platform !== "linux") : it;
+    // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+    test(`${caller} handles an expired replay reply with ${collected ? "collected" : "retained live"} commitment facts`, async () => {
       const state = await harness(false, undefined, 10_000);
       const main = mainProvider(state, caller);
       if (caller === "nested") {
@@ -1480,7 +1485,8 @@ describe("round 6 registered fabric_exec post-completion deadlines", { timeout: 
 });
 describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_000 }, () => {
   for (const caller of ["main", "nested"] as const) for (const before of [true, false]) {
-    it(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {
+    // off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+    it.skipIf(process.platform !== "linux")(`${caller} retry cancellation ${before ? "before" : "after"} commitment preserves the accepted removal obligation`, async () => {
       const state = await harness(false, undefined, 10_000); const main = mainProvider(state, caller);
       if (caller === "nested") {
         vi.stubEnv("PI_FABRIC_MAIN_AGENT_ID", state.config.rootId);

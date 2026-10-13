@@ -149,7 +149,7 @@ it.each(["missing", "stub", "running", "wrong id", "wrong transport", "unreadabl
   } finally { await fixture.close(); }
 }, 15_000);
 
-it.each(["spawnBound", "createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", async operation => {
+const runCachedRetryCase = async (operation: "spawnBound" | "createActor") => {
   const fixture = await setup();
   try {
     const create = operation === "spawnBound" ? vi.spyOn(fixture.host.agents, "spawn") : vi.spyOn(fixture.host.actors, "create");
@@ -186,4 +186,7 @@ it.each(["spawnBound", "createActor"] as const)("later cached %s retries acknowl
     }
     expect(create).toHaveBeenCalledTimes(1);
   } finally { await fixture.close(); }
-}, 30_000);
+};
+it.each(["spawnBound"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);
+// off Linux #1031 refuses removal (accepted gap smarty-dev#11335); pi-fabric#1079 unskips
+it.skipIf(process.platform !== "linux").each(["createActor"] as const)("later cached %s retries acknowledge their own generation, preserve one entity and collect both exchanges", runCachedRetryCase, 30_000);

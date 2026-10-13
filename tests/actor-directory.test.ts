@@ -7,6 +7,11 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
+// smarty-dev#8090, follow-up smarty-dev#11335: off Linux root actor tree deletion refuses (no Main publication fence): a
+// removal resolves with this named refusal pending and the tree kept. Linux assertions are unchanged.
+const OFF_LINUX = process.platform !== "linux";
+const REFUSAL = `Root actor tree deletion needs the Main publication fence, which this platform \\(${process.platform}\\) lacks \\(smarty-dev#8090\\); follow-up smarty-dev#11335; the root session:alpha actor tree is kept`;
+const OFF_LINUX_PENDING = new RegExp(`^removal cleanup failed: ${REFUSAL} \\(a later remove or host start finishes it\\)$`);
 const roots: string[] = [];
 const directories: ActorDirectory[] = [];
 const agents: AgentManager[] = [];
@@ -61,7 +66,7 @@ describe("ActorDirectory", () => {
   it("#169 round 2 permits public same-name create while a waiting removal is behind a live run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-wait-"));
     roots.push(root);
-    const { directory, manager } = open(root, "alpha");
+    const { directory, actorRoots, manager } = open(root, "alpha");
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const runId = "d".repeat(32);
@@ -71,6 +76,7 @@ describe("ActorDirectory", () => {
       return { id: runId, status: "stopped", text: "", usage: {} } as never;
     });
     const actor = await directory.create({ name: "replacement", instructions: "Work." });
+    if (OFF_LINUX) fs.writeFileSync(path.join(actorRoots.project, actor.id, "kept-11335.txt"), "history\n");
     directory.tell(actor.id, "go");
     await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
     let removed = false;
@@ -84,6 +90,12 @@ describe("ActorDirectory", () => {
       expect(directory.status("replacement").id).not.toBe(actor.id);
       release();
       await waiting;
+      if (OFF_LINUX) {
+        expect(directory.pendingRemovals()).toContainEqual(expect.objectContaining({ id: actor.id, state: expect.stringMatching(OFF_LINUX_PENDING) }));
+        expect(directory.list().filter((entry) => !entry.removal)).toHaveLength(1);
+        expect(fs.readFileSync(path.join(actorRoots.project, actor.id, "kept-11335.txt"), "utf8")).toBe("history\n");
+        return;
+      }
       expect(directory.list()).toHaveLength(1);
     } finally { release(); await Promise.allSettled([waiting, creating]); }
   });
@@ -111,12 +123,15 @@ describe("ActorDirectory", () => {
       if (target === dir) { failures++; throw new Error("persistent cleanup failure"); }
       return rm(target, options);
     });
+    if (OFF_LINUX) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n"); }
     try {
       await directory.remove(actor.id, { wait: false });
       release();
       await directory.removalSettled(actor.id);
-      expect(failures).toBeGreaterThanOrEqual(6);
+      if (OFF_LINUX) expect(failures).toBe(0); // refused before the tree delete: the rm is never reached
+      else expect(failures).toBeGreaterThanOrEqual(6);
       expect(directory.pendingRemovals()).toEqual([expect.objectContaining({ id: actor.id, state: expect.stringContaining("cleanup failed") })]);
+      if (OFF_LINUX) expect(directory.pendingRemovals()[0]!.state).toMatch(OFF_LINUX_PENDING);
       expect(directory.list()).toContainEqual(expect.objectContaining({ id: actor.id, scope, status: "stopped", removal: expect.any(Object) }));
       expect(() => directory.status(actor.id)).toThrow(/Unknown Fabric actor/);
       expect(() => directory.tell(actor.id, "must not run")).toThrow();
@@ -132,6 +147,14 @@ describe("ActorDirectory", () => {
       await expect(foreign.remove(actor.id)).rejects.toThrow(/owning host/);
       expect(fs.existsSync(marker)).toBe(true);
       fail.mockRestore();
+      if (OFF_LINUX) {
+        await expect(directory.remove(actor.id)).resolves.toMatchObject({ removed: true, cleaned: false, pending: expect.stringMatching(OFF_LINUX_PENDING) });
+        expect(fs.readFileSync(path.join(dir, "kept-11335.txt"), "utf8")).toBe("history\n");
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(directory.status("reviewer").id).toBe(successor.id);
+        expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor\n");
+        return;
+      }
       await expect(directory.remove(actor.id)).resolves.toEqual({ removed: true });
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(dir)).toBe(false);
@@ -219,7 +242,14 @@ describe("ActorDirectory", () => {
       name: "temporary session actor",
       instructions: "Stay process-local too.",
     });
+    // Off Linux the non-persistent close keeps its actor roots and warns the named refusal; close itself returns normally.
+    const warn = OFF_LINUX ? vi.spyOn(console, "warn").mockImplementation(() => {}) : undefined;
     await transient.directory.close();
+    if (warn) {
+      const kept = new RegExp(`^\\[pi-fabric\\] actor root .+ kept: ${REFUSAL.replace("session:alpha", "session:child")}$`);
+      expect(warn.mock.calls.some((args) => kept.test(String(args[0])))).toBe(true);
+      warn.mockRestore();
+    }
 
     expect(fs.readFileSync(sentinel, "utf8")).toBe("durable");
     expect(fs.existsSync(path.join(projectRoot, "actors.json"))).toBe(false);

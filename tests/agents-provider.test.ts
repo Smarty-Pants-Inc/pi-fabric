@@ -400,14 +400,30 @@ describe("fleet model policy (#2490)", () => {
   });
 
   it("F6 #3115 standalone Main creation needs no participants.self API", async () => {
-    const { provider, actors, agents } = setup();
+    const { provider, actors, agents, root, mesh, identity } = setup();
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     // A minimal topology dependency is sufficient for local creation.
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     const actor = await provider.invoke("create", { name: "minimal-topology", instructions: "Review." }, context) as FabricActorInfo;
     expect(actors.owns(actor.id)).toBe(true);
-    await provider.invoke("remove", { id: actor.id }, context);
-    expect(actors.list()).toEqual([]);
+    if (process.platform === "linux") {
+      await provider.invoke("remove", { id: actor.id }, context);
+      expect(actors.list()).toEqual([]);
+    } else {
+      const historyFile = actors.status(actor.id).sessionFile!;
+      fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: "standalone Main removal" })}\n`);
+      const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+      const removal = await provider.invoke("remove", { id: actor.id }, context) as { removed: boolean; cleaned?: boolean; pending?: string };
+      // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+      const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${identity.id} actor tree is kept (a later remove or host start finishes it)`;
+      expect(removal).toEqual({ removed: true, cleaned: false, pending });
+      expect(actors.list()).toEqual([expect.objectContaining({ id: actor.id, rootId: identity.id, status: "stopped",
+        removal: expect.objectContaining({ state: pending }) })]);
+      expect(actors.listOwned(true).some((entry) => entry.id === actor.id)).toBe(false);
+      expect(fs.existsSync(path.join(root, "actors", actor.id))).toBe(true);
+      expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+      expect(mesh.listAll("actors/test/").map((entry) => entry.key)).toEqual([`actors/test/${actor.id}`]);
+    }
   });
 
   it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
@@ -516,15 +532,52 @@ describe("fleet model policy (#2490)", () => {
           provider.participants, provider.control, provider.lifecycle, undefined, undefined, false,
         ));
         // The returned receipt supplies the exact public cleanup key; an uncancelled control still returns a handle.
-        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
-        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (process.platform === "linux") {
+          expect((await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`)).success).toBe(true);
+          expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        } else {
+          const historyFile = actors.status(id).sessionFile!;
+          fs.appendFileSync(historyFile, `${JSON.stringify({ testHistory: `public guest ${id}` })}\n`);
+          const historyBeforeRemoval = fs.readFileSync(historyFile, "utf8");
+          const removed = await execute(`return await agents.remove({ id: ${JSON.stringify(id)} });`);
+          expect(removed.success).toBe(true);
+          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
+          expect(removed.value).toEqual({ removed: true, cleaned: false, pending });
+          expect(actors.list()).toEqual([expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped",
+            removal: expect.objectContaining({ state: pending }) })]);
+          expect(actors.listOwned(true).some((entry) => entry.id === id)).toBe(false);
+          expect(fs.existsSync(path.join(root, "actors", id))).toBe(true);
+          expect(fs.readFileSync(historyFile, "utf8")).toBe(historyBeforeRemoval);
+          expect(mesh.listAll("actors/test/").map((entry) => entry.key)).toEqual([`actors/test/${id}`]);
+        }
         await published.refresh(); expect(published.get(id)).toBeUndefined();
         const control = await execute(`return await agents.${action}(${JSON.stringify(args)});`);
         expect(control.success).toBe(true); expect(control.residentOutcomes).toBeUndefined();
         expect(control.value).toMatchObject({ name: request.name, status: "idle" });
         const controlId = (control.value as FabricActorInfo).id;
-        expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
-        expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        if (process.platform === "linux") {
+          expect((await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`)).success).toBe(true);
+          expect(actors.list()).toEqual([]); expect(mesh.listAll("actors/test/")).toEqual([]);
+        } else {
+          const controlHistoryFile = actors.status(controlId).sessionFile!;
+          fs.appendFileSync(controlHistoryFile, `${JSON.stringify({ testHistory: `public control ${controlId}` })}\n`);
+          const controlHistoryBeforeRemoval = fs.readFileSync(controlHistoryFile, "utf8");
+          const controlRemoved = await execute(`return await agents.remove({ id: ${JSON.stringify(controlId)} });`);
+          expect(controlRemoved.success).toBe(true);
+          // Off Linux the fence refusal follows registry revocation but precedes tree/presence deletion; follow-up smarty-dev#11335.
+          const pending = `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${provider.mainAgent.id} actor tree is kept (a later remove or host start finishes it)`;
+          expect(controlRemoved.value).toEqual({ removed: true, cleaned: false, pending });
+          expect(actors.list()).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id, rootId: provider.mainAgent.id, status: "stopped", removal: expect.objectContaining({ state: expect.stringContaining("follow-up smarty-dev#11335") }) }),
+            expect.objectContaining({ id: controlId, rootId: provider.mainAgent.id, status: "stopped", removal: expect.objectContaining({ state: pending }) }),
+          ]));
+          expect(actors.list()).toHaveLength(2);
+          expect(actors.listOwned(true).some((entry) => entry.id === id || entry.id === controlId)).toBe(false);
+          expect(fs.existsSync(path.join(root, "actors", controlId))).toBe(true);
+          expect(fs.readFileSync(controlHistoryFile, "utf8")).toBe(controlHistoryBeforeRemoval);
+          expect(mesh.listAll("actors/test/").map((entry) => entry.key).sort()).toEqual([`actors/test/${id}`, `actors/test/${controlId}`].sort());
+        }
       } finally {
         fs.rmSync(lock, { recursive: true, force: true });
         await running; await done;
@@ -1323,8 +1376,15 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       state.control, state.lifecycle, undefined, { removeActor } as unknown as ResidencyClient);
     await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
     expect(removeActor).toHaveBeenCalledExactlyOnceWith(actor.id, context.signal);
+    if (process.platform === "linux") {
     expect(fs.existsSync(dir)).toBe(false);
     expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+    } else {
+      // Off Linux the routed retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335).
+      expect(fs.existsSync(dir)).toBe(true);
+      await expect(owner.remove(actor.id)).resolves.toEqual({ removed: true, cleaned: false,
+        pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)` });
+    }
   });
 
   it.each(["project", "session"] as const)("reports and retries a cleanup-only %s id through the provider, preserving its successor", async (scope) => {
@@ -1355,12 +1415,23 @@ describe("#169 round 1 agents.remove cleanup routing", () => {
       fs.writeFileSync(successor.sessionFile!, "successor history\n");
       await expect(provider.invoke("remove", { id: actor.id.slice(0, 12) }, context)).rejects.toThrow();
       failing.mockRestore();
+      if (process.platform === "linux") {
       await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({ removed: true });
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(dir)).toBe(false);
       expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
       expect(directory.status("retry worker").id).toBe(successor.id);
       expect(await provider.invoke("actors", {}, context)).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+      } else {
+        // Off Linux the retry is refused before any delete (smarty-dev#8090; follow-up smarty-dev#11335): tree kept, pending.
+        await expect(provider.invoke("remove", { id: actor.id }, context)).resolves.toMatchObject({
+          removed: true, cleaned: false,
+          pending: `removal cleanup failed: Root actor tree deletion needs the Main publication fence, which this platform (${process.platform}) lacks (smarty-dev#8090); follow-up smarty-dev#11335; the root ${state.identity.id} actor tree is kept (a later remove or host start finishes it)`,
+        });
+        expect(fs.existsSync(dir)).toBe(true);
+        expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor history\n");
+        expect(directory.status("retry worker").id).toBe(successor.id);
+      }
     } finally { failing.mockRestore(); }
   });
 });
